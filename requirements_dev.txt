@@ -1,4 +1,4 @@
-aiohttp~=3.9
+aiohttp~=3.14.1
 flake8
 mypy
 mypy-extensions

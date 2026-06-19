@@ -308,6 +308,13 @@ def mergedicts(dict1, dict2):
                             for kk, vv in merged.items()
                         ],
                     )
+                elif k == "fingerprint":
+                    # sentry "fingerprint" is a replace-not-append setting: a
+                    # job (or a defaults block) that supplies its own
+                    # fingerprint must override the default entirely. Plain
+                    # concatenation would silently prepend the three default
+                    # entries, making custom Sentry issue grouping impossible.
+                    yield (k, v2)
                 else:
                     yield (k, v1 + v2)
             else:
@@ -319,28 +326,13 @@ def mergedicts(dict1, dict2):
 
 
 class JobConfig:
-    def __init__(self, config: dict) -> None:  # noqa: C901
+    def __init__(self, config: dict) -> None:
         self.name = config["name"]  # type: str
         self.command = config["command"]  # type: Union[str, List[str]]
         self.schedule_unparsed = config.pop("schedule")
-        if isinstance(self.schedule_unparsed, str):
-            if self.schedule_unparsed in {"@reboot"}:
-                self.schedule = self.schedule_unparsed  # type: Union[CronTab, str]
-            else:
-                self.schedule = CronTab(self.schedule_unparsed)
-        elif isinstance(self.schedule_unparsed, dict):
-            minute = self.schedule_unparsed.get("minute", "*")
-            hour = self.schedule_unparsed.get("hour", "*")
-            day = self.schedule_unparsed.get("dayOfMonth", "*")
-            month = self.schedule_unparsed.get("month", "*")
-            dow = self.schedule_unparsed.get("dayOfWeek", "*")
-            tab = "{} {} {} {} {}".format(minute, hour, day, month, dow)
-            logger.debug("Converted schedule to %r", tab)
-            self.schedule = CronTab(tab)
-        else:
-            raise ConfigError(
-                "invalid schedule: {!r}".format(self.schedule_unparsed)
-            )
+        self.schedule: Union[CronTab, str] = self._parse_schedule(
+            self.schedule_unparsed
+        )
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
         self.captureStderr = config.pop("captureStderr")
@@ -350,16 +342,10 @@ class JobConfig:
         self.maxLineLength = config.pop("maxLineLength")
         self.utc = config.pop("utc")
         self.enabled: bool = config.pop("enabled")
-        self.timezone = None  # type: Optional[datetime.tzinfo]
-        if config["timezone"] is not None:
-            try:
-                self.timezone = ZoneInfo(config["timezone"])
-            except (ZoneInfoNotFoundError, ValueError) as err:
-                raise ConfigError(
-                    "unknown timezone: {}".format(config["timezone"])
-                ) from err
-        elif self.utc:
-            self.timezone = datetime.timezone.utc
+        # depends on self.utc, so resolve after it is set
+        self.timezone: Optional[datetime.tzinfo] = self._resolve_timezone(
+            config.pop("timezone")
+        )
 
         self.failsWhen = config.pop("failsWhen")
         self.onFailure = config.pop("onFailure")
@@ -369,36 +355,68 @@ class JobConfig:
         self.env_file = config.pop("env_file")
         self.environment = config.pop("environment")
         if self.env_file is not None:
-            try:
-                file_environs = parse_environment_file(self.env_file)
-            except OSError as e:
-                raise ConfigError(
-                    "Could not load env_file: {}".format(e)
-                ) from e
-            else:
-                # unpack variables in dictionaries
-                config_environs = {
-                    env["key"]: env["value"] for env in self.environment
-                }
-                # update file values with config ones
-                file_environs.update(config_environs)
-                # replace environment
-                self.environment = [
-                    {"key": key, "value": value}
-                    for key, value in file_environs.items()
-                ]
+            self._merge_env_file()
 
         self.executionTimeout = config.pop("executionTimeout")
         self.killTimeout = config.pop("killTimeout")
         self.statsd = config.pop("statsd")
 
-        self.uid = None
-        self.gid = None
+        self.uid = None  # type: Optional[int]
+        self.gid = None  # type: Optional[int]
         # Resolved login name of the target user, used by the child process'
         # privilege-drop (os.initgroups) so it gets the user's supplementary
         # groups instead of inheriting root's. None when unknown.
         self.username: Optional[str] = None
+        self._resolve_user_group(config)
 
+        self._validate_numeric_ranges()
+
+    def _parse_schedule(self, schedule_unparsed) -> Union[CronTab, str]:
+        if isinstance(schedule_unparsed, str):
+            if schedule_unparsed == "@reboot":
+                return schedule_unparsed
+            return CronTab(schedule_unparsed)
+        if isinstance(schedule_unparsed, dict):
+            minute = schedule_unparsed.get("minute", "*")
+            hour = schedule_unparsed.get("hour", "*")
+            day = schedule_unparsed.get("dayOfMonth", "*")
+            month = schedule_unparsed.get("month", "*")
+            dow = schedule_unparsed.get("dayOfWeek", "*")
+            tab = f"{minute} {hour} {day} {month} {dow}"
+            logger.debug("Converted schedule to %r", tab)
+            return CronTab(tab)
+        raise ConfigError("invalid schedule: {!r}".format(schedule_unparsed))
+
+    def _resolve_timezone(
+        self, timezone: Optional[str]
+    ) -> Optional[datetime.tzinfo]:
+        if timezone is not None:
+            try:
+                return ZoneInfo(timezone)
+            except (ZoneInfoNotFoundError, ValueError) as err:
+                raise ConfigError(
+                    "unknown timezone: {}".format(timezone)
+                ) from err
+        if self.utc:
+            return datetime.timezone.utc
+        return None
+
+    def _merge_env_file(self) -> None:
+        try:
+            file_environs = parse_environment_file(self.env_file)
+        except OSError as e:
+            raise ConfigError("Could not load env_file: {}".format(e)) from e
+        # config-defined variables override those loaded from the file
+        config_environs = {
+            env["key"]: env["value"] for env in self.environment
+        }
+        file_environs.update(config_environs)
+        self.environment = [
+            {"key": key, "value": value}
+            for key, value in file_environs.items()
+        ]
+
+    def _resolve_user_group(self, config: dict) -> None:
         user = config.pop("user", None)
         if user is not None:
             if isinstance(user, int):
@@ -443,8 +461,6 @@ class JobConfig:
                     "Job {} wants to change user or group, "
                     "but yacron2 is not running as superuser".format(self.name)
                 )
-
-        self._validate_numeric_ranges()
 
     def _validate_numeric_ranges(self) -> None:
         # strictyaml only enforces the type (Int/Float); fail fast on values
@@ -498,7 +514,7 @@ def parse_environment_file(path: str) -> Dict[str, str]:
     """
     environ: Dict[str, str] = {}
 
-    with open(path, "r") as env_file:
+    with open(path, "r", encoding="utf-8") as env_file:
         # file parsing
         # you may want to use the `dotenv` library to do the job
         for line in env_file.readlines():
@@ -525,7 +541,9 @@ class Yacron2Config:
     logging_config: Optional[LoggingConfig]
 
 
-def parse_config_string(data: str, path: str) -> Yacron2Config:
+def parse_config_string(
+    data: str, path: str, _seen: Optional[set] = None
+) -> Yacron2Config:
     try:
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
     except YAMLError as ex:
@@ -537,7 +555,11 @@ def parse_config_string(data: str, path: str) -> Yacron2Config:
     logging_conf = LoggingConfig(doc["logging"]) if "logging" in doc else None
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
-        inc_config = parse_config_file(inc_path)
+        # Included jobs arrive already fully constructed, so they carry only
+        # their own file's defaults; a top-level ``defaults`` block does NOT
+        # retro-apply to them. Only the included files' defaults are merged
+        # here, and they affect this file's inline jobs.
+        inc_config = parse_config_file(inc_path, _seen)
         inc_defaults_merged = dict(
             mergedicts(inc_defaults_merged, inc_config.job_defaults)
         )
@@ -563,12 +585,20 @@ def parse_config_string(data: str, path: str) -> Yacron2Config:
     )
 
 
-def parse_config_file(
-    path: str,
-) -> Yacron2Config:
+def parse_config_file(path: str, _seen: Optional[set] = None) -> Yacron2Config:
+    # Guard against include cycles (a file that includes itself directly or
+    # transitively) so a misconfiguration raises a clear ConfigError instead
+    # of recursing until RecursionError. _seen is scoped per top-level parse,
+    # so two independent files including a common file is not flagged.
+    abspath = os.path.abspath(path)
+    if _seen is None:
+        _seen = set()
+    if abspath in _seen:
+        raise ConfigError("include cycle detected at {}".format(path))
+    _seen.add(abspath)
     with open(path, "rt", encoding="utf-8") as stream:
         data = stream.read()
-    return parse_config_string(data, path)
+    return parse_config_string(data, path, _seen)
 
 
 def parse_config(config_arg: str) -> Yacron2Config:
@@ -590,7 +620,9 @@ def _parse_config_dir(config_arg: str) -> Yacron2Config:
     logging_config: Optional[LoggingConfig] = None
     logging_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
-    for direntry in os.scandir(config_arg):
+    # Sort by name so job order and the "first config found" error messages
+    # are deterministic; os.scandir yields entries in arbitrary FS order.
+    for direntry in sorted(os.scandir(config_arg), key=lambda e: e.name):
         base, ext = os.path.splitext(direntry.name)
         if base[0] in {"_", "."}:
             continue

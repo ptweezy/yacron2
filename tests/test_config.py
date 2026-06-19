@@ -402,7 +402,8 @@ jobs:
 
 def test_report_defaults_not_aliased():
     # onFailure/onPermanentFailure/onSuccess report blocks must be independent
-    # objects so mutating one cannot corrupt the others (or the global default).
+    # objects so mutating one cannot corrupt the others (or the global
+    # default).
     conf = config.parse_config_string(
         """
 jobs:
@@ -521,3 +522,72 @@ jobs:
             "",
         )
     assert "backoffMultiplier" in str(exc.value)
+
+
+def test_sentry_fingerprint_override_replaces():
+    # a job that supplies its own sentry fingerprint must replace the default
+    # entirely, not have the three default entries prepended to it.
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        sentry:
+          fingerprint:
+            - my-group
+            - "{{ name }}"
+""",
+        "",
+    )
+    job = conf.jobs[0]
+    assert job.onFailure["report"]["sentry"]["fingerprint"] == [
+        "my-group",
+        "{{ name }}",
+    ]
+
+
+def test_parse_config_dir_sorted_order(tmp_path):
+    # job order across files must be deterministic (sorted by filename), not
+    # dependent on the arbitrary order os.scandir returns.
+    (tmp_path / "20-b.yaml").write_text(
+        "jobs:\n  - name: b\n    command: foo\n    schedule: '* * * * *'\n"
+    )
+    (tmp_path / "10-a.yaml").write_text(
+        "jobs:\n  - name: a\n    command: foo\n    schedule: '* * * * *'\n"
+    )
+    (tmp_path / "30-c.yaml").write_text(
+        "jobs:\n  - name: c\n    command: foo\n    schedule: '* * * * *'\n"
+    )
+    conf = config.parse_config(str(tmp_path))
+    assert [j.name for j in conf.jobs] == ["a", "b", "c"]
+
+
+def test_include_cycle_detected(tmp_path):
+    # a file that includes itself must raise a clear ConfigError instead of
+    # recursing until RecursionError.
+    cfg = tmp_path / "a.yaml"
+    cfg.write_text("include:\n  - a.yaml\n")
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config(str(cfg))
+    assert "cycle" in str(exc.value)
+
+
+def test_environ_file_utf8(tmp_path):
+    # env files are decoded as UTF-8 regardless of the system locale.
+    env = tmp_path / "vars.env"
+    env.write_text("GREETING=héllo\n", encoding="utf-8")
+    conf = config.parse_config_string(
+        f"""
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+    env_file: {env}
+""",
+        "",
+    )
+    environment = {e["key"]: e["value"] for e in conf.jobs[0].environment}
+    assert environment["GREETING"] == "héllo"

@@ -9,6 +9,7 @@ from sentry_sdk.utils import Dsn
 
 import yacron2.config
 import yacron2.job
+import yacron2.statsd
 
 
 @pytest.mark.parametrize(
@@ -728,3 +729,107 @@ jobs:
     success = 0 if job.failed else 1
     assert any("the.prefix.success:%i" % success in r for r in received[1:])
     assert any("the.prefix.duration" in r for r in received[1:])
+
+
+@pytest.mark.asyncio
+async def test_start_failure_reported_not_raised():
+    # A command that cannot be launched (e.g. it does not exist) must be
+    # treated as a normal job failure with exit code 127, not raise
+    # RuntimeError (which the reaper logs as "please report this as a bug").
+    conf = yacron2.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command:
+      - /this/command/definitely/does/not/exist
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+
+    await job.start()
+    assert job.proc is None
+    assert job.start_failed
+
+    # must not raise; routed through normal failure handling instead
+    await job.wait()
+    assert job.retcode == 127
+    assert job.failed
+
+
+@pytest.mark.asyncio
+async def test_statsd_failure_does_not_crash(monkeypatch):
+    # statsd is best-effort: a send error (e.g. an unresolvable host) must be
+    # swallowed and not propagate out of start()/wait() to crash the scheduler.
+    async def boom(*args, **kwargs):
+        raise OSError("statsd unreachable")
+
+    monkeypatch.setattr(yacron2.statsd, "send_to_statsd", boom)
+
+    conf = yacron2.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: "true"
+    schedule: "* * * * *"
+    statsd:
+      host: 127.0.0.1
+      port: 9999
+      prefix: the.prefix
+""",
+        "",
+    )
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+
+    await job.start()  # _on_start must swallow the OSError
+    await job.wait()  # _on_stop must swallow the OSError
+    assert job.retcode == 0
+
+
+@pytest.mark.asyncio
+async def test_report_mail_closes_connection_on_error():
+    # if sending fails, the SMTP connection must still be closed (no leak).
+    conf = yacron2.config.parse_config_string(A_JOB, "")
+    job_config = conf.jobs[0]
+    job = Mock(
+        config=job_config,
+        stdout="out",
+        stderr="err",
+        template_vars={
+            "name": job_config.name,
+            "success": False,
+            "stdout": "out",
+            "stderr": "err",
+        },
+    )
+
+    mail = yacron2.job.MailReporter()
+    close_calls = []
+
+    async def connect(self):
+        pass
+
+    async def starttls(self):
+        pass
+
+    async def login(self, username, password):
+        pass
+
+    async def send_message(self, message):
+        raise RuntimeError("smtp boom")
+
+    def close(self):
+        close_calls.append(self)
+
+    with (
+        patch("aiosmtplib.SMTP.connect", connect),
+        patch("aiosmtplib.SMTP.starttls", starttls),
+        patch("aiosmtplib.SMTP.login", login),
+        patch("aiosmtplib.SMTP.send_message", send_message),
+        patch("aiosmtplib.SMTP.close", close),
+    ):
+        with pytest.raises(RuntimeError):
+            await mail.report(False, job, job_config.onSuccess["report"])
+
+    assert len(close_calls) == 1

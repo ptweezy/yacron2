@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import yacron2.cron
-from yacron2.config import JobConfig
+from yacron2.config import ConfigError, JobConfig
 from yacron2.job import RunningJob
 
 
@@ -508,9 +508,8 @@ async def test_schedule_retry_job_disappeared():
 
 
 def test_resolve_web_token_value():
-    token = yacron2.cron.Cron._resolve_web_token(
-        {"authToken": {"value": "secret", "fromFile": None, "fromEnvVar": None}}
-    )
+    auth = {"value": "secret", "fromFile": None, "fromEnvVar": None}
+    token = yacron2.cron.Cron._resolve_web_token({"authToken": auth})
     assert token == "secret"
 
 
@@ -808,3 +807,21 @@ jobs:
     cron = yacron2.cron.Cron(None, config_yaml=config_yaml)
     job = list(cron.cron_jobs.values())[0]
     assert cron.job_should_run(startup, job) == result
+
+
+@pytest.mark.asyncio
+async def test_run_survives_config_error(monkeypatch):
+    # If update_config() raises (e.g. the config became invalid on reload),
+    # run() must log it and keep running the previously-loaded jobs, not crash
+    # with UnboundLocalError when it later inspects `config`.
+    cron = yacron2.cron.Cron(None)
+
+    def failing_update_config():
+        # stop the loop after this (failing) iteration, then fail
+        cron.signal_shutdown()
+        raise ConfigError("boom")
+
+    monkeypatch.setattr(cron, "update_config", failing_update_config)
+
+    # completes without raising (UnboundLocalError before the fix)
+    await asyncio.wait_for(cron.run(), timeout=5)

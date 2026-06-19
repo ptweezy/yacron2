@@ -113,6 +113,11 @@ class Cron:
         startup = True
         applied_logging_config: Optional[LoggingConfig] = None
         while not self._stop_event.is_set():
+            # None until update_config succeeds this iteration; on failure we
+            # keep running the previously-loaded jobs (update_config only
+            # overwrites self.cron_jobs on success) and must not dereference an
+            # unbound config below.
+            config: Optional[Yacron2Config] = None
             try:
                 config = self.update_config()
                 await self.start_stop_web_app(config.web_config)
@@ -125,7 +130,8 @@ class Cron:
             except Exception:  # pragma: nocover
                 logger.exception("please report this as a bug (1)")
             if (
-                config.logging_config is not None
+                config is not None
+                and config.logging_config is not None
                 and config.logging_config != applied_logging_config
             ):
                 try:
@@ -348,13 +354,16 @@ class Cron:
 
     @staticmethod
     def _make_auth_middleware(token: str):
-        expected = "Bearer " + token
-
         @web.middleware
         async def auth_middleware(request, handler):
             header = request.headers.get("Authorization", "")
-            # constant-time comparison to avoid leaking the token via timing
-            if not hmac.compare_digest(header, expected):
+            scheme, _, presented = header.partition(" ")
+            # RFC 7235: the auth scheme is case-insensitive (Bearer/bearer).
+            # Compare only the token, in constant time, to avoid leaking it via
+            # timing (the scheme is not secret).
+            if scheme.lower() != "bearer" or not hmac.compare_digest(
+                presented, token
+            ):
                 raise web.HTTPUnauthorized()
             return await handler(request)
 
@@ -492,7 +501,11 @@ class Cron:
                     try:
                         task.result()
                     except Exception:  # pragma: no cover
-                        logger.exception("please report this as a bug (2)")
+                        logger.exception(
+                            "Unexpected error while waiting on job %s; "
+                            "please report this as a bug (2)",
+                            job.config.name,
+                        )
                     await self._handle_finished_job(job)
             except asyncio.CancelledError:
                 raise

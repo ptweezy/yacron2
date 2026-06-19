@@ -61,6 +61,17 @@ class StreamReader:
         self._reader = asyncio.create_task(self._read(stream))
         self.discarded_lines = 0
 
+    @staticmethod
+    def _emit(out_stream, out_line: str) -> None:
+        # Write bytes so we control the encoding; fall back to ASCII with
+        # replacement when the console encoding can't represent the text.
+        try:
+            out_stream.buffer.write(out_line.encode())
+        except UnicodeEncodeError:
+            safe = out_line.encode("ascii", "replace").decode("ascii")
+            out_stream.write(safe)
+        out_stream.flush()
+
     async def _read(self, stream):
         prefix = self.stream_prefix.format(
             job_name=self.job_name, stream_name=self.stream_name
@@ -83,23 +94,9 @@ class StreamReader:
                 return
             out_line = prefix + line
             if self.stream_name == "stdout":
-                try:
-                    sys.stdout.buffer.write(out_line.encode())
-                except UnicodeEncodeError:
-                    out_line = out_line.encode("ascii", "replace").decode(
-                        "ascii"
-                    )
-                    sys.stdout.write(out_line)
-                sys.stdout.flush()
+                self._emit(sys.stdout, out_line)
             elif self.stream_name == "stderr":
-                try:
-                    sys.stderr.buffer.write(out_line.encode())
-                except UnicodeEncodeError:
-                    out_line = out_line.encode("ascii", "replace").decode(
-                        "ascii"
-                    )
-                    sys.stderr.write(out_line)
-                sys.stderr.flush()
+                self._emit(sys.stderr, out_line)
             if self.save_limit > 0:
                 if len(self.save_top) < limit_top:
                     self.save_top.append(line)
@@ -155,7 +152,14 @@ class SentryReporter(Reporter):
             with open(config["dsn"]["fromFile"], "rt") as dsn_file:
                 dsn = dsn_file.read().strip()
         elif config["dsn"]["fromEnvVar"]:
-            dsn = os.environ[config["dsn"]["fromEnvVar"]]
+            env_var = config["dsn"]["fromEnvVar"]
+            dsn = os.environ.get(env_var, "")
+            if not dsn:
+                logger.error(
+                    "sentry: dsn env var %r is not set; not reporting",
+                    env_var,
+                )
+                return
         else:
             return  # sentry disabled: early return
 
@@ -221,7 +225,14 @@ class MailReporter(Reporter):
             with open(mail["password"]["fromFile"], "rt") as pass_file:
                 password = pass_file.read().strip()
         elif mail["password"]["fromEnvVar"]:
-            password = os.environ[mail["password"]["fromEnvVar"]]
+            env_var = mail["password"]["fromEnvVar"]
+            password = os.environ.get(env_var)
+            if not password:
+                logger.error(
+                    "mail: password env var %r is not set; not sending",
+                    env_var,
+                )
+                return
         else:
             password = None
         username = mail.get("username")
@@ -255,13 +266,18 @@ class MailReporter(Reporter):
             validate_certs=mail["validate_certs"],
         )
         await smtp.connect()
-        if mail["starttls"]:
-            await smtp.starttls()
-        if username and password:
-            # aiosmtplib >=2 takes username/password as positional-only args.
-            await smtp.login(username, password)
-
-        await smtp.send_message(message)
+        # close() (sync, idempotent) guarantees the socket is released even if
+        # starttls/login/send raises, so a failing SMTP server can't leak a
+        # connection per report.
+        try:
+            if mail["starttls"]:
+                await smtp.starttls()
+            if username and password:
+                # aiosmtplib >=2 takes username/password as positional args.
+                await smtp.login(username, password)
+            await smtp.send_message(message)
+        finally:
+            smtp.close()
 
 
 class ShellReporter(Reporter):
@@ -389,6 +405,10 @@ class RunningJob:
         self.execution_deadline = None  # type: Optional[float]
         self.retry_state = retry_state
         self.env = None  # type: Optional[Dict[str, str]]
+        # set when the subprocess could not be launched at all (e.g. the
+        # command does not exist). Lets wait() treat it as a normal job
+        # failure instead of raising RuntimeError("process is not running").
+        self.start_failed = False
         # guards against _on_stop running twice (cancel() racing wait())
         self._stopped = False
         # set by the scheduler when this run is deliberately cancelled to make
@@ -409,7 +429,17 @@ class RunningJob:
 
     async def _on_start(self) -> None:
         if self.statsd_writer:
-            await self.statsd_writer.job_started()
+            # statsd is best-effort telemetry; a send failure (e.g. an
+            # unresolvable host) must never propagate out of job launch and
+            # crash the scheduler loop.
+            try:
+                await self.statsd_writer.job_started()
+            except OSError:
+                logger.warning(
+                    "Job %s: failed to send statsd job_started metric",
+                    self.config.name,
+                    exc_info=True,
+                )
 
     async def _on_stop(self) -> None:
         # idempotent: cancel() and the wait() task can both reach here for a
@@ -420,7 +450,14 @@ class RunningJob:
             return
         self._stopped = True
         if self.statsd_writer:
-            await self.statsd_writer.job_stopped()
+            try:
+                await self.statsd_writer.job_stopped()
+            except OSError:
+                logger.warning(
+                    "Job %s: failed to send statsd job_stopped metric",
+                    self.config.name,
+                    exc_info=True,
+                )
 
     async def start(self) -> None:
         if self.proc is not None:
@@ -474,6 +511,7 @@ class RunningJob:
                 kwargs,
                 sys.getdefaultencoding(),
             )
+            self.start_failed = True
             return
 
         await self._on_start()
@@ -530,6 +568,14 @@ class RunningJob:
 
     async def wait(self) -> None:
         if self.proc is None:
+            if self.start_failed:
+                # The command never launched (e.g. it does not exist). Report
+                # it as a normal failure (conventional "command not found"
+                # exit code 127) rather than raising RuntimeError, which the
+                # reaper would log as "please report this as a bug".
+                self.retcode = 127
+                await self._read_job_streams()
+                return
             raise RuntimeError("process is not running")
         if self.execution_deadline is None:
             self.retcode = await self.proc.wait()

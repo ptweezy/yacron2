@@ -1,6 +1,6 @@
-=======
+============================
 yacron2 (Yet Another Cron 2)
-=======
+============================
 
 
 A modern, Docker-friendly Cron replacement.
@@ -43,7 +43,7 @@ Installation
 Install using pip
 +++++++++++++++++
 
-yacron2 requires Python >= 3.6 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
+yacron2 requires Python >= 3.10 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
 virtual environment, for example:
 
 .. code-block:: shell

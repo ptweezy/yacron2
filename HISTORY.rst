@@ -8,6 +8,16 @@ entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
 
+1.0.2 (2026-06-19)
+------------------
+
+**Packaging**
+
+* Promote the PyPI ``Development Status`` classifier from ``4 - Beta`` to
+  ``5 - Production/Stable`` to reflect the stable 1.0 release series. No code
+  changes.
+
+
 1.0.1 (2026-06-19)
 ------------------
 

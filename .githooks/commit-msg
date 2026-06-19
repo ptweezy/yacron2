@@ -1,5 +1,5 @@
 #!/bin/sh
-# Auto-generate a HISTORY.rst entry on [release] commits.
+# Auto-generate a HISTORY.md entry on [release] commits.
 #
 # This is a thin shim; all logic lives in (and is versioned as)
 # scripts/gen_changelog_entry.py. Install it with:

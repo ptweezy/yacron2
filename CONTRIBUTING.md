@@ -95,9 +95,9 @@ no orphan tag and a re-run cleanly retries the same version.
   re-uploaded, even after it is deleted or yanked. Pick the bump level
   deliberately.
 
-### Changelog (HISTORY.rst)
+### Changelog (HISTORY.md)
 
-A local `commit-msg` hook drafts a `HISTORY.rst` entry whenever you make a
+A local `commit-msg` hook drafts a `HISTORY.md` entry whenever you make a
 release commit, from the commits since the last tag. It is best-effort and
 never blocks a commit. Install it once per clone:
 

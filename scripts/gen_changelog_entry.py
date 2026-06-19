@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a HISTORY.rst entry for a release commit.
+"""Generate a HISTORY.md entry for a release commit.
 
 Invoked by the ``commit-msg`` git hook. It only does anything when the commit
 message has a release-marker line of its own -- ``[release]`` (minor) or
@@ -8,10 +8,10 @@ mention of ``[release]`` inside prose never counts. It then:
 
   1. works out the next version (latest ``X.Y.Z`` tag + the marker's bump,
      default minor),
-  2. drafts a reStructuredText entry summarising the commits since that tag,
+  2. drafts a Markdown entry summarising the commits since that tag,
      using the ``claude`` CLI if one is on PATH, otherwise falling back to a
      deterministic list of commit subjects,
-  3. inserts it at the top of HISTORY.rst and stages the file so it lands in
+  3. inserts it at the top of HISTORY.md and stages the file so it lands in
      this same commit.
 
 It is deliberately best-effort: any failure prints a warning and exits 0 so a
@@ -29,8 +29,8 @@ import shutil
 import subprocess
 import sys
 
-HISTORY = "HISTORY.rst"
-VERSION_HEADER_RE = re.compile(r"^\d+\.\d+\.\d+ \(")
+HISTORY = "HISTORY.md"
+VERSION_HEADER_RE = re.compile(r"^## \d+\.\d+\.\d+ \(")
 # A release marker must be on its OWN line: [release] (minor) or
 # [release:major|minor|patch]. Anchored so prose mentions never match.
 MARKER_RE = re.compile(
@@ -133,13 +133,14 @@ def llm_body(version: str, subjects: list[str], diff: str) -> str | None:
     prompt = (
         "You are writing a changelog entry for the Python project yacron2.\n"
         f"The new version is {version}.\n\n"
-        "Write ONLY the body of a reStructuredText changelog entry:\n"
-        "- a bulleted list using '* ' bullets, present tense, user-facing;\n"
-        "- optionally grouped under bold headers like **Bug fixes** or "
-        "**Features** (only if there is more than one group);\n"
+        "Write ONLY the body of a Markdown changelog entry:\n"
+        "- a bulleted list using '- ' bullets, present tense, user-facing;\n"
+        "- optionally grouped under '### ' headers like '### Bug fixes' or "
+        "'### Features' (only if there is more than one group);\n"
+        "- wrap code/identifiers in single backticks;\n"
         "- wrap lines at about 75 columns;\n"
-        "- do NOT include the version number, the date, a title/underline, or "
-        "code fences. Output raw RST only.\n\n"
+        "- do NOT include the version number, the date, a top-level title, or "
+        "code fences. Output raw Markdown only.\n\n"
         "Commits since the last release:\n"
         + "\n".join(f"- {s}" for s in subjects)
         + "\n\nStaged diff (truncated):\n"
@@ -169,22 +170,21 @@ def llm_body(version: str, subjects: list[str], diff: str) -> str | None:
 
 def fallback_body(subjects: list[str]) -> str:
     if not subjects:
-        return "* Maintenance release."
-    return "\n".join(f"* {s}" for s in subjects)
+        return "- Maintenance release."
+    return "\n".join(f"- {s}" for s in subjects)
 
 
 def insert_entry(version: str, body: str) -> bool:
-    """Insert the entry into HISTORY.rst. Return False if nothing changed."""
+    """Insert the entry into HISTORY.md. Return False if nothing changed."""
     with open(HISTORY, encoding="utf-8") as fh:
         text = fh.read()
 
-    if re.search(rf"^{re.escape(version)} \(", text, flags=re.MULTILINE):
+    if re.search(rf"^## {re.escape(version)} \(", text, flags=re.MULTILINE):
         # Already present (e.g. a commit --amend or re-run); leave it alone.
         return False
 
     today = datetime.date.today().isoformat()
-    header = f"{version} ({today})"
-    entry = f"{header}\n{'-' * len(header)}\n\n{body}\n"
+    entry = f"## {version} ({today})\n\n{body}\n"
 
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
@@ -215,7 +215,7 @@ def main(argv: list[str]) -> int:
 
     os.chdir(git("rev-parse", "--show-toplevel"))
     if not os.path.exists(HISTORY):
-        print("changelog: HISTORY.rst not found; skipping.", file=sys.stderr)
+        print("changelog: HISTORY.md not found; skipping.", file=sys.stderr)
         return 0
 
     latest = latest_release_tag()
@@ -226,7 +226,7 @@ def main(argv: list[str]) -> int:
 
     if insert_entry(version, body):
         git("add", HISTORY)
-        print(f"changelog: added HISTORY.rst entry for {version}.",
+        print(f"changelog: added HISTORY.md entry for {version}.",
               file=sys.stderr)
     return 0
 

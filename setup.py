@@ -38,7 +38,7 @@ setup(
     long_description=(readme + "\n\n" + history),
     author="P",
     author_email="ptweezy@runforyour.money",
-    url="https://github.com/gjcarneiro/yacron",
+    url="https://github.com/ptweezy/yacron2",
     packages=find_packages(include=["yacron"]),
     include_package_data=True,
     install_requires=requirements,

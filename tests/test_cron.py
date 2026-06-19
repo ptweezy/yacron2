@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 import pytz
 
-import yacron.cron
-from yacron.config import JobConfig
-from yacron.job import RunningJob
+import yacron2.cron
+from yacron2.config import JobConfig
+from yacron2.job import RunningJob
 
 
 @pytest.fixture(autouse=True)
@@ -26,13 +26,13 @@ def fixed_current_time(monkeypatch):
                 now = now.astimezone(timezone)
         return now
 
-    monkeypatch.setattr("yacron.cron.get_now", get_now)
+    monkeypatch.setattr("yacron2.cron.get_now", get_now)
 
 
 @pytest.fixture()
 def tracing_running_job(monkeypatch):
     TracingRunningJob._TRACE = asyncio.Queue()
-    monkeypatch.setattr(yacron.cron, "RunningJob", TracingRunningJob)
+    monkeypatch.setattr(yacron2.cron, "RunningJob", TracingRunningJob)
     yield TracingRunningJob
     TracingRunningJob._TRACE = asyncio.Queue()
 
@@ -115,7 +115,7 @@ jobs:
 )
 @pytest.mark.asyncio
 async def test_simple(tracing_running_job, config_yaml, expected_events):
-    cron = yacron.cron.Cron(None, config_yaml=config_yaml)
+    cron = yacron2.cron.Cron(None, config_yaml=config_yaml)
 
     events = []
 
@@ -155,7 +155,7 @@ jobs:
 
 @pytest.mark.asyncio
 async def test_fail_retry(tracing_running_job):
-    cron = yacron.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS)
+    cron = yacron2.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS)
 
     events = []
 
@@ -221,7 +221,7 @@ jobs:
 
 @pytest.mark.asyncio
 async def test_execution_timeout(tracing_running_job):
-    cron = yacron.cron.Cron(None, config_yaml=JOB_THAT_HANGS)
+    cron = yacron2.cron.Cron(None, config_yaml=JOB_THAT_HANGS)
 
     events = []
     jobs_stdout = {}
@@ -310,9 +310,9 @@ async def test_concurrency_policy(
                 now = now.astimezone(timezone)
         return now
 
-    monkeypatch.setattr("yacron.cron.get_now", get_now)
+    monkeypatch.setattr("yacron2.cron.get_now", get_now)
 
-    cron = yacron.cron.Cron(
+    cron = yacron2.cron.Cron(
         None, config_yaml=CONCURRENT_JOB.format(policy=policy)
     )
 
@@ -360,7 +360,7 @@ async def test_concurrency_policy(
 
 def test_simple_config_file(tracing_running_job):
     config_arg = str(Path(__file__).parent / "testconfig.yaml")
-    yacron.cron.Cron(config_arg)
+    yacron2.cron.Cron(config_arg)
 
 
 RETRYING_JOB_THAT_FAILS2 = """
@@ -416,9 +416,9 @@ async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noq
     def get_reltime(ts):
         return START_TIME + datetime.timedelta(seconds=(ts - t0))
 
-    monkeypatch.setattr("yacron.cron.get_now", get_now)
+    monkeypatch.setattr("yacron2.cron.get_now", get_now)
 
-    cron = yacron.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS2)
+    cron = yacron2.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS2)
 
     events = []
     numjobs = 0
@@ -476,7 +476,7 @@ async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noq
     ],
 )
 def test_naturaltime(value_in, out):
-    got_out = yacron.cron.naturaltime(value_in, future=True)
+    got_out = yacron2.cron.naturaltime(value_in, future=True)
     assert got_out == out
 
 
@@ -484,26 +484,26 @@ def test_naturaltime(value_in, out):
 async def test_schedule_retry_job_disappeared():
     # a job removed from config while a retry is pending must not raise
     # UnboundLocalError; the retry is simply skipped.
-    cron = yacron.cron.Cron(None)
+    cron = yacron2.cron.Cron(None)
     await cron.schedule_retry_job("nonexistent", 0.0, 0)
     assert "nonexistent" not in cron.retry_state
 
 
 def test_resolve_web_token_value():
-    token = yacron.cron.Cron._resolve_web_token(
+    token = yacron2.cron.Cron._resolve_web_token(
         {"authToken": {"value": "secret", "fromFile": None, "fromEnvVar": None}}
     )
     assert token == "secret"
 
 
 def test_resolve_web_token_envvar(monkeypatch):
-    monkeypatch.setenv("YACRON_TEST_WEB_TOKEN", "envsecret")
-    token = yacron.cron.Cron._resolve_web_token(
+    monkeypatch.setenv("YACRON2_TEST_WEB_TOKEN", "envsecret")
+    token = yacron2.cron.Cron._resolve_web_token(
         {
             "authToken": {
                 "value": None,
                 "fromFile": None,
-                "fromEnvVar": "YACRON_TEST_WEB_TOKEN",
+                "fromEnvVar": "YACRON2_TEST_WEB_TOKEN",
             }
         }
     )
@@ -511,14 +511,14 @@ def test_resolve_web_token_envvar(monkeypatch):
 
 
 def test_resolve_web_token_absent():
-    assert yacron.cron.Cron._resolve_web_token({"listen": []}) is None
+    assert yacron2.cron.Cron._resolve_web_token({"listen": []}) is None
 
 
 @pytest.mark.asyncio
 async def test_auth_middleware():
     from aiohttp import web
 
-    middleware = yacron.cron.Cron._make_auth_middleware("secret")
+    middleware = yacron2.cron.Cron._make_auth_middleware("secret")
 
     async def handler(request):
         return web.Response(text="ok")
@@ -666,7 +666,7 @@ def test_job_should_run(
         print("now: ", retval)
         return retval
 
-    monkeypatch.setattr("yacron.cron.get_now", get_now)
+    monkeypatch.setattr("yacron2.cron.get_now", get_now)
 
     config_yaml = f"""
 jobs:
@@ -679,6 +679,6 @@ jobs:
     {enabled}
                             """
     print(config_yaml)
-    cron = yacron.cron.Cron(None, config_yaml=config_yaml)
+    cron = yacron2.cron.Cron(None, config_yaml=config_yaml)
     job = list(cron.cron_jobs.values())[0]
     assert cron.job_should_run(startup, job) == result

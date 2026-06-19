@@ -2,6 +2,10 @@
 History
 =======
 
+yacron2 is a fork of `yacron <https://github.com/gjcarneiro/yacron>`_,
+continuing from yacron 0.19.  The entries below document the history of the
+original yacron project, on which yacron2 is based.
+
 0.19.0 (2023-03-11)
 -------------------
 

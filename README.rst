@@ -1,9 +1,14 @@
-================
-Yet Another Cron
-================
+=======
+yacron2 (Yet Another Cron 2)
+=======
 
 
-A modern Cron replacement that is Docker-friendly
+A modern, Docker-friendly Cron replacement.
+
+yacron2 is a fork of `yacron <https://github.com/gjcarneiro/yacron>`_ (by
+Gustavo Carneiro), continuing development from version 0.19.  Except where
+noted, the documentation below describes behaviour inherited from the original
+yacron; "since version X.Y" notes refer to that shared version history.
 
 
 * Free software: MIT license
@@ -38,14 +43,14 @@ Installation
 Install using pip
 +++++++++++++++++
 
-yacron requires Python >= 3.6 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
+yacron2 requires Python >= 3.6 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
 virtual environment, for example:
 
 .. code-block:: shell
 
-    python3 -m venv yacronenv
-    . yacronenv/bin/activate
-    pip install yacron
+    python3 -m venv yacron2env
+    . yacron2env/bin/activate
+    pip install yacron2
 
 Install using pipx
 ++++++++++++++++++
@@ -55,7 +60,7 @@ newly created virtualenv.  It is as simple as:
 
 .. code-block:: shell
 
-    pipx install yacron
+    pipx install yacron2
 
 .. _pipx: https://github.com/pipxproject/pipx
 
@@ -63,18 +68,18 @@ Install using binary
 ++++++++++++++++++++
 
 Alternatively, a self-contained binary can be downloaded
-from github: https://github.com/gjcarneiro/yacron/releases. This binary should
+from github: https://github.com/ptweezy/yacron2/releases. This binary should
 work on any Linux 64-bit system post glibc 2.23 (e.g. Ubuntu:16.04).  Python is not required on the target system (it is embedded in the executable).
 
 Usage
 -----
 
-Configuration is in YAML format.  To start yacron, give it a configuration file
+Configuration is in YAML format.  To start yacron2, give it a configuration file
 or directory path as the ``-c`` argument.  For example::
 
-    yacron -c /tmp/my-crontab.yaml
+    yacron2 -c /tmp/my-crontab.yaml
 
-This starts yacron (always in the foreground!), reading
+This starts yacron2 (always in the foreground!), reading
 ``/tmp/my-crontab.yaml`` as configuration file.  If the path is a directory,
 any ``*.yaml`` or ``*.yml`` files inside this directory are taken as
 configuration files.
@@ -93,7 +98,7 @@ This configuration runs a command every 5 minutes:
         schedule: "*/5 * * * *"
 
 The command can be a string or a list of strings.  If command is a string,
-yacron runs it through a shell, which is ``/bin/bash`` in the above example, but
+yacron2 runs it through a shell, which is ``/bin/bash`` in the above example, but
 is ``/bin/sh`` by default.
 
 If the command is a list of strings, the command is executed directly, without a
@@ -110,8 +115,8 @@ configuration:
         schedule: "*/5 * * * *"
 
 
-The `schedule` option can be a string in a crontab format specified by https://github.com/josiahcarlson/parse-crontab (this module is used by yacron).
-Additionally @reboot can be included , which will only run the job when yacron is initially
+The `schedule` option can be a string in a crontab format specified by https://github.com/josiahcarlson/parse-crontab (this module is used by yacron2).
+Additionally @reboot can be included , which will only run the job when yacron2 is initially
 executed. Further `schedule` can be an object with properties.  The following configuration
 runs a command every 5 minutes, but only on the specific date 2017-07-19, and
 doesn't run it in any other date:
@@ -141,7 +146,7 @@ every day at 19h27 *local time* because of the ``utc: false`` option:
       utc: false
       captureStdout: true
 
-Since Yacron version 0.11, you can also request that the schedule be
+Since Yacron2 version 0.11, you can also request that the schedule be
 interpreted in an arbitrary timezone, using the ``timezone`` attribute:
 
 .. code-block:: yaml
@@ -213,7 +218,7 @@ Note: if the configuration option is a directory and there are multiple configur
 Reporting
 +++++++++
 
-Yacron has builtin support for reporting jobs failure (more on that below) by
+Yacron2 has builtin support for reporting jobs failure (more on that below) by
 email, Sentry and shell command (additional reporting methods might be added in the future):
 
 .. code-block:: yaml
@@ -234,8 +239,8 @@ email, Sentry and shell command (additional reporting methods might be added in 
             # Alternatively:
             # fromFile: /etc/secrets/my-secret-dsn
             # fromEnvVar: SENTRY_DSN
-          fingerprint:  # optional, since yacron 0.6
-            - yacron
+          fingerprint:  # optional, since yacron2 0.6
+            - yacron2
             - "{{ environment.HOSTNAME }}"
             - "{{ name }}"
           extra:
@@ -264,12 +269,12 @@ Here, the ``onFailure`` object indicates that what to do when a job failure
 is detected.  In this case we ask for it to be reported both to sentry and by
 sending an email.
 
-The ``captureStderr: true`` part instructs yacron to capture output from the the
+The ``captureStderr: true`` part instructs yacron2 to capture output from the the
 program's `standard error`, so that it can be included in the report.  We could
 also turn on `standard output` capturing via the ``captureStdout: true`` option.
-By default, yacron captures only standard error.  If a cron job's standard error
+By default, yacron2 captures only standard error.  If a cron job's standard error
 or standard output capturing is not enabled, these streams will simply write to
-the same standard output and standard error as yacron itself.
+the same standard output and standard error as yacron2 itself.
 
 Both `stdout` and `stderr` stream lines are by default prefixed with
 ``[{job_name} {stream_name}]``, i.e. ``[test-01 stdout]``, if for any reason you
@@ -314,7 +319,7 @@ It is possible also to report job success, as well as failure, via the
           to: example@bar.com
           smtpHost: 127.0.0.1
 
-Since yacron 0.5, it is possible to customise the format of the report. For
+Since yacron2 0.5, it is possible to customise the format of the report. For
 ``mail`` reporting, the option ``subject`` indicates what is the subject of the
 email, while ``body`` formats the email body.  For Sentry reporting, there is
 only ``body``.  In all cases, the values of those options are strings that are
@@ -356,19 +361,19 @@ Example:
             (exit code: {{exit_code}})
 
 
-The shell reporter (since yacron 0.13) executes a user given shell command in
+The shell reporter (since yacron2 0.13) executes a user given shell command in
 the specified shell. It passes all environment variables from the python
 executable and specifies some additional ones to inform about the state of the
 job:
 
-* YACRON_FAIL_REASON (str)
-* YACRON_FAILED ("1" or "0")
-* YACRON_JOB_NAME (str)
-* YACRON_JOB_COMMAND (str)
-* YACRON_JOB_SCHEDULE (str)
-* YACRON_RETCODE (str)
-* YACRON_STDERR (str)
-* YACRON_STDOUT (str)
+* YACRON2_FAIL_REASON (str)
+* YACRON2_FAILED ("1" or "0")
+* YACRON2_JOB_NAME (str)
+* YACRON2_JOB_COMMAND (str)
+* YACRON2_JOB_SCHEDULE (str)
+* YACRON2_RETCODE (str)
+* YACRON2_STDERR (str)
+* YACRON2_STDOUT (str)
 
 A simple example configuration:
 
@@ -382,9 +387,9 @@ A simple example configuration:
       report:
         shell:
           shell: /bin/bash
-          command: echo "Error code $YACRON_RETCODE"
+          command: echo "Error code $YACRON2_RETCODE"
 
-Since yacron 0.15, it is possible to send emails formatted as html, by  adding
+Since yacron2 0.15, it is possible to send emails formatted as html, by  adding
 the ``html: true`` property.  For example, here the standard output of a shell
 command is captured and interpreted as html and placed in the email message\:
 
@@ -408,7 +413,7 @@ command is captured and interpreted as html and placed in the email message\:
 Metrics
 +++++++++
 
-Yacron has builtin support for writing job metrics to Statsd_:
+Yacron2 has builtin support for writing job metrics to Statsd_:
 
 .. _Statsd: https://github.com/etsy/statsd
 
@@ -423,7 +428,7 @@ Yacron has builtin support for writing job metrics to Statsd_:
           port: 8125
           prefix: my.cron.jobs.prefix.test01
 
-With this config Yacron will write the following metrics over UDP
+With this config Yacron2 will write the following metrics over UDP
 to the Statsd listening on ``my-statsd.example.com:8125``:
 
 .. code-block::
@@ -437,11 +442,11 @@ to the Statsd listening on ``my-statsd.example.com:8125``:
 Handling failure
 ++++++++++++++++
 
-By default, yacron considers that a job has `failed` if either the process
+By default, yacron2 considers that a job has `failed` if either the process
 returns a non-zero code or if it generates output to `standard error` (and
 standard error capturing is enabled, of course).
 
-You can instruct yacron how to determine if a job has failed or not via the
+You can instruct yacron2 how to determine if a job has failed or not via the
 ``failsWhen`` option:
 
 .. code-block:: yaml
@@ -453,22 +458,22 @@ You can instruct yacron how to determine if a job has failed or not via the
     always: false
 
 producesStdout
-    If true, any captured standard output causes yacron to consider the job
+    If true, any captured standard output causes yacron2 to consider the job
     as failed.  This is false by default.
 
 producesStderr
-    If true, any captured standard error causes yacron to consider the job
+    If true, any captured standard error causes yacron2 to consider the job
     as failed.  This is true by default.
 
 nonzeroReturn
-    If true, if the job process returns a code other than zero causes yacron
+    If true, if the job process returns a code other than zero causes yacron2
     to consider the job as failed.  This is true by default.
 
 always
-    If true, if the job process exits that causes yacron to consider the job as
+    If true, if the job process exits that causes yacron2 to consider the job as
     failed.  This is false by default.
 
-It is possible to instruct yacron to retry failing cron jobs by adding a
+It is possible to instruct yacron2 to retry failing cron jobs by adding a
 ``retry`` option inside ``onFailure``:
 
 .. code-block:: yaml
@@ -493,10 +498,10 @@ It is possible to instruct yacron to retry failing cron jobs by adding a
         maximumDelay: 30
         backoffMultiplier: 2
 
-The above settings tell yacron to retry the job up to 10 times, with the delay
+The above settings tell yacron2 to retry the job up to 10 times, with the delay
 between retries defined by an exponential backoff process: initially 1 second,
 doubling for every retry up to a maximum of 30 seconds. A value of -1 for
-maximumRetries will mean yacron will keep retrying forever, this is mostly
+maximumRetries will mean yacron2 will keep retrying forever, this is mostly
 useful with a schedule of "@reboot" to restart a long running process when it
 has failed.
 
@@ -529,7 +534,7 @@ For that situation, you can use the ``onPermanentFailure`` option:
 
 Concurrency
 +++++++++++
-Sometimes it may happen that a cron job takes so long to execute that when the moment its next scheduled execution is reached a previous instance may still be running.  How yacron handles this situation is controlled by the option ``concurrencyPolicy``, which takes one of the following values:
+Sometimes it may happen that a cron job takes so long to execute that when the moment its next scheduled execution is reached a previous instance may still be running.  How yacron2 handles this situation is controlled by the option ``concurrencyPolicy``, which takes one of the following values:
 
 Allow
     allows concurrently running jobs (default)
@@ -543,10 +548,10 @@ Execution timeout
 
 (new in version 0.4)
 
-If you have a cron job that may possibly hang sometimes, you can instruct yacron
+If you have a cron job that may possibly hang sometimes, you can instruct yacron2
 to terminate the process after N seconds if it's still running by then, via the
 ``executionTimeout`` option.  For example, the following cron job takes 2
-seconds to complete, yacron will terminate it after 1 second:
+seconds to complete, yacron2 will terminate it after 1 second:
 
 .. code-block:: yaml
 
@@ -566,13 +571,13 @@ you tell it to shutdown, the process may need a few seconds to flush buffers and
 avoid losing data.
 
 On the other hand, there are times when programs are buggy and simply get stuck,
-refusing to terminate nicely no matter what.  For this reason, yacron always
+refusing to terminate nicely no matter what.  For this reason, yacron2 always
 checks if a process exited some time after being asked to do so. If it hasn't,
 it tries to forcefully kill the process.  The option ``killTimeout`` option
 indicates how many seconds to wait for the process to gracefully terminate
 before killing it more forcefully.  In Unix systems, we first send a SIGTERM,
 but if the process doesn't exit after ``killTimeout`` seconds (30 by default)
-then we send SIGKILL.  For example, this cron job ignores SIGTERM, and so yacron
+then we send SIGKILL.  For example, this cron job ignores SIGTERM, and so yacron2
 will send it a SIGKILL after half a second:
 
 .. code-block:: yaml
@@ -594,7 +599,7 @@ Change to another user/group
 
 (new in version 0.11)
 
-You can request that Yacron change to another user and/or group for a specific
+You can request that Yacron2 change to another user and/or group for a specific
 cron job.  The field ``user`` indicates the user (uid or userame) under which
 the subprocess must be executed.  The field ``group`` (gid or group name)
 indicates the group id.  If only ``user`` is given, the group defaults to the
@@ -609,7 +614,7 @@ main group of that user.  Example:
     captureStderr: true
     user: www-data
 
-Naturally, yacron must be running as root in order to have permissions to
+Naturally, yacron2 must be running as root in order to have permissions to
 change to another user.
 
 
@@ -618,7 +623,7 @@ Remote web/HTTP interface
 
 (new in version 0.10)
 
-If you wish to remotely control yacron, you can optionally enable an HTTP REST
+If you wish to remotely control yacron2, you can optionally enable an HTTP REST
 interface, with the following configuration (example):
 
 .. code-block:: yaml
@@ -626,11 +631,11 @@ interface, with the following configuration (example):
   web:
     listen:
        - http://127.0.0.1:8080
-       - unix:///tmp/yacron.sock
+       - unix:///tmp/yacron2.sock
 
 Now you have the following options to control it (using HTTPie as example):
 
-Get the version of yacron:
+Get the version of yacron2:
 ##########################
 
 .. code-block:: shell
@@ -778,7 +783,7 @@ Obscure configuration options
 enabled: true|false (default true)
 ##################################
 
-(new in yacron 0.18)
+(new in yacron2 0.18)
 
 It is possible to disable a specific cron job by adding a `enabled: false` option.  Jobs
 with `enabled: false` will simply be skipped, as if they aren't there, apart from

@@ -18,10 +18,10 @@ import jinja2
 import sentry_sdk
 import sentry_sdk.utils
 
-from yacron.config import JobConfig
-from yacron.statsd import StatsdJobMetricWriter
+from yacron2.config import JobConfig
+from yacron2.statsd import StatsdJobMetricWriter
 
-logger = logging.getLogger("yacron")
+logger = logging.getLogger("yacron2")
 
 
 @lru_cache(maxsize=None)
@@ -306,24 +306,24 @@ class ShellReporter(Reporter):
 
         env = {
             **os.environ,
-            "YACRON_FAIL_REASON": (
+            "YACRON2_FAIL_REASON": (
                 job.fail_reason if job.fail_reason is not None else ""
             ),
-            "YACRON_JOB_NAME": job.config.name,
-            "YACRON_JOB_COMMAND": (
+            "YACRON2_JOB_NAME": job.config.name,
+            "YACRON2_JOB_COMMAND": (
                 job.config.command
                 if not isinstance(job.config.command, list)
                 else " ".join(job.config.command)
             ),
-            "YACRON_JOB_SCHEDULE": job.config.schedule_unparsed,
-            "YACRON_FAILED": "1" if job.failed else "0",
-            "YACRON_RETCODE": str(job.retcode),
-            "YACRON_STDERR": std_err_str_safe,
-            "YACRON_STDOUT": std_out_str_safe,
-            "YACRON_STDERR_TRUNCATED": (
+            "YACRON2_JOB_SCHEDULE": job.config.schedule_unparsed,
+            "YACRON2_FAILED": "1" if job.failed else "0",
+            "YACRON2_RETCODE": str(job.retcode),
+            "YACRON2_STDERR": std_err_str_safe,
+            "YACRON2_STDOUT": std_out_str_safe,
+            "YACRON2_STDERR_TRUNCATED": (
                 "1" if len(std_err_str_safe) != len(std_err_str) else "0"
             ),
-            "YACRON_STDOUT_TRUNCATED": (
+            "YACRON2_STDOUT_TRUNCATED": (
                 "1" if len(std_out_str_safe) != len(std_out_str) else "0"
             ),
         }

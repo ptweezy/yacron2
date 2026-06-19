@@ -3,9 +3,9 @@ FROM ubuntu:xenial
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
 	python3 virtualenv
 
-RUN virtualenv -p /usr/bin/python3 /yacron && \
-	/yacron/bin/pip install yacron
+RUN virtualenv -p /usr/bin/python3 /yacron2 && \
+	/yacron2/bin/pip install yacron2
 
-COPY yacrontab.yaml /etc/yacron.d/yacrontab.yaml
+COPY yacron2tab.yaml /etc/yacron2.d/yacron2tab.yaml
 
-ENTRYPOINT ["/yacron/bin/yacron"]
+ENTRYPOINT ["/yacron2/bin/yacron2"]

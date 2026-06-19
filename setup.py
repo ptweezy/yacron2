@@ -33,18 +33,18 @@ with open("HISTORY.rst") as history_file:
     history = history_file.read()
 
 setup(
-    name="yacron",
+    name="yacron2",
     description="A modern, rootless-container-friendly cron replacement.",
     long_description=(readme + "\n\n" + history),
     author="P",
     author_email="ptweezy@runforyour.money",
     url="https://github.com/ptweezy/yacron2",
-    packages=find_packages(include=["yacron"]),
+    packages=find_packages(include=["yacron2"]),
     include_package_data=True,
     install_requires=requirements,
     license="MIT license",
     zip_safe=True,
-    keywords="yacron",
+    keywords="yacron2",
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
@@ -60,8 +60,8 @@ setup(
     setup_requires=setup_requirements,
     tests_require=test_requirements,
     use_scm_version={
-        "write_to": "yacron/version.py",
+        "write_to": "yacron2/version.py",
     },
-    entry_points={"console_scripts": ["yacron = yacron.__main__:main"]},
+    entry_points={"console_scripts": ["yacron2 = yacron2.__main__:main"]},
     python_requires=">=3.10",
 )

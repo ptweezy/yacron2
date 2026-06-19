@@ -33,7 +33,7 @@ from strictyaml import (
 from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
-logger = logging.getLogger("yacron.config")
+logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
 JobDefaults = NewType("JobDefaults", Dict[str, Any])
 LoggingConfig = NewType("LoggingConfig", Dict[str, Any])
@@ -71,7 +71,7 @@ _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
         "body": DEFAULT_SUBJECT_TEMPLATE + "\n" + DEFAULT_BODY_TEMPLATE,
-        "fingerprint": ["yacron", "{{ environment.HOSTNAME }}", "{{ name }}"],
+        "fingerprint": ["yacron2", "{{ environment.HOSTNAME }}", "{{ name }}"],
         "environment": None,
         "maxStringLength": 8192,
     },
@@ -403,7 +403,7 @@ class JobConfig:
                 self.uid = user
                 # Derive the primary gid (and login name) from the passwd
                 # database so a numeric ``user`` without an explicit ``group``
-                # does not silently keep yacron's (root) gid 0.
+                # does not silently keep yacron2's (root) gid 0.
                 try:
                     pw = getpwuid(user)
                 except KeyError:
@@ -439,7 +439,7 @@ class JobConfig:
             if os.geteuid() != 0:
                 raise ConfigError(
                     "Job {} wants to change user or group, "
-                    "but yacron is not running as superuser".format(self.name)
+                    "but yacron2 is not running as superuser".format(self.name)
                 )
 
         self._validate_numeric_ranges()
@@ -516,14 +516,14 @@ def parse_environment_file(path: str) -> Dict[str, str]:
 
 
 @dataclass
-class YacronConfig:
+class Yacron2Config:
     jobs: List[JobConfig]
     web_config: Optional[WebConfig]
     job_defaults: JobDefaults
     logging_config: Optional[LoggingConfig]
 
 
-def parse_config_string(data: str, path: str) -> YacronConfig:
+def parse_config_string(data: str, path: str) -> Yacron2Config:
     try:
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
     except YAMLError as ex:
@@ -553,7 +553,7 @@ def parse_config_string(data: str, path: str) -> YacronConfig:
     for config_job in doc.get("jobs", []):
         job_dict = dict(mergedicts(defaults, config_job))
         jobs.append(JobConfig(job_dict))
-    return YacronConfig(
+    return Yacron2Config(
         jobs=jobs,
         web_config=webconf,
         job_defaults=JobDefaults(defaults),
@@ -563,13 +563,13 @@ def parse_config_string(data: str, path: str) -> YacronConfig:
 
 def parse_config_file(
     path: str,
-) -> YacronConfig:
+) -> Yacron2Config:
     with open(path, "rt", encoding="utf-8") as stream:
         data = stream.read()
     return parse_config_string(data, path)
 
 
-def parse_config(config_arg: str) -> YacronConfig:
+def parse_config(config_arg: str) -> Yacron2Config:
     if os.path.isdir(config_arg):
         return _parse_config_dir(config_arg)
     try:
@@ -580,7 +580,7 @@ def parse_config(config_arg: str) -> YacronConfig:
         raise ConfigError(str(ex)) from ex
 
 
-def _parse_config_dir(config_arg: str) -> YacronConfig:
+def _parse_config_dir(config_arg: str) -> Yacron2Config:
     jobs: List[JobConfig] = []
     config_errors: Dict[str, str] = {}
     web_config: Optional[WebConfig] = None
@@ -633,7 +633,7 @@ def _parse_config_dir(config_arg: str) -> YacronConfig:
     # Build the result from the accumulated values (never the last file's
     # config), and return an empty config for an empty/all-skipped directory
     # instead of raising UnboundLocalError.
-    return YacronConfig(
+    return Yacron2Config(
         jobs=jobs,
         web_config=web_config,
         job_defaults=job_defaults,

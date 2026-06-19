@@ -12,20 +12,20 @@ from urllib.parse import urlparse
 from aiohttp import web
 from crontab import CronTab  # noqa
 
-import yacron.version
-from yacron.config import (
+import yacron2.version
+from yacron2.config import (
     ConfigError,
     JobConfig,
     JobDefaults,
     LoggingConfig,
     WebConfig,
-    YacronConfig,
+    Yacron2Config,
     parse_config,
     parse_config_string,
 )
-from yacron.job import JobRetryState, RunningJob
+from yacron2.job import JobRetryState, RunningJob
 
-logger = logging.getLogger("yacron")
+logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
 
 
@@ -164,9 +164,9 @@ class Cron:
         logger.debug("Signalling shutdown")
         self._stop_event.set()
 
-    def update_config(self) -> YacronConfig:
+    def update_config(self) -> Yacron2Config:
         if self.config_arg is None:
-            return YacronConfig(
+            return Yacron2Config(
                 jobs=[],
                 web_config=None,
                 job_defaults=JobDefaults({}),
@@ -179,7 +179,7 @@ class Cron:
     async def _web_get_version(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         return web.Response(
-            text=yacron.version.version,
+            text=yacron2.version.version,
             headers=self.web_config.get("headers", None),
         )
 

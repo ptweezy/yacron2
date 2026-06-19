@@ -2,8 +2,8 @@ import os
 
 import pytest
 
-from yacron import config
-from yacron.config import ConfigError
+from yacron2 import config
+from yacron2.config import ConfigError
 
 
 def test_mergedicts():

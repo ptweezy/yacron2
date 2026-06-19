@@ -9,17 +9,20 @@ yacron; "since version X.Y" notes refer to that shared version history.
 
 ## Features
 
-* "Crontab" is in YAML format;
-* Builtin sending of Sentry and Mail outputs when cron jobs fail;
-* Flexible configuration: you decide how to determine if a cron job fails or not;
+* "Crontab" is in YAML format
+* Builtin sending of Sentry and Mail outputs when cron jobs fail
+* Flexible configuration: you decide how to determine if a cron job fails or not
 * Designed for running in Docker, Kubernetes, or 12 factor environments:
-  * Runs in the foreground;
-  * Logs everything to stdout/stderr [^1];
-* Option to automatically retry failing cron jobs, with exponential backoff;
-* Optional HTTP REST API, to fetch status and start jobs on demand;
-* Arbitrary timezone support;
-
-[^1]: Whereas vixie cron only logs to syslog, requiring a syslog daemon to be running in the background or else you don't get logs!
+  * Runs in the foreground
+  * Logs everything to stdout/stderr
+  * Production-ready for locked-down corporate container platforms: runs as a
+    non-root user, under a restricted seccomp profile, with a read-only root
+    filesystem, an `fsGroup`-mounted config, and all Linux capabilities
+    dropped — no writable paths or elevated privileges required (see
+    [Production container deployment](#production-container-deployment))
+* Option to automatically retry failing cron jobs, with exponential backoff
+* Optional HTTP REST API, to fetch status and start jobs on demand
+* Arbitrary timezone support
 
 ## Installation
 
@@ -48,6 +51,98 @@ pipx install yacron2
 Alternatively, a self-contained binary can be downloaded
 from github: https://github.com/ptweezy/yacron2/releases. This binary should
 work on any Linux 64-bit system post glibc 2.39 (e.g. Ubuntu:24.04).  Python is not required on the target system (it is embedded in the executable).
+
+## Production container deployment
+
+yacron2 is built to run unmodified under the hardened security contexts that
+corporate and enterprise Kubernetes / container platforms enforce.  At runtime
+the daemon only *reads* its configuration and secrets and writes its output to
+stdout/stderr — it never needs a writable working directory, temp files, or log
+files — so it slots cleanly into a locked-down pod:
+
+* **Non-root user** — yacron2 needs no special privileges to run, so the whole
+  daemon can run as an unprivileged UID.  Only the optional per-job
+  `user`/`group` switching (see [Change to another
+  user/group](#change-to-another-usergroup)) requires running as root; if you
+  don't use that feature, drop root entirely.
+* **Seccomp profile** — yacron2 makes no exotic syscalls, so the
+  `RuntimeDefault` seccomp profile (or an equivalently strict custom profile)
+  works out of the box.
+* **Read-only root filesystem** — no runtime writes are required.  Mount your
+  crontab config read-only.  (If you enable the optional [HTTP
+  interface](#remote-webhttp-interface) on a Unix socket, point the socket at a
+  small writable `emptyDir` volume rather than the root filesystem.)
+* **`fsGroup` and dropped capabilities** — config and secret volumes can be
+  mounted with an `fsGroup` so the non-root process can read them, and you can
+  drop *all* Linux capabilities and forbid privilege escalation.
+
+A hardened image simply adds a non-root `USER`:
+
+```dockerfile
+FROM python:3.14-slim
+
+RUN pip install --no-cache-dir yacron2
+
+COPY yacron2tab.yaml /etc/yacron2.d/yacron2tab.yaml
+
+# Run as an unprivileged, non-root user (65534 = "nobody")
+USER 65534:65534
+
+ENTRYPOINT ["yacron2"]
+CMD ["-c", "/etc/yacron2.d"]
+```
+
+And a corresponding Kubernetes `Deployment` with a fully restricted security
+context:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yacron2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: yacron2
+  template:
+    metadata:
+      labels:
+        app: yacron2
+    spec:
+      securityContext:           # pod-level
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534           # lets the non-root process read mounted volumes
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: yacron2
+          image: yacron2
+          args: ["-c", "/etc/yacron2.d"]
+          securityContext:       # container-level
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+          volumeMounts:
+            - name: crontab
+              mountPath: /etc/yacron2.d
+              readOnly: true
+      volumes:
+        - name: crontab
+          configMap:
+            name: yacron2tab
+```
 
 ## Usage
 

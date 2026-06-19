@@ -1,0 +1,142 @@
+name: release
+
+# Release pipeline (opt-in). It runs on a push to main ONLY when the commit
+# message contains [release], or on a manual workflow_dispatch.
+#   1. gate on lint + mypy + tests (no green, no release)
+#   2. compute the next version from the latest X.Y.Z tag
+#      - default bump is MINOR
+#      - override the level by also putting [major] / [minor] / [patch] in the
+#        commit message; manual runs use the workflow_dispatch dropdown
+#   3. build at that version (via SETUPTOOLS_SCM_PRETEND_VERSION) and publish to
+#      PyPI (Trusted Publishing / OIDC)
+#   4. only AFTER a successful publish, tag the commit and cut a GitHub Release
+#      (no file is committed back -> no infinite loop; a failed publish leaves no
+#      orphan tag, so a re-run cleanly retries the same version)
+#
+# Examples:
+#   git commit -m "Fix web auth bug [release]"           -> minor release
+#   git commit -m "Drop Python 3.12 support [release][major]"  -> major release
+#   git commit -m "Typo fix [release][patch]"            -> patch release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump level"
+        type: choice
+        options: [minor, major, patch]
+        default: minor
+
+# Serialize releases so two quick pushes can't race to compute the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    # Opt-in: only release when the commit asks for it, or on a manual run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[release]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history + tags so setuptools_scm resolves a version
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: |
+            3.13
+            3.14
+      - run: pip install --upgrade pip tox
+      - run: tox  # runs py313, py314, lint, mypy (see tox.ini)
+
+  release:
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the tag and create the GitHub Release
+      id-token: write   # PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history + tags for version computation
+
+      - name: Compute next version
+        id: ver
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          latest=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          latest=${latest:-0.0.0}
+
+          # Default bump is minor; a token in the commit message overrides it.
+          bump=minor
+          msg=$(git log -1 --pretty=%B)
+          case "$msg" in
+            *'[major]'*) bump=major ;;
+            *'[minor]'*) bump=minor ;;
+            *'[patch]'*) bump=patch ;;
+          esac
+          # A manual run's dropdown wins over everything.
+          if [ -n "${{ github.event.inputs.bump }}" ]; then
+            bump="${{ github.event.inputs.bump }}"
+          fi
+
+          IFS='.' read -r major minor patch <<<"$latest"
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new="${major}.${minor}.${patch}"
+
+          # Guard: refuse to reuse a version that already exists as a tag.
+          if git rev-parse -q --verify "refs/tags/$new" >/dev/null; then
+            echo "::error::Tag $new already exists; refusing to re-release." >&2
+            exit 1
+          fi
+
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump"     >> "$GITHUB_OUTPUT"
+          echo "new=$new"       >> "$GITHUB_OUTPUT"
+          echo "::notice::Releasing $new (previous $latest, bump=$bump)"
+
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Build distributions
+        env:
+          # Build the exact target version without needing the tag to exist yet,
+          # so we can tag only after PyPI accepts the upload.
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.ver.outputs.new }}
+        run: |
+          set -euo pipefail
+          pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*.whl dist/*.tar.gz
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      # Everything below runs only after PyPI has accepted the upload.
+      - name: Tag the release
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.ver.outputs.new }}" -m "Release ${{ steps.ver.outputs.new }}"
+          git push origin "refs/tags/${{ steps.ver.outputs.new }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.new }}
+          name: ${{ steps.ver.outputs.new }}
+          generate_release_notes: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz

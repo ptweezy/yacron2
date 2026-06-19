@@ -1,0 +1,65 @@
+[package]
+name = "yacron2"
+version = "1.0.4"
+edition = "2021"
+rust-version = "1.74"
+description = "A modern, rootless-container-friendly cron replacement (YAML crontab)."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/ptweezy/yacron2"
+keywords = ["cron", "scheduler", "yaml", "daemon", "docker"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "yacron2"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "signal",
+    "net",
+    "time",
+    "sync",
+    "io-util",
+    "io-std",
+    "fs",
+] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+minijinja = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "hostname",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-native-tls",
+] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+gethostname = "0.5"
+thiserror = "2"
+futures-util = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["user", "process", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

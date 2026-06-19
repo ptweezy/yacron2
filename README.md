@@ -1,67 +1,91 @@
 # yacron2 (Yet Another Cron 2)
 
-A modern, Docker-friendly Cron replacement.
+A modern, rootless-container-friendly cron replacement, written in Rust.
 
-yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by
-Gustavo Carneiro), continuing development from version 0.19.  Except where
-noted, the documentation below describes behaviour inherited from the original
-yacron; "since version X.Y" notes refer to that shared version history.
+yacron2 is a Rust reimplementation of [yacron](https://github.com/gjcarneiro/yacron)
+(by Gustavo Carneiro). The YAML configuration format is unchanged, so existing
+crontabs keep working; this rewrite trades the Python runtime for a single,
+dependency-free static-ish binary that starts instantly and is trivial to ship
+in a scratch/slim container. Documentation that refers to "since version X.Y"
+describes behaviour inherited from the original yacron's version history.
 
 ## Features
 
 * "Crontab" is in YAML format;
-* Builtin sending of Sentry and Mail outputs when cron jobs fail;
+* Builtin sending of e-mail and shell-command reports when cron jobs fail
+  (Sentry config is accepted but reporting is not yet implemented — see
+  [Differences from the Python version](#differences-from-the-python-version));
 * Flexible configuration: you decide how to determine if a cron job fails or not;
-* Designed for running in Docker, Kubernetes, or 12 factor environments:
+* Designed for running in Docker, Kubernetes, or 12-factor environments:
   * Runs in the foreground;
-  * Logs everything to stdout/stderr [^1];
+  * Logs everything to stdout/stderr;
 * Option to automatically retry failing cron jobs, with exponential backoff;
 * Optional HTTP REST API, to fetch status and start jobs on demand;
-* Arbitrary timezone support;
-
-[^1]: Whereas vixie cron only logs to syslog, requiring a syslog daemon to be running in the background or else you don't get logs!
+* Arbitrary timezone support (the IANA database is bundled into the binary, so
+  timezones resolve even on minimal images with no system tzdata);
+* A single native binary — no interpreter, no runtime dependencies to install.
 
 ## Installation
 
-### Install using pip
-
-yacron2 requires Python >= 3.13 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
-virtual environment, for example:
+### Run with Docker
 
 ```shell
-python3 -m venv yacron2env
-. yacron2env/bin/activate
-pip install yacron2
+docker build -t yacron2 .
+docker run --rm -v "$PWD/my-crontab.yaml:/etc/yacron2.d/crontab.yaml" yacron2
 ```
 
-### Install using pipx
+The image is built from `Dockerfile` (a Debian-slim runtime containing just the
+binary plus the OpenSSL/CA bundle needed for SMTP TLS). See
+[`example/docker/`](example/docker/) for a fuller example, including a
+Kubernetes deployment.
 
-[pipx](https://github.com/pipxproject/pipx) automates creating a virtualenv and installing a python program in the
-newly created virtualenv.  It is as simple as:
+### Prebuilt binary
+
+A self-contained binary can be downloaded from the GitHub releases page:
+https://github.com/ptweezy/yacron2/releases. No runtime is required on the
+target system.
+
+### Build from source
+
+yacron2 builds on Linux, macOS, Windows, and WSL with a stable Rust toolchain
+(1.74+). Install Rust from [rustup.rs](https://rustup.rs), then:
 
 ```shell
-pipx install yacron2
+# install into ~/.cargo/bin
+cargo install --path .
+
+# or just build a release binary at target/release/yacron2
+cargo build --release
 ```
 
-### Install using binary
-
-Alternatively, a self-contained binary can be downloaded
-from github: https://github.com/ptweezy/yacron2/releases. This binary should
-work on any Linux 64-bit system post glibc 2.39 (e.g. Ubuntu:24.04).  Python is not required on the target system (it is embedded in the executable).
+On Linux/WSL the e-mail reporter links against the system OpenSSL, so install
+the development headers first (`apt-get install pkg-config libssl-dev` on
+Debian/Ubuntu). On Windows the SChannel TLS backend is used, so no extra
+packages are needed.
 
 ## Usage
 
-Configuration is in YAML format.  To start yacron2, give it a configuration file
-or directory path as the `-c` argument.  For example:
+Configuration is in YAML format. To start yacron2, give it a configuration file
+or directory path as the `-c` argument. For example:
 
 ```
 yacron2 -c /tmp/my-crontab.yaml
 ```
 
 This starts yacron2 (always in the foreground!), reading
-`/tmp/my-crontab.yaml` as configuration file.  If the path is a directory,
+`/tmp/my-crontab.yaml` as configuration file. If the path is a directory,
 any `*.yaml` or `*.yml` files inside this directory are taken as
 configuration files.
+
+Useful flags:
+
+* `-c, --config FILE-OR-DIR` — configuration file or directory
+  (default `/etc/yacron2.d`);
+* `-l, --log-level LEVEL` — `DEBUG`, `INFO` (default), `WARNING`, or `ERROR`.
+  The `RUST_LOG` environment variable, if set, overrides this and accepts the
+  full [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html);
+* `-v, --validate-config` — validate the configuration and exit;
+* `--version` — print the version and exit.
 
 ### Configuration basics
 
@@ -75,12 +99,12 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The command can be a string or a list of strings.  If command is a string,
+The command can be a string or a list of strings. If command is a string,
 yacron2 runs it through a shell, which is `/bin/bash` in the above example, but
 is `/bin/sh` by default.
 
 If the command is a list of strings, the command is executed directly, without a
-shell.  The ARGV of the command to execute is extracted directly from the
+shell. The ARGV of the command to execute is extracted directly from the
 configuration:
 
 ```yaml
@@ -92,11 +116,20 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The `schedule` option can be a string in a crontab format specified by https://github.com/josiahcarlson/parse-crontab (this module is used by yacron2).
-Additionally @reboot can be included , which will only run the job when yacron2 is initially
-executed. Further `schedule` can be an object with properties.  The following configuration
-runs a command every 5 minutes, but only on the specific date 2017-07-19, and
-doesn't run it in any other date:
+The `schedule` option can be a string in crontab format. The fields are
+`minute hour day-of-month month day-of-week`, with an optional 6th field for the
+`year`. Steps (`*/5`), ranges (`1-5`), lists (`1,3,5`), month/day names
+(`JAN`, `MON`), `L` (last day of month / last weekday), and the
+`@yearly`/`@monthly`/`@weekly`/`@daily`/`@hourly` aliases are all supported.
+`@reboot` is special-cased to run a job once, when yacron2 starts.
+
+> **Note on semantics:** like the `parse-crontab` library the Python version
+> used, day-of-month and day-of-week are combined with **AND** (a job with both
+> fields restricted runs only when *both* match) — this differs from Vixie
+> cron's "OR" rule. Sunday may be written as `0` or `7`.
+
+`schedule` can also be an object with named fields. The following runs a command
+every 5 minutes, but only on the specific date 2017-07-19:
 
 ```yaml
 jobs:
@@ -111,7 +144,7 @@ jobs:
 ```
 
 Important: by default all time is interpreted to be in UTC, but you can
-request to use local time instead.  For instance, the cron job below runs
+request to use local time instead. For instance, the cron job below runs
 every day at 19h27 *local time* because of the `utc: false` option:
 
 ```yaml
@@ -123,8 +156,8 @@ jobs:
     captureStdout: true
 ```
 
-Since Yacron2 version 0.11, you can also request that the schedule be
-interpreted in an arbitrary timezone, using the `timezone` attribute:
+You can also request that the schedule be interpreted in an arbitrary timezone,
+using the `timezone` attribute:
 
 ```yaml
 jobs:
@@ -165,7 +198,7 @@ Variables declared in the `environment` option will override those found in the 
 
 ### Specifying defaults
 
-There can be a special `defaults` section in the config.  Any attributes
+There can be a special `defaults` section in the config. Any attributes
 defined in this section provide default values for cron jobs to inherit.
 Although cron jobs can still override the defaults, as needed:
 
@@ -190,8 +223,8 @@ Note: if the configuration option is a directory and there are multiple configur
 
 ### Reporting
 
-Yacron2 has builtin support for reporting jobs failure (more on that below) by
-email, Sentry and shell command (additional reporting methods might be added in the future):
+yacron2 has builtin support for reporting job failure (more on that below) by
+e-mail and shell command:
 
 ```yaml
 - name: test-01
@@ -204,21 +237,6 @@ email, Sentry and shell command (additional reporting methods might be added in 
   captureStderr: true
   onFailure:
     report:
-      sentry:
-        dsn:
-          value: example
-          # Alternatively:
-          # fromFile: /etc/secrets/my-secret-dsn
-          # fromEnvVar: SENTRY_DSN
-        fingerprint:  # optional, since yacron2 0.6
-          - yacron2
-          - "{{ environment.HOSTNAME }}"
-          - "{{ name }}"
-        extra:
-          foo: bar
-          zbr: 123
-        level: warning
-        environment: production
       mail:
         from: example@foo.com
         to: example@bar.com
@@ -230,28 +248,25 @@ email, Sentry and shell command (additional reporting methods might be added in 
           # Alternatively:
           # fromFile: /etc/secrets/my-secret-password
           # fromEnvVar: MAIL_PASSWORD
-        tls: false  # set to true to enable TLS
+        tls: false  # set to true to enable implicit TLS
         starttls: false  # set to true to enable StartTLS
       shell:
         shell: /bin/bash
         command: ...
 ```
 
-Here, the `onFailure` object indicates that what to do when a job failure
-is detected.  In this case we ask for it to be reported both to sentry and by
-sending an email.
-
-The `captureStderr: true` part instructs yacron2 to capture output from the the
-program's *standard error*, so that it can be included in the report.  We could
-also turn on *standard output* capturing via the `captureStdout: true` option.
-By default, yacron2 captures only standard error.  If a cron job's standard error
-or standard output capturing is not enabled, these streams will simply write to
-the same standard output and standard error as yacron2 itself.
+Here, the `onFailure` object indicates what to do when a job failure is
+detected. The `captureStderr: true` part instructs yacron2 to capture output
+from the program's *standard error*, so that it can be included in the report.
+We could also turn on *standard output* capturing via the `captureStdout: true`
+option. By default, yacron2 captures only standard error. If a cron job's
+standard error or standard output capturing is not enabled, these streams will
+simply write to the same standard output and standard error as yacron2 itself.
 
 Both *stdout* and *stderr* stream lines are by default prefixed with
-`[{job_name} {stream_name}]`, i.e. `[test-01 stdout]`, if for any reason you
-need to change this, provide the option `streamPrefix` (new in version 0.16)
-with your own custom string.
+`[{job_name} {stream_name}]`, i.e. `[test-01 stdout]`. If for any reason you
+need to change this, provide the option `streamPrefix` with your own custom
+string:
 
 ```yaml
 - name: test-01
@@ -262,7 +277,7 @@ with your own custom string.
   streamPrefix: "[{job_name} job]"
 ```
 
-In some cases, for instance when you're logging JSON objects you might want to
+In some cases, for instance when you're logging JSON objects, you might want to
 completely get rid of the prefix altogether:
 
 ```yaml
@@ -291,12 +306,11 @@ It is possible also to report job success, as well as failure, via the
         smtpHost: 127.0.0.1
 ```
 
-Since yacron2 0.5, it is possible to customise the format of the report. For
-`mail` reporting, the option `subject` indicates what is the subject of the
-email, while `body` formats the email body.  For Sentry reporting, there is
-only `body`.  In all cases, the values of those options are strings that are
-processed by the [jinja2](http://jinja.pocoo.org/) templating engine.  The following variables are
-available in templating:
+It is possible to customise the format of the report. For `mail` reporting, the
+option `subject` indicates the subject of the email, while `body` formats the
+email body. The values of those options are strings that are processed by a
+Jinja2-compatible templating engine. The following variables are available in
+templating:
 
 * name(str): name of the cron job
 * success(bool): whether or not the cron job succeeded
@@ -330,10 +344,9 @@ Example:
           (exit code: {{exit_code}})
 ```
 
-The shell reporter (since yacron2 0.13) executes a user given shell command in
-the specified shell. It passes all environment variables from the python
-executable and specifies some additional ones to inform about the state of the
-job:
+The shell reporter executes a user-given shell command. It passes all of
+yacron2's environment variables to the child and adds some that describe the
+state of the job:
 
 * YACRON2_FAIL_REASON (str)
 * YACRON2_FAILED ("1" or "0")
@@ -343,6 +356,8 @@ job:
 * YACRON2_RETCODE (str)
 * YACRON2_STDERR (str)
 * YACRON2_STDOUT (str)
+* YACRON2_STDERR_TRUNCATED ("1" or "0")
+* YACRON2_STDOUT_TRUNCATED ("1" or "0")
 
 A simple example configuration:
 
@@ -358,9 +373,8 @@ A simple example configuration:
         command: echo "Error code $YACRON2_RETCODE"
 ```
 
-Since yacron2 0.15, it is possible to send emails formatted as html, by  adding
-the `html: true` property.  For example, here the standard output of a shell
-command is captured and interpreted as html and placed in the email message:
+It is possible to send e-mail formatted as HTML by adding the `html: true`
+property:
 
 ```yaml
 - name: test-01
@@ -380,7 +394,8 @@ command is captured and interpreted as html and placed in the email message:
 
 ### Metrics
 
-Yacron2 has builtin support for writing job metrics to [Statsd](https://github.com/etsy/statsd):
+yacron2 has builtin support for writing job metrics to
+[Statsd](https://github.com/etsy/statsd):
 
 ```yaml
 jobs:
@@ -393,7 +408,7 @@ jobs:
       prefix: my.cron.jobs.prefix.test01
 ```
 
-With this config Yacron2 will write the following metrics over UDP
+With this config yacron2 will write the following metrics over UDP
 to the Statsd listening on `my-statsd.example.com:8125`:
 
 ```
@@ -422,19 +437,19 @@ failsWhen:
 
 producesStdout
 : If true, any captured standard output causes yacron2 to consider the job
-as failed.  This is false by default.
+as failed. This is false by default.
 
 producesStderr
 : If true, any captured standard error causes yacron2 to consider the job
-as failed.  This is true by default.
+as failed. This is true by default.
 
 nonzeroReturn
 : If true, if the job process returns a code other than zero causes yacron2
-to consider the job as failed.  This is true by default.
+to consider the job as failed. This is true by default.
 
 always
 : If true, if the job process exits that causes yacron2 to consider the job as
-failed.  This is false by default.
+failed. This is false by default.
 
 It is possible to instruct yacron2 to retry failing cron jobs by adding a
 `retry` option inside `onFailure`:
@@ -497,7 +512,7 @@ For that situation, you can use the `onPermanentFailure` option:
 
 ### Concurrency
 
-Sometimes it may happen that a cron job takes so long to execute that when the moment its next scheduled execution is reached a previous instance may still be running.  How yacron2 handles this situation is controlled by the option `concurrencyPolicy`, which takes one of the following values:
+Sometimes it may happen that a cron job takes so long to execute that the moment its next scheduled execution is reached a previous instance may still be running. How yacron2 handles this situation is controlled by the option `concurrencyPolicy`, which takes one of the following values:
 
 Allow
 : allows concurrently running jobs (default)
@@ -510,11 +525,9 @@ Replace
 
 ### Execution timeout
 
-(new in version 0.4)
-
 If you have a cron job that may possibly hang sometimes, you can instruct yacron2
 to terminate the process after N seconds if it's still running by then, via the
-`executionTimeout` option.  For example, the following cron job takes 2
+`executionTimeout` option. For example, the following cron job takes 2
 seconds to complete, yacron2 will terminate it after 1 second:
 
 ```yaml
@@ -530,19 +543,10 @@ seconds to complete, yacron2 will terminate it after 1 second:
 ```
 
 When terminating a job, it is always a good idea to give that job process some
-time to terminate properly.  For example, it may have opened a file, and even if
-you tell it to shutdown, the process may need a few seconds to flush buffers and
-avoid losing data.
-
-On the other hand, there are times when programs are buggy and simply get stuck,
-refusing to terminate nicely no matter what.  For this reason, yacron2 always
-checks if a process exited some time after being asked to do so. If it hasn't,
-it tries to forcefully kill the process.  The option `killTimeout` option
-indicates how many seconds to wait for the process to gracefully terminate
-before killing it more forcefully.  In Unix systems, we first send a SIGTERM,
-but if the process doesn't exit after `killTimeout` seconds (30 by default)
-then we send SIGKILL.  For example, this cron job ignores SIGTERM, and so yacron2
-will send it a SIGKILL after half a second:
+time to terminate properly. The option `killTimeout` indicates how many seconds
+to wait for the process to gracefully terminate before killing it more
+forcefully. On Unix systems, we first send a SIGTERM, but if the process doesn't
+exit after `killTimeout` seconds (30 by default) then we send SIGKILL:
 
 ```yaml
 - name: test-03
@@ -560,13 +564,11 @@ will send it a SIGKILL after half a second:
 
 ### Change to another user/group
 
-(new in version 0.11)
-
-You can request that Yacron2 change to another user and/or group for a specific
-cron job.  The field `user` indicates the user (uid or userame) under which
-the subprocess must be executed.  The field `group` (gid or group name)
-indicates the group id.  If only `user` is given, the group defaults to the
-main group of that user.  Example:
+You can request that yacron2 change to another user and/or group for a specific
+cron job (Unix only). The field `user` indicates the user (uid or username)
+under which the subprocess must be executed. The field `group` (gid or group
+name) indicates the group id. If only `user` is given, the group defaults to the
+main group of that user. Example:
 
 ```yaml
 - name: test-03
@@ -582,8 +584,6 @@ change to another user.
 
 ### Remote web/HTTP interface
 
-(new in version 0.10)
-
 If you wish to remotely control yacron2, you can optionally enable an HTTP REST
 interface, with the following configuration (example):
 
@@ -594,100 +594,74 @@ web:
      - unix:///tmp/yacron2.sock
 ```
 
-Now you have the following options to control it (using HTTPie as example):
+You may optionally require bearer-token authentication and set custom response
+headers:
 
-#### Get the version of yacron2:
-
-```shell
-$ http get http://127.0.0.1:8080/version
-HTTP/1.1 200 OK
-Content-Length: 22
-Content-Type: text/plain; charset=utf-8
-Date: Sun, 03 Nov 2019 19:48:15 GMT
-Server: Python/3.7 aiohttp/3.6.2
-
-0.10.0b3.dev7+g45bc4ce
+```yaml
+web:
+  listen:
+    - http://127.0.0.1:8080
+  authToken:
+    value: my-secret-token
+    # Alternatively:
+    # fromFile: /etc/secrets/web-token
+    # fromEnvVar: YACRON2_WEB_TOKEN
+  headers:
+    x-custom-header: value
+  # octal permissions to apply to a unix:// socket
+  socketMode: "660"
 ```
 
-#### Get the status of cron jobs:
+If `authToken` is configured but resolves to an empty value, yacron2 refuses to
+start the web API (fail-closed), rather than serving it unauthenticated.
+
+The following endpoints are available:
+
+#### Get the version of yacron2
 
 ```shell
-$ http get http://127.0.0.1:8080/status
-HTTP/1.1 200 OK
-Content-Length: 104
-Content-Type: text/plain; charset=utf-8
-Date: Sun, 03 Nov 2019 19:44:45 GMT
-Server: Python/3.7 aiohttp/3.6.2
+$ curl http://127.0.0.1:8080/version
+1.0.4
+```
 
+#### Get the status of cron jobs
+
+```shell
+$ curl http://127.0.0.1:8080/status
 test-01: scheduled (in 14 seconds)
 test-02: scheduled (in 74 seconds)
-test-03: scheduled (in 14 seconds)
+test-03: running (pid: 12345)
 ```
 
-You may also get status info in json format:
+You may also get status info in JSON format:
 
 ```shell
-$ http get http://127.0.0.1:8080/status Accept:application/json
-HTTP/1.1 200 OK
-Content-Length: 206
-Content-Type: application/json; charset=utf-8
-Date: Sun, 03 Nov 2019 19:45:53 GMT
-Server: Python/3.7 aiohttp/3.6.2
-
+$ curl -H 'Accept: application/json' http://127.0.0.1:8080/status
 [
-    {
-        "job": "test-01",
-        "scheduled_in": 6.16588,
-        "status": "scheduled"
-    },
-    {
-        "job": "test-02",
-        "scheduled_in": 6.165787,
-        "status": "scheduled"
-    },
-    {
-        "job": "test-03",
-        "scheduled_in": 6.165757,
-        "status": "scheduled"
-    }
+  {"job": "test-01", "status": "scheduled", "scheduled_in": 6.16},
+  {"job": "test-02", "status": "scheduled", "scheduled_in": 66.16}
 ]
 ```
 
-#### Start a job right now:
-
-Sometimes it's useful to start a cron job right now, even if it's not
-scheduled to run yet, for example for testing:
+#### Start a job right now
 
 ```shell
-$ http post http://127.0.0.1:8080/jobs/test-02/start
-HTTP/1.1 200 OK
-Content-Length: 0
-Content-Type: application/octet-stream
-Date: Sun, 03 Nov 2019 19:50:20 GMT
-Server: Python/3.7 aiohttp/3.6.2
+$ curl -X POST http://127.0.0.1:8080/jobs/test-02/start
 ```
 
 ### Includes
 
-(new in version 0.13)
-
 You may have a use case where it's convenient to have multiple config files,
-and choose at runtime which one to use.  In that case, it might be useful if
+and choose at runtime which one to use. In that case, it might be useful if
 you can put common definitions (such as defaults for reporting, shell, etc.)
-in a separate file, that is included by the other files.
-
-To support this use case, it is possible to ask one config file to include
-another one, via the `include` directive.  It takes a list of file names:
-those files will be parsed as configuration and merged in with this file.
-
-Example, your main config file could be:
+in a separate file, that is included by the other files via the `include`
+directive. It takes a list of file names:
 
 ```yaml
 include:
   - _inc.yaml
 
 jobs:
-
   - name: my job
     ...
 ```
@@ -699,45 +673,17 @@ defaults:
   shell: /bin/bash
   onPermanentFailure:
     report:
-      sentry:
-        ...
-```
-
-### Custom logging
-
-It's possible to provide a custom logging configuration, via the `logging`
-configuration section.  For example, the following configuration displays log lines with
-an embedded timestamp for each message.
-
-```yaml
-logging:
-  # In the format of:
-  # https://docs.python.org/3/library/logging.config.html#dictionary-schema-details
-  version: 1
-  disable_existing_loggers: false
-  formatters:
-    simple:
-      format: '%(asctime)s [%(processName)s/%(threadName)s] %(levelname)s (%(name)s): %(message)s'
-      datefmt: '%Y-%m-%d %H:%M:%S'
-  handlers:
-    console:
-      class: logging.StreamHandler
-      level: DEBUG
-      formatter: simple
-      stream: ext://sys.stdout
-  root:
-    level: INFO
-    handlers:
-      - console
+      mail:
+        from: example@foo.com
+        to: example@bar.com
+        smtpHost: 127.0.0.1
 ```
 
 ### Obscure configuration options
 
 #### enabled: true|false (default true)
 
-(new in yacron2 0.18)
-
-It is possible to disable a specific cron job by adding a `enabled: false` option.  Jobs
+It is possible to disable a specific cron job by adding an `enabled: false` option. Jobs
 with `enabled: false` will simply be skipped, as if they aren't there, apart from
 validating the configuration.
 
@@ -750,8 +696,26 @@ jobs:
     schedule: "* * * * *"
 ```
 
+## Differences from the Python version
+
+The Rust port aims for full configuration and behavioural parity, with a few
+deliberate exceptions:
+
+* **Sentry reporting is not yet implemented.** The `sentry` report block is
+  still parsed and validated (so existing configs load), but no event is sent —
+  yacron2 logs a one-time warning if a DSN is configured. The `mail` and `shell`
+  reporters are fully implemented.
+* **The `logging:` section is informational only.** Python's `logging.dictConfig`
+  has no equivalent here; logging is controlled by `--log-level` and the
+  `RUST_LOG` environment variable. A present `logging:` block is accepted (for
+  config compatibility) but not applied.
+* **`user`/`group` are Unix-only.** On non-Unix platforms a job that requests a
+  user or group change is a configuration error.
+* **The `year` field works in the object schedule form.** The Python version
+  silently dropped `year` when assembling an object-form schedule; here it is
+  honoured, matching what the documentation always advertised.
+
 ## Contributing
 
-Development setup, the test/lint/type-check workflow, and the automated release
-process (including the commit-message marker that triggers a PyPI release) are
-documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+Development setup, the test workflow, and the release process are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md).

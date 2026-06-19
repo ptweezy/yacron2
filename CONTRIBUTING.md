@@ -1,46 +1,60 @@
 # Contributing to yacron2
 
-Thanks for working on yacron2! This document covers local development and,
-importantly, how releases are cut.
+Thanks for working on yacron2! This document covers local development and how
+releases are cut. yacron2 is written in **Rust** (stable, 1.74+).
 
 ## Development setup
 
-yacron2 targets **Python 3.13+** (3.13 and 3.14 are tested).
+Install a Rust toolchain from [rustup.rs](https://rustup.rs), then:
 
 ```sh
 git clone https://github.com/ptweezy/yacron2
 cd yacron2
-python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
+cargo build
 ```
 
-> **Note:** yacron2 is POSIX-only — it imports `grp`/`pwd` at load time, so the
-> package and its test suite must run on Linux/macOS (or WSL on Windows).
-> Linting and type-checking work anywhere.
+On Linux/WSL the e-mail reporter links against the system OpenSSL, so install
+the development headers first:
+
+```sh
+sudo apt-get install -y pkg-config libssl-dev   # Debian/Ubuntu/WSL
+```
+
+On Windows the SChannel TLS backend is used, so no extra packages are needed.
+
+> **Tests that spawn processes are Unix-only** (they run `echo`, `sleep`, etc.).
+> They run on Linux, macOS, and WSL; the rest of the suite runs everywhere.
 
 ## Running the checks
 
-Everything CI runs is driven by `tox`:
-
 ```sh
-tox            # all envs: py313, py314, lint, mypy
-tox -e lint    # ruff check + ruff format --check
-tox -e mypy    # mypy
-tox -e py      # pytest on the current interpreter
+cargo test               # unit + integration tests
+cargo clippy --all-targets   # lints
+cargo fmt --all -- --check   # formatting
 ```
 
-`pre-commit` runs ruff and bandit on staged changes:
+If you don't have a local toolchain (for example, on a Windows box without
+Rust installed), everything can be run in Docker:
 
 ```sh
-pip install pre-commit
-pre-commit install
+docker run --rm -v "$PWD:/work" -w /work rust:1-bookworm \
+  bash -c "apt-get update && apt-get install -y pkg-config libssl-dev && cargo test"
+```
+
+To build and try the container image:
+
+```sh
+docker build -t yacron2 .
+docker run --rm -v "$PWD/example/docker/yacron2tab.yaml:/etc/yacron2.d/crontab.yaml" yacron2 -l DEBUG
 ```
 
 ## Releasing
 
 Releases are **automated** by the [`release`](.github/workflows/release.yml)
-GitHub Actions workflow. Version numbers come from git tags via
-`setuptools_scm`; you never edit a version by hand.
+GitHub Actions workflow. The crate version in `Cargo.toml` is the source of
+truth; the workflow computes the next version from the latest `X.Y.Z` git tag
+and builds the release binaries at that version (without committing a change
+back, so a release never re-triggers the workflow).
 
 ### Cutting a release
 
@@ -48,68 +62,41 @@ A release happens when a commit lands on `main` with a **release marker on its
 own line** in the commit message:
 
 ```
-Add retry backoff to the HTTP reporter
+Add retry backoff to the shell reporter
 
 [release:minor]
 ```
 
 Valid markers (the bump level is optional; whitespace and case are ignored):
 
-| Marker             | Bump  | 1.0.2 → |
+| Marker             | Bump  | 1.0.4 → |
 | ------------------ | ----- | ------- |
 | `[release]`        | minor | 1.1.0   |
 | `[release:major]`  | major | 2.0.0   |
 | `[release:minor]`  | minor | 1.1.0   |
-| `[release:patch]`  | patch | 1.0.3   |
+| `[release:patch]`  | patch | 1.0.5   |
 
-> **The marker must be on a line by itself.** This is deliberate: a mention of
-> `[release]` *inside* a sentence (for example, in this very document, or in a
-> commit body) must never trigger a publish. The workflow matches a whole line,
-> not a substring.
+> **The marker must be on a line by itself.** A mention of `[release]` *inside*
+> a sentence (for example, in this document or in a commit body) must never
+> trigger a publish. The workflow matches a whole line, not a substring.
 
-You can also release manually without a marker: **Actions → release → Run
-workflow**, then pick the bump level from the dropdown.
+You can also release manually: **Actions → release → Run workflow**, then pick
+the bump level from the dropdown.
 
 ### What the pipeline does
 
 On a release the workflow, in order:
 
 1. **decides** whether to release and at what level (the strict marker check);
-2. **gates** on `tox` (py313, py314, lint, mypy) — a red build means no release;
-3. **builds** the wheel + sdist at the computed version;
-4. **publishes to PyPI** via [Trusted Publishing
-   (OIDC)](https://docs.pypi.org/trusted-publishers/) — there is no API token to
-   manage or leak;
-5. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
-   GitHub Release with the artifacts attached.
+2. **gates** on `cargo test` / `clippy` / `fmt` — a red build means no release;
+3. **builds** a release binary for each target platform at the computed version;
+4. **only after a successful build**, creates and pushes the `X.Y.Z` tag and a
+   GitHub Release with the binaries attached.
 
-Because no file is committed back to the repo, a release never re-triggers the
-workflow. Because the tag is created *after* publishing, a failed publish leaves
-no orphan tag and a re-run cleanly retries the same version.
-
-### Important: releases are irreversible
-
-- Every release marker that lands on `main` **publishes to PyPI**. There is no
-  staging step — treat a marked commit as "ship it."
-- **PyPI versions are immutable.** A version, once uploaded, can never be
-  re-uploaded, even after it is deleted or yanked. Pick the bump level
-  deliberately.
+Because the tag is created *after* the build, a failed build leaves no orphan
+tag and a re-run cleanly retries the same version.
 
 ### Changelog (HISTORY.md)
 
-A local `commit-msg` hook drafts a `HISTORY.md` entry whenever you make a
-release commit, from the commits since the last tag. It is best-effort and
-never blocks a commit. Install it once per clone:
-
-```sh
-cp .githooks/commit-msg .git/hooks/commit-msg
-# Windows (PowerShell):
-# Copy-Item .githooks/commit-msg .git/hooks/commit-msg -Force
-```
-
-All the logic lives in
-[`scripts/gen_changelog_entry.py`](scripts/gen_changelog_entry.py). If a
-[`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI is on your
-`PATH`, the hook uses it to write a grouped, prose changelog entry; otherwise it
-falls back to a plain list of commit subjects. Review/edit the generated entry
-before pushing — it ships inside the published sdist.
+`HISTORY.md` is maintained by hand. Add an entry under the top heading
+describing user-visible changes before cutting a release.

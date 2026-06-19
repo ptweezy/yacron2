@@ -1,7 +1,0 @@
-mypy
-mypy-extensions
-pytest
-pytest-asyncio
-pytest-cov
-ruff
-tox

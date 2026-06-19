@@ -1,5 +1,15 @@
-# Keep the build context small. NOTE: .git MUST be included — setuptools_scm
-# derives the version from git tags during `pip install .`.
+# Keep the build context small. The Rust build only needs Cargo.* and src/.
+target
+.git
+.github
+.githooks
+example
+pyinstaller
+*.md
+.editorconfig
+.gitignore
+.dockerignore
+# stale Python artifacts (removed from the repo, ignored if present locally)
 .venv
 .venv314
 .tox

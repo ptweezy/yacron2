@@ -6,6 +6,47 @@ entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
 
+## Unreleased — Rust rewrite
+
+yacron2 has been rewritten from scratch in Rust. The YAML configuration format
+is unchanged, so existing crontabs continue to work without modification; the
+runtime is now a single native binary with no interpreter or runtime
+dependencies.
+
+### Changed
+
+- The whole implementation is now Rust (Tokio async runtime). The published
+  artifact is a self-contained binary; the Python package and the
+  PyInstaller-based binary build are gone.
+- The container image is now built from a multi-stage `Dockerfile` at the repo
+  root onto a Debian-slim runtime, replacing the `pip install yacron2` image.
+- Logging is driven by `--log-level` and the `RUST_LOG` environment variable.
+  The `logging:` configuration section is still accepted for compatibility but
+  is no longer applied (Python's `logging.dictConfig` has no equivalent).
+- The IANA timezone database is bundled into the binary (via `chrono-tz`), so
+  arbitrary timezones resolve without a system tzdata package.
+
+### Behavioural notes
+
+- **Sentry reporting is not yet implemented.** The `sentry` report block is
+  still parsed and validated, but no event is sent (a one-time warning is logged
+  if a DSN is configured). The `mail` and `shell` reporters are fully
+  implemented.
+- **`user`/`group` are Unix-only.** On non-Unix platforms a job requesting a
+  user/group change is now a configuration error (previously the module simply
+  failed to import on Windows).
+- The object form of `schedule` now honours the `year` field, matching the
+  documentation (the Python version silently dropped it).
+- Crontab matching preserves `parse-crontab` semantics, including the
+  day-of-month **AND** day-of-week combination rule (not Vixie cron's OR rule).
+
+### Platforms
+
+- Builds and runs on Linux, macOS, Windows, and WSL with a stable Rust
+  toolchain (1.74+); the container image and the prebuilt release binary cover
+  the common deployment targets.
+
+
 ## 1.0.4 (2026-06-19)
 
 ### Reliability fixes

@@ -1,67 +1,21 @@
-/.pytest_cache/
-# Byte-compiled / optimized / DLL files
+# Rust build artifacts
+/target/
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+
+# Stale Python tooling artifacts (the project is Rust now; ignored if present)
 __pycache__/
 *.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
+.venv/
+.venv*/
 .tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*,cover
-.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+/build/
+/dist/
 
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# pyenv python configuration file
-.python-version
-
-/.mypy_cache/
-
-/pyoxidizer/venv/
-/yacron2/version.py
+# Note: Cargo.lock IS committed (this is an application, not a library).

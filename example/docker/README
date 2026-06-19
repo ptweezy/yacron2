@@ -1,8 +1,9 @@
-A simple example of how to add yacron2 to a docker image.  To try it out,
-run for instance:
+A simple example of how to add yacron2 to a docker image.  The build context
+must be the repository root (so the Rust sources are available).  To try it
+out, run from the repo root:
 
-	$ docker build -t yacron2demo .
-	$ docker run -ti yacron2demo -l DEBUG  # Ctrl-C to stop
+	$ docker build -f example/docker/Dockerfile -t yacron2demo .
+	$ docker run --rm -ti yacron2demo -l DEBUG  # Ctrl-C to stop
 
 Moreover, you can find an example of deploying to Kubernetes in the
 ``k8s-deploy.yaml`` file.  To test:

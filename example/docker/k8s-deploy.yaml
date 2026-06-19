@@ -24,6 +24,3 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
-        env:
-          - name: PYTHONIOENCODING
-            value: "utf-8"

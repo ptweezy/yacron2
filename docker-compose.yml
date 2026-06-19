@@ -1,0 +1,51 @@
+# docker-compose for yacron2.
+#
+#   docker compose up --build        # build the image and run in the foreground
+#   docker compose up -d --build     # ... or detached
+#   docker compose logs -f           # follow job output
+#   docker compose down              # stop (sends SIGTERM -> graceful shutdown)
+#
+# Drop your crontab YAML files into ./config — anything in that directory is
+# read as configuration (it is mounted at /etc/yacron2.d, yacron2's default
+# config path, so no -c flag is needed). A starter ./config/crontab.yaml is
+# included.
+
+services:
+  yacron2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yacron2:latest
+    container_name: yacron2
+    restart: unless-stopped
+
+    # Run as PID 1 with proper signal forwarding, and give running jobs time to
+    # finish on `docker compose down` before they are killed.
+    init: true
+    stop_grace_period: 30s
+
+    # Mount your config directory read-only at the default config path.
+    volumes:
+      - ./config:/etc/yacron2.d:ro
+
+    # Arguments passed to the yacron2 binary (the image's ENTRYPOINT).
+    command: ["-l", "INFO"]
+
+    environment:
+      # A friendly name surfaces in logs and the {{ environment.HOSTNAME }}
+      # report template (otherwise it is the random container id).
+      HOSTNAME: yacron2
+      # The IANA tz database is bundled, but `utc: false` jobs use the host
+      # local time, which inside a container is driven by TZ. Uncomment to set:
+      # TZ: America/Los_Angeles
+
+    # Load secrets (e.g. MAIL_PASSWORD, YACRON2_WEB_TOKEN referenced via
+    # `fromEnvVar:` in your config) from a local .env file. Uncomment to use:
+    # env_file:
+    #   - .env
+
+    # Expose the optional web REST API. Requires a `web:` section in your config
+    # listening on http://0.0.0.0:8080 (note: 0.0.0.0, not 127.0.0.1, so it is
+    # reachable from outside the container). Uncomment to publish:
+    # ports:
+    #   - "8080:8080"

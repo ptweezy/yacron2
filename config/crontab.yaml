@@ -1,0 +1,15 @@
+# Starter crontab for the docker-compose setup. Edit me, or drop additional
+# *.yaml / *.yml files alongside this one — every file in this directory is
+# loaded. See the README for the full configuration reference.
+
+jobs:
+  - name: heartbeat
+    command: echo "yacron2 is alive on $HOSTNAME"
+    schedule: "* * * * *"   # every minute
+    captureStdout: true
+
+# Uncomment to enable the web REST API (and publish the port in
+# docker-compose.yml). Use 0.0.0.0 so it is reachable from the host.
+# web:
+#   listen:
+#     - http://0.0.0.0:8080

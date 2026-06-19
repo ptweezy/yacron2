@@ -4,8 +4,8 @@ jobs:
   tox-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v3
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6.2.0
       - run: pip install --upgrade pip
       - run: pip install tox
       - run: tox -e lint
@@ -13,8 +13,8 @@ jobs:
   tox-mypy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v3
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6.2.0
       - run: pip install --upgrade pip
       - run: pip install tox
       - run: tox -e mypy

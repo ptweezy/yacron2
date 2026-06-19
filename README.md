@@ -7,8 +7,6 @@ Gustavo Carneiro), continuing development from version 0.19.  Except where
 noted, the documentation below describes behaviour inherited from the original
 yacron; "since version X.Y" notes refer to that shared version history.
 
-* Free software: MIT license
-
 ## Features
 
 * "Crontab" is in YAML format;

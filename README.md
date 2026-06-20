@@ -8,7 +8,7 @@
 
 A modern, container-friendly cron replacement.
 
-yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (byGustavo Carneiro), continuing development from version 0.19.
+yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
 ## Features
 

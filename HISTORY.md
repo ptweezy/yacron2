@@ -5,6 +5,10 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.5 (2026-06-20)
+
+- docker builds
+
 ## 1.0.4 (2026-06-19)
 
 ### Reliability fixes

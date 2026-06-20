@@ -90,6 +90,36 @@ chmod +x yacron2
 ./yacron2 --version
 ```
 
+The standalone binary is a self-extracting executable: on each start it unpacks
+its embedded Python runtime into a temporary directory and loads shared
+libraries from there.  It therefore needs a temporary directory that is both
+**writable and executable**.  On an ordinary system the default `/tmp` already
+satisfies this, so no extra setup is required.
+
+This only matters when you run the binary under a **read-only root filesystem**
+(for example, a hardened container).  With the root filesystem read-only, `/tmp`
+is read-only too, and the binary aborts at startup — `Could not create temporary
+directory`, or `Error loading shared library …: Operation not permitted`.  Give
+it a small writable *and executable* temp mount and it runs fine:
+
+```shell
+# Note `exec`: Docker's --tmpfs defaults to `noexec`, but the binary must be
+# able to execute the libraries it unpacks.
+docker run --rm --read-only \
+  --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m \
+  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
+  your-image-with-the-binary -c /etc/yacron2.d
+```
+
+On Kubernetes, mount an `emptyDir` at `/tmp` (an `emptyDir` is writable and
+executable by default; use `medium: Memory` for a tmpfs).  Alternatively, point
+the binary at another writable, executable directory with `TMPDIR=/path`.
+
+This requirement is unique to the standalone binary.  The published container
+image (and `pip`/`pipx` installs) run yacron2 as a normal Python package with
+the interpreter on disk, so they never self-extract and need no writable temp
+directory — see [Production container deployment](#production-container-deployment).
+
 ## Production container deployment
 
 yacron2 is built to run unmodified under the hardened security contexts that
@@ -106,10 +136,14 @@ files — so it slots cleanly into a locked-down pod:
 * **Seccomp profile** — yacron2 makes no exotic syscalls, so the
   `RuntimeDefault` seccomp profile (or an equivalently strict custom profile)
   works out of the box.
-* **Read-only root filesystem** — no runtime writes are required.  Mount your
-  crontab config read-only.  (If you enable the optional [HTTP
+* **Read-only root filesystem** — no runtime writes are required by the
+  published image (or a `pip`/`pipx` install).  Mount your crontab config
+  read-only.  (If you enable the optional [HTTP
   interface](#remote-webhttp-interface) on a Unix socket, point the socket at a
-  small writable `emptyDir` volume rather than the root filesystem.)
+  small writable `emptyDir` volume rather than the root filesystem.  And if you
+  deploy the standalone *binary* instead of the image, it additionally needs a
+  small writable, executable temp mount — see [Install using
+  binary](#install-using-binary).)
 * **`fsGroup` and dropped capabilities** — config and secret volumes can be
   mounted with an `fsGroup` so the non-root process can read them, and you can
   drop *all* Linux capabilities and forbid privilege escalation.

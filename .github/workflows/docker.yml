@@ -1,39 +1,40 @@
 name: docker
 
-# Build the official multi-arch container image and publish it to GHCR (and, if
-# the DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets are set, to Docker Hub too).
+# Build the container image on EVERY commit (build-only, so a broken Dockerfile
+# fails fast) and publish the multi-arch image to GHCR (and Docker Hub, if the
+# DOCKERHUB_* secrets are set) when a release is cut.
 #
-#   - on a published GitHub Release: build linux/amd64 + linux/arm64 and push,
-#     tagging the image with the release version and `latest`;
-#   - manually (workflow_dispatch): (re)build any existing release tag — handy
-#     to backfill an image for a release cut before this workflow existed;
-#   - on pull requests / main pushes that touch the image: build only, without
-#     pushing, so a broken Dockerfile fails CI before a release.
+#   - on a push to any branch: build linux/amd64 only and do NOT push -- a fast
+#     gate proving the image still builds for every commit;
+#   - on release: the release workflow CALLS this one (workflow_call) right after
+#     it publishes, building linux/amd64 + linux/arm64 and pushing, tagged with
+#     the release version and `latest`;
+#   - manually (workflow_dispatch): (re)build and push any existing release tag --
+#     handy to backfill an image for a release whose build was missed.
+#
+# Why workflow_call instead of `on: release`? A GitHub Release created by the
+# release workflow's default GITHUB_TOKEN does NOT emit a `release: published`
+# event capable of starting another workflow -- GitHub suppresses token-triggered
+# events to avoid recursion. Having release.yml invoke this workflow directly
+# makes the image a first-class step of the release instead of a trigger that
+# silently never fires. (The per-commit build above is what catches a broken
+# Dockerfile early, so building the image after publish is safe.)
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version/tag to build and push (e.g. 1.0.9)."
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       tag:
         description: "Release tag to build (e.g. 1.0.4). Defaults to the latest release."
         type: string
         required: false
-  pull_request:
-    paths:
-      - Dockerfile
-      - .dockerignore
-      - pyproject.toml
-      - yacron2/**
-      - .github/workflows/docker.yml
   push:
-    branches: [main]
-    paths:
-      - Dockerfile
-      - .dockerignore
-      - pyproject.toml
-      - yacron2/**
-      - .github/workflows/docker.yml
+    branches: ["**"] # build on every commit, on every branch
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
@@ -57,26 +58,30 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          CALL_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           version=""          # empty => Dockerfile reads the version from .git
-          ref=""              # empty => checkout the default ref
+          ref=""              # empty => checkout the triggering ref
           push=false
           platforms="linux/amd64"
-          case "$EVENT" in
-            release)
-              version="$RELEASE_TAG"; ref="$RELEASE_TAG"
-              push=true; platforms="linux/amd64,linux/arm64" ;;
-            workflow_dispatch)
-              if [ -n "${INPUT_TAG:-}" ]; then
-                version="$INPUT_TAG"
-              else
-                version="$(gh release view --repo "$REPO" --json tagName -q .tagName)"
-              fi
-              ref="$version"
-              push=true; platforms="linux/amd64,linux/arm64" ;;
-          esac
+          if [ -n "${CALL_VERSION:-}" ]; then
+            # Invoked by the release workflow (workflow_call): build + push at the
+            # just-released version. Detected via the input, NOT github.event_name
+            # -- in a called workflow that still reports the CALLER's event.
+            version="$CALL_VERSION"; ref="$CALL_VERSION"
+            push=true; platforms="linux/amd64,linux/arm64"
+          elif [ "$EVENT" = "workflow_dispatch" ]; then
+            # Manual (re)build of an existing release tag.
+            if [ -n "${INPUT_TAG:-}" ]; then
+              version="$INPUT_TAG"
+            else
+              version="$(gh release view --repo "$REPO" --json tagName -q .tagName)"
+            fi
+            ref="$version"
+            push=true; platforms="linux/amd64,linux/arm64"
+          fi
+          # else: push -> build-only CI on every commit (defaults above).
           {
             echo "version=$version"
             echo "ref=$ref"
@@ -117,7 +122,7 @@ jobs:
           images: ${{ steps.registries.outputs.images }}
           tags: |
             type=raw,value=${{ steps.target.outputs.version }},enable=${{ steps.target.outputs.version != '' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' && github.event.release.prerelease == false }}
+            type=raw,value=latest,enable=${{ steps.target.outputs.push == 'true' }}
             type=raw,value=ci-build,enable=${{ steps.target.outputs.push == 'false' }}
 
       - name: Log in to GHCR

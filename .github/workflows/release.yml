@@ -341,3 +341,19 @@ jobs:
             binaries/yacron2-linux-arm64
             binaries/yacron2-linux-amd64-musl
             binaries/yacron2-linux-arm64-musl
+
+  # Build + push the multi-arch container image at the just-released version.
+  # Invoked here (workflow_call) rather than via `on: release` because a Release
+  # created by GITHUB_TOKEN does not emit a triggering `release: published`
+  # event. Runs after `release` so the tag it checks out already exists; the
+  # Dockerfile was already proven buildable by docker.yml's per-commit CI.
+  docker:
+    needs: [decide, version, release]
+    if: needs.decide.outputs.release == 'true'
+    permissions:
+      contents: read
+      packages: write   # push to GHCR
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.version.outputs.new }}
+    secrets: inherit

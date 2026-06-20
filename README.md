@@ -74,13 +74,19 @@ pipx install yacron2
 
 Alternatively, a self-contained binary can be downloaded
 from github: <https://github.com/ptweezy/yacron2/releases>. Every release
-automatically attaches a binary for both architectures —
-`yacron2-linux-amd64` and `yacron2-linux-arm64`. They work on any Linux system
-post glibc 2.39 (e.g. Ubuntu 24.04) on the matching CPU.  Python is not required
-on the target system (it is embedded in the executable):
+automatically attaches a binary for both architectures in two libc flavors:
+
+* `yacron2-linux-amd64` / `yacron2-linux-arm64` — glibc builds for the
+  mainstream distros. They work on any Linux system post glibc 2.39 (e.g.
+  Ubuntu 24.04) on the matching CPU.
+* `yacron2-linux-amd64-musl` / `yacron2-linux-arm64-musl` — musl builds for
+  Alpine and other musl-based systems.
+
+Python is not required on the target system (it is embedded in the executable):
 
 ```shell
-# pick the asset for your architecture (amd64 shown)
+# pick the asset for your architecture and libc (glibc amd64 shown;
+# append -musl on Alpine)
 curl -fsSL -o yacron2 \
   https://github.com/ptweezy/yacron2/releases/latest/download/yacron2-linux-amd64
 chmod +x yacron2

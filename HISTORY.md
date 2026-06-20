@@ -5,6 +5,16 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.8 (2026-06-20)
+
+- Add self-contained musl binaries to every release for Alpine and
+  other musl-based systems: `yacron2-linux-amd64-musl` and
+  `yacron2-linux-arm64-musl`, alongside the existing glibc
+  `yacron2-linux-amd64` and `yacron2-linux-arm64` builds. Python is
+  not required on the target system.
+- Build the release binaries with Python 3.14.
+
+
 ## 1.0.7 (2026-06-20)
 
 - GitHub Releases now use the curated `HISTORY.md` section for the

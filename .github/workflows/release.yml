@@ -17,7 +17,8 @@ name: release
 # On release it: gates on tox, computes the next version from the latest X.Y.Z
 # tag, builds at that version (SETUPTOOLS_SCM_PRETEND_VERSION) -- both the wheel
 # + sdist and self-contained PyInstaller binaries for linux/amd64 + linux/arm64
-# (built natively on amd64 and arm64 runners) -- publishes the wheel + sdist to
+# in both glibc and musl/Alpine flavors (built natively on amd64 and arm64
+# runners) -- publishes the wheel + sdist to
 # PyPI via Trusted Publishing (OIDC), then ONLY after a successful publish tags
 # the commit and cuts a GitHub Release with the binaries attached. No file is
 # committed back -> no loop; the binaries build BEFORE the publish (a broken
@@ -162,11 +163,12 @@ jobs:
       - run: pip install --upgrade pip tox
       - run: tox  # runs py313, py314, lint, mypy (see tox.ini)
 
-  # Build the self-contained PyInstaller binaries, one per architecture on a
-  # native runner (no QEMU). Each is uploaded as an artifact for the release job
-  # to attach. Built before the publish, so a broken binary fails the run rather
-  # than producing a half-finished release; the per-arch `--version` smoke test
-  # catches a bad bundle here.
+  # Build the self-contained glibc PyInstaller binaries, one per architecture on
+  # a native runner (no QEMU). Each is uploaded as an artifact for the release
+  # job to attach. Built before the publish, so a broken binary fails the run
+  # rather than producing a half-finished release; the per-arch `--version` smoke
+  # test catches a bad bundle here. These target glibc (the Ubuntu runner's
+  # libc) -- the `binaries-musl` job below covers Alpine/musl hosts.
   binaries:
     needs: [decide, version, gate]
     if: needs.decide.outputs.release == 'true'
@@ -185,7 +187,7 @@ jobs:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - uses: actions/setup-python@v6.2.0
         with:
-          python-version: '3.13'
+          python-version: '3.14'
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -203,8 +205,60 @@ jobs:
           path: dist/yacron2-linux-${{ matrix.arch }}
           if-no-files-found: error
 
+  # Build the musl/Alpine self-contained binaries, one per architecture. GitHub
+  # runners are glibc (Ubuntu), so the build runs *inside* an Alpine container
+  # via `docker run` rather than a job-level `container:` -- that keeps checkout
+  # and upload-artifact on the glibc host (Alpine lacks the glibc Node the runner
+  # injects for JS actions) and confines musl to the build itself. arm64 builds
+  # on a native arm64 runner, so no QEMU is involved. Same pyinstaller pin and
+  # `--version` smoke test as the glibc job above; the asset just carries a
+  # `-musl` suffix so it sits alongside the glibc one on the release.
+  binaries-musl:
+    needs: [decide, version, gate]
+    if: needs.decide.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
+      - name: Build binary (Alpine/musl)
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -v "$PWD:/src" -w /src \
+            python:3.14-alpine sh -euc '
+              # build-base brings the C toolchain + strip (the spec sets
+              # strip=True); libffi/zlib headers cover any dep that lacks a
+              # musllinux wheel and falls back to compiling from sdist.
+              apk add --no-cache build-base libffi-dev zlib-dev
+              pip install --upgrade pip
+              pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
+              pip install .                     # bakes the pinned version into yacron2/version.py
+              pyinstaller pyinstaller/yacron2.spec
+              dist/yacron2 --version            # smoke test: a musl binary on a musl host
+              mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yacron2-linux-${{ matrix.arch }}-musl
+          path: dist/yacron2-linux-${{ matrix.arch }}-musl
+          if-no-files-found: error
+
   release:
-    needs: [decide, version, gate, binaries]
+    needs: [decide, version, gate, binaries, binaries-musl]
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -217,7 +271,7 @@ jobs:
 
       - uses: actions/setup-python@v6.2.0
         with:
-          python-version: '3.13'
+          python-version: '3.14'
 
       - name: Build distributions
         env:
@@ -285,3 +339,5 @@ jobs:
             dist/*.tar.gz
             binaries/yacron2-linux-amd64
             binaries/yacron2-linux-arm64
+            binaries/yacron2-linux-amd64-musl
+            binaries/yacron2-linux-arm64-musl

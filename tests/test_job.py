@@ -1,11 +1,15 @@
-import yacron.job
-import yacron.config
 import asyncio
-import pytest
-import aiosmtplib
-from unittest.mock import Mock, patch
-import tempfile
 import os
+import tempfile
+from unittest.mock import Mock, patch
+
+import aiosmtplib
+import pytest
+from sentry_sdk.utils import Dsn
+
+import yacron2.config
+import yacron2.job
+import yacron2.statsd
 
 
 @pytest.mark.parametrize(
@@ -38,11 +42,11 @@ async def test_stream_reader(
     save_limit, input_lines, output, expected_failure
 ):
     fake_stream = asyncio.StreamReader()
-    reader = yacron.job.StreamReader(
+    reader = yacron2.job.StreamReader(
         "cronjob-1", "stderr", fake_stream, "", save_limit
     )
 
-    conf = yacron.config.parse_config_string(
+    conf = yacron2.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -53,7 +57,7 @@ jobs:
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron.job.RunningJob(job_config, None)
+    job = yacron2.job.RunningJob(job_config, None)
 
     async def producer(fake_stream):
         fake_stream.feed_data(input_lines)
@@ -72,11 +76,11 @@ jobs:
 @pytest.mark.asyncio
 async def test_stream_reader_long_line():
     fake_stream = asyncio.StreamReader()
-    reader = yacron.job.StreamReader(
+    reader = yacron2.job.StreamReader(
         "cronjob-1", "stderr", fake_stream, "", 500
     )
 
-    conf = yacron.config.parse_config_string(
+    conf = yacron2.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -87,7 +91,7 @@ jobs:
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron.job.RunningJob(job_config, None)
+    job = yacron2.job.RunningJob(job_config, None)
 
     async def producer(fake_stream):
         fake_stream.feed_data(b"one line\n")
@@ -173,7 +177,7 @@ jobs:
 )
 @pytest.mark.asyncio
 async def test_report_mail(success, stdout, stderr, subject, body):
-    conf = yacron.config.parse_config_string(A_JOB, "")
+    conf = yacron2.config.parse_config_string(A_JOB, "")
     job_config = conf.jobs[0]
     print(job_config.onSuccess["report"])
     job = Mock(
@@ -188,7 +192,7 @@ async def test_report_mail(success, stdout, stderr, subject, body):
         },
     )
 
-    mail = yacron.job.MailReporter()
+    mail = yacron2.job.MailReporter()
 
     connect_calls = []
     start_tls_calls = []
@@ -215,12 +219,12 @@ async def test_report_mail(success, stdout, stderr, subject, body):
         smtp_init_args = args, kwargs
         real_init(self, *args, **kwargs)
 
-    with patch("aiosmtplib.SMTP.__init__", init), patch(
-        "aiosmtplib.SMTP.connect", connect
-    ), patch("aiosmtplib.SMTP.send_message", send_message), patch(
-        "aiosmtplib.SMTP.login", login
-    ), patch(
-        "aiosmtplib.SMTP.starttls", starttls
+    with (
+        patch("aiosmtplib.SMTP.__init__", init),
+        patch("aiosmtplib.SMTP.connect", connect),
+        patch("aiosmtplib.SMTP.send_message", send_message),
+        patch("aiosmtplib.SMTP.login", login),
+        patch("aiosmtplib.SMTP.starttls", starttls),
     ):
         await mail.report(success, job, job_config.onSuccess["report"])
 
@@ -230,7 +234,7 @@ async def test_report_mail(success, stdout, stderr, subject, body):
             "hostname": "smtp1",
             "port": 1025,
             "use_tls": False,
-            "validate_certs": False,
+            "validate_certs": True,
         },
     )
     assert len(connect_calls) == 1
@@ -302,7 +306,7 @@ async def test_report_mail(success, stdout, stderr, subject, body):
     ],
 )
 @pytest.mark.asyncio
-async def test_report_sentry(
+async def test_report_sentry(  # noqa: C901
     success,
     dsn_from,
     body,
@@ -314,7 +318,7 @@ async def test_report_sentry(
     tmpdir,
     monkeypatch,
 ):
-    conf = yacron.config.parse_config_string(A_JOB, "")
+    conf = yacron2.config.parse_config_string(A_JOB, "")
     job_config = conf.jobs[0]
 
     p = tmpdir.join("sentry-secret-dsn")
@@ -345,9 +349,9 @@ async def test_report_sentry(
     else:
         raise AssertionError
 
-    job_config.onSuccess["report"]["sentry"][
-        "body"
-    ] = yacron.config.DEFAULT_CONFIG["onFailure"]["report"]["sentry"]["body"]
+    job_config.onSuccess["report"]["sentry"]["body"] = (
+        yacron2.config.DEFAULT_CONFIG["onFailure"]["report"]["sentry"]["body"]
+    )
 
     job_config.onSuccess["report"]["sentry"]["fingerprint"] = ["{{ name }}"]
 
@@ -375,9 +379,26 @@ async def test_report_sentry(
             self.args = args
             self.kwargs = kwargs
             self.messages_sent = []
+            # sentry-sdk 2.x reads transport.parsed_dsn off the client; the
+            # options dict is passed positionally as make_transport(options).
+            options = args[0] if args else kwargs.get("options", {})
+            dsn = options.get("dsn")
+            self.parsed_dsn = Dsn(dsn) if dsn else None
+
+        # sentry-sdk 2.x delivers events as envelopes, not bare events.
+        def capture_envelope(self, envelope):
+            event = envelope.get_event()
+            if event is not None:
+                self.messages_sent.append(event)
 
         def capture_event(self, event_opt):
             self.messages_sent.append(event_opt)
+
+        def record_lost_event(self, *args, **kwargs):
+            pass
+
+        def is_healthy(self):
+            return True
 
         def kill(self):
             pass
@@ -392,7 +413,7 @@ async def test_report_sentry(
 
     monkeypatch.setattr("sentry_sdk.client.make_transport", make_transport)
 
-    sentry = yacron.job.SentryReporter()
+    sentry = yacron2.job.SentryReporter()
     await sentry.report(success, job, job_config.onSuccess["report"])
     for transport in transports:
         assert transport.args[0].get("dsn") == expected_dsn
@@ -435,7 +456,7 @@ async def test_report_shell(command, expected_output):
     with tempfile.TemporaryDirectory() as tmp:
         out_file_path = os.path.join(tmp, "unit_test_file")
 
-        conf = yacron.config.parse_config_string(
+        conf = yacron2.config.parse_config_string(
             f"""
 jobs:
   - name: test
@@ -445,8 +466,8 @@ jobs:
       report:
         shell:
             command: >
-                echo "$YACRON_JOB_NAME - $YACRON_JOB_COMMAND -
-                $YACRON_JOB_SCHEDULE - Error code $YACRON_RETCODE"
+                echo "$YACRON2_JOB_NAME - $YACRON2_JOB_COMMAND -
+                $YACRON2_JOB_SCHEDULE - Error code $YACRON2_RETCODE"
                 >> {out_file_path}
     """,
             "",
@@ -468,7 +489,7 @@ jobs:
             failed=True,
         )
 
-        shell_reporter = yacron.job.ShellReporter()
+        shell_reporter = yacron2.job.ShellReporter()
 
         await shell_reporter.report(False, job, job_config.onFailure["report"])
 
@@ -490,7 +511,6 @@ jobs:
 async def test_job_run(
     monkeypatch, shell, command, expected_type, expected_args
 ):
-
     shell_commands = []
     exec_commands = []
 
@@ -531,7 +551,7 @@ async def test_job_run(
     else:
         command_snippet = "    command: " + command
 
-    conf = yacron.config.parse_config_string(
+    conf = yacron2.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -543,14 +563,12 @@ jobs:
     environment:
       - key: FOO
         value: bar
-""".format(
-            command=command_snippet, shell=shell
-        ),
+""".format(command=command_snippet, shell=shell),
         "",
     )
     job_config = conf.jobs[0]
 
-    job = yacron.job.RunningJob(job_config, None)
+    job = yacron2.job.RunningJob(job_config, None)
 
     await job.start()
     await job.wait()
@@ -573,7 +591,7 @@ jobs:
 
 @pytest.mark.asyncio
 async def test_execution_timeout():
-    conf = yacron.config.parse_config_string(
+    conf = yacron2.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -589,7 +607,7 @@ jobs:
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron.job.RunningJob(job_config, None)
+    job = yacron2.job.RunningJob(job_config, None)
     await job.start()
     await job.wait()
     assert job.stdout == "hello\n"
@@ -597,7 +615,7 @@ jobs:
 
 @pytest.mark.asyncio
 async def test_error1():
-    conf = yacron.config.parse_config_string(
+    conf = yacron2.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -607,7 +625,7 @@ jobs:
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron.job.RunningJob(job_config, None)
+    job = yacron2.job.RunningJob(job_config, None)
 
     await job.start()
     with pytest.raises(RuntimeError):
@@ -617,7 +635,7 @@ jobs:
 
 @pytest.mark.asyncio
 async def test_error2():
-    conf = yacron.config.parse_config_string(
+    conf = yacron2.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -627,7 +645,7 @@ jobs:
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron.job.RunningJob(job_config, None)
+    job = yacron2.job.RunningJob(job_config, None)
 
     with pytest.raises(RuntimeError):
         await job.wait()
@@ -635,7 +653,7 @@ jobs:
 
 @pytest.mark.asyncio
 async def test_error3():
-    conf = yacron.config.parse_config_string(
+    conf = yacron2.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -645,7 +663,7 @@ jobs:
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron.job.RunningJob(job_config, None)
+    job = yacron2.job.RunningJob(job_config, None)
 
     with pytest.raises(RuntimeError):
         await job.cancel()
@@ -678,7 +696,7 @@ async def test_statsd(command):
         host, port = transport.get_extra_info("sockname")
         print("Listening UDP on %s:%s" % (host, port))
 
-        conf = yacron.config.parse_config_string(
+        conf = yacron2.config.parse_config_string(
             """
 jobs:
   - name: test
@@ -688,14 +706,12 @@ jobs:
       host: 127.0.0.1
       port: {port}
       prefix: the.prefix
-""".format(
-                port=port, command=command
-            ),
+""".format(port=port, command=command),
             "",
         )
         job_config = conf.jobs[0]
 
-        job = yacron.job.RunningJob(job_config, None)
+        job = yacron2.job.RunningJob(job_config, None)
 
         await job.start()
         await job.wait()
@@ -713,3 +729,107 @@ jobs:
     success = 0 if job.failed else 1
     assert any("the.prefix.success:%i" % success in r for r in received[1:])
     assert any("the.prefix.duration" in r for r in received[1:])
+
+
+@pytest.mark.asyncio
+async def test_start_failure_reported_not_raised():
+    # A command that cannot be launched (e.g. it does not exist) must be
+    # treated as a normal job failure with exit code 127, not raise
+    # RuntimeError (which the reaper logs as "please report this as a bug").
+    conf = yacron2.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command:
+      - /this/command/definitely/does/not/exist
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+
+    await job.start()
+    assert job.proc is None
+    assert job.start_failed
+
+    # must not raise; routed through normal failure handling instead
+    await job.wait()
+    assert job.retcode == 127
+    assert job.failed
+
+
+@pytest.mark.asyncio
+async def test_statsd_failure_does_not_crash(monkeypatch):
+    # statsd is best-effort: a send error (e.g. an unresolvable host) must be
+    # swallowed and not propagate out of start()/wait() to crash the scheduler.
+    async def boom(*args, **kwargs):
+        raise OSError("statsd unreachable")
+
+    monkeypatch.setattr(yacron2.statsd, "send_to_statsd", boom)
+
+    conf = yacron2.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: "true"
+    schedule: "* * * * *"
+    statsd:
+      host: 127.0.0.1
+      port: 9999
+      prefix: the.prefix
+""",
+        "",
+    )
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+
+    await job.start()  # _on_start must swallow the OSError
+    await job.wait()  # _on_stop must swallow the OSError
+    assert job.retcode == 0
+
+
+@pytest.mark.asyncio
+async def test_report_mail_closes_connection_on_error():
+    # if sending fails, the SMTP connection must still be closed (no leak).
+    conf = yacron2.config.parse_config_string(A_JOB, "")
+    job_config = conf.jobs[0]
+    job = Mock(
+        config=job_config,
+        stdout="out",
+        stderr="err",
+        template_vars={
+            "name": job_config.name,
+            "success": False,
+            "stdout": "out",
+            "stderr": "err",
+        },
+    )
+
+    mail = yacron2.job.MailReporter()
+    close_calls = []
+
+    async def connect(self):
+        pass
+
+    async def starttls(self):
+        pass
+
+    async def login(self, username, password):
+        pass
+
+    async def send_message(self, message):
+        raise RuntimeError("smtp boom")
+
+    def close(self):
+        close_calls.append(self)
+
+    with (
+        patch("aiosmtplib.SMTP.connect", connect),
+        patch("aiosmtplib.SMTP.starttls", starttls),
+        patch("aiosmtplib.SMTP.login", login),
+        patch("aiosmtplib.SMTP.send_message", send_message),
+        patch("aiosmtplib.SMTP.close", close),
+    ):
+        with pytest.raises(RuntimeError):
+            await mail.report(False, job, job_config.onSuccess["report"])
+
+    assert len(close_calls) == 1

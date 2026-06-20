@@ -4,7 +4,7 @@ block_cipher = None
 
 
 a = Analysis(
-    ["yacron"],
+    ["yacron2"],
     pathex=["."],
     binaries=[],
     datas=[],
@@ -25,7 +25,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="yacron",
+    name="yacron2",
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,

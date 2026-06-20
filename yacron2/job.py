@@ -2,24 +2,33 @@ import asyncio
 import asyncio.subprocess
 import logging
 import os
+import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from email.utils import format_datetime
+from functools import lru_cache
 from socket import gethostname
-from typing import Any, Dict, List, Optional, Tuple
-import subprocess
-
-import sentry_sdk
-import sentry_sdk.utils
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import aiosmtplib
 import jinja2
+import sentry_sdk
+import sentry_sdk.utils
 
-from yacron.config import JobConfig
-from yacron.statsd import StatsdJobMetricWriter
+from yacron2.config import JobConfig
+from yacron2.statsd import StatsdJobMetricWriter
 
-logger = logging.getLogger("yacron")
+logger = logging.getLogger("yacron2")
+
+
+@lru_cache(maxsize=None)
+def _compiled_template(source: str) -> jinja2.Template:
+    # Template source strings come from config and are constant for the life
+    # of the process; compile each distinct one once and reuse it.
+    return jinja2.Template(source)
 
 
 if "HOSTNAME" not in os.environ:
@@ -44,13 +53,24 @@ class StreamReader:
         save_limit: int,
     ) -> None:
         self.save_top: List[str] = []
-        self.save_bottom: List[str] = []
+        self.save_bottom: Deque[str] = deque()
         self.job_name = job_name
         self.save_limit = save_limit
         self.stream_name = stream_name
         self.stream_prefix = stream_prefix
         self._reader = asyncio.create_task(self._read(stream))
         self.discarded_lines = 0
+
+    @staticmethod
+    def _emit(out_stream, out_line: str) -> None:
+        # Write bytes so we control the encoding; fall back to ASCII with
+        # replacement when the console encoding can't represent the text.
+        try:
+            out_stream.buffer.write(out_line.encode())
+        except UnicodeEncodeError:
+            safe = out_line.encode("ascii", "replace").decode("ascii")
+            out_stream.write(safe)
+        out_stream.flush()
 
     async def _read(self, stream):
         prefix = self.stream_prefix.format(
@@ -60,7 +80,11 @@ class StreamReader:
         limit_bottom = self.save_limit - limit_top
         while True:
             try:
-                line = (await stream.readline()).decode("utf-8")
+                # errors="replace" so a job emitting non-UTF-8 bytes does not
+                # crash the reader task with UnicodeDecodeError.
+                line = (await stream.readline()).decode(
+                    "utf-8", errors="replace"
+                )
             except ValueError:
                 logger.warning(
                     "job %s: ignored a very long line", self.job_name
@@ -69,18 +93,18 @@ class StreamReader:
             if not line:
                 return
             out_line = prefix + line
-            try:
-                sys.stdout.buffer.write(out_line.encode())
-            except UnicodeEncodeError:
-                out_line = out_line.encode("ascii", "replace").decode("ascii")
-                sys.stdout.write(out_line)
-            sys.stdout.flush()
+            if self.stream_name == "stdout":
+                self._emit(sys.stdout, out_line)
+            elif self.stream_name == "stderr":
+                self._emit(sys.stderr, out_line)
             if self.save_limit > 0:
                 if len(self.save_top) < limit_top:
                     self.save_top.append(line)
                 else:
+                    # deque(maxlen) would evict silently; track discards
+                    # explicitly to preserve the "N lines discarded" count.
                     if len(self.save_bottom) == limit_bottom:
-                        del self.save_bottom[0]
+                        self.save_bottom.popleft()
                         self.discarded_lines += 1
                     self.save_bottom.append(line)
             else:
@@ -98,7 +122,7 @@ class StreamReader:
                 if self.discarded_lines
                 else []
             )
-            output = "".join(self.save_top + middle + self.save_bottom)
+            output = "".join(self.save_top + middle + list(self.save_bottom))
         else:
             output = "".join(self.save_top)
         return output, self.discarded_lines
@@ -112,6 +136,12 @@ class Reporter:
 
 
 class SentryReporter(Reporter):
+    def __init__(self) -> None:
+        # Remember the last (dsn, environment) we initialised the global
+        # Sentry client with, so we don't rebuild the client/transport on
+        # every single report.
+        self._inited_key: Optional[Tuple[str, Optional[str]]] = None
+
     async def report(
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
     ) -> None:
@@ -122,23 +152,37 @@ class SentryReporter(Reporter):
             with open(config["dsn"]["fromFile"], "rt") as dsn_file:
                 dsn = dsn_file.read().strip()
         elif config["dsn"]["fromEnvVar"]:
-            dsn = os.environ[config["dsn"]["fromEnvVar"]]
+            env_var = config["dsn"]["fromEnvVar"]
+            dsn = os.environ.get(env_var, "")
+            if not dsn:
+                logger.error(
+                    "sentry: dsn env var %r is not set; not reporting",
+                    env_var,
+                )
+                return
         else:
             return  # sentry disabled: early return
 
-        template = jinja2.Template(config["body"])
+        template = _compiled_template(config["body"])
         body = template.render(job.template_vars)
 
         fingerprint = []
         for line in config["fingerprint"]:
-            fingerprint.append(jinja2.Template(line).render(job.template_vars))
+            fingerprint.append(
+                _compiled_template(line).render(job.template_vars)
+            )
 
         kwargs = {}
         if config.get("maxStringLength"):
-            sentry_sdk.utils.MAX_STRING_LENGTH = config["maxStringLength"]
+            sentry_sdk.utils.MAX_STRING_LENGTH = (  # type:ignore
+                config["maxStringLength"]
+            )
         if config.get("environment"):
             kwargs["environment"] = config["environment"]
-        sentry_sdk.init(dsn=dsn, **kwargs)
+        init_key = (dsn, kwargs.get("environment"))
+        if init_key != self._inited_key:
+            sentry_sdk.init(dsn=dsn, **kwargs)
+            self._inited_key = init_key
         extra = {
             "job": job.config.name,
             "exit_code": job.retcode,
@@ -153,7 +197,7 @@ class SentryReporter(Reporter):
             extra,
             body,
         )
-        with sentry_sdk.push_scope() as scope:
+        with sentry_sdk.new_scope() as scope:
             for key, val in extra.items():
                 scope.set_extra(key, val)
             scope.fingerprint = fingerprint
@@ -181,18 +225,26 @@ class MailReporter(Reporter):
             with open(mail["password"]["fromFile"], "rt") as pass_file:
                 password = pass_file.read().strip()
         elif mail["password"]["fromEnvVar"]:
-            password = os.environ[mail["password"]["fromEnvVar"]]
+            env_var = mail["password"]["fromEnvVar"]
+            password = os.environ.get(env_var)
+            if not password:
+                # The env var *name* is config-derived and tied to a secret,
+                # so we don't echo it to the logs.
+                logger.error(
+                    "mail: password env var is not set; not sending email"
+                )
+                return
         else:
             password = None
         username = mail.get("username")
 
         tmpl_vars = job.template_vars
-        body_tmpl = jinja2.Template(mail["body"])
+        body_tmpl = _compiled_template(mail["body"])
         body = body_tmpl.render(tmpl_vars)
         if success and not body.strip():
             logger.debug("body is empty, not sending email")
             return
-        subject_tmpl = jinja2.Template(mail["subject"])
+        subject_tmpl = _compiled_template(mail["subject"])
         subject = subject_tmpl.render(tmpl_vars)
 
         logger.debug("smtp: host=%r, port=%r", smtp_host, smtp_port)
@@ -200,10 +252,12 @@ class MailReporter(Reporter):
         message["From"] = mail["from"]
         message["To"] = mail["to"].strip()
         message["Subject"] = subject.strip()
-        message["Date"] = datetime.now(timezone.utc)
+        # RFC 5322 date, e.g. "Wed, 18 Jun 2026 12:34:56 +0000" (not ISO-8601).
+        message["Date"] = format_datetime(datetime.now(timezone.utc))
         if mail["html"]:
-            message.set_payload(body)
-            message.add_header("Content-Type", "text/html")
+            # set_content handles charset + transfer-encoding so non-ASCII
+            # HTML bodies are sent correctly (set_payload would not).
+            message.set_content(body, subtype="html")
         else:
             message.set_content(body)
         smtp = aiosmtplib.SMTP(
@@ -213,12 +267,18 @@ class MailReporter(Reporter):
             validate_certs=mail["validate_certs"],
         )
         await smtp.connect()
-        if mail["starttls"]:
-            await smtp.starttls()
-        if username and password:
-            await smtp.login(username=username, password=password)
-
-        await smtp.send_message(message)
+        # close() (sync, idempotent) guarantees the socket is released even if
+        # starttls/login/send raises, so a failing SMTP server can't leak a
+        # connection per report.
+        try:
+            if mail["starttls"]:
+                await smtp.starttls()
+            if username and password:
+                # aiosmtplib >=2 takes username/password as positional args.
+                await smtp.login(username, password)
+            await smtp.send_message(message)
+        finally:
+            smtp.close()
 
 
 class ShellReporter(Reporter):
@@ -264,24 +324,24 @@ class ShellReporter(Reporter):
 
         env = {
             **os.environ,
-            "YACRON_FAIL_REASON": (
+            "YACRON2_FAIL_REASON": (
                 job.fail_reason if job.fail_reason is not None else ""
             ),
-            "YACRON_JOB_NAME": job.config.name,
-            "YACRON_JOB_COMMAND": (
+            "YACRON2_JOB_NAME": job.config.name,
+            "YACRON2_JOB_COMMAND": (
                 job.config.command
                 if not isinstance(job.config.command, list)
                 else " ".join(job.config.command)
             ),
-            "YACRON_JOB_SCHEDULE": job.config.schedule_unparsed,
-            "YACRON_FAILED": "1" if job.failed else "0",
-            "YACRON_RETCODE": str(job.retcode),
-            "YACRON_STDERR": std_err_str_safe,
-            "YACRON_STDOUT": std_out_str_safe,
-            "YACRON_STDERR_TRUNCATED": (
+            "YACRON2_JOB_SCHEDULE": job.config.schedule_unparsed,
+            "YACRON2_FAILED": "1" if job.failed else "0",
+            "YACRON2_RETCODE": str(job.retcode),
+            "YACRON2_STDERR": std_err_str_safe,
+            "YACRON2_STDOUT": std_out_str_safe,
+            "YACRON2_STDERR_TRUNCATED": (
                 "1" if len(std_err_str_safe) != len(std_err_str) else "0"
             ),
-            "YACRON_STDOUT_TRUNCATED": (
+            "YACRON2_STDOUT_TRUNCATED": (
                 "1" if len(std_out_str_safe) != len(std_out_str) else "0"
             ),
         }
@@ -297,7 +357,9 @@ class ShellReporter(Reporter):
 
         retcode = await proc.wait()
         if retcode != 0:
-            logger.exception(
+            # not in an except block: a nonzero exit is not an exception, so
+            # logger.exception would log a bogus "NoneType: None" traceback.
+            logger.error(
                 "Error executing shell reporter of job %s with return code %s",
                 job.config.name,
                 retcode,
@@ -344,6 +406,16 @@ class RunningJob:
         self.execution_deadline = None  # type: Optional[float]
         self.retry_state = retry_state
         self.env = None  # type: Optional[Dict[str, str]]
+        # set when the subprocess could not be launched at all (e.g. the
+        # command does not exist). Lets wait() treat it as a normal job
+        # failure instead of raising RuntimeError("process is not running").
+        self.start_failed = False
+        # guards against _on_stop running twice (cancel() racing wait())
+        self._stopped = False
+        # set by the scheduler when this run is deliberately cancelled to make
+        # way for a newer instance (concurrencyPolicy=Replace). Such a forced
+        # termination is not a job failure and must not be reported or retried.
+        self.replaced = False
 
         statsd_config = self.config.statsd
         if statsd_config is not None:
@@ -358,11 +430,35 @@ class RunningJob:
 
     async def _on_start(self) -> None:
         if self.statsd_writer:
-            await self.statsd_writer.job_started()
+            # statsd is best-effort telemetry; a send failure (e.g. an
+            # unresolvable host) must never propagate out of job launch and
+            # crash the scheduler loop.
+            try:
+                await self.statsd_writer.job_started()
+            except OSError:
+                logger.warning(
+                    "Job %s: failed to send statsd job_started metric",
+                    self.config.name,
+                    exc_info=True,
+                )
 
     async def _on_stop(self) -> None:
+        # idempotent: cancel() and the wait() task can both reach here for a
+        # single run (e.g. concurrencyPolicy=Replace), but stop metrics must
+        # only be emitted once. Safe without locking because asyncio is
+        # single-threaded and there is no await before the flag is set.
+        if self._stopped:
+            return
+        self._stopped = True
         if self.statsd_writer:
-            await self.statsd_writer.job_stopped()
+            try:
+                await self.statsd_writer.job_stopped()
+            except OSError:
+                logger.warning(
+                    "Job %s: failed to send statsd job_stopped metric",
+                    self.config.name,
+                    exc_info=True,
+                )
 
     async def start(self) -> None:
         if self.proc is not None:
@@ -383,7 +479,7 @@ class RunningJob:
             fixup_pyinstaller_env(env)
             for envvar in self.config.environment:
                 env[envvar["key"]] = envvar["value"]
-                self.env = env
+            self.env = env
             kwargs["env"] = env
         if self.config.uid is not None or self.config.gid is not None:
             kwargs["preexec_fn"] = self._demote
@@ -416,6 +512,7 @@ class RunningJob:
                 kwargs,
                 sys.getdefaultencoding(),
             )
+            self.start_failed = True
             return
 
         await self._on_start()
@@ -440,21 +537,46 @@ class RunningJob:
             )
 
     def _demote(self):
-        if self.config.gid is not None:
-            logger.debug("Changing to gid %r ...", self.config.gid)
+        # Runs in the child (preexec_fn) while still privileged. Order matters:
+        # set/clear supplementary groups, then the primary gid, then the uid.
+        # Dropping supplementary groups BEFORE setuid is essential — otherwise
+        # the child keeps root's supplementary group memberships (the classic
+        # "forgot setgroups() before setuid()" privilege-escalation bug).
+        gid = self.config.gid
+        uid = self.config.uid
+        username = self.config.username
+        try:
+            if username is not None and gid is not None:
+                # gives the target user exactly their own supplementary groups
+                os.initgroups(username, gid)
+            else:
+                # unknown user/gid: drop all supplementary groups
+                os.setgroups([])
+        except OSError as ex:
+            raise RuntimeError("setgroups/initgroups: {}".format(ex)) from ex
+        if gid is not None:
+            logger.debug("Changing to gid %r ...", gid)
             try:
-                os.setgid(self.config.gid)
+                os.setgid(gid)
             except OSError as ex:
-                raise RuntimeError("setgid: {}".format(ex))
-        if self.config.uid is not None:
-            logger.debug("Changing to uid %r ...", self.config.uid)
+                raise RuntimeError("setgid: {}".format(ex)) from ex
+        if uid is not None:
+            logger.debug("Changing to uid %r ...", uid)
             try:
-                os.setuid(self.config.uid)
+                os.setuid(uid)
             except OSError as ex:
-                raise RuntimeError("setuid: {}".format(ex))
+                raise RuntimeError("setuid: {}".format(ex)) from ex
 
     async def wait(self) -> None:
         if self.proc is None:
+            if self.start_failed:
+                # The command never launched (e.g. it does not exist). Report
+                # it as a normal failure (conventional "command not found"
+                # exit code 127) rather than raising RuntimeError, which the
+                # reaper would log as "please report this as a bug".
+                self.retcode = 127
+                await self._read_job_streams()
+                return
             raise RuntimeError("process is not running")
         if self.execution_deadline is None:
             self.retcode = await self.proc.wait()

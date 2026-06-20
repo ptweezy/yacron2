@@ -1,7 +1,6 @@
+import asyncio
 import logging
 import time
-import asyncio
-
 
 logger = logging.getLogger("statsd")
 
@@ -20,14 +19,16 @@ class StatsdClientProtocol:
         pass
 
     def error_received(self, exc):
-        logger.error("UDP error received:", exc)
+        # the format string needs a placeholder, otherwise logging raises a
+        # TypeError and the actual exception detail is lost.
+        logger.error("UDP error received: %s", exc)
 
     def connection_lost(self, exc):
         pass
 
 
 async def send_to_statsd(host, port, message):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     connect = loop.create_datagram_endpoint(
         lambda: StatsdClientProtocol(message, loop), remote_addr=(host, port)
     )

@@ -64,4 +64,4 @@ target/
 /.mypy_cache/
 
 /pyoxidizer/venv/
-/yacron/version.py
+/yacron2/version.py

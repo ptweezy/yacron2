@@ -1,31 +1,36 @@
-import logging.config
 import asyncio
 import asyncio.subprocess
 import datetime
+import hmac
 import logging
+import logging.config
+import os
 from collections import OrderedDict, defaultdict
 from typing import Any, Awaitable, Dict, List, Optional, Union  # noqa
 from urllib.parse import urlparse
+
 from aiohttp import web
-import yacron.version
-from yacron.config import (
-    JobConfig,
-    parse_config,
-    ConfigError,
-    parse_config_string,
-    WebConfig,
-    YacronConfig,
-    JobDefaults,
-)
-from yacron.job import RunningJob, JobRetryState
 from crontab import CronTab  # noqa
 
-logger = logging.getLogger("yacron")
+import yacron2.version
+from yacron2.config import (
+    ConfigError,
+    JobConfig,
+    JobDefaults,
+    LoggingConfig,
+    WebConfig,
+    Yacron2Config,
+    parse_config,
+    parse_config_string,
+)
+from yacron2.job import JobRetryState, RunningJob
+
+logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
 
 
-def naturaltime(seconds: float, future=False) -> str:
-    assert future
+def naturaltime(seconds: float) -> str:
+    # only ever used to describe a future instant ("in N seconds")
     if seconds < 120:
         return "in {} second{}".format(
             int(seconds), "s" if seconds >= 2 else ""
@@ -55,8 +60,13 @@ def next_sleep_interval() -> float:
 def web_site_from_url(runner: web.AppRunner, url: str) -> web.BaseSite:
     parsed = urlparse(url)
     if parsed.scheme == "http":
-        assert parsed.hostname is not None
-        assert parsed.port is not None
+        if parsed.hostname is None or parsed.port is None:
+            # raise ValueError (not AssertionError) so a malformed http url is
+            # treated as a skippable bad-config entry, not an internal bug.
+            logger.warning(
+                "Ignoring web listen url %s: http url needs host and port", url
+            )
+            raise ValueError(url)
         return web.TCPSite(runner, parsed.hostname, parsed.port)
     elif parsed.scheme == "unix":
         return web.UnixSite(runner, parsed.path)
@@ -77,9 +87,7 @@ class Cron:
         self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
         # list of cron jobs already running
         # name -> list of RunningJob
-        self.running_jobs = defaultdict(
-            list
-        )  # type: Dict[str, List[RunningJob]]
+        self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -103,8 +111,13 @@ class Cron:
         )
 
         startup = True
-        logging_configured = False
+        applied_logging_config: Optional[LoggingConfig] = None
         while not self._stop_event.is_set():
+            # None until update_config succeeds this iteration; on failure we
+            # keep running the previously-loaded jobs (update_config only
+            # overwrites self.cron_jobs on success) and must not dereference an
+            # unbound config below.
+            config: Optional[Yacron2Config] = None
             try:
                 config = self.update_config()
                 await self.start_stop_web_app(config.web_config)
@@ -116,8 +129,11 @@ class Cron:
                 )
             except Exception:  # pragma: nocover
                 logger.exception("please report this as a bug (1)")
-            if config.logging_config is not None and not logging_configured:
-                logging_configured = True
+            if (
+                config is not None
+                and config.logging_config is not None
+                and config.logging_config != applied_logging_config
+            ):
                 try:
                     logging.config.dictConfig(config.logging_config)
                 except Exception as ex:
@@ -129,6 +145,11 @@ class Cron:
                         ex,
                         config.logging_config,
                     )
+                else:
+                    # only mark applied on success, and re-apply when the
+                    # config changes, so a fixed-after-error logging section
+                    # is picked up on reload without a restart.
+                    applied_logging_config = config.logging_config
             await self.spawn_jobs(startup)
             startup = False
             sleep_interval = next_sleep_interval()
@@ -154,9 +175,9 @@ class Cron:
         logger.debug("Signalling shutdown")
         self._stop_event.set()
 
-    def update_config(self) -> YacronConfig:
+    def update_config(self) -> Yacron2Config:
         if self.config_arg is None:
-            return YacronConfig(
+            return Yacron2Config(
                 jobs=[],
                 web_config=None,
                 job_defaults=JobDefaults({}),
@@ -167,9 +188,14 @@ class Cron:
         return config
 
     async def _web_get_version(self, request: web.Request) -> web.Response:
-        return web.Response(text=yacron.version.version)
+        assert self.web_config is not None
+        return web.Response(
+            text=yacron2.version.version,
+            headers=self.web_config.get("headers", None),
+        )
 
     async def _web_get_status(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
         out = []
         for name, job in self.cron_jobs.items():
             running = self.running_jobs.get(name, None)
@@ -185,6 +211,10 @@ class Cron:
                         ],
                     }
                 )
+            elif not job.enabled:
+                # disabled jobs never run on schedule; report that honestly
+                # instead of an inapplicable "scheduled (in N seconds)".
+                out.append({"job": name, "status": "disabled"})
             else:
                 crontab = job.schedule  # type: Union[CronTab, str]
                 now = get_now(job.timezone)
@@ -200,7 +230,9 @@ class Cron:
                     }
                 )
         if request.headers.get("Accept") == "application/json":
-            return web.json_response(out)
+            return web.json_response(
+                out, headers=self.web_config.get("headers", None)
+            )
         else:
             lines = []
             for jobstat in out:  # type: Dict[str, Any]
@@ -208,14 +240,14 @@ class Cron:
                     status = "running (pid: {pid})".format(
                         pid=", ".join(str(pid) for pid in jobstat["pid"])
                     )
+                elif jobstat["status"] == "disabled":
+                    status = "disabled"
                 else:
                     status = "scheduled ({})".format(
                         (
                             jobstat["scheduled_in"]
-                            if type(jobstat["scheduled_in"]) is str
-                            else naturaltime(
-                                jobstat["scheduled_in"], future=True
-                            )
+                            if isinstance(jobstat["scheduled_in"], str)
+                            else naturaltime(jobstat["scheduled_in"])
                         )
                     )
                 lines.append(
@@ -223,16 +255,27 @@ class Cron:
                         name=jobstat["job"], status=status
                     )
                 )
-            return web.Response(text="\n".join(lines))
+            return web.Response(
+                text="\n".join(lines),
+                headers=self.web_config.get("headers", None),
+            )
 
     async def _web_start_job(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
         name = request.match_info["name"]
         try:
             job = self.cron_jobs[name]
-        except KeyError:
-            raise web.HTTPNotFound()
+        except KeyError as ex:
+            raise web.HTTPNotFound() from ex
+        if not job.enabled:
+            # a disabled job behaves "as if it isn't there"; refuse to launch
+            # it manually rather than silently overriding the config.
+            raise web.HTTPConflict(
+                text="job {!r} is disabled".format(name),
+                headers=self.web_config.get("headers", None),
+            )
         await self.maybe_launch_job(job)
-        return web.Response()
+        return web.Response(headers=self.web_config.get("headers", None))
 
     async def start_stop_web_app(self, web_config: Optional[WebConfig]):
         if self.web_runner is not None and (
@@ -248,7 +291,12 @@ class Cron:
             and web_config["listen"]
             and self.web_runner is None
         ):
-            app = web.Application()
+            middlewares = []
+            token = self._resolve_web_token(web_config)
+            if token is not None:
+                logger.info("web: requiring bearer-token authentication")
+                middlewares.append(self._make_auth_middleware(token))
+            app = web.Application(middlewares=middlewares)
             app.add_routes(
                 [
                     web.get("/version", self._web_get_version),
@@ -258,14 +306,83 @@ class Cron:
             )
             self.web_runner = web.AppRunner(app)
             await self.web_runner.setup()
+            socket_mode = web_config.get("socketMode")
             for addr in web_config["listen"]:
-                site = web_site_from_url(self.web_runner, addr)
-                logger.info("web: started listening on %s", addr)
                 try:
+                    site = web_site_from_url(self.web_runner, addr)
                     await site.start()
-                except ValueError:
-                    pass
+                except (ValueError, OSError) as ex:
+                    # bad scheme/url (ValueError) or bind failure (OSError):
+                    # skip this address rather than aborting the whole config
+                    # update or reporting it as an internal bug.
+                    logger.warning("web: could not listen on %s: %s", addr, ex)
+                    continue
+                logger.info("web: started listening on %s", addr)
+                if socket_mode:
+                    self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
+
+    @staticmethod
+    def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
+        auth = web_config.get("authToken")
+        if not auth:
+            return None
+        # authToken is configured: resolve it from exactly one source and fail
+        # closed (ConfigError) if it cannot be resolved to a non-empty secret.
+        # Otherwise a misconfigured source (unset env var, empty/missing file)
+        # would silently leave the web API listening with no authentication.
+        if auth.get("value"):
+            token = str(auth["value"])
+        elif auth.get("fromFile"):
+            try:
+                with open(auth["fromFile"], "rt") as token_file:
+                    token = token_file.read().strip()
+            except OSError as ex:
+                raise ConfigError(
+                    "web.authToken.fromFile could not be read: {}".format(ex)
+                ) from ex
+        elif auth.get("fromEnvVar"):
+            token = os.environ.get(auth["fromEnvVar"], "")
+        else:
+            token = ""
+        if not token:
+            raise ConfigError(
+                "web.authToken is configured but resolved to an empty token; "
+                "refusing to start the web API without authentication"
+            )
+        return token
+
+    @staticmethod
+    def _make_auth_middleware(token: str):
+        @web.middleware
+        async def auth_middleware(request, handler):
+            header = request.headers.get("Authorization", "")
+            scheme, _, presented = header.partition(" ")
+            # RFC 7235: the auth scheme is case-insensitive (Bearer/bearer).
+            # Compare only the token, in constant time, to avoid leaking it via
+            # timing (the scheme is not secret).
+            if scheme.lower() != "bearer" or not hmac.compare_digest(
+                presented, token
+            ):
+                raise web.HTTPUnauthorized()
+            return await handler(request)
+
+        return auth_middleware
+
+    @staticmethod
+    def _apply_socket_mode(addr: str, socket_mode: str) -> None:
+        parsed = urlparse(addr)
+        if parsed.scheme != "unix":
+            return
+        try:
+            os.chmod(parsed.path, int(socket_mode, 8))
+        except (OSError, ValueError) as ex:
+            logger.warning(
+                "web: could not set socketMode %r on %s: %s",
+                socket_mode,
+                parsed.path,
+                ex,
+            )
 
     async def spawn_jobs(self, startup: bool) -> None:
         for job in self.cron_jobs.values():
@@ -339,6 +456,9 @@ class Cron:
                 return
             elif job.concurrencyPolicy == "Replace":
                 for running_job in self.running_jobs[job.name]:
+                    # mark before cancelling so the reaper treats the forced
+                    # termination as a replacement, not a job failure.
+                    running_job.replaced = True
                     await running_job.cancel()
             else:
                 raise AssertionError  # pragma: no cover
@@ -381,32 +501,47 @@ class Cron:
                     try:
                         task.result()
                     except Exception:  # pragma: no cover
-                        logger.exception("please report this as a bug (2)")
-
-                    jobs_list = self.running_jobs[job.config.name]
-                    jobs_list.remove(job)
-                    if not jobs_list:
-                        del self.running_jobs[job.config.name]
-
-                    fail_reason = job.fail_reason
-                    logger.info(
-                        "Job %s exit code %s; has stdout: %s, "
-                        "has stderr: %s; fail_reason: %r",
-                        job.config.name,
-                        job.retcode,
-                        str(bool(job.stdout)).lower(),
-                        str(bool(job.stderr)).lower(),
-                        fail_reason,
-                    )
-                    if fail_reason is not None:
-                        await self.handle_job_failure(job)
-                    else:
-                        await self.handle_job_success(job)
+                        logger.exception(
+                            "Unexpected error while waiting on job %s; "
+                            "please report this as a bug (2)",
+                            job.config.name,
+                        )
+                    await self._handle_finished_job(job)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover
                 logger.exception("please report this as a bug (3)")
                 await asyncio.sleep(1)
+
+    async def _handle_finished_job(self, job: RunningJob) -> None:
+        jobs_list = self.running_jobs[job.config.name]
+        jobs_list.remove(job)
+        if not jobs_list:
+            del self.running_jobs[job.config.name]
+
+        if job.replaced:
+            # deliberately cancelled to make way for a newer instance
+            # (concurrencyPolicy=Replace); not a failure, so don't report it
+            # or trigger retries.
+            logger.info(
+                "Job %s was replaced by a newer instance", job.config.name
+            )
+            return
+
+        fail_reason = job.fail_reason
+        logger.info(
+            "Job %s exit code %s; has stdout: %s, "
+            "has stderr: %s; fail_reason: %r",
+            job.config.name,
+            job.retcode,
+            str(bool(job.stdout)).lower(),
+            str(bool(job.stderr)).lower(),
+            fail_reason,
+        )
+        if fail_reason is not None:
+            await self.handle_job_failure(job)
+        else:
+            await self.handle_job_success(job)
 
     async def handle_job_failure(self, job: RunningJob) -> None:
         if self._stop_event.is_set():
@@ -454,7 +589,7 @@ class Cron:
         self, job_name: str, delay: float, retry_num: int
     ) -> None:
         logger.info(
-            "Cron job %s scheduled to be retried (#%i) " "in %.1f seconds",
+            "Cron job %s scheduled to be retried (#%i) in %.1f seconds",
             job_name,
             retry_num,
             delay,
@@ -468,6 +603,10 @@ class Cron:
                 "disappeared from the configuration",
                 job_name,
             )
+            # clear the now-stale retry state and stop; falling through here
+            # would call maybe_launch_job(job) with an unbound 'job'.
+            self.retry_state.pop(job_name, None)
+            return
         await self.maybe_launch_job(job)
 
     async def handle_job_success(self, job: RunningJob) -> None:

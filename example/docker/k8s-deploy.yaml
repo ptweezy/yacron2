@@ -1,18 +1,21 @@
 ---
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: yacrondemo
+  name: yacron2demo
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: yacron2demo
   template:
     metadata:
       labels:
-        app: yacrondemo
+        app: yacron2demo
     spec:
       containers:
-      - name: yacrondemo
-        image: yacrondemo
+      - name: yacron2demo
+        image: yacron2demo
         imagePullPolicy: Never
         resources:
           limits:

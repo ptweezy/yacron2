@@ -1,19 +1,18 @@
 import argparse
 import asyncio
-import asyncio.subprocess
 import logging
+import os
 import signal
 import sys
-import os
 
-from yacron.cron import Cron, ConfigError
-import yacron.version
+import yacron2.version
+from yacron2.cron import ConfigError, Cron
 
-CONFIG_DEFAULT = "/etc/yacron.d"
+CONFIG_DEFAULT = "/etc/yacron2.d"
 
 
 def main_loop(loop):
-    parser = argparse.ArgumentParser(prog="yacron")
+    parser = argparse.ArgumentParser(prog="yacron2")
     parser.add_argument(
         "-c",
         "--config",
@@ -30,15 +29,15 @@ def main_loop(loop):
 
     logging.basicConfig(level=getattr(logging, args.log_level))
     # logging.getLogger("asyncio").setLevel(logging.WARNING)
-    logger = logging.getLogger("yacron")
+    logger = logging.getLogger("yacron2")
 
     if args.version:
-        print(yacron.version.version)
+        print(yacron2.version.version)
         sys.exit(0)
 
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(
-            "yacron error: configuration file not found, please provide one "
+            "yacron2 error: configuration file not found, please provide one "
             "with the --config option",
             file=sys.stderr,
         )
@@ -65,11 +64,9 @@ def main_loop(loop):
 
 
 def main():  # pragma: no cover
-    if sys.platform == "win32":
-        _loop = asyncio.ProactorEventLoop()
-        asyncio.set_event_loop(_loop)
-    else:
-        _loop = asyncio.get_event_loop()
+    # yacron2 is POSIX-only (config.py imports grp/pwd at module load), so
+    # there is no Windows event-loop branch to maintain here.
+    _loop = asyncio.new_event_loop()
     try:
         main_loop(_loop)
     finally:

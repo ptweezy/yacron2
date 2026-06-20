@@ -1,0 +1,26 @@
+# Keep the build context small. NOTE: .git MUST be included — setuptools_scm
+# derives the version from git tags during `pip install .`. README.md and
+# LICENSE must also stay: pyproject.toml references them at build time.
+.venv
+.venv314
+.tox
+.mypy_cache
+.ruff_cache
+.pytest_cache
+dist
+build
+*.egg-info
+__pycache__
+*.pyc
+
+# Not needed to build the package; excluded to shrink the build context.
+.claude
+.github
+example
+pyinstaller
+scripts
+target
+tests
+.editorconfig
+.gitignore
+.pre-commit-config.yaml

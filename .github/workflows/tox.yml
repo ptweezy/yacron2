@@ -1,20 +1,25 @@
 name: tox
 on: [push, pull_request]
+
+# Least-privilege default: every job here only reads the repo.
+permissions:
+  contents: read
+
 jobs:
-  tox-flake8:
+  tox-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v3
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6.2.0
       - run: pip install --upgrade pip
       - run: pip install tox
-      - run: tox -e flake8
+      - run: tox -e lint
 
   tox-mypy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v3
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6.2.0
       - run: pip install --upgrade pip
       - run: pip install tox
       - run: tox -e mypy
@@ -24,11 +29,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]  # [macos-latest, ubuntu-latest, windows-latest]
-        python: ['3.7', '3.8', '3.9', '3.10']
+        python: ['3.13', '3.14']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v3
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6.2.0
         with:
           python-version: ${{ matrix.python }}
       - run: pip install --upgrade pip

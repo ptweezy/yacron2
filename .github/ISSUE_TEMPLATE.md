@@ -1,4 +1,4 @@
-* Yet Another Cron version:
+* yacron2 version:
 * Python version:
 * Operating System:
 

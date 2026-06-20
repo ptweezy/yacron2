@@ -1,32 +1,39 @@
-from dataclasses import dataclass
-from pwd import getpwnam
-from grp import getgrnam
+import copy
+import datetime
 import logging
 import os.path
-from typing import Union  # noqa
-from typing import List, Optional, Any, Dict, NewType
-import datetime
-import pytz
+from dataclasses import dataclass
+from grp import getgrnam
+from pwd import getpwnam, getpwuid
+from typing import (
+    Any,
+    Dict,
+    List,
+    NewType,
+    Optional,
+    Union,  # noqa
+)
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import strictyaml
-from strictyaml import Optional as Opt, EmptyDict
+from crontab import CronTab
 from strictyaml import Any as YamlAny
 from strictyaml import (
     Bool,
+    EmptyDict,
     EmptyNone,
     Enum,
     Float,
     Int,
     Map,
+    MapPattern,
     Seq,
     Str,
-    MapPattern,
 )
+from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
-from crontab import CronTab
-
-logger = logging.getLogger("yacron.config")
+logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
 JobDefaults = NewType("JobDefaults", Dict[str, Any])
 LoggingConfig = NewType("LoggingConfig", Dict[str, Any])
@@ -57,15 +64,14 @@ STDERR:
 """
 
 DEFAULT_SUBJECT_TEMPLATE = (
-    "Cron job '{{name}}' {% if success %}completed"
-    "{% else %}failed{% endif %}"
+    "Cron job '{{name}}' {% if success %}completed{% else %}failed{% endif %}"
 )
 
 _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
         "body": DEFAULT_SUBJECT_TEMPLATE + "\n" + DEFAULT_BODY_TEMPLATE,
-        "fingerprint": ["yacron", "{{ environment.HOSTNAME }}", "{{ name }}"],
+        "fingerprint": ["yacron2", "{{ environment.HOSTNAME }}", "{{ name }}"],
         "environment": None,
         "maxStringLength": 8192,
     },
@@ -76,7 +82,7 @@ _REPORT_DEFAULTS = {
         "smtpPort": 25,
         "tls": False,
         "starttls": False,
-        "validate_certs": False,
+        "validate_certs": True,
         "html": False,
         "subject": DEFAULT_SUBJECT_TEMPLATE,
         "body": DEFAULT_BODY_TEMPLATE,
@@ -112,10 +118,12 @@ DEFAULT_CONFIG = {
             "maximumDelay": 300,
             "backoffMultiplier": 2,
         },
-        "report": _REPORT_DEFAULTS,
+        # deepcopy so the three report blocks below do not alias the same
+        # mutable object (and its nested lists, e.g. sentry "fingerprint").
+        "report": copy.deepcopy(_REPORT_DEFAULTS),
     },
-    "onPermanentFailure": {"report": _REPORT_DEFAULTS},
-    "onSuccess": {"report": _REPORT_DEFAULTS},
+    "onPermanentFailure": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
+    "onSuccess": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
     "environment": [],
     "env_file": None,
     "executionTimeout": None,
@@ -242,7 +250,22 @@ CONFIG_SCHEMA = EmptyDict() | Map(
     {
         Opt("defaults"): Map(_job_defaults_common),
         Opt("jobs"): Seq(Map(_job_schema_dict)),
-        Opt("web"): Map({"listen": Seq(Str())}),
+        Opt("web"): Map(
+            {
+                "listen": Seq(Str()),
+                Opt("headers"): MapPattern(Str(), Str()),
+                # optional opt-in bearer-token auth for the web API
+                Opt("authToken"): Map(
+                    {
+                        Opt("value"): EmptyNone() | Str(),
+                        Opt("fromFile"): EmptyNone() | Str(),
+                        Opt("fromEnvVar"): EmptyNone() | Str(),
+                    }
+                ),
+                # octal permissions to apply to a unix:// listen socket
+                Opt("socketMode"): Str(),
+            }
+        ),
         Opt("include"): Seq(Str()),
         Opt("logging"): Map(
             {
@@ -271,7 +294,29 @@ def mergedicts(dict1, dict2):
             elif isinstance(v1, dict) and v2 is None:  # modification
                 yield (k, dict(mergedicts(v1, {})))
             elif isinstance(v1, list) and isinstance(v2, list):  # merge lists
-                yield (k, v1 + v2)
+                if k == "environment":
+                    # environment is a list of {key, value}; merge by key so a
+                    # job's variable overrides the default instead of producing
+                    # a duplicate-keyed concatenation.
+                    merged = {e["key"]: e["value"] for e in v1}
+                    for e in v2:
+                        merged[e["key"]] = e["value"]
+                    yield (
+                        k,
+                        [
+                            {"key": kk, "value": vv}
+                            for kk, vv in merged.items()
+                        ],
+                    )
+                elif k == "fingerprint":
+                    # sentry "fingerprint" is a replace-not-append setting: a
+                    # job (or a defaults block) that supplies its own
+                    # fingerprint must override the default entirely. Plain
+                    # concatenation would silently prepend the three default
+                    # entries, making custom Sentry issue grouping impossible.
+                    yield (k, v2)
+                else:
+                    yield (k, v1 + v2)
             else:
                 yield (k, v2)
         elif k in dict1:
@@ -285,24 +330,9 @@ class JobConfig:
         self.name = config["name"]  # type: str
         self.command = config["command"]  # type: Union[str, List[str]]
         self.schedule_unparsed = config.pop("schedule")
-        if isinstance(self.schedule_unparsed, str):
-            if self.schedule_unparsed in {"@reboot"}:
-                self.schedule = (
-                    self.schedule_unparsed
-                )  # type: Union[CronTab, str]
-            else:
-                self.schedule = CronTab(self.schedule_unparsed)
-        elif isinstance(self.schedule_unparsed, dict):
-            minute = self.schedule_unparsed.get("minute", "*")
-            hour = self.schedule_unparsed.get("hour", "*")
-            day = self.schedule_unparsed.get("dayOfMonth", "*")
-            month = self.schedule_unparsed.get("month", "*")
-            dow = self.schedule_unparsed.get("dayOfWeek", "*")
-            tab = "{} {} {} {} {}".format(minute, hour, day, month, dow)
-            logger.debug("Converted schedule to %r", tab)
-            self.schedule = CronTab(tab)
-        else:
-            raise ConfigError("invalid schedule: %r", self.schedule_unparsed)
+        self.schedule: Union[CronTab, str] = self._parse_schedule(
+            self.schedule_unparsed
+        )
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
         self.captureStderr = config.pop("captureStderr")
@@ -312,14 +342,10 @@ class JobConfig:
         self.maxLineLength = config.pop("maxLineLength")
         self.utc = config.pop("utc")
         self.enabled: bool = config.pop("enabled")
-        self.timezone = None  # type: Optional[datetime.tzinfo]
-        if config["timezone"] is not None:
-            try:
-                self.timezone = pytz.timezone(config["timezone"])
-            except pytz.UnknownTimeZoneError as err:
-                raise ConfigError("unknown timezone: " + str(err))
-        elif self.utc:
-            self.timezone = datetime.timezone.utc
+        # depends on self.utc, so resolve after it is set
+        self.timezone: Optional[datetime.tzinfo] = self._resolve_timezone(
+            config.pop("timezone")
+        )
 
         self.failsWhen = config.pop("failsWhen")
         self.onFailure = config.pop("onFailure")
@@ -329,41 +355,93 @@ class JobConfig:
         self.env_file = config.pop("env_file")
         self.environment = config.pop("environment")
         if self.env_file is not None:
-            try:
-                file_environs = parse_environment_file(self.env_file)
-            except OSError as e:
-                raise ConfigError("Could not load env_file: {}".format(e))
-            else:
-                # unpack variables in dictionaries
-                config_environs = {
-                    env["key"]: env["value"] for env in self.environment
-                }
-                # update file values with config ones
-                file_environs.update(config_environs)
-                # replace environment
-                self.environment = [
-                    {"key": key, "value": value}
-                    for key, value in file_environs.items()
-                ]
+            self._merge_env_file()
 
         self.executionTimeout = config.pop("executionTimeout")
         self.killTimeout = config.pop("killTimeout")
         self.statsd = config.pop("statsd")
 
-        self.uid = None
-        self.gid = None
+        self.uid = None  # type: Optional[int]
+        self.gid = None  # type: Optional[int]
+        # Resolved login name of the target user, used by the child process'
+        # privilege-drop (os.initgroups) so it gets the user's supplementary
+        # groups instead of inheriting root's. None when unknown.
+        self.username: Optional[str] = None
+        self._resolve_user_group(config)
 
+        self._validate_numeric_ranges()
+
+    def _parse_schedule(self, schedule_unparsed) -> Union[CronTab, str]:
+        if isinstance(schedule_unparsed, str):
+            if schedule_unparsed == "@reboot":
+                return schedule_unparsed
+            return CronTab(schedule_unparsed)
+        if isinstance(schedule_unparsed, dict):
+            minute = schedule_unparsed.get("minute", "*")
+            hour = schedule_unparsed.get("hour", "*")
+            day = schedule_unparsed.get("dayOfMonth", "*")
+            month = schedule_unparsed.get("month", "*")
+            dow = schedule_unparsed.get("dayOfWeek", "*")
+            tab = f"{minute} {hour} {day} {month} {dow}"
+            logger.debug("Converted schedule to %r", tab)
+            return CronTab(tab)
+        raise ConfigError("invalid schedule: {!r}".format(schedule_unparsed))
+
+    def _resolve_timezone(
+        self, timezone: Optional[str]
+    ) -> Optional[datetime.tzinfo]:
+        if timezone is not None:
+            try:
+                return ZoneInfo(timezone)
+            except (ZoneInfoNotFoundError, ValueError) as err:
+                raise ConfigError(
+                    "unknown timezone: {}".format(timezone)
+                ) from err
+        if self.utc:
+            return datetime.timezone.utc
+        return None
+
+    def _merge_env_file(self) -> None:
+        try:
+            file_environs = parse_environment_file(self.env_file)
+        except OSError as e:
+            raise ConfigError("Could not load env_file: {}".format(e)) from e
+        # config-defined variables override those loaded from the file
+        config_environs = {
+            env["key"]: env["value"] for env in self.environment
+        }
+        file_environs.update(config_environs)
+        self.environment = [
+            {"key": key, "value": value}
+            for key, value in file_environs.items()
+        ]
+
+    def _resolve_user_group(self, config: dict) -> None:
         user = config.pop("user", None)
         if user is not None:
             if isinstance(user, int):
                 self.uid = user
+                # Derive the primary gid (and login name) from the passwd
+                # database so a numeric ``user`` without an explicit ``group``
+                # does not silently keep yacron2's (root) gid 0.
+                try:
+                    pw = getpwuid(user)
+                except KeyError:
+                    pw = None
+                if pw is not None:
+                    self.username = pw.pw_name
+                    if self.gid is None:
+                        self.gid = pw.pw_gid
             else:
                 try:
                     pw = getpwnam(user)
                     self.uid = pw.pw_uid
                     self.gid = pw.pw_gid
-                except KeyError:
-                    raise ConfigError("User not found: {!r}".format(user))
+                    self.username = pw.pw_name
+                except KeyError as e:
+                    raise ConfigError(
+                        "User not found: {!r}".format(user)
+                    ) from e
 
         group = config.pop("group", None)
         if group is not None:
@@ -372,15 +450,53 @@ class JobConfig:
             else:
                 try:
                     self.gid = getgrnam(group).gr_gid
-                except KeyError:
-                    raise ConfigError("Group not found: {!r}".format(group))
+                except KeyError as e:
+                    raise ConfigError(
+                        "Group not found: {!r}".format(group)
+                    ) from e
 
         if self.uid is not None or self.gid is not None:
             if os.geteuid() != 0:
                 raise ConfigError(
                     "Job {} wants to change user or group, "
-                    "but yacron is not running as superuser".format(self.name)
+                    "but yacron2 is not running as superuser".format(self.name)
                 )
+
+    def _validate_numeric_ranges(self) -> None:
+        # strictyaml only enforces the type (Int/Float); fail fast on values
+        # that would otherwise produce obscure runtime behaviour instead of a
+        # clear configuration error.
+        def require(condition: bool, message: str) -> None:
+            if not condition:
+                raise ConfigError("Job {}: {}".format(self.name, message))
+
+        require(self.saveLimit >= 0, "saveLimit must be >= 0")
+        require(self.maxLineLength > 0, "maxLineLength must be > 0")
+        require(self.killTimeout >= 0, "killTimeout must be >= 0")
+        if self.executionTimeout is not None:
+            require(
+                self.executionTimeout > 0,
+                "executionTimeout must be > 0 when set",
+            )
+        retry = self.onFailure.get("retry")
+        if retry is not None:
+            # -1 is the documented sentinel for "retry forever".
+            require(
+                retry["maximumRetries"] >= -1,
+                "onFailure.retry.maximumRetries must be >= -1",
+            )
+            require(
+                retry["initialDelay"] >= 0,
+                "onFailure.retry.initialDelay must be >= 0",
+            )
+            require(
+                retry["maximumDelay"] > 0,
+                "onFailure.retry.maximumDelay must be > 0",
+            )
+            require(
+                retry["backoffMultiplier"] > 0,
+                "onFailure.retry.backoffMultiplier must be > 0",
+            )
 
 
 def parse_environment_file(path: str) -> Dict[str, str]:
@@ -398,7 +514,7 @@ def parse_environment_file(path: str) -> Dict[str, str]:
     """
     environ: Dict[str, str] = {}
 
-    with open(path, "r") as env_file:
+    with open(path, "r", encoding="utf-8") as env_file:
         # file parsing
         # you may want to use the `dotenv` library to do the job
         for line in env_file.readlines():
@@ -418,18 +534,20 @@ def parse_environment_file(path: str) -> Dict[str, str]:
 
 
 @dataclass
-class YacronConfig:
+class Yacron2Config:
     jobs: List[JobConfig]
     web_config: Optional[WebConfig]
     job_defaults: JobDefaults
     logging_config: Optional[LoggingConfig]
 
 
-def parse_config_string(data: str, path: str) -> YacronConfig:
+def parse_config_string(
+    data: str, path: str, _seen: Optional[set] = None
+) -> Yacron2Config:
     try:
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
     except YAMLError as ex:
-        raise ConfigError(str(ex))
+        raise ConfigError(str(ex)) from ex
 
     inc_defaults_merged: dict = {}
     jobs = []
@@ -437,7 +555,11 @@ def parse_config_string(data: str, path: str) -> YacronConfig:
     logging_conf = LoggingConfig(doc["logging"]) if "logging" in doc else None
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
-        inc_config = parse_config_file(inc_path)
+        # Included jobs arrive already fully constructed, so they carry only
+        # their own file's defaults; a top-level ``defaults`` block does NOT
+        # retro-apply to them. Only the included files' defaults are merged
+        # here, and they affect this file's inline jobs.
+        inc_config = parse_config_file(inc_path, _seen)
         inc_defaults_merged = dict(
             mergedicts(inc_defaults_merged, inc_config.job_defaults)
         )
@@ -455,7 +577,7 @@ def parse_config_string(data: str, path: str) -> YacronConfig:
     for config_job in doc.get("jobs", []):
         job_dict = dict(mergedicts(defaults, config_job))
         jobs.append(JobConfig(job_dict))
-    return YacronConfig(
+    return Yacron2Config(
         jobs=jobs,
         web_config=webconf,
         job_defaults=JobDefaults(defaults),
@@ -463,56 +585,91 @@ def parse_config_string(data: str, path: str) -> YacronConfig:
     )
 
 
-def parse_config_file(
-    path: str,
-) -> YacronConfig:
+def parse_config_file(path: str, _seen: Optional[set] = None) -> Yacron2Config:
+    # Guard against include cycles (a file that includes itself directly or
+    # transitively) so a misconfiguration raises a clear ConfigError instead
+    # of recursing until RecursionError. _seen is scoped per top-level parse,
+    # so two independent files including a common file is not flagged.
+    abspath = os.path.abspath(path)
+    if _seen is None:
+        _seen = set()
+    if abspath in _seen:
+        raise ConfigError("include cycle detected at {}".format(path))
+    _seen.add(abspath)
     with open(path, "rt", encoding="utf-8") as stream:
         data = stream.read()
-    return parse_config_string(data, path)
+    return parse_config_string(data, path, _seen)
 
 
-def parse_config(config_arg: str) -> YacronConfig:
-    jobs = []
-    config_errors = {}
-    web_config = None
-    web_config_source_fname = None
+def parse_config(config_arg: str) -> Yacron2Config:
     if os.path.isdir(config_arg):
-        for direntry in os.scandir(config_arg):
-            base, ext = os.path.splitext(direntry.name)
-            if base[0] in {"_", "."}:
-                continue
-            if ext in {".yml", ".yaml"}:
-                try:
-                    config = parse_config_file(direntry.path)
-                except ConfigError as err:
-                    config_errors[direntry.path] = str(err)
-                except OSError as ex:
-                    config_errors[config_arg] = str(ex)
-                else:
-                    jobs.extend(config.jobs)
-                    if config.web_config is not None:
-                        if web_config is None:
-                            web_config = config.web_config
-                            web_config_source_fname = direntry.path
-                        else:
-                            raise ConfigError(
-                                "Multiple 'web' configurations found: "
-                                "first in {}, now in {}".format(
-                                    web_config_source_fname, direntry.path
-                                )
-                            )
-    else:
+        return _parse_config_dir(config_arg)
+    try:
+        return parse_config_file(config_arg)
+    except OSError as ex:
+        # surface a clean ConfigError (e.g. file not found) rather than a bare
+        # OSError, so callers (__main__) handle it uniformly.
+        raise ConfigError(str(ex)) from ex
+
+
+def _parse_config_dir(config_arg: str) -> Yacron2Config:
+    jobs: List[JobConfig] = []
+    config_errors: Dict[str, str] = {}
+    web_config: Optional[WebConfig] = None
+    web_config_source_fname: Optional[str] = None
+    logging_config: Optional[LoggingConfig] = None
+    logging_config_source_fname: Optional[str] = None
+    job_defaults: JobDefaults = JobDefaults({})
+    # Sort by name so job order and the "first config found" error messages
+    # are deterministic; os.scandir yields entries in arbitrary FS order.
+    for direntry in sorted(os.scandir(config_arg), key=lambda e: e.name):
+        base, ext = os.path.splitext(direntry.name)
+        if base[0] in {"_", "."}:
+            continue
+        if ext not in {".yml", ".yaml"}:
+            continue
         try:
-            config = parse_config_file(config_arg)
+            config = parse_config_file(direntry.path)
+        except ConfigError as err:
+            config_errors[direntry.path] = str(err)
+            continue
         except OSError as ex:
             config_errors[config_arg] = str(ex)
-        else:
-            jobs.extend(config.jobs)
+            continue
+        jobs.extend(config.jobs)
+        if config.web_config is not None:
+            if web_config is None:
+                web_config = config.web_config
+                web_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'web' configurations found: "
+                    "first in {}, now in {}".format(
+                        web_config_source_fname, direntry.path
+                    )
+                )
+        if config.logging_config is not None:
+            if logging_config is None:
+                logging_config = config.logging_config
+                logging_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'logging' configurations found: "
+                    "first in {}, now in {}".format(
+                        logging_config_source_fname, direntry.path
+                    )
+                )
+        job_defaults = JobDefaults(
+            dict(mergedicts(job_defaults, config.job_defaults))
+        )
     if config_errors:
         raise ConfigError("\n---".join(config_errors.values()))
-    return YacronConfig(
+    # Build the result from the accumulated values (never the last file's
+    # config), and return an empty config for an empty/all-skipped directory
+    # instead of raising UnboundLocalError.
+    return Yacron2Config(
         jobs=jobs,
-        web_config=config.web_config,
-        job_defaults=config.job_defaults,
-        logging_config=config.logging_config,
+        web_config=web_config,
+        job_defaults=job_defaults,
+        logging_config=logging_config,
     )

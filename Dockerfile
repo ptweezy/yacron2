@@ -64,4 +64,3 @@ USER 65534:65534
 
 ENTRYPOINT ["yacron2"]
 CMD ["-c", "/etc/yacron2.d"]
-

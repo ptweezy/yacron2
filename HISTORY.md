@@ -5,6 +5,16 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.7 (2026-06-20)
+
+- GitHub Releases now use the curated `HISTORY.md` section for the
+  release as the body of the release notes. The matching `## X.Y.Z`
+  entry is extracted and shown above GitHub's auto-generated "What's
+  Changed" list and changelog compare link, so each release page leads
+  with the human-written changelog instead of only auto-generated
+  notes.
+
+
 ## 1.0.6 (2026-06-20)
 
 - Release binaries are now published for both `linux/amd64` and

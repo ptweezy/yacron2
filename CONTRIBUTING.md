@@ -153,3 +153,4 @@ them up automatically (no code change needed):
 
 The image is then pushed to `docker.io/<DOCKERHUB_USERNAME>/yacron2` alongside
 GHCR.
+

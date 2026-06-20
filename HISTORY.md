@@ -5,6 +5,18 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.10 (2026-06-20)
+
+- Release binaries now include macOS builds for both Apple Silicon
+  (`yacron2-macos-arm64`) and Intel (`yacron2-macos-amd64`),
+  alongside the existing Linux glibc and musl binaries. As with the
+  Linux binaries, Python is not required on the target machine.
+- Document clearing the macOS Gatekeeper quarantine with
+  `xattr -d com.apple.quarantine` before first running the macOS
+  binaries, which are unsigned and unnotarized.
+- Fix a typo in the README fork attribution.
+
+
 ## 1.0.9 (2026-06-20)
 
 ### Documentation

@@ -75,13 +75,19 @@ workflow**, then pick the bump level from the dropdown.
 On a release the workflow, in order:
 
 1. **decides** whether to release and at what level (the strict marker check);
-2. **gates** on `tox` (py313, py314, lint, mypy) — a red build means no release;
-3. **builds** the wheel + sdist at the computed version;
-4. **publishes to PyPI** via [Trusted Publishing
+2. **computes** the next version from the latest `X.Y.Z` tag (refusing if that
+   tag already exists);
+3. **gates** on `tox` (py313, py314, lint, mypy) — a red build means no release;
+4. **builds** the wheel + sdist *and* the self-contained PyInstaller binaries
+   for `linux/amd64` + `linux/arm64` (each on a native runner, smoke-tested with
+   `--version`) — all at the computed version, *before* publishing, so a broken
+   build fails the run instead of producing a half-finished release;
+5. **publishes the wheel + sdist to PyPI** via [Trusted Publishing
    (OIDC)](https://docs.pypi.org/trusted-publishers/) — there is no API token to
    manage or leak;
-5. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
-   GitHub Release with the artifacts attached.
+6. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
+   GitHub Release with the wheel, sdist, and both binaries
+   (`yacron2-linux-amd64`, `yacron2-linux-arm64`) attached.
 
 Because no file is committed back to the repo, a release never re-triggers the
 workflow. Because the tag is created *after* publishing, a failed publish leaves
@@ -94,25 +100,6 @@ no orphan tag and a re-run cleanly retries the same version.
 - **PyPI versions are immutable.** A version, once uploaded, can never be
   re-uploaded, even after it is deleted or yanked. Pick the bump level
   deliberately.
-
-### Changelog (HISTORY.md)
-
-A local `commit-msg` hook drafts a `HISTORY.md` entry whenever you make a
-release commit, from the commits since the last tag. It is best-effort and
-never blocks a commit. Install it once per clone:
-
-```sh
-cp .githooks/commit-msg .git/hooks/commit-msg
-# Windows (PowerShell):
-# Copy-Item .githooks/commit-msg .git/hooks/commit-msg -Force
-```
-
-All the logic lives in
-[`scripts/gen_changelog_entry.py`](scripts/gen_changelog_entry.py). If a
-[`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI is on your
-`PATH`, the hook uses it to write a grouped, prose changelog entry; otherwise it
-falls back to a plain list of commit subjects. Review/edit the generated entry
-before pushing — it ships inside the published sdist.
 
 ## Container image
 

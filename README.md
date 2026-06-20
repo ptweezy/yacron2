@@ -73,8 +73,19 @@ pipx install yacron2
 ### Install using binary
 
 Alternatively, a self-contained binary can be downloaded
-from github: <https://github.com/ptweezy/yacron2/releases>. This binary should
-work on any Linux 64-bit system post glibc 2.39 (e.g. Ubuntu:24.04).  Python is not required on the target system (it is embedded in the executable).
+from github: <https://github.com/ptweezy/yacron2/releases>. Every release
+automatically attaches a binary for both architectures —
+`yacron2-linux-amd64` and `yacron2-linux-arm64`. They work on any Linux system
+post glibc 2.39 (e.g. Ubuntu 24.04) on the matching CPU.  Python is not required
+on the target system (it is embedded in the executable):
+
+```shell
+# pick the asset for your architecture (amd64 shown)
+curl -fsSL -o yacron2 \
+  https://github.com/ptweezy/yacron2/releases/latest/download/yacron2-linux-amd64
+chmod +x yacron2
+./yacron2 --version
+```
 
 ## Production container deployment
 

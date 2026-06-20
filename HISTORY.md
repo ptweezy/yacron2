@@ -5,6 +5,31 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.9 (2026-06-20)
+
+### Documentation
+
+- Document that the standalone binary is self-extracting: on each
+  start it unpacks its embedded Python runtime into a temporary
+  directory, so it requires a temp directory that is both writable
+  and executable.
+- Add guidance for running the binary under a read-only root
+  filesystem â€” mount a small `rw,exec` tmpfs at `/tmp` (Docker's
+  `--tmpfs` defaults to `noexec`, which fails), use a Kubernetes
+  `emptyDir`, or point `TMPDIR` at a writable, executable directory.
+- Clarify that this temp-directory requirement is unique to the
+  standalone binary: the published container image and `pip`/`pipx`
+  installs run yacron2 as a normal Python package and need no
+  writable temp directory.
+
+### Container image
+
+- The official multi-arch (`linux/amd64` + `linux/arm64`) container
+  image is now built and published to GHCR automatically as part of
+  every release, and is build-checked on every commit so a broken
+  `Dockerfile` fails fast.
+
+
 ## 1.0.8 (2026-06-20)
 
 - Add self-contained musl binaries to every release for Alpine and

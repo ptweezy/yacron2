@@ -71,23 +71,34 @@ pipx install yacron2
 
 Alternatively, a self-contained binary can be downloaded
 from github: <https://github.com/ptweezy/yacron2/releases>. Every release
-automatically attaches a binary for both architectures in two libc flavors:
+automatically attaches binaries for Linux and macOS, on both amd64 and arm64:
 
-* `yacron2-linux-amd64` / `yacron2-linux-arm64` — glibc builds for the
-  mainstream distros. They work on any Linux system post glibc 2.39 (e.g.
-  Ubuntu 24.04) on the matching CPU.
-* `yacron2-linux-amd64-musl` / `yacron2-linux-arm64-musl` — musl builds for
-  Alpine and other musl-based systems.
+* **Linux** — `yacron2-linux-amd64` / `yacron2-linux-arm64` are glibc builds
+  for the mainstream distros. They work on any Linux system post glibc 2.39
+  (e.g. Ubuntu 24.04) on the matching CPU. `yacron2-linux-amd64-musl` /
+  `yacron2-linux-arm64-musl` are musl builds for Alpine and other musl-based
+  systems.
+* **macOS** — `yacron2-macos-arm64` (Apple Silicon) / `yacron2-macos-amd64`
+  (Intel).
 
 Python is not required on the target system (it is embedded in the executable):
 
 ```shell
-# pick the asset for your architecture and libc (glibc amd64 shown;
-# append -musl on Alpine)
+# pick the asset for your OS and architecture (glibc amd64 Linux shown; append
+# -musl on Alpine, or use yacron2-macos-<arch> on a Mac)
 curl -fsSL -o yacron2 \
   https://github.com/ptweezy/yacron2/releases/latest/download/yacron2-linux-amd64
 chmod +x yacron2
 ./yacron2 --version
+```
+
+The macOS binaries are not code-signed or notarized, so the first time you run
+one Gatekeeper refuses it ("cannot be checked for malicious software"). Clear
+the quarantine attribute once and it runs normally:
+
+```shell
+xattr -d com.apple.quarantine ./yacron2-macos-arm64
+./yacron2-macos-arm64 --version
 ```
 
 The standalone binary is a self-extracting executable: on each start it unpacks

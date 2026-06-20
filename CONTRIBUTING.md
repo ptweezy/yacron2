@@ -86,15 +86,17 @@ On a release the workflow, in order:
    tag already exists);
 3. **gates** on `tox` (py313, py314, lint, mypy) — a red build means no release;
 4. **builds** the wheel + sdist *and* the self-contained PyInstaller binaries
-   for `linux/amd64` + `linux/arm64` (each on a native runner, smoke-tested with
-   `--version`) — all at the computed version, *before* publishing, so a broken
-   build fails the run instead of producing a half-finished release;
+   for Linux (`amd64` + `arm64`, glibc and musl) and macOS (`arm64` + `amd64`),
+   each on a native runner, smoke-tested with `--version` — all at the computed
+   version, *before* publishing, so a broken build fails the run instead of
+   producing a half-finished release;
 5. **publishes the wheel + sdist to PyPI** via [Trusted Publishing
    (OIDC)](https://docs.pypi.org/trusted-publishers/) — there is no API token to
    manage or leak;
 6. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
-   GitHub Release with the wheel, sdist, and both binaries
-   (`yacron2-linux-amd64`, `yacron2-linux-arm64`) attached.
+   GitHub Release with the wheel, sdist, and all the binaries
+   (`yacron2-linux-{amd64,arm64}`, their `-musl` variants, and
+   `yacron2-macos-{arm64,amd64}`) attached.
 
 Because no file is committed back to the repo, a release never re-triggers the
 workflow. Because the tag is created *after* publishing, a failed publish leaves

@@ -15,12 +15,12 @@ name: release
 #   - or it is started manually via workflow_dispatch (bump from the dropdown).
 #
 # On release it: gates on tox, computes the next version from the latest X.Y.Z
-# tag, builds at that version (SETUPTOOLS_SCM_PRETEND_VERSION) -- both the wheel
-# + sdist and self-contained PyInstaller binaries for linux/amd64 + linux/arm64
-# in both glibc and musl/Alpine flavors (built natively on amd64 and arm64
-# runners) -- publishes the wheel + sdist to
-# PyPI via Trusted Publishing (OIDC), then ONLY after a successful publish tags
-# the commit and cuts a GitHub Release with the binaries attached. No file is
+# tag, builds at that version (SETUPTOOLS_SCM_PRETEND_VERSION) -- the wheel
+# + sdist and self-contained PyInstaller binaries for Linux (amd64 + arm64 in
+# both glibc and musl/Alpine flavors) and macOS (arm64 + amd64), each built
+# natively on a matching runner -- publishes the wheel + sdist to PyPI via
+# Trusted Publishing (OIDC), then ONLY after a successful publish tags the
+# commit and cuts a GitHub Release with the binaries attached. No file is
 # committed back -> no loop; the binaries build BEFORE the publish (a broken
 # build fails the run, never a half release) and a failed publish leaves no
 # orphan tag, so a re-run cleanly retries.
@@ -257,8 +257,62 @@ jobs:
           path: dist/yacron2-linux-${{ matrix.arch }}-musl
           if-no-files-found: error
 
+  # Build the self-contained macOS binaries, one per architecture on a native
+  # runner. PyInstaller is not a cross-compiler, so each runner emits its own
+  # arch: arm64 on Apple Silicon, amd64 on the Intel runner. Same pyinstaller
+  # pin and `--version` smoke test as the Linux jobs; the assets carry a
+  # `-macos-<arch>` suffix. The runner labels are pinned (like the Linux
+  # `ubuntu-24.04*` jobs) so a release never silently jumps macOS versions --
+  # bump them when GitHub retires this generation (note `macos-latest` is arm64
+  # only; the Intel sibling is `macos-15-intel`). These binaries are unsigned
+  # and unnotarized, so end users clear the Gatekeeper quarantine before running
+  # (`xattr -d com.apple.quarantine ./yacron2-macos-<arch>`); see the README.
+  binaries-macos:
+    needs: [decide, version, gate]
+    if: needs.decide.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15          # Apple Silicon
+          - arch: amd64
+            runner: macos-15-intel    # Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
+      - name: Build binary
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          pip install --upgrade pip
+          pip install pyinstaller==6.21.0  # pin matches the Linux jobs
+          pip install .                     # bakes the pinned version into yacron2/version.py
+          pyinstaller pyinstaller/yacron2.spec
+          dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
+          # Assert the binary is the intended native arch: Rosetta would happily
+          # run an x86_64 build on the arm64 runner and let the smoke test pass,
+          # silently shipping a mislabelled asset. `file` reports x86_64/arm64.
+          case "${{ matrix.arch }}" in
+            amd64) want=x86_64 ;;
+            arm64) want=arm64 ;;
+          esac
+          file dist/yacron2 | grep -q "$want"
+          mv dist/yacron2 "dist/yacron2-macos-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yacron2-macos-${{ matrix.arch }}
+          path: dist/yacron2-macos-${{ matrix.arch }}
+          if-no-files-found: error
+
   release:
-    needs: [decide, version, gate, binaries, binaries-musl]
+    needs: [decide, version, gate, binaries, binaries-musl, binaries-macos]
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -296,13 +350,16 @@ jobs:
           git tag -a "$NEW" -m "Release $NEW"
           git push origin "refs/tags/$NEW"
 
-      # Pull in the per-arch binaries built by the `binaries` job and flatten
-      # them into ./binaries (yacron2-linux-amd64, yacron2-linux-arm64).
+      # Pull in every per-arch binary built by the binaries-* jobs (Linux glibc
+      # + musl, macOS) and flatten them into ./binaries. The pattern must stay
+      # broad enough to match all of them -- a too-narrow pattern (e.g.
+      # `yacron2-linux-*`) does NOT error on the artifacts it misses, it just
+      # silently drops them from the release.
       - name: Download release binaries
         uses: actions/download-artifact@v4
         with:
           path: binaries
-          pattern: yacron2-linux-*
+          pattern: yacron2-*
           merge-multiple: true
 
       - name: Build release notes from HISTORY.md
@@ -341,6 +398,8 @@ jobs:
             binaries/yacron2-linux-arm64
             binaries/yacron2-linux-amd64-musl
             binaries/yacron2-linux-arm64-musl
+            binaries/yacron2-macos-amd64
+            binaries/yacron2-macos-arm64
 
   # Build + push the multi-arch container image at the just-released version.
   # Invoked here (workflow_call) rather than via `on: release` because a Release

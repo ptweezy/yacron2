@@ -1,5 +1,11 @@
 # yacron2 (Yet Another Cron 2)
 
+[![PyPI version](https://img.shields.io/pypi/v/yacron2.svg)](https://pypi.org/project/yacron2/)
+[![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg)](https://pypi.org/project/yacron2/)
+[![CI](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml)
+[![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/yacron2/pkgs/container/yacron2)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A modern, Docker-friendly Cron replacement.
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by
@@ -25,6 +31,24 @@ yacron; "since version X.Y" notes refer to that shared version history.
 * Arbitrary timezone support
 
 ## Installation
+
+### Run with Docker
+
+Prebuilt, multi-architecture (`linux/amd64` + `linux/arm64`) images are
+published to the GitHub Container Registry on every release. Mount your crontab
+and go:
+
+```shell
+docker run --rm \
+  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
+  ghcr.io/ptweezy/yacron2:latest
+```
+
+The image runs as a non-root user and reads its configuration from
+`/etc/yacron2.d` by default. For production, pin a specific version instead of
+`latest` (e.g. `ghcr.io/ptweezy/yacron2:1.0.4`) and see [Production container
+deployment](#production-container-deployment) for the hardened
+Kubernetes/Docker setup.
 
 ### Install using pip
 
@@ -76,20 +100,17 @@ files — so it slots cleanly into a locked-down pod:
   mounted with an `fsGroup` so the non-root process can read them, and you can
   drop *all* Linux capabilities and forbid privilege escalation.
 
-A hardened image simply adds a non-root `USER`:
+The published image (`ghcr.io/ptweezy/yacron2`) is already built this way —
+non-root, with `yacron2 -c /etc/yacron2.d` as its entrypoint and no writable
+paths required — so for most deployments you can use it directly and mount your
+crontab read-only. If you would rather bake the configuration into your own
+image, base it on the published image:
 
 ```dockerfile
-FROM python:3.14-slim
+FROM ghcr.io/ptweezy/yacron2:latest
 
-RUN pip install --no-cache-dir yacron2
-
+# The base image already runs as the non-root user 65534.
 COPY yacron2tab.yaml /etc/yacron2.d/yacron2tab.yaml
-
-# Run as an unprivileged, non-root user (65534 = "nobody")
-USER 65534:65534
-
-ENTRYPOINT ["yacron2"]
-CMD ["-c", "/etc/yacron2.d"]
 ```
 
 And a corresponding Kubernetes `Deployment` with a fully restricted security
@@ -119,7 +140,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: yacron2
-          image: yacron2
+          image: ghcr.io/ptweezy/yacron2:latest
           args: ["-c", "/etc/yacron2.d"]
           securityContext:       # container-level
             allowPrivilegeEscalation: false

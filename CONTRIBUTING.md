@@ -113,3 +113,43 @@ All the logic lives in
 `PATH`, the hook uses it to write a grouped, prose changelog entry; otherwise it
 falls back to a plain list of commit subjects. Review/edit the generated entry
 before pushing — it ships inside the published sdist.
+
+## Container image
+
+The official image is built and published by the
+[`docker`](.github/workflows/docker.yml) workflow, from the top-level
+[`Dockerfile`](Dockerfile):
+
+- **On each published release** it builds a multi-arch (`linux/amd64` +
+  `linux/arm64`) image and pushes it to GHCR as
+  `ghcr.io/ptweezy/yacron2:<version>` and `:latest`.
+- **On pull requests / `main` pushes** that touch the `Dockerfile`, the package,
+  or the workflow, it builds the image *without* pushing, so a broken
+  `Dockerfile` fails CI before a release.
+- **Manually** (Actions → docker → Run workflow) you can (re)build any existing
+  release tag — useful to backfill an image for a release cut before this
+  workflow existed, or to retry a failed push.
+
+Build it locally the same way CI does (the version is read from git, or pass
+`--build-arg VERSION=X.Y.Z`):
+
+```sh
+docker build -t yacron2 .
+docker run --rm -v "$PWD/example/docker/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" yacron2
+```
+
+> The first GHCR push creates the package as **private**. In the repository's
+> *Packages* settings, mark it public and link it to this repo so the image is
+> discoverable and `docker pull` works without authentication.
+
+### Publishing to Docker Hub (optional)
+
+GHCR needs no setup — it authenticates with the built-in `GITHUB_TOKEN`. To
+*also* publish to Docker Hub, add two repository secrets and the workflow picks
+them up automatically (no code change needed):
+
+- `DOCKERHUB_USERNAME` — your Docker Hub account / namespace
+- `DOCKERHUB_TOKEN` — a Docker Hub access token with read/write scope
+
+The image is then pushed to `docker.io/<DOCKERHUB_USERNAME>/yacron2` alongside
+GHCR.

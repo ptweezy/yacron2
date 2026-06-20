@@ -44,8 +44,8 @@ GitHub Actions workflow. Version numbers come from git tags via
 
 ### Cutting a release
 
-A release happens when a commit lands on `main` with a **release marker on its
-own line** in the commit message:
+A release happens when **any commit in a push to `main`** has a release marker
+anywhere in its message:
 
 ```
 Add retry backoff to the HTTP reporter
@@ -53,19 +53,26 @@ Add retry backoff to the HTTP reporter
 [release:minor]
 ```
 
-Valid markers (the bump level is optional; whitespace and case are ignored):
+It does not need to be the latest commit in the push, and the marker does not
+need to be on its own line.
 
-| Marker             | Bump  | 1.0.2 → |
+Valid markers (the bump level is optional; case is ignored):
+
+| Marker             | Bump  | 1.0.5 → |
 | ------------------ | ----- | ------- |
 | `[release]`        | minor | 1.1.0   |
 | `[release:major]`  | major | 2.0.0   |
 | `[release:minor]`  | minor | 1.1.0   |
-| `[release:patch]`  | patch | 1.0.3   |
+| `[release:patch]`  | patch | 1.0.6   |
 
-> **The marker must be on a line by itself.** This is deliberate: a mention of
-> `[release]` *inside* a sentence (for example, in this very document, or in a
-> commit body) must never trigger a publish. The workflow matches a whole line,
-> not a substring.
+If more than one marker appears across the pushed commits, the most significant
+bump wins (major > minor > patch).
+
+> **Caution:** the match is a plain substring, so writing a literal
+> `[release:patch]` (or `[release]`) anywhere in a commit message — even in prose
+> describing the release process — **will trigger a publish**. Don't quote the
+> marker verbatim in a commit message unless you mean it. (File contents like
+> this document are never scanned — only commit messages are.)
 
 You can also release manually without a marker: **Actions → release → Run
 workflow**, then pick the bump level from the dropdown.

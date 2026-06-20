@@ -1,13 +1,17 @@
 name: release
 
-# Release pipeline (opt-in, strict). It runs ONLY when:
-#   - a commit pushed to main has a line that is EXACTLY a release marker
-#     (surrounding whitespace allowed) -- the marker must be on its OWN line,
-#     so a mention of "[release]" inside prose never triggers anything:
+# Release pipeline (opt-in). It runs when:
+#   - ANY commit included in a push to main has a [release] marker anywhere in
+#     its message (not just the tip commit):
 #         [release]          -> minor (default)
 #         [release:major]    -> major
 #         [release:minor]    -> minor
 #         [release:patch]    -> patch
+#     If several markers appear across the push, the most significant bump wins
+#     (major > minor > patch). NOTE: the match is a substring, so a literal
+#     "[release:patch]" written anywhere in a commit message WILL trigger a
+#     release -- don't quote the marker verbatim in a commit message unless you
+#     mean it. (Only commit messages are scanned, never file contents.)
 #   - or it is started manually via workflow_dispatch (bump from the dropdown).
 #
 # On release it: gates on tox, computes the next version from the latest X.Y.Z
@@ -61,6 +65,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           INPUT_BUMP: ${{ github.event.inputs.bump }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
         run: |
           set -euo pipefail
           release=false
@@ -69,16 +75,34 @@ jobs:
             release=true
             bump="${INPUT_BUMP:-minor}"
           else
-            # Read the message via git (never interpolate it into the script)
-            # and match a whole line that is only the marker.
-            marker="$(git log -1 --pretty=%B \
-              | grep -iE '^[[:space:]]*\[release(:(major|minor|patch))?\][[:space:]]*$' \
-              | head -n1 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' || true)"
-            case "$marker" in
-              '[release]'|'[release:minor]') release=true; bump=minor ;;
-              '[release:major]')             release=true; bump=major ;;
-              '[release:patch]')             release=true; bump=patch ;;
-            esac
+            # Trigger if ANY commit introduced by this push has a [release]
+            # marker anywhere in its message -- not just the tip commit. The
+            # range is the commits new in this push (BEFORE..AFTER); on a
+            # brand-new branch BEFORE is all-zeros, so fall back to the tip.
+            zero="0000000000000000000000000000000000000000"
+            if [ -z "${BEFORE:-}" ] || [ "$BEFORE" = "$zero" ] \
+                 || ! git rev-parse -q --verify "${BEFORE}^{commit}" >/dev/null; then
+              msgs="$(git log -1 --pretty=%B "$AFTER")"
+            else
+              msgs="$(git log --pretty=%B "${BEFORE}..${AFTER}")"
+            fi
+            # Collect every marker token (substring match, anywhere in any
+            # message), lowercased.
+            markers="$(printf '%s\n' "$msgs" \
+              | grep -oiE '\[release(:(major|minor|patch))?\]' \
+              | tr '[:upper:]' '[:lower:]' || true)"
+            if [ -n "$markers" ]; then
+              release=true
+              # If several markers appear, the most significant bump wins
+              # (major > minor > patch); a bare [release] counts as minor.
+              if printf '%s\n' "$markers" | grep -q '\[release:major\]'; then
+                bump=major
+              elif printf '%s\n' "$markers" | grep -qE '\[release(:minor)?\]'; then
+                bump=minor
+              else
+                bump=patch
+              fi
+            fi
           fi
           echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "bump=$bump" >> "$GITHUB_OUTPUT"

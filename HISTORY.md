@@ -5,6 +5,20 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.6 (2026-06-20)
+
+- Release binaries are now published for both `linux/amd64` and
+  `linux/arm64`. Every GitHub Release attaches a self-contained
+  `yacron2-linux-amd64` and `yacron2-linux-arm64` executable, each built
+  natively on its target architecture (previously only a single binary
+  was provided).
+- The downloadable binaries embed Python, so none is required on the
+  target system, and run on any Linux host with glibc 2.39 or newer
+  (e.g. Ubuntu 24.04) matching the CPU architecture.
+- Each binary is smoke-tested with `--version` and built before
+  publishing
+
+
 ## 1.0.5 (2026-06-20)
 
 - docker builds

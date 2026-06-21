@@ -7,10 +7,10 @@ import json
 import logging
 import logging.config
 import os
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Awaitable, Dict, List, Optional, Union  # noqa
+from typing import Any, Awaitable, Deque, Dict, List, Optional, Union  # noqa
 from urllib.parse import urlparse
 
 from aiohttp import web
@@ -31,10 +31,46 @@ from yacron2.job import JobOutputStream, JobRetryState, RunningJob
 
 logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
+# How many finished runs to retain per job for the web UI's history/stats view.
+# In-memory only (like the rest of the run record), and bounded so a frequently
+# scheduled job cannot grow memory without limit.
+RUN_HISTORY_LIMIT = 50
+# How many compact run summaries to embed per job in the /jobs payload — enough
+# for the dashboard's inline sparkline without shipping the full detailed
+# history on every poll. The full history is available from /jobs/{name}/runs.
+JOBS_INLINE_HISTORY = 20
 # requests served without bearer-token auth even when authToken is configured.
 # Only the UI page itself (which carries no data and no secrets) is public; the
 # browser then authenticates every data request with the token the user enters.
 WEB_PUBLIC_PATHS = frozenset({"/"})
+
+# Defence-in-depth security headers for the dashboard HTML document. The
+# page is fully self-contained (one inline <script>, inline styles, no
+# external assets) and only ever talks to its own origin, so this CSP is
+# deliberately strict:
+#   - 'unsafe-inline' for script/style is unavoidable (everything is inlined),
+#     but connect-src 'self' confines any hypothetical injected script to this
+#     origin — it cannot exfiltrate to an attacker's server;
+#   - frame-ancestors 'none' (plus X-Frame-Options) blocks clickjacking of the
+#     run/cancel controls; base-uri/form-action 'none' close those vectors.
+# Operators can override any of these via the web.headers config option, which
+# is merged on top of these defaults (see _security_headers).
+WEB_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "base-uri 'none'; "
+        "form-action 'none'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
 
 
 @dataclass
@@ -57,6 +93,47 @@ class JobRunInfo:
         if self.started_at is None:
             return None
         return (self.finished_at - self.started_at).total_seconds()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-serialisable summary (everything except the output stream)."""
+        return {
+            "outcome": self.outcome,
+            "exit_code": self.exit_code,
+            "started_at": (
+                self.started_at.isoformat()
+                if self.started_at is not None
+                else None
+            ),
+            "finished_at": self.finished_at.isoformat(),
+            "duration": self.duration,
+            "fail_reason": self.fail_reason,
+        }
+
+
+def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
+    """Aggregate stats over a job's retained run history, for the web UI."""
+    total = len(runs)
+    success = sum(1 for r in runs if r.outcome == "success")
+    failure = sum(1 for r in runs if r.outcome == "failure")
+    cancelled = sum(1 for r in runs if r.outcome == "cancelled")
+    durations = [r.duration for r in runs if r.duration is not None]
+    return {
+        "total": total,
+        "success": success,
+        "failure": failure,
+        "cancelled": cancelled,
+        # success rate over runs that ran to completion (excludes
+        # cancellations: user-initiated, not a verdict on the job itself).
+        "success_rate": (
+            success / (success + failure) if (success + failure) else None
+        ),
+        "avg_duration": (
+            (sum(durations) / len(durations)) if durations else None
+        ),
+        "min_duration": min(durations) if durations else None,
+        "max_duration": max(durations) if durations else None,
+        "last_duration": runs[-1].duration if runs else None,
+    }
 
 
 @lru_cache(maxsize=1)
@@ -177,6 +254,9 @@ class Cron:
         self.retry_state = {}  # type: Dict[str, JobRetryState]
         # name -> most recent finished run, for the web UI (in-memory only)
         self.last_run = {}  # type: Dict[str, JobRunInfo]
+        # name -> bounded history of recent finished runs, oldest first, for
+        # the web UI's history/stats view (in-memory only, like last_run)
+        self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
 
@@ -352,12 +432,50 @@ class Cron:
         await self.maybe_launch_job(job)
         return web.Response(headers=self.web_config.get("headers", None))
 
+    async def _web_cancel_job(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        name = request.match_info["name"]
+        if name not in self.cron_jobs:
+            raise web.HTTPNotFound()
+        running = list(self.running_jobs.get(name) or [])
+        if not running:
+            # nothing to cancel: report a conflict rather than a silent no-op
+            # so the dashboard can tell the user the job was not running.
+            raise web.HTTPConflict(
+                text="job {!r} is not running".format(name),
+                headers=self.web_config.get("headers", None),
+            )
+        for runjob in running:
+            # mark before cancelling so the reaper records this as a deliberate
+            # "cancelled" run rather than a job failure (no report, no retry).
+            runjob.cancelled = True
+        # cancel instances concurrently: a job with several running instances
+        # then costs at most one killTimeout, not one per instance.
+        await asyncio.gather(
+            *(rj.cancel() for rj in running if rj.proc is not None)
+        )
+        return web.Response(headers=self.web_config.get("headers", None))
+
+    def _security_headers(self) -> Dict[str, str]:
+        """Security headers for the dashboard HTML page.
+
+        Secure defaults (CSP, anti-clickjacking, nosniff) with any operator
+        ``web.headers`` merged on top, so an operator who deliberately sets one
+        of these (e.g. a relaxed CSP or framing policy) still wins.
+        """
+        assert self.web_config is not None
+        headers = dict(WEB_SECURITY_HEADERS)
+        custom = self.web_config.get("headers", None)
+        if custom:
+            headers.update(custom)
+        return headers
+
     async def _web_index(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         return web.Response(
             text=load_index_html(),
             content_type="text/html",
-            headers=self.web_config.get("headers", None),
+            headers=self._security_headers(),
         )
 
     def _job_to_dict(self, name: str, job: JobConfig) -> Dict[str, Any]:
@@ -372,20 +490,20 @@ class Cron:
                 scheduled_in = crontab.next(now=now, default_utc=job.utc)
 
         last = self.last_run.get(name)
-        last_run: Optional[Dict[str, Any]] = None
-        if last is not None:
-            last_run = {
-                "outcome": last.outcome,
-                "exit_code": last.exit_code,
-                "started_at": (
-                    last.started_at.isoformat()
-                    if last.started_at is not None
-                    else None
-                ),
-                "finished_at": last.finished_at.isoformat(),
-                "duration": last.duration,
-                "fail_reason": last.fail_reason,
-            }
+        last_run = last.to_dict() if last is not None else None
+
+        history = self.run_history.get(name)
+        # compact, oldest-first tail of recent runs for the inline sparkline:
+        # only outcome + duration are needed there, so the per-poll payload
+        # stays small. Full per-run detail comes from /jobs/{name}/runs.
+        recent = (
+            [
+                {"outcome": r.outcome, "duration": r.duration}
+                for r in list(history)[-JOBS_INLINE_HISTORY:]
+            ]
+            if history
+            else []
+        )
 
         return {
             "name": name,
@@ -394,6 +512,13 @@ class Cron:
             "command": command_str(job.command),
             "captureStdout": job.captureStdout,
             "captureStderr": job.captureStderr,
+            # the schedule's reference frame, so the dashboard can compute and
+            # label upcoming run times (utc=True is the default; timezone, when
+            # set, is an IANA name like "America/Los_Angeles").
+            "utc": job.utc,
+            "timezone": (
+                str(job.timezone) if job.timezone is not None else None
+            ),
             "running": bool(running),
             "pids": [
                 runjob.proc.pid
@@ -402,6 +527,7 @@ class Cron:
             ],
             "scheduled_in": scheduled_in,
             "last_run": last_run,
+            "history": recent,
         }
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
@@ -412,6 +538,21 @@ class Cron:
         ]
         return web.json_response(
             out, headers=self.web_config.get("headers", None)
+        )
+
+    async def _web_job_runs(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        name = request.match_info["name"]
+        if name not in self.cron_jobs:
+            raise web.HTTPNotFound()
+        runs = list(self.run_history.get(name) or [])
+        return web.json_response(
+            {
+                "name": name,
+                "runs": [r.to_dict() for r in runs],  # oldest first
+                "stats": _run_stats(runs),
+            },
+            headers=self.web_config.get("headers", None),
         )
 
     def _job_output(self, name: str) -> Optional[JobOutputStream]:
@@ -501,7 +642,9 @@ class Cron:
                 web.get("/version", self._web_get_version),
                 web.get("/status", self._web_get_status),
                 web.get("/jobs", self._web_list_jobs),
+                web.get("/jobs/{name}/runs", self._web_job_runs),
                 web.post("/jobs/{name}/start", self._web_start_job),
+                web.post("/jobs/{name}/cancel", self._web_cancel_job),
                 web.get("/jobs/{name}/logs", self._web_job_logs),
             ]
             if ui_enabled:
@@ -720,6 +863,12 @@ class Cron:
                 logger.exception("please report this as a bug (3)")
                 await asyncio.sleep(1)
 
+    def _record_run(self, name: str, info: JobRunInfo) -> None:
+        # the latest finished run (for status/log replay) plus the bounded
+        # history (for the dashboard's history/stats view); in-memory only.
+        self.last_run[name] = info
+        self.run_history[name].append(info)
+
     async def _handle_finished_job(self, job: RunningJob) -> None:
         jobs_list = self.running_jobs[job.config.name]
         jobs_list.remove(job)
@@ -735,6 +884,25 @@ class Cron:
             )
             return
 
+        if job.cancelled:
+            # explicitly cancelled by a user via the web UI: record it (as
+            # "cancelled" in the dashboard) but, like a replacement, do not
+            # report it as a failure or schedule retries.
+            logger.info("Job %s was cancelled via the web UI", job.config.name)
+            self._record_run(
+                job.config.name,
+                JobRunInfo(
+                    outcome="cancelled",
+                    exit_code=job.retcode,
+                    started_at=job.started_at,
+                    finished_at=get_now(datetime.timezone.utc),
+                    fail_reason="cancelled via web UI",
+                    output=job.output,
+                ),
+            )
+            await self.cancel_job_retries(job.config.name)
+            return
+
         fail_reason = job.fail_reason
         logger.info(
             "Job %s exit code %s; has stdout: %s, "
@@ -746,13 +914,16 @@ class Cron:
             fail_reason,
         )
         # record this run for the web UI's "latest status / latest logs" view
-        self.last_run[job.config.name] = JobRunInfo(
-            outcome="failure" if fail_reason is not None else "success",
-            exit_code=job.retcode,
-            started_at=job.started_at,
-            finished_at=get_now(datetime.timezone.utc),
-            fail_reason=fail_reason,
-            output=job.output,
+        self._record_run(
+            job.config.name,
+            JobRunInfo(
+                outcome="failure" if fail_reason is not None else "success",
+                exit_code=job.retcode,
+                started_at=job.started_at,
+                finished_at=get_now(datetime.timezone.utc),
+                fail_reason=fail_reason,
+                output=job.output,
+            ),
         )
         if fail_reason is not None:
             await self.handle_job_failure(job)

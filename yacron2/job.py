@@ -484,6 +484,10 @@ class RunningJob:
         # way for a newer instance (concurrencyPolicy=Replace). Such a forced
         # termination is not a job failure and must not be reported or retried.
         self.replaced = False
+        # set when a user explicitly cancels this run from the web UI. Like
+        # `replaced` it is not reported or retried, but unlike `replaced` it is
+        # recorded in the run history (shown as "cancelled" in the dashboard).
+        self.cancelled = False
 
         statsd_config = self.config.statsd
         if statsd_config is not None:

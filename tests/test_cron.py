@@ -334,6 +334,7 @@ async def test_handle_finished_job_skips_replaced(monkeypatch):
     job = SimpleNamespace(
         config=SimpleNamespace(name="test"),
         replaced=True,
+        cancelled=False,
         fail_reason="failsWhen=nonzeroReturn and retcode=-15",
         retcode=-15,
         stdout=None,
@@ -347,6 +348,7 @@ async def test_handle_finished_job_skips_replaced(monkeypatch):
     assert calls == []  # replaced -> neither reported
     assert "test" not in cron.running_jobs  # still cleaned up
     assert "test" not in cron.last_run  # replaced runs aren't recorded
+    assert "test" not in cron.run_history  # nor added to history
 
 
 @pytest.mark.asyncio
@@ -368,6 +370,7 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     job = SimpleNamespace(
         config=SimpleNamespace(name="test"),
         replaced=False,
+        cancelled=False,
         fail_reason="failsWhen=nonzeroReturn and retcode=2",
         retcode=2,
         stdout=None,
@@ -382,6 +385,8 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     # the finished run is recorded for the web UI
     assert cron.last_run["test"].outcome == "failure"
     assert cron.last_run["test"].exit_code == 2
+    # ...and appended to the bounded run history
+    assert [r.outcome for r in cron.run_history["test"]] == ["failure"]
 
 
 def test_simple_config_file(tracing_running_job):
@@ -740,6 +745,226 @@ async def test_web_list_jobs_includes_last_run():
     assert last["fail_reason"].startswith("failsWhen")
 
 
+def _mk_run(outcome, exit_code=0, dur=1.0):
+    start = DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+    return yacron2.cron.JobRunInfo(
+        outcome=outcome,
+        exit_code=exit_code,
+        started_at=start,
+        finished_at=start + datetime.timedelta(seconds=dur),
+        fail_reason=None if outcome == "success" else "boom",
+        output=JobOutputStream(),
+    )
+
+
+def test_record_run_caps_history():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    limit = yacron2.cron.RUN_HISTORY_LIMIT
+    for i in range(limit + 10):
+        cron._record_run("alpha", _mk_run("success", exit_code=i))
+    hist = cron.run_history["alpha"]
+    assert len(hist) == limit  # bounded ring buffer
+    # oldest entries evicted; newest retained and ordered oldest-first
+    assert hist[0].exit_code == 10
+    assert hist[-1].exit_code == limit + 9
+    # last_run mirrors the most recent recorded run
+    assert cron.last_run["alpha"].exit_code == limit + 9
+
+
+@pytest.mark.asyncio
+async def test_web_list_jobs_includes_history_and_timezone():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    for outcome in ("success", "failure", "success"):
+        cron._record_run("alpha", _mk_run(outcome))
+
+    class Req:
+        pass
+
+    resp = await cron._web_list_jobs(Req())
+    data = json.loads(resp.text)
+    alpha = data[0]
+    # inline compact history (oldest first) for the table sparkline
+    assert [h["outcome"] for h in alpha["history"]] == [
+        "success",
+        "failure",
+        "success",
+    ]
+    # schedule reference frame exposed for client-side next-run computation;
+    # a utc:true job (the default) resolves to the "UTC" zone
+    assert alpha["utc"] is True
+    assert alpha["timezone"] == "UTC"
+    # a job that never ran reports an empty (not missing) history
+    assert data[1]["history"] == []
+
+
+@pytest.mark.asyncio
+async def test_web_job_runs_endpoint_returns_runs_and_stats():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    cron._record_run("alpha", _mk_run("success", dur=2.0))
+    cron._record_run("alpha", _mk_run("failure", dur=4.0))
+    cron._record_run("alpha", _mk_run("success", dur=6.0))
+    cron._record_run("alpha", _mk_run("cancelled", dur=1.0))
+
+    class Req:
+        match_info = {"name": "alpha"}
+
+    resp = await cron._web_job_runs(Req())
+    body = json.loads(resp.text)
+    assert body["name"] == "alpha"
+    assert [r["outcome"] for r in body["runs"]] == [
+        "success",
+        "failure",
+        "success",
+        "cancelled",
+    ]
+    stats = body["stats"]
+    assert stats["total"] == 4
+    assert stats["success"] == 2
+    assert stats["failure"] == 1
+    assert stats["cancelled"] == 1
+    # success rate excludes cancellations: 2 success / (2 success + 1 failure)
+    assert stats["success_rate"] == pytest.approx(2 / 3)
+    assert stats["avg_duration"] == pytest.approx((2 + 4 + 6 + 1) / 4)
+    assert stats["min_duration"] == 1.0
+    assert stats["max_duration"] == 6.0
+    assert stats["last_duration"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_web_job_runs_unknown_job_404():
+    from aiohttp import web
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        match_info = {"name": "nope"}
+
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_job_runs(Req())
+
+
+@pytest.mark.asyncio
+async def test_web_job_runs_empty_history():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        match_info = {"name": "alpha"}
+
+    resp = await cron._web_job_runs(Req())
+    body = json.loads(resp.text)
+    assert body["runs"] == []
+    assert body["stats"]["total"] == 0
+    assert body["stats"]["success_rate"] is None
+    assert body["stats"]["avg_duration"] is None
+
+
+@pytest.mark.asyncio
+async def test_web_cancel_unknown_job_404():
+    from aiohttp import web
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        match_info = {"name": "nope"}
+
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_cancel_job(Req())
+
+
+@pytest.mark.asyncio
+async def test_web_cancel_not_running_409():
+    from aiohttp import web
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        match_info = {"name": "alpha"}
+        headers: dict = {}
+
+    with pytest.raises(web.HTTPConflict):
+        await cron._web_cancel_job(Req())
+
+
+@pytest.mark.asyncio
+async def test_handle_finished_job_records_cancelled(monkeypatch):
+    # a run cancelled by the user is recorded as "cancelled" but, like a
+    # replacement, must not be reported as success/failure or retried.
+    from types import SimpleNamespace
+
+    cron = yacron2.cron.Cron(None)
+    calls = []
+
+    async def fake_failure(job):
+        calls.append(("failure", job))
+
+    async def fake_success(job):
+        calls.append(("success", job))
+
+    monkeypatch.setattr(cron, "handle_job_failure", fake_failure)
+    monkeypatch.setattr(cron, "handle_job_success", fake_success)
+
+    job = SimpleNamespace(
+        config=SimpleNamespace(name="test"),
+        replaced=False,
+        cancelled=True,
+        fail_reason=None,
+        retcode=-15,
+        stdout=None,
+        stderr=None,
+        started_at=None,
+        output=JobOutputStream(),
+    )
+    cron.running_jobs["test"].append(job)
+    await cron._handle_finished_job(job)
+
+    assert calls == []  # neither reported
+    assert "test" not in cron.running_jobs  # cleaned up
+    assert cron.last_run["test"].outcome == "cancelled"
+    assert cron.last_run["test"].exit_code == -15
+    assert [r.outcome for r in cron.run_history["test"]] == ["cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_web_cancel_running_job_terminates_and_records():
+    # end-to-end: launch a real long-running job, cancel it via the endpoint,
+    # and confirm it is actually terminated and recorded as "cancelled".
+    cron = yacron2.cron.Cron(
+        None, config_yaml=CONCURRENT_JOB.format(policy="Allow")
+    )
+    cron.web_config = {}
+    job = cron.cron_jobs["test"]
+    await cron.maybe_launch_job(job)
+    rj = cron.running_jobs["test"][0]
+    assert rj.proc.returncode is None
+
+    class Req:
+        match_info = {"name": "test"}
+        headers: dict = {}
+
+    resp = await cron._web_cancel_job(Req())
+    assert resp.status == 200
+    assert rj.cancelled is True
+    assert rj.proc.returncode is not None  # process actually terminated
+
+    # the reaper would normally do this once the process exits; drive it here
+    await cron._handle_finished_job(rj)
+    assert "test" not in cron.running_jobs
+    assert cron.last_run["test"].outcome == "cancelled"
+    assert [r.outcome for r in cron.run_history["test"]] == ["cancelled"]
+
+
 @pytest.mark.asyncio
 async def test_web_index_served():
     cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
@@ -752,6 +977,41 @@ async def test_web_index_served():
     assert resp.content_type == "text/html"
     assert "yacron2" in resp.text
     assert "<html" in resp.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_web_index_sets_security_headers():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        pass
+
+    resp = await cron._web_index(Req())
+    csp = resp.headers["Content-Security-Policy"]
+    # self-contained app: no external connections, so the CSP confines any
+    # injected script to this origin and blocks framing of the action controls
+    assert "connect-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert "object-src 'none'" in csp
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+
+
+@pytest.mark.asyncio
+async def test_web_index_security_headers_overridable():
+    # an operator-configured web.headers value wins over the secure default,
+    # while defaults the operator didn't set are still applied.
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {"headers": {"X-Frame-Options": "SAMEORIGIN"}}
+
+    class Req:
+        pass
+
+    resp = await cron._web_index(Req())
+    assert resp.headers["X-Frame-Options"] == "SAMEORIGIN"  # operator override
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"  # default kept
 
 
 @pytest.mark.asyncio

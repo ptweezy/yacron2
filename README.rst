@@ -29,8 +29,7 @@ Features
 Status
 --------------
 
-The project is in beta stage: essential features are complete, and the focus is
-finding and fixing bugs before the first stable release.
+The project is not being maintained.  For a more frequently maintained version, check out https://github.com/ptweezy/yacron2.
 
 Installation
 ------------

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the notarized macOS binary.
+
+  Apple requires the hardened runtime (codesign --options runtime) for
+  notarization, but a PyInstaller one-file binary unpacks its embedded Python
+  runtime to a temp dir and loads/executes those .so/.dylib files at startup.
+  Under the default hardened runtime that is blocked, so the binary would pass
+  notarization yet crash on launch. These three entitlements re-permit it:
+
+    * allow-unsigned-executable-memory / allow-jit -- CPython's interpreter
+      writes and executes memory the runtime would otherwise refuse.
+    * disable-library-validation -- the freshly unpacked shared libraries are
+      not signed by our Team ID, so library validation must be relaxed to load
+      them.
+
+  Keep this list minimal: each entry widens the runtime, so do not add others
+  without a demonstrated need.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

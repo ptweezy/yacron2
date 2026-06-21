@@ -264,9 +264,15 @@ jobs:
   # `-macos-<arch>` suffix. The runner labels are pinned (like the Linux
   # `ubuntu-24.04*` jobs) so a release never silently jumps macOS versions --
   # bump them when GitHub retires this generation (note `macos-latest` is arm64
-  # only; the Intel sibling is `macos-15-intel`). These binaries are unsigned
-  # and unnotarized, so end users clear the Gatekeeper quarantine before running
-  # (`xattr -d com.apple.quarantine ./yacron2-macos-<arch>`); see the README.
+  # only; the Intel sibling is `macos-15-intel`).
+  #
+  # The binary is Developer ID signed (hardened runtime) and notarized when the
+  # signing secrets are configured (see the "Sign and notarize" step). A bare
+  # Mach-O cannot be stapled, so notarization publishes the ticket online and
+  # Gatekeeper validates on first run -- no `xattr -d com.apple.quarantine`
+  # needed by end users. If the secrets are absent the step is skipped with a
+  # warning and the build ships unsigned (the old behaviour), so a release is
+  # never blocked on signing setup.
   binaries-macos:
     needs: [decide, version, gate]
     if: needs.decide.outputs.release == 'true'
@@ -304,7 +310,60 @@ jobs:
             arm64) want=arm64 ;;
           esac
           file dist/yacron2 | grep -q "$want"
-          mv dist/yacron2 "dist/yacron2-macos-${{ matrix.arch }}"
+      # Developer ID sign + notarize the binary in place. Guarded on the cert
+      # secret: if the macOS signing secrets are not configured, the step warns
+      # and exits 0, leaving the unsigned binary to ship as before. Renaming
+      # after signing is safe -- the notarization ticket is keyed to the code
+      # signature (cdhash), not the filename -- so this runs before the `mv`.
+      - name: Sign and notarize
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then
+            echo "::warning::macOS signing secrets not set; shipping an unsigned, unnotarized binary."
+            exit 0
+          fi
+
+          # Import the Developer ID cert into a throwaway, randomly-keyed
+          # keychain scoped to this runner (never the login keychain).
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" \
+            -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          # Let codesign use the key non-interactively.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          # Sign with the hardened runtime + secure timestamp (both required for
+          # notarization) and the PyInstaller entitlements, then verify.
+          codesign --force --options runtime --timestamp \
+            --entitlements pyinstaller/entitlements.plist \
+            --keychain "$KEYCHAIN" \
+            --sign "$MACOS_SIGN_IDENTITY" dist/yacron2
+          codesign --verify --strict --verbose=2 dist/yacron2
+
+          # Notarize: the zip is just the upload transport; the ticket binds to
+          # the binary's signature, so we keep shipping the bare signed binary.
+          echo "$MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k dist/yacron2 "$RUNNER_TEMP/yacron2.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/yacron2.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER_ID" \
+            --wait
+      - name: Rename binary
+        run: mv dist/yacron2 "dist/yacron2-macos-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
           name: yacron2-macos-${{ matrix.arch }}

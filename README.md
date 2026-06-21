@@ -92,14 +92,11 @@ chmod +x yacron2
 ./yacron2 --version
 ```
 
-The macOS binaries are not code-signed or notarized, so the first time you run
-one Gatekeeper refuses it ("cannot be checked for malicious software"). Clear
-the quarantine attribute once and it runs normally:
-
-```shell
-xattr -d com.apple.quarantine ./yacron2-macos-arm64
-./yacron2-macos-arm64 --version
-```
+The macOS binaries are Developer ID code-signed and notarized by Apple, so
+Gatekeeper accepts them and they run without any extra steps. (Older releases
+were unsigned; if you hit a "cannot be checked for malicious software" prompt on
+one of those, clear the quarantine attribute once with
+`xattr -d com.apple.quarantine ./yacron2-macos-arm64` and it runs normally.)
 
 The standalone binary is a self-extracting executable: on each start it unpacks
 its embedded Python runtime into a temporary directory and loads shared

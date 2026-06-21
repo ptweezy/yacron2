@@ -228,9 +228,7 @@ class Cron:
         self.last_run = {}  # type: Dict[str, JobRunInfo]
         # name -> bounded history of recent finished runs, oldest first, for
         # the web UI's history/stats view (in-memory only, like last_run)
-        self.run_history = defaultdict(
-            lambda: deque(maxlen=RUN_HISTORY_LIMIT)
-        )  # type: Dict[str, Deque[JobRunInfo]]
+        self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
 
@@ -848,9 +846,7 @@ class Cron:
             # explicitly cancelled by a user via the web UI: record it (as
             # "cancelled" in the dashboard) but, like a replacement, do not
             # report it as a failure or schedule retries.
-            logger.info(
-                "Job %s was cancelled via the web UI", job.config.name
-            )
+            logger.info("Job %s was cancelled via the web UI", job.config.name)
             self._record_run(
                 job.config.name,
                 JobRunInfo(

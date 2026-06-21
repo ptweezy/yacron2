@@ -980,6 +980,41 @@ async def test_web_index_served():
 
 
 @pytest.mark.asyncio
+async def test_web_index_sets_security_headers():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        pass
+
+    resp = await cron._web_index(Req())
+    csp = resp.headers["Content-Security-Policy"]
+    # self-contained app: no external connections, so the CSP confines any
+    # injected script to this origin and blocks framing of the action controls
+    assert "connect-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert "object-src 'none'" in csp
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+
+
+@pytest.mark.asyncio
+async def test_web_index_security_headers_overridable():
+    # an operator-configured web.headers value wins over the secure default,
+    # while defaults the operator didn't set are still applied.
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {"headers": {"X-Frame-Options": "SAMEORIGIN"}}
+
+    class Req:
+        pass
+
+    resp = await cron._web_index(Req())
+    assert resp.headers["X-Frame-Options"] == "SAMEORIGIN"  # operator override
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"  # default kept
+
+
+@pytest.mark.asyncio
 async def test_auth_middleware_public_path():
     from aiohttp import web
 

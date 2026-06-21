@@ -44,6 +44,33 @@ JOBS_INLINE_HISTORY = 20
 # browser then authenticates every data request with the token the user enters.
 WEB_PUBLIC_PATHS = frozenset({"/"})
 
+# Defence-in-depth security headers for the dashboard HTML document. The page is
+# fully self-contained (one inline <script>, inline styles, no external assets)
+# and only ever talks to its own origin, so this CSP is deliberately strict:
+#   - 'unsafe-inline' for script/style is unavoidable (everything is inlined),
+#     but connect-src 'self' confines any hypothetical injected script to this
+#     origin — it cannot exfiltrate to an attacker's server;
+#   - frame-ancestors 'none' (plus X-Frame-Options) blocks clickjacking of the
+#     run/cancel controls; base-uri/form-action 'none' close those vectors.
+# Operators can override any of these via the web.headers config option, which
+# is merged on top of these defaults (see _security_headers).
+WEB_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "base-uri 'none'; "
+        "form-action 'none'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+}
+
 
 @dataclass
 class JobRunInfo:
@@ -428,12 +455,26 @@ class Cron:
         )
         return web.Response(headers=self.web_config.get("headers", None))
 
+    def _security_headers(self) -> Dict[str, str]:
+        """Security headers for the dashboard HTML page.
+
+        Secure defaults (CSP, anti-clickjacking, nosniff) with any operator
+        ``web.headers`` merged on top, so an operator who deliberately sets one
+        of these (e.g. a relaxed CSP or framing policy) still wins.
+        """
+        assert self.web_config is not None
+        headers = dict(WEB_SECURITY_HEADERS)
+        custom = self.web_config.get("headers", None)
+        if custom:
+            headers.update(custom)
+        return headers
+
     async def _web_index(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         return web.Response(
             text=load_index_html(),
             content_type="text/html",
-            headers=self.web_config.get("headers", None),
+            headers=self._security_headers(),
         )
 
     def _job_to_dict(self, name: str, job: JobConfig) -> Dict[str, Any]:

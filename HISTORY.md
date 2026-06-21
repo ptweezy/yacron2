@@ -5,6 +5,20 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.14 (2026-06-21)
+
+Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`, an `arm64` addition to `docker.yml`). Here's the changelog body:
+
+- Add a per-commit build-verification workflow that builds the wheel,
+  `sdist`, and self-contained PyInstaller binaries for Linux (both
+  glibc and musl/Alpine, on `amd64` and `arm64`) and macOS (`amd64`
+  and `arm64`) on every push, without publishing, so a broken build or
+  bundle is caught at commit time instead of only at release.
+- Build-verify the Docker image for both `linux/amd64` and
+  `linux/arm64` on every commit, catching arm64-only breakage (such as
+  a dependency with no arm64 wheel) that the previous amd64-only check
+  would miss.
+
 ## 1.0.13 (2026-06-20)
 
 ### Improvements

@@ -4,13 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yacron2"
-description = "A modern, rootless-container-friendly cron replacement."
+description = "A modern, container-friendly cron replacement."
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "P", email = "ptweezy@runforyour.money" }]
-keywords = ["yacron2"]
+keywords = [
+    "cron",
+    "crontab",
+    "scheduler",
+    "job-scheduler",
+    "task-scheduler",
+    "scheduling",
+    "cron-replacement",
+    "cronjob",
+    "container",
+    "docker",
+    "kubernetes",
+    "k8s",
+    "12-factor",
+    "daemon",
+    "yaml",
+    "devops",
+    "sre",
+    "sysadmin",
+    "sentry",
+    "statsd",
+    "retry",
+    "timezone",
+    "asyncio",
+]
 dynamic = ["version"]
 dependencies = [
     "strictyaml>=1.7,<2",
@@ -26,16 +50,28 @@ dependencies = [
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "Natural Language :: English",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Environment :: Console",
+    "Framework :: AsyncIO",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: System :: Systems Administration",
+    "Topic :: System :: Monitoring",
+    "Topic :: Office/Business :: Scheduling",
     "Topic :: Utilities",
 ]
 
 [project.urls]
 Homepage = "https://github.com/ptweezy/yacron2"
+Documentation = "https://github.com/ptweezy/yacron2#readme"
+Source = "https://github.com/ptweezy/yacron2"
+Changelog = "https://github.com/ptweezy/yacron2/releases"
+Issues = "https://github.com/ptweezy/yacron2/issues"
+Container = "https://github.com/ptweezy/yacron2/pkgs/container/yacron2"
 
 [project.scripts]
 yacron2 = "yacron2.__main__:main"

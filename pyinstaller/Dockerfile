@@ -11,10 +11,10 @@ RUN curl https://pyenv.run | bash
 ENV PATH="/root/.pyenv/bin:$PATH"
 
 RUN pyenv install -l | grep 3.13
-RUN CONFIGURE_OPTS=--enable-shared pyenv install 3.13.5
-RUN pyenv global 3.13.5
+RUN CONFIGURE_OPTS=--enable-shared pyenv install 3.13.14
+RUN pyenv global 3.13.14
 
-RUN /root/.pyenv/versions/3.13.5/bin/python -m venv /yacron2
+RUN /root/.pyenv/versions/3.13.14/bin/python -m venv /yacron2
 ENV PATH=/yacron2/bin:$PATH
 RUN pip install -U pip setuptools pyinstaller==6.21.0
 

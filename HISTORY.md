@@ -5,6 +5,18 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.16 (2026-06-21)
+
+- Publish container images to Docker Hub as `docker.io/ptweezy/yacron2`
+  on every release, in addition to GHCR. The two registries carry the
+  same multi-arch (`linux/amd64` + `linux/arm64`) image, so you can
+  pull from whichever you prefer.
+- Document the Docker Hub images in the README and add a quick-start
+  `docker run` example and a Docker Hub badge.
+- Harden the release workflow so Docker Hub publishing is enabled only
+  when both `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` are configured.
+
+
 ## 1.0.15 (2026-06-21)
 
 - Lower the minimum required Python version from 3.13 to 3.10;

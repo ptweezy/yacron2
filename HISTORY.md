@@ -5,6 +5,17 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.12 (2026-06-20)
+
+- Update the GitHub Actions used to build and publish Docker images
+  (`docker/metadata-action`, `docker/login-action`,
+  `docker/setup-qemu-action`, `docker/setup-buildx-action`, and
+  `docker/build-push-action`) to their latest major versions.
+- Update the release workflow's `actions/upload-artifact`,
+  `actions/download-artifact`, and `softprops/action-gh-release`
+  actions to their latest major versions.
+
+
 ## 1.0.11 (2026-06-20)
 
 - The macOS binaries are now Developer ID code-signed and notarized by

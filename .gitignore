@@ -68,6 +68,3 @@ target/
 
 # Local-only changelog tooling
 /scripts/*
-
-
-docker-compose.yml

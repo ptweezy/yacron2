@@ -1,0 +1,20 @@
+# Spins up yacron2 with the built-in web dashboard and a set of demo jobs to
+# play with.
+#
+#   docker compose up --build      # start (rebuild image)
+#   docker compose logs -f         # watch job output
+#   docker compose down            # stop and remove
+#
+# Open the dashboard at: http://localhost:8080/
+
+services:
+  yacron2:
+    build:
+      context: .
+    container_name: yacron2
+    ports:
+      # host:container — dashboard + REST API are served on 8080 in the container
+      - "8080:8080"
+    volumes:
+      - ./example/demo/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro
+    restart: unless-stopped

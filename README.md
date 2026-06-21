@@ -1,4 +1,4 @@
-# yacron2 (Yet Another Cron 2)
+# yacron2 (Yet Another Cron...2...)
 
 [![PyPI version](https://img.shields.io/pypi/v/yacron2.svg)](https://pypi.org/project/yacron2/)
 [![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg)](https://pypi.org/project/yacron2/)

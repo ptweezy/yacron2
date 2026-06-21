@@ -653,7 +653,17 @@ class RunningJob:
                 self.config.name,
                 self.config.killTimeout,
             )
-            self.proc.kill()
+            # The process may already be gone: on Python <=3.11
+            # asyncio.wait_for can spuriously time out even though
+            # proc.wait() completed (the timeout race fixed in 3.12),
+            # leaving the transport closed with the returncode already
+            # set. kill() would then raise ProcessLookupError on the
+            # dead transport, so re-check and guard it like terminate().
+            if self.proc.returncode is None:
+                try:
+                    self.proc.kill()
+                except ProcessLookupError:
+                    pass
         await self._on_stop()
 
     async def report_failure(self):

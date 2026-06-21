@@ -1,8 +1,9 @@
 name: docker
 
 # Build the container image on EVERY commit (build-only, so a broken Dockerfile
-# fails fast) and publish the multi-arch image to GHCR (and Docker Hub, if the
-# DOCKERHUB_* secrets are set) when a release is cut.
+# fails fast) and, when a release is cut, publish the multi-arch image to both
+# GHCR and Docker Hub. (GHCR authenticates with the built-in GITHUB_TOKEN;
+# Docker Hub uses the DOCKERHUB_* secrets and is skipped.)
 #
 #   - on a push to any branch: build linux/amd64 + linux/arm64 (arm64 via QEMU
 #     emulation) and do NOT push -- a gate proving the image still builds for
@@ -105,12 +106,18 @@ jobs:
         id: registries
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           images="ghcr.io/${REPO,,}"   # GHCR image names must be lowercase
           dockerhub=false
-          if [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+          # Require BOTH secrets before enabling Docker Hub. Gating on the
+          # username alone would, in the half-configured case (username set but
+          # token empty), still try the Docker Hub login -- which fails ("Password
+          # required") and aborts the whole job, taking the otherwise-safe GHCR
+          # push down with it. Demanding both degrades cleanly to GHCR-only.
+          if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
             images="${images}"$'\n'"docker.io/${DOCKERHUB_USERNAME}/yacron2"
             dockerhub=true
           fi

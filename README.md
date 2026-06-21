@@ -8,6 +8,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-informational)](https://github.com/ptweezy/yacron2/releases/latest)
 [![CI](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/yacron2/pkgs/container/yacron2)
+[![Docker Hub](https://img.shields.io/badge/docker.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/ptweezy/yacron2)
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -37,20 +38,27 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 ### Run with Docker
 
 Prebuilt, multi-architecture (`linux/amd64` + `linux/arm64`) images are
-published to the GitHub Container Registry on every release. Mount your crontab
-and go:
+published on every release to two registries — the GitHub Container Registry
+and Docker Hub. The images are identical; pull from whichever you prefer. Mount
+your crontab and go:
 
 ```shell
+# GitHub Container Registry
 docker run --rm \
   -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
   ghcr.io/ptweezy/yacron2:latest
+
+# Docker Hub
+docker run --rm \
+  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
+  ptweezy/yacron2:latest
 ```
 
 The image runs as a non-root user and reads its configuration from
 `/etc/yacron2.d` by default. For production, pin a specific version instead of
-`latest` (e.g. `ghcr.io/ptweezy/yacron2:1.0.4`) and see [Production container
-deployment](#production-container-deployment) for the hardened
-Kubernetes/Docker setup.
+`latest` (e.g. `ghcr.io/ptweezy/yacron2:1.0.14` or `ptweezy/yacron2:1.0.14`) and
+see [Production container deployment](#production-container-deployment) for the
+hardened Kubernetes/Docker setup.
 
 ### Install using pip
 
@@ -157,11 +165,11 @@ files — so it slots cleanly into a locked-down pod:
   mounted with an `fsGroup` so the non-root process can read them, and you can
   drop *all* Linux capabilities and forbid privilege escalation.
 
-The published image (`ghcr.io/ptweezy/yacron2`) is already built this way —
-non-root, with `yacron2 -c /etc/yacron2.d` as its entrypoint and no writable
-paths required — so for most deployments you can use it directly and mount your
-crontab read-only. If you would rather bake the configuration into your own
-image, base it on the published image:
+The published image (`ghcr.io/ptweezy/yacron2` and `docker.io/ptweezy/yacron2`)
+is already built this way — non-root, with `yacron2 -c /etc/yacron2.d` as its
+entrypoint and no writable paths required — so for most deployments you can use
+it directly and mount your crontab read-only. If you would rather bake the
+configuration into your own image, base it on the published image:
 
 ```dockerfile
 FROM ghcr.io/ptweezy/yacron2:latest

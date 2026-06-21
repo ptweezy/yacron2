@@ -108,9 +108,11 @@ The official image is built and published by the
 [`docker`](.github/workflows/docker.yml) workflow, from the top-level
 [`Dockerfile`](Dockerfile):
 
-- **On each published release** it builds a multi-arch (`linux/amd64` +
-  `linux/arm64`) image and pushes it to GHCR as
-  `ghcr.io/ptweezy/yacron2:<version>` and `:latest`.
+- **On each published release** it builds one multi-arch (`linux/amd64` +
+  `linux/arm64`) image and pushes it, tagged `<version>` and `:latest`, to both
+  `ghcr.io/ptweezy/yacron2` and `docker.io/ptweezy/yacron2`. GHCR authenticates
+  with the built-in `GITHUB_TOKEN`; Docker Hub uses the `DOCKERHUB_USERNAME` and
+  `DOCKERHUB_TOKEN` repository secrets.
 - **On pull requests / `main` pushes** that touch the `Dockerfile`, the package,
   or the workflow, it builds the image *without* pushing, so a broken
   `Dockerfile` fails CI before a release.

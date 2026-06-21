@@ -30,12 +30,24 @@ jobs:
       matrix:
         os: [ubuntu-latest]  # [macos-latest, ubuntu-latest, windows-latest]
         python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        experimental: [false]
+        include:
+          # Python 3.15 is in beta (final: 2026-10-01). Run it for early signal,
+          # but never let it gate CI -> continue-on-error. The risk is aiohttp:
+          # it has no cp315 wheels yet, so pip falls back to building it from
+          # source against a beta C-API, which may fail. allow-prereleases lets
+          # setup-python pick up the beta (it's a no-op for the stable rows).
+          - os: ubuntu-latest
+            python: '3.15'
+            experimental: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6.2.0
         with:
           python-version: ${{ matrix.python }}
+          allow-prereleases: true
       - run: pip install --upgrade pip
       - run: pip install tox
       - run: tox -e py

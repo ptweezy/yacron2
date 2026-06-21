@@ -4,8 +4,11 @@ name: docker
 # fails fast) and publish the multi-arch image to GHCR (and Docker Hub, if the
 # DOCKERHUB_* secrets are set) when a release is cut.
 #
-#   - on a push to any branch: build linux/amd64 only and do NOT push -- a fast
-#     gate proving the image still builds for every commit;
+#   - on a push to any branch: build linux/amd64 + linux/arm64 (arm64 via QEMU
+#     emulation) and do NOT push -- a gate proving the image still builds for
+#     BOTH release arches on every commit. arm64-under-QEMU is slow, but it
+#     catches arm64-only breakage (e.g. a dep with no arm64 wheel) that an
+#     amd64-only build would miss;
 #   - on release: the release workflow CALLS this one (workflow_call) right after
 #     it publishes, building linux/amd64 + linux/arm64 and pushing, tagged with
 #     the release version and `latest`;
@@ -64,7 +67,10 @@ jobs:
           version=""          # empty => Dockerfile reads the version from .git
           ref=""              # empty => checkout the triggering ref
           push=false
-          platforms="linux/amd64"
+          # Per-commit default: build both release arches (amd64 + arm64 via
+          # QEMU) but never push -- a build-only gate at the same arch coverage
+          # as the release image. The branches below opt up to push=true.
+          platforms="linux/amd64,linux/arm64"
           if [ -n "${CALL_VERSION:-}" ]; then
             # Invoked by the release workflow (workflow_call): build + push at the
             # just-released version. Detected via the input, NOT github.event_name
@@ -81,7 +87,7 @@ jobs:
             ref="$version"
             push=true; platforms="linux/amd64,linux/arm64"
           fi
-          # else: push -> build-only CI on every commit (defaults above).
+          # else: push -> multi-arch build-only CI on every commit (defaults above).
           {
             echo "version=$version"
             echo "ref=$ref"

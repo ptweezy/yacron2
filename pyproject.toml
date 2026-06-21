@@ -23,7 +23,6 @@ keywords = [
     "docker",
     "kubernetes",
     "k8s",
-    "12-factor",
     "daemon",
     "yaml",
     "devops",

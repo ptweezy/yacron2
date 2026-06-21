@@ -180,11 +180,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # macOS PyInstaller binaries, one per arch on a native runner. Mirrors
+  # macOS PyInstaller binaries. Per-commit we build on BOTH macOS 15 and macOS
+  # 26 (Tahoe), each on a native runner, arm64 + Intel -- four jobs -- so OS-
+  # version-specific build breakage surfaces early. (release.yml still ships
+  # only the macOS 15 pair; this extra macOS 26 coverage is CI-only.) Mirrors
   # release.yml's binaries-macos -- including the arch assertion that guards
   # against Rosetta silently building the wrong arch -- but deliberately OMITS
   # the "Sign and notarize" step (that needs secrets and only matters for a
-  # published release).
+  # published release). The matrix carries an `os` (15/26) discriminator so the
+  # four binaries/artifacts get unique names instead of colliding on arch.
   binaries-macos:
     needs: version
     strategy:
@@ -192,9 +196,17 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-15          # Apple Silicon
+            runner: macos-15          # macOS 15, Apple Silicon
+            os: '15'
           - arch: amd64
-            runner: macos-15-intel    # Intel
+            runner: macos-15-intel    # macOS 15, Intel
+            os: '15'
+          - arch: arm64
+            runner: macos-26          # macOS 26 (Tahoe), Apple Silicon
+            os: '26'
+          - arch: amd64
+            runner: macos-26-intel    # macOS 26 (Tahoe), Intel
+            os: '26'
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -221,10 +233,10 @@ jobs:
             arm64) want=arm64 ;;
           esac
           file dist/yacron2 | grep -q "$want"
-          mv dist/yacron2 "dist/yacron2-macos-${{ matrix.arch }}"
+          mv dist/yacron2 "dist/yacron2-macos${{ matrix.os }}-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7
         with:
-          name: yacron2-macos-${{ matrix.arch }}
-          path: dist/yacron2-macos-${{ matrix.arch }}
+          name: yacron2-macos${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/yacron2-macos${{ matrix.os }}-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7

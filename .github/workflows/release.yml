@@ -12,10 +12,13 @@ name: release
 #     "[release:patch]" written anywhere in a commit message WILL trigger a
 #     release -- don't quote the marker verbatim in a commit message unless you
 #     mean it. (Only commit messages are scanned, never file contents.)
-#   - or it is started manually via workflow_dispatch (bump from the dropdown).
+#   - or it is started manually via workflow_dispatch (bump from the dropdown,
+#     or an exact `tag` to release a specific X.Y.Z instead of the computed
+#     next one -- the `tag` input wins over `bump` when set).
 #
 # On release it: gates on tox, computes the next version from the latest X.Y.Z
-# tag, builds at that version (SETUPTOOLS_SCM_PRETEND_VERSION) -- the wheel
+# tag (or uses the explicit `tag` input verbatim), builds at that version
+# (SETUPTOOLS_SCM_PRETEND_VERSION) -- the wheel
 # + sdist and self-contained PyInstaller binaries for Linux (amd64 + arm64 in
 # both glibc and musl/Alpine flavors) and macOS (arm64 + amd64), each built
 # natively on a matching runner -- publishes the wheel + sdist to PyPI via
@@ -36,10 +39,14 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Version bump level"
+        description: "Version bump level (ignored when 'tag' is set)"
         type: choice
         options: [minor, major, patch]
         default: minor
+      tag:
+        description: "Exact version to release as X.Y.Z (overrides bump); leave blank to compute the next one"
+        type: string
+        default: ""
 
 concurrency:
   group: release
@@ -126,26 +133,43 @@ jobs:
         id: ver
         env:
           BUMP: ${{ needs.decide.outputs.bump }}
+          OVERRIDE: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
           git fetch --tags --force
-          latest=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
-          latest=${latest:-0.0.0}
-          IFS='.' read -r major minor patch <<<"$latest"
-          case "$BUMP" in
-            major) major=$((major + 1)); minor=0; patch=0 ;;
-            minor) minor=$((minor + 1)); patch=0 ;;
-            patch) patch=$((patch + 1)) ;;
-          esac
-          new="${major}.${minor}.${patch}"
+          if [ -n "${OVERRIDE:-}" ]; then
+            # Explicit override from workflow_dispatch: release exactly this
+            # version instead of the computed next one. Tags in this repo are
+            # bare X.Y.Z and the rest of the pipeline (HISTORY.md lookup, asset
+            # names, the PyPI/scm version) assumes that shape, so reject anything
+            # else rather than silently building a malformed release.
+            new="$OVERRIDE"
+            if ! printf '%s' "$new" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Invalid tag '$new'; expected X.Y.Z (digits only, no leading 'v')." >&2
+              exit 1
+            fi
+            echo "::notice::Releasing $new (explicit tag override)"
+          else
+            latest=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+            latest=${latest:-0.0.0}
+            IFS='.' read -r major minor patch <<<"$latest"
+            case "$BUMP" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            new="${major}.${minor}.${patch}"
+            echo "::notice::Releasing $new (previous $latest, bump=$BUMP)"
+          fi
 
+          # Applies to both paths: never clobber an existing tag (a failed
+          # publish leaves no orphan tag, so a clean retry is still possible).
           if git rev-parse -q --verify "refs/tags/$new" >/dev/null; then
             echo "::error::Tag $new already exists; refusing to re-release." >&2
             exit 1
           fi
 
           echo "new=$new" >> "$GITHUB_OUTPUT"
-          echo "::notice::Releasing $new (previous $latest, bump=$BUMP)"
 
   gate:
     needs: decide

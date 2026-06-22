@@ -86,18 +86,19 @@ On a release the workflow, in order:
    tag already exists);
 3. **gates** on `tox` (py310, py311, py312, py313, py314, lint, mypy) — a red build means no release;
 4. **builds** the wheel + sdist *and* the self-contained PyInstaller binaries
-   for Linux (`amd64`, `arm64`, `i686` and `armv7`, glibc and musl) and macOS
-   (`arm64` + `amd64`), each on a matching runner (the 32-bit arches inside a
-   container, `armv7` under QEMU), smoke-tested with `--version` — all at the
-   computed version, *before* publishing, so a broken build fails the run
-   instead of producing a half-finished release;
+   for Linux (`amd64`, `arm64`, `i686`, `armv7`, `ppc64le` and `s390x`, glibc
+   and musl) and macOS (`arm64` + `amd64`), each on a matching runner (the
+   non-native arches inside a container, `armv7`/`ppc64le`/`s390x` under QEMU),
+   smoke-tested with `--version` — all at the computed version, *before*
+   publishing, so a broken build fails the run instead of producing a
+   half-finished release;
 5. **publishes the wheel + sdist to PyPI** via [Trusted Publishing
    (OIDC)](https://docs.pypi.org/trusted-publishers/) — there is no API token to
    manage or leak;
 6. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
    GitHub Release with the wheel, sdist, and all the binaries
-   (`yacron2-linux-{amd64,arm64,i686,armv7}`, their `-musl` variants, and
-   `yacron2-macos-{arm64,amd64}`) attached.
+   (`yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x}`, their `-musl`
+   variants, and `yacron2-macos-{arm64,amd64}`) attached.
 
 Because no file is committed back to the repo, a release never re-triggers the
 workflow. Because the tag is created *after* publishing, a failed publish leaves
@@ -110,8 +111,8 @@ The official image is built and published by the
 [`Dockerfile`](Dockerfile):
 
 - **On each published release** it builds one multi-arch (`linux/amd64`,
-  `linux/arm64`, `linux/386` and `linux/arm/v7`) image and pushes it, tagged
-  `<version>` and `:latest`, to both
+  `linux/arm64`, `linux/386`, `linux/arm/v7`, `linux/ppc64le` and `linux/s390x`)
+  image and pushes it, tagged `<version>` and `:latest`, to both
   `ghcr.io/ptweezy/yacron2` and `docker.io/ptweezy/yacron2`. GHCR authenticates
   with the built-in `GITHUB_TOKEN`; Docker Hub uses the `DOCKERHUB_USERNAME` and
   `DOCKERHUB_TOKEN` repository secrets.

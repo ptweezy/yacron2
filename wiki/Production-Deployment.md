@@ -23,9 +23,9 @@ published image. If you do not use that feature, drop root entirely. See
 
 ## The published image
 
-Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386` and
-`linux/arm/v7`) images are published to the GitHub Container Registry on every
-release.
+Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
+`linux/arm/v7`, `linux/ppc64le` and `linux/s390x`) images are published to the
+GitHub Container Registry on every release.
 
 | Property | Value |
 | --- | --- |

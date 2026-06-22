@@ -25,9 +25,11 @@ COPY . .
 #
 # build-essential + libffi/zlib headers let pip source-compile the C-extension
 # deps that ship no wheel on some targets — notably the aiohttp stack on 32-bit
-# x86 (linux/386) and propcache on 32-bit ARM (linux/arm/v7). On 64-bit the
-# whole stack is prebuilt wheels, so the toolchain goes unused; either way it
-# stays in this builder stage and never reaches the slim runtime image.
+# x86 (linux/386), propcache on 32-bit ARM (linux/arm/v7), and
+# multidict/frozenlist/ruamel.yaml.clib on linux/riscv64 (no riscv64 wheels yet).
+# On amd64/arm64 the whole stack is prebuilt wheels, so the toolchain goes
+# unused; either way it stays in this builder stage and never reaches the slim
+# runtime image.
 #
 # When VERSION is given we hand it to setuptools_scm directly — no git needed.
 # Otherwise (a plain `docker build .`) setuptools_scm reads the version from

@@ -3,7 +3,8 @@ name: build
 # Per-commit build verification. Runs EVERY build that release.yml performs --
 # the wheel + sdist and the self-contained PyInstaller binaries for Linux
 # (amd64, arm64, i686, armv7, ppc64le and s390x, in both glibc and musl/Alpine
-# flavors) and macOS (arm64 + amd64) -- on every push, but WITHOUT publishing,
+# flavors -- plus a build-only riscv64 spike, see below) and macOS (arm64 +
+# amd64) -- on every push, but WITHOUT publishing,
 # tagging,
 # signing, or pushing anything. A broken build (or a broken bundle the
 # `--version` smoke test
@@ -22,7 +23,21 @@ name: build
 # The build steps below are kept deliberately identical to their release.yml
 # counterparts (same Python, same pyinstaller==6.21.0 pin, same `--version`
 # smoke test, same matrices) so a change there and a drift here are easy to
-# spot -- only the publish/sign/version-pin differences are intentional.
+# spot -- only the publish/sign/version-pin differences, the macOS 26 coverage,
+# and the riscv64 spike (below) are intentional.
+#
+# riscv64 SPIKE (intentional divergence from release.yml): this workflow ALSO
+# builds the Linux riscv64 PyInstaller binaries (glibc + musl) that release.yml
+# does NOT yet ship. PyInstaller publishes no precompiled riscv64 bootloader, so
+# pip must compile it from the sdist via waf under QEMU -- unproven for this
+# project (its wscript doesn't recognize riscv and falls back to a generic
+# "unknown" target). These build-only jobs prove (or disprove) that end to end
+# BEFORE riscv64 is promoted into release.yml's published asset list: if they
+# stay green, add riscv64 to release.yml's binaries-musl/binaries-glibc-extra
+# matrices and its release `files:` list; if they prove broken/flaky, this is the
+# safe place to find out -- nothing here is published. (The riscv64 *Docker
+# image* is already a real release artifact via docker.yml; only the standalone
+# binaries are still a spike.)
 
 on:
   push:
@@ -136,14 +151,16 @@ jobs:
 
   # musl/Alpine PyInstaller binaries, built inside an Alpine container (see
   # release.yml's binaries-musl for why it's `docker run`, not a job container).
-  # Mirrors that job; the pinned version is what lets the no-git Alpine image
-  # resolve a setuptools_scm version. Covers all six Linux arches: amd64/arm64
-  # build natively on a matching runner; i686 (linux/386) runs natively on the
-  # amd64 runner (x86-64 executes 32-bit x86 directly); armv7, ppc64le and s390x
-  # have no native execution on the runners, so they run under QEMU emulation.
-  # musllinux wheels exist for the whole stack on armv7/ppc64le/s390x, but NOT
-  # for the i686 aiohttp family (aiohttp/yarl/frozenlist/propcache) -- build-base
-  # compiles those from sdist.
+  # Mirrors that job (plus the riscv64 spike); the pinned version is what lets the
+  # no-git Alpine image resolve a setuptools_scm version. Covers all six release
+  # Linux arches plus a riscv64 spike (see banner): amd64/arm64 build natively on
+  # a matching runner; i686 (linux/386) runs natively on the amd64 runner (x86-64
+  # executes 32-bit x86 directly); armv7, ppc64le, s390x and riscv64 have no
+  # native execution on the runners, so they run under QEMU emulation. musllinux
+  # wheels exist for the whole stack on armv7/ppc64le/s390x, but NOT for the i686
+  # aiohttp family (aiohttp/yarl/frozenlist/propcache) or for
+  # multidict/frozenlist/ruamel.yaml.clib on riscv64 -- build-base compiles those
+  # from sdist.
   binaries-musl:
     needs: version
     strategy:
@@ -171,6 +188,14 @@ jobs:
             runner: ubuntu-24.04
             platform: linux/s390x
             qemu: true            # no native s390x on the runners -> emulate
+          # riscv64 SPIKE (build-only; NOT in release.yml -- see banner). No
+          # native runner and no precompiled PyInstaller bootloader, so the
+          # bootloader (and multidict/frozenlist/ruamel.yaml.clib, which lack
+          # riscv64 musllinux wheels) compile from source under QEMU.
+          - arch: riscv64
+            runner: ubuntu-24.04
+            platform: linux/riscv64
+            qemu: true            # no native riscv64 on the runners -> emulate
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -209,15 +234,17 @@ jobs:
           retention-days: 7
 
   # glibc PyInstaller binaries for the arches with no native GitHub runner
-  # (i686, armv7, ppc64le, s390x). The native `binaries` job covers only amd64
-  # and arm64 (the runners GitHub hosts) and PyInstaller is not a cross-compiler,
-  # so -- like binaries-musl -- these build inside a container via
-  # `docker run --platform`, here on python:3.14-slim (Debian glibc). i686
-  # (linux/386) runs natively on the amd64 runner; armv7, ppc64le and s390x run
-  # under QEMU. glibc wheel coverage varies: ppc64le/s390x have full manylinux
-  # wheels, while the i686 aiohttp stack and propcache-on-armv7 ship no wheel and
-  # compile from sdist -- so build-essential is installed either way. Assets
-  # carry no -musl suffix and sit beside the 64-bit glibc binaries.
+  # (i686, armv7, ppc64le, s390x, plus the riscv64 spike -- see banner). The
+  # native `binaries` job covers only amd64 and arm64 (the runners GitHub hosts)
+  # and PyInstaller is not a cross-compiler, so -- like binaries-musl -- these
+  # build inside a container via `docker run --platform`, here on
+  # python:3.14-slim (Debian glibc). i686 (linux/386) runs natively on the amd64
+  # runner; armv7, ppc64le, s390x and riscv64 run under QEMU. glibc wheel
+  # coverage varies: ppc64le/s390x have full manylinux wheels, while the i686
+  # aiohttp stack, propcache-on-armv7, and multidict/frozenlist/ruamel.yaml.clib
+  # on riscv64 ship no wheel and compile from sdist -- so build-essential is
+  # installed either way. Assets carry no -musl suffix and sit beside the 64-bit
+  # glibc binaries.
   binaries-glibc-extra:
     needs: version
     strategy:
@@ -238,6 +265,14 @@ jobs:
           - arch: s390x
             runner: ubuntu-24.04
             platform: linux/s390x
+            qemu: true
+          # riscv64 SPIKE (build-only; NOT in release.yml -- see banner). No
+          # native runner and no precompiled PyInstaller bootloader, so the
+          # bootloader (and multidict/frozenlist/ruamel.yaml.clib, which lack
+          # riscv64 manylinux wheels) compile from source under QEMU.
+          - arch: riscv64
+            runner: ubuntu-24.04
+            platform: linux/riscv64
             qemu: true
     runs-on: ${{ matrix.runner }}
     steps:

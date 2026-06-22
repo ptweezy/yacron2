@@ -5,14 +5,15 @@ name: docker
 # GHCR and Docker Hub. (GHCR authenticates with the built-in GITHUB_TOKEN;
 # Docker Hub uses the DOCKERHUB_* secrets and is skipped.)
 #
-#   - on a push to any branch: build all six release arches -- linux/amd64,
-#     linux/arm64, linux/386, linux/arm/v7, linux/ppc64le and linux/s390x
-#     (everything but amd64 via QEMU emulation) -- and do NOT push: a gate
-#     proving the image still builds for EVERY release arch on every commit. The
-#     emulated arches are slow, but they catch arch-only breakage (e.g. a dep
-#     with no wheel for that arch -- the 32-bit aiohttp stack notably compiles
-#     from source) an amd64-only build would miss. (The 32-bit source builds need
-#     a toolchain in the Dockerfile's builder stage; see Dockerfile.)
+#   - on a push to any branch: build all seven release arches -- linux/amd64,
+#     linux/arm64, linux/386, linux/arm/v7, linux/ppc64le, linux/s390x and
+#     linux/riscv64 (everything but amd64 via QEMU emulation) -- and do NOT
+#     push: a gate proving the image still builds for EVERY release arch on every
+#     commit. The emulated arches are slow, but they catch arch-only breakage
+#     (e.g. a dep with no wheel for that arch -- the 32-bit aiohttp stack, and
+#     multidict/frozenlist/ruamel.yaml.clib on riscv64, notably compile from
+#     source) an amd64-only build would miss. (Those source builds need a
+#     toolchain in the Dockerfile's builder stage; see Dockerfile.)
 #   - on release: the release workflow CALLS this one (workflow_call) right after
 #     it publishes, building all six arches and pushing, tagged with
 #     the release version and `latest`;
@@ -71,17 +72,17 @@ jobs:
           version=""          # empty => Dockerfile reads the version from .git
           ref=""              # empty => checkout the triggering ref
           push=false
-          # Per-commit default: build all six release arches (amd64 native;
-          # arm64/386/armv7/ppc64le/s390x via QEMU) but never push -- a build-only
+          # Per-commit default: build all seven release arches (amd64 native;
+          # arm64/386/armv7/ppc64le/s390x/riscv64 via QEMU) but never push -- a build-only
           # gate at the same arch coverage as the release image. The branches
           # below opt up to push=true.
-          platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x"
+          platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
           if [ -n "${CALL_VERSION:-}" ]; then
             # Invoked by the release workflow (workflow_call): build + push at the
             # just-released version. Detected via the input, NOT github.event_name
             # -- in a called workflow that still reports the CALLER's event.
             version="$CALL_VERSION"; ref="$CALL_VERSION"
-            push=true; platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x"
+            push=true; platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
           elif [ "$EVENT" = "workflow_dispatch" ]; then
             # Manual (re)build of an existing release tag.
             if [ -n "${INPUT_TAG:-}" ]; then
@@ -90,7 +91,7 @@ jobs:
               version="$(gh release view --repo "$REPO" --json tagName -q .tagName)"
             fi
             ref="$version"
-            push=true; platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x"
+            push=true; platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
           fi
           # else: push -> multi-arch build-only CI on every commit (defaults above).
           {

@@ -3,8 +3,8 @@ name: build
 # Per-commit build verification. Runs EVERY build that release.yml performs --
 # the wheel + sdist and the self-contained PyInstaller binaries for Linux
 # (amd64, arm64, i686, armv7, ppc64le and s390x, in both glibc and musl/Alpine
-# flavors -- plus a build-only riscv64 spike, see below) and macOS (arm64 +
-# amd64) -- on every push, but WITHOUT publishing,
+# flavors -- plus build-only riscv64 + armv6 spikes, see below) and macOS (arm64
+# + amd64) -- on every push, but WITHOUT publishing,
 # tagging,
 # signing, or pushing anything. A broken build (or a broken bundle the
 # `--version` smoke test
@@ -24,20 +24,23 @@ name: build
 # counterparts (same Python, same pyinstaller==6.21.0 pin, same `--version`
 # smoke test, same matrices) so a change there and a drift here are easy to
 # spot -- only the publish/sign/version-pin differences, the macOS 26 coverage,
-# and the riscv64 spike (below) are intentional.
+# and the riscv64 + armv6 spikes (below) are intentional.
 #
-# riscv64 SPIKE (intentional divergence from release.yml): this workflow ALSO
-# builds the Linux riscv64 PyInstaller binaries (glibc + musl) that release.yml
-# does NOT yet ship. PyInstaller publishes no precompiled riscv64 bootloader, so
-# pip must compile it from the sdist via waf under QEMU -- unproven for this
-# project (its wscript doesn't recognize riscv and falls back to a generic
-# "unknown" target). These build-only jobs prove (or disprove) that end to end
-# BEFORE riscv64 is promoted into release.yml's published asset list: if they
-# stay green, add riscv64 to release.yml's binaries-musl/binaries-glibc-extra
-# matrices and its release `files:` list; if they prove broken/flaky, this is the
-# safe place to find out -- nothing here is published. (The riscv64 *Docker
-# image* is already a real release artifact via docker.yml; only the standalone
-# binaries are still a spike.)
+# riscv64 + armv6 SPIKES (intentional divergence from release.yml): this workflow
+# ALSO builds Linux PyInstaller binaries that release.yml does NOT yet ship --
+# riscv64 (glibc + musl) and armv6 (musl/Alpine ONLY; Debian/glibc has no
+# arm32v6 image, it ships arm32v5, so there is no glibc armv6 binary and no armv6
+# Docker image). PyInstaller publishes no precompiled riscv64 or armv6 bootloader,
+# so pip must compile it from the sdist via waf under QEMU -- unproven for this
+# project (the wscript doesn't recognize riscv, and armv6 has a history of
+# platform-detection quirks). These build-only jobs prove (or disprove) that end
+# to end BEFORE either arch is promoted into release.yml's published asset list:
+# if they stay green, add the arch to release.yml's binaries-musl matrix (plus
+# binaries-glibc-extra for riscv64) and its release `files:` list; if they prove
+# broken/flaky, this is the safe place to find out -- nothing here is published.
+# (The riscv64 *Docker image* is already a real release artifact via docker.yml;
+# armv6 has no Docker image because the Debian base lacks arm32v6 -- only the
+# standalone binaries are spikes.)
 
 on:
   push:
@@ -151,16 +154,17 @@ jobs:
 
   # musl/Alpine PyInstaller binaries, built inside an Alpine container (see
   # release.yml's binaries-musl for why it's `docker run`, not a job container).
-  # Mirrors that job (plus the riscv64 spike); the pinned version is what lets the
-  # no-git Alpine image resolve a setuptools_scm version. Covers all six release
-  # Linux arches plus a riscv64 spike (see banner): amd64/arm64 build natively on
-  # a matching runner; i686 (linux/386) runs natively on the amd64 runner (x86-64
-  # executes 32-bit x86 directly); armv7, ppc64le, s390x and riscv64 have no
-  # native execution on the runners, so they run under QEMU emulation. musllinux
-  # wheels exist for the whole stack on armv7/ppc64le/s390x, but NOT for the i686
-  # aiohttp family (aiohttp/yarl/frozenlist/propcache) or for
-  # multidict/frozenlist/ruamel.yaml.clib on riscv64 -- build-base compiles those
-  # from sdist.
+  # Mirrors that job (plus the riscv64 + armv6 spikes); the pinned version is what
+  # lets the no-git Alpine image resolve a setuptools_scm version. Covers all six
+  # release Linux arches plus riscv64 + armv6 spikes (see banner): amd64/arm64
+  # build natively on a matching runner; i686 (linux/386) runs natively on the
+  # amd64 runner (x86-64 executes 32-bit x86 directly); armv7, ppc64le, s390x,
+  # riscv64 and armv6 have no native execution on the runners, so they run under
+  # QEMU emulation. musllinux wheels exist for the whole stack on
+  # armv7/ppc64le/s390x, but NOT for the i686 aiohttp family
+  # (aiohttp/yarl/frozenlist/propcache), nothing at all for armv6 (no musllinux
+  # armv6 wheels exist), or multidict/frozenlist/ruamel.yaml.clib on riscv64 --
+  # build-base compiles those from sdist.
   binaries-musl:
     needs: version
     strategy:
@@ -196,6 +200,16 @@ jobs:
             runner: ubuntu-24.04
             platform: linux/riscv64
             qemu: true            # no native riscv64 on the runners -> emulate
+          # armv6 SPIKE (build-only; NOT in release.yml -- see banner). musl-only:
+          # Debian/glibc has no arm32v6 image (it ships arm32v5), so there is no
+          # binaries-glibc-extra counterpart and no armv6 Docker image. No native
+          # runner, no precompiled PyInstaller bootloader, and NO musllinux armv6
+          # wheels at all, so the bootloader AND the entire C-ext stack compile
+          # from source under QEMU (slowest leg in the matrix).
+          - arch: armv6
+            runner: ubuntu-24.04
+            platform: linux/arm/v6
+            qemu: true            # no native armv6 on the runners -> emulate
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7

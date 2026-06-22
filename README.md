@@ -6,7 +6,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/yacron2?logo=github)](https://github.com/ptweezy/yacron2/releases/latest)
 [![Release downloads](https://img.shields.io/github/downloads/ptweezy/yacron2/total?logo=github&label=binary%20downloads)](https://github.com/ptweezy/yacron2/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-informational)](https://github.com/ptweezy/yacron2/releases/latest)
-[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20i686%20%7C%20armv7%20%7C%20ppc64le%20%7C%20s390x-informational)](https://github.com/ptweezy/yacron2/releases/latest)
+[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64-informational)](https://github.com/ptweezy/yacron2/releases/latest)
 [![CI](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/yacron2/pkgs/container/yacron2)
 [![Docker Hub](https://img.shields.io/badge/docker.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/ptweezy/yacron2)

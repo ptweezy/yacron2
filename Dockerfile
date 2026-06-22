@@ -1,9 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Official yacron2 image: a minimal, non-root, multi-arch build suitable for the
-# hardened (read-only root filesystem, dropped-capabilities) deployments
-# described in the README. Built and published to GHCR by
-# .github/workflows/docker.yml.
+# Official yacron2 image: a minimal, non-root, multi-arch build
 #
 # Build locally:
 #   docker build -t yacron2 .
@@ -50,7 +47,7 @@ LABEL org.opencontainers.image.title="yacron2" \
       org.opencontainers.image.licenses="MIT"
 
 # Flush stdout/stderr immediately (yacron2 logs to them) and never write .pyc
-# files — both matter under a read-only root filesystem.
+# files — because remember....the read-only root filesystem.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
@@ -58,8 +55,8 @@ ENV PYTHONUNBUFFERED=1 \
 COPY --from=builder /opt/venv /opt/venv
 
 # Run as an unprivileged, non-root user (65534 = "nobody"). Per-job user/group
-# switching is unavailable in this mode; dropping root gives the fully
-# locked-down container the README documents.
+# switching is unavailable in this mode; dropping root gives a fully
+# locked-down container.
 USER 65534:65534
 
 ENTRYPOINT ["yacron2"]

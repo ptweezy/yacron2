@@ -5,6 +5,29 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.2 (2026-06-21)
+
+This is a documentation release; there are no changes to the `yacron2`
+package itself.
+
+### Documentation
+
+- Add a project wiki (under `wiki/`) covering installation, the
+  configuration reference, the HTTP API, the web dashboard, schedules and
+  timezones, reporting, statsd metrics, output capturing, concurrency and
+  timeouts, failure detection and retries, includes and defaults, logging,
+  the CLI, architecture and internals, production deployment, migration
+  from yacron, contributing/releasing, and troubleshooting.
+- Showcase the web dashboard near the top of the README with annotated
+  screenshots of the overview, live log tail, run history, schedule
+  preview, command palette, keyboard-shortcut reference, and the
+  green-phosphor and flat modern themes, linking the dashboard tour in the
+  wiki.
+- Slim the README's web-server section to an "Enabling the web dashboard"
+  pointer to that showcase and the wiki, removing the duplicated feature
+  list.
+
+
 ## 1.1.1 (2026-06-21)
 
 ### Features

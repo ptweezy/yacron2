@@ -262,7 +262,7 @@ Three built-in themes — amber and green phosphor CRT, or a flat **modern** loo
 | :---: | :---: |
 | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) |
 
-Run history and live logs are kept **in memory only** — nothing is written to disk — so the dashboard adds nothing to yacron2's read-only-root-filesystem deployment story, and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
+Run history and live logs are kept **in memory only**, and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
 
 ## Usage
 

@@ -139,11 +139,11 @@ following assets, built natively on a matching runner:
 The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
 (added in 1.0.8) are built inside an Alpine container for musl/Alpine hosts.
-The `i686`, `armv7`, `ppc64le` and `s390x` builds (added in 1.1.3, glibc and
-musl) extend the 64-bit `amd64`/`arm64` binaries to 32-bit x86, 32-bit ARM,
-POWER and IBM Z hosts; they build inside a container (`i686` natively on the
-x86-64 runner, the rest under QEMU emulation). macOS builds (added in 1.0.10)
-cover both Apple Silicon and Intel.
+The `i686` and `armv7` builds (added in 1.1.3) and the `ppc64le` and `s390x`
+builds (added in 1.1.4) — both glibc and musl — extend the 64-bit `amd64`/`arm64`
+binaries to 32-bit x86, 32-bit ARM, POWER and IBM Z hosts; they build inside a
+container (`i686` natively on the x86-64 runner, the rest under QEMU emulation).
+macOS builds (added in 1.0.10) cover both Apple Silicon and Intel.
 
 Download and run (glibc amd64 Linux shown — append `-musl` on Alpine, or use
 `yacron2-macos-<arch>` on a Mac):

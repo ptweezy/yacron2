@@ -5,20 +5,36 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.4 (2026-06-22)
+
+- Add self-contained binaries for two more Linux architectures to every
+  release, in both glibc and musl flavors: little-endian POWER (`ppc64le`)
+  and IBM Z (`s390x`) — `yacron2-linux-ppc64le`, `yacron2-linux-s390x`, and
+  their `-musl` variants — alongside the existing `amd64`, `arm64`, `i686`
+  and `armv7` builds. As with the other binaries, Python is not required on
+  the target system. Neither arch has a native GitHub runner, so they build
+  inside a container via `docker run --platform` under QEMU emulation; both
+  have prebuilt manylinux and musllinux wheels for the aiohttp dependency
+  stack, so nothing compiles from source.
+- The published container image now covers them too: the multi-arch image
+  adds `linux/ppc64le` and `linux/s390x` (to `linux/amd64`, `linux/arm64`,
+  `linux/386` and `linux/arm/v7`), and is build-checked at that full arch
+  coverage on every commit.
+
+
 ## 1.1.3 (2026-06-22)
 
-- Add self-contained binaries for four more Linux architectures to every
-  release, in both glibc and musl flavors: 32-bit x86 (`i686`), 32-bit ARM
-  (`armv7`), little-endian POWER (`ppc64le`) and IBM Z (`s390x`), alongside the
-  existing 64-bit `amd64` and `arm64` builds — e.g. `yacron2-linux-ppc64le` and
-  `yacron2-linux-s390x-musl`. As with the other binaries, Python is not required
-  on the target system. These arches have no native GitHub runner, so they build
-  inside a container via `docker run --platform` (`i686` runs natively on the
-  x86-64 runner; `armv7`, `ppc64le` and `s390x` run under QEMU emulation).
+- Add self-contained binaries for two more Linux architectures to every
+  release, in both glibc and musl flavors: 32-bit x86 (`yacron2-linux-i686`
+  and `yacron2-linux-i686-musl`) and 32-bit ARM (`yacron2-linux-armv7` and
+  `yacron2-linux-armv7-musl`), alongside the existing 64-bit `amd64` and
+  `arm64` builds. As with the other binaries, Python is not required on the
+  target system. The 32-bit binaries are built inside a 32-bit container
+  (`i686` natively on the x86-64 runner, `armv7` under QEMU emulation).
 - The published container image now covers those architectures too: the
-  multi-arch image is built for `linux/amd64`, `linux/arm64`, `linux/386`,
-  `linux/arm/v7`, `linux/ppc64le` and `linux/s390x`, and is build-checked at
-  that full arch coverage on every commit.
+  multi-arch image is built for `linux/amd64`, `linux/arm64`, `linux/386`
+  and `linux/arm/v7`, and is build-checked at that full arch coverage on
+  every commit.
 
 
 ## 1.1.2 (2026-06-21)

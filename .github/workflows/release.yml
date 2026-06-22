@@ -43,8 +43,8 @@ on:
       bump:
         description: "Version bump level (ignored when 'tag' is set)"
         type: choice
-        options: [minor, major, patch]
-        default: minor
+        options: [patch, minor, major]
+        default: patch
       tag:
         description: "Exact version to release as X.Y.Z (overrides bump); leave blank to compute the next one"
         type: string

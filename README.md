@@ -6,6 +6,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/yacron2?logo=github)](https://github.com/ptweezy/yacron2/releases/latest)
 [![Release downloads](https://img.shields.io/github/downloads/ptweezy/yacron2/total?logo=github&label=binary%20downloads)](https://github.com/ptweezy/yacron2/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-informational)](https://github.com/ptweezy/yacron2/releases/latest)
+[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20i686%20%7C%20armv7%20%7C%20ppc64le%20%7C%20s390x-informational)](https://github.com/ptweezy/yacron2/releases/latest)
 [![CI](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/yacron2/pkgs/container/yacron2)
 [![Docker Hub](https://img.shields.io/badge/docker.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/ptweezy/yacron2)
@@ -27,13 +28,15 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
   * Production-ready for locked-down corporate container platforms: runs as a
     non-root user, under a restricted seccomp profile, with a read-only root
     filesystem, an `fsGroup`-mounted config, and all Linux capabilities
-    dropped — no writable paths or elevated privileges required (see
+    dropped, so no writable paths or elevated privileges are required (see
     [Production container deployment](#production-container-deployment))
 * Option to automatically retry failing cron jobs, with exponential backoff
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
-* Optional **built-in [web dashboard](#web-dashboard)** — a live, keyboard-driven control panel to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 * Arbitrary timezone support
+* Optional **[live control panel](#web-dashboard)** to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
+
+[![yacron2 web dashboard: a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](#web-dashboard)
 
 ## Installation
 
@@ -41,7 +44,7 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 
 Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
 `linux/arm/v7`, `linux/ppc64le` and `linux/s390x`) images are
-published on every release to two registries — the GitHub Container Registry
+published on every release to two registries: the GitHub Container Registry
 and Docker Hub. The images are identical; pull from whichever you prefer. Mount
 your crontab and go:
 
@@ -90,12 +93,12 @@ from github: <https://github.com/ptweezy/yacron2/releases>. Every release
 automatically attaches binaries for Linux (amd64, arm64, i686, armv7, ppc64le
 and s390x) and macOS (amd64 and arm64):
 
-* **Linux** — glibc builds (`yacron2-linux-<arch>`) for the mainstream distros,
+* **Linux**: glibc builds (`yacron2-linux-<arch>`) for the mainstream distros,
   working on any system post glibc 2.39 (e.g. Ubuntu 24.04) on the matching CPU,
   plus musl builds (`yacron2-linux-<arch>-musl`) for Alpine and other musl-based
   systems. `<arch>` is one of `amd64`, `arm64`, `i686` (32-bit x86), `armv7`
   (32-bit ARM, e.g. older Raspberry Pi), `ppc64le` (POWER) or `s390x` (IBM Z).
-* **macOS** — `yacron2-macos-arm64` (Apple Silicon) / `yacron2-macos-amd64`
+* **macOS**: `yacron2-macos-arm64` (Apple Silicon) / `yacron2-macos-amd64`
   (Intel).
 
 Python is not required on the target system (it is embedded in the executable):
@@ -119,7 +122,7 @@ satisfies this, so no extra setup is required.
 
 This only matters when you run the binary under a **read-only root filesystem**
 (for example, a hardened container).  With the root filesystem read-only, `/tmp`
-is read-only too, and the binary aborts at startup — `Could not create temporary
+is read-only too, and the binary aborts at startup: `Could not create temporary
 directory`, or `Error loading shared library …: Operation not permitted`.  Give
 it a small writable *and executable* temp mount and it runs fine:
 
@@ -139,39 +142,39 @@ the binary at another writable, executable directory with `TMPDIR=/path`.
 This requirement is unique to the standalone binary.  The published container
 image (and `pip`/`pipx` installs) run yacron2 as a normal Python package with
 the interpreter on disk, so they never self-extract and need no writable temp
-directory — see [Production container deployment](#production-container-deployment).
+directory. See [Production container deployment](#production-container-deployment).
 
 ## Production container deployment
 
 yacron2 is built to run unmodified under the hardened security contexts that
 corporate and enterprise Kubernetes / container platforms enforce.  At runtime
 the daemon only *reads* its configuration and secrets and writes its output to
-stdout/stderr — it never needs a writable working directory, temp files, or log
-files — so it slots cleanly into a locked-down pod:
+stdout/stderr. It never needs a writable working directory, temp files, or log
+files, so it slots cleanly into a locked-down pod:
 
-* **Non-root user** — yacron2 needs no special privileges to run, so the whole
+* **Non-root user**: yacron2 needs no special privileges to run, so the whole
   daemon can run as an unprivileged UID.  Only the optional per-job
   `user`/`group` switching (see [Change to another
   user/group](#change-to-another-usergroup)) requires running as root; if you
   don't use that feature, drop root entirely.
-* **Seccomp profile** — yacron2 makes no exotic syscalls, so the
+* **Seccomp profile**: yacron2 makes no exotic syscalls, so the
   `RuntimeDefault` seccomp profile (or an equivalently strict custom profile)
   works out of the box.
-* **Read-only root filesystem** — no runtime writes are required by the
+* **Read-only root filesystem**: no runtime writes are required by the
   published image (or a `pip`/`pipx` install).  Mount your crontab config
   read-only.  (If you enable the optional [HTTP
   interface](#remote-webhttp-interface) on a Unix socket, point the socket at a
   small writable `emptyDir` volume rather than the root filesystem.  And if you
   deploy the standalone *binary* instead of the image, it additionally needs a
-  small writable, executable temp mount — see [Install using
+  small writable, executable temp mount; see [Install using
   binary](#install-using-binary).)
-* **`fsGroup` and dropped capabilities** — config and secret volumes can be
+* **`fsGroup` and dropped capabilities**: config and secret volumes can be
   mounted with an `fsGroup` so the non-root process can read them, and you can
   drop *all* Linux capabilities and forbid privilege escalation.
 
 The published image (`ghcr.io/ptweezy/yacron2` and `docker.io/ptweezy/yacron2`)
-is already built this way — non-root, with `yacron2 -c /etc/yacron2.d` as its
-entrypoint and no writable paths required — so for most deployments you can use
+is already built this way (non-root, with `yacron2 -c /etc/yacron2.d` as its
+entrypoint and no writable paths required), so for most deployments you can use
 it directly and mount your crontab read-only. If you would rather bake the
 configuration into your own image, base it on the published image:
 
@@ -238,28 +241,28 @@ spec:
 
 yacron2 ships with a **built-in web dashboard**. Point your browser at the HTTP listener and you have a keyboard-driven control room for every job.
 
-[![yacron2 web dashboard — a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
+[![yacron2 web dashboard: a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
 
-The overview shows every job with its **live status**, a **countdown to its next run**, how long the last run took, an exit-code badge, and a **sparkline of recent runs** — all sortable, filterable, and searchable. Click any job (or press `Enter`) to open its detail drawer:
+The overview shows every job with its **live status**, a **countdown to its next run**, how long the last run took, an exit-code badge, and a **sparkline of recent runs**, all sortable, filterable, and searchable. Click any job (or press `Enter`) to open its detail drawer:
 
 | Live log tail | Run history | Schedule, explained |
 | :---: | :---: | :---: |
 | [![Live log tailing with ANSI colour and in-log search](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png) | [![Run history with success rate and a per-run duration chart](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png) |
-| Follow a running job's output **live** over Server-Sent Events — with ANSI colour, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a colour-coded per-run duration chart and the full run log. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
+| Follow a running job's output **live** over Server-Sent Events, with ANSI colour, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a colour-coded per-run duration chart and the full run log. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
 
-**Everything is one keypress away** — a fuzzy command palette (`Ctrl-K` / `⌘K`) runs any action or jumps to any job, `?` lists every shortcut, `/` filters, `j`/`k` move the cursor, `r` runs the selected job and `x` cancels it. You can **run a single job — or every failing job at once — on demand**, with a click.
+**Everything is one keypress away**: a fuzzy command palette (`Ctrl-K` / `⌘K`) runs any action or jumps to any job, `?` lists every shortcut, `/` filters, `j`/`k` move the cursor, `r` runs the selected job and `x` cancels it. You can **run a single job, or every failing job at once, on demand**, with a click.
 
 | Fuzzy command palette | Keyboard-first, with a shortcut for everything |
 | :---: | :---: |
 | [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png) |
 
-Three built-in themes — amber and green phosphor CRT, or a flat **modern** look — plus configurable CRT glow, scanlines, compact density, desktop failure notifications, and polling interval, all remembered in your browser (and the CRT effects honour `prefers-reduced-motion`):
+Three built-in themes (amber and green phosphor CRT, or a flat **modern** look), plus configurable CRT glow, scanlines, compact density, desktop failure notifications, and polling interval, all remembered in your browser (and the CRT effects honour `prefers-reduced-motion`):
 
 | Green phosphor CRT | Flat modern theme |
 | :---: | :---: |
 | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) |
 
-Run history and live logs are kept **in memory only** — nothing is written to disk — so the dashboard adds nothing to yacron2's read-only-root-filesystem deployment story, and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
+Run history and live logs are kept **in memory only**, and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
 
 ## Usage
 
@@ -810,7 +813,7 @@ web:
 
 With the web interface enabled, yacron2 also serves the **[web dashboard](#web-dashboard)**
 (showcased near the top of this README) at the root path (`/`) of any `http://`
-listener — open <http://127.0.0.1:8080/> in the example above, and see the
+listener. Open <http://127.0.0.1:8080/> in the example above, and see the
 [full dashboard tour](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in
 the wiki. It is a single self-contained page (no build step or external assets)
 that watches every job's status, tails its logs live, runs or cancels jobs on
@@ -818,7 +821,7 @@ demand, and shows run history and a plain-English schedule preview. Logs are
 shown for the streams a job captures, so enable `captureStdout` /
 `captureStderr` on jobs whose output you want to watch here.
 
-The run history and logs are kept **in memory only** — nothing is written to
+The run history and logs are kept **in memory only**. Nothing is written to
 disk, so the dashboard does not change yacron2's read-only-filesystem
 deployment story. History resets when yacron2 restarts.
 
@@ -925,7 +928,7 @@ HTTP/1.1 200 OK
 
 #### Get detailed job info (used by the dashboard)
 
-`GET /jobs` returns a JSON array describing every job — its schedule and
+`GET /jobs` returns a JSON array describing every job: its schedule and
 timezone, whether it is enabled/running, the time until its next scheduled run, a
 summary of its most recent finished run (outcome, exit code, start/finish times
 and duration), and a compact `history` of recent outcomes for the trend

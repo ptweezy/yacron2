@@ -5,6 +5,25 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.5 (2026-06-22)
+
+This is a documentation release; there are no changes to the `yacron2`
+package itself.
+
+### Documentation
+
+- README changes
+- Add an `Architectures` badge to the README summarising the binary and
+  container targets (`amd64`, `arm64`, `i686`, `armv7`, `ppc64le`,
+  `s390x`).
+
+### Release automation
+
+- Default the manual (`workflow_dispatch`) release to a `patch` bump and
+  list `patch` first in the bump options, since patch releases are the
+  common case.
+
+
 ## 1.1.4 (2026-06-22)
 
 - Add self-contained binaries for two more Linux architectures to every

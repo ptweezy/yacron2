@@ -32,7 +32,7 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * Option to automatically retry failing cron jobs, with exponential backoff
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
-* Optional built-in web dashboard to watch each job's latest status, tail its live logs, run or cancel it on demand, and review its recent run history, success rate, and schedule.
+* Optional **built-in [web dashboard](#web-dashboard)** — a live, keyboard-driven control panel to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 * Arbitrary timezone support
 
 ## Installation
@@ -231,6 +231,33 @@ spec:
           configMap:
             name: yacron2tab
 ```
+
+## Web dashboard
+
+yacron2 ships with a **built-in web dashboard**. Point your browser at the HTTP listener and you have a keyboard-driven control room for every job.
+
+[![yacron2 web dashboard — a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
+
+The overview shows every job with its **live status**, a **countdown to its next run**, how long the last run took, an exit-code badge, and a **sparkline of recent runs** — all sortable, filterable, and searchable. Click any job (or press `Enter`) to open its detail drawer:
+
+| Live log tail | Run history | Schedule, explained |
+| :---: | :---: | :---: |
+| [![Live log tailing with ANSI colour and in-log search](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png) | [![Run history with success rate and a per-run duration chart](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png) |
+| Follow a running job's output **live** over Server-Sent Events — with ANSI colour, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a colour-coded per-run duration chart and the full run log. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
+
+**Everything is one keypress away** — a fuzzy command palette (`Ctrl-K` / `⌘K`) runs any action or jumps to any job, `?` lists every shortcut, `/` filters, `j`/`k` move the cursor, `r` runs the selected job and `x` cancels it. You can **run a single job — or every failing job at once — on demand**, with a click.
+
+| Fuzzy command palette | Keyboard-first, with a shortcut for everything |
+| :---: | :---: |
+| [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png) |
+
+Three built-in themes — amber and green phosphor CRT, or a flat **modern** look — plus configurable CRT glow, scanlines, compact density, desktop failure notifications, and polling interval, all remembered in your browser (and the CRT effects honour `prefers-reduced-motion`):
+
+| Green phosphor CRT | Flat modern theme |
+| :---: | :---: |
+| [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) |
+
+Run history and live logs are kept **in memory only** — nothing is written to disk — so the dashboard adds nothing to yacron2's read-only-root-filesystem deployment story, and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
 
 ## Usage
 
@@ -777,32 +804,17 @@ web:
      - unix:///tmp/yacron2.sock
 ```
 
-#### Web dashboard
+#### Enabling the web dashboard
 
-With the web interface enabled, yacron2 also serves a browser dashboard at the
-root path (`/`) of any `http://` listener — open <http://127.0.0.1:8080/> in the
-example above. It is a single self-contained page that lets you:
-
-* see each job's **latest status** at a glance — whether it is running,
-  scheduled (with a live countdown to its next run), disabled, cancelled, or how
-  its last run finished (success / failure, exit code, when, and how long it
-  took), with a small **trend sparkline** of its recent runs;
-* **tail each job's logs live** as it runs (and replay the most recent run's
-  captured output afterwards), with in-log **search/grep**, ANSI-colour
-  rendering, optional per-line timestamps, line-wrap toggle, and a download
-  button. Logs are shown for the streams a job captures, so enable
-  `captureStdout` / `captureStderr` on jobs whose output you want to watch here;
-* **run any job on demand**, or **cancel** a running job, with one click;
-* review each job's **run history and statistics** — recent outcomes, success
-  rate, and average / min / max duration;
-* read a plain-English description of each job's **schedule** and a preview of
-  its next few run times.
-
-It is keyboard-first: press `?` for the shortcut list, `Ctrl-K` (or `⌘K`) for a
-command palette, and `/` to filter. Three themes (amber / green CRT, or a flat
-"modern" theme), a compact density mode, optional desktop failure notifications,
-and the polling interval are all configurable from the settings panel and
-remembered in the browser; CRT effects honour `prefers-reduced-motion`.
+With the web interface enabled, yacron2 also serves the **[web dashboard](#web-dashboard)**
+(showcased near the top of this README) at the root path (`/`) of any `http://`
+listener — open <http://127.0.0.1:8080/> in the example above, and see the
+[full dashboard tour](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in
+the wiki. It is a single self-contained page (no build step or external assets)
+that watches every job's status, tails its logs live, runs or cancels jobs on
+demand, and shows run history and a plain-English schedule preview. Logs are
+shown for the streams a job captures, so enable `captureStdout` /
+`captureStderr` on jobs whose output you want to watch here.
 
 The run history and logs are kept **in memory only** — nothing is written to
 disk, so the dashboard does not change yacron2's read-only-filesystem

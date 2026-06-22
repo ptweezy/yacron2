@@ -18,6 +18,7 @@
   - [Reporting (Mail, Sentry, Shell)](Reporting)
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)
+  - [Web Dashboard](Web-Dashboard)
 - **Reference and Development**
   - [Architecture and Internals](Architecture-and-Internals)
   - [Contributing and Releasing](Contributing-and-Releasing)

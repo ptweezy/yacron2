@@ -9,6 +9,11 @@ authentication, Unix-socket permissions, and lifecycle behavior.
 The interface is *new in version 0.10*; `web.authToken` and `web.socketMode` are new
 in yacron2 1.0.0.
 
+> **Looking for the browser UI?** The same HTTP interface also serves the
+> built-in **[Web Dashboard](Web-Dashboard)** at `/` on every `http://` listener
+> (enabled by default; disable it with `ui: false`). This page documents the REST
+> endpoints; the [Web Dashboard](Web-Dashboard) page is the visual tour.
+
 ## Enabling the API
 
 Add a `web` section with at least one `listen` URL:
@@ -273,6 +278,7 @@ configuration (the new config is not applied).
 
 ## See also
 
+- [Web Dashboard](Web-Dashboard) — the built-in browser UI served by this interface.
 - [Configuration Reference](Configuration-Reference)
 - [CLI Reference](CLI-Reference)
 - [Concurrency and Timeouts](Concurrency-and-Timeouts)

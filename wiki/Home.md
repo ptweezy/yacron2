@@ -29,6 +29,7 @@ yacron2 is a cron replacement built on asyncio for POSIX systems. Its "crontab" 
 - [Reporting (Mail, Sentry, Shell)](Reporting) — `onFailure`/`onSuccess` reporting via email, Sentry, and shell, with jinja2 templating.
 - [Metrics with statsd](Metrics-with-Statsd) — Emitting start/stop/success/duration metrics over UDP to statsd.
 - [HTTP Control API](HTTP-API) — The optional REST interface for status and on-demand job starts.
+- [Web Dashboard](Web-Dashboard) — The built-in browser dashboard: live status, live log tailing, run history, and timezone-aware schedule previews.
 
 ### Reference and Development
 

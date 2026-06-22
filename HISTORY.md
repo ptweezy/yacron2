@@ -5,6 +5,23 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.4 (2026-06-22)
+
+- Add self-contained binaries for two more Linux architectures to every
+  release, in both glibc and musl flavors: little-endian POWER (`ppc64le`)
+  and IBM Z (`s390x`) — `yacron2-linux-ppc64le`, `yacron2-linux-s390x`, and
+  their `-musl` variants — alongside the existing `amd64`, `arm64`, `i686`
+  and `armv7` builds. As with the other binaries, Python is not required on
+  the target system. Neither arch has a native GitHub runner, so they build
+  inside a container via `docker run --platform` under QEMU emulation; both
+  have prebuilt manylinux and musllinux wheels for the aiohttp dependency
+  stack, so nothing compiles from source.
+- The published container image now covers them too: the multi-arch image
+  adds `linux/ppc64le` and `linux/s390x` (to `linux/amd64`, `linux/arm64`,
+  `linux/386` and `linux/arm/v7`), and is build-checked at that full arch
+  coverage on every commit.
+
+
 ## 1.1.3 (2026-06-22)
 
 - Add self-contained binaries for two more Linux architectures to every

@@ -5,6 +5,32 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.6 (2026-06-22)
+
+- Add self-contained binaries for two more Linux architectures, bringing
+  every release to eight Linux architectures plus macOS: 64-bit RISC-V
+  (`riscv64`) in both glibc and musl flavors — `yacron2-linux-riscv64` and
+  `yacron2-linux-riscv64-musl` — and 32-bit ARMv6 (`armv6`, e.g. Raspberry
+  Pi Zero / Pi 1) in musl only — `yacron2-linux-armv6-musl`. As with the
+  other binaries, Python is not required on the target system. Neither arch
+  has a native GitHub runner, so they build inside a container via
+  `docker run --platform` under QEMU emulation.
+  - `armv6` is musl-only because the Debian/glibc base image ships no
+    32-bit ARMv6 variant (only ARMv5/ARMv7), so there is no glibc `armv6`
+    binary and the container image does not cover it.
+  - Some dependencies ship no prebuilt wheel for these arches
+    (`multidict`/`frozenlist`/`ruamel.yaml.clib` on `riscv64`; the entire
+    C-extension stack on `armv6`), so they compile from source during the
+    build.
+- The published container image now also covers `linux/riscv64` (alongside
+  `linux/amd64`, `linux/arm64`, `linux/386`, `linux/arm/v7`, `linux/ppc64le`
+  and `linux/s390x`), and is build-checked at that full arch set on every
+  commit.
+- Update the README `Architectures` badge to list the new targets
+  (`amd64`, `arm64`, `armv7`, `armv6`, `i686`, `ppc64le`, `s390x`,
+  `riscv64`).
+
+
 ## 1.1.5 (2026-06-22)
 
 This is a documentation release; there are no changes to the `yacron2`

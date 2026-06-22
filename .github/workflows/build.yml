@@ -2,8 +2,9 @@ name: build
 
 # Per-commit build verification. Runs EVERY build that release.yml performs --
 # the wheel + sdist and the self-contained PyInstaller binaries for Linux
-# (amd64, arm64, i686, armv7, ppc64le and s390x, in both glibc and musl/Alpine
-# flavors) and macOS (arm64 + amd64) -- on every push, but WITHOUT publishing,
+# (amd64, arm64, i686, armv7, ppc64le, s390x and riscv64 in both glibc and
+# musl/Alpine flavors, plus armv6 in musl only) and macOS (arm64 + amd64) -- on
+# every push, but WITHOUT publishing,
 # tagging,
 # signing, or pushing anything. A broken build (or a broken bundle the
 # `--version` smoke test
@@ -22,7 +23,14 @@ name: build
 # The build steps below are kept deliberately identical to their release.yml
 # counterparts (same Python, same pyinstaller==6.21.0 pin, same `--version`
 # smoke test, same matrices) so a change there and a drift here are easy to
-# spot -- only the publish/sign/version-pin differences are intentional.
+# spot -- only the publish/sign/version-pin differences and the macOS 26
+# coverage are intentional.
+#
+# armv6 note: it is musl-only -- Debian/glibc has no arm32v6 image (it ships
+# arm32v5), so armv6 appears only in binaries-musl (no binaries-glibc-extra
+# entry) and the published container image does not cover it (the Debian-based
+# Dockerfile has no arm32v6 base). riscv64 and armv6 have no precompiled
+# PyInstaller bootloader, so pip compiles it from the sdist via waf under QEMU.
 
 on:
   push:
@@ -136,14 +144,16 @@ jobs:
 
   # musl/Alpine PyInstaller binaries, built inside an Alpine container (see
   # release.yml's binaries-musl for why it's `docker run`, not a job container).
-  # Mirrors that job; the pinned version is what lets the no-git Alpine image
-  # resolve a setuptools_scm version. Covers all six Linux arches: amd64/arm64
-  # build natively on a matching runner; i686 (linux/386) runs natively on the
-  # amd64 runner (x86-64 executes 32-bit x86 directly); armv7, ppc64le and s390x
-  # have no native execution on the runners, so they run under QEMU emulation.
-  # musllinux wheels exist for the whole stack on armv7/ppc64le/s390x, but NOT
-  # for the i686 aiohttp family (aiohttp/yarl/frozenlist/propcache) -- build-base
-  # compiles those from sdist.
+  # Mirrors release.yml's binaries-musl; the pinned version is what lets the
+  # no-git Alpine image resolve a setuptools_scm version. Covers all eight Linux
+  # musl arches: amd64/arm64 build natively on a matching runner; i686 (linux/386)
+  # runs natively on the amd64 runner (x86-64 executes 32-bit x86 directly);
+  # armv7, armv6, ppc64le, s390x and riscv64 have no native execution on the
+  # runners, so they run under QEMU emulation. musllinux wheels exist for the
+  # whole stack on armv7/ppc64le/s390x, but NOT for the i686 aiohttp family
+  # (aiohttp/yarl/frozenlist/propcache), nothing at all for armv6 (no musllinux
+  # armv6 wheels exist), or multidict/frozenlist/ruamel.yaml.clib on riscv64 --
+  # build-base compiles those from sdist.
   binaries-musl:
     needs: version
     strategy:
@@ -171,13 +181,26 @@ jobs:
             runner: ubuntu-24.04
             platform: linux/s390x
             qemu: true            # no native s390x on the runners -> emulate
+          - arch: riscv64
+            runner: ubuntu-24.04
+            platform: linux/riscv64
+            qemu: true            # no native riscv64 on the runners -> emulate
+          # armv6 is musl-only: Debian/glibc ships no arm32v6 image (it ships
+          # arm32v5), so there is no binaries-glibc-extra counterpart. Entire
+          # C-ext stack + PyInstaller bootloader compile from sdist (no musllinux
+          # armv6 wheels) -> slowest leg.
+          - arch: armv6
+            runner: ubuntu-24.04
+            platform: linux/arm/v6
+            qemu: true            # no native armv6 on the runners -> emulate
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
-      # container (armv7, ppc64le, s390x). amd64/arm64/i686 run natively and skip this.
+      # container (armv7, armv6, ppc64le, s390x, riscv64). amd64/arm64/i686 run
+      # natively and skip this.
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4
       - name: Build binary (Alpine/musl)
@@ -209,15 +232,16 @@ jobs:
           retention-days: 7
 
   # glibc PyInstaller binaries for the arches with no native GitHub runner
-  # (i686, armv7, ppc64le, s390x). The native `binaries` job covers only amd64
-  # and arm64 (the runners GitHub hosts) and PyInstaller is not a cross-compiler,
-  # so -- like binaries-musl -- these build inside a container via
+  # (i686, armv7, ppc64le, s390x, riscv64). The native `binaries` job covers only
+  # amd64 and arm64 (the runners GitHub hosts) and PyInstaller is not a
+  # cross-compiler, so -- like binaries-musl -- these build inside a container via
   # `docker run --platform`, here on python:3.14-slim (Debian glibc). i686
-  # (linux/386) runs natively on the amd64 runner; armv7, ppc64le and s390x run
-  # under QEMU. glibc wheel coverage varies: ppc64le/s390x have full manylinux
-  # wheels, while the i686 aiohttp stack and propcache-on-armv7 ship no wheel and
-  # compile from sdist -- so build-essential is installed either way. Assets
-  # carry no -musl suffix and sit beside the 64-bit glibc binaries.
+  # (linux/386) runs natively on the amd64 runner; armv7, ppc64le, s390x and
+  # riscv64 run under QEMU. glibc wheel coverage varies: ppc64le/s390x have full
+  # manylinux wheels, while the i686 aiohttp stack, propcache-on-armv7, and
+  # multidict/frozenlist/ruamel.yaml.clib on riscv64 ship no wheel and compile
+  # from sdist -- so build-essential is installed either way. Assets carry no
+  # -musl suffix and sit beside the 64-bit glibc binaries.
   binaries-glibc-extra:
     needs: version
     strategy:
@@ -238,6 +262,10 @@ jobs:
           - arch: s390x
             runner: ubuntu-24.04
             platform: linux/s390x
+            qemu: true
+          - arch: riscv64
+            runner: ubuntu-24.04
+            platform: linux/riscv64
             qemu: true
     runs-on: ${{ matrix.runner }}
     steps:

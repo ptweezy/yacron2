@@ -2,8 +2,9 @@ name: build
 
 # Per-commit build verification. Runs EVERY build that release.yml performs --
 # the wheel + sdist and the self-contained PyInstaller binaries for Linux
-# (amd64, arm64, i686 and armv7, in both glibc and musl/Alpine flavors) and
-# macOS (arm64 + amd64) -- on every push, but WITHOUT publishing, tagging,
+# (amd64, arm64, i686, armv7, ppc64le and s390x, in both glibc and musl/Alpine
+# flavors) and macOS (arm64 + amd64) -- on every push, but WITHOUT publishing,
+# tagging,
 # signing, or pushing anything. A broken build (or a broken bundle the
 # `--version` smoke test
 # catches) fails the commit early instead of only surfacing at release time.
@@ -136,13 +137,13 @@ jobs:
   # musl/Alpine PyInstaller binaries, built inside an Alpine container (see
   # release.yml's binaries-musl for why it's `docker run`, not a job container).
   # Mirrors that job; the pinned version is what lets the no-git Alpine image
-  # resolve a setuptools_scm version. Covers all four Linux arches: amd64/arm64
+  # resolve a setuptools_scm version. Covers all six Linux arches: amd64/arm64
   # build natively on a matching runner; i686 (linux/386) runs natively on the
-  # amd64 runner (x86-64 executes 32-bit x86 directly); armv7 has no native
-  # 32-bit execution on the runners, so it runs under QEMU emulation. musllinux
-  # wheels exist for the whole stack on armv7, but NOT for the i686 aiohttp
-  # family (aiohttp/yarl/frozenlist/propcache) -- build-base compiles those from
-  # sdist.
+  # amd64 runner (x86-64 executes 32-bit x86 directly); armv7, ppc64le and s390x
+  # have no native execution on the runners, so they run under QEMU emulation.
+  # musllinux wheels exist for the whole stack on armv7/ppc64le/s390x, but NOT
+  # for the i686 aiohttp family (aiohttp/yarl/frozenlist/propcache) -- build-base
+  # compiles those from sdist.
   binaries-musl:
     needs: version
     strategy:
@@ -162,13 +163,21 @@ jobs:
             runner: ubuntu-24.04
             platform: linux/arm/v7
             qemu: true            # no native 32-bit ARM on the runners -> emulate
+          - arch: ppc64le
+            runner: ubuntu-24.04
+            platform: linux/ppc64le
+            qemu: true            # no native ppc64le on the runners -> emulate
+          - arch: s390x
+            runner: ubuntu-24.04
+            platform: linux/s390x
+            qemu: true            # no native s390x on the runners -> emulate
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
-      # Register binfmt/QEMU so `docker run --platform` can execute the 32-bit
-      # ARM container. amd64/arm64/i686 run natively and skip this.
+      # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
+      # container (armv7, ppc64le, s390x). amd64/arm64/i686 run natively and skip this.
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4
       - name: Build binary (Alpine/musl)
@@ -199,16 +208,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # 32-bit glibc PyInstaller binaries (i686 + armv7). The native `binaries` job
-  # cannot produce these -- the runners are 64-bit and PyInstaller is not a
-  # cross-compiler -- so, like binaries-musl, they build inside a 32-bit
-  # container via `docker run --platform`, here on python:3.14-slim (Debian
-  # glibc). i686 (linux/386) runs natively on the amd64 runner; armv7 runs under
-  # QEMU. glibc 32-bit wheel coverage is thinner than musl's: the i686 aiohttp
-  # stack and propcache-on-armv7 ship no wheel, so build-essential compiles them
-  # from sdist. Assets carry no -musl suffix and sit beside the 64-bit glibc
-  # binaries.
-  binaries-glibc32:
+  # glibc PyInstaller binaries for the arches with no native GitHub runner
+  # (i686, armv7, ppc64le, s390x). The native `binaries` job covers only amd64
+  # and arm64 (the runners GitHub hosts) and PyInstaller is not a cross-compiler,
+  # so -- like binaries-musl -- these build inside a container via
+  # `docker run --platform`, here on python:3.14-slim (Debian glibc). i686
+  # (linux/386) runs natively on the amd64 runner; armv7, ppc64le and s390x run
+  # under QEMU. glibc wheel coverage varies: ppc64le/s390x have full manylinux
+  # wheels, while the i686 aiohttp stack and propcache-on-armv7 ship no wheel and
+  # compile from sdist -- so build-essential is installed either way. Assets
+  # carry no -musl suffix and sit beside the 64-bit glibc binaries.
+  binaries-glibc-extra:
     needs: version
     strategy:
       fail-fast: false
@@ -221,6 +231,14 @@ jobs:
             runner: ubuntu-24.04
             platform: linux/arm/v7
             qemu: true
+          - arch: ppc64le
+            runner: ubuntu-24.04
+            platform: linux/ppc64le
+            qemu: true
+          - arch: s390x
+            runner: ubuntu-24.04
+            platform: linux/s390x
+            qemu: true
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -228,7 +246,7 @@ jobs:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4
-      - name: Build binary (Debian/glibc, 32-bit)
+      - name: Build binary (Debian/glibc container)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
@@ -238,16 +256,17 @@ jobs:
             -v "$PWD:/src" -w /src \
             python:3.14-slim sh -euc '
               # build-essential brings gcc + strip (the spec sets strip=True);
-              # libffi/zlib headers cover the C-extension deps that ship no
-              # 32-bit glibc wheel and compile from sdist (the i686 aiohttp
-              # stack; propcache on armv7).
+              # libffi/zlib headers cover the C-extension deps that ship no glibc
+              # wheel and compile from sdist (the i686 aiohttp stack; propcache on
+              # armv7). ppc64le/s390x have full manylinux wheels, so the toolchain
+              # goes unused there.
               apt-get update
               apt-get install -y --no-install-recommends build-essential libffi-dev zlib1g-dev
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into yacron2/version.py
               pyinstaller pyinstaller/yacron2.spec
-              dist/yacron2 --version            # smoke test: a 32-bit binary, native or emulated
+              dist/yacron2 --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
             '
       - uses: actions/upload-artifact@v7

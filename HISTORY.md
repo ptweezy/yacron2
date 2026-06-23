@@ -5,6 +5,28 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.7 (2026-06-23)
+
+- **Windows support.** yacron2 now runs natively on Windows, in addition to
+  Linux and macOS. The core was made portable: the POSIX-only `grp`/`pwd`
+  imports are now lazy and guarded, Ctrl-C / Ctrl-Break shutdown is wired up
+  without the POSIX-only event-loop signal handlers, and subprocess argv is
+  encoded per platform. `pip install yacron2` works on Windows, and every
+  release now also ships self-contained binaries `yacron2-windows-amd64.exe`
+  and `yacron2-windows-arm64.exe` (Python not required on the target).
+  - On Windows a string `command` with no explicit `shell` runs through the
+    native command processor (`%ComSpec%`, i.e. `cmd.exe`), mirroring the
+    `/bin/sh` default on POSIX. Set `shell:` or pass `command` as a list for
+    anything else.
+  - The default config location (`-c`) is `%APPDATA%\yacron2` on Windows
+    (`/etc/yacron2.d` is unchanged on POSIX).
+  - Two features remain POSIX-only and are reported clearly on Windows: per-job
+    `user`/`group` switching (rejected with a configuration error) and
+    `unix://` web listeners (skipped with a warning; use an `http://` listener).
+- CI now runs the test suite on Windows (x64 and ARM64) as well as Linux, and
+  the per-commit build plus every release build the Windows binaries.
+- Update the README `Platforms` badge to include Windows.
+
 ## 1.1.6 (2026-06-22)
 
 - Add self-contained binaries for two more Linux architectures, bringing

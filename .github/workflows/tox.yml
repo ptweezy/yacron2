@@ -28,10 +28,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]  # [macos-latest, ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]  # macOS is POSIX like Linux; add macos-latest to cover it too
         python: ['3.10', '3.11', '3.12', '3.13', '3.14']
         experimental: [false]
         include:
+          # Windows on ARM64: a gating row on the latest stable Python so the
+          # runtime is exercised on win-arm64 (the released .exe targets it too).
+          # One Python version keeps the arm matrix small; the per-commit
+          # build.yml binary job covers the dep-install/bundle path there.
+          - os: windows-11-arm
+            python: '3.14'
+            experimental: false
           # Python 3.15 is in beta (final: 2026-10-01). Run it for early signal,
           # but never let it gate CI -> continue-on-error. The risk is aiohttp:
           # it has no cp315 wheels yet, so pip falls back to building it from

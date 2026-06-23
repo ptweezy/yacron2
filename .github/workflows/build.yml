@@ -3,7 +3,8 @@ name: build
 # Per-commit build verification. Runs EVERY build that release.yml performs --
 # the wheel + sdist and the self-contained PyInstaller binaries for Linux
 # (amd64, arm64, i686, armv7, ppc64le, s390x and riscv64 in both glibc and
-# musl/Alpine flavors, plus armv6 in musl only) and macOS (arm64 + amd64) -- on
+# musl/Alpine flavors, plus armv6 in musl only), macOS (arm64 + amd64) and
+# Windows (amd64 + arm64) -- on
 # every push, but WITHOUT publishing,
 # tagging,
 # signing, or pushing anything. A broken build (or a broken bundle the
@@ -362,5 +363,53 @@ jobs:
         with:
           name: yacron2-macos${{ matrix.os }}-${{ matrix.arch }}
           path: dist/yacron2-macos${{ matrix.os }}-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # Windows PyInstaller binaries: amd64 on the hosted runner, arm64 on the
+  # windows-11-arm runner. Mirrors release.yml's binaries-windows. Any C-
+  # extension dep without a win_arm64 wheel (parts of the aiohttp stack --
+  # multidict/yarl/frozenlist/propcache -- and ruamel.yaml.clib) compiles from
+  # sdist using the runner's Visual Studio ARM64 toolchain, the same way the
+  # QEMU Linux legs compile from sdist for riscv64/armv6. Same pyinstaller pin
+  # and `--version` smoke test as the other binary jobs; the bundle is a single
+  # self-contained yacron2-windows-<arch>.exe. Steps use bash (git bash ships on
+  # the Windows runners) so they read identically to the Linux/macOS jobs.
+  binaries-windows:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: '3.14'
+      - name: Build binary
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          pip install --upgrade pip
+          pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
+          pip install .                     # bakes the pinned version into yacron2/version.py
+          pyinstaller pyinstaller/yacron2.spec
+          ./dist/yacron2.exe --version      # smoke test: fails the job if the bundle is broken
+          mv dist/yacron2.exe "dist/yacron2-windows-${{ matrix.arch }}.exe"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yacron2-windows-${{ matrix.arch }}
+          path: dist/yacron2-windows-${{ matrix.arch }}.exe
           if-no-files-found: error
           retention-days: 7

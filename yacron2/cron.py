@@ -17,6 +17,7 @@ from aiohttp import web
 from crontab import CronTab  # noqa
 
 import yacron2.version
+from yacron2 import platform
 from yacron2.config import (
     ConfigError,
     JobConfig,
@@ -219,6 +220,15 @@ def web_site_from_url(runner: web.AppRunner, url: str) -> web.BaseSite:
             raise ValueError(url)
         return web.TCPSite(runner, parsed.hostname, parsed.port)
     elif parsed.scheme == "unix":
+        if not platform.supports_unix_sockets():
+            # asyncio's Windows Proactor loop can't serve a unix socket; skip
+            # this listener (a skippable bad-config entry) rather than crash.
+            logger.warning(
+                "Ignoring web listen url %s: unix-socket listeners are not "
+                "supported on this platform",
+                url,
+            )
+            raise ValueError(url)
         return web.UnixSite(runner, parsed.path)
     else:
         logger.warning(

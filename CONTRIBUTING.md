@@ -5,7 +5,9 @@ importantly, how releases are cut.
 
 ## Development setup
 
-yacron2 targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13 and 3.14 are tested).
+yacron2 targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13 and 3.14 are tested)
+and runs on **Linux, macOS and Windows** (the test suite runs on all three in
+CI, including Windows ARM64).
 
 ```sh
 git clone https://github.com/ptweezy/yacron2
@@ -14,9 +16,13 @@ python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
 ```
 
-> **Note:** yacron2 is POSIX-only — it imports `grp`/`pwd` at load time, so the
-> package and its test suite must run on Linux/macOS (or WSL on Windows).
-> Linting and type-checking work anywhere.
+> **Note:** all OS-specific behaviour lives in
+> [`yacron2/platform.py`](yacron2/platform.py) (default shell, default config
+> location, unix-socket support, and shutdown-signal wiring). The POSIX-only
+> `user`/`group` feature imports `grp`/`pwd` lazily and is rejected on Windows.
+> mypy is pinned to the `linux` platform (it type-checks the POSIX API surface;
+> the Windows branches are runtime-guarded), so type-checking is identical on
+> every OS.
 
 ## Running the checks
 
@@ -86,19 +92,21 @@ On a release the workflow, in order:
    tag already exists);
 3. **gates** on `tox` (py310, py311, py312, py313, py314, lint, mypy) — a red build means no release;
 4. **builds** the wheel + sdist *and* the self-contained PyInstaller binaries
-   for Linux (`amd64`, `arm64`, `i686`, `armv7`, `ppc64le` and `s390x`, glibc
-   and musl) and macOS (`arm64` + `amd64`), each on a matching runner (the
-   non-native arches inside a container, `armv7`/`ppc64le`/`s390x` under QEMU),
-   smoke-tested with `--version` — all at the computed version, *before*
-   publishing, so a broken build fails the run instead of producing a
+   for Linux (`amd64`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x`
+   and `riscv64`, glibc and musl), macOS (`arm64` + `amd64`) and Windows
+   (`amd64` + `arm64`), each on a matching runner (the non-native Linux arches
+   inside a container under QEMU; Windows ARM64 on the `windows-11-arm`
+   runner), smoke-tested with `--version` — all at the computed version,
+   *before* publishing, so a broken build fails the run instead of producing a
    half-finished release;
 5. **publishes the wheel + sdist to PyPI** via [Trusted Publishing
    (OIDC)](https://docs.pypi.org/trusted-publishers/) — there is no API token to
    manage or leak;
 6. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
    GitHub Release with the wheel, sdist, and all the binaries
-   (`yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x}`, their `-musl`
-   variants, and `yacron2-macos-{arm64,amd64}`) attached.
+   (`yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}`, their
+   `-musl` variants plus `yacron2-linux-armv6-musl`, `yacron2-macos-{arm64,amd64}`,
+   and `yacron2-windows-{amd64,arm64}.exe`) attached.
 
 Because no file is committed back to the repo, a release never re-triggers the
 workflow. Because the tag is created *after* publishing, a failed publish leaves

@@ -18,6 +18,7 @@ import jinja2
 import sentry_sdk
 import sentry_sdk.utils
 
+from yacron2 import platform
 from yacron2.config import JobConfig
 from yacron2.statsd import StatsdJobMetricWriter
 
@@ -38,7 +39,9 @@ if "HOSTNAME" not in os.environ:
 def fixup_pyinstaller_env(env: Dict[str, str]) -> None:
     # check for pyinstaller env, fix clobbered env vars
     # https://github.com/gjcarneiro/yacron/issues/68
-    if getattr(sys, "frozen", False):
+    # These are the dynamic-loader paths PyInstaller rewrites on POSIX; the
+    # Windows bootloader doesn't touch them, so there's nothing to restore.
+    if getattr(sys, "frozen", False) and not platform.IS_WINDOWS:
         for env_var in "LD_LIBRARY_PATH", "LIBPATH":
             env[env_var] = env.get(f"{env_var}_ORIG", "")
 
@@ -555,6 +558,9 @@ class RunningJob:
             self.env = env
             kwargs["env"] = env
         if self.config.uid is not None or self.config.gid is not None:
+            # POSIX only: uid/gid are always None on Windows (the config layer
+            # rejects user/group there), so preexec_fn is never wired up on a
+            # platform that doesn't support it.
             kwargs["preexec_fn"] = self._demote
         logger.debug("%s: will execute argv %r", self.config.name, cmd)
         if self.config.captureStderr:
@@ -569,7 +575,9 @@ class RunningJob:
             kwargs["limit"] = self.config.maxLineLength
 
         try:
-            args = [c.encode() for c in cmd]
+            # POSIX wants UTF-8 bytes argv (locale-independent); Windows wants
+            # str (CreateProcessW rejects bytes). See platform.encode_argv.
+            args = platform.encode_argv(cmd)
             logger.debug("subprocess: args=%r, kwargs=%r", args, kwargs)
             self.proc = await create(*args, **kwargs)
         except (

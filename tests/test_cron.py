@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import yacron2.cron
+from tests._commands import cmd_hang, cmd_print, cmd_sleep, yaml_command
 from yacron2.config import ConfigError, JobConfig
 from yacron2.job import JobOutputStream, RunningJob
 
@@ -74,22 +75,17 @@ class TracingRunningJob(RunningJob):
         await super().report_success()
 
 
-JOB_THAT_SUCCEEDS = """
-jobs:
-  - name: test
-    command: |
-      echo "foobar"
-    schedule: "@reboot"
-"""
+JOB_THAT_SUCCEEDS = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(cmd_print(out="foobar"))
+    + '\n    schedule: "@reboot"\n'
+)
 
-JOB_THAT_FAILS = """
-jobs:
-  - name: test
-    command: |
-      echo "foobar"
-      exit 2
-    schedule: "@reboot"
-"""
+JOB_THAT_FAILS = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(cmd_print(out="foobar", code=2))
+    + '\n    schedule: "@reboot"\n'
+)
 
 
 @pytest.mark.parametrize(
@@ -137,12 +133,10 @@ async def test_simple(tracing_running_job, config_yaml, expected_events):
     assert events == expected_events
 
 
-RETRYING_JOB_THAT_FAILS = """
-jobs:
-  - name: test
-    command: |
-      echo "foobar"
-      exit 2
+RETRYING_JOB_THAT_FAILS = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(cmd_print(out="foobar", code=2))
+    + """
     schedule: "@reboot"
     onFailure:
       retry:
@@ -151,6 +145,7 @@ jobs:
         maximumDelay: 1
         backoffMultiplier: 2
 """
+)
 
 
 @pytest.mark.asyncio
@@ -204,19 +199,16 @@ async def test_fail_retry(tracing_running_job):
     ]
 
 
-JOB_THAT_HANGS = """
-jobs:
-  - name: test
-    command: |
-      trap "echo '(ignoring SIGTERM)'" TERM
-      echo "starting..."
-      sleep 10
-      echo "all done."
+JOB_THAT_HANGS = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(cmd_hang("starting...", 10))
+    + """
     schedule: "@reboot"
     captureStdout: true
     executionTimeout: 0.25
     killTimeout: 0.25
 """
+)
 
 
 @pytest.mark.asyncio
@@ -261,15 +253,15 @@ async def test_execution_timeout(tracing_running_job):
     assert jobs_stdout[1] == "starting...\n"
 
 
-CONCURRENT_JOB = """
-jobs:
-  - name: test
-    command: |
-      sleep 30
+CONCURRENT_JOB = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(cmd_sleep(30))
+    + """
     schedule: "@reboot"
     captureStdout: true
     concurrencyPolicy: {policy}
 """
+)
 
 
 @pytest.mark.parametrize("policy", ["Allow", "Forbid", "Replace"])
@@ -394,12 +386,10 @@ def test_simple_config_file(tracing_running_job):
     yacron2.cron.Cron(config_arg)
 
 
-RETRYING_JOB_THAT_FAILS2 = """
-jobs:
-  - name: test
-    command: |
-      echo "foobar"
-      exit 2
+RETRYING_JOB_THAT_FAILS2 = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(cmd_print(out="foobar", code=2))
+    + """
     schedule: "@reboot"
     onFailure:
       retry:
@@ -408,6 +398,7 @@ jobs:
         maximumDelay: 1
         backoffMultiplier: 1
 """
+)
 
 
 @pytest.mark.asyncio

@@ -2,13 +2,15 @@ import argparse
 import asyncio
 import logging
 import os
-import signal
 import sys
 
 import yacron2.version
+from yacron2 import platform
 from yacron2.cron import ConfigError, Cron
 
-CONFIG_DEFAULT = "/etc/yacron2.d"
+# Where -c looks when not given: /etc/yacron2.d on POSIX, %APPDATA%\yacron2 on
+# Windows (see yacron2.platform).
+CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH
 
 
 def main_loop(loop):
@@ -54,18 +56,22 @@ def main_loop(loop):
         logger.info("Configuration is valid.")
         sys.exit(0)
 
-    loop.add_signal_handler(signal.SIGINT, cron.signal_shutdown)
-    loop.add_signal_handler(signal.SIGTERM, cron.signal_shutdown)
+    # Wire Ctrl-C / termination to a graceful shutdown.  The mechanism differs
+    # per platform (loop signal handlers on POSIX, signal.signal on Windows),
+    # so it lives behind platform.install_shutdown_handlers.
+    remove_shutdown_handlers = platform.install_shutdown_handlers(
+        loop, cron.signal_shutdown
+    )
     try:
         loop.run_until_complete(cron.run())
     finally:
-        loop.remove_signal_handler(signal.SIGINT)
-        loop.remove_signal_handler(signal.SIGTERM)
+        remove_shutdown_handlers()
 
 
 def main():  # pragma: no cover
-    # yacron2 is POSIX-only (config.py imports grp/pwd at module load), so
-    # there is no Windows event-loop branch to maintain here.
+    # asyncio.new_event_loop() yields the right loop on each platform: a
+    # subprocess-capable Proactor loop on Windows (the default since 3.8) and a
+    # selector loop on POSIX.
     _loop = asyncio.new_event_loop()
     try:
         main_loop(_loop)

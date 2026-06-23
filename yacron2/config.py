@@ -1,10 +1,9 @@
 import copy
 import datetime
 import logging
-import os.path
+import os
+import sys
 from dataclasses import dataclass
-from grp import getgrnam
-from pwd import getpwnam, getpwuid
 from typing import (
     Any,
     Dict,
@@ -32,6 +31,8 @@ from strictyaml import (
 )
 from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
+
+from yacron2 import platform
 
 logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
@@ -90,14 +91,14 @@ _REPORT_DEFAULTS = {
         "password": {"value": None, "fromFile": None, "fromEnvVar": None},
     },
     "shell": {
-        "shell": "/bin/sh",
+        "shell": platform.DEFAULT_SHELL,
         "command": None,
     },
 }
 
 
 DEFAULT_CONFIG = {
-    "shell": "/bin/sh",
+    "shell": platform.DEFAULT_SHELL,
     "concurrencyPolicy": "Allow",
     "captureStderr": True,
     "captureStdout": False,
@@ -420,6 +421,26 @@ class JobConfig:
 
     def _resolve_user_group(self, config: dict) -> None:
         user = config.pop("user", None)
+        group = config.pop("group", None)
+        if user is None and group is None:
+            return  # nothing to switch to: nothing POSIX-only to resolve
+
+        # Windows has no setuid/setgid model that maps onto this feature, so
+        # reject it with a clear error instead of silently running the job as
+        # the wrong account.  Spelt as ``sys.platform == "win32"`` (rather than
+        # platform.IS_WINDOWS) so the type checker statically prunes the
+        # POSIX-only imports/calls below on Windows.
+        if sys.platform == "win32":
+            raise ConfigError(
+                "Job {}: changing user/group is not supported on "
+                "Windows".format(self.name)
+            )
+
+        # POSIX only: the passwd/group databases live in modules that don't
+        # exist on Windows; imported lazily (only reached above on POSIX).
+        from grp import getgrnam
+        from pwd import getpwnam, getpwuid
+
         if user is not None:
             if isinstance(user, int):
                 self.uid = user
@@ -445,7 +466,6 @@ class JobConfig:
                         "User not found: {!r}".format(user)
                     ) from e
 
-        group = config.pop("group", None)
         if group is not None:
             if isinstance(group, int):
                 self.gid = group

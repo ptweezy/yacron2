@@ -21,7 +21,8 @@ name: release
 # (SETUPTOOLS_SCM_PRETEND_VERSION) -- the wheel
 # + sdist and self-contained PyInstaller binaries for Linux (amd64, arm64, i686,
 # armv7, ppc64le, s390x and riscv64 in both glibc and musl/Alpine flavors, plus
-# armv6 in musl only as Debian has no arm32v6) and macOS (arm64 + amd64), each
+# armv6 in musl only as Debian has no arm32v6), macOS (arm64 + amd64) and
+# Windows (amd64 + arm64), each
 # built on a matching runner (the non-native arches inside a container,
 # armv7/armv6/ppc64le/s390x/riscv64 under QEMU) -- publishes the wheel + sdist to
 # PyPI via
@@ -510,8 +511,58 @@ jobs:
           path: dist/yacron2-macos-${{ matrix.arch }}
           if-no-files-found: error
 
+  # Build the self-contained Windows binaries: amd64 on the hosted runner,
+  # arm64 on the windows-11-arm runner. Same pyinstaller pin and `--version`
+  # smoke test as the Linux/macOS jobs; the assets are yacron2-windows-<arch>.exe.
+  # Any C-extension dep lacking a win_arm64 wheel (parts of the aiohttp stack and
+  # ruamel.yaml.clib) compiles from sdist via the runner's Visual Studio ARM64
+  # toolchain -- the same sdist fallback the QEMU Linux legs use for
+  # riscv64/armv6. There is no Windows code-signing step (the binaries ship
+  # unsigned, like the Linux binaries). A failing arch fails this job before the
+  # publish, so the release simply doesn't happen (no tag is cut) rather than
+  # half-completing. Steps use bash (git bash ships on the Windows runners) so
+  # they read like the other jobs.
+  binaries-windows:
+    needs: [decide, version, gate]
+    if: needs.decide.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: '3.14'
+      - name: Build binary
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          pip install --upgrade pip
+          pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
+          pip install .                     # bakes the pinned version into yacron2/version.py
+          pyinstaller pyinstaller/yacron2.spec
+          ./dist/yacron2.exe --version      # smoke test: fails the job if the bundle is broken
+          mv dist/yacron2.exe "dist/yacron2-windows-${{ matrix.arch }}.exe"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yacron2-windows-${{ matrix.arch }}
+          path: dist/yacron2-windows-${{ matrix.arch }}.exe
+          if-no-files-found: error
+
   release:
-    needs: [decide, version, gate, binaries, binaries-glibc-extra, binaries-musl, binaries-macos]
+    needs: [decide, version, gate, binaries, binaries-glibc-extra, binaries-musl, binaries-macos, binaries-windows]
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -610,6 +661,8 @@ jobs:
             binaries/yacron2-linux-armv6-musl
             binaries/yacron2-macos-amd64
             binaries/yacron2-macos-arm64
+            binaries/yacron2-windows-amd64.exe
+            binaries/yacron2-windows-arm64.exe
 
   # Build + push the multi-arch container image at the just-released version.
   # Invoked here (workflow_call) rather than via `on: release` because a Release

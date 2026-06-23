@@ -5,7 +5,7 @@
 [![PyPI status](https://img.shields.io/pypi/status/yacron2.svg)](https://pypi.org/project/yacron2/)
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/yacron2?logo=github)](https://github.com/ptweezy/yacron2/releases/latest)
 [![Release downloads](https://img.shields.io/github/downloads/ptweezy/yacron2/total?logo=github&label=binary%20downloads)](https://github.com/ptweezy/yacron2/releases)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-informational)](https://github.com/ptweezy/yacron2/releases/latest)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-informational)](https://github.com/ptweezy/yacron2/releases/latest)
 [![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64-informational)](https://github.com/ptweezy/yacron2/releases/latest)
 [![CI](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/yacron2/pkgs/container/yacron2)
@@ -90,16 +90,20 @@ pipx install yacron2
 
 Alternatively, a self-contained binary can be downloaded
 from github: <https://github.com/ptweezy/yacron2/releases>. Every release
-automatically attaches binaries for Linux (amd64, arm64, i686, armv7, ppc64le
-and s390x) and macOS (amd64 and arm64):
+automatically attaches binaries for Linux (amd64, arm64, i686, armv7, armv6,
+ppc64le, s390x and riscv64), macOS (amd64 and arm64) and Windows (amd64 and
+arm64):
 
 * **Linux**: glibc builds (`yacron2-linux-<arch>`) for the mainstream distros,
   working on any system post glibc 2.39 (e.g. Ubuntu 24.04) on the matching CPU,
   plus musl builds (`yacron2-linux-<arch>-musl`) for Alpine and other musl-based
   systems. `<arch>` is one of `amd64`, `arm64`, `i686` (32-bit x86), `armv7`
-  (32-bit ARM, e.g. older Raspberry Pi), `ppc64le` (POWER) or `s390x` (IBM Z).
+  (32-bit ARM, e.g. older Raspberry Pi), `armv6` (musl only), `ppc64le` (POWER),
+  `s390x` (IBM Z) or `riscv64` (64-bit RISC-V).
 * **macOS**: `yacron2-macos-arm64` (Apple Silicon) / `yacron2-macos-amd64`
   (Intel).
+* **Windows**: `yacron2-windows-amd64.exe` (x64) / `yacron2-windows-arm64.exe`
+  (ARM64).
 
 Python is not required on the target system (it is embedded in the executable):
 
@@ -143,6 +147,49 @@ This requirement is unique to the standalone binary.  The published container
 image (and `pip`/`pipx` installs) run yacron2 as a normal Python package with
 the interpreter on disk, so they never self-extract and need no writable temp
 directory. See [Production container deployment](#production-container-deployment).
+
+## Running on Windows
+
+yacron2 runs natively on Windows (x64 and ARM64), in addition to Linux and
+macOS. Install it with `pip install yacron2`, or download the self-contained
+`yacron2-windows-amd64.exe` / `yacron2-windows-arm64.exe` from the
+[releases page](https://github.com/ptweezy/yacron2/releases) (no Python
+required). Everything else — the YAML crontab, scheduling, reporting, retries,
+the HTTP API and the [web dashboard](#web-dashboard) — works the same as on
+POSIX. A few platform details differ:
+
+* **Default config location.** When `-c` is omitted, yacron2 looks in
+  `%APPDATA%\yacron2` (e.g. `C:\Users\you\AppData\Roaming\yacron2`), the
+  Windows analogue of `/etc/yacron2.d`. Point it anywhere with `-c`:
+
+  ```shell
+  yacron2 -c C:\path\to\yacron2tab.yaml
+  ```
+
+* **Default shell.** A string `command` with no explicit `shell` runs through
+  the native command processor (`%ComSpec%`, i.e. `cmd.exe`), mirroring the
+  `/bin/sh` default on POSIX. For PowerShell, or any other interpreter, set
+  `shell:` or pass `command` as a list (which bypasses the shell entirely):
+
+  ```yaml
+  jobs:
+    - name: powershell-job
+      command:
+        - powershell
+        - -Command
+        - Get-Date
+      schedule: "*/5 * * * *"
+      captureStdout: true
+  ```
+
+* **Graceful shutdown.** Press `Ctrl-C` (or `Ctrl-Break`) to stop yacron2; it
+  shuts down after the currently running jobs finish, just as `SIGTERM` does on
+  POSIX.
+
+* **Not supported on Windows.** Per-job `user`/`group` switching (there is no
+  `setuid`/`setgid` equivalent) is rejected with a clear configuration error,
+  and `unix://` web listeners are skipped with a warning — use an `http://`
+  listener instead.
 
 ## Production container deployment
 
@@ -794,6 +841,10 @@ main group of that user.  Example:
 
 Naturally, yacron2 must be running as root in order to have permissions to
 change to another user.
+
+This feature is POSIX-only (it relies on `setuid`/`setgid`). On Windows, a job
+with `user` or `group` set is rejected with a configuration error; see
+[Running on Windows](#running-on-windows).
 
 ### Remote web/HTTP interface
 

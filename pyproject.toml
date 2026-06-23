@@ -61,6 +61,7 @@ classifiers = [
     "Framework :: AsyncIO",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: System :: Systems Administration",
     "Topic :: System :: Monitoring",
     "Topic :: Office/Business :: Scheduling",
@@ -129,6 +130,11 @@ max-complexity = 20
 
 [tool.mypy]
 python_version = "3.10"
+# Type-check against the POSIX API surface (grp/pwd/os.setuid/...), which is
+# where those calls actually run; the Windows-specific branches are guarded at
+# runtime (sys.platform checks / getattr) and covered by the test suite. CI
+# runs mypy on Linux, so pinning this keeps local runs on any OS consistent.
+platform = "linux"
 no_implicit_optional = true
 warn_no_return = true
 warn_return_any = true

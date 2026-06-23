@@ -10,6 +10,20 @@ from sentry_sdk.utils import Dsn
 import yacron2.config
 import yacron2.job
 import yacron2.statsd
+from tests._commands import (
+    cmd_print,
+    cmd_print_sleep_print,
+    cmd_sleep,
+    cmd_write_env,
+    yaml_command,
+)
+from yacron2.platform import DEFAULT_SHELL, IS_WINDOWS
+
+
+def _argv(*parts):
+    """Expected subprocess argv for this platform (str on Windows, bytes on
+    POSIX) -- mirrors yacron2.platform.encode_argv."""
+    return tuple(parts) if IS_WINDOWS else tuple(p.encode() for p in parts)
 
 
 @pytest.mark.parametrize(
@@ -324,7 +338,7 @@ async def test_report_mail(success, stdout, stderr, subject, body):
                 "job": "test",
                 "exit_code": 0,
                 "command": "ls",
-                "shell": "/bin/sh",
+                "shell": DEFAULT_SHELL,
                 "success": True,
             },
             "http://xxx:yyy@sentry/1",
@@ -341,7 +355,7 @@ async def test_report_mail(success, stdout, stderr, subject, body):
                 "job": "test",
                 "exit_code": 0,
                 "command": "ls",
-                "shell": "/bin/sh",
+                "shell": DEFAULT_SHELL,
                 "success": False,
             },
             "http://xxx:yyy@sentry/2",
@@ -358,7 +372,7 @@ async def test_report_mail(success, stdout, stderr, subject, body):
                 "job": "test",
                 "exit_code": 0,
                 "command": "ls",
-                "shell": "/bin/sh",
+                "shell": DEFAULT_SHELL,
                 "success": False,
             },
             "http://xxx:yyy@sentry/3",
@@ -518,6 +532,7 @@ async def test_report_shell(command, expected_output):
     stdout, stderr = None, None
     with tempfile.TemporaryDirectory() as tmp:
         out_file_path = os.path.join(tmp, "unit_test_file")
+        reporter = yaml_command(cmd_write_env(out_file_path), indent=10)
 
         conf = yacron2.config.parse_config_string(
             f"""
@@ -528,11 +543,8 @@ jobs:
     onFailure:
       report:
         shell:
-            command: >
-                echo "$YACRON2_JOB_NAME - $YACRON2_JOB_COMMAND -
-                $YACRON2_JOB_SCHEDULE - Error code $YACRON2_RETCODE"
-                >> {out_file_path}
-    """,
+{reporter}
+""",
             "",
         )
         job_config = conf.jobs[0]
@@ -565,9 +577,9 @@ jobs:
 @pytest.mark.parametrize(
     "shell, command, expected_type, expected_args",
     [
-        ("", "Civ 6", "shell", (b"Civ 6",)),
-        ("", ["echo", "hello"], "exec", (b"echo", b"hello")),
-        ("bash", 'echo "hello"', "exec", (b"bash", b"-c", b'echo "hello"')),
+        ("", "Civ 6", "shell", _argv("Civ 6")),
+        ("", ["echo", "hello"], "exec", _argv("echo", "hello")),
+        ("bash", 'echo "hello"', "exec", _argv("bash", "-c", 'echo "hello"')),
     ],
 )
 @pytest.mark.asyncio
@@ -655,13 +667,9 @@ jobs:
 @pytest.mark.asyncio
 async def test_execution_timeout():
     conf = yacron2.config.parse_config_string(
-        """
-jobs:
-  - name: test
-    command: |
-        echo "hello"
-        sleep 1
-        echo "world"
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print_sleep_print("hello", 1, "world"))
+        + """
     executionTimeout: 0.25
     schedule: "* * * * *"
     captureStderr: false
@@ -679,12 +687,9 @@ jobs:
 @pytest.mark.asyncio
 async def test_error1():
     conf = yacron2.config.parse_config_string(
-        """
-jobs:
-  - name: test
-    command: echo "hello"
-    schedule: "* * * * *"
-""",
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_sleep(5))
+        + '\n    schedule: "* * * * *"\n',
         "",
     )
     job_config = conf.jobs[0]
@@ -699,12 +704,9 @@ jobs:
 @pytest.mark.asyncio
 async def test_error2():
     conf = yacron2.config.parse_config_string(
-        """
-jobs:
-  - name: test
-    command: echo "hello"
-    schedule: "* * * * *"
-""",
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_sleep(5))
+        + '\n    schedule: "* * * * *"\n',
         "",
     )
     job_config = conf.jobs[0]
@@ -717,12 +719,9 @@ jobs:
 @pytest.mark.asyncio
 async def test_error3():
     conf = yacron2.config.parse_config_string(
-        """
-jobs:
-  - name: test
-    command: echo "hello"
-    schedule: "* * * * *"
-""",
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_sleep(5))
+        + '\n    schedule: "* * * * *"\n',
         "",
     )
     job_config = conf.jobs[0]
@@ -732,7 +731,9 @@ jobs:
         await job.cancel()
 
 
-@pytest.mark.parametrize("command", ['echo "hello"', "exit 1"])
+@pytest.mark.parametrize(
+    "command", [cmd_print(out="hello"), cmd_print(code=1)]
+)
 @pytest.mark.asyncio
 async def test_statsd(command):
     loop = asyncio.get_event_loop()
@@ -760,16 +761,15 @@ async def test_statsd(command):
         print("Listening UDP on %s:%s" % (host, port))
 
         conf = yacron2.config.parse_config_string(
-            """
-jobs:
-  - name: test
-    command: {command}
+            "jobs:\n  - name: test\n"
+            + yaml_command(command)
+            + """
     schedule: "* * * * *"
     statsd:
       host: 127.0.0.1
       port: {port}
       prefix: the.prefix
-""".format(port=port, command=command),
+""".format(port=port),
             "",
         )
         job_config = conf.jobs[0]
@@ -831,10 +831,9 @@ async def test_statsd_failure_does_not_crash(monkeypatch):
     monkeypatch.setattr(yacron2.statsd, "send_to_statsd", boom)
 
     conf = yacron2.config.parse_config_string(
-        """
-jobs:
-  - name: test
-    command: "true"
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print())
+        + """
     schedule: "* * * * *"
     statsd:
       host: 127.0.0.1

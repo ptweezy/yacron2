@@ -75,11 +75,17 @@ jobs:
 def test_web_site_from_url_unix_socket():
     url = "unix:///tmp/yacron2.sock"
     if platform.IS_WINDOWS:
-        # asyncio can't serve a unix socket on Windows: skipped as a bad entry.
+        # asyncio can't serve a unix socket on Windows: skipped as a bad entry
+        # (raises before the runner is ever touched).
         with pytest.raises(ValueError):
             yacron2.cron.web_site_from_url(None, url)
     else:
-        site = yacron2.cron.web_site_from_url(None, url)
+        # POSIX: a unix listener is accepted. UnixSite.__init__ dereferences
+        # runner.server, so pass a minimal stand-in instead of None.
+        class _FakeRunner:
+            server = object()
+
+        site = yacron2.cron.web_site_from_url(_FakeRunner(), url)
         assert isinstance(site, web.UnixSite)
 
 

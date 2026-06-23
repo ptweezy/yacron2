@@ -17,13 +17,21 @@ yacron2 error: configuration file not found, please provide one with the --confi
 
 followed by the argument help, and exit code `1`.
 
-**Cause.** `__main__.py` defaults `-c`/`--config` to `CONFIG_DEFAULT = "/etc/yacron2.d"`.
-When that default is in effect *and* the path does not exist
+**Cause.** `__main__.py` defaults `-c`/`--config` to a platform-specific
+`CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH`: `/etc/yacron2.d` on POSIX, or
+`%APPDATA%\yacron2` on Windows (for example `C:\Users\<you>\AppData\Roaming\yacron2`,
+falling back to the user profile `~` if `APPDATA` is unset). When that default is in
+effect *and* the path does not exist
 (`args.config == CONFIG_DEFAULT and not os.path.exists(args.config)`), yacron2
-prints the error and exits before constructing the scheduler.
+prints the error and exits before constructing the scheduler. The not-found special
+case keys off the *platform default value*, not the literal string `/etc/yacron2.d`,
+so on Windows it fires when `-c` is left at `%APPDATA%\yacron2` and that path does not
+exist. See [Running on Windows](Running-on-Windows).
 
 **Fix.** Create `/etc/yacron2.d/` and place `*.yaml`/`*.yml` files in it, or pass an
-explicit path with `-c FILE-OR-DIR` (a single file or a directory). Note the error
+explicit path with `-c FILE-OR-DIR` (a single file or a directory). On Windows the
+default location to create and populate is `%APPDATA%\yacron2` rather than
+`/etc/yacron2.d` — see [Running on Windows](Running-on-Windows). Note the error
 text is only emitted for the *default* path; an explicit `-c` pointing at a missing
 file instead surfaces as a `ConfigError` (see below). The default changed from
 `/etc/yacron.d` to `/etc/yacron2.d` in 1.0.0; if you upgraded from yacron, move your
@@ -103,6 +111,15 @@ Job <name> wants to change user or group, but yacron2 is not running as superuse
 `ConfigError` whenever `self.uid` or `self.gid` is set and `os.geteuid() != 0`.
 Dropping to another user requires the daemon itself to start as root.
 
+**Windows note.** Per-job `user`/`group` switching is POSIX-only (Windows has no
+setuid/setgid model). On Windows a job with `user` or `group` set raises a config
+error *before* the superuser/`geteuid` check is ever reached, verbatim:
+`Job <name>: changing user/group is not supported on Windows`. The "not running as
+superuser", "User not found", and "Group not found" errors and the numeric-uid
+passwd-database behaviour below are therefore all POSIX-only (they require the
+`pwd`/`grp` databases and `os.geteuid()`). The fix on Windows is to remove the
+`user`/`group` fields. See [Running on Windows](Running-on-Windows).
+
 **Fix.** Run the daemon as root if you need per-job privilege drop, or remove the
 `user`/`group` fields from the job. Related `ConfigError`s from the same code path:
 
@@ -152,10 +169,19 @@ internally and is skipped; a bind `OSError` (port in use, permission, bad socket
 path) is likewise skipped. Only `http://` and `unix://` schemes are supported. The
 `web: started listening on <url>` message is logged only after the bind succeeds.
 
+**Windows note.** `unix://` listeners are *not* supported on Windows (the Proactor
+event loop lacks `create_unix_server`). Such a listen URL is skipped with the
+verbatim warning
+`Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`;
+use an `http://` listener instead. See [Running on Windows](Running-on-Windows).
+
 **Fix.** Use a supported scheme with host and port (`http://127.0.0.1:8080`) or a
 `unix://` path, and resolve the bind error. For a `unix://` socket on a read-only
 root filesystem, point it at a writable volume and optionally set `web.socketMode`
-(octal string) for permissions.
+(octal string) for permissions. This `unix://`/`web.socketMode` guidance is
+POSIX-only — on Windows unix sockets are unavailable and `socketMode` is irrelevant
+(it only ever applies to unix sockets); on Windows use an `http://` listener. See
+[Running on Windows](Running-on-Windows).
 
 ### Duplicate `web` or `logging` across a config directory
 
@@ -406,6 +432,13 @@ and possibly `Job <name> did not gracefully terminate after <n> seconds, killing
 **Cause.** `executionTimeout` (default unset/`None`) cancels a job still running after
 N seconds (recorded internally as retcode `-100`). Cancellation sends `SIGTERM`, then
 `SIGKILL` if the process is still alive after `killTimeout` seconds (default `30`).
+
+**Windows note.** The `SIGTERM`-then-`SIGKILL` escalation is POSIX behaviour
+(`terminate()` = `SIGTERM`, graceful and trappable; `kill()` = `SIGKILL`, forceful).
+Windows has no POSIX signals — both `terminate()` and `kill()` call `TerminateProcess`,
+an immediate ungraceful stop. The child is not notified to clean up, so the
+terminate->kill escalation is effectively moot (`killTimeout` still bounds the wait,
+but the outcome is the same hard kill). See [Running on Windows](Running-on-Windows).
 
 **Fix.** Raise `executionTimeout`, or give the process more graceful-shutdown time via
 `killTimeout`. See [Concurrency and Timeouts](Concurrency-and-Timeouts).

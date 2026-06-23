@@ -1,6 +1,6 @@
 # yacron2 Wiki
 
-yacron2 is a cron replacement built on asyncio for POSIX systems. Its "crontab" is written in YAML, so jobs, schedules, and behavior are all declared in configuration: it reports job failures by email, Sentry, or shell command; retries failing jobs with exponential backoff; emits job metrics to statsd; and can expose an optional HTTP control API to inspect status and trigger jobs on demand. It runs in the foreground, logs to stdout/stderr, and supports arbitrary timezones, which suits Docker, Kubernetes, and 12-factor deployments. yacron2 is a fork of [gjcarneiro/yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
+yacron2 is a cron replacement built on asyncio that runs natively on Linux, macOS, and Windows. Its "crontab" is written in YAML, so jobs, schedules, and behavior are all declared in configuration: it reports job failures by email, Sentry, or shell command; retries failing jobs with exponential backoff; emits job metrics to statsd; and can expose an optional HTTP control API to inspect status and trigger jobs on demand. It runs in the foreground, logs to stdout/stderr, and supports arbitrary timezones, which suits Docker, Kubernetes, and 12-factor deployments. yacron2 is a fork of [gjcarneiro/yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
 ## Contents
 
@@ -9,6 +9,7 @@ yacron2 is a cron replacement built on asyncio for POSIX systems. Its "crontab" 
 - [Installation](Installation) — Install via Docker, pip, pipx, or the self-contained binary.
 - [Command-Line Reference](CLI-Reference) — The `yacron2` command, its flags, and config file/directory loading.
 - [Production and Container Deployment](Production-Deployment) — Running hardened under non-root, read-only-root-filesystem Kubernetes/Docker.
+- [Running on Windows](Running-on-Windows) — Installing and running yacron2 natively on Windows: config path, default shell, Ctrl-C shutdown, and unsupported features.
 
 ### Configuration
 

@@ -4,9 +4,11 @@ This page covers the yacron2 developer workflow (environment, tests, linters, ty
 
 ## Development environment
 
-yacron2 targets **Python 3.13+**; 3.13 and 3.14 are the tested interpreters (`pyproject.toml` `requires-python = ">=3.13"`, classifiers for 3.13 and 3.14).
+yacron2 targets **Python 3.10+**; 3.10, 3.11, 3.12, 3.13 and 3.14 are the tested interpreters (`pyproject.toml` `requires-python = ">=3.10"`, classifiers for 3.10 through 3.14).
 
-yacron2 is **POSIX-only**: it imports `grp` and `pwd` at load time, so the package and its test suite must run on Linux or macOS (or WSL on Windows). Linting and type checking do not import the package and run on any platform.
+yacron2 runs **natively on Windows, Linux, and macOS** (as of 1.2.0; WSL is no longer required). All OS-specific behaviour is isolated in `yacron2/platform.py` — `grp`/`pwd` are guarded there, not imported unconditionally at load time on Windows — so the package and its full test suite run natively on every supported OS, and `pip install yacron2` works on Windows. See [Running on Windows](Running-on-Windows) for the platform-specific details.
+
+Linting and type checking do not import the package and run on any platform. mypy is pinned to the `linux` platform (`pyproject.toml` `[tool.mypy]` `platform = "linux"`), so type-checking is identical on every OS: it type-checks the POSIX API surface, and the Windows branches are runtime-guarded.
 
 Clone and install the editable package with the `dev` extra:
 
@@ -17,14 +19,16 @@ python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
 ```
 
+The editable dev install (`pip install -e ".[dev]"`) and the checks (`pytest`, `ruff`, `mypy`) all run natively on Windows too — use `.venv\Scripts\activate` to enter the venv as shown above.
+
 The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: `mypy`, `mypy-extensions`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, and `tox`. The console entry point `yacron2 = yacron2.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
 
 ## Running the checks
 
-All CI checks are driven by `tox` (`tox.ini`). The default `envlist` is `py313, py314, lint, mypy`.
+All CI checks are driven by `tox` (`tox.ini`). The default `envlist` is `py310, py311, py312, py313, py314, lint, mypy`.
 
 ```sh
-tox            # all envs: py313, py314, lint, mypy
+tox            # all envs: py310-py314, lint, mypy
 tox -e lint    # ruff check + ruff format --check
 tox -e mypy    # mypy
 tox -e py      # pytest on the current interpreter
@@ -67,7 +71,7 @@ Note `pre-commit`'s ruff runs with `--fix` (auto-applies fixes), whereas `tox -e
 
 ### CI for every commit
 
-`.github/workflows/tox.yml` runs on every `push` and `pull_request` (read-only permissions). It has three jobs on `ubuntu-latest`: `tox-lint` (`tox -e lint`), `tox-mypy` (`tox -e mypy`), and a `tox` matrix over Python `3.13` and `3.14` running `tox -e py` (`fail-fast: false`). The matrix `os` is currently `ubuntu-latest` only; macOS and Windows are commented out in the matrix.
+`.github/workflows/tox.yml` runs on every `push` and `pull_request` (read-only permissions). It has three jobs: `tox-lint` (`tox -e lint`) and `tox-mypy` (`tox -e mypy`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py` (`fail-fast: false`). The matrix runs the full test suite on **both Linux and Windows** — `os` is `[ubuntu-latest, windows-latest]` across Python `3.10`, `3.11`, `3.12`, `3.13`, and `3.14`, with an experimental `ubuntu-latest`/`3.15` row (`continue-on-error`, never gates) and an extra `windows-11-arm` row pinned to Python `3.14` to exercise **Windows ARM64** (the released `.exe` targets it too). macOS (`macos-latest`) is still optionally commented out, since macOS is POSIX like Linux.
 
 A second per-commit gate is `.github/workflows/docker.yml`, which builds the container image on **every commit on every branch** (`push: branches: ["**"]`) as `linux/amd64` build-only (no push, tagged `ci-build`), so a broken `Dockerfile` fails CI before a release. See [Production and Container Deployment](Production-Deployment).
 
@@ -103,12 +107,13 @@ The `release.yml` jobs run in dependency order. Top-level `permissions` default 
 
 1. **`decide`** — Determines `release` (true/false) and `bump`. Trigger logic lives in a real shell script rather than a fuzzy `contains()` expression. All downstream jobs are gated on `needs.decide.outputs.release == 'true'`.
 2. **`version`** — Computes the next version once, so every builder and the publish job build at the same number. Finds the latest tag matching `^[0-9]+\.[0-9]+\.[0-9]+$` (via `git tag -l | … | sort -V | tail -n1`, defaulting to `0.0.0`), applies the bump, and **refuses with an error if the computed tag already exists** (`refs/tags/$new`).
-3. **`gate`** — Checks out full history and runs `tox` on Python 3.13 + 3.14 (`tox` with no `-e` runs `py313, py314, lint, mypy`). A red build means no release.
+3. **`gate`** — Checks out full history and runs `tox` across Python 3.10–3.14 (`tox` with no `-e` runs `py310, py311, py312, py313, py314, lint, mypy`). A red build means no release.
 4. **Native binary builds** (run before publishing, so a broken build fails the run instead of producing a half-finished release). Each job pins `pyinstaller==6.21.0`, runs `pip install .` to bake `SETUPTOOLS_SCM_PRETEND_VERSION` (the computed version) into `yacron2/version.py`, runs `pyinstaller pyinstaller/yacron2.spec`, and smoke-tests the bundle with `dist/yacron2 --version`:
    - **`binaries`** — Linux **glibc, 64-bit**, `amd64` on `ubuntu-24.04` and `arm64` on `ubuntu-24.04-arm` (native runners, no QEMU). Built on Python 3.14. Artifacts `yacron2-linux-amd64`, `yacron2-linux-arm64`.
-   - **`binaries-glibc-extra`** — Linux **glibc** for the arches with no native GitHub runner (`i686`, `armv7`, `ppc64le`, `s390x`), built **inside a `python:3.14-slim` (Debian) container via `docker run --platform`** — the native `binaries` job covers only `amd64`/`arm64` and PyInstaller is not a cross-compiler, so these need a foreign-arch container. `i686` (`linux/386`) runs natively on the `ubuntu-24.04` runner; `armv7` (`linux/arm/v7`), `ppc64le` (`linux/ppc64le`) and `s390x` (`linux/s390x`) run under QEMU (`docker/setup-qemu-action`). Installs `build-essential libffi-dev zlib1g-dev` (the spec sets `strip=True`; `ppc64le`/`s390x` have full manylinux wheels, while the i686 aiohttp stack and propcache-on-`armv7` compile from sdist). Artifacts `yacron2-linux-{i686,armv7,ppc64le,s390x}` (no `-musl` suffix; they sit beside the 64-bit glibc binaries).
-   - **`binaries-musl`** — Linux **musl/Alpine**, `amd64`, `arm64`, `i686`, `armv7`, `ppc64le` and `s390x`, built **inside a `python:3.14-alpine` container via `docker run`** (so checkout/upload stay on the glibc host). `amd64`/`arm64` use their native runners; `i686` (`linux/386`) runs natively on the `ubuntu-24.04` runner and `armv7`/`ppc64le`/`s390x` under QEMU. Installs `build-base libffi-dev zlib-dev` (the spec sets `strip=True`, and headers cover any dep that compiles from sdist — notably the i686 aiohttp stack, which ships no `musllinux_i686` wheels). Artifacts `yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x}-musl`.
+   - **`binaries-glibc-extra`** — Linux **glibc** for the arches with no native GitHub runner (`i686`, `armv7`, `ppc64le`, `s390x`, `riscv64`), built **inside a `python:3.14-slim` (Debian) container via `docker run --platform`** — the native `binaries` job covers only `amd64`/`arm64` and PyInstaller is not a cross-compiler, so these need a foreign-arch container. `i686` (`linux/386`) runs natively on the `ubuntu-24.04` runner; `armv7` (`linux/arm/v7`), `ppc64le` (`linux/ppc64le`), `s390x` (`linux/s390x`) and `riscv64` (`linux/riscv64`) run under QEMU (`docker/setup-qemu-action`). Installs `build-essential libffi-dev zlib1g-dev` (the spec sets `strip=True`; `ppc64le`/`s390x` have full manylinux wheels, while the i686 aiohttp stack, propcache-on-`armv7`, and multidict/frozenlist/ruamel.yaml.clib on `riscv64` compile from sdist). Artifacts `yacron2-linux-{i686,armv7,ppc64le,s390x,riscv64}` (no `-musl` suffix; they sit beside the 64-bit glibc binaries).
+   - **`binaries-musl`** — Linux **musl/Alpine**, `amd64`, `arm64`, `i686`, `armv7`, `ppc64le`, `s390x`, `riscv64` and `armv6`, built **inside a `python:3.14-alpine` container via `docker run`** (so checkout/upload stay on the glibc host). `amd64`/`arm64` use their native runners; `i686` (`linux/386`) runs natively on the `ubuntu-24.04` runner and `armv7`/`ppc64le`/`s390x`/`riscv64`/`armv6` under QEMU. `armv6` is **musl-only** — the Debian/glibc image ships no arm32v6, so it has no `binaries-glibc-extra` counterpart. Installs `build-base libffi-dev zlib-dev` (the spec sets `strip=True`, and headers cover any dep that compiles from sdist — notably the i686 aiohttp stack, which ships no `musllinux_i686` wheels, and the whole C-ext stack on `armv6`). Artifacts `yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64,armv6}-musl`.
    - **`binaries-macos`** — macOS, `arm64` on `macos-15` (Apple Silicon) and `amd64` on `macos-15-intel`. Built on Python 3.14. After the smoke test it asserts the native arch with `file` (so Rosetta cannot let a mislabelled x86_64 build pass on the arm64 runner). Artifacts `yacron2-macos-arm64`, `yacron2-macos-amd64`.
+   - **`binaries-windows`** — Windows, `amd64` on `windows-latest` and `arm64` on the `windows-11-arm` runner (both native; PyInstaller is not a cross-compiler). Built on Python 3.14 with the same `pyinstaller==6.21.0` pin and `dist/yacron2.exe --version` smoke test as the other jobs; any C-extension dep lacking a `win_arm64` wheel compiles from sdist via the runner's Visual Studio ARM64 toolchain. There is **no Windows code-signing step** (the binaries ship unsigned, like the Linux binaries). Artifacts `yacron2-windows-amd64.exe`, `yacron2-windows-arm64.exe`. See [Running on Windows](Running-on-Windows).
 5. **`release`** — Runs only after all builders succeed, with `permissions: contents: write` and `id-token: write`. In order:
    - Builds the wheel + sdist with `python -m build` (at `SETUPTOOLS_SCM_PRETEND_VERSION`) and validates with `twine check`.
    - **Publishes the wheel + sdist to PyPI** via Trusted Publishing / OIDC (`pypa/gh-action-pypi-publish@release/v1`) — no API token.
@@ -134,9 +139,10 @@ The "Build release notes from HISTORY.md" step extracts this version's section f
 The GitHub Release (`softprops/action-gh-release@v3`) attaches:
 
 - `dist/*.whl`, `dist/*.tar.gz`
-- `yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x}` (glibc)
-- the same six arches with a `-musl` suffix, e.g. `yacron2-linux-amd64-musl` … `yacron2-linux-s390x-musl`
+- `yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}` (glibc)
+- the same seven arches with a `-musl` suffix, e.g. `yacron2-linux-amd64-musl` … `yacron2-linux-riscv64-musl`, **plus** `yacron2-linux-armv6-musl` (armv6 is musl-only)
 - `yacron2-macos-amd64`, `yacron2-macos-arm64`
+- `yacron2-windows-amd64.exe`, `yacron2-windows-arm64.exe`
 
 The download-artifact pattern `yacron2-*` must stay broad enough to match all of them — a too-narrow pattern silently drops artifacts it misses rather than erroring.
 
@@ -167,6 +173,7 @@ The version is baked in by installing the package under `SETUPTOOLS_SCM_PRETEND_
 ## Related pages
 
 - [Installation](Installation)
+- [Running on Windows](Running-on-Windows)
 - [Command-Line Reference](CLI-Reference)
 - [Production and Container Deployment](Production-Deployment)
 - [Architecture and Internals](Architecture-and-Internals)

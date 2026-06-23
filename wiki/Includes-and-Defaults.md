@@ -8,8 +8,10 @@ settings inherit from defaults. All behavior here is implemented in
 
 ## Config loading entry points
 
-yacron2 resolves the `-c`/`--config` argument (default `/etc/yacron2.d`, see
-[CLI Reference](CLI-Reference)) through `parse_config(config_arg)`:
+yacron2 resolves the `-c`/`--config` argument (default `/etc/yacron2.d` on
+POSIX, `%APPDATA%\yacron2` on Windows — falling back to `~` if APPDATA is
+unset; see [CLI Reference](CLI-Reference) and [Running on Windows](Running-on-Windows))
+through `parse_config(config_arg)`:
 
 - If `config_arg` is a directory, it is loaded by `_parse_config_dir`
   (directory mode, below).
@@ -95,14 +97,21 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
+The `shell` field works on every OS; the `/bin/...` paths above are POSIX
+examples. On Windows you'd set e.g. `shell: powershell`, leave it empty to use
+cmd.exe (via %ComSpec%), or pass `command` as a list to bypass the shell
+entirely (see [Running on Windows](Running-on-Windows)).
+
 ### Merge precedence
 
 Within a single parsed file (`parse_config_string`), each job's effective
 configuration is built by successively merging with `mergedicts`, in this order
 (later wins):
 
-1. `DEFAULT_CONFIG` — the built-in defaults (e.g. `shell: /bin/sh`,
-   `captureStderr: true`, `utc: true`, `killTimeout: 30`; full list in the
+1. `DEFAULT_CONFIG` — the built-in defaults (e.g. `shell: /bin/sh` on POSIX
+   (empty on Windows, which routes a string `command` through %ComSpec%/cmd.exe;
+   see [Running on Windows](Running-on-Windows)), `captureStderr: true`,
+   `utc: true`, `killTimeout: 30`; full list in the
    [Configuration Reference](Configuration-Reference)).
 2. **Included files' defaults** — the `defaults` blocks of any files named by
    this file's `include` directive, merged together in include order.
@@ -112,7 +121,10 @@ configuration is built by successively merging with `mergedicts`, in this order
 Each job dict is `mergedicts(defaults, config_job)`, where `defaults` is
 `mergedicts(mergedicts(DEFAULT_CONFIG, included_defaults), this_files_defaults)`.
 The resulting per-job dict is then passed to `JobConfig`, which validates it
-(numeric ranges, timezone, user/group). The merged `defaults` (steps 1–3) is
+(numeric ranges, timezone, user/group). On Windows, user/group switching is
+unsupported: a job with `user` or `group` set raises a configuration error
+(`Job <name>: changing user/group is not supported on Windows`); see
+[Running on Windows](Running-on-Windows). The merged `defaults` (steps 1–3) is
 also returned as the file's `job_defaults`.
 
 ## Merge semantics (`mergedicts`)

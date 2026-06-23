@@ -17,13 +17,19 @@ deadline derived from `executionTimeout`; on expiry it is cancelled, and
 `killTimeout` controls the SIGTERM-then-SIGKILL escalation used during any
 cancellation.
 
+The SIGTERM-then-SIGKILL escalation is the POSIX behaviour. On Windows there
+are no POSIX signals, so both steps call `TerminateProcess` (an immediate,
+ungraceful stop); `killTimeout` still bounds the wait, but the
+terminate-then-kill escalation is effectively moot because the outcome is the
+same hard kill. See [Running on Windows](Running-on-Windows).
+
 ## Option summary
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `concurrencyPolicy` | enum: `Allow`, `Forbid`, `Replace` | `Allow` | Behaviour when a launch is requested while another instance of the same job is still running. |
 | `executionTimeout` | float (seconds, `> 0` when set) | none (`null`) | Maximum wall-clock duration of a single run. On expiry the run is cancelled and assigned return code `-100`. |
-| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is cancelled, seconds to wait after SIGTERM before sending SIGKILL. |
+| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is cancelled, seconds to wait after SIGTERM before sending SIGKILL (POSIX); on Windows both calls map to `TerminateProcess`, so `killTimeout` only bounds the wait before the same hard kill. See [Running on Windows](Running-on-Windows). |
 
 Types are from the strictyaml schema (`concurrencyPolicy` is
 `Enum(["Allow", "Forbid", "Replace"])`; `executionTimeout` and `killTimeout`
@@ -170,14 +176,28 @@ expiry and by `concurrencyPolicy: Replace`. The sequence is:
 3. If it has not exited by then, log `Job <name> did not gracefully terminate
    after <N> seconds, killing it...` and send SIGKILL via `proc.kill()`.
 
+`proc.terminate()` = SIGTERM and `proc.kill()` = SIGKILL only on POSIX (a real
+escalation; a child can trap SIGTERM to clean up). On Windows both
+`terminate()` and `kill()` call `TerminateProcess`, an immediate ungraceful
+stop in which the child is *not* notified to clean up, so the escalation is
+effectively moot — `killTimeout` still bounds the wait, but the result is the
+same hard kill. See [Running on Windows](Running-on-Windows).
+
 `killTimeout` defaults to `30` seconds and must be `>= 0`. A value of `0` is
 valid and means SIGKILL is sent almost immediately after SIGTERM (the
 `asyncio.wait_for` with a zero timeout gives the process essentially no grace
-period). The SIGTERM/SIGKILL escalation is POSIX-specific.
+period). The SIGTERM/SIGKILL escalation is POSIX-specific: on Windows both
+`terminate()` and `kill()` map to `TerminateProcess`, an immediate hard kill in
+which the child is not notified, so the escalation is moot — `killTimeout` still
+bounds the wait, but the outcome is the same hard kill.
 
 `killTimeout` gives a job time to flush buffers and clean up after being asked
 to stop; raise it for jobs that need longer to shut down, lower it for jobs
-that may ignore SIGTERM and must be force-killed quickly.
+that may ignore SIGTERM and must be force-killed quickly. This grace and the
+"ignore SIGTERM" guidance apply only on POSIX; on Windows `TerminateProcess`
+gives the child no chance to flush or clean up and a job cannot trap or ignore
+the stop, so `killTimeout` effectively only delays the (identical) hard kill.
+See [Running on Windows](Running-on-Windows).
 
 ```yaml
 jobs:
@@ -193,6 +213,11 @@ jobs:
     executionTimeout: 1
     killTimeout: 0.5   # SIGKILL 0.5s after the (ignored) SIGTERM
 ```
+
+This example demonstrates POSIX-only behaviour (a shell trapping SIGTERM). On
+Windows there is no signal to trap; the job would be hard-killed via
+`TerminateProcess` regardless, so the trap and the SIGTERM/SIGKILL timing it
+illustrates do not apply. See [Running on Windows](Running-on-Windows).
 
 ## Scope and interaction
 

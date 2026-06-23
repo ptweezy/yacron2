@@ -8,7 +8,10 @@ moving an existing yacron 0.19 deployment to yacron2.
 yacron2 carries forward all of upstream yacron's functionality: scheduling,
 reporting, retries, concurrency, metrics, and the HTTP API all behave as in
 0.19 except where a breaking change below says otherwise, and yacron2 1.0.0 adds
-new options on top (e.g. the `web.authToken` and `web.socketMode` keys). The
+new options on top (e.g. the `web.authToken` and `web.socketMode` keys;
+`web.socketMode` only applies to `unix://` listeners and is therefore
+irrelevant on Windows, where unix-socket listeners are unsupported — see
+[Running on Windows](Running-on-Windows)). The
 breaking changes below are packaging renames, an interpreter floor, two
 security-relevant default/behavior changes, one merge semantics change, and
 dependency-pin changes. No per-job YAML key was removed, renamed, or retyped;
@@ -40,12 +43,21 @@ explicitly with `-c /etc/yacron.d`. The published container image and the
 example Dockerfile read from `/etc/yacron2.d`. See
 [Includes, Defaults, and Multi-File Config](Includes-and-Defaults).
 
-### Minimum Python is now 3.13
+This default is platform-specific: it is `/etc/yacron2.d` only on POSIX. On
+Windows the default is instead `%APPDATA%\yacron2` (e.g.
+`C:\Users\<you>\AppData\Roaming\yacron2`), falling back to the user profile
+(`~`) when `APPDATA` is unset. The "config not found -> exit 1" special case
+keys off whichever platform default applies (not the literal `/etc/yacron2.d`
+string). See [Running on Windows](Running-on-Windows).
 
-`requires-python` is `>=3.13`; only Python 3.13 and 3.14 are supported. Python
-3.7 through 3.12 are no longer supported. If your host runs an older
+### Minimum Python is now 3.10
+
+`requires-python` is `>=3.10`; Python 3.10 through 3.14 are supported. Python
+3.9 and earlier are no longer supported. If your host runs an older
 interpreter, use the self-contained binary (which embeds Python) or the
-container image instead of a `pip` install. See [Installation](Installation).
+container image instead of a `pip` install. Since 1.2.0, `pip install yacron2`
+and the self-contained binaries also work natively on Windows (amd64/arm64);
+see [Running on Windows](Running-on-Windows). See [Installation](Installation).
 
 ### Reporter shell environment variables renamed `YACRON_*` -> `YACRON2_*`
 
@@ -120,6 +132,13 @@ of silently keeping yacron's gid `0`. If you previously relied on a numeric
 `user` retaining gid `0`, set `group` explicitly. See
 [Commands and Environment](Commands-and-Environment).
 
+Per-job `user`/`group` switching is POSIX-only (Windows has no setuid/setgid
+model). On Windows a job with `user` or `group` set raises a configuration
+error, `Job <name>: changing user/group is not supported on Windows`, so the
+entire privilege-drop discussion above (and the related checklist item about a
+numeric `user` retaining gid `0`) applies only on POSIX. See
+[Running on Windows](Running-on-Windows).
+
 ### `defaults.environment` merges by key instead of concatenating
 
 When a `defaults` block and a job both define `environment` entries, yacron2
@@ -157,24 +176,30 @@ same libraries. See [Schedules and Timezones](Schedules-and-Timezones).
 ## Migration checklist
 
 - [ ] Install the new distribution: `pip install yacron2` (or `pipx install
-  yacron2`), or switch to the container image / standalone binary. See
-  [Installation](Installation).
-- [ ] Ensure the target interpreter is Python 3.13 or 3.14. On older hosts, use
+  yacron2`), or switch to the container image / standalone binary. `pip` and
+  the standalone binaries (amd64/arm64) also work on Windows; see
+  [Running on Windows](Running-on-Windows). See [Installation](Installation).
+- [ ] Ensure the target interpreter is Python 3.10 or newer. On older hosts, use
   the binary or container image.
 - [ ] Update any code/scripts that `import yacron` to `import yacron2`, and any
   service unit or wrapper invoking the `yacron` command to invoke `yacron2`.
 - [ ] Move your config directory from `/etc/yacron.d` to `/etc/yacron2.d`, or
   pass `-c /etc/yacron.d` explicitly. Update systemd units, Dockerfiles, and
-  Kubernetes manifests accordingly.
+  Kubernetes manifests accordingly. On Windows the platform default is
+  `%APPDATA%\yacron2` instead; see [Running on Windows](Running-on-Windows).
 - [ ] In every shell reporter script, rename `YACRON_*` references to
   `YACRON2_*`.
 - [ ] For each `mail` reporter targeting a server with a self-signed or invalid
   certificate that previously worked, add `validate_certs: false` (or fix the
   server certificate). All other mail reporters now validate certificates by
   default.
-- [ ] If any job uses a numeric `user` without a `group` and relied on keeping
-  gid `0`, add an explicit `group`. Re-test per-job privilege dropping; the
-  child now also gets the target user's supplementary groups instead of root's.
+- [ ] (POSIX only; on Windows remove `user`/`group`) If any job uses a numeric
+  `user` without a `group` and relied on keeping gid `0`, add an explicit
+  `group`. Re-test per-job privilege dropping; the child now also gets the
+  target user's supplementary groups instead of root's. On Windows `user`/
+  `group` is unsupported and raises a config error, so any job carrying
+  `user`/`group` must have it removed (or be run on a POSIX host) before
+  migration. See [Running on Windows](Running-on-Windows).
 - [ ] Review `defaults.environment` overrides; the merged environment list no
   longer contains duplicate keys (the effective value of each variable is
   unchanged).

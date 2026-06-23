@@ -26,6 +26,14 @@ def main_loop(loop):
     parser.add_argument(
         "-v", "--validate-config", default=False, action="store_true"
     )
+    parser.add_argument(
+        "--job-set-id",
+        default=False,
+        action="store_true",
+        help="print the job-set id (an order-independent hash of every job's "
+        "effective configuration) and exit; identical across instances "
+        "running the same set of jobs",
+    )
     parser.add_argument("--version", default=False, action="store_true")
     args = parser.parse_args()
 
@@ -51,6 +59,10 @@ def main_loop(loop):
     except ConfigError as err:
         logger.error("Configuration error: %s", str(err))
         sys.exit(1)
+
+    if args.job_set_id:
+        print(cron.job_set_id())
+        sys.exit(0)
 
     if args.validate_config:
         logger.info("Configuration is valid.")

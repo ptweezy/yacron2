@@ -4,15 +4,17 @@ This page covers every way to install yacron2: the published container image,
 `pip`, `pipx`, and the self-contained PyInstaller binaries. It documents the
 Python and platform requirements, the runtime dependencies, the exact binary
 release assets, and the writable-and-executable temp-directory requirement that
-applies to the standalone binary only.
+applies to the standalone binary only. As of 1.2.0 yacron2 runs natively on
+Windows in addition to Linux and macOS; see [Running on Windows](Running-on-Windows)
+for the Windows-specific details.
 
 ## Requirements
 
 | Requirement | Value |
 | --- | --- |
-| Python (pip/pipx) | `>= 3.13`; only 3.13 and 3.14 are supported (`requires-python = ">=3.13"`). Python 3.7–3.12 are not supported. |
-| Operating system | POSIX only (Linux, macOS). yacron2 imports `grp`/`pwd` at module load; there is no Windows support. |
-| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z) — both the container image and the prebuilt binaries; macOS: `amd64` and `arm64` (prebuilt binaries). |
+| Python (pip/pipx) | `>= 3.10`; 3.10, 3.11, 3.12, 3.13 and 3.14 are supported and tested (`requires-python = ">=3.10"`). For an older Python, use the standalone binary instead. |
+| Operating system | Linux, macOS, and Windows. OS-specific behaviour is isolated in `yacron2/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows — see [Running on Windows](Running-on-Windows). |
+| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z) — both the container image and the prebuilt binaries; the prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
 bundles its own interpreter, and the standalone binaries embed Python, so
@@ -88,7 +90,7 @@ Kubernetes/Docker setup (read-only root filesystem, dropped capabilities,
 
 ## Install using pip
 
-yacron2 requires Python >= 3.13. Install it in a virtual environment:
+yacron2 requires Python >= 3.10. Install it in a virtual environment:
 
 ```shell
 python3 -m venv yacron2env
@@ -109,7 +111,7 @@ the program into it:
 pipx install yacron2
 ```
 
-pipx still requires a supported Python (3.13 or 3.14) available to build the
+pipx still requires a supported Python (3.10 or newer) available to build the
 isolated environment.
 
 ## Install using a binary
@@ -127,14 +129,19 @@ following assets, built natively on a matching runner:
 | `yacron2-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7, e.g. older Raspberry Pi) for glibc-based systems. |
 | `yacron2-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER) for glibc-based systems. |
 | `yacron2-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian) for glibc-based systems. |
+| `yacron2-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V for glibc-based systems. |
 | `yacron2-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl-based systems. |
 | `yacron2-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl-based systems. |
 | `yacron2-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl-based systems. |
 | `yacron2-linux-armv7-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv7) for Alpine and other musl-based systems. |
 | `yacron2-linux-ppc64le-musl` | Linux | musl, ppc64le | 64-bit little-endian POWER for Alpine and other musl-based systems. |
 | `yacron2-linux-s390x-musl` | Linux | musl, s390x | IBM Z (s390x) for Alpine and other musl-based systems. |
+| `yacron2-linux-riscv64-musl` | Linux | musl, riscv64 | 64-bit RISC-V for Alpine and other musl-based systems. |
+| `yacron2-linux-armv6-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv6, e.g. Raspberry Pi 1/Zero); musl-only, no glibc build. |
 | `yacron2-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
 | `yacron2-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
+| `yacron2-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`; Python not required on the target. |
+| `yacron2-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`; Python not required on the target. |
 
 The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
@@ -143,7 +150,12 @@ The `i686` and `armv7` builds (added in 1.1.3) and the `ppc64le` and `s390x`
 builds (added in 1.1.4) — both glibc and musl — extend the 64-bit `amd64`/`arm64`
 binaries to 32-bit x86, 32-bit ARM, POWER and IBM Z hosts; they build inside a
 container (`i686` natively on the x86-64 runner, the rest under QEMU emulation).
-macOS builds (added in 1.0.10) cover both Apple Silicon and Intel.
+The `riscv64` builds (added in 1.1.6) cover 64-bit RISC-V for both glibc and
+musl, and the musl-only `armv6` build extends to older 32-bit ARM (e.g.
+Raspberry Pi 1/Zero); there is no glibc `armv6` build. macOS builds (added in
+1.0.10) cover both Apple Silicon and Intel. The Windows binaries are
+self-contained `.exe` files for x64 (`amd64`) and ARM64; like the other
+binaries they embed Python, so Python is not required on the target.
 
 Download and run (glibc amd64 Linux shown — append `-musl` on Alpine, or use
 `yacron2-macos-<arch>` on a Mac):
@@ -153,6 +165,13 @@ curl -fsSL -o yacron2 \
   https://github.com/ptweezy/yacron2/releases/latest/download/yacron2-linux-amd64
 chmod +x yacron2
 ./yacron2 --version
+```
+
+On Windows, download `yacron2-windows-amd64.exe` (or `yacron2-windows-arm64.exe`
+on ARM64) and run it directly — no `chmod` is needed:
+
+```powershell
+.\yacron2-windows-amd64.exe --version
 ```
 
 ### macOS signing and notarization
@@ -200,6 +219,10 @@ image and the `pip`/`pipx` installs run yacron2 as a normal Python package with
 the interpreter on disk, so they never self-extract and need no writable temp
 directory. See [Production and Container Deployment](Production-Deployment).
 
+On Windows the self-extracting `.exe` uses the standard Windows temp directory
+(`%TEMP%`), which is writable and executable by default; the read-only-rootfs and
+`noexec` caveats above are Linux-container concerns only.
+
 ## After installation
 
 Start yacron2 by giving it a configuration file or directory with `-c`; it
@@ -209,7 +232,18 @@ always runs in the foreground:
 yacron2 -c /etc/yacron2.d
 ```
 
+The `-c` default is platform-specific: `/etc/yacron2.d` on POSIX, and
+`%APPDATA%\yacron2` on Windows (e.g. `C:\Users\<you>\AppData\Roaming\yacron2`,
+falling back to the user profile `~` if `APPDATA` is unset). The default `shell`
+also differs — `/bin/sh` on POSIX, and on Windows an empty default that runs a
+string `command` through `%ComSpec%` (`cmd.exe`). On Windows, press Ctrl-C (or
+Ctrl-Break) to stop yacron2 gracefully; it finishes running jobs first, just as
+SIGTERM does on POSIX. Note that per-job `user`/`group` switching and `unix://`
+web listeners are not available on Windows; see
+[Running on Windows](Running-on-Windows) for the full details.
+
 See [Command-Line Reference](CLI-Reference) for all flags, and
-[Configuration Reference](Configuration-Reference) for the config schema. If you
+[Configuration Reference](Configuration-Reference) for the config schema. For
+Windows-specific behaviour, see [Running on Windows](Running-on-Windows). If you
 are coming from the original yacron, see
 [Migration from yacron](Migration-from-yacron).

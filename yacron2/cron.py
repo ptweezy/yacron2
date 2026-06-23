@@ -28,6 +28,7 @@ from yacron2.config import (
     parse_config,
     parse_config_string,
 )
+from yacron2.fingerprint import job_set_id
 from yacron2.job import JobOutputStream, JobRetryState, RunningJob
 
 logger = logging.getLogger("yacron2")
@@ -269,6 +270,8 @@ class Cron:
         self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
+        # last job-set id we logged, so reloads only log it again on change
+        self._logged_job_set_id = None  # type: Optional[str]
 
     async def run(self) -> None:
         self._wait_for_running_jobs_task = asyncio.create_task(
@@ -285,6 +288,7 @@ class Cron:
             config: Optional[Yacron2Config] = None
             try:
                 config = self.update_config()
+                self._log_job_set_id()
                 await self.start_stop_web_app(config.web_config)
             except ConfigError as err:
                 logger.error(
@@ -352,12 +356,43 @@ class Cron:
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
         return config
 
+    def job_set_id(self) -> str:
+        """Order-independent fingerprint of the currently-loaded job set.
+
+        Two yacron2 instances return the same value iff they hold the same set
+        of jobs (same effective config, any order); see yacron2.fingerprint.
+        """
+        return job_set_id(self.cron_jobs.values())
+
+    def _log_job_set_id(self) -> None:
+        """Log the job-set id at startup and whenever a reload changes it."""
+        current = self.job_set_id()
+        if current != self._logged_job_set_id:
+            logger.info(
+                "Job set id: %s (%d job%s)",
+                current,
+                len(self.cron_jobs),
+                "" if len(self.cron_jobs) == 1 else "s",
+            )
+            self._logged_job_set_id = current
+
     async def _web_get_version(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         return web.Response(
             text=yacron2.version.version,
             headers=self.web_config.get("headers", None),
         )
+
+    async def _web_job_set_id(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        job_set = self.job_set_id()
+        headers = self.web_config.get("headers", None)
+        if request.headers.get("Accept") == "application/json":
+            return web.json_response(
+                {"job_set_id": job_set, "jobs": len(self.cron_jobs)},
+                headers=headers,
+            )
+        return web.Response(text=job_set, headers=headers)
 
     async def _web_get_status(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
@@ -650,6 +685,7 @@ class Cron:
             app = web.Application(middlewares=middlewares)
             routes = [
                 web.get("/version", self._web_get_version),
+                web.get("/job-set-id", self._web_job_set_id),
                 web.get("/status", self._web_get_status),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),

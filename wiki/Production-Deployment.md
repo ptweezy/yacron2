@@ -1,10 +1,13 @@
 # Production and Container Deployment
 
-This page covers running yacron2 in hardened container environments: the published
-image, the security context it is built to satisfy, the Kubernetes `Deployment`
-manifest, the FROM-the-published-image build pattern, and the few cases that
-require a writable path. See [Installation](Installation) for the package/binary
-install methods and [HTTP Control API](HTTP-API) for the optional web interface.
+This page covers running yacron2 in hardened Linux container and Kubernetes
+environments (the published Docker image is Linux-only): the published image, the
+security context it is built to satisfy, the Kubernetes `Deployment` manifest, the
+FROM-the-published-image build pattern, and the few cases that require a writable
+path. See [Installation](Installation) for the package/binary install methods and
+[HTTP Control API](HTTP-API) for the optional web interface. For native Windows
+deployment with the `yacron2-windows-amd64.exe` / `yacron2-windows-arm64.exe`
+binaries, see [Running on Windows](Running-on-Windows).
 
 ## Why yacron2 fits a locked-down pod
 
@@ -181,6 +184,13 @@ with `web.listen: [unix:///run/yacron2/yacron2.sock]` in your config. (TCP
 listeners such as `http://0.0.0.0:8080` need no writable path.) The optional
 `web.socketMode` config key, if set, `chmod`s the socket after bind.
 
+> `unix://` web listeners are not supported on Windows (the Proactor event loop
+> lacks `create_unix_server`); such a listen URL is skipped with the warning
+> `Ignoring web listen url <url>: unix-socket listeners are not supported on this
+> platform` — use an `http://` listener instead. `web.socketMode` only applies to
+> unix sockets, so it is irrelevant on Windows. See
+> [Running on Windows](Running-on-Windows).
+
 ### 2. The standalone binary under a read-only rootfs
 
 This applies only if you deploy the standalone *binary* (from the GitHub
@@ -221,12 +231,19 @@ on disk; they never self-extract and need no writable temp directory. See
 * **Logging** — yacron2 logs to stdout/stderr; collect logs at the platform
   level (`kubectl logs`, the container runtime's log driver). Adjust verbosity
   with `-l/--log-level` (default `INFO`) or a `logging:` config section.
-* **Shutdown** — yacron2 installs handlers for `SIGINT` and `SIGTERM` and shuts
-  down gracefully, so the default pod termination path works without extra
-  configuration.
+* **Shutdown** — on POSIX, yacron2 installs handlers for `SIGINT` and `SIGTERM`
+  and shuts down gracefully, so the default pod termination path works without
+  extra configuration. On Windows (where the Proactor loop has no
+  `add_signal_handler`) it instead handles `SIGINT`/`SIGBREAK` via
+  `signal.signal` plus a heartbeat timer, so pressing Ctrl-C or Ctrl-Break stops
+  it; either way it finishes the currently-running jobs first. See
+  [Running on Windows](Running-on-Windows).
 * **Validate before deploy** — `yacron2 -c <path> --validate-config` parses the
   config and exits, useful as a CI/pre-deploy gate. See [Command-Line
   Reference](CLI-Reference).
-* **Config not found** — when `-c` is left at its default `/etc/yacron2.d` and the
-  path does not exist, yacron2 prints an error and exits non-zero. Ensure the
-  config volume is mounted there.
+* **Config not found** — the default config path is platform-specific:
+  `/etc/yacron2.d` on POSIX, `%APPDATA%\yacron2` on Windows (falling back to the
+  user profile `~` if `APPDATA` is unset). When `-c` is left at whichever is the
+  platform default and that path does not exist, yacron2 prints an error and exits
+  non-zero. In the container, ensure the config volume is mounted at
+  `/etc/yacron2.d`.

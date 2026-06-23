@@ -13,15 +13,17 @@ Types and defaults are taken from the strictyaml schema and `DEFAULT_CONFIG`.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `command` | `Str` or `Seq(Str)` | required | The program to run. A string is run through a shell; a list is executed directly. |
-| `shell` | `Str` | `/bin/sh` | Shell used when `command` is a string. |
+| `command` | `Str` or `Seq(Str)` | required | The program to run. A string is run through a shell (on Windows, with the default empty `shell`, through the native command processor `cmd.exe` via `%ComSpec%`); a list is executed directly with no shell on every platform. |
+| `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used when `command` is a string. The default is platform-specific: `/bin/sh` on POSIX, empty on Windows (an empty default routes a string command through the native command processor `%ComSpec%` / `cmd.exe`). To use PowerShell or another interpreter, set `shell:` explicitly, or pass `command` as a list (which bypasses the shell on every platform). See [Running on Windows](Running-on-Windows). |
 | `environment` | `Seq(Map({key, value}))` | `[]` | Environment variables (each an item with `key` and `value`, both `Str`) added to the subprocess environment. |
 | `env_file` | `Str` | `None` | Path to a `KEY=VALUE` file whose variables are merged into `environment`. |
-| `user` | `Str` or `Int` | unset | User (login name or numeric uid) to run the subprocess as. New in version 0.11. |
-| `group` | `Str` or `Int` | unset | Group (group name or numeric gid) to run the subprocess as. New in version 0.11. |
+| `user` | `Str` or `Int` | unset | User (login name or numeric uid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). New in version 0.11. |
+| `group` | `Str` or `Int` | unset | Group (group name or numeric gid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). New in version 0.11. |
 
-`command` is required on every job. `shell` has a schema/`DEFAULT_CONFIG`
-default of `/bin/sh`. `environment` defaults to an empty list. `env_file`,
+`command` is required on every job. `shell` has a platform-specific
+schema/`DEFAULT_CONFIG` default: `/bin/sh` on POSIX and an empty string on
+Windows (`DEFAULT_SHELL` in `yacron2/platform.py`), which makes a string command
+run via `cmd.exe`. `environment` defaults to an empty list. `env_file`,
 `user`, and `group` are optional (`Opt(...)` in the schema) and unset by default;
 `environment` and `env_file` are also inheritable via `defaults`, but `user` and
 `group` are job-only fields in the schema (they appear in `_job_defaults_common`,
@@ -34,13 +36,17 @@ root-required check happen per job).
 how the process is launched (`RunningJob.start` in `yacron2/job.py`):
 
 - **String** — run through a shell.
-  - If `shell` is set (it defaults to `/bin/sh`), yacron2 launches
-    `asyncio.create_subprocess_exec` with argv `[shell, "-c", command]`. With the
-    default `shell`, that is `["/bin/sh", "-c", command]`.
-  - If `shell` were falsy, yacron2 would instead use
-    `asyncio.create_subprocess_shell` with the bare command string. In practice
-    `shell` is never empty because the schema/default supply `/bin/sh`, so the
-    `exec`-with-`-c` path is what runs.
+  - If `shell` is set, yacron2 launches `asyncio.create_subprocess_exec` with
+    argv `[shell, "-c", command]`. With the default `shell` on POSIX, that is
+    `["/bin/sh", "-c", command]`.
+  - If `shell` is falsy, yacron2 instead uses `asyncio.create_subprocess_shell`
+    with the bare command string. On POSIX the default `/bin/sh` makes the
+    `exec`-with-`-c` path the one that runs; on Windows the default `shell` is
+    empty (`DEFAULT_SHELL` in `yacron2/platform.py`), so the
+    `create_subprocess_shell` path is the default — the command is handed to the
+    native command processor `cmd.exe` via `%ComSpec%`. Setting `shell:`
+    explicitly on Windows takes the `exec`-with-`-c` path with that interpreter.
+    See [Running on Windows](Running-on-Windows).
 - **List** — executed directly with `asyncio.create_subprocess_exec`, with no
   shell involved. The argv is taken verbatim from the list; no word splitting,
   globbing, quoting, or `$VAR` expansion is performed.
@@ -202,6 +208,13 @@ process environment (including injected `HOSTNAME`) < `env_file` < merged
 `user` and `group` request that the subprocess run under a different identity.
 Resolution happens in `JobConfig._resolve_user_group` (`yacron2/config.py`):
 
+> **Windows:** this whole feature is POSIX-only. Windows has no setuid/setgid
+> model, so a job with `user` or `group` set raises the configuration error
+> `Job <name>: changing user/group is not supported on Windows`
+> (`config.py` `_resolve_user_group`). The Root requirement, Resolution rules,
+> and Demotion ordering below all apply to POSIX only. See
+> [Running on Windows](Running-on-Windows).
+
 ### Resolution rules
 
 - **`user` as a name (`Str`)** — looked up with `getpwnam`. Sets `uid` from
@@ -231,9 +244,11 @@ running as root (`os.geteuid() != 0`), config parsing fails with:
 Job <name> wants to change user or group, but yacron2 is not running as superuser
 ```
 
-Any use of `user` **or** `group` therefore requires yacron2 to run as root.
-yacron2 needs no special privileges otherwise; `user`/`group` switching is the
-only feature that requires root.
+On POSIX, any use of `user` **or** `group` therefore requires yacron2 to run as
+root. yacron2 needs no special privileges otherwise; `user`/`group` switching is
+the only feature that requires root. (On Windows `user`/`group` are rejected
+outright with a configuration error, so this root requirement is a POSIX-only
+statement — see the Windows note above.)
 
 ```yaml
 jobs:

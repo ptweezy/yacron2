@@ -25,6 +25,14 @@ web:
     - unix:///tmp/yacron2.sock
 ```
 
+> **Windows:** `unix://` listeners are not supported on Windows. On Windows
+> such a listen URL is skipped with the warning `Ignoring web listen url
+> <url>: unix-socket listeners are not supported on this platform` (aiohttp's
+> `UnixSite` needs `create_unix_server`, which the Windows Proactor loop
+> lacks); use an `http://` listener instead. The `http://` listener and the
+> entire HTTP control API otherwise behave identically on Windows. See
+> [Running on Windows](Running-on-Windows).
+
 The server is created only when `web.listen` is non-empty. There must be exactly one
 `web` block across the whole configuration: a duplicate `web` block in an included file
 or a second file in a config directory raises a `ConfigError`. See
@@ -40,21 +48,22 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `yacron2/config
 | `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port` or `unix:///path`. An empty list disables the server. |
 | `headers` | map of string→string | (none) | Extra HTTP headers added to the success responses (including the 409 conflict body and the empty start-job response, but not the 404 or 401). |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes (see [Authentication](#authentication)). |
-| `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). |
+| `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
 
 ### `listen` URL forms
 
 | Scheme | Form | Requirements |
 | --- | --- | --- |
 | `http` | `http://host:port` | Both host and port are required. An `http` URL missing either is logged as a warning (`Ignoring web listen url ...: http url needs host and port`) and skipped. |
-| `unix` | `unix:///path/to/socket` | Binds an `aiohttp` `UnixSite` at the given filesystem path. |
+| `unix` | `unix:///path/to/socket` | Binds an `aiohttp` `UnixSite` at the given filesystem path. POSIX-only: on Windows `UnixSite` is unavailable (no `create_unix_server` on the Proactor loop), so such a URL is skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform` — use an `http://` listener instead. |
 
 Any other scheme is logged (`scheme ... not supported`) and skipped. Binding maps to
 `web.TCPSite` for `http` and `web.UnixSite` for `unix` (`web_site_from_url` in
 `yacron2/cron.py`).
 
 `https` is not a recognized scheme. To serve the API over TLS, bind to a loopback
-`http` address or a `unix` socket and terminate TLS in a reverse proxy.
+`http` address or a `unix` socket (POSIX-only; on Windows use a loopback `http`
+address) and terminate TLS in a reverse proxy.
 
 ## Endpoints
 
@@ -232,6 +241,11 @@ If `fromFile` cannot be read (`OSError`), yacron2 also raises a `ConfigError`
 
 ## Unix socket permissions
 
+> **Windows:** this entire feature is POSIX-only — it depends on `unix://`
+> sockets (which Windows does not support) and on `chmod`. On Windows
+> `socketMode` has no effect and `unix://` listen URLs are skipped with a
+> warning; use an `http://` listener. See [Running on Windows](Running-on-Windows).
+
 `web.socketMode` (*new in 1.0.0*) is an octal-string file mode applied with `chmod`
 to each `unix://` listen socket after it starts (`_apply_socket_mode`):
 
@@ -270,6 +284,10 @@ reload from the scheduler loop:
 - The `web: started listening on <addr>` log line is emitted only after the bind
   succeeds.
 - On shutdown, the running server is stopped after currently running jobs finish.
+  On Windows, graceful shutdown is triggered with Ctrl-C or Ctrl-Break (rather
+  than `SIGTERM` as on POSIX); yacron2 still finishes currently-running jobs
+  before stopping the server, identical to POSIX behavior. See
+  [Running on Windows](Running-on-Windows).
 
 A `ConfigError` raised while resolving `authToken` (empty token or unreadable
 `fromFile`) propagates out of `start_stop_web_app` and is caught by the reload loop,
@@ -279,6 +297,8 @@ configuration (the new config is not applied).
 ## See also
 
 - [Web Dashboard](Web-Dashboard) — the built-in browser UI served by this interface.
+- [Running on Windows](Running-on-Windows) — `unix://` listeners and `socketMode`
+  behave differently on Windows.
 - [Configuration Reference](Configuration-Reference)
 - [CLI Reference](CLI-Reference)
 - [Concurrency and Timeouts](Concurrency-and-Timeouts)

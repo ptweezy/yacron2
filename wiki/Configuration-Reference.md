@@ -46,10 +46,10 @@ logging: { ... }    # optional: Python logging dictConfig
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `listen` | `Seq(Str)` | required | Listen URLs, e.g. `http://127.0.0.1:8080` or `unix:///tmp/yacron2.sock`. |
+| `listen` | `Seq(Str)` | required | Listen URLs, e.g. `http://127.0.0.1:8080` or `unix:///tmp/yacron2.sock`. `http://` listeners work everywhere; `unix://` listeners are not supported on Windows (the Proactor loop lacks `create_unix_server`) and are skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform` — use an `http://` listener instead. See [Running on Windows](Running-on-Windows). |
 | `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. |
 | `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, yacron2 refuses to start. |
-| `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. |
+| `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. Only ever applies to unix sockets, so it is irrelevant on Windows (where `unix://` listeners are unsupported). |
 
 `listen` is the only required key. Full behavior, authentication, and endpoint
 semantics are documented in [HTTP Control API](HTTP-API).
@@ -74,9 +74,9 @@ in a `defaults` block (only the common keys are).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `name` | `Str` | required | Job identifier. Used in logs, the stream prefix, reports, statsd, and the HTTP API. |
-| `command` | `Str` or `Seq(Str)` | required | A shell command string (run via `shell`) or an argv list (run directly, no shell). See [Commands and Environment](Commands-and-Environment). |
+| `command` | `Str` or `Seq(Str)` | required | A shell command string (run via `shell`) or an argv list (run directly, no shell). The shell used for a string `command` is platform-specific (`/bin/sh` on POSIX vs cmd.exe via `%ComSpec%` on Windows when `shell` is left empty); an argv list bypasses the shell on every platform. See [Commands and Environment](Commands-and-Environment) and [Running on Windows](Running-on-Windows). |
 | `schedule` | `Str` or `Map` | required | A crontab string, the literal `@reboot`, or a mapping with `minute`, `hour`, `dayOfMonth`, `month`, `year`, `dayOfWeek` (each `Str`, all optional). The mapping is assembled into a 5-field crontab; the five used fields default to `*`. `year` is accepted by the schema but ignored (the parser builds only a 5-field crontab). See [Schedules and Timezones](Schedules-and-Timezones). |
-| `shell` | `Str` | `/bin/sh` | Shell used to run a string `command`. Ignored when `command` is a list. |
+| `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used to run a string `command`. Ignored when `command` is a list. The default is platform-specific: on POSIX a string `command` runs as `["/bin/sh", "-c", command]`; on Windows the default is empty, which routes a string `command` through the native command processor `%ComSpec%` (cmd.exe) via `asyncio.create_subprocess_shell`. For PowerShell or another interpreter set `shell:` explicitly, or pass `command` as a list to bypass the shell entirely (on every platform). The `shell` field itself works on all OSes. See [Running on Windows](Running-on-Windows). |
 | `enabled` | `Bool` | `true` | When `false`, the job is parsed and validated but never scheduled or runnable. New in version 0.18. |
 
 ### Output capturing
@@ -106,8 +106,8 @@ See [Schedules and Timezones](Schedules-and-Timezones).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `concurrencyPolicy` | `Enum(["Allow", "Forbid", "Replace"])` | `Allow` | Behavior when a scheduled run overlaps a still-running instance. `Allow`: run concurrently. `Forbid`: skip the new run. `Replace`: cancel the running instance and start the new one. |
-| `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. New in version 0.4. |
-| `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. New in version 0.4. |
+| `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). New in version 0.4. |
+| `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals — both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). New in version 0.4. |
 
 See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
@@ -201,7 +201,7 @@ Defaults from `_REPORT_DEFAULTS["sentry"]`:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `shell` | `Str` | `/bin/sh` | Shell used to run the reporter command. |
+| `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used to run the reporter command. The default is platform-specific, same as the per-job `shell` field: on Windows the default is empty (the reporter command runs via cmd.exe through `%ComSpec%`). Set `shell:` explicitly for another interpreter, or pass `command` as a list. See [Running on Windows](Running-on-Windows). |
 | `command` | `Str` or `Seq(Str)` | `None` | Reporter command (required key). Receives `YACRON2_*` environment variables. New in version 0.13. |
 
 ### Environment
@@ -231,8 +231,13 @@ See [Commands and Environment](Commands-and-Environment).
 | `user` | `Str` or `Int` | none | User name or numeric uid the process runs as. A numeric uid derives its primary gid and login name from the passwd database. An unknown name raises a `ConfigError`. New in version 0.11. |
 | `group` | `Str` or `Int` | none | Group name or numeric gid the process runs as. If only `user` is set, the group defaults to that user's primary group. An unknown name raises a `ConfigError`. |
 
-Setting `user` or `group` requires yacron2 to run as root (euid 0); otherwise a
-`ConfigError` is raised. See [Production and Container Deployment](Production-Deployment).
+This section is POSIX-only (the setuid/setgid model). On POSIX, setting `user`
+or `group` requires yacron2 to run as root (euid 0); otherwise a `ConfigError`
+is raised. Privilege switching is **not supported on Windows**: a job with
+`user` or `group` set raises a configuration error, verbatim
+`Job <name>: changing user/group is not supported on Windows`. See
+[Production and Container Deployment](Production-Deployment) and
+[Running on Windows](Running-on-Windows).
 
 ### Metrics
 
@@ -264,7 +269,7 @@ time, not at run time. New in the yacron2 fork.
 
 ```yaml
 defaults:
-  shell: /bin/bash
+  shell: /bin/bash   # POSIX path; on Windows omit shell (uses cmd.exe) or set a Windows interpreter
   utc: false
 
 jobs:

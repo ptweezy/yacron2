@@ -3,6 +3,7 @@
 - **Getting Started**
   - [Installation](Installation)
   - [Command-Line Reference](CLI-Reference)
+  - [Running on Windows](Running-on-Windows)
   - [Production and Container Deployment](Production-Deployment)
 - **Configuration**
   - [Configuration Reference](Configuration-Reference)

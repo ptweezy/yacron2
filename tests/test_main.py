@@ -53,3 +53,18 @@ def test_missing_config(monkeypatch):
     monkeypatch.setattr(sys, "exit", exit)
     with pytest.raises(ExitError):
         yacron2.__main__.main_loop(loop)
+
+
+def test_job_set_id_flag(monkeypatch, capsys):
+    # uses the real Cron so the printed id reflects the parsed config
+    loop = asyncio.new_event_loop()
+    config_file = str(Path(__file__).parent / "testconfig.yaml")
+    monkeypatch.setattr(
+        sys, "argv", ["yacron2", "-c", config_file, "--job-set-id"]
+    )
+    monkeypatch.setattr(sys, "exit", exit)
+    with pytest.raises(ExitError):
+        yacron2.__main__.main_loop(loop)
+    out = capsys.readouterr().out.strip()
+    assert out.startswith("v1:")
+    assert len(out.split(":", 1)[1]) == 64

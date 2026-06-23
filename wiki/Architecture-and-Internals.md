@@ -9,12 +9,18 @@ name rather than repeating the option reference; see
 
 ## Module map
 
-yacron2 is a POSIX-only asyncio Python daemon. The package imports `grp` and
-`pwd` at module load (`config.py`), so it does not run on Windows.
+yacron2 is an asyncio Python daemon that runs natively on Linux, macOS, and
+Windows. All OS-specific behaviour is isolated in `yacron2/platform.py`
+(`DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`,
+`install_shutdown_handlers`, plus the `IS_WINDOWS` flag). `grp`/`pwd` and per-job
+user/group switching remain POSIX-only and are runtime-gated on `IS_WINDOWS`
+rather than blocking import. See [Running on Windows](Running-on-Windows) for the
+operator-facing walkthrough.
 
 | Module | Responsibility |
 | --- | --- |
-| `yacron2/__main__.py` | CLI entry point. Argument parsing, basic logging setup, event-loop creation, signal-handler registration, and process exit codes. |
+| `yacron2/__main__.py` | CLI entry point. Argument parsing, basic logging setup, event-loop creation, shutdown-handler registration (delegated to `platform.install_shutdown_handlers`), and process exit codes. |
+| `yacron2/platform.py` | The single home for all per-OS branches: `DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`, `install_shutdown_handlers`, and the `IS_WINDOWS` flag. The rest of the codebase reads the same on every platform. |
 | `yacron2/config.py` | strictyaml `CONFIG_SCHEMA`, `DEFAULT_CONFIG`, `_REPORT_DEFAULTS`; config loading from a file or directory; include handling and dict merging (`mergedicts`); `JobConfig` parsing/validation; `Yacron2Config` dataclass. |
 | `yacron2/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`), and `JobRetryState`. |
@@ -23,13 +29,17 @@ yacron2 is a POSIX-only asyncio Python daemon. The package imports `grp` and
 
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`) ->
 (`statsd`, `config`). `config.py` has no dependency on `cron.py` or `job.py`.
+`platform.py` is a leaf module with no yacron2 dependencies, imported by
+`__main__`, `config`, `cron`, and `job` wherever per-OS behaviour is needed.
 
 ## The event loop
 
 `main()` in `__main__.py` creates a fresh event loop with
 `asyncio.new_event_loop()` and runs `main_loop(loop)` inside a `try/finally`
-that always calls `loop.close()`. There is no Windows event-loop branch by
-design (the module is POSIX-only).
+that always calls `loop.close()`. The daemon runs on Windows too; the event loop
+is created the same way on every OS, and the only difference is shutdown-handler
+wiring via `platform.install_shutdown_handlers` (Windows uses the Proactor loop,
+which lacks `add_signal_handler`).
 
 `main_loop` parses arguments (`-c/--config`, `-l/--log-level`,
 `-v/--validate-config`, `--version`), calls `logging.basicConfig` at the chosen
@@ -46,10 +56,15 @@ aiohttp web server. Concurrency is cooperative via `await`; there are no worker
 threads and no locks (the code comments note that `asyncio` being
 single-threaded is what makes certain flag-based guards safe without locking).
 
-The two POSIX signals `SIGINT` and `SIGTERM` are registered with
-`loop.add_signal_handler(...)` bound to `cron.signal_shutdown`, then removed in
-the `finally`. `loop.run_until_complete(cron.run())` blocks until the main loop
-returns.
+Shutdown-handler registration is delegated to `platform.install_shutdown_handlers`,
+which returns a cleanup function called in the `finally`. On POSIX it registers
+`SIGINT` and `SIGTERM` with `loop.add_signal_handler(...)` bound to
+`cron.signal_shutdown`. On Windows `loop.add_signal_handler` raises
+`NotImplementedError`, so it falls back to `signal.signal` for `SIGINT` (Ctrl-C)
+and `SIGBREAK` (Ctrl-Break / console close), marshalling onto the loop thread
+with `call_soon_threadsafe` and ticking a ~0.25s heartbeat timer so the handler
+runs while the loop is blocked in IOCP. `loop.run_until_complete(cron.run())`
+blocks until the main loop returns. See [Running on Windows](Running-on-Windows).
 
 ## `Cron.run` — the scheduler main loop
 
@@ -130,10 +145,11 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
 3. If a web server is running, logs `"Stopping http server"` and
    `await self.web_runner.cleanup()`.
 
-`signal_shutdown` simply calls `self._stop_event.set()`. Note that
-`handle_job_failure` early-returns when `_stop_event.is_set()`, so jobs that
-finish during shutdown are not reported as failures and do not schedule new
-retries.
+`signal_shutdown` simply calls `self._stop_event.set()`; it is invoked from the
+platform shutdown handler (`SIGINT`/`SIGTERM` on POSIX, Ctrl-C/Ctrl-Break on
+Windows — see "The event loop"). Note that `handle_job_failure` early-returns
+when `_stop_event.is_set()`, so jobs that finish during shutdown are not reported
+as failures and do not schedule new retries.
 
 ## Configuration hot reload
 
@@ -167,6 +183,13 @@ include merging, and defaults application all happen inside `parse_config*`; see
   `unix://path`); a malformed URL or a bind error logs a warning and skips that
   address rather than aborting the reload. `socketMode` is applied to
   `unix://` sockets via `_apply_socket_mode`.
+
+On Windows, `unix://` listeners are unsupported (the Proactor loop lacks
+`create_unix_server` / aiohttp's `UnixSite`), so such a URL is skipped (gated via
+`platform.supports_unix_sockets`) with the warning `"Ignoring web listen url
+<url>: unix-socket listeners are not supported on this platform"`; use an
+`http://` listener instead. Since `socketMode` only ever applies to unix sockets,
+it is irrelevant on Windows. See [Running on Windows](Running-on-Windows).
 
 See [HTTP Control API](HTTP-API) for the request/response contract.
 
@@ -209,25 +232,40 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
 1. **`start()`** chooses the spawn function from the command form:
    `create_subprocess_exec` for a list command, or when `shell` is set the
    command is run as `[shell, "-c", command]` via `exec`; a string command with
-   no `shell` uses `create_subprocess_shell`. It assembles `env` (only when the
-   job has `environment` entries, layering them over `os.environ` after
-   `fixup_pyinstaller_env`), sets `preexec_fn=self._demote` when a uid/gid is
-   configured, requests `stdout`/`stderr` PIPEs per `captureStdout`/
-   `captureStderr`, sets the stream buffer `limit` to `maxLineLength`, and
-   records `execution_deadline = time.perf_counter() + executionTimeout` when a
-   timeout is set. Arguments are encoded to bytes before spawning. If the spawn
-   raises `SubprocessError`, `UnicodeEncodeError`, or `FileNotFoundError`, the
-   error is logged, `self.start_failed = True` is set, and `start()` returns
-   without a process. On success `_on_start()` emits the statsd `job_started`
-   metric (best-effort; `OSError` is caught) and a `StreamReader` task is
-   started for each captured stream.
+   no `shell` uses `create_subprocess_shell`. The default `shell` is
+   platform-specific (via `platform.DEFAULT_SHELL`): POSIX defaults to `/bin/sh`,
+   so a string command runs as `["/bin/sh", "-c", command]`; on Windows the
+   default is empty, so a string command with no shell goes through
+   `create_subprocess_shell` to the native command processor `%ComSpec%`
+   (cmd.exe). A list command bypasses the shell on every platform. It assembles
+   `env` (only when the job has `environment` entries, layering them over
+   `os.environ` after `fixup_pyinstaller_env`), sets `preexec_fn=self._demote`
+   when a uid/gid is configured, requests `stdout`/`stderr` PIPEs per
+   `captureStdout`/`captureStderr`, sets the stream buffer `limit` to
+   `maxLineLength`, and records `execution_deadline = time.perf_counter() +
+   executionTimeout` when a timeout is set. Arguments are encoded via
+   `platform.encode_argv` before spawning (UTF-8 bytes on POSIX; passed as `str`
+   unchanged on Windows for `CreateProcessW`). The `preexec_fn=self._demote` path
+   is POSIX-only: per-job user/group switching is not supported on Windows, where
+   a job with `user` or `group` set is rejected up front with the configuration
+   error `"Job <name>: changing user/group is not supported on Windows"` (gated on
+   `IS_WINDOWS` in `config.py`), so `_demote`/`preexec_fn` never applies there. If
+   the spawn raises `SubprocessError`, `UnicodeEncodeError`, or
+   `FileNotFoundError`, the error is logged, `self.start_failed = True` is set, and
+   `start()` returns without a process. On success `_on_start()` emits the statsd
+   `job_started` metric (best-effort; `OSError` is caught) and a `StreamReader`
+   task is started for each captured stream. See
+   [Running on Windows](Running-on-Windows).
 
 2. **`_demote()`** runs in the child (still privileged) and drops privileges in
    the security-critical order: supplementary groups first
    (`os.initgroups(username, gid)` when both are known, else `os.setgroups([])`),
    then `os.setgid(gid)`, then `os.setuid(uid)`. Any failure raises
    `RuntimeError`. (uid/gid resolution and the "must be root" check happen
-   earlier in `JobConfig._resolve_user_group`.)
+   earlier in `JobConfig._resolve_user_group`.) This whole privilege-drop path is
+   POSIX-only — there is no setuid/setgid model on Windows; on Windows
+   `user`/`group` config is rejected up front with a configuration error (see
+   `start()` above), so `_demote` is never reached.
 
 3. **`wait()`** is what the reaper awaits. If there is no process but
    `start_failed` is set, it synthesises `retcode = 127` (conventional
@@ -240,9 +278,15 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
 
 4. **`cancel()`** sends `SIGTERM` (`proc.terminate()`), waits up to
    `killTimeout` for graceful exit, and `proc.kill()`s (`SIGKILL`) on timeout;
-   it then calls `_on_stop()`. `_on_stop()` is idempotent (guarded by
-   `self._stopped`) because `cancel()` and `wait()` can both reach it for one
-   run (e.g. under `Replace`); it emits the statsd `job_stopped` metric once.
+   it then calls `_on_stop()`. The signal mapping is POSIX-specific: on POSIX
+   `terminate()` = `SIGTERM` (graceful/trappable) and `kill()` = `SIGKILL`
+   (forceful), a real escalation. On Windows there are no POSIX signals: both
+   `terminate()` and `kill()` call `TerminateProcess` (immediate, ungraceful, the
+   child is not notified to clean up), so the terminate -> kill escalation is
+   effectively moot, though `killTimeout` still bounds the wait. `_on_stop()` is
+   idempotent (guarded by `self._stopped`) because `cancel()` and `wait()` can
+   both reach it for one run (e.g. under `Replace`); it emits the statsd
+   `job_stopped` metric once.
 
 5. **Failure classification.** `fail_reason` is a property evaluated against
    `failsWhen`: `always`, then `nonzeroReturn` (`retcode != 0`), then
@@ -364,7 +408,11 @@ call sites and logged as warnings so telemetry never crashes the scheduler. See
 - Reporters run concurrently per job but failures are isolated.
 - Shutdown is cooperative: a signal sets `_stop_event`, the scheduler stops
   spawning, pending retries are cancelled, and the reaper drains in-flight jobs
-  before the process exits.
+  before the process exits. The trigger is platform-specific —
+  `SIGINT`/`SIGTERM` on POSIX vs Ctrl-C/Ctrl-Break (`SIGINT`/`SIGBREAK`) on
+  Windows, both routed through `platform.install_shutdown_handlers` into
+  `signal_shutdown` -> `_stop_event.set()` — but the finish-running-jobs-first
+  behaviour is identical on every OS.
 
 For the broader operational picture see
 [Production and Container Deployment](Production-Deployment); for the CLI surface

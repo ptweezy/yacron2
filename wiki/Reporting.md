@@ -254,19 +254,23 @@ variables. The shell reporter was added in yacron2 0.13.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `shell` | str (Opt) | `/bin/sh` | Shell used when `command` is a string. |
-| `command` | str or list of str (required in block) | `None` | The command to run. A list is executed directly (argv); a string is run via `shell -c`. Required key when a `shell` block is present; reporting is skipped if it resolves to nothing. |
+| `shell` | str (Opt) | `/bin/sh` (POSIX); empty (Windows) | Shell used when `command` is a string. The default is platform-specific (`platform.DEFAULT_SHELL`), mirroring the job-level `shell` default: `/bin/sh` on POSIX, but empty (`""`) on Windows, where an empty default routes a string `command` through the native command processor (%ComSpec% / cmd.exe). See [Running on Windows](Running-on-Windows). |
+| `command` | str or list of str (required in block) | `None` | The command to run. A list is executed directly (argv); a string is run via `shell -c` when `shell` is set, or through the system default shell when `shell` is empty (the Windows default - see the execution model below). Required key when a `shell` block is present; reporting is skipped if it resolves to nothing. |
 
 Execution model:
 
 - If `command` is a **list**, it is executed directly with
   `asyncio.create_subprocess_exec` (no shell).
-- If `command` is a **string** and `shell` is set (the default `/bin/sh`
-  applies), it is executed as `[shell, "-c", command]` with
+- If `command` is a **string** and `shell` is set (on POSIX the default
+  `/bin/sh` applies), it is executed as `[shell, "-c", command]` with
   `asyncio.create_subprocess_exec`.
 - If `command` is a **string** and `shell` resolves to a falsy value (e.g.
   `shell: ""`), the string is passed to `asyncio.create_subprocess_shell`
-  (run by the system default shell).
+  (run by the system default shell). **This is the Windows default**, where
+  the empty `shell` makes the string run through the native command processor
+  (cmd.exe via %ComSpec%). To use PowerShell or another interpreter on
+  Windows, set `shell:` explicitly, or pass `command` as a list to bypass the
+  shell entirely. See [Running on Windows](Running-on-Windows).
 - The reporter does not fail the job. A failure to launch the command is logged
   (with traceback) and the reporter returns; a nonzero exit code from the command
   is logged at `ERROR` level (without a spurious traceback).
@@ -311,6 +315,11 @@ jobs:
           shell: /bin/bash
           command: echo "job $YACRON2_JOB_NAME failed with code $YACRON2_RETCODE"
 ```
+
+This POSIX-shaped example (a `/bin/bash` shell and `$VAR` syntax) won't run as
+written on Windows. There, either leave `shell` unset (the command runs via
+cmd.exe, using `%VAR%` syntax) or set `shell:` to a PowerShell path. See
+[Running on Windows](Running-on-Windows).
 
 List form (no shell):
 
@@ -363,3 +372,4 @@ the logs (it is tied to a secret); for sentry, the DSN env-var name is logged.
 - [Output Capturing](Output-Capturing)
 - [Metrics with statsd](Metrics-with-Statsd)
 - [Includes, Defaults, and Multi-File Config](Includes-and-Defaults)
+- [Running on Windows](Running-on-Windows)

@@ -1,8 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import sys
+
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
+
+# strip is a Unix concept (ELF/Mach-O). On Windows the GNU `strip` that ships
+# with git bash WILL corrupt the bundled PE DLLs (notably pythonXY.dll) if
+# PyInstaller is allowed to run it -- the resulting .exe then fails to load the
+# Python DLL ("Invalid access to memory location"). So strip only off Windows.
+STRIP = sys.platform != "win32"
 
 # bundle the single-page web UI (yacron2/web/index.html) so the binary serves
 # it without needing any files on disk
@@ -34,7 +42,7 @@ exe = EXE(
     name="yacron2",
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,
+    strip=STRIP,
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,

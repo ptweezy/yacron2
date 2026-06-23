@@ -5,7 +5,7 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
-## 1.2.0 (2026-06-23)
+## 1.1.7 (2026-06-23)
 
 - **Windows support.** yacron2 now runs natively on Windows, in addition to
   Linux and macOS. The core was made portable: the POSIX-only `grp`/`pwd`

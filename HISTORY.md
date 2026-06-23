@@ -5,6 +5,23 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.8 (2026-06-23)
+
+- **Job-set id.** yacron2 can now emit a *job-set id*: an order-independent
+  hash of every job's effective configuration. Two instances deployed from the
+  same configuration produce the same id, so replicas can confirm they hold an
+  identical set of jobs (e.g. for leader election / to avoid double-running).
+  It is taken over the merged, effective config (so reordering jobs, or moving
+  a setting into `defaults`, doesn't change it), normalises equivalent schedule
+  spellings, fingerprints `user`/`group` as configured rather than as a
+  host-specific resolved uid/gid, and embeds no secret material (inline
+  reporting secrets are redacted, and only `environment` variable names are
+  hashed, not their values). Get it from
+  the CLI (`yacron2 --job-set-id`, prints and exits), the web API
+  (`GET /job-set-id`, also `application/json`), and the dashboard header; it is
+  logged once at startup and again whenever a config reload changes it. The
+  scheme is versioned (a `v1:` prefix) so ids are only compared within a scheme.
+
 ## 1.1.7 (2026-06-23)
 
 - **Windows support.** yacron2 now runs natively on Windows, in addition to

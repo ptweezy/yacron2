@@ -710,6 +710,41 @@ async def test_web_list_jobs():
 
 
 @pytest.mark.asyncio
+async def test_web_job_set_id():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        headers: dict = {}
+
+    resp = await cron._web_job_set_id(Req())
+    assert resp.text == cron.job_set_id()
+    assert resp.text.startswith("v1:")
+
+    class JsonReq:
+        headers = {"Accept": "application/json"}
+
+    resp = await cron._web_job_set_id(JsonReq())
+    data = json.loads(resp.text)
+    assert data["job_set_id"] == cron.job_set_id()
+    assert data["jobs"] == 2
+
+
+def test_job_set_id_logged_only_on_change(caplog):
+    import logging
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    with caplog.at_level(logging.INFO, logger="yacron2"):
+        cron._log_job_set_id()
+        cron._log_job_set_id()  # unchanged: must not log again
+    logged = [r.message for r in caplog.records if "Job set id" in r.message]
+    assert len(logged) == 1
+    assert cron.job_set_id() in logged[0]
+
+
+@pytest.mark.asyncio
 async def test_web_list_jobs_includes_last_run():
     import json
 

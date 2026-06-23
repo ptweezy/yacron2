@@ -33,6 +33,9 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * Option to automatically retry failing cron jobs, with exponential backoff
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* A **job-set id**: an order-independent fingerprint of every job's effective
+  configuration, so replicas deployed from the same config can confirm they
+  hold an identical set of jobs (see [Job-set id](#job-set-id))
 * Arbitrary timezone support
 * Optional **[live control panel](#web-dashboard)** to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 
@@ -1071,6 +1074,63 @@ data: {"stream": "stdout", "line": "foobar"}
 event: end
 data: {}
 ```
+
+### Job-set id
+
+The **job-set id** is an order-independent fingerprint of the set of jobs a
+yacron2 instance is running. Two instances produce the *same* id if and only if
+they hold the same set of jobs, which lets several replicas deployed from the
+same configuration confirm they agree, for example for leader election, or to
+detect that one replica has drifted before letting it run jobs.
+
+The id is taken over the *effective* (post-merge) configuration of every job,
+which gives it some useful properties:
+
+* it is **independent of job order**, and of whether a setting was written
+  inline on each job or hoisted into a `defaults` block;
+* **equivalent schedule spellings match**: the `minute:`/`hour:` object form
+  fingerprints the same as the equivalent five-field crontab string;
+* it covers **every behaviour-affecting field** (command, schedule, shell, the
+  *names* of `environment` variables, capture flags, `failsWhen`,
+  retry/reporting policy, timezone, `enabled`, and so on), so any meaningful
+  change to a job changes the id;
+* `user`/`group` are fingerprinted **as configured** (e.g. `www-data`), not as
+  the resolved numeric uid/gid, which can differ host to host;
+* **secret/value material is never embedded**: inline reporting secrets
+  (Sentry DSN, mail password) are redacted, and only the *names* of
+  `environment` variables are hashed, not their values (env commonly holds
+  secrets, and a per-host value, e.g. from `env_file`, would otherwise make
+  identical configs differ across hosts). The id is safe to log and serve, and
+  rotating a secret or changing an env value does not change it.
+
+Because it reflects *effective* config, it also reflects platform-dependent
+defaults (the default `shell` is `/bin/sh` on POSIX, `cmd.exe` on Windows), so
+compare instances running on the same platform, which replicas are. The scheme
+is versioned with a `v1:` prefix; ids are only comparable within a scheme
+version.
+
+It is available three ways:
+
+* **CLI**: print it and exit (handy in scripts / health checks):
+
+  ```shell
+  $ yacron2 -c /etc/yacron2.d --job-set-id
+  v1:b834d7565aee0da50cd017f666651a5ba3b2e6b161daf0cb6e430f23f51ce90b
+  ```
+
+* **HTTP**: `GET /job-set-id` on the [web interface](#remote-webhttp-interface)
+  (also `application/json`), and shown in the dashboard header:
+
+  ```shell
+  $ http get http://127.0.0.1:8080/job-set-id
+  v1:b834d7565aee0da50cd017f666651a5ba3b2e6b161daf0cb6e430f23f51ce90b
+
+  $ http get http://127.0.0.1:8080/job-set-id Accept:application/json
+  {"job_set_id": "v1:b834d7…51ce90b", "jobs": 3}
+  ```
+
+* **Logs**: it is logged once at startup, and again whenever a config reload
+  changes it.
 
 ### Includes
 

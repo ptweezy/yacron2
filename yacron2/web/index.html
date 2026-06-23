@@ -455,6 +455,7 @@
     <h1 class="glow">yacron2</h1>
     <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
+    <span class="ver" id="jobset" title=""></span>
   </div>
   <div class="spacer"></div>
   <span class="clock" id="clock">--:--:-- UTC</span>
@@ -1997,6 +1998,18 @@
     catch (_) {}
   }
 
+  async function loadJobSetId() {
+    try {
+      const r = await apiFetch("/job-set-id");
+      if (!r.ok) return;
+      const id = (await r.text()).trim();
+      const el = $("jobset");
+      // show a short prefix in the header; full id in the tooltip
+      el.textContent = "#" + id.replace(/^v\d+:/, "").slice(0, 12);
+      el.title = "job set id: " + id;
+    } catch (_) {}
+  }
+
   // ===================================================================
   //  boot
   // ===================================================================
@@ -2017,6 +2030,7 @@
     setTimeout(() => document.body.classList.remove("booting"), 600);
   }
   loadVersion();
+  loadJobSetId();
   loadJobs().then(openFromHash);
   restartPolling();
   setInterval(tick, 1000);

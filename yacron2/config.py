@@ -422,6 +422,12 @@ class JobConfig:
     def _resolve_user_group(self, config: dict) -> None:
         user = config.pop("user", None)
         group = config.pop("group", None)
+        # Retain the *configured* user/group (string name or numeric id, or
+        # None) for the job-set fingerprint.  The resolved uid/gid below are
+        # host-specific (the same name can map to different ids on different
+        # hosts), so fingerprinting must use the configured value, not them.
+        self.user: Optional[Union[str, int]] = user
+        self.group: Optional[Union[str, int]] = group
         if user is None and group is None:
             return  # nothing to switch to: nothing POSIX-only to resolve
 

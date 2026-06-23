@@ -36,6 +36,9 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [Job-set id](#job-set-id))
+* **Cluster peer attestation**: optionally have instances confirm over mutual
+  TLS that a configured set of peers is running the same job set (see
+  [Cluster peer attestation](#cluster-peer-attestation))
 * Arbitrary timezone support
 * Optional **[live control panel](#web-dashboard)** to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 
@@ -1080,8 +1083,8 @@ data: {}
 The **job-set id** is an order-independent fingerprint of the set of jobs a
 yacron2 instance is running. Two instances produce the *same* id if and only if
 they hold the same set of jobs, which lets several replicas deployed from the
-same configuration confirm they agree, for example for leader election, or to
-detect that one replica has drifted before letting it run jobs.
+same configuration confirm they are running the same thing, or detect that one
+has drifted from the others.
 
 The id is taken over the *effective* (post-merge) configuration of every job,
 which gives it some useful properties:
@@ -1131,6 +1134,51 @@ It is available three ways:
 
 * **Logs**: it is logged once at startup, and again whenever a config reload
   changes it.
+
+### Cluster peer attestation
+
+(new in version 1.1.8)
+
+An optional `cluster` section lets an instance confirm that a static set of
+peers is running the *same* job set as itself. It builds directly on the
+[job-set id](#job-set-id): each node serves a small `GET /peer` endpoint over
+**mutual TLS** and periodically polls every configured peer, comparing ids.
+
+```yaml
+cluster:
+  listen: "0.0.0.0:8443"          # the mTLS listener for this node
+  tls:
+    ca:   /etc/yacron2/cluster-ca.pem   # trust anchor for peer certificates
+    cert: /etc/yacron2/this-node.pem    # this node's certificate
+    key:  /etc/yacron2/this-node.key
+  peers:
+    - host: yacron-b.internal:8443
+    - host: yacron-c.internal:8443
+  nodeName: node-a                # optional; defaults to the system hostname
+  interval: 30                    # optional; seconds per round (default 30)
+  driftAfter: 3                   # optional; rounds before "drifted" (default 3)
+```
+
+The trust model is deliberately small and keeps no shared state:
+
+* **mTLS is the membership boundary.** A peer's certificate must chain to the
+  configured `ca`, and (client side) match the host it was reached at, so only
+  nodes the CA vouches for are ever attested; standard TLS hostname
+  verification provides that SAN pinning. Provision the certificates with your
+  own PKI (cert-manager, a service mesh, an internal CA); yacron2 only consumes
+  them.
+* **Each node keeps its own view.** No node is authoritative: two healthy nodes
+  converge to the same picture, and any disagreement is itself the signal. Each
+  peer is reported as `agreed`, `syncing`, `drifted`, `unreachable`,
+  `untrusted`, or `self` (the node found its own address in the peer list).
+* **Drift is debounced.** A reachable peer whose id differs is only reported as
+  `drifted` after `driftAfter` consecutive rounds, so a rolling deploy (a brief,
+  legitimate mismatch) does not raise a false alarm.
+
+The current view is available at `GET /cluster` on the
+[web interface](#remote-webhttp-interface) and is shown as a panel in the
+dashboard. The `/peer` endpoint is served only on the separate mTLS `listen`
+address, never on the public web API.
 
 ### Includes
 

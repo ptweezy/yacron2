@@ -10,8 +10,8 @@ project, on which yacron2 is based.
 - **Job-set id.** yacron2 can now emit a *job-set id*: an order-independent
   hash of every job's effective configuration. Two instances deployed from the
   same configuration produce the same id, so replicas can confirm they hold an
-  identical set of jobs (e.g. for leader election / to avoid double-running).
-  It is taken over the merged, effective config (so reordering jobs, or moving
+  identical set of jobs. It is taken over the merged, effective config (so
+  reordering jobs, or moving
   a setting into `defaults`, doesn't change it), normalises equivalent schedule
   spellings, fingerprints `user`/`group` as configured rather than as a
   host-specific resolved uid/gid, and embeds no secret material (inline
@@ -21,6 +21,14 @@ project, on which yacron2 is based.
   (`GET /job-set-id`, also `application/json`), and the dashboard header; it is
   logged once at startup and again whenever a config reload changes it. The
   scheme is versioned (a `v1:` prefix) so ids are only compared within a scheme.
+- **Cluster peer attestation.** An optional `cluster` section lets an instance
+  confirm that a static list of peers is running the same job set. Each node
+  serves a small `GET /peer` endpoint over mutual TLS and periodically polls
+  its configured peers to compare job-set ids, building a per-node view
+  (`agreed`/`syncing`/`drifted`/`unreachable`/`untrusted`) exposed at
+  `GET /cluster` and as a dashboard panel. mTLS (a cluster CA plus a per-node
+  cert/key) is the membership boundary, and drift is debounced over
+  `driftAfter` rounds so a rolling deploy does not false-alarm.
 
 ## 1.1.7 (2026-06-23)
 

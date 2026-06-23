@@ -2,6 +2,7 @@ import copy
 import datetime
 import logging
 import os
+import socket
 import sys
 from dataclasses import dataclass
 from typing import (
@@ -36,8 +37,18 @@ from yacron2 import platform
 
 logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
+ClusterConfig = NewType("ClusterConfig", Dict[str, Any])
 JobDefaults = NewType("JobDefaults", Dict[str, Any])
 LoggingConfig = NewType("LoggingConfig", Dict[str, Any])
+
+# Defaults for an (optional) cluster block. Only applied when a `cluster`
+# section is present; see _build_cluster_config.
+DEFAULT_CLUSTER = {
+    "interval": 30,  # seconds between peer-attestation rounds
+    "driftAfter": 3,  # reachable-but-mismatched rounds before "drifted"
+    "nodeName": None,  # defaults to the system hostname at load time
+    "connectTimeout": 10,  # seconds per peer request
+}
 
 
 class ConfigError(Exception):
@@ -267,6 +278,26 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("socketMode"): Str(),
                 # serve the browser dashboard at "/" (default true)
                 Opt("ui"): Bool(),
+            }
+        ),
+        # Optional cluster section: lets an instance attest its job set against
+        # a static list of peers over mutual TLS (see yacron2.cluster).
+        Opt("cluster"): Map(
+            {
+                # host:port the mTLS cluster listener binds to
+                "listen": Str(),
+                "tls": Map(
+                    {
+                        "ca": Str(),  # trust anchor for peer certificates
+                        "cert": Str(),  # this node's certificate
+                        "key": Str(),  # this node's private key
+                    }
+                ),
+                "peers": Seq(Map({"host": Str()})),
+                Opt("nodeName"): Str(),
+                Opt("interval"): Int(),
+                Opt("driftAfter"): Int(),
+                Opt("connectTimeout"): Int(),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -561,12 +592,34 @@ def parse_environment_file(path: str) -> Dict[str, str]:
     return environ
 
 
+def _build_cluster_config(raw: dict) -> ClusterConfig:
+    # Fill defaults over the raw (schema-validated) cluster block and validate
+    # the numeric fields, mirroring _validate_numeric_ranges for jobs.
+    cfg: Dict[str, Any] = dict(DEFAULT_CLUSTER)
+    cfg.update(raw)
+    if not cfg.get("nodeName"):
+        # a stable, human-readable identity for this node, used so a peer can
+        # recognise itself in someone else's peer list; the system hostname is
+        # a sensible default.
+        cfg["nodeName"] = socket.gethostname()
+    if cfg["interval"] <= 0:
+        raise ConfigError("cluster.interval must be > 0")
+    if cfg["driftAfter"] < 1:
+        raise ConfigError("cluster.driftAfter must be >= 1")
+    if cfg["connectTimeout"] <= 0:
+        raise ConfigError("cluster.connectTimeout must be > 0")
+    return ClusterConfig(cfg)
+
+
 @dataclass
 class Yacron2Config:
     jobs: List[JobConfig]
     web_config: Optional[WebConfig]
     job_defaults: JobDefaults
     logging_config: Optional[LoggingConfig]
+    # Optional; None default so existing constructors (e.g. the empty config in
+    # Cron.update_config) need no change.
+    cluster_config: Optional[ClusterConfig] = None
 
 
 def parse_config_string(
@@ -580,6 +633,9 @@ def parse_config_string(
     inc_defaults_merged: dict = {}
     jobs = []
     webconf = WebConfig(doc["web"]) if "web" in doc else None
+    clusterconf = (
+        _build_cluster_config(doc["cluster"]) if "cluster" in doc else None
+    )
     logging_conf = LoggingConfig(doc["logging"]) if "logging" in doc else None
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
@@ -596,6 +652,10 @@ def parse_config_string(
             if webconf:
                 raise ConfigError("multiple web configs")
             webconf = inc_config.web_config
+        if inc_config.cluster_config:
+            if clusterconf:
+                raise ConfigError("multiple cluster configs")
+            clusterconf = inc_config.cluster_config
         if inc_config.logging_config:
             if logging_conf:
                 raise ConfigError("multiple logging configs")
@@ -610,6 +670,7 @@ def parse_config_string(
         web_config=webconf,
         job_defaults=JobDefaults(defaults),
         logging_config=logging_conf,
+        cluster_config=clusterconf,
     )
 
 
@@ -645,6 +706,8 @@ def _parse_config_dir(config_arg: str) -> Yacron2Config:
     config_errors: Dict[str, str] = {}
     web_config: Optional[WebConfig] = None
     web_config_source_fname: Optional[str] = None
+    cluster_config: Optional[ClusterConfig] = None
+    cluster_config_source_fname: Optional[str] = None
     logging_config: Optional[LoggingConfig] = None
     logging_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
@@ -676,6 +739,17 @@ def _parse_config_dir(config_arg: str) -> Yacron2Config:
                         web_config_source_fname, direntry.path
                     )
                 )
+        if config.cluster_config is not None:
+            if cluster_config is None:
+                cluster_config = config.cluster_config
+                cluster_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'cluster' configurations found: "
+                    "first in {}, now in {}".format(
+                        cluster_config_source_fname, direntry.path
+                    )
+                )
         if config.logging_config is not None:
             if logging_config is None:
                 logging_config = config.logging_config
@@ -700,4 +774,5 @@ def _parse_config_dir(config_arg: str) -> Yacron2Config:
         web_config=web_config,
         job_defaults=job_defaults,
         logging_config=logging_config,
+        cluster_config=cluster_config,
     )

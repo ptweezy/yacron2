@@ -444,6 +444,14 @@
     .summary .pill.opt { display: none; }
     .clock, .brand .ver { display: none; }
   }
+  /* cluster panel */
+  .cdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: var(--fg-faint); }
+  .cdot.agreed { background: #3fb950; }
+  .cdot.syncing { background: #d29922; }
+  .cdot.drifted { background: #f85149; }
+  .cdot.untrusted { background: #f85149; }
+  .cdot.unreachable { background: #8b949e; }
+  .cdot.self { background: #58a6ff; }
 </style>
 </head>
 <body>
@@ -519,6 +527,14 @@
       <div class="big">▙▟</div>
       <div id="emptyMsg">No jobs configured.</div>
     </div>
+  </div>
+
+  <div class="card" id="clusterCard" style="display:none">
+    <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><span id="clusterSummary"></span></div>
+    <table>
+      <thead><tr><th>Peer</th><th>Node</th><th>Status</th><th>Job set</th></tr></thead>
+      <tbody id="clusterRows"></tbody>
+    </table>
   </div>
 </main>
 
@@ -1136,6 +1152,7 @@
       maybeNotify(jobs);
       renderSummary();
       renderRows();
+      loadCluster();
       if (state.drawerJob) renderDrawerMeta();
     } catch (e) {
       if (e.message !== "unauthorized") { setConnected(false); console.warn("loadJobs failed:", e); }
@@ -2010,6 +2027,34 @@
     } catch (_) {}
   }
 
+  function shortId(id) {
+    return id ? id.replace(/^v\d+:/, "").slice(0, 12) : "—";
+  }
+
+  async function loadCluster() {
+    try {
+      const r = await apiFetch("/cluster");
+      if (!r.ok) return;
+      const data = await r.json();
+      const card = $("clusterCard");
+      if (!data.enabled) { card.style.display = "none"; return; }
+      card.style.display = "";
+      const peers = data.peers || [];
+      // "self" entries are this node listed in its own peers; exclude from the
+      // agreement tally.
+      const counted = peers.filter((p) => p.status !== "self");
+      const agreed = counted.filter((p) => p.status === "agreed").length;
+      $("clusterSummary").textContent =
+        (data.node_name || "?") + " · " + agreed + "/" + counted.length + " agreed";
+      $("clusterRows").innerHTML = peers.map((p) =>
+        '<tr><td><span class="cdot ' + esc(p.status) + '"></span>' + esc(p.host) + "</td>" +
+        "<td>" + esc(p.node_name || "—") + "</td>" +
+        "<td>" + esc(p.status) + "</td>" +
+        '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
+      ).join("");
+    } catch (_) {}
+  }
+
   // ===================================================================
   //  boot
   // ===================================================================
@@ -2031,6 +2076,7 @@
   }
   loadVersion();
   loadJobSetId();
+  loadCluster();
   loadJobs().then(openFromHash);
   restartPolling();
   setInterval(tick, 1000);

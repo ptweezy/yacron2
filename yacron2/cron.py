@@ -7,6 +7,7 @@ import json
 import logging
 import logging.config
 import os
+import ssl
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from functools import lru_cache
@@ -18,7 +19,9 @@ from crontab import CronTab  # noqa
 
 import yacron2.version
 from yacron2 import platform
+from yacron2.cluster import ClusterManager
 from yacron2.config import (
+    ClusterConfig,
     ConfigError,
     JobConfig,
     JobDefaults,
@@ -270,6 +273,8 @@ class Cron:
         self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
+        # the peer-attestation manager, when a cluster section is configured
+        self.cluster_manager = None  # type: Optional[ClusterManager]
         # last job-set id we logged, so reloads only log it again on change
         self._logged_job_set_id = None  # type: Optional[str]
 
@@ -290,6 +295,7 @@ class Cron:
                 config = self.update_config()
                 self._log_job_set_id()
                 await self.start_stop_web_app(config.web_config)
+                await self.start_stop_cluster(config.cluster_config)
             except ConfigError as err:
                 logger.error(
                     "Error in configuration file(s), so not updating "
@@ -335,6 +341,11 @@ class Cron:
             ]
             await asyncio.gather(*cancel_all)
         await self._wait_for_running_jobs_task
+
+        if self.cluster_manager is not None:
+            logger.info("Stopping cluster manager")
+            await self.cluster_manager.stop()
+            self.cluster_manager = None
 
         if self.web_runner is not None:
             logger.info("Stopping http server")
@@ -393,6 +404,17 @@ class Cron:
                 headers=headers,
             )
         return web.Response(text=job_set, headers=headers)
+
+    async def _web_get_cluster(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        if self.cluster_manager is None:
+            return web.json_response(
+                {"enabled": False, "peers": []}, headers=headers
+            )
+        payload = dict(self.cluster_manager.view_dict())
+        payload["enabled"] = True
+        return web.json_response(payload, headers=headers)
 
     async def _web_get_status(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
@@ -686,6 +708,7 @@ class Cron:
             routes = [
                 web.get("/version", self._web_get_version),
                 web.get("/job-set-id", self._web_job_set_id),
+                web.get("/cluster", self._web_get_cluster),
                 web.get("/status", self._web_get_status),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
@@ -713,6 +736,31 @@ class Cron:
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
+
+    async def start_stop_cluster(
+        self, cluster_config: Optional[ClusterConfig]
+    ) -> None:
+        # Restart the manager when the cluster section is removed or changed,
+        # mirroring start_stop_web_app. The id it reports tracks config reloads
+        # on its own (it calls self.job_set_id each round), so only a change to
+        # the cluster section itself (peers/tls/listen) needs a restart.
+        if self.cluster_manager is not None and (
+            cluster_config is None
+            or cluster_config != self.cluster_manager.config
+        ):
+            logger.info("cluster: configuration changed, stopping")
+            await self.cluster_manager.stop()
+            self.cluster_manager = None
+        if cluster_config is not None and self.cluster_manager is None:
+            manager = ClusterManager(cluster_config, self.job_set_id)
+            try:
+                await manager.start()
+            except (OSError, ssl.SSLError, ValueError) as ex:
+                # bad cert files / bad listen address / port already in use:
+                # log and keep running jobs rather than aborting the reload.
+                logger.error("cluster: failed to start: %s", ex)
+                return
+            self.cluster_manager = manager
 
     @staticmethod
     def _resolve_web_token(web_config: WebConfig) -> Optional[str]:

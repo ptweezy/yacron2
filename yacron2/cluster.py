@@ -1,0 +1,307 @@
+"""Peer attestation: confirm a static set of peers run the same job set.
+
+Each instance is configured with a list of peer ``host:port`` addresses and a
+mutual-TLS identity (a cluster CA plus this node's certificate/key).  It serves
+a tiny ``GET /peer`` endpoint on a dedicated mTLS listener, and periodically
+polls every configured peer's ``/peer`` over mTLS to compare job-set ids (see
+:mod:`yacron2.fingerprint`).
+
+The trust model is deliberately simple and keeps no shared state:
+
+* **mTLS is the membership boundary.**  A peer's certificate must chain to the
+  configured cluster CA, and (client side) match the host we connected to, so
+  only nodes the CA vouches for are ever attested.  Standard TLS hostname
+  verification gives us that SAN pinning for free.
+* **Each node keeps its own view.**  ``ClusterView`` is just this node's table
+  of what it last observed per peer; two healthy nodes converge to the same
+  picture, and any disagreement is itself the signal.  Nobody is authoritative.
+* **Drift is debounced.**  A reachable peer whose id differs is only reported
+  as ``drifted`` after ``driftAfter`` consecutive rounds, so a rolling deploy
+  (a transient, legitimate mismatch) does not raise a false alarm.
+"""
+
+import asyncio
+import datetime
+import logging
+import ssl
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
+
+import aiohttp
+from aiohttp import web
+
+from yacron2.config import ClusterConfig
+from yacron2.fingerprint import SCHEME_VERSION
+
+logger = logging.getLogger("yacron2.cluster")
+
+# Per-peer status, as reported in the /cluster view.
+STATUS_UNKNOWN = "unknown"  # not yet contacted
+STATUS_SELF = "self"  # the peer reported our own node name
+STATUS_AGREED = "agreed"  # reachable, same job-set id
+STATUS_SYNCING = "syncing"  # reachable, id differs but within driftAfter
+STATUS_DRIFTED = "drifted"  # reachable, id has differed >= driftAfter rounds
+STATUS_UNREACHABLE = "unreachable"  # connect/timeout failure
+STATUS_UNTRUSTED = "untrusted"  # TLS/cert verification failed
+
+
+@dataclass
+class PeerState:
+    """This node's last observation of one configured peer."""
+
+    host: str
+    status: str = STATUS_UNKNOWN
+    job_set_id: Optional[str] = None  # peer's last-reported id
+    node_name: Optional[str] = None  # peer's last-reported node name
+    last_seen: Optional[datetime.datetime] = None  # last successful contact
+    last_error: Optional[str] = None
+    # consecutive reachable-but-mismatched rounds, for the drift hysteresis
+    mismatch_streak: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "host": self.host,
+            "status": self.status,
+            "job_set_id": self.job_set_id,
+            "node_name": self.node_name,
+            "last_seen": (
+                self.last_seen.isoformat()
+                if self.last_seen is not None
+                else None
+            ),
+            "last_error": self.last_error,
+            "mismatch_streak": self.mismatch_streak,
+        }
+
+
+class ClusterView:
+    """This node's peer table and the rules that update it.
+
+    Pure (no I/O): the networking layer feeds it observations and reads back
+    the table, which keeps the drift/state logic trivially testable.
+    """
+
+    def __init__(self, hosts: List[str], drift_after: int) -> None:
+        self.drift_after = drift_after
+        # preserve configured order for a stable view
+        self.peers: "Dict[str, PeerState]" = {
+            host: PeerState(host=host) for host in hosts
+        }
+
+    def record_success(
+        self,
+        host: str,
+        peer_name: Optional[str],
+        peer_id: Optional[str],
+        peer_scheme: Optional[str],
+        my_id: str,
+        now: datetime.datetime,
+        my_name: str,
+    ) -> None:
+        peer = self.peers[host]
+        peer.last_seen = now
+        peer.last_error = None
+        peer.job_set_id = peer_id
+        peer.node_name = peer_name
+
+        if peer_name is not None and peer_name == my_name:
+            # the peer recognised itself: an operator listed this node's own
+            # address. Not a real peer, so it never counts toward agreement.
+            peer.status = STATUS_SELF
+            peer.mismatch_streak = 0
+            return
+
+        if peer_scheme is not None and peer_scheme != SCHEME_VERSION:
+            # different fingerprint scheme: the ids are not comparable, so this
+            # is a (non-debounced) disagreement rather than transient skew.
+            peer.status = STATUS_DRIFTED
+            peer.last_error = (
+                "fingerprint scheme mismatch: {!r} != {!r}".format(
+                    peer_scheme, SCHEME_VERSION
+                )
+            )
+            return
+
+        if peer_id == my_id:
+            peer.status = STATUS_AGREED
+            peer.mismatch_streak = 0
+        else:
+            # debounce: a mismatch is "syncing" until it persists, so a rolling
+            # deploy does not immediately read as drift.
+            peer.mismatch_streak += 1
+            peer.status = (
+                STATUS_DRIFTED
+                if peer.mismatch_streak >= self.drift_after
+                else STATUS_SYNCING
+            )
+
+    def record_failure(
+        self, host: str, error: str, *, untrusted: bool
+    ) -> None:
+        peer = self.peers[host]
+        peer.last_error = error
+        peer.status = STATUS_UNTRUSTED if untrusted else STATUS_UNREACHABLE
+        # we could not observe the id this round, so the drift streak (which
+        # only counts *reachable* mismatches) is reset.
+        peer.mismatch_streak = 0
+
+    def to_list(self) -> List[Dict[str, Any]]:
+        return [peer.to_dict() for peer in self.peers.values()]
+
+
+def build_client_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
+    """Client context: verify peer certs vs the CA, pin the hostname."""
+    ctx = ssl.create_default_context(cafile=tls["ca"])
+    ctx.load_cert_chain(tls["cert"], tls["key"])
+    # create_default_context already sets check_hostname=True and
+    # verify_mode=CERT_REQUIRED for the client purpose; be explicit anyway.
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+def build_server_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
+    """Server context: require and verify a CA-signed client cert (mTLS)."""
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH, cafile=tls["ca"])
+    ctx.load_cert_chain(tls["cert"], tls["key"])
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+def _split_host_port(addr: str) -> "tuple[str, int]":
+    host, _, port = addr.rpartition(":")
+    if not host or not port:
+        raise ValueError("expected host:port, got {!r}".format(addr))
+    return host, int(port)
+
+
+class ClusterManager:
+    """Owns the mTLS ``/peer`` listener and the periodic peer-poll loop."""
+
+    def __init__(
+        self,
+        config: ClusterConfig,
+        get_job_set_id: Callable[[], str],
+    ) -> None:
+        self.config = config
+        self.get_job_set_id = get_job_set_id
+        self.node_name: str = config["nodeName"]
+        self.view = ClusterView(
+            [peer["host"] for peer in config["peers"]],
+            config["driftAfter"],
+        )
+        self._client_ssl = build_client_ssl_context(config["tls"])
+        self._server_ssl = build_server_ssl_context(config["tls"])
+        self._runner: Optional[web.AppRunner] = None
+        self._poll_task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+
+    # --- the mTLS /peer server -------------------------------------------
+
+    async def _handle_peer(self, request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "node_name": self.node_name,
+                "job_set_id": self.get_job_set_id(),
+                "scheme_version": SCHEME_VERSION,
+            }
+        )
+
+    async def start(self) -> None:
+        app = web.Application()
+        app.add_routes([web.get("/peer", self._handle_peer)])
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        host, port = _split_host_port(self.config["listen"])
+        site = web.TCPSite(
+            self._runner, host, port, ssl_context=self._server_ssl
+        )
+        await site.start()
+        logger.info(
+            "cluster: node %r serving mTLS /peer on %s, polling %d peer(s) "
+            "every %ds",
+            self.node_name,
+            self.config["listen"],
+            len(self.config["peers"]),
+            self.config["interval"],
+        )
+        self._poll_task = asyncio.create_task(self._poll_loop())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            self._poll_task = None
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+
+    # --- the peer-poll loop ----------------------------------------------
+
+    async def _poll_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._poll_all()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("cluster: unexpected error in poll loop")
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), self.config["interval"]
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _poll_all(self) -> None:
+        my_id = self.get_job_set_id()
+        timeout = aiohttp.ClientTimeout(total=self.config["connectTimeout"])
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(
+                *(
+                    self._poll_peer(session, peer["host"], my_id)
+                    for peer in self.config["peers"]
+                )
+            )
+
+    async def _poll_peer(
+        self, session: aiohttp.ClientSession, host: str, my_id: str
+    ) -> None:
+        url = "https://{}/peer".format(host)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            async with session.get(url, ssl=self._client_ssl) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except aiohttp.ClientSSLError as ex:
+            # cert chain / hostname verification failure: the peer is not (or
+            # not provably) a cluster member.
+            self.view.record_failure(host, str(ex), untrusted=True)
+            return
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OSError,
+        ) as ex:
+            self.view.record_failure(host, str(ex), untrusted=False)
+            return
+        self.view.record_success(
+            host,
+            data.get("node_name"),
+            data.get("job_set_id"),
+            data.get("scheme_version"),
+            my_id,
+            now,
+            self.node_name,
+        )
+
+    def view_dict(self) -> Dict[str, Any]:
+        return {
+            "node_name": self.node_name,
+            "job_set_id": self.get_job_set_id(),
+            "peers": self.view.to_list(),
+        }

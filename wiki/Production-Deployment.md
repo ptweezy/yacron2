@@ -161,9 +161,11 @@ election that keeps no shared state, so:
 
 * **Use an odd replica count.** 3 replicas tolerate one failure, 5 tolerate
   two; even counts buy no extra fault tolerance, and `replicas: 2` is worse
-  than 1 (a majority of 2 is 2, so both must be up to run anything). Spread them
-  across nodes/zones with `topologySpreadConstraints` — correlated failures
-  defeat quorum regardless of count.
+  than 1 (a majority of 2 is 2, so both must be up to run anything); yacron2
+  refuses to start with `electLeader` and a 2-node cluster, and warns on even
+  sizes. Spread the replicas across nodes/zones with
+  `topologySpreadConstraints`; correlated failures defeat quorum regardless of
+  count.
 * **A minority partition stands down** (runs nothing) to guarantee at most one
   leader, and the view is only as fresh as the poll `interval`, so this is
   best-effort, not fenced exactly-once. If a job must *never* be skipped or

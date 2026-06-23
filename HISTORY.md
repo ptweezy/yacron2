@@ -36,13 +36,16 @@ project, on which yacron2 is based.
   peers it can see, but only when that set is a strict majority (*quorum*) of
   the cluster; only the leader runs *scheduled* jobs (manual API triggers and
   retries are unaffected). The quorum gate keeps this safe with no shared
-  state — two majorities can't be disjoint, so a clean partition elects at most
-  one leader — at the cost of liveness: a minority partition stands down rather
+  state: two majorities can't be disjoint, so a clean partition elects at most
+  one leader. The cost is liveness: a minority partition stands down rather
   than risk a second leader. Use an odd cluster size (3 tolerates one failure,
   5 tolerates two); even sizes buy no extra fault tolerance. Leadership is
   exposed at `GET /cluster`, shown in the dashboard panel, and logged on each
   transition. If election is enabled but the cluster manager isn't running, the
-  node fails closed (stays idle) rather than risk every replica firing.
+  node fails closed (stays idle) rather than risk every replica firing. As a
+  guardrail, enabling `electLeader` on a 2-node cluster is rejected at config
+  load (a quorum of 2 needs both up, so it is strictly worse than one replica),
+  and an even cluster size is warned about.
 
 ## 1.1.7 (2026-06-23)
 

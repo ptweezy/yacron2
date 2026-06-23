@@ -1204,14 +1204,14 @@ cluster:
 ```
 
 Each node independently elects, as leader, the lowest `nodeName` among the
-members it currently sees *agreeing* on the job-set id — but only if that set
+members it currently sees *agreeing* on the job-set id, but only if that set
 is a **quorum** (a strict majority) of the cluster. **Only the leader runs
 *scheduled* jobs.** Manual runs via the API (`POST /jobs/{name}/start`) and
 automatic retries are deliberately *not* gated, so you can still trigger a job
 on any node.
 
 * **List every *other* member in `peers`** (not this node itself). The cluster
-  size is `len(peers) + 1`, and the quorum is `⌊size / 2⌋ + 1` — so the peer
+  size is `len(peers) + 1`, and the quorum is `⌊size / 2⌋ + 1`, so the peer
   lists must be consistent across nodes. The computed size, quorum, elected
   leader, and whether this node is the leader are all shown at `GET /cluster`
   and in the dashboard panel.
@@ -1225,10 +1225,12 @@ on any node.
   firing runs is the probability a majority is up: ~`3p² − 2p³` for 3 nodes,
   higher for 5. **3 nodes** tolerate one simultaneous failure (≈4 nines of
   "runs" at `p = 0.99`); **5 nodes** tolerate two (≈5 nines). Even sizes buy no
-  extra fault tolerance (4 tolerates the same one failure as 3), and **2 nodes
-  is worse than 1** (a majority of 2 is 2, so both must be up). Spread the nodes
-  across independent failure domains — correlated failures (a bad config push, a
-  shared host/AZ) defeat the math regardless of `N`.
+  extra fault tolerance (4 tolerates the same one failure as 3; yacron2 *warns*
+  on an even size), and **2 nodes is worse than 1** (a majority of 2 is 2, so
+  both must be up): yacron2 **refuses to start** with `electLeader` and a
+  2-node cluster, since it can only lower availability with no upside. Spread
+  the nodes across independent failure domains. Correlated failures (a bad
+  config push, a shared host/AZ) defeat the math regardless of `N`.
 
 **This is best-effort, not fenced exactly-once.** Because each node acts on a
 view only as fresh as its last poll (`interval`), there are narrow windows

@@ -27,8 +27,8 @@ Only the leader runs scheduled jobs, so replicas deployed from one config no
 longer double-run.  The quorum gate is what makes this safe with no shared
 state: two strict majorities of N cannot be disjoint, so under a clean
 partition at most one side is quorate and at most one leader exists.  The
-trade-off is liveness — a minority partition deliberately goes idle rather than
-risk a second leader — and, because the view is only as fresh as the last poll,
+trade-off is liveness: a minority partition deliberately goes idle rather than
+risk a second leader, and because the view is only as fresh as the last poll,
 the guarantee is best-effort across membership changes (a brief window after a
 leader dies may skip a firing; asymmetric/flapping reachability may briefly
 double-elect).  It is *not* a fenced, exactly-once guarantee; for that you

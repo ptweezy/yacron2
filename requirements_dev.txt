@@ -1,3 +1,4 @@
+cryptography
 mypy
 mypy-extensions
 pytest

@@ -614,6 +614,33 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
         raise ConfigError("cluster.driftAfter must be >= 1")
     if cfg["connectTimeout"] <= 0:
         raise ConfigError("cluster.connectTimeout must be > 0")
+    if cfg["electLeader"]:
+        # `peers` lists every OTHER member, so the cluster is that many plus
+        # this node.
+        size = len(cfg["peers"]) + 1
+        if size == 2:
+            # A 2-node quorum is 2: both must be up for *either* to run, so it
+            # is strictly worse than a single replica (lower availability, and
+            # still no failover) with no upside. Refuse it rather than silently
+            # degrade. This keys off the declared size, so a 3+ node cluster
+            # with a peer transiently down (a rolling deploy) is unaffected.
+            raise ConfigError(
+                "cluster.electLeader needs a fault-tolerant cluster, but "
+                "this config declares only 2 nodes (1 peer). A quorum of 2 "
+                "requires both nodes up for either to run, so it is strictly "
+                "worse than a single replica. Use 3 or more nodes (an odd "
+                "count is best), or run a single replica without electLeader."
+            )
+        if size % 2 == 0:
+            # Even sizes tolerate the same number of failures as the odd size
+            # below them (e.g. 4 tolerates 1, same as 3): the extra node only
+            # adds something that can fail. Allowed, but warn.
+            logger.warning(
+                "cluster.electLeader: an even cluster size (%d nodes) "
+                "tolerates no more failures than %d; prefer an odd size.",
+                size,
+                size - 1,
+            )
     return ClusterConfig(cfg)
 
 

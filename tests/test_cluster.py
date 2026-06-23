@@ -545,3 +545,45 @@ def test_elect_leader_parsed_from_config():
 def test_elect_leader_defaults_false():
     cfg = parse_config_string(CLUSTER_YAML, "").cluster_config
     assert cfg is not None and cfg["electLeader"] is False
+
+
+# a cluster declaring a single peer -> 2 nodes total
+TWO_NODE_YAML = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+cluster:
+  listen: "0.0.0.0:8443"
+  tls:
+    ca: /etc/yacron2/ca.pem
+    cert: /etc/yacron2/node.pem
+    key: /etc/yacron2/node.key
+  peers:
+    - host: yacron-b:8443
+"""
+
+
+def test_elect_leader_rejects_two_node_cluster():
+    # quorum of 2 needs both up -> strictly worse than a single replica
+    with pytest.raises(ConfigError, match="strictly worse than a single"):
+        parse_config_string(TWO_NODE_YAML + "  electLeader: true\n", "")
+
+
+def test_two_node_cluster_ok_without_election():
+    # the same 2-node cluster is fine for attestation-only (no electLeader)
+    cfg = parse_config_string(TWO_NODE_YAML, "").cluster_config
+    assert cfg is not None and cfg["electLeader"] is False
+
+
+def test_elect_leader_warns_on_even_size(caplog):
+    import logging
+
+    # CLUSTER_YAML has 2 peers -> 3 nodes; add one more for an even 4
+    even_yaml = (
+        CLUSTER_YAML + "    - host: yacron-d:8443\n  electLeader: true\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="yacron2.config"):
+        cfg = parse_config_string(even_yaml, "").cluster_config
+    assert cfg is not None and cfg["electLeader"] is True
+    assert any("even cluster size" in r.message for r in caplog.records)

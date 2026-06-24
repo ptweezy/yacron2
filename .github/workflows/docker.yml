@@ -116,10 +116,14 @@ jobs:
             suffix: "-amazonlinux"
             platforms: "linux/amd64,linux/arm64"
             ci_platforms: "linux/amd64"
+          # distroless is amd64/arm64 only: gcr.io/distroless/python3-debian12
+          # publishes no ppc64le or s390x manifest, so requesting them aborts the
+          # build with "no match for platform in manifest" (unlike the rhel/
+          # fedora/opensuse bases, which do ship those arches).
           - distro: distroless
             dockerfile: docker/Dockerfile.distroless
             suffix: "-distroless"
-            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+            platforms: "linux/amd64,linux/arm64"
             ci_platforms: "linux/amd64"
     steps:
       - name: Resolve build target

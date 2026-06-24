@@ -1,9 +1,10 @@
 # HTTP Control API
 
 yacron2 exposes an optional [aiohttp](https://docs.aiohttp.org/) REST control API,
-enabled by adding a top-level `web` section to the configuration. It serves three
-endpoints for querying the daemon version, inspecting job status, and triggering a
-job on demand. This page documents the configuration schema, the endpoints, bearer-token
+enabled by adding a top-level `web` section to the configuration. It serves
+endpoints for querying the daemon version, inspecting job status, triggering a
+job on demand, and (when a `cluster` section is configured) reporting the cluster
+view. This page documents the configuration schema, the endpoints, bearer-token
 authentication, Unix-socket permissions, and lifecycle behavior.
 
 The interface is *new in version 0.10*; `web.authToken` and `web.socketMode` are new
@@ -73,11 +74,17 @@ All routes are registered in `start_stop_web_app`:
 | --- | --- | --- | --- |
 | `GET` | `/version` | `_web_get_version` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
+| `GET` | `/cluster` | `_web_get_cluster` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
 
-The configured `headers` map is applied to the `200` responses of all three
+The configured `headers` map is applied to the `200` responses of these
 handlers and to the `409` body of `/jobs/{name}/start`. The `404` (unknown job)
 and `401` (authentication failure) responses are raised without it.
+
+> The control API also serves the **[Web Dashboard](Web-Dashboard)** and several
+> dashboard-supporting routes (`/job-set-id`, `/jobs`, `/jobs/{name}/runs`,
+> `/jobs/{name}/logs`, `/jobs/{name}/cancel`). This page documents the primary
+> control endpoints; the [Web Dashboard](Web-Dashboard) page covers the rest.
 
 ### `GET /version`
 
@@ -144,6 +151,46 @@ Content-Type: application/json; charset=utf-8
     {"job": "test-03", "status": "disabled"}
 ]
 ```
+
+### `GET /cluster`
+
+Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
+*New in version 1.2.0.* When no `cluster` section is configured, it returns
+`{"enabled": false, "peers": []}`. When a cluster section is present it returns
+`enabled: true` plus the node's view: its `node_name` and `job_set_id`, the
+computed `cluster_size` and `quorum`, whether `elect_leader` is on, the elected
+`leader` (`null` when this node is not quorate) and `is_leader`, and a `peers`
+array (each with `host`, `status`, `node_name`, `job_set_id`, `last_seen`,
+`last_error`, and `mismatch_streak`).
+
+```shell
+$ http get http://127.0.0.1:8080/cluster Accept:application/json
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "enabled": true,
+    "node_name": "node-a",
+    "job_set_id": "v1:…",
+    "cluster_size": 3,
+    "quorum": 2,
+    "elect_leader": true,
+    "leader": "node-a",
+    "is_leader": true,
+    "peers": [
+        {"host": "yacron-b.internal:8443", "status": "agreed", "node_name": "node-b", "job_set_id": "v1:…", "last_seen": "2026-06-23T19:00:00+00:00", "last_error": null, "mismatch_streak": 0}
+    ]
+}
+```
+
+The per-peer `status` values (`agreed`, `syncing`, `drifted`, `unreachable`,
+`untrusted`, `self`, `unknown`) are documented in
+[Clustering and Leader Election](Clustering-and-Leader-Election#per-peer-status).
+
+> The separate `GET /peer` attestation endpoint is **not** part of this web API.
+> It is served only on the cluster's own mutual-TLS `listen` address (default
+> port `8443`), never on the public `web` listeners. See
+> [Clustering and Leader Election](Clustering-and-Leader-Election).
 
 ### `POST /jobs/{name}/start`
 
@@ -297,6 +344,7 @@ configuration (the new config is not applied).
 ## See also
 
 - [Web Dashboard](Web-Dashboard) — the built-in browser UI served by this interface.
+- [Clustering and Leader Election](Clustering-and-Leader-Election) — the `GET /cluster` view and the separate mTLS `/peer` endpoint.
 - [Running on Windows](Running-on-Windows) — `unix://` listeners and `socketMode`
   behave differently on Windows.
 - [Configuration Reference](Configuration-Reference)

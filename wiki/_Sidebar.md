@@ -15,6 +15,7 @@
 - **Job Behavior**
   - [Concurrency and Timeouts](Concurrency-and-Timeouts)
   - [Failure Detection and Retries](Failure-Detection-and-Retries)
+  - [Clustering and Leader Election](Clustering-and-Leader-Election)
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell)](Reporting)
   - [Metrics with statsd](Metrics-with-Statsd)

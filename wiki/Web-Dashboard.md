@@ -74,7 +74,10 @@ The toolbar above the table lets you:
 Clicking a job (or pressing `Enter` on the selected row) opens a detail drawer
 with three tabs: **Logs**, **History**, and **Schedule**. The drawer header
 repeats the job's status, schedule (with its plain-English reading), the running
-PID(s), and a one-click button to copy the command. Jobs are **deep-linkable** —
+PID(s), and a one-click button to copy the command. When
+[leader election](Clustering-and-Leader-Election#per-job-policy) is enabled, the
+header also shows the job's active **`clusterPolicy`** (`Leader`,
+`PreferLeader`, or `EveryNode`). Jobs are **deep-linkable** —
 opening a job updates the URL to `#job/<name>`, so you can bookmark or share a
 direct link to it.
 
@@ -123,6 +126,27 @@ The Schedule tab turns the cron expression into something you can read at a glan
 - a preview of the **next run times**, computed live in the browser and shown in the job's own [timezone](Schedules-and-Timezones) (UTC, server-local, or an arbitrary IANA zone such as `America/Los_Angeles`), each with a relative countdown;
 - impossible schedules (such as the 31st of February) are detected and called out rather than described as if they will fire;
 - a key/value summary of whether the job is enabled, its timezone frame, a concurrency note, and its command.
+
+## Cluster panel
+
+*New in version 1.2.0.* When a [`cluster`](Clustering-and-Leader-Election)
+section is configured, the dashboard shows a **cluster panel** below the job
+table (it stays hidden otherwise). The panel polls `GET /cluster` alongside the
+job list and renders:
+
+- a **summary line** with this node's name and the agreement tally (e.g.
+  `node-a · 2/2 agreed`); when [leader election](Clustering-and-Leader-Election#leader-election)
+  is on, it also shows the live quorum count and this node's role: **leader**,
+  **follower** (with the current leader's name), or **no quorum** when the node
+  has stood down;
+- a **per-peer table** listing each peer's host, reported node name, status, and
+  the short form of its job-set id, with a coloured **status dot**: green for
+  `agreed`, amber for `syncing`, red for `drifted`/`untrusted`, grey for
+  `unreachable`, and blue for `self`.
+
+Peers the node has listed as its own address (`self`) are excluded from the
+agreement tally. This makes it easy to watch a rolling deploy (`syncing` →
+`agreed`), spot drift, or watch leadership move when a node goes down.
 
 ## Command palette
 
@@ -189,6 +213,7 @@ token button at any time.
 The dashboard is a thin client over the [HTTP Control API](HTTP-API):
 
 - it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline);
+- it polls `GET /cluster` on the same interval for the [cluster panel](#cluster-panel) (the panel stays hidden unless a cluster section is configured);
 - opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats);
 - opening the **Logs** tab opens the `GET /jobs/{name}/logs` SSE stream;
 - the **Run** / **Stop** buttons call `POST /jobs/{name}/start` and `POST /jobs/{name}/cancel`;
@@ -202,6 +227,7 @@ cleanly on restart.
 ## See also
 
 - [HTTP Control API](HTTP-API) — the REST endpoints, configuration schema, authentication, and Unix-socket options the dashboard is built on.
+- [Clustering and Leader Election](Clustering-and-Leader-Election) — the cluster panel, per-job `clusterPolicy`, and the `GET /cluster` view it polls.
 - [Output Capturing](Output-Capturing) — `captureStdout` / `captureStderr`, which control what the Logs tab can show.
 - [Schedules and Timezones](Schedules-and-Timezones) — the schedule strings and timezones the Schedule tab explains and previews.
 - [Production and Container Deployment](Production-Deployment) — running the interface under a hardened, read-only-root-filesystem deployment.

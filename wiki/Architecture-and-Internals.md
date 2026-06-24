@@ -24,11 +24,15 @@ operator-facing walkthrough.
 | `yacron2/config.py` | strictyaml `CONFIG_SCHEMA`, `DEFAULT_CONFIG`, `_REPORT_DEFAULTS`; config loading from a file or directory; include handling and dict merging (`mergedicts`); `JobConfig` parsing/validation; `Yacron2Config` dataclass. |
 | `yacron2/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`), and `JobRetryState`. |
+| `yacron2/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and by `cluster.py` (peer comparison). |
+| `yacron2/cluster.py` | Cluster peer attestation and leader election: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop), the pure `ClusterView` state machine (per-peer status + drift debounce), and the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `yacron2/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
 | `yacron2/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
-The dependency direction is `__main__` -> `cron` -> (`config`, `job`) ->
-(`statsd`, `config`). `config.py` has no dependency on `cron.py` or `job.py`.
+The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
+`fingerprint`, `cluster`) -> (`statsd`, `config`). `cluster.py` depends on
+`config` and `fingerprint` only; `config.py` has no dependency on `cron.py` or
+`job.py`.
 `platform.py` is a leaf module with no yacron2 dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behaviour is needed.
 
@@ -90,7 +94,19 @@ in order:
    reconciles the running aiohttp server against the (possibly changed) web
    config. (See "Web control app".)
 
-3. **Logging config.** If the reloaded config has a non-`None`
+3. **Cluster start/stop.** `await self.start_stop_cluster(config.cluster_config)`
+   reconciles the `ClusterManager` against the (possibly changed) `cluster`
+   config, mirroring the web-app reconcile: the manager is stopped when the
+   section is removed or changed, and (re)started when present. It also records
+   `_elect_leader_configured` up front so the leader gate can fail closed even
+   when the manager is absent or failed to start. A start failure (bad cert
+   files, bad listen address, port in use) is logged and the reload continues.
+   The id the manager reports tracks reloads on its own (it calls
+   `self.job_set_id` each round), so only a change to the cluster section itself
+   needs a restart. (See "Cluster manager" and
+   [Clustering and Leader Election](Clustering-and-Leader-Election).)
+
+4. **Logging config.** If the reloaded config has a non-`None`
    `logging_config` that differs from `applied_logging_config`,
    `logging.config.dictConfig(...)` is applied. It is recorded as applied only
    on success, so a logging section that was broken on a previous reload is
@@ -98,9 +114,9 @@ in order:
    error pointing at the Python `logging.config` dictionary-schema docs and the
    offending config.
 
-4. **Spawn due jobs.** `await self.spawn_jobs(startup)`.
+5. **Spawn due jobs.** `await self.spawn_jobs(startup)`.
 
-5. **Sleep to the next minute boundary.** `next_sleep_interval()` computes the
+6. **Sleep to the next minute boundary.** `next_sleep_interval()` computes the
    seconds until the next minute boundary in UTC as `now.replace(second=0) +
    WAKEUP_INTERVAL` (where `WAKEUP_INTERVAL` is one minute). Because
    `replace(second=0)` clears only the seconds field, the target retains `now`'s
@@ -117,8 +133,16 @@ pass (see below).
 ### Startup pass (`@reboot`)
 
 `spawn_jobs(startup)` iterates `self.cron_jobs.values()` and calls
-`launch_scheduled_job(job)` for every job where `job_should_run(startup, job)`
-is true. `job_should_run`:
+`launch_scheduled_job(job)` for every job where both `job_should_run(startup,
+job)` **and** `self._cluster_allows(job)` are true (and first logs any
+leadership transition via `_log_cluster_role`). `_cluster_allows` is always
+`True` unless `cluster.electLeader` is configured; then it consults the job's
+`clusterPolicy` against the elected-leader state: `EveryNode` always runs,
+`Leader`/`PreferLeader` fail closed when no manager is running, and otherwise
+gate on `is_leader()` / `is_available_leader()`. Manual (API) triggers and
+retries go through `maybe_launch_job` and are **not** gated. See
+[Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy).
+`job_should_run`:
 
 - returns `False` for any disabled job (`job.enabled` is `False`);
 - when `startup` is `True`, returns `True` only for jobs whose schedule is the
@@ -142,7 +166,10 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
    `asyncio.gather`.
 2. `await self._wait_for_running_jobs_task` — awaits the reaper, which only
    returns once `self.running_jobs` is empty and the stop event is set.
-3. If a web server is running, logs `"Stopping http server"` and
+3. If a cluster manager is running, logs `"Stopping cluster manager"` and
+   `await self.cluster_manager.stop()` (which cancels the poll loop and tears
+   down the mTLS `/peer` listener).
+4. If a web server is running, logs `"Stopping http server"` and
    `await self.web_runner.cleanup()`.
 
 `signal_shutdown` simply calls `self._stop_event.set()`; it is invoked from the
@@ -192,6 +219,42 @@ On Windows, `unix://` listeners are unsupported (the Proactor loop lacks
 it is irrelevant on Windows. See [Running on Windows](Running-on-Windows).
 
 See [HTTP Control API](HTTP-API) for the request/response contract.
+
+## Cluster manager
+
+`start_stop_cluster(cluster_config)` reconciles a single `ClusterManager`,
+mirroring the web-app reconcile: the manager is stopped when the `cluster`
+section is removed or differs from the running one, and (re)started when present
+and none is running. A start failure (`OSError`, `ssl.SSLError`, `ValueError`:
+bad cert files, a bad listen address, a port already in use) is logged and the
+reload continues (jobs keep running). `_elect_leader_configured` is set first, so
+the leader gate is correct even if the manager is absent.
+
+The `ClusterManager` (in `yacron2/cluster.py`) owns two things:
+
+- **The mTLS `/peer` listener** — its own `aiohttp` `AppRunner` on the `cluster`
+  `listen` address, with a server SSL context that *requires* a CA-signed client
+  cert (`ssl.CERT_REQUIRED`). It serves a single route returning
+  `{"node_name", "job_set_id", "scheme_version"}`. This listener is entirely
+  separate from the public web app.
+- **The poll loop** — every `interval` seconds it polls each peer's `/peer` over
+  mTLS (a client SSL context with `check_hostname=True`, so the peer cert's SAN
+  must match the configured host), and feeds each observation into the pure
+  `ClusterView`. TLS/cert failures classify the peer as `untrusted`; connect or
+  timeout failures as `unreachable`.
+
+`ClusterView` is pure (no I/O): it holds the per-peer table and the rules that
+update it (the `agreed`/`syncing`/`drifted`/`unreachable`/`untrusted`/`self`
+state machine and the `driftAfter` debounce), which keeps the logic trivially
+testable. Leader election is likewise pure: `quorum_size`, `elect_leader`
+(quorum-gated, returns `None` for a minority), and `elect_available_leader` (no
+quorum gate, for `PreferLeader`) take a node name, the agreeing peer names, and
+the cluster size, and the manager wraps them as `is_leader()` /
+`is_available_leader()` / `leader_name()`. The `/cluster` web endpoint serialises
+`view_dict()`.
+
+See [Clustering and Leader Election](Clustering-and-Leader-Election) for the
+operator-facing model and trust boundary.
 
 ## The reaper task — `_wait_for_running_jobs`
 

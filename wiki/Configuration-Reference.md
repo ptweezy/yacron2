@@ -31,6 +31,7 @@ jobs:               # optional: list of job definitions
     schedule: ...
 include: [ ... ]    # optional: list of other config files to merge
 web: { ... }        # optional: HTTP control API
+cluster: { ... }    # optional: mTLS peer attestation / leader election
 logging: { ... }    # optional: Python logging dictConfig
 ```
 
@@ -40,6 +41,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `jobs` | `Seq(Map)` of job definitions | No | The list of cron jobs. Each entry is validated against the per-job schema below. |
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
+| `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). New in version 1.2.0. |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
 
 ### `web`
@@ -53,6 +55,36 @@ logging: { ... }    # optional: Python logging dictConfig
 
 `listen` is the only required key. Full behavior, authentication, and endpoint
 semantics are documented in [HTTP Control API](HTTP-API).
+
+### `cluster`
+
+Optional. Lets an instance attest, over mutual TLS, that a static list of peers
+is running the same job set, and (with `electLeader`) elect a leader so several
+replicas can run from one config without double-running jobs. There must be
+exactly one `cluster` block across the whole configuration; a duplicate in an
+included file or a second config-directory file raises a `ConfigError`. Defaults
+come from `DEFAULT_CLUSTER` and are applied only when a `cluster` section is
+present. New in version 1.2.0.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `listen` | `Str` | required | `host:port` the mTLS `/peer` listener binds to (e.g. `0.0.0.0:8443`). Served only here, never on the public `web` API. |
+| `tls.ca` | `Str` | required | Path to the cluster CA (trust anchor for peer certificates). |
+| `tls.cert` | `Str` | required | Path to this node's certificate (used both to serve `/peer` and to authenticate as a client). Its SAN must match the host other nodes use to reach it. |
+| `tls.key` | `Str` | required | Path to this node's private key. |
+| `peers` | `Seq(Map({"host": Str}))` | required | Every **other** member as `host:port`. Cluster size is `len(peers) + 1`. |
+| `nodeName` | `Str` | system hostname | Stable, human-readable identity for this node; the leader is the lowest `nodeName` among agreeing members. |
+| `interval` | `Int` | `30` | Seconds between peer-attestation rounds. Must be `> 0`. |
+| `driftAfter` | `Int` | `3` | Consecutive reachable-but-mismatched rounds before a peer is reported `drifted` (debounce). Must be `>= 1`. |
+| `connectTimeout` | `Int` | `10` | Seconds per peer request. Must be `> 0`. |
+| `electLeader` | `Bool` | `false` | When true, only the quorum-gated elected leader runs *scheduled* jobs (manual API triggers and retries are unaffected). Off by default, so a `cluster` section is observe-only until opted in. |
+
+Load-time validation (in addition to the numeric ranges above): with
+`electLeader: true`, a **2-node** cluster (one peer) is rejected with a
+`ConfigError` (a quorum of 2 needs both up, strictly worse than one replica),
+and an **even** cluster size is allowed but logs a warning. Full behavior,
+the trust model, quorum math, and per-job `clusterPolicy` are documented in
+[Clustering and Leader Election](Clustering-and-Leader-Election).
 
 ### `logging`
 
@@ -106,6 +138,7 @@ See [Schedules and Timezones](Schedules-and-Timezones).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `concurrencyPolicy` | `Enum(["Allow", "Forbid", "Replace"])` | `Allow` | Behavior when a scheduled run overlaps a still-running instance. `Allow`: run concurrently. `Forbid`: skip the new run. `Replace`: cancel the running instance and start the new one. |
+| `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). New in version 1.2.0. See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
 | `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). New in version 0.4. |
 | `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals — both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). New in version 0.4. |
 

@@ -154,7 +154,7 @@ spec:
 two replicas with no coordination each run every job independently.
 
 To run more than one replica without double-running jobs, enable
-[leader election](https://github.com/ptweezy/yacron2#leader-election): add a
+[leader election](Clustering-and-Leader-Election): add a
 `cluster` section with `electLeader: true` and a mutual-TLS identity, and only
 the elected leader runs scheduled jobs. It is a quorum-gated, leaderless
 election that keeps no shared state, so:
@@ -173,6 +173,10 @@ election that keeps no shared state, so:
 * Provision the per-pod certificates from your own PKI (e.g. cert-manager) and
   give each pod a stable `nodeName`; a StatefulSet's ordinal hostnames make
   both the cert SANs and the peer list straightforward.
+
+See [Clustering and Leader Election](Clustering-and-Leader-Election) for the full
+trust model, quorum math, per-job `clusterPolicy`, and a runnable local
+three-node example.
 
 ## Writable-path exceptions
 

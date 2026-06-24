@@ -24,6 +24,7 @@ yacron2 is a cron replacement built on asyncio that runs natively on Linux, macO
 
 - [Concurrency and Timeouts](Concurrency-and-Timeouts) — `concurrencyPolicy`, `executionTimeout`, and `killTimeout`.
 - [Failure Detection and Retries](Failure-Detection-and-Retries) — `failsWhen` rules, `retry` with exponential backoff, and `onPermanentFailure`.
+- [Clustering and Leader Election](Clustering-and-Leader-Election) — the `cluster` section: mTLS peer attestation, quorum-gated leader election, and per-job `clusterPolicy`.
 
 ### Integrations
 

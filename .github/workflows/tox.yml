@@ -5,6 +5,15 @@ on: [push, pull_request]
 permissions:
   contents: read
 
+# Make every pip call (including the ones tox runs inside its venvs) resilient
+# to transient PyPI/network blips: PIP_RETRIES retries failed requests and
+# PIP_TIMEOUT raises the per-request socket timeout. pip reads both from the
+# environment, so this covers the explicit installs below AND tox's internal
+# ones with no third-party action.
+env:
+  PIP_RETRIES: "5"
+  PIP_TIMEOUT: "60"
+
 jobs:
   tox-lint:
     runs-on: ubuntu-latest

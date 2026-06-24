@@ -24,15 +24,20 @@ COPY . .
 # without a wheel for the target arch; it stays in this builder stage. git is
 # pulled in only for a plain local build (empty VERSION), where setuptools_scm
 # reads the version from .git.
+# retry() re-runs a network step (package refresh/install, pip download) a few
+# times with backoff. zypper exit 106 means a repo mirror was unreachable, so
+# the refresh is retried explicitly before install.
 RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     pkgs="python311 python311-pip python311-devel gcc"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
-    zypper --non-interactive install $pkgs; \
+    retry zypper --non-interactive refresh; \
+    retry zypper --non-interactive install $pkgs; \
     zypper clean --all; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
     python3.11 -m venv /opt/venv; \
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/pip install --no-cache-dir .
+    retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
 # ---- runtime stage ------------------------------------------------------
 FROM opensuse/leap:${LEAP_VERSION}
@@ -49,7 +54,9 @@ ENV PYTHONUNBUFFERED=1 \
 # The venv references /usr/bin/python3.11, so the runtime needs python311
 # installed. Both stages are opensuse/leap:${LEAP_VERSION}, so it matches.
 RUN set -eux; \
-    zypper --non-interactive install python311; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry zypper --non-interactive refresh; \
+    retry zypper --non-interactive install python311; \
     zypper clean --all
 
 COPY --from=builder /opt/venv /opt/venv

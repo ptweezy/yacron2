@@ -48,6 +48,14 @@ concurrency:
 permissions:
   contents: read
 
+# Retry/timeout for every pip call against a transient PyPI/network blip. pip
+# reads PIP_RETRIES/PIP_TIMEOUT from the environment; the in-container binary
+# jobs forward them into `docker run` with `-e` so the same hardening applies
+# inside the emulated builds.
+env:
+  PIP_RETRIES: "5"
+  PIP_TIMEOUT: "60"
+
 jobs:
   # Compute the version once on the host (which has git + full history) and feed
   # it to every build via SETUPTOOLS_SCM_PRETEND_VERSION -- mirroring release.yml,
@@ -211,6 +219,7 @@ jobs:
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
             -v "$PWD:/src" -w /src \
             python:3.14-alpine sh -euc '
               # build-base brings the C toolchain + strip (the spec sets
@@ -282,6 +291,7 @@ jobs:
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
             -v "$PWD:/src" -w /src \
             python:3.14-slim sh -euc '
               # build-essential brings gcc + strip (the spec sets strip=True);

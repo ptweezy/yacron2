@@ -23,15 +23,18 @@ COPY . .
 # dep lacking a wheel for the target arch. The toolchain stays in this builder
 # stage. git is pulled in only for a plain local build (empty VERSION), where
 # setuptools_scm reads the version from .git.
+# retry() re-runs a network step (package install, pip download) a few times
+# with backoff, so a transient mirror/index hiccup does not fail the build.
 RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     pkgs="python3 python3-pip python3-devel gcc"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
-    dnf install -y $pkgs; \
+    retry dnf --setopt=retries=10 install -y $pkgs; \
     dnf clean all; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
     python3 -m venv /opt/venv; \
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/pip install --no-cache-dir .
+    retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
 # ---- runtime stage ------------------------------------------------------
 FROM fedora:${FEDORA_VERSION}
@@ -48,7 +51,8 @@ ENV PYTHONUNBUFFERED=1 \
 # The venv references the system interpreter at /usr/bin/python3; both stages
 # are fedora:${FEDORA_VERSION}, so it is present and the version matches.
 RUN set -eux; \
-    dnf install -y python3; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry dnf --setopt=retries=10 install -y python3; \
     dnf clean all
 
 COPY --from=builder /opt/venv /opt/venv

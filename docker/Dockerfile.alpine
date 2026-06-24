@@ -25,14 +25,17 @@ COPY . .
 # musl-dev + make) and libffi-dev cover that toolchain; it stays in this builder
 # stage and never reaches the runtime image. git is pulled in only for a plain
 # local build (empty VERSION), where setuptools_scm reads the version from .git.
+# retry() re-runs a network step (package install, pip download) a few times
+# with backoff, so a transient mirror/index hiccup does not fail the build.
 RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     pkgs="build-base libffi-dev"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
-    apk add --no-cache $pkgs; \
+    retry apk add --no-cache $pkgs; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
     python -m venv /opt/venv; \
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/pip install --no-cache-dir .
+    retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
 # ---- runtime stage ------------------------------------------------------
 FROM python:${PYTHON_VERSION}-alpine

@@ -895,3 +895,317 @@ async def test_report_mail_closes_connection_on_error():
             await mail.report(False, job, job_config.onSuccess["report"])
 
     assert len(close_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Privilege drop (_demote) -- POSIX only.
+#
+# The child drops supplementary groups BEFORE setuid (the classic "forgot
+# setgroups() before setuid()" privilege-escalation bug). A refactor that
+# reorders these syscalls, drops the setgroups([]) fallback, swaps initgroups
+# for a plain setgid, or stops wrapping OSError, would re-open that hole
+# or run the job as the wrong account. There is no test that catches it today,
+# yet _demote runs on every POSIX deploy that uses user/group. These lock the
+# exact syscall order, both group branches, and the error wrapping.
+# ---------------------------------------------------------------------------
+
+_SIMPLE_JOB = """
+jobs:
+  - name: t
+    command: echo hi
+    schedule: "* * * * *"
+"""
+
+
+def _make_job_with_ids(uid=None, gid=None, username=None):
+    conf = yacron2.config.parse_config_string(_SIMPLE_JOB, "")
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job.config.uid = uid
+    job.config.gid = gid
+    job.config.username = username
+    return job
+
+
+def _record_priv_syscalls(monkeypatch, calls, failing=None):
+    # Replace the four privilege-drop syscalls with recorders. The one named in
+    # `failing` raises OSError instead, exercising the error-wrap branches.
+    def make(name):
+        def fake(*args):
+            if name == failing:
+                raise OSError("denied")
+            calls.append((name, args))
+
+        return fake
+
+    for name in ("initgroups", "setgroups", "setgid", "setuid"):
+        monkeypatch.setattr(os, name, make(name))
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="privilege drop is POSIX-only")
+def test_demote_drops_groups_before_setuid(monkeypatch):
+    calls = []
+    _record_priv_syscalls(monkeypatch, calls)
+
+    job = _make_job_with_ids(uid=1000, gid=1000, username="svc")
+    job._demote()
+
+    # supplementary groups MUST be set before the gid, which MUST be set
+    # before the uid: once the uid drops to non-root, setgid/setgroups fail.
+    assert [name for name, _ in calls] == ["initgroups", "setgid", "setuid"]
+    # a known user+gid uses initgroups (the user's groups), not setgroups([])
+    assert calls[0] == ("initgroups", ("svc", 1000))
+    assert calls[1] == ("setgid", (1000,))
+    assert calls[2] == ("setuid", (1000,))
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="privilege drop is POSIX-only")
+def test_demote_clears_groups_when_no_username(monkeypatch):
+    calls = []
+    _record_priv_syscalls(monkeypatch, calls)
+
+    # numeric uid with no resolved username: the user's own groups cannot be
+    # enumerated, so ALL supplementary groups are dropped, never kept.
+    job = _make_job_with_ids(uid=1000, gid=1000, username=None)
+    job._demote()
+
+    assert [name for name, _ in calls] == ["setgroups", "setgid", "setuid"]
+    assert calls[0] == ("setgroups", ([],))
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="privilege drop is POSIX-only")
+@pytest.mark.parametrize(
+    "failing_call, prefix",
+    [
+        ("initgroups", "setgroups/initgroups:"),
+        ("setgid", "setgid:"),
+        ("setuid", "setuid:"),
+    ],
+)
+def test_demote_wraps_oserror(monkeypatch, failing_call, prefix):
+    # every privilege-drop syscall that fails must surface as a RuntimeError
+    # with a clear prefix, not a bare OSError the reaper would mislabel as an
+    # internal yacron2 bug.
+    calls = []
+    _record_priv_syscalls(monkeypatch, calls, failing=failing_call)
+
+    job = _make_job_with_ids(uid=1000, gid=1000, username="svc")
+    with pytest.raises(RuntimeError) as exc:
+        job._demote()
+    assert str(exc.value).startswith(prefix)
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="preexec_fn is POSIX-only")
+@pytest.mark.asyncio
+async def test_start_wires_preexec_fn_only_when_demoting(monkeypatch):
+    captured = []
+
+    async def fake_exec(*args, **kwargs):
+        captured.append(kwargs)
+        proc = Mock(stdout=None, stderr=None)
+
+        async def wait():
+            return 0
+
+        proc.wait = wait
+        return proc
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+
+    conf = yacron2.config.parse_config_string(
+        """
+jobs:
+  - name: t
+    command:
+      - echo
+      - hi
+    schedule: "* * * * *"
+    captureStdout: false
+    captureStderr: false
+""",
+        "",
+    )
+
+    # with a uid to drop to, start() must wire preexec_fn -> _demote (bound
+    # methods compare equal, not identical, so use ==).
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job.config.uid = 1000
+    await job.start()
+    assert captured[-1].get("preexec_fn") == job._demote
+
+    # with neither uid nor gid, preexec_fn must NOT be passed: it is needless
+    # overhead on every spawn and an outright error on some platforms.
+    job2 = yacron2.job.RunningJob(conf.jobs[0], None)
+    job2.config.uid = None
+    job2.config.gid = None
+    await job2.start()
+    assert "preexec_fn" not in captured[-1]
+
+
+# ---------------------------------------------------------------------------
+# Shell-reporter YACRON2_* env contract.
+#
+# Users' alerting scripts read these exact variable names; a rename or typo,
+# or an inverted truncation flag, breaks them silently with the suite green.
+# The pre-existing shell-reporter test reads back only 4 of 10 variables and
+# never exercises truncation. These lock the full name set, the values, and the
+# 16 KiB truncation behavior.
+# ---------------------------------------------------------------------------
+
+GOLDEN_SHELL_ENV_KEYS = frozenset(
+    {
+        "YACRON2_FAIL_REASON",
+        "YACRON2_JOB_NAME",
+        "YACRON2_JOB_COMMAND",
+        "YACRON2_JOB_SCHEDULE",
+        "YACRON2_FAILED",
+        "YACRON2_RETCODE",
+        "YACRON2_STDERR",
+        "YACRON2_STDOUT",
+        "YACRON2_STDERR_TRUNCATED",
+        "YACRON2_STDOUT_TRUNCATED",
+    }
+)
+
+_MAX_ARG = 1024 * 16  # mirrors ShellReporter.max_length_arg
+
+_SHELL_REPORTER_JOB = """
+jobs:
+  - name: test
+    command: echo the-command
+    schedule: "*/5 * * * *"
+    onFailure:
+      report:
+        shell:
+          command: "true"
+"""
+
+
+async def _capture_shell_reporter_env(
+    monkeypatch, *, stdout, stderr, retcode=7, fail_reason="boom", failed=True
+):
+    # Drop any ambient YACRON2_* so the exact-set assertion is deterministic
+    # regardless of how the suite was launched.
+    for key in [k for k in os.environ if k.startswith("YACRON2_")]:
+        monkeypatch.delenv(key, raising=False)
+
+    captured = {}
+
+    async def fake_create(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        proc = Mock()
+
+        async def wait():
+            return 0
+
+        proc.wait = wait
+        return proc
+
+    # patch both spawn paths so the capture is robust to shell-vs-exec routing
+    monkeypatch.setattr("asyncio.create_subprocess_shell", fake_create)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_create)
+
+    conf = yacron2.config.parse_config_string(_SHELL_REPORTER_JOB, "")
+    job_config = conf.jobs[0]
+    job = Mock(
+        config=job_config,
+        stdout=stdout,
+        stderr=stderr,
+        retcode=retcode,
+        fail_reason=fail_reason,
+        failed=failed,
+    )
+    await yacron2.job.ShellReporter().report(
+        False, job, job_config.onFailure["report"]
+    )
+    return captured["env"]
+
+
+@pytest.mark.asyncio
+async def test_report_shell_full_env_contract(monkeypatch):
+    env = await _capture_shell_reporter_env(
+        monkeypatch, stdout="out", stderr="err"
+    )
+
+    # exactly these YACRON2_* variables are exported, no more and no fewer: a
+    # dropped, renamed, or added variable fails here.
+    assert {
+        k for k in env if k.startswith("YACRON2_")
+    } == GOLDEN_SHELL_ENV_KEYS
+
+    assert env["YACRON2_JOB_NAME"] == "test"
+    assert env["YACRON2_JOB_COMMAND"] == "echo the-command"
+    assert env["YACRON2_JOB_SCHEDULE"] == "*/5 * * * *"
+    assert env["YACRON2_FAILED"] == "1"
+    assert env["YACRON2_RETCODE"] == "7"
+    assert env["YACRON2_FAIL_REASON"] == "boom"
+    assert env["YACRON2_STDOUT"] == "out"
+    assert env["YACRON2_STDERR"] == "err"
+    assert env["YACRON2_STDOUT_TRUNCATED"] == "0"
+    assert env["YACRON2_STDERR_TRUNCATED"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_report_shell_env_when_succeeded(monkeypatch):
+    # FAILED tracks job.failed; a success exports "0" and an empty FAIL_REASON
+    # (job.fail_reason is None -> ""), and None stdout/stderr collapse to "".
+    env = await _capture_shell_reporter_env(
+        monkeypatch,
+        stdout=None,
+        stderr=None,
+        retcode=0,
+        fail_reason=None,
+        failed=False,
+    )
+    assert env["YACRON2_FAILED"] == "0"
+    assert env["YACRON2_RETCODE"] == "0"
+    assert env["YACRON2_FAIL_REASON"] == ""
+    assert env["YACRON2_STDOUT"] == ""
+    assert env["YACRON2_STDERR"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "out_len, err_len, exp_out_trunc, exp_err_trunc, exp_out_len, exp_err_len",
+    [
+        # both small: nothing truncated
+        (100, 100, "0", "0", 100, 100),
+        # stdout alone exceeds the per-arg limit: only stdout is truncated
+        (_MAX_ARG + 5000, 100, "1", "0", _MAX_ARG, 100),
+        # stderr alone exceeds the limit: only stderr is truncated
+        (100, _MAX_ARG + 5000, "0", "1", 100, _MAX_ARG),
+    ],
+)
+async def test_report_shell_truncates_large_output(
+    monkeypatch,
+    out_len,
+    err_len,
+    exp_out_trunc,
+    exp_err_trunc,
+    exp_out_len,
+    exp_err_len,
+):
+    env = await _capture_shell_reporter_env(
+        monkeypatch, stdout="o" * out_len, stderr="e" * err_len
+    )
+    assert env["YACRON2_STDOUT_TRUNCATED"] == exp_out_trunc
+    assert env["YACRON2_STDERR_TRUNCATED"] == exp_err_trunc
+    assert len(env["YACRON2_STDOUT"]) == exp_out_len
+    assert len(env["YACRON2_STDERR"]) == exp_err_len
+
+
+@pytest.mark.asyncio
+async def test_report_shell_combined_over_limit_is_not_truncated(monkeypatch):
+    # DOCUMENTS CURRENT BEHAVIOR (and a latent gap): when stdout and stderr are
+    # each under the 16 KiB per-arg limit but whose SUM exceeds it, the code
+    # flags args_too_long internally, yet the [:16 KiB] slice shortens neither
+    # value, so neither *_TRUNCATED flag is set and the combined env block is
+    # still ~2x the limit. If this is ever tightened, update this test
+    # deliberately.
+    each = 10000  # 2 * 10000 = 20000 > 16384, but each value < 16384
+    env = await _capture_shell_reporter_env(
+        monkeypatch, stdout="o" * each, stderr="e" * each
+    )
+    assert env["YACRON2_STDOUT_TRUNCATED"] == "0"
+    assert env["YACRON2_STDERR_TRUNCATED"] == "0"
+    assert len(env["YACRON2_STDOUT"]) == each
+    assert len(env["YACRON2_STDERR"]) == each

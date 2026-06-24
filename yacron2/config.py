@@ -248,8 +248,14 @@ _job_defaults_common = {
     Opt("executionTimeout"): Float(),
     Opt("killTimeout"): Float(),
     Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
-    Opt("user"): Str() | Int(),
-    Opt("group"): Str() | Int(),
+    # Int() is tried first so a numeric ``user: 1000`` parses as the integer
+    # 1000 (a uid/gid), reaching the isinstance(..., int) branches in
+    # _resolve_user_group. With Str() first, strictyaml's union would match the
+    # always-accepting Str() and a bare number would arrive as the string
+    # "1000", silently looked up as a login *name* (getpwnam("1000")) instead.
+    # A non-numeric name (``user: www-data``) fails Int() and uses Str().
+    Opt("user"): Int() | Str(),
+    Opt("group"): Int() | Str(),
     Opt("streamPrefix"): Str(),
     Opt("enabled"): Bool(),
 }

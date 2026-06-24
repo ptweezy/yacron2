@@ -1,32 +1,47 @@
 name: docker
 
-# Build the container image on EVERY commit (build-only, so a broken Dockerfile
-# fails fast) and, when a release is cut, publish the multi-arch image to both
+# Build the container images on EVERY commit (build-only, so a broken Dockerfile
+# fails fast) and, when a release is cut, publish the multi-arch images to both
 # GHCR and Docker Hub. (GHCR authenticates with the built-in GITHUB_TOKEN;
-# Docker Hub uses the DOCKERHUB_* secrets and is skipped.)
+# Docker Hub uses the DOCKERHUB_* secrets and is skipped if they are unset.)
 #
-#   - on a push to any branch: build all seven release arches -- linux/amd64,
-#     linux/arm64, linux/386, linux/arm/v7, linux/ppc64le, linux/s390x and
-#     linux/riscv64 (everything but amd64 via QEMU emulation) -- and do NOT
-#     push: a gate proving the image still builds for EVERY release arch on every
-#     commit. The emulated arches are slow, but they catch arch-only breakage
-#     (e.g. a dep with no wheel for that arch -- the 32-bit aiohttp stack, and
-#     multidict/frozenlist/ruamel.yaml.clib on riscv64, notably compile from
-#     source) an amd64-only build would miss. (Those source builds need a
-#     toolchain in the Dockerfile's builder stage; see Dockerfile.)
-#   - on release: the release workflow CALLS this one (workflow_call) right after
-#     it publishes, building all six arches and pushing, tagged with
-#     the release version and `latest`;
-#   - manually (workflow_dispatch): (re)build and push any existing release tag --
-#     handy to backfill an image for a release whose build was missed.
+# We publish one image per base distro, fanned out over the matrix below:
+#
+#     distro        base                          tag suffix   default Python
+#     ------        ----                          ----------   --------------
+#     debian        python:3.14-slim              (none)       3.14   <- latest
+#     alpine        python:3.14-alpine            -alpine      3.14
+#     ubuntu        ubuntu:24.04                  -ubuntu      3.12
+#     rhel          ubi9 (Red Hat UBI)            -rhel        3.12
+#     fedora        fedora:41                     -fedora      3.13
+#     opensuse      opensuse/leap:15.6            -opensuse    3.11
+#     amazonlinux   amazonlinux:2023              -amazonlinux 3.11
+#     distroless    gcr.io/distroless/python3     -distroless  3.11
+#
+# The Debian image is the default: it gets the bare `latest`/`<version>` tags
+# (no suffix). The variants get `latest-<distro>` and `<version>-<distro>`.
+# yacron2 is a pure-Python app that supports any Python >= 3.10, so the per-distro
+# interpreter version is functionally invisible; each distro uses its own native
+# Python rather than source-building a single version everywhere.
+#
+# Triggers:
+#   - push to any branch (build-only gate): build WITHOUT pushing. The Debian
+#     image builds for ALL its release arches (amd64 native; arm64/386/armv7/
+#     ppc64le/s390x/riscv64 via QEMU emulation) -- the same coverage as the
+#     released image, proving it still builds for every arch on every commit.
+#     The other distros build amd64-only here: a fast smoke test that catches a
+#     broken Dockerfile without paying full QEMU cost on every push. Their full
+#     arch sets are exercised on release.
+#   - release (workflow_call from release.yml): build + push every distro at its
+#     full arch set, tagged with the release version and `latest`(-<distro>).
+#   - workflow_dispatch: (re)build and push any existing release tag, all distros.
 #
 # Why workflow_call instead of `on: release`? A GitHub Release created by the
 # release workflow's default GITHUB_TOKEN does NOT emit a `release: published`
 # event capable of starting another workflow -- GitHub suppresses token-triggered
 # events to avoid recursion. Having release.yml invoke this workflow directly
-# makes the image a first-class step of the release instead of a trigger that
-# silently never fires. (The per-commit build above is what catches a broken
-# Dockerfile early, so building the image after publish is safe.)
+# makes the images a first-class step of the release instead of a trigger that
+# silently never fires.
 
 on:
   workflow_call:
@@ -58,6 +73,54 @@ jobs:
     permissions:
       contents: read
       packages: write # push to GHCR (only used on release / workflow_dispatch)
+    strategy:
+      fail-fast: false # one distro failing must not cancel the others
+      matrix:
+        include:
+          # `suffix` is the docker/metadata-action flavor suffix (leading dash);
+          # empty for Debian so it owns the bare `latest`/`<version>` tags.
+          # `platforms` is the published arch set; `ci_platforms` is the lighter
+          # per-commit build-only gate.
+          - distro: debian
+            dockerfile: Dockerfile
+            suffix: ""
+            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+            ci_platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+          - distro: alpine
+            dockerfile: docker/Dockerfile.alpine
+            suffix: "-alpine"
+            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+            ci_platforms: "linux/amd64"
+          - distro: ubuntu
+            dockerfile: docker/Dockerfile.ubuntu
+            suffix: "-ubuntu"
+            platforms: "linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+            ci_platforms: "linux/amd64"
+          - distro: rhel
+            dockerfile: docker/Dockerfile.rhel
+            suffix: "-rhel"
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+            ci_platforms: "linux/amd64"
+          - distro: fedora
+            dockerfile: docker/Dockerfile.fedora
+            suffix: "-fedora"
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+            ci_platforms: "linux/amd64"
+          - distro: opensuse
+            dockerfile: docker/Dockerfile.opensuse
+            suffix: "-opensuse"
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+            ci_platforms: "linux/amd64"
+          - distro: amazonlinux
+            dockerfile: docker/Dockerfile.amazonlinux
+            suffix: "-amazonlinux"
+            platforms: "linux/amd64,linux/arm64"
+            ci_platforms: "linux/amd64"
+          - distro: distroless
+            dockerfile: docker/Dockerfile.distroless
+            suffix: "-distroless"
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+            ci_platforms: "linux/amd64"
     steps:
       - name: Resolve build target
         id: target
@@ -67,22 +130,19 @@ jobs:
           EVENT: ${{ github.event_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
           CALL_VERSION: ${{ inputs.version }}
+          DISTRO: ${{ matrix.distro }}
+          FULL_PLATFORMS: ${{ matrix.platforms }}
+          CI_PLATFORMS: ${{ matrix.ci_platforms }}
         run: |
           set -euo pipefail
           version=""          # empty => Dockerfile reads the version from .git
           ref=""              # empty => checkout the triggering ref
           push=false
-          # Per-commit default: build all seven release arches (amd64 native;
-          # arm64/386/armv7/ppc64le/s390x/riscv64 via QEMU) but never push -- a build-only
-          # gate at the same arch coverage as the release image. The branches
-          # below opt up to push=true.
-          platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
           if [ -n "${CALL_VERSION:-}" ]; then
             # Invoked by the release workflow (workflow_call): build + push at the
             # just-released version. Detected via the input, NOT github.event_name
             # -- in a called workflow that still reports the CALLER's event.
-            version="$CALL_VERSION"; ref="$CALL_VERSION"
-            push=true; platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+            version="$CALL_VERSION"; ref="$CALL_VERSION"; push=true
           elif [ "$EVENT" = "workflow_dispatch" ]; then
             # Manual (re)build of an existing release tag.
             if [ -n "${INPUT_TAG:-}" ]; then
@@ -90,17 +150,25 @@ jobs:
             else
               version="$(gh release view --repo "$REPO" --json tagName -q .tagName)"
             fi
-            ref="$version"
-            push=true; platforms="linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+            ref="$version"; push=true
           fi
-          # else: push -> multi-arch build-only CI on every commit (defaults above).
+          # else: push -> build-only CI gate on every commit (no push).
+          #
+          # Published builds use the distro's full arch set; the per-commit gate
+          # uses the lighter ci_platforms (full 7 arches for Debian, amd64-only
+          # for the variants).
+          if [ "$push" = true ]; then
+            platforms="$FULL_PLATFORMS"
+          else
+            platforms="$CI_PLATFORMS"
+          fi
           {
             echo "version=$version"
             echo "ref=$ref"
             echo "push=$push"
             echo "platforms=$platforms"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::event=$EVENT version=${version:-<git>} push=$push platforms=$platforms"
+          echo "::notice::distro=$DISTRO event=$EVENT version=${version:-<git>} push=$push platforms=$platforms"
 
       - uses: actions/checkout@v7
         with:
@@ -138,10 +206,19 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ steps.registries.outputs.images }}
+          # The distro suffix (e.g. `-alpine`) is appended to every tag; it is
+          # empty for Debian, which therefore owns the bare `latest`/`<version>`.
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
           tags: |
             type=raw,value=${{ steps.target.outputs.version }},enable=${{ steps.target.outputs.version != '' }}
             type=raw,value=latest,enable=${{ steps.target.outputs.push == 'true' }}
             type=raw,value=ci-build,enable=${{ steps.target.outputs.push == 'false' }}
+            # Explicit -debian alias so the default base is pinnable by name too
+            # (latest-debian / <version>-debian), mirroring the other variants.
+            type=raw,value=${{ steps.target.outputs.version }}-debian,enable=${{ matrix.distro == 'debian' && steps.target.outputs.version != '' }}
+            type=raw,value=latest-debian,enable=${{ matrix.distro == 'debian' && steps.target.outputs.push == 'true' }}
 
       - name: Log in to GHCR
         if: steps.target.outputs.push == 'true'
@@ -165,6 +242,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ steps.target.outputs.platforms }}
           push: ${{ steps.target.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -172,5 +250,7 @@ jobs:
           build-args: |
             VERSION=${{ steps.target.outputs.version }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scope the GHA cache per distro so the eight builds don't clobber
+          # each other's layers.
+          cache-from: type=gha,scope=${{ matrix.distro }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.distro }}

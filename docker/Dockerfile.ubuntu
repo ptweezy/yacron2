@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+#
+# yacron2 — Ubuntu variant, built on Ubuntu 24.04 LTS using its native Python
+# 3.12. For users who standardise on an Ubuntu base (familiar userland, apt,
+# matching host images).
+#
+# Build locally:
+#   docker build -f docker/Dockerfile.ubuntu -t yacron2:ubuntu .
+# CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
+# reads it from .git (kept in the context by .dockerignore).
+
+ARG UBUNTU_VERSION=24.04
+
+# ---- build stage --------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS builder
+
+ARG VERSION=""
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /src
+COPY . .
+
+# Ubuntu ships no official "python" image, so install its packaged interpreter
+# (3.12 on 24.04) plus a toolchain, letting pip source-compile any dep that has
+# no wheel for the target arch (e.g. propcache on 32-bit ARM). The toolchain
+# stays in this builder stage. git is pulled in only for a plain local build
+# (empty VERSION), where setuptools_scm reads the version from .git.
+RUN set -eux; \
+    apt-get update; \
+    pkgs="python3 python3-venv python3-dev python3-pip build-essential libffi-dev zlib1g-dev"; \
+    if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
+    apt-get install -y --no-install-recommends $pkgs; \
+    rm -rf /var/lib/apt/lists/*; \
+    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    python3 -m venv /opt/venv; \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/venv/bin/pip install --no-cache-dir .
+
+# ---- runtime stage ------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION}
+
+LABEL org.opencontainers.image.title="yacron2" \
+      org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (Ubuntu)." \
+      org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# The venv was built against the system interpreter at /usr/bin/python3, so the
+# runtime image needs that same Python present (and ca-certificates so TLS to
+# Sentry/SMTP validates). Both stages are ubuntu:${UBUNTU_VERSION}, so the
+# interpreter version matches.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends python3 ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+
+# Run as an unprivileged, non-root user (65534 = "nobody").
+USER 65534:65534
+
+ENTRYPOINT ["yacron2"]
+CMD ["-c", "/etc/yacron2.d"]

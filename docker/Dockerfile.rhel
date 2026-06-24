@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1
+#
+# yacron2 — RHEL variant, built on Red Hat's Universal Base Image (UBI 9) with
+# its native Python 3.12. UBI is freely redistributable and is the right base
+# for RHEL/OpenShift shops and image-provenance policies that require a Red Hat
+# base. The runtime is the slimmer ubi-minimal.
+#
+# Build locally:
+#   docker build -f docker/Dockerfile.rhel -t yacron2:rhel .
+# CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
+# reads it from .git (kept in the context by .dockerignore).
+
+ARG UBI_VERSION=9
+
+# ---- build stage --------------------------------------------------------
+FROM registry.access.redhat.com/ubi${UBI_VERSION}/ubi AS builder
+
+ARG VERSION=""
+
+WORKDIR /src
+COPY . .
+
+# Install Python 3.12 from the UBI AppStream plus a toolchain so pip can
+# source-compile any dep lacking a manylinux wheel for the target arch. The
+# toolchain stays in this builder stage. git is pulled in only for a plain local
+# build (empty VERSION), where setuptools_scm reads the version from .git.
+RUN set -eux; \
+    pkgs="python3.12 python3.12-pip python3.12-devel gcc"; \
+    if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
+    dnf install -y $pkgs; \
+    dnf clean all; \
+    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    python3.12 -m venv /opt/venv; \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/venv/bin/pip install --no-cache-dir .
+
+# ---- runtime stage ------------------------------------------------------
+FROM registry.access.redhat.com/ubi${UBI_VERSION}/ubi-minimal
+
+LABEL org.opencontainers.image.title="yacron2" \
+      org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (RHEL/UBI 9)." \
+      org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# The venv references /usr/bin/python3.12, so the ubi-minimal runtime needs that
+# interpreter installed. microdnf is ubi-minimal's package manager; the same
+# Python 3.12 RPM the builder used is available here.
+RUN set -eux; \
+    microdnf install -y python3.12; \
+    microdnf clean all
+
+COPY --from=builder /opt/venv /opt/venv
+
+# Run as an unprivileged, non-root user (65534 = "nobody").
+USER 65534:65534
+
+ENTRYPOINT ["yacron2"]
+CMD ["-c", "/etc/yacron2.d"]

@@ -484,8 +484,8 @@ class JobConfig:
 
         # Windows has no setuid/setgid model that maps onto this feature, so
         # reject it with a clear error instead of silently running the job as
-        # the wrong account.  Spelled as ``sys.platform == "win32"`` (rather than
-        # platform.IS_WINDOWS) so the type checker statically prunes the
+        # the wrong account.  Spelled as ``sys.platform == "win32"`` (rather
+        # than platform.IS_WINDOWS) so the type checker statically prunes the
         # POSIX-only imports/calls below on Windows.
         if sys.platform == "win32":
             raise ConfigError(

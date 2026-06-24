@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+#
+# yacron2 — Amazon Linux variant, built on Amazon Linux 2023 with its packaged
+# Python 3.11. For AWS-centric deployments (ECS/EKS/EC2) that prefer a base
+# matching their hosts.
+#
+# Build locally:
+#   docker build -f docker/Dockerfile.amazonlinux -t yacron2:amazonlinux .
+# CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
+# reads it from .git (kept in the context by .dockerignore).
+
+ARG AL_VERSION=2023
+
+# ---- build stage --------------------------------------------------------
+FROM amazonlinux:${AL_VERSION} AS builder
+
+ARG VERSION=""
+
+WORKDIR /src
+COPY . .
+
+# Amazon Linux 2023's default python3 is 3.9; install the newer, packaged
+# python3.11 plus a toolchain so pip can source-compile any dep lacking a wheel
+# for the target arch. The toolchain stays in this builder stage. git is pulled
+# in only for a plain local build (empty VERSION), where setuptools_scm reads
+# the version from .git.
+RUN set -eux; \
+    pkgs="python3.11 python3.11-pip python3.11-devel gcc"; \
+    if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
+    dnf install -y $pkgs; \
+    dnf clean all; \
+    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    python3.11 -m venv /opt/venv; \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/venv/bin/pip install --no-cache-dir .
+
+# ---- runtime stage ------------------------------------------------------
+FROM amazonlinux:${AL_VERSION}
+
+LABEL org.opencontainers.image.title="yacron2" \
+      org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (Amazon Linux 2023)." \
+      org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# The venv references /usr/bin/python3.11, so the runtime needs it installed.
+# Both stages are amazonlinux:${AL_VERSION}, so the version matches.
+RUN set -eux; \
+    dnf install -y python3.11; \
+    dnf clean all
+
+COPY --from=builder /opt/venv /opt/venv
+
+# Run as an unprivileged, non-root user (65534 = "nobody").
+USER 65534:65534
+
+ENTRYPOINT ["yacron2"]
+CMD ["-c", "/etc/yacron2.d"]

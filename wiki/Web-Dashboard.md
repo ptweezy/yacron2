@@ -77,7 +77,10 @@ repeats the job's status, schedule (with its plain-English reading), the running
 PID(s), and a one-click button to copy the command. When
 [leader election](Clustering-and-Leader-Election#per-job-policy) is enabled, the
 header also shows the job's active **`clusterPolicy`** (`Leader`,
-`PreferLeader`, or `EveryNode`). Jobs are **deep-linkable** —
+`PreferLeader`, or `EveryNode`), and under
+[`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
+the node that currently **owns** the job (e.g. `cluster: Leader → yacron-c`).
+Jobs are **deep-linkable** —
 opening a job updates the URL to `#job/<name>`, so you can bookmark or share a
 direct link to it.
 
@@ -138,7 +141,9 @@ job list and renders:
   `node-a · 2/2 agreed`); when [leader election](Clustering-and-Leader-Election#leader-election)
   is on, it also shows the live quorum count and this node's role: **leader**,
   **follower** (with the current leader's name), or **no quorum** when the node
-  has stood down;
+  has stood down. Under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
+  there is no single leader, so the role reads **spread (per-job owner)** while
+  quorate, or **spread (no quorum)** otherwise;
 - a **per-peer table** listing each peer's host, reported node name, status, and
   the short form of its job-set id, with a coloured **status dot**: green for
   `agreed`, amber for `syncing`, red for `drifted`/`untrusted`, grey for

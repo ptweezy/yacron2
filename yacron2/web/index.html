@@ -1296,7 +1296,12 @@
     }
     if (caps.length) parts.push('<span class="faint">capture: ' + esc(caps.join(", ")) + "</span>");
     // clusterPolicy is only present in the payload when leader election is on
-    if (job.clusterPolicy) parts.push('<span class="faint">cluster: <b>' + esc(job.clusterPolicy) + "</b></span>");
+    if (job.clusterPolicy) {
+      var cl = "cluster: <b>" + esc(job.clusterPolicy) + "</b>";
+      // clusterOwner is present only under distribution: spread; null = no quorum
+      if ("clusterOwner" in job) cl += " → " + esc(job.clusterOwner || "no quorum");
+      parts.push('<span class="faint">' + cl + "</span>");
+    }
     $("dMeta").innerHTML = parts.join("");
     $("dRun").disabled = !job.enabled || job.running;
     $("dCancel").disabled = !job.running;
@@ -2053,11 +2058,17 @@
         // itself); cluster_size counts every member, so live = agreed + self.
         const live = agreed + 1;
         const quorate = data.quorum ? live >= data.quorum : false;
-        const role = data.is_leader
-          ? "leader"
-          : data.leader
-            ? "follower (leader: " + data.leader + ")"
-            : quorate ? "follower" : "no quorum";
+        let role;
+        if (data.distribution === "spread") {
+          // no single leader: per-job ownership, gated on quorum
+          role = quorate ? "spread (per-job owner)" : "spread (no quorum)";
+        } else {
+          role = data.is_leader
+            ? "leader"
+            : data.leader
+              ? "follower (leader: " + data.leader + ")"
+              : quorate ? "follower" : "no quorum";
+        }
         summary +=
           " · quorum " + live + "/" + (data.quorum || "?") +
           " · " + role;

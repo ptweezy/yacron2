@@ -21,7 +21,8 @@ Files
 Dashboards: yacron-a http://localhost:8080/ , yacron-b :8081 , yacron-c :8082 .
 Scroll to the "cluster" panel on any dashboard to watch attestation and
 leadership. The compose file's header comments list the things to try (failing
-the leader, losing quorum, drift, per-policy behaviour).
+the leader, losing quorum, drift, per-policy behaviour, and the opt-in
+`distribution: spread` mode that fans leader-gated jobs out across the nodes).
 
 These certificates are for local experimentation only. For real deployments
 provision per-node certs from your own PKI; see the wiki page

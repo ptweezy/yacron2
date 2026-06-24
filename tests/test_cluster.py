@@ -12,7 +12,9 @@ from yacron2.cluster import (
     STATUS_UNTRUSTED,
     ClusterManager,
     ClusterView,
+    elect_available_job_owner,
     elect_available_leader,
+    elect_job_owner,
     elect_leader,
     quorum_size,
 )
@@ -618,3 +620,114 @@ def test_elect_leader_warns_on_even_size(caplog):
         cfg = parse_config_string(even_yaml, "").cluster_config
     assert cfg is not None and cfg["electLeader"] is True
     assert any("even cluster size" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# distribution: spread (per-job rendezvous ownership)
+# --------------------------------------------------------------------------
+
+
+def test_distribution_defaults_single_leader():
+    cfg = parse_config_string(CLUSTER_YAML, "").cluster_config
+    assert cfg is not None and cfg["distribution"] == "single-leader"
+
+
+def test_distribution_spread_parsed():
+    cfg = parse_config_string(
+        CLUSTER_YAML + "  electLeader: true\n  distribution: spread\n", ""
+    ).cluster_config
+    assert cfg is not None and cfg["distribution"] == "spread"
+
+
+def test_distribution_spread_without_electleader_warns(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="yacron2.config"):
+        cfg = parse_config_string(
+            CLUSTER_YAML + "  distribution: spread\n", ""
+        ).cluster_config
+    assert cfg is not None and cfg["distribution"] == "spread"
+    assert any("no effect without electLeader" in r.message
+               for r in caplog.records)
+
+
+def test_job_owner_quorum_gated():
+    # below quorum -> nobody owns it (stands down), exactly like elect_leader
+    assert elect_job_owner("job1", "a", [], 3) is None
+    # at quorum -> a deterministic owner from the live set is chosen
+    owner = elect_job_owner("job1", "a", ["b"], 3)
+    assert owner in {"a", "b"}
+
+
+def test_job_owner_deterministic_and_consistent_across_nodes():
+    # every node in one quorum computes the SAME owner for a given job: that is
+    # what keeps spread mode at-most-once under a clean partition.
+    members = ["a", "b", "c"]
+    for job in ["alpha", "beta", "gamma", "delta", "epsilon"]:
+        owners = {
+            elect_job_owner(job, me, [p for p in members if p != me], 3)
+            for me in members
+        }
+        assert len(owners) == 1  # all three agree
+        assert owners.pop() in members
+
+
+def test_job_owner_spreads_load_across_nodes():
+    # over many jobs, ownership fans out across all three nodes (rendezvous
+    # hashing is well-mixed) rather than concentrating on one.
+    members = ["a", "b", "c"]
+    counts = dict.fromkeys(members, 0)
+    for i in range(300):
+        owner = elect_job_owner("job-%d" % i, "a", ["b", "c"], 3)
+        counts[owner] += 1
+    assert all(c > 0 for c in counts.values())  # every node owns some jobs
+    # roughly balanced: no node owns more than ~half (sanity, not exact)
+    assert max(counts.values()) < 200
+
+
+def test_available_job_owner_no_quorum_gate():
+    # isolated node still owns all its jobs (never skips) -- the PreferLeader
+    # contract; contrast elect_job_owner which would return None.
+    for job in ["a", "b", "c", "d"]:
+        assert elect_available_job_owner(job, "solo", []) == "solo"
+    assert elect_job_owner("a", "solo", [], 3) is None
+
+
+def test_available_job_owner_matches_quorate_owner_when_all_agree():
+    # with the full set agreeing, the quorum-gated and ungated owners coincide
+    for job in ["w", "x", "y", "z"]:
+        gated = elect_job_owner(job, "a", ["b", "c"], 3)
+        ungated = elect_available_job_owner(job, "a", ["b", "c"])
+        assert gated == ungated
+
+
+@pytest.mark.asyncio
+async def test_mtls_spread_assigns_distinct_owners(tmp_path):
+    # two agreeing nodes in spread mode: each job is owned by exactly one of
+    # them, and both compute the same owner for the same job.
+    tls = _write_tls(tmp_path)
+    pa, pb = _free_port(), _free_port()
+    cfg_a = _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a")
+    cfg_a["distribution"] = "spread"
+    cfg_b = _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b")
+    cfg_b["distribution"] = "spread"
+    a = ClusterManager(cfg_a, lambda: "v1:same")
+    b = ClusterManager(cfg_b, lambda: "v1:same")
+    await a.start()
+    await b.start()
+    try:
+        await a._poll_all()
+        await b._poll_all()
+        assert a.distribution == "spread"
+        for job in ["one", "two", "three", "four", "five"]:
+            # exactly one of the two nodes owns each job...
+            assert a.is_job_owner(job) != b.is_job_owner(job)
+            # ...and they agree on which one
+            assert a.job_owner(job) == b.job_owner(job)
+        # and there is no single "leader" reported in spread mode
+        assert a.view_dict()["leader"] is None
+        assert a.view_dict()["distribution"] == "spread"
+        assert a.view_dict()["quorate"] is True
+    finally:
+        await a.stop()
+        await b.stop()

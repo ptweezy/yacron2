@@ -33,10 +33,21 @@ the guarantee is best-effort across membership changes (a brief window after a
 leader dies may skip a firing; asymmetric/flapping reachability may briefly
 double-elect).  It is *not* a fenced, exactly-once guarantee; for that you
 would need a lease/consensus store, which this design intentionally avoids.
+
+When ``distribution`` is ``"spread"`` the single elected leader is replaced by
+**per-job ownership** via rendezvous (highest-random-weight) hashing (see
+:func:`elect_job_owner`): each job is independently assigned to one member
+of the quorate set, so leader-gated work fans out roughly evenly across the
+cluster instead of piling onto one node.  This is purely a load optimization:
+it keeps
+the same quorum gate and therefore the same safety guarantee (under a clean
+partition all quorate nodes see the same member set and compute the same owner
+for each job, so still at most one node runs it).
 """
 
 import asyncio
 import datetime
+import hashlib
 import logging
 import ssl
 from dataclasses import dataclass
@@ -105,6 +116,69 @@ def elect_available_leader(
     policy; contrast :func:`elect_leader`.
     """
     return min([node_name, *agreeing_peer_names])
+
+
+def _hrw_score(job_name: str, node_name: str) -> int:
+    """Rendezvous (highest-random-weight) score for one (job, node) pair.
+
+    A stable hash of ``job_name`` + ``node_name``: deterministic across nodes
+    and processes (so every node computes the same scores), and well-mixed, so
+    different jobs favour different nodes.  Only the *ordering* of scores
+    matters, not their magnitude.
+    """
+    digest = hashlib.sha256(
+        job_name.encode("utf-8") + b"\x00" + node_name.encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def _hrw_owner(job_name: str, members: List[str]) -> str:
+    """The rendezvous winner for ``job_name`` among ``members``.
+
+    The member with the highest score owns the job; ties (astronomically
+    unlikely with a 64-bit score) break on the node name so the choice stays
+    deterministic.  This is what spreads jobs ~evenly and, crucially, only
+    reassigns a leaving/joining node's *own* share on a membership change
+    (the defining property of rendezvous hashing) rather than reshuffling
+    everything the way ``hash % N`` would.
+    """
+    return max(members, key=lambda n: (_hrw_score(job_name, n), n))
+
+
+def elect_job_owner(
+    job_name: str,
+    node_name: str,
+    agreeing_peer_names: Iterable[str],
+    cluster_size: int,
+) -> Optional[str]:
+    """Quorum-gated per-job owner (the ``distribution: spread`` analogue of
+    :func:`elect_leader`).
+
+    The live set is this node plus the peers it sees agreeing.  If that set is
+    at least a quorum of ``cluster_size`` the owner is its rendezvous winner
+    for ``job_name`` (so every node in one quorum picks the same owner); else
+    ``None`` is returned, which is how a minority partition is made to stand
+    down, exactly as in :func:`elect_leader`, just per job.
+    """
+    live = [node_name, *agreeing_peer_names]
+    if len(live) < quorum_size(cluster_size):
+        return None
+    return _hrw_owner(job_name, live)
+
+
+def elect_available_job_owner(
+    job_name: str,
+    node_name: str,
+    agreeing_peer_names: Iterable[str],
+) -> str:
+    """Per-job owner *without* the quorum gate (spread-mode ``PreferLeader``).
+
+    The rendezvous winner among this node and the peers it sees agreeing.  As
+    with :func:`elect_available_leader`, this node is always a candidate, so a
+    value is always returned (never ``None``): an isolated node owns all its
+    jobs and never skips, at the cost of a possible double-run on partition.
+    """
+    return _hrw_owner(job_name, [node_name, *agreeing_peer_names])
 
 
 @dataclass
@@ -248,6 +322,9 @@ class ClusterManager:
         self.config = config
         self.get_job_set_id = get_job_set_id
         self.node_name: str = config["nodeName"]
+        # "single-leader" (one leader runs all Leader jobs) or "spread"
+        # (per-job ownership via rendezvous hashing); see _cluster_allows.
+        self.distribution: str = config.get("distribution", "single-leader")
         self.view = ClusterView(
             [peer["host"] for peer in config["peers"]],
             config["driftAfter"],
@@ -404,15 +481,53 @@ class ClusterManager:
         """Whether this node leads its reachable set, quorum or not."""
         return self.available_leader_name() == self.node_name
 
+    def is_quorate(self) -> bool:
+        """Whether this node currently sees a quorum (so it may run jobs)."""
+        return self.leader_name() is not None
+
+    # --- per-job ownership (distribution: spread) -------------------------
+
+    def job_owner(self, job_name: str) -> Optional[str]:
+        """Quorum-gated owner of ``job_name`` (spread mode), else ``None``."""
+        return elect_job_owner(
+            job_name,
+            self.node_name,
+            self._agreeing_peer_names(),
+            self.cluster_size(),
+        )
+
+    def is_job_owner(self, job_name: str) -> bool:
+        """Whether this node owns ``job_name`` (quorate, rendezvous winner)."""
+        return self.job_owner(job_name) == self.node_name
+
+    def available_job_owner(self, job_name: str) -> str:
+        """Owner of ``job_name`` ignoring quorum (spread ``PreferLeader``)."""
+        return elect_available_job_owner(
+            job_name, self.node_name, self._agreeing_peer_names()
+        )
+
+    def is_available_job_owner(self, job_name: str) -> bool:
+        """Whether this node owns ``job_name`` in its reachable set."""
+        return self.available_job_owner(job_name) == self.node_name
+
     def view_dict(self) -> Dict[str, Any]:
         leader = self.leader_name()
+        spread = self.distribution == "spread"
         return {
             "node_name": self.node_name,
             "job_set_id": self.get_job_set_id(),
             "cluster_size": self.cluster_size(),
             "quorum": self.quorum(),
             "elect_leader": bool(self.config.get("electLeader")),
-            "leader": leader,
-            "is_leader": leader is not None and leader == self.node_name,
+            "distribution": self.distribution,
+            "quorate": leader is not None,
+            # In spread mode there is no single leader: ownership is per job,
+            # so leader/is_leader are not meaningful (reported null/false).
+            "leader": None if spread else leader,
+            "is_leader": (
+                False
+                if spread
+                else (leader is not None and leader == self.node_name)
+            ),
             "peers": self.view.to_list(),
         }

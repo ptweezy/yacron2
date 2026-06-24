@@ -16,3 +16,8 @@ cluster:
   electLeader: true                 # only the elected leader runs scheduled jobs
   interval: 10                      # poll every 10s so the demo reacts quickly
   driftAfter: 2                     # report drift after 2 mismatched rounds
+  # distribution: spread            # OPT-IN: per-job ownership instead of one
+                                    # leader, so jobs fan out across nodes. Set
+                                    # it on ALL three node files together, then
+                                    # `docker compose ... up -d`. See THINGS TO
+                                    # TRY #7 in docker-compose-cluster.yml.

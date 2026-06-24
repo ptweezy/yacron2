@@ -78,6 +78,7 @@ present. New in version 1.2.0.
 | `driftAfter` | `Int` | `3` | Consecutive reachable-but-mismatched rounds before a peer is reported `drifted` (debounce). Must be `>= 1`. |
 | `connectTimeout` | `Int` | `10` | Seconds per peer request. Must be `> 0`. |
 | `electLeader` | `Bool` | `false` | When true, only the quorum-gated elected leader runs *scheduled* jobs (manual API triggers and retries are unaffected). Off by default, so a `cluster` section is observe-only until opted in. |
+| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
 
 Load-time validation (in addition to the numeric ranges above): with
 `electLeader: true`, a **2-node** cluster (one peer) is rejected with a

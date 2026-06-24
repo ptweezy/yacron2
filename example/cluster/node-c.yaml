@@ -13,3 +13,4 @@ cluster:
   electLeader: true
   interval: 10
   driftAfter: 2
+  # distribution: spread            # opt-in; must match the other nodes

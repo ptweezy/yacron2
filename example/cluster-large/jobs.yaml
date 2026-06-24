@@ -1,0 +1,118 @@
+# Shared job set for the 10-node docker-compose-cluster-large.yml demo.
+#
+# Mounted IDENTICALLY into all ten nodes (the job-set id is a fingerprint of
+# this file, so it must match on every node for them to agree). Node identity in
+# the output comes from $HOSTNAME at runtime, never from this file.
+#
+# This set is deliberately larger than the 3-node demo and includes several
+# CPU-heavy jobs so you can watch `distribution: spread` fan the load out across
+# the cluster (vs single-leader, where one node runs all of them at once).
+# Watch with:  docker stats
+#
+# CPU-heavy jobs burn one core for a fixed time via `timeout ... while :; do :`
+# and normalise their exit code with `|| true` so the timeout kill is not
+# reported as a failure.
+
+defaults:
+  captureStdout: true
+  captureStderr: true
+
+web:
+  listen:
+    - http://0.0.0.0:8080
+
+jobs:
+  # ---- EveryNode: run on all ten replicas -------------------------------
+  - name: welcome
+    command: echo "👋 $HOSTNAME joined the cluster at $(date -u +%H:%M:%S) UTC"
+    schedule: "@reboot"
+    clusterPolicy: EveryNode
+
+  - name: heartbeat
+    command: echo "♥ $HOSTNAME heartbeat at $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  # ---- Leader: one owner each (the single leader, or a per-job owner
+  #      under distribution: spread) ------------------------------------
+  - name: leader-echo-1
+    command: echo "[Leader] leader-echo-1 ran on $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+
+  - name: leader-echo-2
+    command: echo "[Leader] leader-echo-2 ran on $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+
+  - name: leader-echo-3
+    command: echo "[Leader] leader-echo-3 ran on $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+
+  - name: report-rollup
+    command: echo "[Leader] report-rollup ran on $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "*/3 * * * *"
+    clusterPolicy: Leader
+
+  # ---- Leader + CPU-heavy: these are what make spreading worthwhile ----
+  - name: cpu-burn-1
+    command: |
+      echo "[cpu] cpu-burn-1 burning one core ~25s on $HOSTNAME at $(date -u +%H:%M:%S)"
+      timeout 25 sh -c 'while :; do :; done' || true
+      echo "[cpu] cpu-burn-1 finished on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+
+  - name: cpu-burn-2
+    command: |
+      echo "[cpu] cpu-burn-2 burning one core ~25s on $HOSTNAME at $(date -u +%H:%M:%S)"
+      timeout 25 sh -c 'while :; do :; done' || true
+      echo "[cpu] cpu-burn-2 finished on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+
+  - name: cpu-burn-3
+    command: |
+      echo "[cpu] cpu-burn-3 burning one core ~40s on $HOSTNAME at $(date -u +%H:%M:%S)"
+      timeout 40 sh -c 'while :; do :; done' || true
+      echo "[cpu] cpu-burn-3 finished on $HOSTNAME"
+    schedule: "*/2 * * * *"
+    clusterPolicy: Leader
+
+  - name: cpu-burn-4
+    command: |
+      echo "[cpu] cpu-burn-4 burning one core ~30s on $HOSTNAME at $(date -u +%H:%M:%S)"
+      timeout 30 sh -c 'while :; do :; done' || true
+      echo "[cpu] cpu-burn-4 finished on $HOSTNAME"
+    schedule: "*/2 * * * *"
+    clusterPolicy: Leader
+
+  - name: hash-crunch
+    command: |
+      echo "[cpu] hash-crunch hashing ~25s on $HOSTNAME at $(date -u +%H:%M:%S)"
+      timeout 25 sh -c 'yes | sha256sum >/dev/null' || true
+      echo "[cpu] hash-crunch finished on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+
+  # ---- PreferLeader: lowest reachable owner; never skips, may double-run
+  - name: prefer-echo
+    command: echo "[PreferLeader] prefer-echo ran on $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: PreferLeader
+
+  - name: prefer-cpu
+    command: |
+      echo "[cpu] prefer-cpu burning one core ~20s on $HOSTNAME at $(date -u +%H:%M:%S)"
+      timeout 20 sh -c 'while :; do :; done' || true
+      echo "[cpu] prefer-cpu finished on $HOSTNAME"
+    schedule: "*/2 * * * *"
+    clusterPolicy: PreferLeader
+
+  # ---- Manual only: scheduled ~never, run it with "Run now" on any node;
+  #      manual triggers are not leader-gated. ----------------------------
+  - name: run-anywhere
+    command: echo "🚀 run-anywhere launched on $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "0 0 1 1 *"
+    clusterPolicy: Leader

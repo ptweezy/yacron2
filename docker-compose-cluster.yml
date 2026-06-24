@@ -49,6 +49,23 @@
 # 6. Cause drift. Edit example/cluster/jobs.yaml on ONE node only by pointing its
 #    jobs volume at a different file, restart it, and watch its peers report
 #    "drifted" (after driftAfter=2 rounds) on the others' cluster panels.
+#
+# 7. Spread the load. By default ONE leader (yacron-a) runs every Leader job.
+#    Uncomment `distribution: spread` in ALL THREE example/cluster/node-*.yaml
+#    files and recreate (`docker compose -f docker-compose-cluster.yml up -d`).
+#    Now each leader-gated job is owned by a (possibly different) node via
+#    rendezvous hashing, so the work fans out instead of piling on the leader.
+#    With these job names and all three nodes healthy you will see:
+#        tick-leader-only    -> runs on yacron-c
+#        tick-prefer-leader  -> runs on yacron-b
+#    (vs both on yacron-a under the default single-leader mode). The cluster
+#    panel shows the role as "spread (per-job owner)" and each job's drawer /
+#    `curl -s localhost:8080/jobs` shows its "clusterOwner". Same quorum gate,
+#    same guarantee — purely a load optimization.
+#
+#    For a bigger playground (10 nodes, more jobs, several CPU-heavy, spread on
+#    by default so you can watch the load fan out in `docker stats`), see
+#    docker-compose-cluster-large.yml.
 
 x-yacron-node: &yacron-node
   build:

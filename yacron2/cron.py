@@ -606,6 +606,20 @@ class Cron:
         # keep the per-poll payload lean for the common single-instance case.
         if self._elect_leader_configured:
             result["clusterPolicy"] = job.clusterPolicy
+            # Under spread distribution each leader-gated job has its own
+            # owner, so surface it for the dashboard (None = no quorum)
+            # and EveryNode has no single owner.
+            mgr = self.cluster_manager
+            if (
+                mgr is not None
+                and mgr.distribution == "spread"
+                and job.clusterPolicy != "EveryNode"
+            ):
+                result["clusterOwner"] = (
+                    mgr.available_job_owner(job.name)
+                    if job.clusterPolicy == "PreferLeader"
+                    else mgr.job_owner(job.name)
+                )
         return result
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
@@ -859,11 +873,17 @@ class Cron:
 
         * ``EveryNode`` — run on every replica, independent of cluster state
           (so these jobs keep firing even if the manager failed to start);
-        * ``Leader`` (default) — only the quorum-gated elected leader runs it
+        * ``Leader`` (default) — only the quorum-gated elected owner runs it
           (at-most-once; skips when there is no quorum);
-        * ``PreferLeader`` — the lowest reachable agreeing node runs it,
-          ignoring quorum (never skips while a node is up, but may double-run
-          across a partition).
+        * ``PreferLeader`` — the reachable agreeing owner runs it, ignoring
+          quorum (never skips while a node is up, but may double-run across a
+          partition).
+
+        Under the default ``distribution: single-leader`` the "owner" is the
+        one cluster-wide elected leader (so all ``Leader`` jobs run on that
+        node); under ``distribution: spread`` it is a *per-job*
+        rendezvous-hashed owner, so leader-gated work fans out across the
+        quorate nodes.  Both keep the same quorum gate and the same guarantee.
 
         ``Leader``/``PreferLeader`` fail *closed* (return False) when election
         is configured but no manager is running, so a broken cluster does not
@@ -877,18 +897,35 @@ class Cron:
         mgr = self.cluster_manager
         if mgr is None:
             return False  # election wanted but undeterminable -> fail closed
+        if mgr.distribution == "spread":
+            if job.clusterPolicy == "PreferLeader":
+                return mgr.is_available_job_owner(job.name)
+            return mgr.is_job_owner(job.name)  # "Leader"
         if job.clusterPolicy == "PreferLeader":
             return mgr.is_available_leader()
         return mgr.is_leader()  # "Leader"
 
     def _log_cluster_role(self) -> None:
-        """Log this node's quorum-leadership transitions (once per change)."""
+        """Log this node's run-eligibility transitions (once per change).
+
+        In single-leader mode this is leadership; in spread mode there is no
+        single leader, so we log quorum membership (the gate that decides
+        whether this node runs its owned jobs at all).
+        """
         if not self._elect_leader_configured:
             return
-        leader = (
-            self.cluster_manager is not None
-            and self.cluster_manager.is_leader()
-        )
+        mgr = self.cluster_manager
+        if mgr is not None and mgr.distribution == "spread":
+            quorate = mgr.is_quorate()
+            if quorate != self._was_leader:
+                logger.info(
+                    "cluster: this node %s quorum; per-job ownership %s",
+                    "joined" if quorate else "left",
+                    "active" if quorate else "suspended",
+                )
+                self._was_leader = quorate
+            return
+        leader = mgr is not None and mgr.is_leader()
         if leader != self._was_leader:
             logger.info(
                 "cluster: this node %s scheduled-job leadership",

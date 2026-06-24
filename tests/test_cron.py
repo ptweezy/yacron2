@@ -1316,6 +1316,8 @@ def test_cluster_allows_per_policy():
     assert cron._cluster_allows(job("PreferLeader")) is False
 
     class _Mgr:
+        distribution = "single-leader"
+
         def __init__(self, leader, avail):
             self._leader, self._avail = leader, avail
 
@@ -1338,6 +1340,37 @@ def test_cluster_allows_per_policy():
     assert cron._cluster_allows(job("PreferLeader")) is True
 
 
+def test_cluster_allows_spread_distribution():
+    import types
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+
+    def job(policy, name="j"):
+        return types.SimpleNamespace(clusterPolicy=policy, name=name)
+
+    # spread mode consults per-job ownership instead of one leader:
+    # is_job_owner is keyed on job name, is_available_job_owner ignores quorum.
+    class _SpreadMgr:
+        distribution = "spread"
+
+        def is_job_owner(self, name):
+            return name == "mine"
+
+        def is_available_job_owner(self, name):
+            return name == "mine-avail"
+
+    cron.cluster_manager = _SpreadMgr()
+    # Leader: runs only on the per-job owner
+    assert cron._cluster_allows(job("Leader", "mine")) is True
+    assert cron._cluster_allows(job("Leader", "other")) is False
+    # PreferLeader: runs on the reachable owner (no quorum gate)
+    assert cron._cluster_allows(job("PreferLeader", "mine-avail")) is True
+    assert cron._cluster_allows(job("PreferLeader", "other")) is False
+    # EveryNode: always runs, regardless of distribution
+    assert cron._cluster_allows(job("EveryNode", "other")) is True
+
+
 def test_cluster_role_logged_on_transition(caplog):
     import logging
 
@@ -1345,6 +1378,8 @@ def test_cluster_role_logged_on_transition(caplog):
     cron._elect_leader_configured = True
 
     class _Mgr:
+        distribution = "single-leader"
+
         def __init__(self, leader):
             self._leader = leader
 
@@ -1361,4 +1396,32 @@ def test_cluster_role_logged_on_transition(caplog):
     assert msgs == [
         "cluster: this node acquired scheduled-job leadership",
         "cluster: this node lost scheduled-job leadership",
+    ]
+
+
+def test_cluster_role_logged_spread_quorum(caplog):
+    import logging
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+
+    class _SpreadMgr:
+        distribution = "spread"
+
+        def __init__(self, quorate):
+            self._quorate = quorate
+
+        def is_quorate(self):
+            return self._quorate
+
+    cron.cluster_manager = _SpreadMgr(True)
+    with caplog.at_level(logging.INFO, logger="yacron2"):
+        cron._log_cluster_role()
+        cron._log_cluster_role()  # unchanged: no second log
+        cron.cluster_manager = _SpreadMgr(False)
+        cron._log_cluster_role()
+    msgs = [r.message for r in caplog.records if "quorum" in r.message]
+    assert msgs == [
+        "cluster: this node joined quorum; per-job ownership active",
+        "cluster: this node left quorum; per-job ownership suspended",
     ]

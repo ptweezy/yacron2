@@ -284,6 +284,78 @@ PreferLeader  -> run only if this node is the lowest reachable agreeing node
 Leader        -> run only if this node is the quorum-gated elected leader
 ```
 
+(Under `distribution: spread`, described next, the last two lines become "the
+*per-job owner* among the reachable agreeing nodes" and "the quorum-gated
+*per-job owner*" respectively.)
+
+## Distribution: one leader, or spread the load
+
+By default (`distribution: single-leader`) the single elected leader runs
+**every** `Leader` job, so the other replicas are pure standby for scheduled
+work. That is the simplest model, but on a busy cluster it makes the leader a
+hotspot while the rest idle.
+
+Setting `distribution: spread` keeps the same quorum gate but replaces the one
+leader with **per-job ownership**: each leader-gated job is assigned to a single
+node by *rendezvous (highest-random-weight) hashing* of the job name against the
+agreeing members. Different jobs hash to different nodes, so the scheduled
+workload fans out roughly evenly across the cluster.
+
+```yaml
+cluster:
+  listen: "0.0.0.0:8443"
+  tls: { ca: /etc/yacron2/cluster-ca.pem, cert: /etc/yacron2/this-node.pem, key: /etc/yacron2/this-node.key }
+  peers:
+    - host: yacron-b.internal:8443
+    - host: yacron-c.internal:8443
+  electLeader: true
+  distribution: spread      # default is single-leader
+```
+
+What to know:
+
+* **Same safety, not more.** Under a clean partition every quorate node sees the
+  same member set and computes the same owner for each job, so still at most one
+  node runs it. This is a *load* optimization only; it does not change the
+  best-effort guarantee. `Leader` jobs still skip without quorum; `PreferLeader`
+  still ignores quorum (its owner is computed over the reachable set, so an
+  isolated node owns and runs all of its jobs).
+* **Rendezvous hashing, not modulo.** When a node leaves or joins, only *its*
+  share of jobs is reassigned (to the next-highest-weight node); the rest stay
+  put. A membership change is therefore minimally disruptive, unlike
+  `hash % N`, which would reshuffle everything.
+* **Best with many or heavy jobs.** Hashing is only *roughly* even, so with a
+  handful of jobs the split is lumpy (several can land on one node). It pays off
+  when a single node cannot comfortably carry all the scheduled work; for light
+  workloads the default single leader is simpler and equally correct.
+* **Keep it consistent.** Every node must agree on `distribution` (just like the
+  peer list and `electLeader`). A node left on `single-leader` while the others
+  run `spread` would run every job itself. `distribution` is *not* part of the
+  job-set id (it is cluster config, not a job property), so a mismatch does not
+  show up as drift; treat it like `electLeader` and roll it out uniformly. It is
+  inert without `electLeader` (and yacron2 warns if you set it anyway).
+
+### Worked example
+
+The bundled [three-node demo](#trying-it-locally) names its two scheduled
+leader-gated jobs `tick-leader-only` (`Leader`) and `tick-prefer-leader`
+(`PreferLeader`). With all three nodes healthy:
+
+| Job | `single-leader` (default) | `spread` |
+| --- | --- | --- |
+| `tick-leader-only` | runs on `yacron-a` (the leader) | runs on `yacron-c` |
+| `tick-prefer-leader` | runs on `yacron-a` (the leader) | runs on `yacron-b` |
+
+So flipping to `spread` moves the two jobs onto two *different* nodes instead of
+piling both onto the leader. The owner is a deterministic function of the job
+name and the live member set, so it stays put until membership changes (then
+only the affected jobs move). You can confirm it live:
+
+```shell
+curl -s http://localhost:8080/jobs | python -m json.tool | grep -A1 clusterPolicy
+# each leader-gated job shows a "clusterOwner" naming the node that runs it
+```
+
 ## Observing the cluster
 
 `GET /cluster` on the [web/HTTP interface](HTTP-API) returns the current view as
@@ -298,8 +370,10 @@ JSON. When no `cluster` section is configured it returns
   "cluster_size": 3,
   "quorum": 2,
   "elect_leader": true,
-  "leader": "node-a",          // null when this node is not quorate
-  "is_leader": true,
+  "distribution": "single-leader", // or "spread"
+  "quorate": true,                 // whether this node sees a quorum
+  "leader": "node-a",              // null when not quorate, or always in spread mode
+  "is_leader": true,               // always false in spread mode (no single leader)
   "peers": [
     {"host": "yacron-b.internal:8443", "status": "agreed",
      "node_name": "node-b", "job_set_id": "v1:…",
@@ -313,10 +387,15 @@ JSON. When no `cluster` section is configured it returns
 }
 ```
 
+In `spread` mode there is no single leader, so `leader` is `null` and
+`is_leader` is `false`; use `quorate` to tell whether this node is running its
+owned jobs. The per-job owners appear as a `clusterOwner` field on each
+leader-gated job in [`GET /jobs`](HTTP-API).
+
 The same view is rendered as a **cluster panel** in the
 [Web Dashboard](Web-Dashboard): a status dot per peer, the agreement tally, and
 (when election is on) the quorum count and this node's role (leader, follower,
-or "no quorum").
+"no quorum", or, in spread mode, "spread (per-job owner)").
 
 ## Guarantees and trade-offs
 
@@ -365,6 +444,28 @@ docker compose -f docker-compose-cluster.yml stop yacron-a   # watch leadership 
 
 The compose file's header comments document the full set of things to try
 (losing quorum, drift, the per-policy job behaviour).
+
+### A larger, CPU-heavy cluster
+
+To watch [`distribution: spread`](#distribution-one-leader-or-spread-the-load)
+fan real load across the cluster, the repository also ships
+[`docker-compose-cluster-large.yml`](https://github.com/ptweezy/yacron2/blob/develop/docker-compose-cluster-large.yml):
+**ten** nodes (dashboards on ports 8080–8089) running a larger job set with
+several CPU-heavy jobs, defaulting to `spread`. Each node's config is generated
+from environment variables by a small entrypoint, so there are no per-node files
+to maintain.
+
+```shell
+docker compose -f docker-compose-cluster-large.yml up --build
+docker stats     # watch CPU spread across the nodes (a few cores busy on several nodes)
+
+# contrast: pin everything to one leader and watch a single node light up
+DISTRIBUTION=single-leader docker compose -f docker-compose-cluster-large.yml up -d
+```
+
+(Ten is an *even* size, so the nodes log the even-size warning; that is expected
+and called out in the file. Quorum is 6, so it tolerates four failures.) Its
+header comments list how to inspect per-job owners and fail nodes.
 
 ## See also
 

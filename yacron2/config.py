@@ -52,6 +52,13 @@ DEFAULT_CLUSTER = {
     # triggers and retries are unaffected); see yacron2.cluster.elect_leader.
     # Off by default so a cluster section is observe-only until opted in.
     "electLeader": False,
+    # How leader-gated jobs are distributed across the quorate cluster:
+    #   "single-leader" (default) - one elected leader runs every Leader job;
+    #   "spread"                  - per-job ownership via rendezvous hashing,
+    #                               so the work fans out across the quorate
+    #                               nodes (same quorum gate, same guarantee).
+    # Inert unless electLeader is on; see yacron2.cluster.elect_job_owner.
+    "distribution": "single-leader",
 }
 
 
@@ -308,6 +315,8 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("connectTimeout"): Int(),
                 # run scheduled jobs on the elected leader only (default false)
                 Opt("electLeader"): Bool(),
+                # how leader-gated jobs spread across the quorate cluster
+                Opt("distribution"): Enum(["single-leader", "spread"]),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -646,6 +655,14 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
                 size,
                 size - 1,
             )
+    elif cfg["distribution"] != DEFAULT_CLUSTER["distribution"]:
+        # distribution only governs how *leader-gated* jobs spread, so it does
+        # nothing without electLeader. Warn rather than fail (harmless).
+        logger.warning(
+            "cluster.distribution=%r has no effect without electLeader; "
+            "without leader election every node runs every job.",
+            cfg["distribution"],
+        )
     return ClusterConfig(cfg)
 
 

@@ -25,7 +25,7 @@ operator-facing walkthrough.
 | `yacron2/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`), and `JobRetryState`. |
 | `yacron2/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and by `cluster.py` (peer comparison). |
-| `yacron2/cluster.py` | Cluster peer attestation and leader election: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop), the pure `ClusterView` state machine (per-peer status + drift debounce), and the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
+| `yacron2/cluster.py` | Cluster peer attestation and leader election: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop), the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `yacron2/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
 | `yacron2/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
@@ -252,6 +252,17 @@ quorum gate, for `PreferLeader`) take a node name, the agreeing peer names, and
 the cluster size, and the manager wraps them as `is_leader()` /
 `is_available_leader()` / `leader_name()`. The `/cluster` web endpoint serialises
 `view_dict()`.
+
+Under `distribution: spread` the single leader is replaced by per-job ownership:
+the equally pure `elect_job_owner` (quorum-gated) and `elect_available_job_owner`
+pick the owner of a given job via rendezvous (highest-random-weight) hashing
+(`_hrw_score` / `_hrw_owner`), and the manager exposes `is_job_owner(name)` /
+`is_available_job_owner(name)`. `Cron._cluster_allows` branches on
+`manager.distribution` to call the leader or the per-job variant; the choice is
+purely about *which node* runs a job, so the quorum gate and the guarantee are
+unchanged. Because the owner is a deterministic function of the job name and the
+agreeing member set, all quorate nodes agree, and a membership change only
+reassigns the affected jobs.
 
 See [Clustering and Leader Election](Clustering-and-Leader-Election) for the
 operator-facing model and trust boundary.

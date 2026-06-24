@@ -51,6 +51,18 @@ project, on which yacron2 is based.
   — never skips, but may double-run across a partition), or `EveryNode` (run on
   every replica, for per-node or idempotent work). `clusterPolicy` is part of
   the job-set id and shown in the dashboard job drawer.
+- **Spread distribution (opt-in).** A `cluster.distribution` option chooses how
+  leader-gated jobs spread across the quorate cluster: the default
+  `single-leader` keeps one elected leader running every `Leader` job, while
+  `spread` gives each job its own owner via rendezvous (highest-random-weight)
+  hashing, so the scheduled workload fans out roughly evenly instead of piling
+  onto one node. It keeps the same quorum gate and the same best-effort
+  guarantee (under a clean partition every quorate node computes the same owner
+  per job, so still at-most-once); a membership change only reassigns the
+  affected jobs. Purely a load optimization for clusters with many or heavy
+  jobs; inert without `electLeader`. In spread mode `GET /cluster` reports
+  `distribution`/`quorate` (no single `leader`), and `GET /jobs` plus the
+  dashboard drawer show each job's `clusterOwner`.
 
 ## 1.1.7 (2026-06-23)
 

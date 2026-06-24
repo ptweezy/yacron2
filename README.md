@@ -1281,6 +1281,33 @@ each job (when election is on) is shown in the dashboard's job drawer and in the
 `GET /jobs` payload, and it is part of the [job-set id](#job-set-id), so
 replicas that disagree on a job's policy show up as drift.
 
+#### Distribution: one leader, or spread the load
+
+By default (`distribution: single-leader`) the one elected leader runs *every*
+`Leader` job, so the other replicas are pure standby for scheduled work. Setting
+`cluster.distribution: spread` keeps the same quorum gate but gives each
+leader-gated job its own owner via rendezvous (highest-random-weight) hashing of
+the job name against the agreeing members, so the workload fans out roughly
+evenly across the quorate cluster instead of piling onto one node:
+
+```yaml
+cluster:
+  # ...listen / tls / peers...
+  electLeader: true
+  distribution: spread       # default is single-leader
+```
+
+This is a *load* optimization, not a stronger guarantee: under a clean partition
+every quorate node sees the same member set and computes the same owner for each
+job, so it stays at-most-once; a membership change only reassigns the affected
+jobs (the defining property of rendezvous hashing). It pays off when one node
+cannot comfortably carry all the scheduled work; for light workloads the default
+single leader is simpler and equally correct. Set `distribution` consistently on
+every node (like `electLeader`); it is inert without election. In spread mode
+`GET /cluster` reports `distribution`/`quorate` (no single `leader`), and each
+leader-gated job's owner appears as `clusterOwner` in `GET /jobs` and the
+dashboard drawer.
+
 ### Includes
 
 (new in version 0.13)

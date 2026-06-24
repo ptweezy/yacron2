@@ -1,4 +1,4 @@
-"""OS-specific behaviour, isolated so the rest of yacron2 stays portable.
+"""OS-specific behavior, isolated so the rest of yacron2 stays portable.
 
 yacron2 began life POSIX-only.  Everything that genuinely differs between Unix
 and Windows lives here behind a small, uniform surface, so the scheduler, the

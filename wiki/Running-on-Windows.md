@@ -1,14 +1,14 @@
 # Running on Windows
 
 yacron2 runs natively on Windows, alongside Linux and macOS. This page is the
-canonical reference for the handful of behaviours that differ on Windows: how
+canonical reference for the handful of behaviors that differ on Windows: how
 to install it, where it looks for configuration, how a string `command` is fed
 to a shell, how to stop the daemon, how a job is terminated, and the two
 POSIX-only features that are reported (never silently dropped) on Windows.
 Everything not listed here behaves exactly as it does on POSIX, so the rest of
 this wiki applies unchanged.
 
-All of the OS-specific behaviour is isolated in a single module
+All of the OS-specific behavior is isolated in a single module
 (`yacron2/platform.py`); the scheduler, job runner, config loader, and entry
 point read the same on every platform.
 
@@ -76,7 +76,7 @@ platform-specific:
 | POSIX | `/etc/yacron2.d` |
 | Windows | `%APPDATA%\yacron2` (e.g. `C:\Users\<you>\AppData\Roaming\yacron2`) |
 
-On Windows the default is `%APPDATA%\yacron2`, the Windows analogue of
+On Windows the default is `%APPDATA%\yacron2`, the Windows analog of
 `/etc/yacron2.d`. If `APPDATA` is somehow unset (rare — for example a bare
 service account with no roaming profile), yacron2 falls back to the user
 profile directory (`~`, i.e. `os.path.expanduser("~")`) and uses
@@ -178,7 +178,7 @@ Windows Proactor loop has no `add_signal_handler`, so on Windows yacron2 instead
 installs `signal.signal` handlers for `SIGINT` (Ctrl-C) and `SIGBREAK`
 (Ctrl-Break / console close) and runs a lightweight heartbeat timer so the
 interpreter observes the pending handler promptly even while the loop is blocked
-in I/O. The user-visible behaviour is identical to POSIX. For the shutdown
+in I/O. The user-visible behavior is identical to POSIX. For the shutdown
 sequence in detail, see
 [Signal handling and graceful shutdown](CLI-Reference#signal-handling-and-graceful-shutdown)
 in the [Command-Line Reference](CLI-Reference).

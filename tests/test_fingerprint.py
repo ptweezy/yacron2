@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 from yacron2.config import parse_config_string
 from yacron2.fingerprint import (
     SCHEME_VERSION,
@@ -7,6 +9,7 @@ from yacron2.fingerprint import (
     job_digest,
     job_set_id,
 )
+from yacron2.platform import IS_WINDOWS
 
 
 def _jobs(yaml: str):
@@ -126,7 +129,7 @@ jobs:
 
 
 def test_fractional_float_is_preserved():
-    # normalisation must only collapse whole-number floats, not lose precision
+    # normalization must only collapse whole-number floats, not lose precision
     half = """
 jobs:
   - name: a
@@ -392,3 +395,235 @@ jobs:
         "https://aaa@example.com/1"
     )
     assert job_digest(job) == first
+
+
+# ---------------------------------------------------------------------------
+# Stability + completeness of the fingerprint.
+#
+# The job-set id is a cross-instance coordination contract: operators compare
+# stored ids across versions, so the scheme must be STABLE (a canonicalization
+# refactor must not silently change every id) and COMPLETE (every
+# behavior-affecting field must be in identity). The existing tests are all
+# relational (_id(A) vs _id(B)); these add a golden value, a field-set
+# lock, and redaction coverage for the mail password and the onSuccess /
+# onPermanentFailure action blocks.
+# ---------------------------------------------------------------------------
+
+# The golden values are the POSIX reference. The fingerprint is platform-scoped
+# by design: besides the job's own `shell` (pinned below), the default report
+# block's shell also defaults to platform.DEFAULT_SHELL (/bin/sh on POSIX, ""
+# on Windows), so the digest legitimately differs across platforms. HA replicas
+# are compared per-platform, so the POSIX value is the right tripwire and the
+# test is POSIX-only. If this literal changes on POSIX, the canonicalization
+# scheme changed, which REQUIRES bumping SCHEME_VERSION, not just editing the
+# constant. Treat an unexpected change here as a bug, not a test to "fix".
+GOLDEN_CONFIG = """
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "*/5 * * * *"
+    shell: /bin/sh
+  - name: beta
+    command:
+      - echo
+      - beta
+    schedule: "0 0 * * *"
+    shell: /bin/sh
+    captureStdout: true
+"""
+
+GOLDEN_JOB_SET_ID = (
+    "v1:a9f2f815d95b5d2a8a098bb7ea65f4d41fb415cfe8bbf89f27d84ab5ad38ee15"
+)
+GOLDEN_ALPHA_DIGEST = (
+    "bd4f380c66dff46676accb37c1d8a5ebae76964346a1bcf0a38f5410efc8ac59"
+)
+
+
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="golden digest is the POSIX reference (platform-scoped)"
+)
+def test_job_set_id_golden_value():
+    jobs = _jobs(GOLDEN_CONFIG)
+    assert job_set_id(jobs) == GOLDEN_JOB_SET_ID
+    # the per-job digest is pinned too, so a drift can be localized to the
+    # per-job canonicalization vs the set-combining step.
+    assert job_digest(jobs[0]) == GOLDEN_ALPHA_DIGEST
+
+
+EXPECTED_CANONICAL_FIELDS = frozenset(
+    {
+        "name",
+        "command",
+        "schedule",
+        "shell",
+        "concurrencyPolicy",
+        "captureStderr",
+        "captureStdout",
+        "streamPrefix",
+        "saveLimit",
+        "maxLineLength",
+        "timezone",
+        "enabled",
+        "failsWhen",
+        "onFailure",
+        "onPermanentFailure",
+        "onSuccess",
+        "environment",
+        "executionTimeout",
+        "killTimeout",
+        "statsd",
+        "user",
+        "group",
+    }
+)
+
+
+def test_canonical_job_field_set_is_locked():
+    # adding or removing a field from the identity changes every id, so it must
+    # be a deliberate decision. This fails loudly and names the drift, instead
+    # of a field silently entering/leaving identity in an unrelated edit.
+    (job,) = _jobs(
+        """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+"""
+    )
+    assert set(canonical_job(job).keys()) == EXPECTED_CANONICAL_FIELDS
+
+
+_IDENTITY_BASE = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    concurrencyPolicy: Allow
+    captureStderr: false
+    captureStdout: false
+    streamPrefix: "p"
+    saveLimit: 4096
+    maxLineLength: 4096
+    executionTimeout: 10
+    killTimeout: 30
+"""
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("concurrencyPolicy: Allow", "concurrencyPolicy: Forbid"),
+        ("captureStderr: false", "captureStderr: true"),
+        ("captureStdout: false", "captureStdout: true"),
+        ('streamPrefix: "p"', 'streamPrefix: "q"'),
+        ("saveLimit: 4096", "saveLimit: 8192"),
+        ("maxLineLength: 4096", "maxLineLength: 8192"),
+        ("executionTimeout: 10", "executionTimeout: 20"),
+        ("killTimeout: 30", "killTimeout: 60"),
+        ("name: a", "name: b"),
+    ],
+)
+def test_identity_field_change_changes_id(old, new):
+    # each of these fields affects firing/behavior, so a change must change the
+    # id (else HA replicas with different behavior would wrongly match).
+    variant = _IDENTITY_BASE.replace(old, new)
+    assert variant != _IDENTITY_BASE  # the replacement actually fired
+    assert _id(_IDENTITY_BASE) != _id(variant)
+
+
+def test_statsd_presence_changes_id():
+    without = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+"""
+    with_statsd = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    statsd:
+      host: localhost
+      port: 8125
+      prefix: yacron
+"""
+    assert _id(without) != _id(with_statsd)
+
+
+def test_fails_when_change_changes_id():
+    base = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    failsWhen:
+      producesStdout: false
+"""
+    variant = base.replace("producesStdout: false", "producesStdout: true")
+    assert _id(base) != _id(variant)
+
+
+def _mail_pw_config(secret):
+    return """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        mail:
+          from: a@b.com
+          to: c@d.com
+          smtpHost: smtp
+          password:
+            value: {secret}
+""".format(secret=secret)
+
+
+def test_inline_mail_password_is_redacted():
+    # two configs differing only in the mail password value must produce the
+    # same: the id is logged and HTTP-served, so it must embed no secret.
+    assert _id(_mail_pw_config("hunter2")) == _id(_mail_pw_config("swordfish"))
+
+
+def test_mail_password_presence_still_changes_id():
+    with_pw = _mail_pw_config("hunter2")
+    without_pw = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        mail:
+          from: a@b.com
+          to: c@d.com
+          smtpHost: smtp
+"""
+    # redaction hides the value, not the fact that a password is configured
+    assert _id(with_pw) != _id(without_pw)
+
+
+def _sentry_action_config(action, secret):
+    return """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    {action}:
+      report:
+        sentry:
+          dsn:
+            value: {secret}
+""".format(action=action, secret=secret)
+
+
+@pytest.mark.parametrize("action", ["onSuccess", "onPermanentFailure"])
+def test_sentry_secret_redacted_in_action_block(action):
+    # redaction must be wired through ALL action blocks, not just onFailure
+    # (which the existing test covers).
+    a = _sentry_action_config(action, "https://aaa@example.com/1")
+    b = _sentry_action_config(action, "https://bbb@example.com/2")
+    assert _id(a) == _id(b)

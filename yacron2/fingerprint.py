@@ -9,7 +9,7 @@ if they are running the same set of jobs, regardless of:
   ``defaults`` block (the fingerprint is taken over the *merged*, effective
   :class:`~yacron2.config.JobConfig`, not the raw YAML text);
 * equivalent spellings of the same schedule (the ``minute:``/``hour:`` object
-  form normalises to the same five-field crontab line as the string form).
+  form normalizes to the same five-field crontab line as the string form).
 
 This is intended for coordinating replicas: several yacron2 instances deployed
 from the same configuration can confirm they hold an identical job set (e.g.
@@ -31,7 +31,7 @@ Design notes that matter for that "byte-identical across hosts" guarantee:
   is configured, never its literal value.
 * **the scheme is versioned** (the ``v1:`` prefix).  IDs are only comparable
   within the same scheme version; bumping :data:`SCHEME_VERSION` lets the
-  canonicalisation evolve without silently making old and new IDs "disagree".
+  canonicalization evolve without silently making old and new IDs "disagree".
 
 Because the fingerprint is over *effective* config, it also reflects
 platform-dependent defaults (e.g. the default ``shell`` is ``/bin/sh`` on POSIX
@@ -46,8 +46,8 @@ from typing import Any, Dict, Iterable, List, Union
 
 from yacron2.config import JobConfig
 
-# Canonicalisation scheme version.  Prefixes the emitted ID and is folded into
-# the hash input, so a future change to what/how we canonicalise can bump this
+# Canonicalization scheme version.  Prefixes the emitted ID and is folded into
+# the hash input, so a future change to what/how we canonicalize can bump this
 # and old/new IDs will compare unequal instead of silently colliding.
 SCHEME_VERSION = "v1"
 
@@ -58,7 +58,7 @@ _SECRET_PLACEHOLDER = "<redacted>"
 
 
 def _schedule_repr(job: JobConfig) -> str:
-    """Normalise a job's schedule to a canonical string.
+    """Normalize a job's schedule to a canonical string.
 
     The object form (``minute:``/``hour:``/...) collapses to the same
     five-field crontab line as the equivalent string form, so the two spellings
@@ -123,8 +123,8 @@ def _redact_action(action: Dict[str, Any]) -> Dict[str, Any]:
 def canonical_job(job: JobConfig) -> Dict[str, Any]:
     """Build the canonical, host-independent identity dict for one job.
 
-    Includes every behaviour-affecting field of the effective config.  The
-    resolved uid/gid (host-specific) are deliberately excluded in favour of the
+    Includes every behavior-affecting field of the effective config.  The
+    resolved uid/gid (host-specific) are deliberately excluded in favor of the
     configured ``user``/``group``; inline secret values are redacted.
     """
     return {
@@ -138,9 +138,9 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
         "streamPrefix": job.streamPrefix,
         "saveLimit": job.saveLimit,
         "maxLineLength": job.maxLineLength,
-        # The resolved scheduling frame fully captures firing behaviour, so the
+        # The resolved scheduling frame fully captures firing behavior, so the
         # raw ``utc`` flag is NOT hashed separately: it would be redundant and
-        # would split behaviourally-identical configs. job.timezone is "UTC"
+        # would split behaviorally-identical configs. job.timezone is "UTC"
         # when utc=true (or unset), the IANA name when a timezone is set (the
         # raw utc flag is then inert), and None for local time (utc=false, no
         # timezone).
@@ -171,7 +171,7 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
 def _normalize_numbers(obj: Any) -> Any:
     """Collapse the int/float distinction by value, recursively.
 
-    A whole-number float (``30.0``) canonicalises to the same int (``30``) it
+    A whole-number float (``30.0``) canonicalizes to the same int (``30``) it
     would be if inherited from a ``DEFAULT_CONFIG`` int literal.  Without this,
     a ``Float()``-typed field (``killTimeout``, the retry delays, ...) written
     *inline*, where strictyaml coerces it to a float, would hash differently
@@ -194,7 +194,7 @@ def _normalize_numbers(obj: Any) -> Any:
 def _canonical_bytes(obj: Any) -> bytes:
     # sort_keys for order-independence; ensure_ascii so the byte output is
     # pure-ASCII and identical regardless of locale/encoding; compact
-    # separators so there is exactly one serialisation; _normalize_numbers so
+    # separators so there is exactly one serialization; _normalize_numbers so
     # int and float spellings of the same value cannot diverge.
     return json.dumps(
         _normalize_numbers(obj),
@@ -213,7 +213,7 @@ def job_set_id(jobs: Iterable[JobConfig]) -> str:
     """Compute the order-independent fingerprint of a set of jobs.
 
     Returns a string of the form ``"v1:<64 hex chars>"``.  Per-job digests are
-    sorted (neutralising order) and hashed together; an empty job set yields a
+    sorted (neutralizing order) and hashed together; an empty job set yields a
     stable, well-defined ID.
     """
     digests = sorted(job_digest(job) for job in jobs)

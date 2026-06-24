@@ -116,7 +116,7 @@ setuid/setgid model). On Windows a job with `user` or `group` set raises a confi
 error *before* the superuser/`geteuid` check is ever reached, verbatim:
 `Job <name>: changing user/group is not supported on Windows`. The "not running as
 superuser", "User not found", and "Group not found" errors and the numeric-uid
-passwd-database behaviour below are therefore all POSIX-only (they require the
+passwd-database behavior below are therefore all POSIX-only (they require the
 `pwd`/`grp` databases and `os.geteuid()`). The fix on Windows is to remove the
 `user`/`group` fields. See [Running on Windows](Running-on-Windows).
 
@@ -433,7 +433,7 @@ and possibly `Job <name> did not gracefully terminate after <n> seconds, killing
 N seconds (recorded internally as retcode `-100`). Cancellation sends `SIGTERM`, then
 `SIGKILL` if the process is still alive after `killTimeout` seconds (default `30`).
 
-**Windows note.** The `SIGTERM`-then-`SIGKILL` escalation is POSIX behaviour
+**Windows note.** The `SIGTERM`-then-`SIGKILL` escalation is POSIX behavior
 (`terminate()` = `SIGTERM`, graceful and trappable; `kill()` = `SIGKILL`, forceful).
 Windows has no POSIX signals — both `terminate()` and `kill()` call `TerminateProcess`,
 an immediate ungraceful stop. The child is not notified to clean up, so the

@@ -17,7 +17,7 @@ deadline derived from `executionTimeout`; on expiry it is cancelled, and
 `killTimeout` controls the SIGTERM-then-SIGKILL escalation used during any
 cancellation.
 
-The SIGTERM-then-SIGKILL escalation is the POSIX behaviour. On Windows there
+The SIGTERM-then-SIGKILL escalation is the POSIX behavior. On Windows there
 are no POSIX signals, so both steps call `TerminateProcess` (an immediate,
 ungraceful stop); `killTimeout` still bounds the wait, but the
 terminate-then-kill escalation is effectively moot because the outcome is the
@@ -27,7 +27,7 @@ same hard kill. See [Running on Windows](Running-on-Windows).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `concurrencyPolicy` | enum: `Allow`, `Forbid`, `Replace` | `Allow` | Behaviour when a launch is requested while another instance of the same job is still running. |
+| `concurrencyPolicy` | enum: `Allow`, `Forbid`, `Replace` | `Allow` | Behavior when a launch is requested while another instance of the same job is still running. |
 | `executionTimeout` | float (seconds, `> 0` when set) | none (`null`) | Maximum wall-clock duration of a single run. On expiry the run is cancelled and assigned return code `-100`. |
 | `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is cancelled, seconds to wait after SIGTERM before sending SIGKILL (POSIX); on Windows both calls map to `TerminateProcess`, so `killTimeout` only bounds the wait before the same hard kill. See [Running on Windows](Running-on-Windows). |
 
@@ -214,7 +214,7 @@ jobs:
     killTimeout: 0.5   # SIGKILL 0.5s after the (ignored) SIGTERM
 ```
 
-This example demonstrates POSIX-only behaviour (a shell trapping SIGTERM). On
+This example demonstrates POSIX-only behavior (a shell trapping SIGTERM). On
 Windows there is no signal to trap; the job would be hard-killed via
 `TerminateProcess` regardless, so the trap and the SIGTERM/SIGKILL timing it
 illustrates do not apply. See [Running on Windows](Running-on-Windows).

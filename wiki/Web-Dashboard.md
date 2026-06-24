@@ -25,7 +25,7 @@ Open the listener's root path in a browser — <http://127.0.0.1:8080/> for the
 example above. The page is served at `/` on every `http://` listener and is
 self-contained, so nothing else needs to be installed or hosted.
 
-The HTML document is returned with defence-in-depth security headers, including a
+The HTML document is returned with defense-in-depth security headers, including a
 strict `Content-Security-Policy` (`default-src 'self'`, `connect-src 'self'`,
 `frame-ancestors 'none'`, anti-clickjacking `X-Frame-Options: DENY`, and
 `X-Content-Type-Options: nosniff`). Any header you set under `web.headers` is
@@ -53,13 +53,13 @@ Each row shows:
 
 | Column | What it shows |
 | --- | --- |
-| **Status** | The job's current health — one of **Running**, **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`) — each with a colour and glyph. |
+| **Status** | The job's current health — one of **Running**, **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`) — each with a color and glyph. |
 | **Job** | The job `name` and its command. |
 | **Schedule** | The raw schedule string; hover it for a plain-English reading. |
 | **Last run** | How long ago the last run finished (kept fresh every second) and an exit-code badge. |
 | **Took** | The last run's duration. |
 | **Next** | A live countdown to the next scheduled run (`—` while running or disabled). |
-| **Trend** | A **sparkline** of recent runs — one bar per run, height by duration, coloured by outcome. |
+| **Trend** | A **sparkline** of recent runs — one bar per run, height by duration, colored by outcome. |
 | **Actions** | One-click **Run** (or **Stop**, for a running job) and **Logs**. |
 
 The toolbar above the table lets you:
@@ -80,14 +80,14 @@ direct link to it.
 
 ### Logs — live output, in your browser
 
-[![Live log tailing in the drawer, with ANSI colour, line numbers, and an in-log search highlighting every match](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)
+[![Live log tailing in the drawer, with ANSI color, line numbers, and an in-log search highlighting every match](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)
 
 The Logs tab streams a job's captured output over
 [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events):
 it replays the most recent buffered lines first, then appends new lines live as a
 running job produces them. Features:
 
-- **ANSI colour** rendering (toggle off to see raw text), with `stderr` lines distinguished from `stdout`;
+- **ANSI color** rendering (toggle off to see raw text), with `stderr` lines distinguished from `stdout`;
 - absolute **line numbers** and optional per-line **timestamps**;
 - in-log **search / grep**, plain-text or **regex**, with a live match count, `Enter` to jump between matches, and a **matches-only** mode that hides non-matching lines;
 - **follow** (auto-scroll) and **line-wrap** toggles;
@@ -104,10 +104,10 @@ the tab without limit.
 
 [![The history tab: a stats grid (runs, success rate, ok/fail, avg/min/max duration), a per-run duration bar chart, and a detailed run table](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)
 
-The History tab summarises the job's retained run history:
+The History tab summarizes the job's retained run history:
 
 - a **stats grid** — total runs, **success rate**, OK / fail counts, and average / min / max duration. The success rate is computed over runs that ran to completion, so deliberate **cancellations are excluded**;
-- a **duration bar chart**, one bar per run (newest on the right), coloured by outcome;
+- a **duration bar chart**, one bar per run (newest on the right), colored by outcome;
 - a **run table** — outcome, exit code, when it finished, how long it took, and a reason for any run that carries one (failed runs, and runs cancelled from the dashboard).
 
 History is retained **in memory only**, up to the most recent 50 runs per job, and

@@ -1,5 +1,7 @@
 import asyncio
 import datetime
+import os
+import signal
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8,6 +10,7 @@ import pytest
 
 import yacron2.cron
 from tests._commands import cmd_hang, cmd_print, cmd_sleep, yaml_command
+from yacron2 import platform
 from yacron2.config import ConfigError, JobConfig
 from yacron2.job import JobOutputStream, RunningJob
 
@@ -1291,3 +1294,248 @@ async def test_run_survives_config_error(monkeypatch):
 
     # completes without raising (UnboundLocalError before the fix)
     await asyncio.wait_for(cron.run(), timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Web server integration.
+#
+# Every other web test calls a handler coroutine directly with a hand-rolled
+# fake request, so routing, the auth middleware, and the bind/serve path are
+# never exercised together. These drive the real server start_stop_web_app
+# stands up, over real HTTP, so a dropped route or an inverted ui/auth gate (a
+# data endpoint served unauthenticated) is caught.
+# ---------------------------------------------------------------------------
+
+_WEB_ONE_JOB = """
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "*/5 * * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_web_app_enforces_auth_when_token_configured():
+    import aiohttp
+
+    cron = yacron2.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authToken": {"value": "secret"},
+            "ui": False,
+        }
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        async with aiohttp.ClientSession() as session:
+            # no credentials -> rejected
+            async with session.get(base + "/jobs") as resp:
+                assert resp.status == 401
+            # wrong token -> rejected
+            async with session.get(
+                base + "/jobs", headers={"Authorization": "Bearer nope"}
+            ) as resp:
+                assert resp.status == 401
+            # correct token -> the real jobs payload is served
+            async with session.get(
+                base + "/jobs", headers={"Authorization": "Bearer secret"}
+            ) as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert [j["name"] for j in data] == ["alpha"]
+    finally:
+        await cron.start_stop_web_app(None)
+    # clearing the config fully stops the server
+    assert cron.web_runner is None
+
+
+@pytest.mark.asyncio
+async def test_web_app_ui_path_public_but_data_paths_require_auth():
+    import aiohttp
+
+    cron = yacron2.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authToken": {"value": "secret"},
+            "ui": True,
+        }
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        async with aiohttp.ClientSession() as session:
+            # the UI page holds no data, so it is reachable without a token
+            async with session.get(base + "/") as resp:
+                assert resp.status == 200
+                assert "text/html" in resp.headers["Content-Type"]
+            # a data endpoint still requires the token even with the UI enabled
+            async with session.get(base + "/jobs") as resp:
+                assert resp.status == 401
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+@pytest.mark.asyncio
+async def test_web_app_restarts_on_config_change(monkeypatch):
+    # changing the web config replaces the running server with a new one;
+    # clearing it stops the server entirely. web_site_from_url is faked so no
+    # real socket is bound and the transition logic is tested in isolation.
+    started = []
+
+    class FakeSite:
+        def __init__(self, url):
+            self.url = url
+
+        async def start(self):
+            started.append(self.url)
+
+    monkeypatch.setattr(
+        yacron2.cron,
+        "web_site_from_url",
+        lambda runner, url: FakeSite(url),
+    )
+
+    cron = yacron2.cron.Cron(None)
+    await cron.start_stop_web_app({"listen": ["http://host-a:8000"]})
+    runner1 = cron.web_runner
+    assert runner1 is not None
+    assert started == ["http://host-a:8000"]
+
+    # a different config: the old runner is replaced and the new site started
+    await cron.start_stop_web_app({"listen": ["http://host-b:9000"]})
+    assert cron.web_runner is not None
+    assert cron.web_runner is not runner1
+    assert started == ["http://host-a:8000", "http://host-b:9000"]
+
+    # clearing the config stops the server
+    await cron.start_stop_web_app(None)
+    assert cron.web_runner is None
+
+
+# ---------------------------------------------------------------------------
+# Daemon lifecycle: config hot-reload, graceful shutdown drain, real signal.
+#
+# These drive the actual run() loop end-to-end. Reload through run() (vs the
+# existing tests all use config_arg=None, so the job set never changes) and
+# the retry-drain-on-shutdown path were untested; a regression in either breaks
+# headline daemon behavior silently.
+# ---------------------------------------------------------------------------
+
+
+async def _wait_until(pred, tries=300, interval=0.01):
+    # Poll a predicate instead of sleeping a fixed time, so the tests stay fast
+    # and do not flake under CI load. Bounded so a never-true predicate fails
+    # cleanly instead of hanging.
+    for _ in range(tries):
+        if pred():
+            return
+        await asyncio.sleep(interval)
+    raise AssertionError("condition not met within {} tries".format(tries))
+
+
+# schedules fire at midnight; the suite's clock is fixed at noon, so these jobs
+# never actually spawn -- the test exercises reload, not execution.
+_RELOAD_V1 = """
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "0 0 * * *"
+  - name: beta
+    command: echo beta
+    schedule: "0 0 * * *"
+"""
+
+_RELOAD_V2 = """
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "0 0 * * *"
+  - name: gamma
+    command: echo gamma
+    schedule: "0 0 * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_run_reloads_changed_config(tmp_path, monkeypatch):
+    # tiny sleep so the reload loop iterates quickly instead of waiting out the
+    # real ~60s to the next minute boundary.
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda: 0.02)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_V1)
+
+    cron = yacron2.cron.Cron(str(cfg))
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+    id1 = cron.job_set_id()
+
+    task = asyncio.create_task(cron.run())
+    try:
+        # let the loop load v1 at least once, then change the file on disk
+        await _wait_until(lambda: cron._logged_job_set_id is not None)
+        cfg.write_text(_RELOAD_V2)
+        # the running daemon must pick up the new job set on its own
+        await _wait_until(lambda: set(cron.cron_jobs) == {"alpha", "gamma"})
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert set(cron.cron_jobs) == {"alpha", "gamma"}
+    assert cron.job_set_id() != id1
+
+
+_RETRY_DRAIN_JOB = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(cmd_print(out="x", code=2))
+    + """
+    schedule: "@reboot"
+    onFailure:
+      retry:
+        maximumRetries: 5
+        initialDelay: 30
+        maximumDelay: 30
+        backoffMultiplier: 1
+"""
+)
+
+
+@pytest.mark.asyncio
+async def test_run_drains_pending_retry_on_shutdown():
+    # the @reboot job fails at once and schedules a retry with a long delay,
+    # so a pending (sleeping) retry task sits in retry_state when we shut down.
+    cron = yacron2.cron.Cron(None, config_yaml=_RETRY_DRAIN_JOB)
+
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: bool(cron.retry_state))
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+    # graceful shutdown must cancel and drain the pending retry, not orphan a
+    # task or leave retry_state populated.
+    assert cron.retry_state == {}
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="POSIX signal delivery (SIGTERM)"
+)
+def test_sigterm_triggers_graceful_shutdown():
+    # End-to-end of the systemd/`docker stop` path: a real SIGTERM, routed
+    # through the installed handler, must drive run() to a clean return. Uses a
+    # dedicated loop (like the platform handler roundtrip test) so the handler
+    # owns the signal and it does not reach the default disposition.
+    loop = asyncio.new_event_loop()
+    try:
+        cron = yacron2.cron.Cron(None)  # no jobs: run() idles until signalled
+        remove = platform.install_shutdown_handlers(loop, cron.signal_shutdown)
+        try:
+            loop.call_later(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM))
+            loop.run_until_complete(asyncio.wait_for(cron.run(), timeout=5))
+            assert cron._stop_event.is_set()
+        finally:
+            remove()
+    finally:
+        loop.close()

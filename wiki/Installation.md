@@ -13,7 +13,7 @@ for the Windows-specific details.
 | Requirement | Value |
 | --- | --- |
 | Python (pip/pipx) | `>= 3.10`; 3.10, 3.11, 3.12, 3.13 and 3.14 are supported and tested (`requires-python = ">=3.10"`). For an older Python, use the standalone binary instead. |
-| Operating system | Linux, macOS, and Windows. OS-specific behaviour is isolated in `yacron2/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows — see [Running on Windows](Running-on-Windows). |
+| Operating system | Linux, macOS, and Windows. OS-specific behavior is isolated in `yacron2/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows — see [Running on Windows](Running-on-Windows). |
 | CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z) — both the container image and the prebuilt binaries; the prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
@@ -244,6 +244,6 @@ web listeners are not available on Windows; see
 
 See [Command-Line Reference](CLI-Reference) for all flags, and
 [Configuration Reference](Configuration-Reference) for the config schema. For
-Windows-specific behaviour, see [Running on Windows](Running-on-Windows). If you
+Windows-specific behavior, see [Running on Windows](Running-on-Windows). If you
 are coming from the original yacron, see
 [Migration from yacron](Migration-from-yacron).

@@ -6,7 +6,7 @@ This page covers the yacron2 developer workflow (environment, tests, linters, ty
 
 yacron2 targets **Python 3.10+**; 3.10, 3.11, 3.12, 3.13 and 3.14 are the tested interpreters (`pyproject.toml` `requires-python = ">=3.10"`, classifiers for 3.10 through 3.14).
 
-yacron2 runs **natively on Windows, Linux, and macOS** (as of 1.2.0; WSL is no longer required). All OS-specific behaviour is isolated in `yacron2/platform.py` — `grp`/`pwd` are guarded there, not imported unconditionally at load time on Windows — so the package and its full test suite run natively on every supported OS, and `pip install yacron2` works on Windows. See [Running on Windows](Running-on-Windows) for the platform-specific details.
+yacron2 runs **natively on Windows, Linux, and macOS** (as of 1.2.0; WSL is no longer required). All OS-specific behavior is isolated in `yacron2/platform.py` — `grp`/`pwd` are guarded there, not imported unconditionally at load time on Windows — so the package and its full test suite run natively on every supported OS, and `pip install yacron2` works on Windows. See [Running on Windows](Running-on-Windows) for the platform-specific details.
 
 Linting and type checking do not import the package and run on any platform. mypy is pinned to the `linux` platform (`pyproject.toml` `[tool.mypy]` `platform = "linux"`), so type-checking is identical on every OS: it type-checks the POSIX API surface, and the Windows branches are runtime-guarded.
 

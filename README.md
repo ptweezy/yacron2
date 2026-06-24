@@ -1,12 +1,12 @@
 # yacron2 (Yet Another Cron ...2)
 
-[![PyPI version](https://img.shields.io/pypi/v/yacron2.svg)](https://pypi.org/project/yacron2/)
-[![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg)](https://pypi.org/project/yacron2/)
-[![PyPI status](https://img.shields.io/pypi/status/yacron2.svg)](https://pypi.org/project/yacron2/)
-[![GitHub release](https://img.shields.io/github/v/release/ptweezy/yacron2?logo=github)](https://github.com/ptweezy/yacron2/releases/latest)
-[![Release downloads](https://img.shields.io/github/downloads/ptweezy/yacron2/total?logo=github&label=binary%20downloads)](https://github.com/ptweezy/yacron2/releases)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-informational)](https://github.com/ptweezy/yacron2/releases/latest)
-[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64-informational)](https://github.com/ptweezy/yacron2/releases/latest)
+[![PyPI version](https://img.shields.io/pypi/v/yacron2.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/yacron2/)
+[![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/yacron2/)
+[![PyPI status](https://img.shields.io/pypi/status/yacron2.svg?color=2ea44f)](https://pypi.org/project/yacron2/)
+[![GitHub release](https://img.shields.io/github/v/release/ptweezy/yacron2?logo=github&color=8a2be2)](https://github.com/ptweezy/yacron2/releases/latest)
+[![Release downloads](https://img.shields.io/github/downloads/ptweezy/yacron2/total?logo=github&label=binary%20downloads&color=fb8c00)](https://github.com/ptweezy/yacron2/releases)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-00bcd4)](https://github.com/ptweezy/yacron2/releases/latest)
+[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64-c2185b)](https://github.com/ptweezy/yacron2/releases/latest)
 [![CI](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/yacron2/pkgs/container/yacron2)
 [![Docker Hub](https://img.shields.io/badge/docker.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/ptweezy/yacron2)
@@ -98,7 +98,7 @@ docker run --rm \
   ghcr.io/ptweezy/yacron2:1.0.14-alpine
 ```
 
-yacron2 is a pure-Python app that supports any Python >= 3.10, so behaviour is
+yacron2 is a pure-Python app that supports any Python >= 3.10, so behavior is
 identical across variants. Pick the base, not the interpreter version. The
 Debian default covers the most architectures; each variant covers the arches
 its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
@@ -200,7 +200,7 @@ POSIX. A few platform details differ:
 
 * **Default config location.** When `-c` is omitted, yacron2 looks in
   `%APPDATA%\yacron2` (e.g. `C:\Users\you\AppData\Roaming\yacron2`), the
-  Windows analogue of `/etc/yacron2.d`. Point it anywhere with `-c`:
+  Windows analog of `/etc/yacron2.d`. Point it anywhere with `-c`:
 
   ```shell
   yacron2 -c C:\path\to\yacron2tab.yaml
@@ -334,8 +334,8 @@ The overview shows every job with its **live status**, a **countdown to its next
 
 | Live log tail | Run history | Schedule, explained |
 | :---: | :---: | :---: |
-| [![Live log tailing with ANSI colour and in-log search](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png) | [![Run history with success rate and a per-run duration chart](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png) |
-| Follow a running job's output **live** over Server-Sent Events, with ANSI colour, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a colour-coded per-run duration chart and the full run log. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
+| [![Live log tailing with ANSI color and in-log search](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png) | [![Run history with success rate and a per-run duration chart](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png) |
+| Follow a running job's output **live** over Server-Sent Events, with ANSI color, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a color-coded per-run duration chart and the full run log. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
 
 **Everything is one keypress away**: a fuzzy command palette (`Ctrl-K` / `⌘K`) runs any action or jumps to any job, `?` lists every shortcut, `/` filters, `j`/`k` move the cursor, `r` runs the selected job and `x` cancels it. You can **run a single job, or every failing job at once, on demand**, with a click.
 
@@ -593,7 +593,7 @@ It is possible also to report job success, as well as failure, via the
         smtpHost: 127.0.0.1
 ```
 
-Since yacron2 0.5, it is possible to customise the format of the report. For
+Since yacron2 0.5, it is possible to customize the format of the report. For
 `mail` reporting, the option `subject` indicates what is the subject of the
 email, while `body` formats the email body.  For Sentry reporting, there is
 only `body`.  In all cases, the values of those options are strings that are
@@ -1061,7 +1061,7 @@ $ http get http://127.0.0.1:8080/jobs
 
 `GET /jobs/{name}/runs` returns the job's retained run history (oldest first,
 bounded and in memory only) together with aggregate statistics. Each run carries
-the same fields as `last_run` above; `stats` summarises them. The `success_rate`
+the same fields as `last_run` above; `stats` summarizes them. The `success_rate`
 is computed over runs that ran to completion (cancellations are excluded).
 Returns `404 Not Found` for an unknown job.
 
@@ -1127,7 +1127,7 @@ which gives it some useful properties:
   inline on each job or hoisted into a `defaults` block;
 * **equivalent schedule spellings match**: the `minute:`/`hour:` object form
   fingerprints the same as the equivalent five-field crontab string;
-* it covers **every behaviour-affecting field** (command, schedule, shell, the
+* it covers **every behavior-affecting field** (command, schedule, shell, the
   *names* of `environment` variables, capture flags, `failsWhen`,
   retry/reporting policy, timezone, `enabled`, and so on), so any meaningful
   change to a job changes the id;

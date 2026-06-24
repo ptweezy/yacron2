@@ -24,15 +24,18 @@ COPY . .
 # for the target arch. The toolchain stays in this builder stage. git is pulled
 # in only for a plain local build (empty VERSION), where setuptools_scm reads
 # the version from .git.
+# retry() re-runs a network step (package install, pip download) a few times
+# with backoff, so a transient mirror/index hiccup does not fail the build.
 RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     pkgs="python3.11 python3.11-pip python3.11-devel gcc"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
-    dnf install -y $pkgs; \
+    retry dnf --setopt=retries=10 install -y $pkgs; \
     dnf clean all; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
     python3.11 -m venv /opt/venv; \
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/pip install --no-cache-dir .
+    retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
 # ---- runtime stage ------------------------------------------------------
 FROM amazonlinux:${AL_VERSION}
@@ -49,7 +52,8 @@ ENV PYTHONUNBUFFERED=1 \
 # The venv references /usr/bin/python3.11, so the runtime needs it installed.
 # Both stages are amazonlinux:${AL_VERSION}, so the version matches.
 RUN set -eux; \
-    dnf install -y python3.11; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry dnf --setopt=retries=10 install -y python3.11; \
     dnf clean all
 
 COPY --from=builder /opt/venv /opt/venv

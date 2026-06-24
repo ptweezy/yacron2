@@ -46,7 +46,7 @@ JOBS_INLINE_HISTORY = 20
 # browser then authenticates every data request with the token the user enters.
 WEB_PUBLIC_PATHS = frozenset({"/"})
 
-# Defence-in-depth security headers for the dashboard HTML document. The
+# Defense-in-depth security headers for the dashboard HTML document. The
 # page is fully self-contained (one inline <script>, inline styles, no
 # external assets) and only ever talks to its own origin, so this CSP is
 # deliberately strict:
@@ -97,7 +97,7 @@ class JobRunInfo:
         return (self.finished_at - self.started_at).total_seconds()
 
     def to_dict(self) -> Dict[str, Any]:
-        """JSON-serialisable summary (everything except the output stream)."""
+        """JSON-serializable summary (everything except the output stream)."""
         return {
             "outcome": self.outcome,
             "exit_code": self.exit_code,

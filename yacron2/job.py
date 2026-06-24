@@ -203,7 +203,7 @@ class Reporter:
 
 class SentryReporter(Reporter):
     def __init__(self) -> None:
-        # Remember the last (dsn, environment) we initialised the global
+        # Remember the last (dsn, environment) we initialized the global
         # Sentry client with, so we don't rebuild the client/transport on
         # every single report.
         self._inited_key: Optional[Tuple[str, Optional[str]]] = None

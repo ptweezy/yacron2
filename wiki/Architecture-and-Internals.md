@@ -10,7 +10,7 @@ name rather than repeating the option reference; see
 ## Module map
 
 yacron2 is an asyncio Python daemon that runs natively on Linux, macOS, and
-Windows. All OS-specific behaviour is isolated in `yacron2/platform.py`
+Windows. All OS-specific behavior is isolated in `yacron2/platform.py`
 (`DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`,
 `install_shutdown_handlers`, plus the `IS_WINDOWS` flag). `grp`/`pwd` and per-job
 user/group switching remain POSIX-only and are runtime-gated on `IS_WINDOWS`
@@ -30,7 +30,7 @@ operator-facing walkthrough.
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`) ->
 (`statsd`, `config`). `config.py` has no dependency on `cron.py` or `job.py`.
 `platform.py` is a leaf module with no yacron2 dependencies, imported by
-`__main__`, `config`, `cron`, and `job` wherever per-OS behaviour is needed.
+`__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.
 
 ## The event loop
 
@@ -82,7 +82,7 @@ in order:
    `JobConfig`). On `ConfigError`, the error is logged and `self.cron_jobs` is
    left unchanged, because `update_config` only assigns `self.cron_jobs` on a
    successful parse; the loop keeps running the previously loaded jobs. `config`
-   is initialised to `None` at the top of each iteration so that a failed parse
+   is initialized to `None` at the top of each iteration so that a failed parse
    does not dereference an unbound config later in the body. Any other
    exception is logged as `"please report this as a bug (1)"`.
 
@@ -268,7 +268,7 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
    `start()` above), so `_demote` is never reached.
 
 3. **`wait()`** is what the reaper awaits. If there is no process but
-   `start_failed` is set, it synthesises `retcode = 127` (conventional
+   `start_failed` is set, it synthesizes `retcode = 127` (conventional
    "command not found"), reads streams, and returns — so a failed launch is a
    normal job failure, not a reaper bug. With no deadline it awaits
    `proc.wait()` and then `_on_stop()`. With a deadline it awaits
@@ -325,7 +325,7 @@ Retries are driven by `JobRetryState` (in `job.py`), the
 `Cron.retry_state` map (name -> `JobRetryState`), and the
 `schedule_retry_job` coroutine.
 
-`JobRetryState` holds `delay` (current, initialised to `initialDelay`),
+`JobRetryState` holds `delay` (current, initialized to `initialDelay`),
 `multiplier` (`backoffMultiplier`), `max_delay` (`maximumDelay`), a `count` of
 retries performed, an optional `task` (the pending `schedule_retry_job` task),
 and a `cancelled` flag. `next_delay()` returns the current delay, then advances
@@ -373,7 +373,7 @@ instance is already running:
 - **`Forbid`** — return without launching.
 - **`Replace`** — for each currently running instance, set
   `running_job.replaced = True` *before* `await running_job.cancel()`, so the
-  reaper recognises the forced termination as a replacement rather than a
+  reaper recognizes the forced termination as a replacement rather than a
   failure (`_handle_finished_job` skips reporting/retries for replaced runs),
   then a fresh instance is launched.
 
@@ -412,7 +412,7 @@ call sites and logged as warnings so telemetry never crashes the scheduler. See
   `SIGINT`/`SIGTERM` on POSIX vs Ctrl-C/Ctrl-Break (`SIGINT`/`SIGBREAK`) on
   Windows, both routed through `platform.install_shutdown_handlers` into
   `signal_shutdown` -> `_stop_event.set()` — but the finish-running-jobs-first
-  behaviour is identical on every OS.
+  behavior is identical on every OS.
 
 For the broader operational picture see
 [Production and Container Deployment](Production-Deployment); for the CLI surface

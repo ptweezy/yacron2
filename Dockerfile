@@ -35,16 +35,19 @@ COPY . .
 # Otherwise (a plain `docker build .`) setuptools_scm reads the version from
 # .git, which requires the git binary the slim image does not ship; git is
 # installed only in that case.
+# retry() re-runs a network step (package install, pip download) a few times
+# with backoff, so a transient mirror/index hiccup does not fail the build.
 RUN set -eux; \
-    apt-get update; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     pkgs="build-essential libffi-dev zlib1g-dev"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
-    apt-get install -y --no-install-recommends $pkgs; \
+    retry apt-get -o Acquire::Retries=5 update; \
+    retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends $pkgs; \
     rm -rf /var/lib/apt/lists/*; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
     python -m venv /opt/venv; \
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/pip install --no-cache-dir .
+    retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
 # ---- runtime stage ------------------------------------------------------
 FROM python:3.14-slim

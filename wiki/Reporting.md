@@ -204,7 +204,7 @@ returns early.
 
 Notes on behavior:
 
-- The Sentry client is initialised once per `(dsn, environment)` pair and cached;
+- The Sentry client is initialized once per `(dsn, environment)` pair and cached;
   it is rebuilt only when one of those changes, not on every report.
 - `maxStringLength` mutates the process-global `sentry_sdk.utils.MAX_STRING_LENGTH`
   when set (and truthy).

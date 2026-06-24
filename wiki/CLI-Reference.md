@@ -173,7 +173,7 @@ On Windows the config path uses Windows paths and the default is
 yacron2.exe -c %APPDATA%\yacron2
 ```
 
-See [Running on Windows](Running-on-Windows) for Windows-specific CLI behaviour
+See [Running on Windows](Running-on-Windows) for Windows-specific CLI behavior
 (default config path, default shell, Ctrl-C / Ctrl-Break shutdown).
 
 Validate a config and exit (suitable for CI or a container healthcheck/preflight):
@@ -197,5 +197,5 @@ yacron2 --version
 For installation and packaging details (pip, PyInstaller binary, Docker), see
 [Installation](Installation). For deploying yacron2 as a long-running service,
 see [Production and Container Deployment](Production-Deployment). For
-Windows-specific CLI behaviour (default config path, default shell, Ctrl-C /
+Windows-specific CLI behavior (default config path, default shell, Ctrl-C /
 Ctrl-Break shutdown), see [Running on Windows](Running-on-Windows).

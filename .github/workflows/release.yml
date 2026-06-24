@@ -412,7 +412,7 @@ jobs:
   # Mach-O cannot be stapled, so notarization publishes the ticket online and
   # Gatekeeper validates on first run -- no `xattr -d com.apple.quarantine`
   # needed by end users. If the secrets are absent the step is skipped with a
-  # warning and the build ships unsigned (the old behaviour), so a release is
+  # warning and the build ships unsigned (the old behavior), so a release is
   # never blocked on signing setup.
   binaries-macos:
     needs: [decide, version, gate]

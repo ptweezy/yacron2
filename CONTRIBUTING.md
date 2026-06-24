@@ -16,7 +16,7 @@ python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
 ```
 
-> **Note:** all OS-specific behaviour lives in
+> **Note:** all OS-specific behavior lives in
 > [`yacron2/platform.py`](yacron2/platform.py) (default shell, default config
 > location, unix-socket support, and shutdown-signal wiring). The POSIX-only
 > `user`/`group` feature imports `grp`/`pwd` lazily and is rejected on Windows.

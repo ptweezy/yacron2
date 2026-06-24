@@ -60,7 +60,7 @@ jobs:
     schedule: "*/2 * * * *"
 
   # Always fails, then retries with exponential backoff (2s, 4s, 8s). Good for
-  # watching the retry/backoff behaviour and the eventual failed status.
+  # watching the retry/backoff behavior and the eventual failed status.
   - name: flaky-with-retry
     command: |
       echo "Trying the flaky operation at $(date -u +%T)..."

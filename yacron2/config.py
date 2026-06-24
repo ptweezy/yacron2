@@ -222,8 +222,14 @@ _job_defaults_common = {
     Opt("executionTimeout"): Float(),
     Opt("killTimeout"): Float(),
     Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
-    Opt("user"): Str() | Int(),
-    Opt("group"): Str() | Int(),
+    # Int() is tried first so a numeric ``user: 1000`` parses as the integer
+    # 1000 (a uid/gid), reaching the isinstance(..., int) branches in
+    # _resolve_user_group. With Str() first, strictyaml's union would match the
+    # always-accepting Str() and a bare number would arrive as the string
+    # "1000", silently looked up as a login *name* (getpwnam("1000")) instead.
+    # A non-numeric name (``user: www-data``) fails Int() and uses Str().
+    Opt("user"): Int() | Str(),
+    Opt("group"): Int() | Str(),
     Opt("streamPrefix"): Str(),
     Opt("enabled"): Bool(),
 }
@@ -433,8 +439,8 @@ class JobConfig:
 
         # Windows has no setuid/setgid model that maps onto this feature, so
         # reject it with a clear error instead of silently running the job as
-        # the wrong account.  Spelt as ``sys.platform == "win32"`` (rather than
-        # platform.IS_WINDOWS) so the type checker statically prunes the
+        # the wrong account.  Spelled as ``sys.platform == "win32"`` (rather
+        # than platform.IS_WINDOWS) so the type checker statically prunes the
         # POSIX-only imports/calls below on Windows.
         if sys.platform == "win32":
             raise ConfigError(
@@ -492,7 +498,7 @@ class JobConfig:
 
     def _validate_numeric_ranges(self) -> None:
         # strictyaml only enforces the type (Int/Float); fail fast on values
-        # that would otherwise produce obscure runtime behaviour instead of a
+        # that would otherwise produce obscure runtime behavior instead of a
         # clear configuration error.
         def require(condition: bool, message: str) -> None:
             if not condition:

@@ -2,7 +2,7 @@
 
 The original tests drove real subprocesses with POSIX shell snippets
 (``echo``/``sleep``/``exit``, SIGTERM traps).  Windows has no ``/bin/sh``, so
-these helpers express the same behaviour as **list-form** commands that run
+these helpers express the same behavior as **list-form** commands that run
 the test interpreter (``sys.executable -c ...``); a list command bypasses the
 shell entirely and behaves identically on every platform.
 
@@ -38,7 +38,7 @@ def _py(code):
 def cmd_print(out=None, err=None, code=0):
     """argv that writes a line to stdout/stderr then exits ``code``.
 
-    The Python analogue of ``echo "<out>" [1>&2] ; exit <code>``.  ``out`` /
+    The Python analog of ``echo "<out>" [1>&2] ; exit <code>``.  ``out`` /
     ``err`` are line contents *without* the trailing newline (it is appended,
     like echo).
     """
@@ -58,7 +58,7 @@ def cmd_print(out=None, err=None, code=0):
 
 
 def cmd_sleep(seconds):
-    """argv that sleeps for ``seconds`` (the Python analogue of ``sleep``)."""
+    """argv that sleeps for ``seconds`` (the Python analog of ``sleep``)."""
     return _py("import time; time.sleep({})".format(seconds))
 
 

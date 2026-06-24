@@ -65,7 +65,7 @@ A run whose command never launches (the subprocess could not be spawned; `start_
 
 statsd metrics are telemetry and never affect job execution or the scheduler.
 
-- **Fire-and-forget UDP.** Each send opens a datagram endpoint (`loop.create_datagram_endpoint(... remote_addr=(host, port))`), writes the message in `connection_made` via `sendto`, then immediately closes the transport. There is no acknowledgement, no retry, and no delivery confirmation; lost datagrams are silently dropped by the network/OS. Inbound datagrams are ignored.
+- **Fire-and-forget UDP.** Each send opens a datagram endpoint (`loop.create_datagram_endpoint(... remote_addr=(host, port))`), writes the message in `connection_made` via `sendto`, then immediately closes the transport. There is no acknowledgment, no retry, and no delivery confirmation; lost datagrams are silently dropped by the network/OS. Inbound datagrams are ignored.
 - **Send failures are caught and logged, never fatal.** Both `_on_start` and `_on_stop` wrap the send in `try/except OSError`. A failure (for example, an unresolvable `host`) is logged with `logger.warning(...)` plus `exc_info=True` and the job proceeds normally. The messages are:
   - `Job <name>: failed to send statsd job_started metric`
   - `Job <name>: failed to send statsd job_stopped metric`

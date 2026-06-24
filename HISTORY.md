@@ -5,6 +5,43 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.10 (2026-06-24)
+
+- **Numeric `user`/`group` is read as a uid/gid, not a login name.** In the
+  config schema the `user`/`group` type was a `Str() | Int()` union, and
+  strictyaml matched the always-accepting `Str()` first, so `user: 1000`
+  arrived as the *string* `"1000"` and was looked up as a login *name*
+  (`getpwnam("1000")`) rather than used as uid 1000. The union is now
+  `Int() | Str()`, so a bare number is treated as the uid/gid it looks like; a
+  non-numeric name (`user: www-data`) still falls through to `Str()`. (POSIX
+  only; per-job `user`/`group` remains rejected with a configuration error on
+  Windows.)
+
+- **More resilient container builds.** Every image build, across the default
+  Debian image and all seven distro variants (`-alpine`, `-ubuntu`, `-rhel`,
+  `-fedora`, `-opensuse`, `-amazonlinux`, `-distroless`), now wraps its
+  package-manager and `pip` network steps in a retry-with-backoff helper,
+  alongside each manager's native knobs (`apt`'s `Acquire::Retries`, `dnf`'s
+  `--setopt=retries`, an explicit `zypper refresh` retry, and a longer
+  `pip --timeout`), so a transient mirror or package-index hiccup retries
+  instead of failing the whole build. The build and test CI workflows get the
+  same hardening via `PIP_RETRIES`/`PIP_TIMEOUT`, with `build.yml` forwarding
+  them into its emulated cross-architecture binary builds via `docker run -e`.
+
+- **The `-distroless` image now builds for `amd64`/`arm64` only.** The
+  `gcr.io/distroless/python3-debian12` base publishes no `ppc64le` or `s390x`
+  manifest, so requesting those arches aborted the distroless release with
+  "no match for platform in manifest". The RPM-based variants (`-rhel`,
+  `-fedora`, `-opensuse`) still cover the wider arch set.
+
+- The README status badges also gain brand colors
+  (and logos on the PyPI/Python badges). yay
+
+- Internal: branch coverage is now measured and gated in CI (tox runs
+  `pytest --cov-fail-under=82`), backed by substantially expanded unit tests for
+  config and user/group validation, config reload and graceful shutdown, the
+  job runner, and the job-set-id fingerprint.
+
 ## 1.1.9 (2026-06-23)
 
 - **More prebuilt container images.** Alongside the default Debian-based image,
@@ -12,7 +49,7 @@ project, on which yacron2 is based.
   tagged with a `-<distro>` suffix: `-alpine`, `-ubuntu`, `-rhel` (Red Hat
   UBI 9), `-fedora`, `-opensuse` (Leap), `-amazonlinux` (2023) and
   `-distroless`, plus an explicit `-debian` alias for the default. Pick the base
-  that matches your host userland or image-provenance policy; behaviour is
+  that matches your host userland or image-provenance policy; behavior is
   identical, since yacron2 is a pure-Python app (Python >= 3.10) and each image
   uses its distro's native interpreter. The Debian image still owns the bare
   `latest`/`<version>` tags and the widest architecture coverage. See
@@ -25,7 +62,7 @@ project, on which yacron2 is based.
   same configuration produce the same id, so replicas can confirm they hold an
   identical set of jobs (e.g. for leader election / to avoid double-running).
   It is taken over the merged, effective config (so reordering jobs, or moving
-  a setting into `defaults`, doesn't change it), normalises equivalent schedule
+  a setting into `defaults`, doesn't change it), normalizes equivalent schedule
   spellings, fingerprints `user`/`group` as configured rather than as a
   host-specific resolved uid/gid, and embeds no secret material (inline
   reporting secrets are redacted, and only `environment` variable names are
@@ -91,7 +128,7 @@ package itself.
 ### Documentation
 
 - README changes
-- Add an `Architectures` badge to the README summarising the binary and
+- Add an `Architectures` badge to the README summarizing the binary and
   container targets (`amd64`, `arm64`, `i686`, `armv7`, `ppc64le`,
   `s390x`).
 
@@ -164,7 +201,7 @@ package itself.
 - Add a built-in web dashboard, served at the root path (`/`) of any
   `http://` listener. It shows each job's latest status with a live
   countdown to the next run and a trend sparkline, tails job logs live
-  (with in-log search, ANSI-colour rendering, optional timestamps, a
+  (with in-log search, ANSI-color rendering, optional timestamps, a
   line-wrap toggle, and a download button), runs or cancels jobs on
   demand, and reports each job's run history, success rate, and a
   plain-English schedule with a preview of upcoming run times. It is
@@ -404,7 +441,7 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
 ### Internal
 
 - Refactored `JobConfig` construction into focused helper methods and
-  switched `send_to_statsd` to `asyncio.get_running_loop()`; no behavioural
+  switched `send_to_statsd` to `asyncio.get_running_loop()`; no behavioral
   change.
 - Added a `.github/CODEOWNERS` file.
 
@@ -559,7 +596,7 @@ This is a tooling and documentation release; there are no changes to the
   (`email.utils.format_datetime`), encode HTML bodies with the correct
   charset/transfer-encoding (`set_content` subtype `html`), and call
   `smtp.login` positionally for aiosmtplib v2+ compatibility.
-- The Sentry client is now initialised once per `(dsn, environment)` and
+- The Sentry client is now initialized once per `(dsn, environment)` and
   cached instead of on every report, and uses `sentry_sdk.new_scope()`
   (replacing the deprecated `push_scope()`).
 - Report templates (sentry/mail body, subject, fingerprint) are now compiled

@@ -1293,19 +1293,56 @@ async def test_run_survives_config_error(monkeypatch):
     await asyncio.wait_for(cron.run(), timeout=5)
 
 
-def test_cluster_leader_gate(caplog):
-    import logging
+def test_cluster_allows_per_policy():
+    import types
 
     cron = yacron2.cron.Cron(None)
 
-    # no cluster / election not configured: scheduled jobs always allowed
-    assert cron._is_cluster_leader() is True
+    def job(policy):
+        return types.SimpleNamespace(clusterPolicy=policy)
 
-    # election configured but no manager running (e.g. it failed to start):
-    # fail closed so we don't risk every replica running every job.
+    # election not configured: every policy runs here (today's behavior)
+    for p in ("Leader", "PreferLeader", "EveryNode"):
+        assert cron._cluster_allows(job(p)) is True
+
     cron._elect_leader_configured = True
+
+    # no manager running (e.g. failed to start): EveryNode jobs are immune and
+    # still run; Leader/PreferLeader fail closed so we don't risk every replica
+    # firing.
     cron.cluster_manager = None
-    assert cron._is_cluster_leader() is False
+    assert cron._cluster_allows(job("EveryNode")) is True
+    assert cron._cluster_allows(job("Leader")) is False
+    assert cron._cluster_allows(job("PreferLeader")) is False
+
+    class _Mgr:
+        def __init__(self, leader, avail):
+            self._leader, self._avail = leader, avail
+
+        def is_leader(self):
+            return self._leader
+
+        def is_available_leader(self):
+            return self._avail
+
+    # available leader but not quorum leader (e.g. a minority partition):
+    # Leader skips, PreferLeader runs, EveryNode runs.
+    cron.cluster_manager = _Mgr(leader=False, avail=True)
+    assert cron._cluster_allows(job("Leader")) is False
+    assert cron._cluster_allows(job("PreferLeader")) is True
+    assert cron._cluster_allows(job("EveryNode")) is True
+
+    # the quorum leader: everything runs here
+    cron.cluster_manager = _Mgr(leader=True, avail=True)
+    assert cron._cluster_allows(job("Leader")) is True
+    assert cron._cluster_allows(job("PreferLeader")) is True
+
+
+def test_cluster_role_logged_on_transition(caplog):
+    import logging
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
 
     class _Mgr:
         def __init__(self, leader):
@@ -1314,14 +1351,12 @@ def test_cluster_leader_gate(caplog):
         def is_leader(self):
             return self._leader
 
-    # election configured with a manager: defer to its election result, and
-    # log only on transition.
     cron.cluster_manager = _Mgr(True)
     with caplog.at_level(logging.INFO, logger="yacron2"):
-        assert cron._is_cluster_leader() is True
-        assert cron._is_cluster_leader() is True  # unchanged: no second log
+        cron._log_cluster_role()
+        cron._log_cluster_role()  # unchanged: no second log
         cron.cluster_manager = _Mgr(False)
-        assert cron._is_cluster_leader() is False
+        cron._log_cluster_role()
     msgs = [r.message for r in caplog.records if "leadership" in r.message]
     assert msgs == [
         "cluster: this node acquired scheduled-job leadership",

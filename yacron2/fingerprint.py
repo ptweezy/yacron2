@@ -133,6 +133,10 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
         "schedule": _schedule_repr(job),
         "shell": job.shell,
         "concurrencyPolicy": job.concurrencyPolicy,
+        # where the job runs under leader election: a behaviour-affecting,
+        # host-independent field, so replicas disagreeing on it should show as
+        # drift rather than silently coordinate differently.
+        "clusterPolicy": job.clusterPolicy,
         "captureStderr": job.captureStderr,
         "captureStdout": job.captureStdout,
         "streamPrefix": job.streamPrefix,

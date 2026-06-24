@@ -285,6 +285,24 @@ jobs:
     assert _id(disabled) != _id(enabled)
 
 
+def test_cluster_policy_changes_id():
+    # clusterPolicy is behaviour-affecting and host-independent, so two
+    # configs differing only in it must fingerprint differently (replicas
+    # disagreeing on it should surface as drift, not coordinate differently).
+    leader = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+"""
+    every = leader.replace("Leader", "EveryNode")
+    assert _id(leader) != _id(every)
+    # the default is Leader, so omitting it matches an explicit Leader
+    omitted = leader.replace('    clusterPolicy: Leader\n', "")
+    assert _id(omitted) == _id(leader)
+
+
 def test_shell_command_vs_argv_do_not_collide():
     as_shell = """
 jobs:

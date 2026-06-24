@@ -1242,6 +1242,45 @@ intentionally avoids in favour of keeping no shared state. If election is
 configured but the cluster listener fails to start, the node **fails closed**
 (stays idle) rather than fall back to running everything.
 
+#### Per-job policy
+
+The cluster-wide `electLeader` switch sets the *default* behaviour, but each job
+can override it with `clusterPolicy` to pick its own point on the
+liveness-vs-duplication trade-off. Note that **no option is true exactly-once** —
+each gives up one side: `Leader` may *skip*, `PreferLeader` may *double-run*.
+
+| `clusterPolicy` | healthy (quorate) | partitioned / sub-quorum | use for |
+| --- | --- | --- | --- |
+| `Leader` *(default)* | leader runs once | **nobody** runs (skips) | non-idempotent jobs where a duplicate is harmful and an occasional skip is OK (billing, outbound email) |
+| `PreferLeader` | lowest node runs once | each side's lowest node runs (**may double-run**) | important **and** idempotent jobs that should never skip |
+| `EveryNode` | every node runs | every reachable node runs | genuinely per-node work (local log rotation), or fully idempotent jobs |
+
+```yaml
+jobs:
+  - name: charge-cards          # must not double-charge; skip-tolerant
+    command: ./charge.sh
+    schedule: "0 * * * *"
+    clusterPolicy: Leader       # the default; can be omitted
+
+  - name: refresh-cache         # idempotent, but must not be skipped
+    command: ./refresh.sh
+    schedule: "*/5 * * * *"
+    clusterPolicy: PreferLeader
+
+  - name: rotate-local-logs     # inherently per-node
+    command: ./rotate.sh
+    schedule: "@daily"
+    clusterPolicy: EveryNode
+```
+
+`clusterPolicy` is inert unless `cluster.electLeader` is on (without election,
+every job runs on every instance regardless). `EveryNode` jobs are independent
+of cluster health, so they keep firing even if the cluster listener failed to
+start; `Leader`/`PreferLeader` jobs fail closed there. The active policy for
+each job (when election is on) is shown in the dashboard's job drawer and in the
+`GET /jobs` payload, and it is part of the [job-set id](#job-set-id), so
+replicas that disagree on a job's policy show up as drift.
+
 ### Includes
 
 (new in version 0.13)

@@ -578,7 +578,7 @@ class Cron:
             else []
         )
 
-        return {
+        result = {
             "name": name,
             "enabled": job.enabled,
             "schedule": schedule_str(job),
@@ -601,7 +601,12 @@ class Cron:
             "scheduled_in": scheduled_in,
             "last_run": last_run,
             "history": recent,
-        }
+        }  # type: Dict[str, Any]
+        # only relevant when leader election is on, so omit it otherwise to
+        # keep the per-poll payload lean for the common single-instance case.
+        if self._elect_leader_configured:
+            result["clusterPolicy"] = job.clusterPolicy
+        return result
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
@@ -840,26 +845,46 @@ class Cron:
             )
 
     async def spawn_jobs(self, startup: bool) -> None:
-        if not self._is_cluster_leader():
-            return
+        self._log_cluster_role()
         for job in self.cron_jobs.values():
-            if self.job_should_run(startup, job):
+            if self.job_should_run(startup, job) and self._cluster_allows(job):
                 await self.launch_scheduled_job(job)
 
-    def _is_cluster_leader(self) -> bool:
-        """Whether this node may run *scheduled* jobs this cycle.
+    def _cluster_allows(self, job: JobConfig) -> bool:
+        """Whether this node may run *scheduled* ``job`` this cycle.
 
         Always true unless leader election is enabled
-        (``cluster.electLeader``), in which case only the elected leader runs
-        scheduled jobs.  Manual (API) triggers and retries go through
-        ``maybe_launch_job`` and are unaffected.
+        (``cluster.electLeader``); then it depends on the job's
+        ``clusterPolicy``:
 
-        Fails *closed*: if election is configured but no manager is running
-        (e.g. it failed to start), this node stays quiet rather than risk every
-        replica running every job.
+        * ``EveryNode`` — run on every replica, independent of cluster state
+          (so these jobs keep firing even if the manager failed to start);
+        * ``Leader`` (default) — only the quorum-gated elected leader runs it
+          (at-most-once; skips when there is no quorum);
+        * ``PreferLeader`` — the lowest reachable agreeing node runs it,
+          ignoring quorum (never skips while a node is up, but may double-run
+          across a partition).
+
+        ``Leader``/``PreferLeader`` fail *closed* (return False) when election
+        is configured but no manager is running, so a broken cluster does not
+        make every replica fire.  Manual (API) triggers and retries go through
+        ``maybe_launch_job`` and are unaffected by any of this.
         """
         if not self._elect_leader_configured:
             return True
+        if job.clusterPolicy == "EveryNode":
+            return True
+        mgr = self.cluster_manager
+        if mgr is None:
+            return False  # election wanted but undeterminable -> fail closed
+        if job.clusterPolicy == "PreferLeader":
+            return mgr.is_available_leader()
+        return mgr.is_leader()  # "Leader"
+
+    def _log_cluster_role(self) -> None:
+        """Log this node's quorum-leadership transitions (once per change)."""
+        if not self._elect_leader_configured:
+            return
         leader = (
             self.cluster_manager is not None
             and self.cluster_manager.is_leader()
@@ -870,7 +895,6 @@ class Cron:
                 "acquired" if leader else "lost",
             )
             self._was_leader = leader
-        return leader
 
     @staticmethod
     def job_should_run(startup: bool, job: JobConfig) -> bool:

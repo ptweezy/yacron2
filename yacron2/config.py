@@ -115,6 +115,9 @@ _REPORT_DEFAULTS = {
 DEFAULT_CONFIG = {
     "shell": platform.DEFAULT_SHELL,
     "concurrencyPolicy": "Allow",
+    # where this job runs under cluster leader election (inert unless
+    # cluster.electLeader is set); see yacron2.cron._cluster_allows.
+    "clusterPolicy": "Leader",
     "captureStderr": True,
     "captureStdout": False,
     "saveLimit": 4096,
@@ -203,6 +206,7 @@ _report_schema = Map(
 _job_defaults_common = {
     Opt("shell"): Str(),
     Opt("concurrencyPolicy"): Enum(["Allow", "Forbid", "Replace"]),
+    Opt("clusterPolicy"): Enum(["Leader", "PreferLeader", "EveryNode"]),
     Opt("captureStderr"): Bool(),
     Opt("captureStdout"): Bool(),
     Opt("saveLimit"): Int(),
@@ -375,6 +379,7 @@ class JobConfig:
         )
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
+        self.clusterPolicy = config.pop("clusterPolicy")
         self.captureStderr = config.pop("captureStderr")
         self.captureStdout = config.pop("captureStdout")
         self.streamPrefix = config.pop("streamPrefix")

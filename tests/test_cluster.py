@@ -12,6 +12,7 @@ from yacron2.cluster import (
     STATUS_UNTRUSTED,
     ClusterManager,
     ClusterView,
+    elect_available_leader,
     elect_leader,
     quorum_size,
 )
@@ -478,6 +479,20 @@ def test_two_node_cluster_needs_both():
     assert elect_leader("a", [], 2) is None  # peer down -> nobody leads
 
 
+def test_available_leader_ignores_quorum():
+    # lowest name among self + agreeing peers, regardless of cluster size
+    assert elect_available_leader("a", ["b", "c"]) == "a"
+    assert elect_available_leader("c", ["a", "b"]) == "a"
+    # isolated node (no reachable peers) still elects itself -> never skips,
+    # which is the whole point of PreferLeader; contrast elect_leader -> None.
+    assert elect_available_leader("b", []) == "b"
+    assert elect_leader("b", [], 3) is None
+    # a partitioned 5-node cluster: each side elects its own available leader
+    # (so the job may run on both sides) -- the liveness/safety trade.
+    assert elect_available_leader("a", ["b"]) == "a"  # majority side
+    assert elect_available_leader("d", ["e"]) == "d"  # minority side
+
+
 @pytest.mark.asyncio
 async def test_mtls_round_trip_elects_single_leader(tmp_path):
     # two agreeing nodes (cluster_size 2, quorum 2): once each has polled the
@@ -574,6 +589,22 @@ def test_two_node_cluster_ok_without_election():
     # the same 2-node cluster is fine for attestation-only (no electLeader)
     cfg = parse_config_string(TWO_NODE_YAML, "").cluster_config
     assert cfg is not None and cfg["electLeader"] is False
+
+
+def test_job_cluster_policy_parsed():
+    y = (
+        "jobs:\n"
+        "  - name: a\n"
+        "    command: echo a\n"
+        '    schedule: "* * * * *"\n'
+        "    clusterPolicy: EveryNode\n"
+        "  - name: b\n"
+        "    command: echo b\n"
+        '    schedule: "* * * * *"\n'
+    )
+    jobs = {j.name: j for j in parse_config_string(y, "").jobs}
+    assert jobs["a"].clusterPolicy == "EveryNode"
+    assert jobs["b"].clusterPolicy == "Leader"  # default
 
 
 def test_elect_leader_warns_on_even_size(caplog):

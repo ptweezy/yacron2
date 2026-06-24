@@ -90,6 +90,23 @@ def elect_leader(
     return min(live)
 
 
+def elect_available_leader(
+    node_name: str,
+    agreeing_peer_names: Iterable[str],
+) -> str:
+    """Leaderless election *without* the quorum gate (favours liveness).
+
+    Returns the lowest ``nodeName`` among this node and the peers it sees
+    agreeing — and, since this node is always in that set, it always returns a
+    name (never ``None``).  Dropping the quorum requirement means a node
+    isolated from the rest still elects itself and runs, so a job never skips
+    while any node is up; the price is that two sides of a partition may each
+    elect their own leader and double-run.  Used by the ``PreferLeader`` job
+    policy; contrast :func:`elect_leader`.
+    """
+    return min([node_name, *agreeing_peer_names])
+
+
 @dataclass
 class PeerState:
     """This node's last observation of one configured peer."""
@@ -376,6 +393,16 @@ class ClusterManager:
     def is_leader(self) -> bool:
         """Whether this node is the elected leader (quorate, lowest name)."""
         return self.leader_name() == self.node_name
+
+    def available_leader_name(self) -> str:
+        """Elected leader ignoring quorum (for the ``PreferLeader`` policy)."""
+        return elect_available_leader(
+            self.node_name, self._agreeing_peer_names()
+        )
+
+    def is_available_leader(self) -> bool:
+        """Whether this node leads its reachable set, quorum or not."""
+        return self.available_leader_name() == self.node_name
 
     def view_dict(self) -> Dict[str, Any]:
         leader = self.leader_name()

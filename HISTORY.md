@@ -5,7 +5,7 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
-## 1.1.8 (2026-06-23)
+## 1.2.0 (2026-06-23)
 
 - **Job-set id.** yacron2 can now emit a *job-set id*: an order-independent
   hash of every job's effective configuration. Two instances deployed from the
@@ -45,7 +45,12 @@ project, on which yacron2 is based.
   node fails closed (stays idle) rather than risk every replica firing. As a
   guardrail, enabling `electLeader` on a 2-node cluster is rejected at config
   load (a quorum of 2 needs both up, so it is strictly worse than one replica),
-  and an even cluster size is warned about.
+  and an even cluster size is warned about. Individual jobs can override the
+  default with a per-job `clusterPolicy`: `Leader` (the default, quorum-gated,
+  at-most-once), `PreferLeader` (lowest reachable node runs it, ignoring quorum
+  — never skips, but may double-run across a partition), or `EveryNode` (run on
+  every replica, for per-node or idempotent work). `clusterPolicy` is part of
+  the job-set id and shown in the dashboard job drawer.
 
 ## 1.1.7 (2026-06-23)
 

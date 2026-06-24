@@ -1295,6 +1295,8 @@
       if (lr.duration != null) parts.push("<span>took " + fmtDuration(lr.duration) + "</span>");
     }
     if (caps.length) parts.push('<span class="faint">capture: ' + esc(caps.join(", ")) + "</span>");
+    // clusterPolicy is only present in the payload when leader election is on
+    if (job.clusterPolicy) parts.push('<span class="faint">cluster: <b>' + esc(job.clusterPolicy) + "</b></span>");
     $("dMeta").innerHTML = parts.join("");
     $("dRun").disabled = !job.enabled || job.running;
     $("dCancel").disabled = !job.running;

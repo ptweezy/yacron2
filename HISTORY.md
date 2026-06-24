@@ -5,6 +5,43 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.10 (2026-06-24)
+
+- **Numeric `user`/`group` is read as a uid/gid, not a login name.** In the
+  config schema the `user`/`group` type was a `Str() | Int()` union, and
+  strictyaml matched the always-accepting `Str()` first, so `user: 1000`
+  arrived as the *string* `"1000"` and was looked up as a login *name*
+  (`getpwnam("1000")`) rather than used as uid 1000. The union is now
+  `Int() | Str()`, so a bare number is treated as the uid/gid it looks like; a
+  non-numeric name (`user: www-data`) still falls through to `Str()`. (POSIX
+  only; per-job `user`/`group` remains rejected with a configuration error on
+  Windows.)
+
+- **More resilient container builds.** Every image build, across the default
+  Debian image and all seven distro variants (`-alpine`, `-ubuntu`, `-rhel`,
+  `-fedora`, `-opensuse`, `-amazonlinux`, `-distroless`), now wraps its
+  package-manager and `pip` network steps in a retry-with-backoff helper,
+  alongside each manager's native knobs (`apt`'s `Acquire::Retries`, `dnf`'s
+  `--setopt=retries`, an explicit `zypper refresh` retry, and a longer
+  `pip --timeout`), so a transient mirror or package-index hiccup retries
+  instead of failing the whole build. The build and test CI workflows get the
+  same hardening via `PIP_RETRIES`/`PIP_TIMEOUT`, with `build.yml` forwarding
+  them into its emulated cross-architecture binary builds via `docker run -e`.
+
+- **The `-distroless` image now builds for `amd64`/`arm64` only.** The
+  `gcr.io/distroless/python3-debian12` base publishes no `ppc64le` or `s390x`
+  manifest, so requesting those arches aborted the distroless release with
+  "no match for platform in manifest". The RPM-based variants (`-rhel`,
+  `-fedora`, `-opensuse`) still cover the wider arch set.
+
+- The README status badges also gain brand new colors
+  (and logos on the PyPI/Python badges). yay
+
+- Internal: branch coverage is now measured and gated in CI (tox runs
+  `pytest --cov-fail-under=82`), backed by substantially expanded unit tests for
+  config and user/group validation, config reload and graceful shutdown, the
+  job runner, and the job-set-id fingerprint.
+
 ## 1.1.9 (2026-06-23)
 
 - **More prebuilt container images.** Alongside the default Debian-based image,

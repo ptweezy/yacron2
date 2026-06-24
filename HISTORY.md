@@ -5,6 +5,19 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.9 (2026-06-23)
+
+- **More prebuilt container images.** Alongside the default Debian-based image,
+  every release now also publishes the same build on seven more bases, each
+  tagged with a `-<distro>` suffix: `-alpine`, `-ubuntu`, `-rhel` (Red Hat
+  UBI 9), `-fedora`, `-opensuse` (Leap), `-amazonlinux` (2023) and
+  `-distroless`, plus an explicit `-debian` alias for the default. Pick the base
+  that matches your host userland or image-provenance policy; behaviour is
+  identical, since yacron2 is a pure-Python app (Python >= 3.10) and each image
+  uses its distro's native interpreter. The Debian image still owns the bare
+  `latest`/`<version>` tags and the widest architecture coverage. See
+  [Distro variants](README.md#distro-variants).
+
 ## 1.1.8 (2026-06-23)
 
 - **Job-set id.** yacron2 can now emit a *job-set id*: an order-independent

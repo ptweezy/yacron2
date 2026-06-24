@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+#
+# yacron2 — openSUSE variant, built on openSUSE Leap 15.6. Covers the SUSE /
+# SLES family; Leap shares its package base with SUSE Linux Enterprise. Leap's
+# default python3 is old, so this installs the parallel-installable python311.
+#
+# Build locally:
+#   docker build -f docker/Dockerfile.opensuse -t yacron2:opensuse .
+# CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
+# reads it from .git (kept in the context by .dockerignore).
+
+ARG LEAP_VERSION=15.6
+
+# ---- build stage --------------------------------------------------------
+FROM opensuse/leap:${LEAP_VERSION} AS builder
+
+ARG VERSION=""
+
+WORKDIR /src
+COPY . .
+
+# python311 is Leap's modern, parallel-installable interpreter (the default
+# python3 is much older). Add a toolchain so pip can source-compile any dep
+# without a wheel for the target arch; it stays in this builder stage. git is
+# pulled in only for a plain local build (empty VERSION), where setuptools_scm
+# reads the version from .git.
+RUN set -eux; \
+    pkgs="python311 python311-pip python311-devel gcc"; \
+    if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
+    zypper --non-interactive install $pkgs; \
+    zypper clean --all; \
+    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    python3.11 -m venv /opt/venv; \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/venv/bin/pip install --no-cache-dir .
+
+# ---- runtime stage ------------------------------------------------------
+FROM opensuse/leap:${LEAP_VERSION}
+
+LABEL org.opencontainers.image.title="yacron2" \
+      org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (openSUSE Leap)." \
+      org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# The venv references /usr/bin/python3.11, so the runtime needs python311
+# installed. Both stages are opensuse/leap:${LEAP_VERSION}, so it matches.
+RUN set -eux; \
+    zypper --non-interactive install python311; \
+    zypper clean --all
+
+COPY --from=builder /opt/venv /opt/venv
+
+# Run as an unprivileged, non-root user (65534 = "nobody").
+USER 65534:65534
+
+ENTRYPOINT ["yacron2"]
+CMD ["-c", "/etc/yacron2.d"]

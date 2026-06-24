@@ -46,10 +46,12 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 ### Run with Docker
 
 Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
-`linux/arm/v7`, `linux/ppc64le` and `linux/s390x`) images are
+`linux/arm/v7`, `linux/ppc64le`, `linux/s390x` and `linux/riscv64`) images are
 published on every release to two registries: the GitHub Container Registry
-and Docker Hub. The images are identical; pull from whichever you prefer. Mount
-your crontab and go:
+and Docker Hub. The images are identical; pull from whichever you prefer. The
+default image is built on Debian (slim); if you would rather match a particular
+base, [Alpine, Ubuntu, RHEL/UBI and other variants](#distro-variants) are
+published from the same release too. Mount your crontab and go:
 
 ```shell
 # GitHub Container Registry
@@ -68,6 +70,41 @@ The image runs as a non-root user and reads its configuration from
 `latest` (e.g. `ghcr.io/ptweezy/yacron2:1.0.14` or `ptweezy/yacron2:1.0.14`) and
 see [Production container deployment](#production-container-deployment) for the
 hardened Kubernetes/Docker setup.
+
+#### Distro variants
+
+The default `latest` (and `<version>`) image is built on **Debian** (slim). The
+same release is also published on several other bases, so you can match a
+specific one to your environment: a familiar userland, an image-provenance
+policy that mandates a particular vendor, or the smallest possible image. Each
+variant adds a `-<distro>` suffix to the tag (and the default Debian image is
+also available explicitly as `-debian`):
+
+| Tag suffix | Base image | Python | Notes |
+| --- | --- | --- | --- |
+| *(none)* / `-debian` | `python:3.14-slim` | 3.14 | Default. Widest architecture coverage. |
+| `-alpine` | `python:3.14-alpine` | 3.14 | musl libc; smallest image. |
+| `-ubuntu` | `ubuntu:24.04` | 3.12 | Ubuntu LTS userland. |
+| `-rhel` | UBI 9 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
+| `-fedora` | `fedora:41` | 3.13 | Leading-edge RPM userland. |
+| `-opensuse` | `opensuse/leap:15.6` | 3.11 | SUSE / SLES family. |
+| `-amazonlinux` | `amazonlinux:2023` | 3.11 | AWS-centric deployments. |
+| `-distroless` | `gcr.io/distroless/python3` | 3.11 | No shell or package manager; minimal attack surface. |
+
+```shell
+# e.g. the Alpine variant, pinned to a version:
+docker run --rm \
+  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
+  ghcr.io/ptweezy/yacron2:1.0.14-alpine
+```
+
+yacron2 is a pure-Python app that supports any Python >= 3.10, so behaviour is
+identical across variants. Pick the base, not the interpreter version. The
+Debian default covers the most architectures; each variant covers the arches
+its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
+openSUSE and distroless cover `amd64`, `arm64`, `ppc64le` and `s390x`; Amazon
+Linux covers `amd64` and `arm64`). All variants share the same non-root,
+read-only-friendly hardening as the default image.
 
 ### Install using pip
 

@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+#
+# yacron2 — Alpine variant (musl libc). The smallest image; built on the
+# official python:alpine images, so it uses the same Python 3.14 as the default
+# (Debian) image.
+#
+# Build locally:
+#   docker build -f docker/Dockerfile.alpine -t yacron2:alpine .
+# CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
+# reads it from .git (kept in the context by .dockerignore).
+
+ARG PYTHON_VERSION=3.14
+
+# ---- build stage --------------------------------------------------------
+FROM python:${PYTHON_VERSION}-alpine AS builder
+
+ARG VERSION=""
+
+WORKDIR /src
+COPY . .
+
+# Alpine is musl, where parts of the aiohttp stack (multidict, frozenlist,
+# propcache, yarl, aiohttp itself, ruamel.yaml.clib) have no musllinux wheel for
+# every target arch and pip compiles them from source. build-base (gcc +
+# musl-dev + make) and libffi-dev cover that toolchain; it stays in this builder
+# stage and never reaches the runtime image. git is pulled in only for a plain
+# local build (empty VERSION), where setuptools_scm reads the version from .git.
+RUN set -eux; \
+    pkgs="build-base libffi-dev"; \
+    if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
+    apk add --no-cache $pkgs; \
+    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    python -m venv /opt/venv; \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/venv/bin/pip install --no-cache-dir .
+
+# ---- runtime stage ------------------------------------------------------
+FROM python:${PYTHON_VERSION}-alpine
+
+LABEL org.opencontainers.image.title="yacron2" \
+      org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (Alpine)." \
+      org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
+      org.opencontainers.image.licenses="MIT"
+
+# Flush stdout/stderr immediately (yacron2 logs to them) and never write .pyc
+# files — because remember....the read-only root filesystem.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# The venv's interpreter lives at the same path in both stages (both are
+# python:${PYTHON_VERSION}-alpine), so its symlinks stay valid.
+COPY --from=builder /opt/venv /opt/venv
+
+# Run as an unprivileged, non-root user (65534 = "nobody").
+USER 65534:65534
+
+ENTRYPOINT ["yacron2"]
+CMD ["-c", "/etc/yacron2.d"]

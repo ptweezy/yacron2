@@ -16,6 +16,7 @@ __pycache__
 # Not needed to build the package; excluded to shrink the build context.
 .claude
 .github
+docker
 example
 pyinstaller
 scripts

@@ -73,12 +73,12 @@ hardened Kubernetes/Docker setup.
 
 #### Distro variants
 
-The default `latest` (and `<version>`) image is built on **Debian** (slim). If
-you would rather match a specific base — for a familiar userland, an
-image-provenance policy that mandates a particular vendor, or the smallest
-possible image — the same release is published on several bases. Each variant
-adds a `-<distro>` suffix to the tag (and the default Debian image is also
-available explicitly as `-debian`):
+The default `latest` (and `<version>`) image is built on **Debian** (slim). The
+same release is also published on several other bases, so you can match a
+specific one to your environment: a familiar userland, an image-provenance
+policy that mandates a particular vendor, or the smallest possible image. Each
+variant adds a `-<distro>` suffix to the tag (and the default Debian image is
+also available explicitly as `-debian`):
 
 | Tag suffix | Base image | Python | Notes |
 | --- | --- | --- | --- |
@@ -99,7 +99,7 @@ docker run --rm \
 ```
 
 yacron2 is a pure-Python app that supports any Python >= 3.10, so behaviour is
-identical across variants — pick the base, not the interpreter version. The
+identical across variants. Pick the base, not the interpreter version. The
 Debian default covers the most architectures; each variant covers the arches
 its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
 openSUSE and distroless cover `amd64`, `arm64`, `ppc64le` and `s390x`; Amazon

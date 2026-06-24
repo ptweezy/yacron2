@@ -9,6 +9,7 @@ from yacron2.fingerprint import (
     job_digest,
     job_set_id,
 )
+from yacron2.platform import IS_WINDOWS
 
 
 def _jobs(yaml: str):
@@ -408,8 +409,12 @@ jobs:
 # onPermanentFailure action blocks.
 # ---------------------------------------------------------------------------
 
-# shell is pinned so the golden value is platform-independent (default shell
-# differs POSIX vs Windows). If this literal changes, the canonicalization
+# The golden values are the POSIX reference. The fingerprint is platform-scoped
+# by design: besides the job's own `shell` (pinned below), the default report
+# block's shell also defaults to platform.DEFAULT_SHELL (/bin/sh on POSIX, ""
+# on Windows), so the digest legitimately differs across platforms. HA replicas
+# are compared per-platform, so the POSIX value is the right tripwire and the
+# test is POSIX-only. If this literal changes on POSIX, the canonicalization
 # scheme changed, which REQUIRES bumping SCHEME_VERSION, not just editing the
 # constant. Treat an unexpected change here as a bug, not a test to "fix".
 GOLDEN_CONFIG = """
@@ -435,6 +440,9 @@ GOLDEN_ALPHA_DIGEST = (
 )
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="golden digest is the POSIX reference (platform-scoped)"
+)
 def test_job_set_id_golden_value():
     jobs = _jobs(GOLDEN_CONFIG)
     assert job_set_id(jobs) == GOLDEN_JOB_SET_ID

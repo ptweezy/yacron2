@@ -263,6 +263,14 @@ def _gen_leaf(ca_key, ca_cert, hostname):
 
 
 def _write_tls(dirpath, cn="cluster-ca"):
+    # cryptography has no win-arm64 wheel and can't build from source on that
+    # CI runner, so it isn't installed there; skip the cert-minting mTLS tests
+    # rather than error. The cluster logic itself is covered by the pure tests
+    # above and the mTLS round-trips run on every other platform.
+    pytest.importorskip(
+        "cryptography",
+        reason="cryptography unavailable on this platform (e.g. win-arm64)",
+    )
     from cryptography.hazmat.primitives import serialization
 
     ca_key, ca_cert = _gen_ca(cn)

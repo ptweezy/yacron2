@@ -1,4 +1,8 @@
-cryptography
+# cryptography is only used by the cluster mTLS tests, to mint throwaway certs.
+# It ships no win-arm64 wheel and can't build from source on that CI runner (no
+# OpenSSL), so don't install it there; those tests importorskip it and self-skip
+# when it's absent. Every other platform keeps full coverage.
+cryptography; platform_machine != "ARM64" or sys_platform != "win32"
 mypy
 mypy-extensions
 pytest

@@ -1,9 +1,11 @@
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from yacron2 import config
 from yacron2.config import ConfigError
+from yacron2.platform import IS_WINDOWS
 
 
 def test_mergedicts():
@@ -591,3 +593,131 @@ jobs:
     )
     environment = {e["key"]: e["value"] for e in conf.jobs[0].environment}
     assert environment["GREETING"] == "héllo"
+
+
+# ---------------------------------------------------------------------------
+# POSIX user/group resolution (_resolve_user_group) -- POSIX only.
+#
+# Resolving a configured user/group to a uid/gid runs on every deploy that uses
+# the feature, yet was entirely untested. A regression here runs a job as the
+# wrong account or fails to fail-closed when not root. The passwd/group lookups
+# and os.geteuid are mocked so the tests are hermetic and need no real accounts.
+# ---------------------------------------------------------------------------
+
+
+def _passwd(name, uid, gid):
+    return SimpleNamespace(pw_name=name, pw_uid=uid, pw_gid=gid)
+
+
+def _mock_userdb(monkeypatch, *, pwnam=None, pwuid=None, grnam=None, euid=0):
+    # Imported here (not at module top) so the module still imports on Windows,
+    # where grp/pwd do not exist; only the POSIX-gated tests below call this.
+    import grp
+    import pwd
+
+    if pwnam is not None:
+        monkeypatch.setattr(pwd, "getpwnam", pwnam)
+    if pwuid is not None:
+        monkeypatch.setattr(pwd, "getpwuid", pwuid)
+    if grnam is not None:
+        monkeypatch.setattr(grp, "getgrnam", grnam)
+    monkeypatch.setattr(os, "geteuid", lambda: euid)
+
+
+def _parse_user_group(line):
+    return config.parse_config_string(
+        "jobs:\n"
+        "  - name: t\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n'
+        "    " + line + "\n",
+        "",
+    )
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
+def test_user_string_resolves_uid_gid_and_name(monkeypatch):
+    _mock_userdb(monkeypatch, pwnam=lambda n: _passwd("svc", 1000, 2000))
+    job = _parse_user_group("user: svc").jobs[0]
+    assert (job.uid, job.gid, job.username) == (1000, 2000, "svc")
+    # the *configured* value is retained (for the fingerprint), not the resolved
+    assert job.user == "svc" and job.group is None
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
+def test_numeric_user_is_looked_up_as_a_name(monkeypatch):
+    # DOCUMENTS CURRENT BEHAVIOR (and a likely latent bug). The schema is
+    # `Str() | Int()`, and strictyaml's union tries Str() first (which always
+    # matches), so a numeric `user: 1000` arrives as the STRING "1000" and is
+    # looked up BY NAME (getpwnam("1000")), never treated as uid 1000. The
+    # isinstance(user, int) branch in _resolve_user_group is therefore
+    # unreachable from YAML. If the schema is reordered so numeric ids mean
+    # uid/gid, update this test deliberately.
+    seen = {}
+
+    def getpwnam(name):
+        seen["name"] = name
+        return _passwd(name, 4242, 2000)
+
+    _mock_userdb(monkeypatch, pwnam=getpwnam)
+    job = _parse_user_group("user: 1000").jobs[0]
+    assert seen["name"] == "1000"  # looked up as a name, not as uid 1000
+    assert job.uid == 4242
+    assert job.user == "1000"  # configured value retained, as a string
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
+def test_user_not_found_raises(monkeypatch):
+    def getpwnam(name):
+        raise KeyError(name)
+
+    _mock_userdb(monkeypatch, pwnam=getpwnam)
+    with pytest.raises(ConfigError, match="User not found"):
+        _parse_user_group("user: ghost")
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
+def test_group_string_resolves_gid(monkeypatch):
+    _mock_userdb(monkeypatch, grnam=lambda n: SimpleNamespace(gr_gid=3000))
+    job = _parse_user_group("group: staff").jobs[0]
+    assert job.gid == 3000
+    assert job.uid is None
+    assert job.group == "staff"
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
+def test_numeric_group_is_looked_up_as_a_name(monkeypatch):
+    # same latent bug as numeric user (see above): `group: 3000` is the string
+    # "3000" and is resolved via getgrnam("3000"), not used as gid 3000.
+    seen = {}
+
+    def getgrnam(name):
+        seen["name"] = name
+        return SimpleNamespace(gr_gid=5000)
+
+    _mock_userdb(monkeypatch, grnam=getgrnam)
+    job = _parse_user_group("group: 3000").jobs[0]
+    assert seen["name"] == "3000"
+    assert job.gid == 5000
+    assert job.group == "3000"
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
+def test_group_not_found_raises(monkeypatch):
+    def getgrnam(name):
+        raise KeyError(name)
+
+    _mock_userdb(monkeypatch, grnam=getgrnam)
+    with pytest.raises(ConfigError, match="Group not found"):
+        _parse_user_group("group: nogroup")
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
+def test_user_group_requires_superuser(monkeypatch):
+    # changing user/group while not root must fail closed at config time, not
+    # silently run the job as the wrong (current) account.
+    _mock_userdb(
+        monkeypatch, pwnam=lambda n: _passwd("svc", 1000, 2000), euid=1000
+    )
+    with pytest.raises(ConfigError, match="not running as superuser"):
+        _parse_user_group("user: svc")

@@ -1291,3 +1291,122 @@ async def test_run_survives_config_error(monkeypatch):
 
     # completes without raising (UnboundLocalError before the fix)
     await asyncio.wait_for(cron.run(), timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Web server integration.
+#
+# Every other web test calls a handler coroutine directly with a hand-rolled
+# fake request, so routing, the auth middleware, and the bind/serve path are
+# never exercised together. These drive the real server start_stop_web_app
+# stands up, over real HTTP, so a dropped route or an inverted ui/auth gate (a
+# data endpoint served unauthenticated) is caught.
+# ---------------------------------------------------------------------------
+
+_WEB_ONE_JOB = """
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "*/5 * * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_web_app_enforces_auth_when_token_configured():
+    import aiohttp
+
+    cron = yacron2.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authToken": {"value": "secret"},
+            "ui": False,
+        }
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        async with aiohttp.ClientSession() as session:
+            # no credentials -> rejected
+            async with session.get(base + "/jobs") as resp:
+                assert resp.status == 401
+            # wrong token -> rejected
+            async with session.get(
+                base + "/jobs", headers={"Authorization": "Bearer nope"}
+            ) as resp:
+                assert resp.status == 401
+            # correct token -> the real jobs payload is served
+            async with session.get(
+                base + "/jobs", headers={"Authorization": "Bearer secret"}
+            ) as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert [j["name"] for j in data] == ["alpha"]
+    finally:
+        await cron.start_stop_web_app(None)
+    # clearing the config fully stops the server
+    assert cron.web_runner is None
+
+
+@pytest.mark.asyncio
+async def test_web_app_ui_path_public_but_data_paths_require_auth():
+    import aiohttp
+
+    cron = yacron2.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authToken": {"value": "secret"},
+            "ui": True,
+        }
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        async with aiohttp.ClientSession() as session:
+            # the UI page holds no data, so it is reachable without a token
+            async with session.get(base + "/") as resp:
+                assert resp.status == 200
+                assert "text/html" in resp.headers["Content-Type"]
+            # a data endpoint still requires the token even with the UI enabled
+            async with session.get(base + "/jobs") as resp:
+                assert resp.status == 401
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+@pytest.mark.asyncio
+async def test_web_app_restarts_on_config_change(monkeypatch):
+    # changing the web config tears down the old server and stands up a new one;
+    # clearing it stops the server entirely. web_site_from_url is faked so no
+    # real socket is bound and the transition logic is tested in isolation.
+    started = []
+
+    class FakeSite:
+        def __init__(self, url):
+            self.url = url
+
+        async def start(self):
+            started.append(self.url)
+
+    monkeypatch.setattr(
+        yacron2.cron,
+        "web_site_from_url",
+        lambda runner, url: FakeSite(url),
+    )
+
+    cron = yacron2.cron.Cron(None)
+    await cron.start_stop_web_app({"listen": ["http://host-a:8000"]})
+    runner1 = cron.web_runner
+    assert runner1 is not None
+    assert started == ["http://host-a:8000"]
+
+    # a different config: the old runner is replaced and the new site started
+    await cron.start_stop_web_app({"listen": ["http://host-b:9000"]})
+    assert cron.web_runner is not None
+    assert cron.web_runner is not runner1
+    assert started == ["http://host-a:8000", "http://host-b:9000"]
+
+    # clearing the config stops the server
+    await cron.start_stop_web_app(None)
+    assert cron.web_runner is None

@@ -144,5 +144,13 @@ strict_optional = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.coverage.run]
+source = ["yacron2"]
+branch = true
+omit = ["yacron2/version.py"]
+
+[tool.coverage.report]
+show_missing = true
+
 [tool.bandit]
 exclude_dirs = ["tests"]

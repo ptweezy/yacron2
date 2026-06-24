@@ -34,7 +34,7 @@ project, on which yacron2 is based.
   "no match for platform in manifest". The RPM-based variants (`-rhel`,
   `-fedora`, `-opensuse`) still cover the wider arch set.
 
-- The README status badges also gain brand colors
+- The README status badges also gain brand new colors
   (and logos on the PyPI/Python badges). yay
 
 - Internal: branch coverage is now measured and gated in CI (tox runs

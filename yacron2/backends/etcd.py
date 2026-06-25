@@ -158,7 +158,6 @@ def lease_ttl_from_keepalive(resp: Dict[str, Any]) -> Optional[int]:
         return None
 
 
-
 class EtcdBackend(LeaseBackend):
     """Leadership via a lease-bound etcd key (the v3 JSON gateway)."""
 
@@ -314,15 +313,9 @@ class EtcdBackend(LeaseBackend):
                 async with self._session.post(
                     url, json=body, ssl=self._ssl, headers=headers
                 ) as resp:
-                    if (
-                        resp.status == 401
-                        and self.username
-                        and allow_reauth
-                    ):
+                    if resp.status == 401 and self.username and allow_reauth:
                         self._auth_token = await self._authenticate()
-                        return await self._post(
-                            path, body, allow_reauth=False
-                        )
+                        return await self._post(path, body, allow_reauth=False)
                     resp.raise_for_status()
                     data: Dict[str, Any] = await resp.json()
                     return data

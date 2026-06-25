@@ -58,33 +58,74 @@ semantics are documented in [HTTP Control API](HTTP-API).
 
 ### `cluster`
 
-Optional. Lets an instance attest, over mutual TLS, that a static list of peers
-is running the same job set, and (with `electLeader`) elect a leader so several
-replicas can run from one config without double-running jobs. There must be
-exactly one `cluster` block across the whole configuration; a duplicate in an
+Optional. Gates scheduled jobs on a **leadership backend** so several replicas
+can run from one config without double-running jobs. `cluster.backend` chooses
+how: the default **`gossip`** backend attests, over mutual TLS, that a static
+list of peers is running the same job set and runs a best-effort quorum
+election; the **`kubernetes`** and **`etcd`** backends use a coordination store
+(a `Lease` / a lease-bound key) for a fenced, exactly-once election. There must
+be exactly one `cluster` block across the whole configuration; a duplicate in an
 included file or a second config-directory file raises a `ConfigError`. Defaults
-come from `DEFAULT_CLUSTER` and are applied only when a `cluster` section is
-present. New in version 1.1.8.
+come from `DEFAULT_CLUSTER` (plus `DEFAULT_K8S` / `DEFAULT_ETCD` for the lease
+backends) and are applied only when a `cluster` section is present. New in
+version 1.1.8; `backend` and the lease backends are new in 1.2.0.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `listen` | `Str` | required | `host:port` the mTLS `/peer` listener binds to (e.g. `0.0.0.0:8443`). Served only here, never on the public `web` API. |
-| `tls.ca` | `Str` | required | Path to the cluster CA (trust anchor for peer certificates). |
-| `tls.cert` | `Str` | required | Path to this node's certificate (used both to serve `/peer` and to authenticate as a client). Its SAN must match the host other nodes use to reach it. |
-| `tls.key` | `Str` | required | Path to this node's private key. |
-| `peers` | `Seq(Map({"host": Str}))` | required | Every **other** member as `host:port`. Cluster size is `len(peers) + 1`. |
-| `nodeName` | `Str` | system hostname | Stable, human-readable identity for this node; the leader is the lowest `nodeName` among agreeing members. **Must be unique across the cluster** — a duplicate is detected at runtime (status `conflict`) and pauses `Leader` jobs until resolved. The hostname default is already unique per host. |
+| `backend` | `Enum(["gossip", "kubernetes", "etcd"])` | `gossip` | Which leadership backend gates jobs. `gossip` (default) is the embedded mTLS best-effort election; `kubernetes`/`etcd` are fenced lease backends. The lease backends talk to their store over plain HTTP via the core `aiohttp` dependency, so they add no runtime dependency. |
+
+**Gossip backend** (`backend: gossip`). `listen`, `tls`, and `peers` are
+required **only for this backend**:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `listen` | `Str` | required (gossip) | `host:port` the mTLS `/peer` listener binds to (e.g. `0.0.0.0:8443`). Served only here, never on the public `web` API. |
+| `tls.ca` | `Str` | required (gossip) | Path to the cluster CA (trust anchor for peer certificates). |
+| `tls.cert` | `Str` | required (gossip) | Path to this node's certificate (used both to serve `/peer` and to authenticate as a client). Its SAN must match the host other nodes use to reach it. |
+| `tls.key` | `Str` | required (gossip) | Path to this node's private key. |
+| `peers` | `Seq(Map({"host": Str}))` | required (gossip) | Every **other** member as `host:port`. Cluster size is `len(peers) + 1`. |
+| `nodeName` | `Str` | system hostname | Stable, human-readable identity for this node; the leader is the lowest `nodeName` among agreeing members. **Must be unique across the cluster** — a duplicate is detected at runtime (status `conflict`) and pauses `Leader` jobs until resolved. The hostname default is already unique per host. (Also used as the lease backends' default `identity` / etcd key value.) |
 | `interval` | `Int` | `30` | Seconds between peer-attestation rounds. Must be `> 0`. |
 | `driftAfter` | `Int` | `3` | Consecutive reachable-but-mismatched rounds before a peer is reported `drifted` (debounce). Must be `>= 1`. |
-| `connectTimeout` | `Int` | `10` | Seconds per peer request. Must be `> 0`. |
-| `electLeader` | `Bool` | `false` | When true, only the quorum-gated elected leader runs *scheduled* jobs (manual API triggers and retries are unaffected). Off by default, so a `cluster` section is observe-only until opted in. |
-| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
+| `connectTimeout` | `Int` | `10` | Seconds per request (also the HTTP timeout for the lease backends). Must be `> 0`. |
+| `electLeader` | `Bool` | `false` | When true, only the quorum-gated elected leader runs *scheduled* jobs (manual API triggers and retries are unaffected). Off by default, so a gossip `cluster` section is observe-only until opted in. The lease backends imply `electLeader: true` (configuring one is opting into leadership). |
+| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). **Rejected for the lease backends** (a single lease holder cannot also be a per-job owner). See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
 
-Load-time validation (in addition to the numeric ranges above): with
+Gossip load-time validation (in addition to the numeric ranges above): with
 `electLeader: true`, a **2-node** cluster (one peer) is rejected with a
 `ConfigError` (a quorum of 2 needs both up, strictly worse than one replica),
-and an **even** cluster size is allowed but logs a warning. Full behavior,
-the trust model, quorum math, and per-job `clusterPolicy` are documented in
+and an **even** cluster size is allowed but logs a warning.
+
+**Kubernetes backend** (`backend: kubernetes`), under `cluster.kubernetes`. A
+`coordination.k8s.io/v1` `Lease` is the fence. Defaults from `DEFAULT_K8S`:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `leaseName` | `Str` | `yacron2-leader` | Name of the `Lease` object the replicas contend for. |
+| `leaseNamespace` | `Str` or null | null → in-cluster namespace | Namespace of the `Lease`; defaults to the pod's own namespace (the service-account namespace file). |
+| `leaseDurationSeconds` | `Int` | `15` | How long a renewal keeps the lease valid. Must be `> renewDeadlineSeconds`. |
+| `renewDeadlineSeconds` | `Int` | `10` | Renewal target within the duration. Must be `> 0` and `< leaseDurationSeconds`. |
+| `retryPeriodSeconds` | `Int` | `2` | Seconds between renew/observe rounds. Must be `> 0`. |
+| `identity` | `Str` or null | null → `nodeName` | The lease `holderIdentity` written for this node. |
+| `kubeconfig` | `Str` or null | null → in-cluster | Path to a kubeconfig for out-of-cluster / local testing; otherwise the in-cluster service-account credentials are used. |
+| `apiServer` | `Str` or null | null | Override the apiserver URL (else the in-cluster `KUBERNETES_SERVICE_*` env or the kubeconfig). |
+| `clientLibrary` | `Enum(["auto", "http", "library"])` | `auto` | Transport selection. `auto` uses the official `kubernetes` client when it is importable (install `yacron2[kubernetes]`) and otherwise falls back to a hand-rolled apiserver REST transport over `aiohttp`; `library` requires the native client (a `ConfigError` if absent); `http` forces the hand-rolled transport. |
+
+**etcd backend** (`backend: etcd`), under `cluster.etcd`. A lease-bound key is
+the fence; the backend uses etcd's v3 gRPC-gateway JSON/HTTP API directly (no
+native client). Defaults from `DEFAULT_ETCD`:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `endpoints` | `Seq(Str)` | `["http://127.0.0.1:2379"]` | etcd client URLs (`http(s)://host:port`), tried in order for failover. Each must be a well-formed URL with a host and port. |
+| `electionName` | `Str` | `yacron2/leader` | The etcd key contended for; its value is the holder's `nodeName`. |
+| `ttl` | `Int` | `15` | Lease time-to-live, seconds. Must be `> 0`. The keepalive cadence is ~`ttl/3`. |
+| `username` | `Str` or null | null | etcd auth username (omit for an auth-less cluster). |
+| `password` | `Map` | unset | etcd auth password, resolved like `web.authToken` from exactly one of `value` / `fromFile` / `fromEnvVar`; a configured-but-empty source fails closed. |
+| `tls.ca` / `tls.cert` / `tls.key` | `Str` or null | null | Optional client TLS for `https://` endpoints. |
+
+Full behavior, the trust model, quorum math, the lease backends' guarantees,
+and per-job `clusterPolicy` are documented in
 [Clustering and Leader Election](Clustering-and-Leader-Election).
 
 ### `logging`

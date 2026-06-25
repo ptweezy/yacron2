@@ -13,6 +13,7 @@ from typing import (
     Optional,
     Union,  # noqa
 )
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import strictyaml
@@ -44,6 +45,14 @@ LoggingConfig = NewType("LoggingConfig", Dict[str, Any])
 # Defaults for an (optional) cluster block. Only applied when a `cluster`
 # section is present; see _build_cluster_config.
 DEFAULT_CLUSTER = {
+    # which leadership backend gates jobs:
+    #   "gossip" (default) - the embedded mTLS, no-shared-state, best-effort
+    #                        quorum election (listen/tls/peers below);
+    #   "kubernetes"       - a coordination.k8s.io/v1 Lease (fenced);
+    #   "etcd"             - a lease-backed etcd key/election (fenced).
+    # The two lease backends talk to their store over plain HTTP (the core
+    # aiohttp dependency), so neither adds a runtime dependency.
+    "backend": "gossip",
     "interval": 30,  # seconds between peer-attestation rounds
     "driftAfter": 3,  # reachable-but-mismatched rounds before "drifted"
     "nodeName": None,  # defaults to the system hostname at load time
@@ -59,6 +68,38 @@ DEFAULT_CLUSTER = {
     #                               nodes (same quorum gate, same guarantee).
     # Inert unless electLeader is on; see yacron2.cluster.elect_job_owner.
     "distribution": "single-leader",
+}
+
+# Defaults merged over a `cluster.kubernetes` block (backend: kubernetes). The
+# values mirror client-go's leaderelection defaults; see
+# yacron2.backends.kubernetes.
+DEFAULT_K8S: Dict[str, Any] = {
+    "leaseName": "yacron2-leader",
+    # None -> the in-cluster service-account namespace file at runtime.
+    "leaseNamespace": None,
+    "leaseDurationSeconds": 15,
+    "renewDeadlineSeconds": 10,
+    "retryPeriodSeconds": 2,
+    "identity": None,  # None -> nodeName
+    "kubeconfig": None,  # for out-of-cluster / local (Docker) testing
+    # override the apiserver URL (else in-cluster env / kubeconfig)
+    "apiServer": None,
+    # auto (native `kubernetes` client if importable, else hand-rolled HTTP) |
+    # library (require the native client) | http (force hand-rolled).
+    "clientLibrary": "auto",
+}
+
+# Defaults merged over a `cluster.etcd` block (backend: etcd). See
+# yacron2.backends.etcd.
+DEFAULT_ETCD: Dict[str, Any] = {
+    "endpoints": ["http://127.0.0.1:2379"],
+    "electionName": "yacron2/leader",
+    "ttl": 15,  # lease time-to-live, seconds
+    "username": None,
+    # resolved like web.authToken: value / fromFile / fromEnvVar
+    "password": {"value": None, "fromFile": None, "fromEnvVar": None},
+    # optional client TLS to the etcd endpoints
+    "tls": {"ca": None, "cert": None, "key": None},
 }
 
 
@@ -301,28 +342,77 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("ui"): Bool(),
             }
         ),
-        # Optional cluster section: lets an instance attest its job set against
-        # a static list of peers over mutual TLS (see yacron2.cluster).
+        # Optional cluster section: gate scheduled jobs on a leadership
+        # backend. The gossip backend (default) attests the job set against a
+        # static peer list over mutual TLS (see yacron2.cluster); the
+        # kubernetes/etcd backends use a lease store (see yacron2.backends).
+        # listen/tls/peers are required for gossip only -- enforced in
+        # _build_cluster_config, not the schema, so a lease backend need not
+        # carry them.
         Opt("cluster"): Map(
             {
+                # gossip (default) | kubernetes | etcd
+                Opt("backend"): Enum(["gossip", "kubernetes", "etcd"]),
+                # --- gossip transport (required for backend: gossip) ---
                 # host:port the mTLS cluster listener binds to
-                "listen": Str(),
-                "tls": Map(
+                Opt("listen"): Str(),
+                Opt("tls"): Map(
                     {
                         "ca": Str(),  # trust anchor for peer certificates
                         "cert": Str(),  # this node's certificate
                         "key": Str(),  # this node's private key
                     }
                 ),
-                "peers": Seq(Map({"host": Str()})),
+                Opt("peers"): Seq(Map({"host": Str()})),
                 Opt("nodeName"): Str(),
                 Opt("interval"): Int(),
                 Opt("driftAfter"): Int(),
                 Opt("connectTimeout"): Int(),
-                # run scheduled jobs on the elected leader only (default false)
+                # run scheduled jobs on the elected leader only (default false;
+                # implicitly true for the lease backends)
                 Opt("electLeader"): Bool(),
                 # how leader-gated jobs spread across the quorate cluster
+                # (gossip only; rejected for the lease backends)
                 Opt("distribution"): Enum(["single-leader", "spread"]),
+                # --- kubernetes Lease backend (backend: kubernetes) ---
+                Opt("kubernetes"): Map(
+                    {
+                        Opt("leaseName"): Str(),
+                        Opt("leaseNamespace"): EmptyNone() | Str(),
+                        Opt("leaseDurationSeconds"): Int(),
+                        Opt("renewDeadlineSeconds"): Int(),
+                        Opt("retryPeriodSeconds"): Int(),
+                        Opt("identity"): EmptyNone() | Str(),
+                        Opt("kubeconfig"): EmptyNone() | Str(),
+                        Opt("apiServer"): EmptyNone() | Str(),
+                        Opt("clientLibrary"): Enum(
+                            ["auto", "http", "library"]
+                        ),
+                    }
+                ),
+                # --- etcd lease-backed election backend (backend: etcd) ---
+                Opt("etcd"): Map(
+                    {
+                        Opt("endpoints"): Seq(Str()),
+                        Opt("electionName"): Str(),
+                        Opt("ttl"): Int(),
+                        Opt("username"): EmptyNone() | Str(),
+                        Opt("password"): Map(
+                            {
+                                Opt("value"): EmptyNone() | Str(),
+                                Opt("fromFile"): EmptyNone() | Str(),
+                                Opt("fromEnvVar"): EmptyNone() | Str(),
+                            }
+                        ),
+                        Opt("tls"): Map(
+                            {
+                                Opt("ca"): EmptyNone() | Str(),
+                                Opt("cert"): EmptyNone() | Str(),
+                                Opt("key"): EmptyNone() | Str(),
+                            }
+                        ),
+                    }
+                ),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -657,22 +747,50 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     return peer_port == listen_port and peer_h == node_name
 
 
-def _build_cluster_config(raw: dict) -> ClusterConfig:
-    # Fill defaults over the raw (schema-validated) cluster block and validate
-    # the numeric fields, mirroring _validate_numeric_ranges for jobs.
+def _cluster_base(raw: dict) -> "Dict[str, Any]":
+    """Fill the shared cluster defaults over a raw (schema-validated) block.
+
+    Covers the keys every backend uses (backend, nodeName, connectTimeout,
+    electLeader, distribution, and the inert gossip cadence fields). Each
+    backend's builder then layers on its own block.
+    """
     cfg: Dict[str, Any] = dict(DEFAULT_CLUSTER)
     cfg.update(raw)
     if not cfg.get("nodeName"):
-        # a stable, human-readable identity for this node, used so a peer can
-        # recognise itself in someone else's peer list; the system hostname is
-        # a sensible default.
+        # a stable, human-readable identity for this node, used as the lease
+        # identity and so a gossip peer can recognise itself in someone else's
+        # peer list; the system hostname is a sensible default.
         cfg["nodeName"] = socket.gethostname()
+    if cfg["connectTimeout"] <= 0:
+        raise ConfigError("cluster.connectTimeout must be > 0")
+    return cfg
+
+
+def _build_cluster_config(raw: dict) -> ClusterConfig:
+    """Build a ClusterConfig, dispatching on the chosen ``backend``."""
+    backend = raw.get("backend", DEFAULT_CLUSTER["backend"])
+    if backend == "kubernetes":
+        return _build_kubernetes_cluster_config(raw)
+    if backend == "etcd":
+        return _build_etcd_cluster_config(raw)
+    return _build_gossip_cluster_config(raw)
+
+
+def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
+    # Fill defaults over the raw (schema-validated) cluster block and validate
+    # the numeric fields, mirroring _validate_numeric_ranges for jobs.
+    cfg = _cluster_base(raw)
+    # listen/tls/peers are schema-optional now (so a lease backend need not
+    # carry them), but the gossip transport requires all three.
+    for key in ("listen", "tls", "peers"):
+        if cfg.get(key) is None:
+            raise ConfigError(
+                "cluster.backend gossip requires cluster.{}".format(key)
+            )
     if cfg["interval"] <= 0:
         raise ConfigError("cluster.interval must be > 0")
     if cfg["driftAfter"] < 1:
         raise ConfigError("cluster.driftAfter must be >= 1")
-    if cfg["connectTimeout"] <= 0:
-        raise ConfigError("cluster.connectTimeout must be > 0")
 
     # Validate every address is a well-formed host:port up front, so a typo
     # (a missing port, a non-numeric port) fails the config load pointing at
@@ -734,6 +852,118 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
     return ClusterConfig(cfg)
 
 
+def _reject_lease_spread(cfg: dict, backend: str) -> None:
+    # A single lease holder cannot also be a per-job (spread) owner: there is
+    # one fenced identity, not a quorate set to rendezvous-hash across.
+    if cfg.get("distribution", "single-leader") != "single-leader":
+        raise ConfigError(
+            "cluster.distribution: spread is not supported with the {!r} "
+            "backend (a single lease holder cannot fan jobs out per-node); "
+            "use distribution: single-leader, or the gossip backend".format(
+                backend
+            )
+        )
+
+
+def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
+    """Resolve a value/fromFile/fromEnvVar secret block, or ``None`` if unset.
+
+    Mirrors :meth:`yacron2.cron.Cron._resolve_web_token`, but tolerates "no
+    source configured" by returning ``None`` (etcd may need no auth at all).
+    A source that *is* configured yet resolves empty fails closed.
+    """
+    if not spec:
+        return None
+    if spec.get("value"):
+        secret = str(spec["value"])
+    elif spec.get("fromFile"):
+        try:
+            with open(spec["fromFile"], "rt") as secret_file:
+                secret = secret_file.read().strip()
+        except OSError as ex:
+            raise ConfigError(
+                "{}.fromFile could not be read: {}".format(what, ex)
+            ) from ex
+    elif spec.get("fromEnvVar"):
+        secret = os.environ.get(spec["fromEnvVar"], "")
+    else:
+        return None  # no source configured
+    if not secret:
+        raise ConfigError(
+            "{} is configured but resolved to an empty secret".format(what)
+        )
+    return secret
+
+
+def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
+    cfg = _cluster_base(raw)
+    _reject_lease_spread(cfg, "kubernetes")
+    k8s = dict(DEFAULT_K8S)
+    k8s.update(cfg.get("kubernetes") or {})
+    cfg["kubernetes"] = k8s
+    if not k8s.get("identity"):
+        # the lease holderIdentity that distinguishes this node; default it to
+        # the (already-defaulted) nodeName.
+        k8s["identity"] = cfg["nodeName"]
+    duration = k8s["leaseDurationSeconds"]
+    renew = k8s["renewDeadlineSeconds"]
+    retry = k8s["retryPeriodSeconds"]
+    if renew <= 0:
+        raise ConfigError(
+            "cluster.kubernetes.renewDeadlineSeconds must be > 0"
+        )
+    if duration <= renew:
+        # client-go's invariant: a holder must be able to renew well within the
+        # window before the lease is considered expired by others.
+        raise ConfigError(
+            "cluster.kubernetes.leaseDurationSeconds ({}) must be greater "
+            "than renewDeadlineSeconds ({})".format(duration, renew)
+        )
+    if retry <= 0:
+        raise ConfigError("cluster.kubernetes.retryPeriodSeconds must be > 0")
+    # configuring a lease backend is opting into leadership.
+    cfg["electLeader"] = True
+    return ClusterConfig(cfg)
+
+
+def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
+    cfg = _cluster_base(raw)
+    _reject_lease_spread(cfg, "etcd")
+    raw_etcd = cfg.get("etcd") or {}
+    etcd = copy.deepcopy(DEFAULT_ETCD)
+    etcd.update(raw_etcd)
+    # the nested password/tls blocks are merged (a plain update would replace
+    # them wholesale, dropping the unset sub-keys' defaults).
+    etcd["password"] = {
+        **DEFAULT_ETCD["password"],
+        **(raw_etcd.get("password") or {}),
+    }
+    etcd["tls"] = {**DEFAULT_ETCD["tls"], **(raw_etcd.get("tls") or {})}
+    cfg["etcd"] = etcd
+    if etcd["ttl"] <= 0:
+        raise ConfigError("cluster.etcd.ttl must be > 0")
+    if not etcd["endpoints"]:
+        raise ConfigError("cluster.etcd.endpoints must list at least one URL")
+    for endpoint in etcd["endpoints"]:
+        parsed = urlparse(endpoint)
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.port is None
+        ):
+            raise ConfigError(
+                "cluster.etcd.endpoints entries must be http(s)://host:port, "
+                "got {!r}".format(endpoint)
+            )
+    # resolve the password once at load time (fail closed on an empty source),
+    # like the web auth token; None when etcd needs no auth.
+    etcd["resolved_password"] = _resolve_secret(
+        etcd["password"], "cluster.etcd.password"
+    )
+    cfg["electLeader"] = True
+    return ClusterConfig(cfg)
+
+
 def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
     """Non-fatal advisories for a cluster config, returned as messages.
 
@@ -743,6 +973,11 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
     warning every minute for the life of the process.
     """
     warnings: List[str] = []
+    if cfg.get("backend", "gossip") != "gossip":
+        # The lease backends have no static peer set or even/odd-size
+        # trade-off, and always imply electLeader, so the gossip-only
+        # advisories below (which read cfg["peers"]) do not apply.
+        return warnings
     if cfg.get("electLeader"):
         # `peers` lists every OTHER member, so size is that many plus self.
         size = len(cfg["peers"]) + 1

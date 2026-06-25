@@ -14,14 +14,74 @@ elected leader firing scheduled jobs. It builds directly on the
 `yacron2/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
 `elect_leader`/`quorum_size` functions).
 
-*New in version 1.1.8.*
+*New in version 1.1.8. Pluggable backends (`kubernetes` / `etcd`) new in 1.2.0.*
 
-> **This is best-effort coordination, not fenced exactly-once.** It keeps no
-> shared state, so it is simple to operate and cannot wedge on a missing
-> consensus store. The trade-off is that there are narrow windows where a
-> firing may be skipped or (under some policies) double-run. If you need a hard
-> exactly-once guarantee, use a lease/consensus store (etcd, a Kubernetes
-> `Lease`) instead. See [Guarantees and trade-offs](#guarantees-and-trade-offs).
+> **The default `gossip` backend is best-effort coordination, not fenced
+> exactly-once.** It keeps no shared state, so it is simple to operate and
+> cannot wedge on a missing consensus store. The trade-off is that there are
+> narrow windows where a firing may be skipped or (under some policies)
+> double-run. If you need a hard exactly-once guarantee **and** already run a
+> coordination store, set `cluster.backend: kubernetes` or `etcd` (below) to
+> elect through a `Lease` / a lease-bound key instead. See
+> [Choosing a backend](#choosing-a-backend) and
+> [Guarantees and trade-offs](#guarantees-and-trade-offs).
+
+## Choosing a backend
+
+`cluster.backend` selects how leadership is decided. All three present the same
+seam to the scheduler — `clusterPolicy` (`Leader` / `PreferLeader` /
+`EveryNode`), the dashboard cluster panel, and `GET /cluster` work the same — so
+you pick a point on the CAP trade-off without changing how jobs are written.
+
+| | `gossip` *(default)* | `kubernetes` | `etcd` |
+| --- | --- | --- | --- |
+| Coordination | embedded mTLS gossip, no shared state | a `coordination.k8s.io/v1` `Lease` | a lease-bound etcd key |
+| Guarantee | best-effort (may skip or double-run in narrow windows) | **fenced, exactly-once** while the apiserver is reachable | **fenced, exactly-once** while etcd is reachable |
+| Extra dependency | none | none (optional `yacron2[kubernetes]`) | none |
+| Needs | per-node mTLS certs + a static peer list | in-cluster (or kubeconfig) apiserver access + a Lease RBAC | reachable etcd endpoint(s) |
+| Best when | zero-dependency replicas, occasional skip/dup tolerable | already on Kubernetes and want a hard guarantee | already run etcd |
+
+How the lease backends talk to their store: **over plain HTTP using the core
+`aiohttp` dependency** — the Kubernetes apiserver's REST API and etcd's v3
+gRPC-gateway JSON API. So the **core install gains no new dependency**, and by
+avoiding grpc/protobuf wheels both backends run on the full set of architectures
+yacron2 ships for. The Kubernetes backend can optionally use the **official
+`kubernetes` client** when it is installed
+(`pip install yacron2[kubernetes]`): `cluster.kubernetes.clientLibrary: auto`
+(the default) prefers it when importable and otherwise falls back to the
+hand-rolled REST transport — so the choice is automatic per architecture
+(`library` requires the client, `http` forces the hand-rolled path). etcd always
+uses its own v3 JSON gateway, so it has no optional client.
+
+### Lease backends at a glance
+
+* **No peer list, no mTLS, no quorum math.** The store is the single source of
+  truth, so `listen`/`tls`/`peers` are not used; `electLeader` is implied
+  (configuring a lease backend *is* opting into leadership). The cluster is
+  logically a single holder (`cluster_size` / `quorum` report `1`), and
+  `GET /cluster` returns a lease-shaped view (a `lease` block with the holder
+  and expiry; an empty `peers` array).
+* **Local-expiry safety.** A holder only calls itself leader until a
+  *locally-computed* lease deadline (renew time + duration, minus a small
+  clock-skew margin), so a node whose renew loop stalls self-demotes **without a
+  network round-trip**, and never two holders act at once.
+* **`PreferLeader` keeps never-skip semantics.** A node that currently **cannot
+  reach** the coordination store runs a `PreferLeader` job anyway (it may
+  double-run); a healthy follower that **can** see the holder defers. `Leader`
+  stays fail-closed: it skips while the store is unreachable. This is the
+  deliberate, documented trade — a `PreferLeader` job never skips, at the cost of
+  a possible double-run during a store outage.
+* **`distribution: spread` is rejected.** A single lease holder cannot also be a
+  per-job owner; use the gossip backend if you need per-job spread.
+
+The per-backend config keys (`cluster.kubernetes.*`, `cluster.etcd.*`) are in the
+[Configuration Reference](Configuration-Reference#cluster); runnable samples are
+in [`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes)
+and [`example/etcd/`](https://github.com/ptweezy/yacron2/tree/develop/example/etcd).
+
+The rest of this page documents the **`gossip`** backend (the default) in
+depth; its trust model and quorum math are specific to it. The `clusterPolicy`
+semantics in [Per-job policy](#per-job-policy), however, apply to every backend.
 
 ## At a glance
 

@@ -125,6 +125,7 @@ from aiohttp import web
 
 from yacron2.config import ClusterConfig
 from yacron2.fingerprint import SCHEME_VERSION
+from yacron2.leadership import LeadershipBackend
 
 logger = logging.getLogger("yacron2.cluster")
 
@@ -624,8 +625,15 @@ def _split_host_port(addr: str) -> "tuple[str, int]":
     return host, int(port)
 
 
-class ClusterManager:
-    """Owns the mTLS ``/peer`` listener and the periodic peer-poll loop."""
+class ClusterManager(LeadershipBackend):
+    """Owns the mTLS ``/peer`` listener and the periodic peer-poll loop.
+
+    The default, best-effort gossip leadership backend (see
+    :class:`yacron2.leadership.LeadershipBackend`).  It defines real bodies for
+    every method on the seam -- core, defaulted, and the never-skip
+    ``available_*`` family -- so subclassing the ABC is purely a conformance
+    declaration and leaves behaviour byte-identical.
+    """
 
     def __init__(
         self,
@@ -1323,6 +1331,7 @@ class ClusterManager:
         conflicts = self.conflict_names()
         size_conflicts = self.conflicting_sizes()
         return {
+            "backend": "gossip",
             "node_name": self.node_name,
             "job_set_id": self.get_job_set_id(),
             "cluster_size": self.cluster_size(),

@@ -1,0 +1,79 @@
+# Minimal RBAC + Deployment for the Kubernetes Lease leadership backend.
+#
+# The Role grants exactly the verbs the backend needs on the single Lease
+# object: get (observe), create (first acquire), and update (renew / replace /
+# release). Apply with:
+#
+#     kubectl apply -f deployment.yaml
+#
+# The yacron2 config (yacron2tab.yaml in this directory) is mounted from a
+# ConfigMap; create it with:
+#
+#     kubectl create configmap yacron2tab --from-file=yacron2tab.yaml
+#
+# Then watch leadership move by deleting the holder pod:
+#
+#     kubectl get lease yacron2-leader -o jsonpath='{.spec.holderIdentity}{"\n"}'
+#     kubectl delete pod <that-pod>     # a survivor takes the lease within ~leaseDurationSeconds
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: yacron2
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: yacron2-lease
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    # get: observe the current holder; create: first acquire; update: renew,
+    # take over an expired lease, and release on shutdown.
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: yacron2-lease
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: yacron2-lease
+subjects:
+  - kind: ServiceAccount
+    name: yacron2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yacron2
+spec:
+  # An odd replica count is not required for a lease backend (the store is the
+  # authority, not a quorum), but spreading replicas across nodes still helps
+  # availability.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: yacron2
+  template:
+    metadata:
+      labels:
+        app: yacron2
+    spec:
+      serviceAccountName: yacron2
+      containers:
+        - name: yacron2
+          image: ghcr.io/ptweezy/yacron2:latest
+          args: ["-c", "/etc/yacron2/yacron2tab.yaml"]
+          # cluster.nodeName (and so the lease identity) defaults to the
+          # container hostname, which Kubernetes sets to the pod name -- already
+          # unique per replica, so the Lease's holderIdentity names a real pod.
+          volumeMounts:
+            - name: yacron2tab
+              mountPath: /etc/yacron2
+              readOnly: true
+      volumes:
+        - name: yacron2tab
+          configMap:
+            name: yacron2tab

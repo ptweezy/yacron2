@@ -1285,12 +1285,16 @@ other through the bridge (a bridge of `quorum - 1` shared members suffices). A
 node only elects a leader it can confirm is itself quorate, so a healthy
 majority is **never silently stood down**; the deliberate trade is that a
 *thinner* bridge or the convergence window can double-run instead of skipping
-(`spread` behaves the same per job). If you need a hard exactly-once guarantee
-you need a
-lease/consensus store (etcd, a Kubernetes `Lease`), which this design
-intentionally avoids in favour of keeping no shared state. If election is
-configured but the cluster listener fails to start, the node **fails closed**
-(stays idle) rather than fall back to running everything.
+(`spread` behaves the same per job). The default `gossip` backend keeps **no
+shared state**, which is what makes it best-effort. If you need a hard
+exactly-once guarantee **and** already run a coordination store, set
+`cluster.backend: kubernetes` or `cluster.backend: etcd` to elect through a
+fenced `coordination.k8s.io/v1` `Lease` or a lease-bound etcd key instead (both
+talk to their store over plain HTTP via the existing `aiohttp` dependency, so
+the core install gains no dependency; see
+[Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election#choosing-a-backend)).
+If election is configured but the backend fails to start, the node **fails
+closed** (stays idle) rather than fall back to running everything.
 
 #### Per-job policy
 

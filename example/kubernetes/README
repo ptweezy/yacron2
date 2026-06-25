@@ -1,0 +1,60 @@
+yacron2 + Kubernetes Lease leadership backend
+=============================================
+
+This example runs several yacron2 replicas that elect a single leader through a
+coordination.k8s.io/v1 Lease. Only the lease holder runs the `Leader` jobs, so
+you can scale for availability without double-running scheduled work -- with a
+fenced, exactly-once guarantee while the apiserver is reachable (unlike the
+best-effort gossip backend).
+
+Files
+-----
+
+  yacron2tab.yaml   the yacron2 config: `cluster.backend: kubernetes` plus one
+                    job of each clusterPolicy (Leader / PreferLeader / EveryNode)
+  deployment.yaml   a ServiceAccount, a Role granting get/create/update on the
+                    Lease, a RoleBinding, and a 3-replica Deployment
+
+How the backend reaches the apiserver
+-------------------------------------
+
+In-cluster it uses the pod's service-account token and CA automatically. By
+default it uses the official `kubernetes` Python client if that is installed in
+the image, otherwise it falls back to a hand-rolled apiserver REST transport
+over the core aiohttp dependency -- so no extra dependency is required, and it
+works on every architecture. To require the native client install the extra
+(`pip install yacron2[kubernetes]`) and set `clientLibrary: library`; to force
+the hand-rolled path set `clientLibrary: http`.
+
+Try it
+------
+
+  # 1. create the config ConfigMap from the file in this directory
+  kubectl create configmap yacron2tab --from-file=yacron2tab.yaml
+
+  # 2. apply the RBAC + Deployment
+  kubectl apply -f deployment.yaml
+
+  # 3. see who holds the lease
+  kubectl get lease yacron2-leader \
+    -o jsonpath='{.spec.holderIdentity}{"\n"}'
+
+  # 4. watch leadership fail over: delete the holder pod and re-check the lease
+  kubectl delete pod <holder-pod-name>
+  #    a survivor acquires it within ~leaseDurationSeconds (15s here)
+
+Each pod also serves the dashboard on :8080 (port-forward to inspect the
+cluster panel, which shows the backend, the current holder, and the lease
+expiry).
+
+Out-of-cluster / local testing
+------------------------------
+
+Point the backend at a kubeconfig (e.g. a local k3d/kind cluster) instead of
+the in-cluster credentials:
+
+  cluster:
+    backend: kubernetes
+    kubernetes:
+      kubeconfig: /path/to/kubeconfig
+      leaseNamespace: default

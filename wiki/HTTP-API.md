@@ -157,18 +157,29 @@ Content-Type: application/json; charset=utf-8
 Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
 *New in version 1.1.8.* When no `cluster` section is configured, it returns
 `{"enabled": false, "peers": []}`. When a cluster section is present it returns
-`enabled: true` plus the node's view: its `node_name` and `job_set_id`, the
-computed `cluster_size` and `quorum`, whether `elect_leader` is on, the
-`distribution` mode (`single-leader` or `spread`), whether any conflict is
-pausing `Leader` jobs (`conflict`) — a duplicate `nodeName` (with the offending
-names in `conflict_names`) and/or an agreeing peer declaring a different cluster
-size (`size_conflict`, with those divergent sizes in `conflicting_sizes`),
-whether this node is `quorate`, the elected `leader` (`null`
-when this node is not quorate, and always `null` in `spread` mode) and
+`enabled: true` plus a `backend` field naming the active leadership backend
+(`gossip`, `kubernetes`, or `etcd`; new in 1.2.0) and the node's view: its
+`node_name` and `job_set_id`, the computed `cluster_size` and `quorum`, whether
+`elect_leader` is on, the `distribution` mode (`single-leader` or `spread`),
+whether any conflict is pausing `Leader` jobs (`conflict`) — a duplicate
+`nodeName` (with the offending names in `conflict_names`) and/or an agreeing peer
+declaring a different cluster size (`size_conflict`, with those divergent sizes
+in `conflicting_sizes`), whether this node is `quorate`, the elected `leader`
+(`null` when this node is not quorate, and always `null` in `spread` mode) and
 `is_leader` (always `false` in `spread` mode), and a `peers` array (each with
 `host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`, and
 `mismatch_streak`). Under `distribution: spread`, per-job owners instead appear
 as a `clusterOwner` field on each leader-gated job in `GET /jobs`.
+
+The **lease backends** (`kubernetes` / `etcd`) have no static peer set, so their
+view is lease-shaped: `backend` names the backend, `peers` is empty, `conflict`/
+`size_conflict` are always `false`, `cluster_size`/`quorum` are `1`,
+`elect_leader` is `true`, `distribution` is `single-leader`, and an extra
+`lease` block carries the backend-specific detail — for `kubernetes`
+`{name, namespace, identity, holder, expiry}`, for `etcd`
+`{electionName, identity, holder, leaseId, expiry}`. `quorate` is whether the
+node has a fresh successful read of the lease store (stale → `Leader` fails
+closed; the never-skip `PreferLeader` default then runs the job anyway).
 
 ```shell
 $ http get http://127.0.0.1:8080/cluster Accept:application/json
@@ -177,6 +188,7 @@ Content-Type: application/json; charset=utf-8
 
 {
     "enabled": true,
+    "backend": "gossip",
     "node_name": "node-a",
     "job_set_id": "v1:…",
     "cluster_size": 3,
@@ -193,6 +205,30 @@ Content-Type: application/json; charset=utf-8
     "peers": [
         {"host": "yacron-b.internal:8443", "status": "agreed", "node_name": "node-b", "job_set_id": "v1:…", "last_seen": "2026-06-23T19:00:00+00:00", "last_error": null, "mismatch_streak": 0}
     ]
+}
+```
+
+A lease backend (here `kubernetes`) returns the lease-shaped view instead:
+
+```jsonc
+{
+    "enabled": true,
+    "backend": "kubernetes",
+    "node_name": "yacron2-0",
+    "job_set_id": "v1:…",
+    "cluster_size": 1,
+    "quorum": 1,
+    "elect_leader": true,
+    "distribution": "single-leader",
+    "conflict": false, "conflict_names": [],
+    "size_conflict": false, "conflicting_sizes": [],
+    "quorate": true,
+    "leader": "yacron2-0",
+    "is_leader": true,
+    "peers": [],
+    "lease": {"name": "yacron2-leader", "namespace": "default",
+              "identity": "yacron2-0", "holder": "yacron2-0",
+              "expiry": "2026-06-24T19:00:14.000000Z"}
 }
 ```
 

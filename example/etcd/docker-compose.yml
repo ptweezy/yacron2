@@ -1,0 +1,43 @@
+# A local etcd plus two yacron2 instances electing a leader through it.
+#
+#   docker compose -f example/etcd/docker-compose.yml up --build
+#
+# Then open http://localhost:8080/ and http://localhost:8081/ and watch the
+# cluster panel: exactly one instance is the leader (holds the lease-bound
+# election key). Stop the leader and the other takes over within ~ttl seconds:
+#
+#   docker compose -f example/etcd/docker-compose.yml stop yacron2-a
+#
+# Inspect the election key directly:
+#
+#   docker compose -f example/etcd/docker-compose.yml exec etcd \
+#     etcdctl get yacron2/leader
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5
+    command:
+      - etcd
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+    ports:
+      - "2379:2379"
+
+  yacron2-a:
+    image: ghcr.io/ptweezy/yacron2:latest
+    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
+    hostname: yacron2-a          # becomes cluster.nodeName / the lease identity
+    depends_on: [etcd]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
+
+  yacron2-b:
+    image: ghcr.io/ptweezy/yacron2:latest
+    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
+    hostname: yacron2-b
+    depends_on: [etcd]
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro

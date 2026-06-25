@@ -19,7 +19,6 @@ from crontab import CronTab  # noqa
 
 import yacron2.version
 from yacron2 import platform
-from yacron2.cluster import ClusterManager
 from yacron2.config import (
     ClusterConfig,
     ConfigError,
@@ -34,6 +33,7 @@ from yacron2.config import (
 )
 from yacron2.fingerprint import job_set_id
 from yacron2.job import JobOutputStream, JobRetryState, RunningJob
+from yacron2.leadership import LeadershipBackend, make_backend
 
 logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
@@ -274,8 +274,8 @@ class Cron:
         self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
-        # the peer-attestation manager, when a cluster section is configured
-        self.cluster_manager = None  # type: Optional[ClusterManager]
+        # the leadership backend, when a cluster section is configured
+        self.cluster_manager: Optional[LeadershipBackend] = None
         # last job-set id we logged, so reloads only log it again on change
         self._logged_job_set_id = None  # type: Optional[str]
         # whether the loaded config asks us to gate jobs on leader election;
@@ -806,19 +806,23 @@ class Cron:
             for warning in cluster_config_warnings(cluster_config):
                 logger.warning("%s", warning)
             try:
-                # Construct INSIDE the try: ClusterManager.__init__ builds the
-                # TLS contexts (loading the CA/cert/key files), which raises
-                # OSError/ssl.SSLError on a missing or malformed file; start()
-                # then parses listen (ValueError) and binds the port (OSError).
-                # All three are operational misconfigurations we log and keep
-                # running through, not bugs -- so they must not escape to the
-                # run loop's generic "please report this as a bug" handler.
-                manager = ClusterManager(cluster_config, self.job_set_id)
+                # Construct INSIDE the try: a backend's __init__/start can
+                # raise on an operational misconfiguration -- the gossip
+                # manager builds the TLS contexts (loading the CA/cert/key
+                # files: OSError/ssl.SSLError) and start() parses listen
+                # (ValueError) and binds the port (OSError); a lease backend's
+                # start() may fail to load in-cluster/kubeconfig credentials
+                # or build a client TLS context (ConfigError/OSError/SSLError).
+                # All are misconfigurations we log and keep running through,
+                # not bugs -- so they must not escape to the run loop's generic
+                # "please report this as a bug" handler.
+                manager = make_backend(cluster_config, self.job_set_id)
                 await manager.start()
-            except (OSError, ssl.SSLError, ValueError) as ex:
-                # bad cert files / bad listen address / port already in use:
-                # log and keep running jobs rather than aborting the reload.
-                # (start() cleans up its own half-started runner on failure.)
+            except (OSError, ssl.SSLError, ValueError, ConfigError) as ex:
+                # bad cert/credential files / bad listen address / port already
+                # in use / unreachable setup: log and keep running jobs rather
+                # than aborting the reload. (A backend cleans up its own
+                # half-started state on failure.)
                 logger.error("cluster: failed to start: %s", ex)
                 return
             self.cluster_manager = manager

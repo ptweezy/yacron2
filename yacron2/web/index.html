@@ -532,9 +532,12 @@
 
   <div class="card" id="clusterCard" style="display:none">
     <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><span id="clusterSummary"></span></div>
-    <table>
+    <table id="clusterTable">
       <thead><tr><th>Peer</th><th>Node</th><th>Status</th><th>Job set</th></tr></thead>
       <tbody id="clusterRows"></tbody>
+    </table>
+    <table id="clusterLease" style="display:none">
+      <tbody id="clusterLeaseRows"></tbody>
     </table>
   </div>
 </main>
@@ -2039,6 +2042,27 @@
     return id ? id.replace(/^v\d+:/, "").slice(0, 12) : "—";
   }
 
+  // Render the lease-backend (kubernetes/etcd) cluster view: a role summary
+  // plus the backend's lease detail block, in place of the gossip peer table.
+  function loadClusterLease(data) {
+    $("clusterTable").style.display = "none";
+    $("clusterLease").style.display = "";
+    let role;
+    if (data.is_leader) role = "leader";
+    else if (data.quorate && data.leader) role = "follower (leader: " + data.leader + ")";
+    else if (data.quorate) role = "follower";
+    else role = "no quorum (store unreachable)";
+    $("clusterSummary").textContent =
+      (data.node_name || "?") + " · " + data.backend + " · " + role;
+    const lease = data.lease || {};
+    const rows = Object.keys(lease)
+      .filter((k) => lease[k] !== null && lease[k] !== undefined)
+      .map((k) => "<tr><td>" + esc(k) + "</td><td>" + esc(String(lease[k])) + "</td></tr>")
+      .join("");
+    $("clusterLeaseRows").innerHTML =
+      rows || '<tr><td colspan="2">no lease detail yet</td></tr>';
+  }
+
   async function loadCluster() {
     try {
       const r = await apiFetch("/cluster");
@@ -2047,6 +2071,15 @@
       const card = $("clusterCard");
       if (!data.enabled) { card.style.display = "none"; return; }
       card.style.display = "";
+      // Lease backends (kubernetes/etcd) have no static peer set: the lease
+      // store is authoritative. Render the lease/role detail instead of a peer
+      // tally.
+      if (data.backend && data.backend !== "gossip") {
+        loadClusterLease(data);
+        return;
+      }
+      $("clusterTable").style.display = "";
+      $("clusterLease").style.display = "none";
       const peers = data.peers || [];
       // "self" entries are this node listed in its own peers; exclude from the
       // agreement tally.

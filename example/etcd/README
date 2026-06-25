@@ -1,0 +1,54 @@
+yacron2 + etcd leadership backend
+=================================
+
+This example runs two yacron2 instances that elect a single leader through an
+etcd key. The holder creates a lease-bound key (`yacron2/leader`) with a
+create-if-absent transaction and keeps the lease alive; if it dies, the lease
+expires, etcd deletes the key, and the other instance's transaction wins. While
+etcd is reachable this is a fenced, exactly-once election (unlike the
+best-effort gossip backend).
+
+The backend speaks etcd's v3 gRPC-gateway JSON/HTTP API directly over the core
+aiohttp dependency -- no etcd3/grpc client and so no extra dependency, and it
+runs on every architecture yacron2 targets. The gateway is etcd's own
+first-class HTTP interface, so there is no optional native-client extra for
+etcd.
+
+Files
+-----
+
+  yacron2tab.yaml      the yacron2 config: `cluster.backend: etcd` plus one job
+                       of each clusterPolicy (Leader / PreferLeader / EveryNode)
+  docker-compose.yml   a single etcd plus two yacron2 instances pointed at it
+
+Try it
+------
+
+  docker compose -f docker-compose.yml up --build
+
+  # exactly one instance is the leader; watch the cluster panel:
+  #   http://localhost:8080/    http://localhost:8081/
+
+  # fail the leader over:
+  docker compose -f docker-compose.yml stop yacron2-a   # the other takes over within ~ttl
+
+  # see the election key value (the current holder's nodeName):
+  docker compose -f docker-compose.yml exec etcd etcdctl get yacron2/leader
+
+Authentication and TLS
+----------------------
+
+For an authenticated etcd cluster set `cluster.etcd.username` and resolve the
+password from a value / file / env var (like `web.authToken`):
+
+  cluster:
+    backend: etcd
+    etcd:
+      endpoints: [https://etcd:2379]
+      username: root
+      password:
+        fromEnvVar: ETCD_PASSWORD
+      tls:
+        ca: /etc/etcd/ca.pem
+        cert: /etc/etcd/client.pem
+        key: /etc/etcd/client.key

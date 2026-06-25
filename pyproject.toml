@@ -80,6 +80,13 @@ Container = "https://github.com/ptweezy/yacron2/pkgs/container/yacron2"
 yacron2 = "yacron2.__main__:main"
 
 [project.optional-dependencies]
+# Optional: use the official Kubernetes client for the `kubernetes` leadership
+# backend. Entirely optional -- without it (or on an architecture where its
+# grpc/protobuf wheels are unavailable) the backend auto-falls back to its
+# hand-rolled apiserver REST transport over the core aiohttp dependency, so the
+# core install stays zero-new-dep and architecture-portable. The etcd backend
+# needs no extra: it always uses etcd's v3 gRPC-gateway JSON/HTTP API directly.
+kubernetes = ["kubernetes>=27"]
 dev = [
     # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.
@@ -94,7 +101,11 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["yacron2", "yacron2.web"]
+# The kubernetes/etcd leadership backends talk to their store over plain HTTP
+# via the core aiohttp dependency (no kubernetes/etcd3 client, no grpc), so
+# they add no runtime dependency and need no optional extra -- which also keeps
+# yacron2's wide architecture coverage intact.
+packages = ["yacron2", "yacron2.web", "yacron2.backends"]
 
 [tool.setuptools.package-data]
 "yacron2.web" = ["*.html"]

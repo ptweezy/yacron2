@@ -142,7 +142,18 @@ def test_etcd_ttl_must_be_positive():
 
 
 def test_etcd_rejects_malformed_endpoint():
-    for bad in ("127.0.0.1:2379", "http://nohost", "ftp://h:2379"):
+    # missing port, missing host, bad scheme, non-numeric port, out-of-range
+    # port, and port 0 must all raise a clean ConfigError (never a raw
+    # ValueError from urlparse().port).
+    bad_endpoints = (
+        "127.0.0.1:2379",
+        "http://nohost",
+        "ftp://h:2379",
+        "http://h:notaport",
+        "http://h:99999",
+        "http://h:0",
+    )
+    for bad in bad_endpoints:
         yaml = (
             "cluster:\n"
             "  backend: etcd\n"

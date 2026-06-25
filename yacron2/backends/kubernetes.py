@@ -136,35 +136,51 @@ def parse_lease(obj: Optional[Dict[str, Any]]) -> LeaseState:
     )
 
 
-def lease_is_expired(state: LeaseState, now: datetime.datetime) -> bool:
-    """Whether ``state``'s lease has lapsed by ``now``.
+def lease_is_expired(
+    state: LeaseState,
+    now: datetime.datetime,
+    observed_at: Optional[datetime.datetime],
+) -> bool:
+    """Whether another holder's lease has lapsed, from *our* clock's view.
 
-    Expired iff ``now`` is at or past ``renewTime + leaseDurationSeconds``.  A
-    lease with no renew time or duration is treated as expired (free to take).
+    The deadline is anchored to ``observed_at`` -- the local instant we first
+    saw this lease record -- not to the holder's own ``renewTime``.  This is
+    client-go's ``observedTime + leaseDurationSeconds`` rule: both the anchor
+    and ``now`` are this node's wall clock, so the steal decision is **immune
+    to clock skew** between us and the holder (judging the holder's own
+    ``renewTime`` against our clock could otherwise make a fast clock steal a
+    freshly-renewed lease and elect a second leader).  ``observed_at`` is
+    ``None`` only before
+    the first observation is recorded, where we fall back to ``renewTime``; a
+    lease with no usable anchor or no duration is treated as expired.
     """
-    if state.renew_time is None or not state.duration:
+    if not state.duration:
         return True
-    expiry = state.renew_time + datetime.timedelta(seconds=state.duration)
-    return now >= expiry
+    anchor = observed_at if observed_at is not None else state.renew_time
+    if anchor is None:
+        return True
+    return now >= anchor + datetime.timedelta(seconds=state.duration)
 
 
 def decide_lease_action(
     state: Optional[LeaseState],
     identity: str,
     now: datetime.datetime,
+    observed_at: Optional[datetime.datetime],
 ) -> str:
     """Choose the action for this round given the observed lease.
 
     * no lease -> ``create``;
     * we are the holder -> ``renew`` (reclaim even if it lapsed);
-    * holder is empty or the lease has expired -> ``acquire`` (take over);
+    * holder is empty, or *our* observation of this record has aged past the
+      lease duration (see :func:`lease_is_expired`) -> ``acquire`` (take over);
     * someone else holds a still-valid lease -> ``wait``.
     """
     if state is None:
         return ACTION_CREATE
     if state.holder == identity:
         return ACTION_RENEW
-    if not state.holder or lease_is_expired(state, now):
+    if not state.holder or lease_is_expired(state, now, observed_at):
         return ACTION_ACQUIRE
     return ACTION_WAIT
 
@@ -225,15 +241,18 @@ def plan_lease_write(
     identity: str,
     now: datetime.datetime,
     duration: int,
+    observed_at: Optional[datetime.datetime],
 ) -> Tuple[str, Optional[Dict[str, Any]], Optional[LeaseState]]:
     """Pure planning step: observed Lease -> (action, body, state).
 
-    ``body`` is ``None`` for ``wait`` (nothing to write).  This is the whole
-    per-round decision with no I/O, so the renew loop reduces to "observe,
-    plan, maybe write, update local state".
+    ``observed_at`` is the local instant we first saw the current lease record
+    (the skew-immune steal anchor; see :func:`lease_is_expired`).  ``body`` is
+    ``None`` for ``wait`` (nothing to write).  This is the whole per-round
+    decision with no I/O, so the renew loop reduces to "observe, track, plan,
+    maybe write, update local state".
     """
     state = parse_lease(lease_obj) if lease_obj is not None else None
-    action = decide_lease_action(state, identity, now)
+    action = decide_lease_action(state, identity, now, observed_at)
     if action == ACTION_WAIT:
         return action, None, state
     body = build_lease_body(
@@ -273,6 +292,14 @@ class KubernetesBackend(LeaseBackend):
         self._holder: Optional[str] = None
         self._leader_until: Optional[datetime.datetime] = None
         self._last_contact: Optional[datetime.datetime] = None
+
+        # client-go's observedTime: the (holder, renewTime) record we last saw
+        # and the local clock when we first saw it. The steal decision is
+        # anchored to _observed_at (our clock), not the holder's renewTime, so
+        # it is immune to clock skew between us and the holder.
+        self._observed_holder: Optional[str] = None
+        self._observed_renew: Optional[datetime.datetime] = None
+        self._observed_at: Optional[datetime.datetime] = None
 
         # the chosen transport (native client or hand-rolled HTTP), bound in
         # start(); see select_transport.
@@ -325,6 +352,26 @@ class KubernetesBackend(LeaseBackend):
 
     # --- the renew loop's per-round local-state update (pure) ------------
 
+    def _track_observation(
+        self, state: Optional[LeaseState], now: datetime.datetime
+    ) -> Optional[datetime.datetime]:
+        """Record client-go's observedTime and return the steal anchor.
+
+        Whenever the observed ``(holder, renewTime)`` record changes, reset the
+        local observation clock to ``now``; an unchanged record keeps the
+        original ``_observed_at``.  The returned anchor is what
+        :func:`lease_is_expired` measures the lease duration from, so a peer's
+        lease is only ever stolen after *we* have watched the same record for a
+        full duration on our own clock.
+        """
+        holder = state.holder if state is not None else None
+        renew = state.renew_time if state is not None else None
+        if holder != self._observed_holder or renew != self._observed_renew:
+            self._observed_holder = holder
+            self._observed_renew = renew
+            self._observed_at = now
+        return self._observed_at
+
     def _apply_round(
         self,
         action: str,
@@ -372,7 +419,14 @@ class KubernetesBackend(LeaseBackend):
             if kind == TRANSPORT_LIBRARY
             else _K8sHttpTransport(self)
         )
-        await self._transport.setup()
+        try:
+            await self._transport.setup()
+        except BaseException:
+            # clean up half-started state (an open session, temp cert files)
+            # so a failed start leaks nothing, honouring the caller's contract.
+            await self._transport.close()
+            self._transport = None
+            raise
         logger.info(
             "cluster: kubernetes backend (%s transport), identity %r, lease "
             "%s/%s (duration %ds, renew %ds, retry %ds)",
@@ -391,7 +445,10 @@ class KubernetesBackend(LeaseBackend):
         assert self._transport is not None
         while not self._stop.is_set():
             try:
-                await self._renew_once()
+                # client-go's renewDeadline: bound each renew/observe round so
+                # a stuck call is abandoned (and retried next round) before the
+                # lease can expire, rather than blocking the whole duration.
+                await asyncio.wait_for(self._renew_once(), self.renew_deadline)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
@@ -411,6 +468,9 @@ class KubernetesBackend(LeaseBackend):
         assert self._transport is not None
         now = _utcnow()
         lease_obj = await self._transport.observe()
+        observed_at = self._track_observation(
+            parse_lease(lease_obj) if lease_obj is not None else None, now
+        )
         action, body, state = plan_lease_write(
             lease_obj,
             self.lease_name,
@@ -418,6 +478,7 @@ class KubernetesBackend(LeaseBackend):
             self.identity,
             now,
             self.lease_duration,
+            observed_at,
         )
         write_ok = False
         if body is not None:
@@ -685,14 +746,32 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
         from kubernetes import client
         from kubernetes import config as kube_config
 
+        context_namespace: Optional[str] = None
         if self.b.kubeconfig:
             kube_config.load_kube_config(config_file=self.b.kubeconfig)
+            # honour the active context's namespace, matching the HTTP
+            # transport's kubeconfig handling so the two transports cannot
+            # contend for the Lease in different namespaces (a split-brain).
+            _contexts, active = kube_config.list_kube_config_contexts(
+                config_file=self.b.kubeconfig
+            )
+            if active:
+                context_namespace = (active.get("context") or {}).get(
+                    "namespace"
+                )
         else:
             kube_config.load_incluster_config()
-        self._api_client = client.ApiClient()
+        # honour cluster.kubernetes.apiServer here too, so the override is not
+        # silently dropped when the native client is selected.
+        config_obj = client.Configuration.get_default_copy()
+        if self.b.api_server_override:
+            config_obj.host = self.b.api_server_override.rstrip("/")
+        self._api_client = client.ApiClient(config_obj)
         self._api = client.CoordinationV1Api(self._api_client)
         if self.b.namespace is None:
-            self.b.namespace = _incluster_namespace() or "default"
+            self.b.namespace = (
+                context_namespace or _incluster_namespace() or "default"
+            )
 
     async def observe(self) -> Optional[Dict[str, Any]]:
         from kubernetes.client.exceptions import ApiException

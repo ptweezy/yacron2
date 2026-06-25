@@ -138,47 +138,67 @@ def _after(seconds):
 
 
 def test_lease_is_expired_fresh():
+    # observed_at == renewTime simulates synced clocks
     state = LeaseState("node-b", NOW, NOW, 15, 0, "1")
-    assert lease_is_expired(state, _after(10)) is False
+    assert lease_is_expired(state, _after(10), NOW) is False
 
 
 def test_lease_is_expired_lapsed():
     state = LeaseState("node-b", NOW, NOW, 15, 0, "1")
-    assert lease_is_expired(state, _after(15)) is True
-    assert lease_is_expired(state, _after(20)) is True
+    assert lease_is_expired(state, _after(15), NOW) is True
+    assert lease_is_expired(state, _after(20), NOW) is True
 
 
-def test_lease_is_expired_when_no_renew_or_duration():
-    assert lease_is_expired(LeaseState(None, None, None, 15, 0, "1"), NOW)
-    assert lease_is_expired(LeaseState("x", NOW, NOW, None, 0, "1"), NOW)
+def test_lease_is_expired_uses_observed_anchor_not_renewtime():
+    # skew immunity: a record OBSERVED 15s ago is expired on our clock even
+    # though the holder's renewTime (NOW) claims it is fresh...
+    state = LeaseState("node-b", NOW, NOW, 15, 0, "1")
+    assert lease_is_expired(state, _after(5), _after(-15)) is True
+    # ...and a record we only just observed is NOT stolen even if the holder's
+    # renewTime is ancient (a slow/skewed holder clock keeps its lease).
+    old = NOW - datetime.timedelta(seconds=100)
+    stale_renew = LeaseState("node-b", old, old, 15, 0, "1")
+    assert lease_is_expired(stale_renew, _after(5), NOW) is False
+
+
+def test_lease_is_expired_anchor_fallback_and_no_duration():
+    # no duration -> expired regardless of anchor
+    assert lease_is_expired(LeaseState("x", NOW, NOW, None, 0, "1"), NOW, NOW)
+    # no anchor at all (observed_at None and renew_time None) -> expired
+    none_state = LeaseState(None, None, None, 15, 0, "1")
+    assert lease_is_expired(none_state, NOW, None)
+    # observed_at None falls back to the holder's renewTime
+    fresh = LeaseState("x", NOW, NOW, 15, 0, "1")
+    assert lease_is_expired(fresh, _after(10), None) is False
+    assert lease_is_expired(fresh, _after(20), None) is True
 
 
 # --- decide_lease_action --------------------------------------------------
 
 
 def test_decide_create_when_no_lease():
-    assert decide_lease_action(None, "node-a", NOW) == ACTION_CREATE
+    assert decide_lease_action(None, "node-a", NOW, None) == ACTION_CREATE
 
 
 def test_decide_renew_when_we_hold_it():
     state = LeaseState("node-a", NOW, NOW, 15, 0, "1")
-    assert decide_lease_action(state, "node-a", NOW) == ACTION_RENEW
+    assert decide_lease_action(state, "node-a", NOW, NOW) == ACTION_RENEW
     # reclaim even if our own lease lapsed
     late = NOW + datetime.timedelta(seconds=99)
-    assert decide_lease_action(state, "node-a", late) == ACTION_RENEW
+    assert decide_lease_action(state, "node-a", late, NOW) == ACTION_RENEW
 
 
 def test_decide_acquire_when_empty_or_expired():
     empty = LeaseState(None, NOW, NOW, 15, 0, "1")
-    assert decide_lease_action(empty, "node-a", NOW) == ACTION_ACQUIRE
+    assert decide_lease_action(empty, "node-a", NOW, NOW) == ACTION_ACQUIRE
     expired = LeaseState("node-b", NOW, NOW, 15, 0, "1")
-    late = NOW + datetime.timedelta(seconds=30)
-    assert decide_lease_action(expired, "node-a", late) == ACTION_ACQUIRE
+    late = _after(30)
+    assert decide_lease_action(expired, "node-a", late, NOW) == ACTION_ACQUIRE
 
 
 def test_decide_wait_when_other_holds_valid_lease():
     state = LeaseState("node-b", NOW, NOW, 15, 0, "1")
-    assert decide_lease_action(state, "node-a", NOW) == ACTION_WAIT
+    assert decide_lease_action(state, "node-a", NOW, NOW) == ACTION_WAIT
 
 
 # --- build_lease_body -----------------------------------------------------
@@ -237,14 +257,18 @@ def test_plan_wait_has_no_body():
             "leaseDurationSeconds": 15,
         },
     }
-    action, body, state = plan_lease_write(obj, "yl", "ns", "node-a", NOW, 15)
+    action, body, state = plan_lease_write(
+        obj, "yl", "ns", "node-a", NOW, 15, NOW
+    )
     assert action == ACTION_WAIT
     assert body is None
     assert state.holder == "node-b"
 
 
 def test_plan_create_when_absent():
-    action, body, state = plan_lease_write(None, "yl", "ns", "node-a", NOW, 15)
+    action, body, state = plan_lease_write(
+        None, "yl", "ns", "node-a", NOW, 15, None
+    )
     assert action == ACTION_CREATE
     assert body is not None
     assert state is None
@@ -312,6 +336,25 @@ def test_leader_name_none_when_not_quorate():
     assert b.leader_name() is None  # stale read -> unknown
     b._last_contact = _utc_now_plus(0)
     assert b.leader_name() == "node-b"
+
+
+def test_track_observation_resets_clock_on_record_change():
+    b = _backend()
+    s1 = LeaseState("node-b", NOW, NOW, 15, 0, "1")
+    t0 = _after(0)
+    assert b._track_observation(s1, t0) == t0  # first sight anchors at t0
+    # same (holder, renewTime) record a bit later: anchor stays at t0
+    assert b._track_observation(s1, _after(3)) == t0
+    # a renewed record (new renewTime) re-anchors to the new observation time
+    s2 = LeaseState("node-b", _after(2), NOW, 15, 0, "1")
+    t1 = _after(4)
+    assert b._track_observation(s2, t1) == t1
+    # a different holder also re-anchors
+    s3 = LeaseState("node-c", _after(2), NOW, 15, 0, "1")
+    t2 = _after(6)
+    assert b._track_observation(s3, t2) == t2
+    # no lease observed (None) re-anchors to that observation too
+    assert b._track_observation(None, _after(8)) == _after(8)
 
 
 def test_apply_round_win_acquire():

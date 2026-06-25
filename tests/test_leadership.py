@@ -88,8 +88,14 @@ def test_never_skip_unreachable_runs_self():
 
 
 def test_never_skip_quorate_unknown_leader_falls_back_to_self():
+    # quorate but holder unknown (e.g. a lost create race): the name-returning
+    # and boolean gates must AGREE that this node runs, so a scheduled
+    # PreferLeader job and its @reboot equivalent never diverge.
     b = _FakeBackend(quorate=True, leader=None)
     assert b.available_leader_name() == "node-a"
+    assert b.is_available_leader() is True
+    assert b.available_job_owner("j") == "node-a"
+    assert b.is_available_job_owner("j") is True
 
 
 def test_available_job_owner_mirrors_leader_paths():

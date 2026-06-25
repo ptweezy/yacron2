@@ -155,10 +155,14 @@ class LeadershipBackend(abc.ABC):
     def is_available_leader(self) -> bool:
         """Whether this node should run a ``PreferLeader`` job this cycle.
 
-        ``True`` when the store is unreachable (run anyway, never skip) or when
-        this node is the observed leader.
+        Derived from :meth:`available_leader_name` so the boolean gate and the
+        name it would resolve to can never disagree -- in particular in the
+        quorate-but-unknown-holder window (a lost ``create`` race), where the
+        never-skip rule names *this* node and so must also run it.  ``True``
+        when the store is unreachable (run anyway, never skip) or this node is
+        the available leader.
         """
-        return not self.is_quorate() or self.is_leader()
+        return self.available_leader_name() == self.node_name
 
     def available_job_owner(self, job_name: str) -> str:
         """``available_leader_name`` for the per-job (spread) shape.
@@ -171,7 +175,7 @@ class LeadershipBackend(abc.ABC):
         return self.job_owner(job_name) or self.node_name
 
     def is_available_job_owner(self, job_name: str) -> bool:
-        return not self.is_quorate() or self.is_job_owner(job_name)
+        return self.available_job_owner(job_name) == self.node_name
 
 
 class LeaseBackend(LeadershipBackend):

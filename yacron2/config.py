@@ -946,10 +946,19 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
         raise ConfigError("cluster.etcd.endpoints must list at least one URL")
     for endpoint in etcd["endpoints"]:
         parsed = urlparse(endpoint)
+        # urlparse's .port *raises* ValueError on a non-numeric or out-of-range
+        # port; guard it so a typo surfaces as a clean ConfigError (config
+        # parsing must only ever raise ConfigError) instead of an opaque
+        # ValueError that __main__ / the reload loop mistake for a yacron2 bug.
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
         if (
             parsed.scheme not in ("http", "https")
             or not parsed.hostname
-            or parsed.port is None
+            or port is None
+            or not 0 < port <= 65535
         ):
             raise ConfigError(
                 "cluster.etcd.endpoints entries must be http(s)://host:port, "

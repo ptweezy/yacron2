@@ -104,7 +104,7 @@ and an **even** cluster size is allowed but logs a warning.
 | `leaseName` | `Str` | `yacron2-leader` | Name of the `Lease` object the replicas contend for. |
 | `leaseNamespace` | `Str` or null | null → in-cluster namespace | Namespace of the `Lease`; defaults to the pod's own namespace (the service-account namespace file). |
 | `leaseDurationSeconds` | `Int` | `15` | How long a renewal keeps the lease valid. Must be `> renewDeadlineSeconds`. |
-| `renewDeadlineSeconds` | `Int` | `10` | Renewal target within the duration. Must be `> 0` and `< leaseDurationSeconds`. |
+| `renewDeadlineSeconds` | `Int` | `10` | Per-round renew/observe deadline: a round that exceeds it is abandoned and retried next round, so a stuck apiserver call cannot run out the full lease. Must be `> 0` and `< leaseDurationSeconds`. |
 | `retryPeriodSeconds` | `Int` | `2` | Seconds between renew/observe rounds. Must be `> 0`. |
 | `identity` | `Str` or null | null → `nodeName` | The lease `holderIdentity` written for this node. |
 | `kubeconfig` | `Str` or null | null → in-cluster | Path to a kubeconfig for out-of-cluster / local testing; otherwise the in-cluster service-account credentials are used. |

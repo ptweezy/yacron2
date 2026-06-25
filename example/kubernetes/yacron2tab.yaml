@@ -13,8 +13,9 @@
 # clientLibrary: http to force the hand-rolled transport.
 cluster:
   backend: kubernetes
-  # nodeName defaults to the pod hostname; the Deployment sets it (and the lease
-  # identity) explicitly from the pod name via the downward API.
+  # nodeName (and so the lease holderIdentity) defaults to the container
+  # hostname, which Kubernetes sets to the pod name -- already unique per
+  # replica, so each pod's identity names a real pod with no extra config.
   kubernetes:
     leaseName: yacron2-leader
     # leaseNamespace defaults to the pod's own namespace (the service-account

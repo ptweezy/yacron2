@@ -1895,6 +1895,158 @@ async def test_deferred_reboot_runs_when_election_disabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_deferred_reboot_kept_when_absent_election_disabled(monkeypatch):
+    # #4 (election-disabled path): the same never-lose rule holds when election
+    # was turned off on a reload -- a momentarily-absent name is kept pending,
+    # not popped, and runs the current job once the name returns.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = False
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job) or _noop(),
+    )
+    stale = _reboot_job()
+    cron._pending_reboot_jobs["boot"] = stale
+    cron.cron_jobs.pop("boot", None)  # absent right now
+    await cron._process_pending_reboots()
+    assert launched == []
+    assert "boot" in cron._pending_reboot_jobs  # kept, not lost
+    # name returns -> runs the CURRENT job (not the stale snapshot)
+    current = _reboot_job()
+    cron.cron_jobs["boot"] = current
+    await cron._process_pending_reboots()
+    assert launched == [current]
+    assert launched[0] is not stale
+    assert not cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_election_disabled_skips_non_reboot_reuse(
+    monkeypatch,
+):
+    # #4 (election-off path): if a deferred name was reused for a non-@reboot
+    # job by the time election is turned off, the stale one-shot is retired
+    # WITHOUT running here -- the reused job schedules itself normally. Only a
+    # name still mapping to an @reboot job runs on the election-off drain path,
+    # mirroring the gated path's _is_deferrable_reboot retirement.
+    import types
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = False
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    cron._pending_reboot_jobs["boot"] = _reboot_job()  # stale @reboot one-shot
+    # the name now maps to a normally-scheduled job (reused)
+    cron.cron_jobs["boot"] = types.SimpleNamespace(
+        name="boot", clusterPolicy="Leader", schedule="0 * * * *"
+    )
+    await cron._process_pending_reboots()
+    assert launched == []  # the reused non-@reboot job is not run here
+    assert "boot" not in cron._pending_reboot_jobs  # stale entry retired
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_kept_on_transient_absence(monkeypatch):
+    # #4: @reboot only defers at startup, so if a name momentarily vanishes
+    # from cron_jobs mid-reload (templating glitch, transient remove-then-
+    # re-add) before the cluster converges, it must NOT be dropped -- dropping
+    # would lose the one-shot forever and break the never-lose property. It
+    # stays pending while absent and runs once the name returns and we own it.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron._pending_reboot_jobs["boot"] = job
+    # the name is transiently absent from cron_jobs (cron.cron_jobs is empty)
+    cron.cluster_manager = _reboot_mgr(leader="node-a")  # we would own it
+    await cron._process_pending_reboots()
+    assert launched == []  # did not run while absent...
+    assert "boot" in cron._pending_reboot_jobs  # ...and was NOT dropped
+    # the name comes back on a later reload; now it runs (we are the owner)
+    cron.cron_jobs["boot"] = job
+    await cron._process_pending_reboots()
+    assert launched == ["boot"]
+    assert "boot" not in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_absent_job_never_runs(monkeypatch):
+    # a deliberately-removed @reboot job that never returns must never run,
+    # even though we keep it pending: the launch is gated on presence.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron._pending_reboot_jobs["boot"] = job  # pending, but absent from config
+    cron.cluster_manager = _reboot_mgr(leader="node-a")  # we would own it
+    for _ in range(3):
+        await cron._process_pending_reboots()
+    assert launched == []  # removed-and-gone -> never runs
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_runs_current_config_on_name_reuse(monkeypatch):
+    # #4 name-reuse edge: if a name is removed and later re-added for a
+    # DIFFERENT @reboot job, the owner runs the CURRENT cron_jobs[name], never
+    # the stale JobConfig captured at boot.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job) or _noop(),
+    )
+    stale = _reboot_job()  # captured at startup, then the name was reused
+    fresh = _reboot_job()  # a different object with the same name
+    cron._pending_reboot_jobs["boot"] = stale
+    cron.cron_jobs["boot"] = fresh
+    cron.cluster_manager = _reboot_mgr(leader="node-a")  # we are the owner
+    await cron._process_pending_reboots()
+    assert launched == [fresh]  # the live config, not the stale captured one
+    assert launched[0] is not stale
+    assert "boot" not in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_retired_when_name_reused_non_deferrable(
+    monkeypatch,
+):
+    # #4 name-reuse edge: if a name is reused for a job that is no longer a
+    # deferrable @reboot (e.g. EveryNode, or a real schedule), the stale
+    # pending entry is retired WITHOUT running through the owner path -- the
+    # new job is left to its own scheduling.
+    import types
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    cron._pending_reboot_jobs["boot"] = _reboot_job()  # stale @reboot Leader
+    # the name now belongs to an EveryNode @reboot job (not deferrable)
+    cron.cron_jobs["boot"] = types.SimpleNamespace(
+        name="boot", clusterPolicy="EveryNode", schedule="@reboot"
+    )
+    cron.cluster_manager = _reboot_mgr(leader="node-a")  # we would own it
+    await cron._process_pending_reboots()
+    assert launched == []  # the owner path did not run the reused name
+    assert "boot" not in cron._pending_reboot_jobs  # stale entry retired
+
+
+@pytest.mark.asyncio
 async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
     config = parse_config_string(
         'jobs:\n  - name: boot\n    command: echo hi\n'
@@ -1977,8 +2129,10 @@ async def test_cluster_start_survives_bad_cert_files(caplog):
 async def test_cluster_restarts_on_in_place_cert_rotation(caplog):
     # an in-place cert rotation leaves the config bytes identical, so the
     # restart-on-config-change check alone never fires; the manager must also
-    # restart on the TLS-file-change signal, else it serves the old cert until
-    # expiry and the cluster loses quorum fleet-wide.
+    # restart on the TLS-file-change signal -- but only once the new material
+    # is actually loadable (#6), so a half-written cert mid-rotation cannot
+    # wedge it. Loadable case: the rotation restart proceeds and the old
+    # manager is stopped.
     import logging
 
     yaml = (
@@ -2005,6 +2159,9 @@ async def test_cluster_restarts_on_in_place_cert_rotation(caplog):
         def tls_files_changed(self):
             return True
 
+        def tls_files_loadable(self):
+            return True  # new material loads cleanly -> proceed with restart
+
         async def stop(self):
             self.stopped = True
 
@@ -2022,6 +2179,104 @@ async def test_cluster_restarts_on_in_place_cert_rotation(caplog):
     # reconstruction uses the (here deliberately bad) cert paths and fails
     # closed, so no new manager replaces the stopped one.
     assert cron.cluster_manager is None
+
+
+@pytest.mark.asyncio
+async def test_cluster_cert_rotation_keeps_manager_when_unloadable(caplog):
+    # #6: a half-written / briefly-absent cert observed mid-rotation must NOT
+    # tear the manager down. The rotation signal fires (tls_files_changed) but
+    # the new material is not yet loadable, so the running manager is kept
+    # (still serving the valid old cert) and we retry next reload -- Leader /
+    # PreferLeader stay up the whole time instead of failing closed for ~1
+    # reload while the rebuild fails on the same bad files.
+    import logging
+
+    yaml = (
+        "jobs:\n  - name: a\n    command: echo a\n"
+        '    schedule: "* * * * *"\n'
+        "cluster:\n"
+        '  listen: "127.0.0.1:18443"\n'
+        "  tls:\n"
+        "    ca: /nonexistent/ca.pem\n"
+        "    cert: /nonexistent/cert.pem\n"
+        "    key: /nonexistent/key.pem\n"
+        "  peers:\n"
+        "    - host: b:8443\n"
+        "    - host: c:8443\n"
+        "  electLeader: true\n"
+    )
+    cfg = parse_config_string(yaml, "").cluster_config
+
+    class _FakeMgr:
+        def __init__(self, config):
+            self.config = config
+            self.stopped = False
+
+        def tls_files_changed(self):
+            return True
+
+        def tls_files_loadable(self):
+            return False  # half-written rotation: cannot load yet
+
+        async def stop(self):
+            self.stopped = True
+
+    cron = yacron2.cron.Cron(None)
+    fake = _FakeMgr(cfg)
+    cron.cluster_manager = fake
+    with caplog.at_level(logging.WARNING, logger="yacron2"):
+        await cron.start_stop_cluster(cfg)
+    # the old manager is kept and was never stopped or replaced
+    assert fake.stopped is False
+    assert cron.cluster_manager is fake
+    assert any("not yet loadable" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cluster_config_change_tears_down_even_if_tls_unloadable():
+    # the pre-validation gate (#6) is for cert ROTATION only: a genuine
+    # configuration change must still tear the old manager down regardless of
+    # TLS loadability (the operator changed config; the old manager no longer
+    # applies), and reconstruction then fails closed on the bad certs.
+    yaml_a = (
+        "jobs:\n  - name: a\n    command: echo a\n"
+        '    schedule: "* * * * *"\n'
+        "cluster:\n"
+        '  listen: "127.0.0.1:18443"\n'
+        "  tls:\n"
+        "    ca: /nonexistent/ca.pem\n"
+        "    cert: /nonexistent/cert.pem\n"
+        "    key: /nonexistent/key.pem\n"
+        "  peers:\n"
+        "    - host: b:8443\n"
+        "    - host: c:8443\n"
+        "  electLeader: true\n"
+    )
+    # a DIFFERENT peer set -> cluster_config != mgr.config -> config change
+    yaml_b = yaml_a.replace("host: c:8443", "host: d:8443")
+    cfg_a = parse_config_string(yaml_a, "").cluster_config
+    cfg_b = parse_config_string(yaml_b, "").cluster_config
+
+    class _FakeMgr:
+        def __init__(self, config):
+            self.config = config
+            self.stopped = False
+
+        def tls_files_changed(self):  # pragma: no cover - not reached
+            return False
+
+        def tls_files_loadable(self):  # pragma: no cover - not reached
+            return False
+
+        async def stop(self):
+            self.stopped = True
+
+    cron = yacron2.cron.Cron(None)
+    fake = _FakeMgr(cfg_a)
+    cron.cluster_manager = fake
+    await cron.start_stop_cluster(cfg_b)
+    assert fake.stopped is True  # config change tears down regardless
+    assert cron.cluster_manager is None  # reconstruction fails closed
 
 
 # ---------------------------------------------------------------------------

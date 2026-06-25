@@ -997,8 +997,10 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
         if size > 2 and size % 2 == 0:
             warnings.append(
                 "cluster.electLeader: an even cluster size ({} nodes) "
-                "tolerates no more failures than {}; prefer an odd "
-                "size.".format(size, size - 1)
+                "tolerates no more failures than {} (the next-lower odd "
+                "size); shrink to {} for the same tolerance with one fewer "
+                "node, or grow to {} to tolerate one more failure; prefer an "
+                "odd size.".format(size, size - 1, size - 1, size + 1)
             )
     elif cfg.get("distribution") != DEFAULT_CLUSTER["distribution"]:
         # distribution only governs how *leader-gated* jobs spread, so it does

@@ -513,6 +513,36 @@ async def test_tls_files_changed_detects_in_place_rotation(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tls_files_loadable_true_then_false_on_corruption(tmp_path):
+    # the gossip override dry-runs build_*_ssl_context against the live files,
+    # which is exactly what fails on a missing / half-written cert. This lets
+    # Cron.start_stop_cluster keep the old manager on a transient mid-rotation
+    # write instead of tearing it down and failing the rebuild (#6).
+    import os
+    import ssl
+
+    tls = _write_tls(tmp_path)
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:18443", ["localhost:18444"], "node-a"),
+        lambda: "v1:x",
+    )
+    # valid material loads
+    assert mgr.tls_files_loadable() is True
+    # half-write the cert in place -> no longer a valid PEM
+    with open(tls["cert"], "w") as fh:
+        fh.write("-----BEGIN CERTIFICATE-----\nnot-valid-base64\n")
+    assert mgr.tls_files_loadable() is False
+    # and a missing file is also unloadable (the OSError path)
+    os.remove(tls["ca"])
+    assert mgr.tls_files_loadable() is False
+    # the dry-run is side-effect-free: it must not raise on its own
+    try:
+        mgr.tls_files_loadable()
+    except (OSError, ssl.SSLError):  # pragma: no cover
+        pytest.fail("tls_files_loadable must swallow load errors, not raise")
+
+
+@pytest.mark.asyncio
 async def test_mtls_round_trip_agreed(tmp_path):
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()

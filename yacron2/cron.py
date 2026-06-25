@@ -798,6 +798,33 @@ class Cron:
                 reason = "TLS certificate files changed"
             else:
                 reason = None
+            if (
+                reason == "TLS certificate files changed"
+                and not mgr.tls_files_loadable()
+            ):
+                # A cert rotation restarts the manager only to swap in the NEW
+                # on-disk material, so validate it BEFORE tearing the old one
+                # down: cert-manager / Vault / a Kubernetes secret refresh are
+                # not atomic across all three files, so a reload can observe a
+                # half-written or briefly-absent cert.  If the new material is
+                # not yet loadable, keep the running manager -- still serving
+                # the valid old cert -- and retry next reload, rather than
+                # stopping it and then failing to rebuild, which would wedge
+                # Leader / PreferLeader closed for up to a reload.  (Make-
+                # before-break is infeasible for gossip: the new manager binds
+                # the same listen port the old one still holds.)  Only this
+                # reason is gated; a genuine configuration change tears the old
+                # manager down regardless and lets start fail closed as before.
+                # Lease backends never reach here (tls_files_changed is always
+                # false) and default tls_files_loadable to true, so this is
+                # gossip-only.
+                logger.warning(
+                    "cluster: TLS certificate files changed but the new "
+                    "material is not yet loadable (a partial/half-written "
+                    "rotation?); keeping the running manager and retrying "
+                    "next reload"
+                )
+                reason = None
             if reason is not None:
                 logger.info("cluster: %s, stopping", reason)
                 await mgr.stop()
@@ -974,16 +1001,39 @@ class Cron:
         and dropping on speculation would lose the one-shot forever.  Dropping
         only on positive confirmation keeps the never-lose property while
         avoiding a re-run when leadership later moves to a node that still held
-        the job pending.  If election was turned off on a reload, the gating is
-        gone, so any still-pending jobs run here.
+        the job pending.  If election was turned off on a reload, the
+        quorum/owner gating is gone, so a still-pending one-shot runs here as
+        long as its name still maps to an ``@reboot`` job (a name reused for a
+        non-``@reboot`` job is retired without running, as on the gated path).
+
+        A name that is momentarily *absent* from ``cron_jobs`` (a templating
+        glitch or a remove-then-re-add seen mid-reload, before the cluster has
+        converged) is **kept pending**, not dropped: dropping on a transient
+        absence would lose the one-shot forever and break the never-lose
+        property.  The launch is always gated on the name being present *and*
+        still a deferrable @reboot, so a genuinely-removed job never runs, and
+        we run the *current* ``cron_jobs[name]`` (never the stale config we
+        captured at boot) so a name later reused for a different job runs the
+        live definition.  If a name is reused for a job that is no longer a
+        deferrable @reboot (e.g. it became ``EveryNode`` or a real schedule),
+        the pending entry is retired and the new job is left to its own
+        scheduling.
         """
         if not self._pending_reboot_jobs:
             return
         if not self._elect_leader_configured:
-            # election removed on reload: nothing gates these anymore -> run.
+            # election removed on reload: the quorum/owner gating is gone, so
+            # run the *current* job for any present name still defining an
+            # @reboot one-shot. A momentarily-absent name is kept pending (not
+            # popped) for the same never-lose reason as the gated path below;
+            # a name reused for a non-@reboot job is retired without running
+            # (its new definition schedules itself), mirroring that path.
             for name in list(self._pending_reboot_jobs):
-                job = self._pending_reboot_jobs.pop(name)
-                if name in self.cron_jobs:
+                job = self.cron_jobs.get(name)
+                if job is None:
+                    continue  # transiently absent -> keep pending, re-check
+                del self._pending_reboot_jobs[name]
+                if isinstance(job.schedule, str) and job.schedule == "@reboot":
                     await self.launch_scheduled_job(job)
             return
         mgr = self.cluster_manager
@@ -992,7 +1042,18 @@ class Cron:
             return
         for name in list(self._pending_reboot_jobs):
             if name not in self.cron_jobs:
-                del self._pending_reboot_jobs[name]  # removed on a reload
+                # Absent right now -- but @reboot only defers at startup, so a
+                # name that vanishes mid-reload (templating glitch, transient
+                # remove-then-re-add) could otherwise be lost forever. Keep it
+                # pending and re-evaluate next wakeup; the launch below is
+                # gated on presence, so a genuinely-removed job never runs.
+                continue
+            job = self.cron_jobs[name]
+            if not self._is_deferrable_reboot(job):
+                # the name was reused for a job that is no longer a deferrable
+                # @reboot (now EveryNode, or a real schedule): retire the stale
+                # pending entry and let the new job schedule itself normally.
+                del self._pending_reboot_jobs[name]
                 continue
             if mgr.reboot_ran(name):
                 # positive confirmation it already ran in the cluster -> retire
@@ -1005,7 +1066,6 @@ class Cron:
                     name,
                 )
                 continue
-            job = self._pending_reboot_jobs[name]
             if self._reboot_owner(job) == mgr.node_name:
                 del self._pending_reboot_jobs[name]
                 logger.info(
@@ -1047,9 +1107,11 @@ class Cron:
         make every replica fire.  Manual (API) triggers and retries go through
         ``maybe_launch_job`` and are unaffected by any of this.
 
-        A detected duplicate ``nodeName`` (``mgr.has_conflict()``) additionally
-        makes ``Leader`` jobs fail closed: the quorum election is unsafe while
-        two nodes share a name (each would elect itself), so skipping is the
+        A detected conflict (``mgr.has_conflict()`` — a duplicate ``nodeName``
+        *or* an agreeing peer declaring a different cluster size ``N``)
+        additionally makes ``Leader`` jobs fail closed: the quorum election is
+        unsafe while two nodes share a name or disagree on ``N`` (either lets
+        two nodes each elect themselves), so skipping is the
         at-most-once-preserving choice.  ``PreferLeader`` is left running — it
         already accepts double-runs as the price of never skipping.
         """

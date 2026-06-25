@@ -1263,7 +1263,10 @@ on any node.
   `nodeName` is the system hostname, which is already unique per host.
 * **The quorum gate is what makes this safe with no shared state.** Two strict
   majorities of `N` can't be disjoint, so under a clean network partition at
-  most one side is quorate and at most one leader exists. The trade-off is
+  most one side is quorate and — within about one poll `interval` — at most one
+  leader exists (a leader just cut off from the majority keeps acting on its
+  stale view until its own next poll, so a clean partition can briefly
+  double-run a `Leader` firing, not only skip one). The trade-off is
   liveness: a node that can't see a majority deliberately **stands down** (runs
   nothing) rather than risk a second leader. A job therefore runs on a given
   firing only while a majority of the cluster is up and mutually reachable.
@@ -1343,7 +1346,10 @@ replicas that disagree on a job's policy show up as drift.
 An `@reboot` job with `Leader`/`PreferLeader` policy is **deferred** until the
 cluster converges and then runs **once** on the elected owner (rather than never
 running, or running on every node at boot). Use `EveryNode` for `@reboot` work
-that must run on every node at startup.
+that must run on every node at startup. A deferred one-shot is never silently
+lost across a reload: a name that momentarily vanishes from the config before
+the cluster converges is kept pending and runs when it returns, while a job you
+deliberately remove (or reuse for a non-`@reboot` job) never runs.
 
 #### Distribution: one leader, or spread the load
 

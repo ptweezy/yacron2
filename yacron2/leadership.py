@@ -139,6 +139,20 @@ class LeadershipBackend(abc.ABC):
         """Lease backends are not restarted on an mTLS cert rotation."""
         return False
 
+    def tls_files_loadable(self) -> bool:
+        """Whether the current on-disk TLS material can be loaded right now.
+
+        Used by :meth:`yacron2.cron.Cron.start_stop_cluster` as a cheap,
+        bind-free dry-run *before* it tears the manager down to apply an
+        in-place cert rotation, so a half-written / briefly-absent cert seen
+        mid-rotation cannot leave the node with no manager (which would wedge
+        ``Leader`` / ``PreferLeader`` jobs closed for up to one reload).  Lease
+        backends have no per-node mTLS material to pre-validate -- and never
+        report :meth:`tls_files_changed` -- so this is never consulted for
+        them; the default is always ``True``.  The gossip backend overrides it.
+        """
+        return True
+
     # --- never-skip PreferLeader defaults (the locked lease semantics) ----
 
     def available_leader_name(self) -> str:

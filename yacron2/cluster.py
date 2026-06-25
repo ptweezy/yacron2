@@ -850,6 +850,30 @@ class ClusterManager(LeadershipBackend):
         """
         return _tls_file_signature(self.config["tls"]) != self._tls_signature
 
+    def tls_files_loadable(self) -> bool:
+        """Whether the *current* on-disk CA/cert/key load into contexts now.
+
+        Re-runs exactly the work :meth:`__init__` did at startup
+        (:func:`build_client_ssl_context` / :func:`build_server_ssl_context`)
+        against the live files but *without binding the listener*, so it is a
+        side-effect-free dry-run of the rebuild that
+        :meth:`yacron2.cron.Cron.start_stop_cluster` is about to attempt on a
+        cert rotation.  The built contexts are discarded -- the real swap
+        happens by reconstructing the manager once validation passes.  Returns
+        ``False`` if any file is missing, unreadable, or a half-written/invalid
+        PEM (the same ``OSError`` / ``ssl.SSLError`` the real rebuild would
+        raise), so the caller can keep the running manager -- still serving the
+        valid old cert -- until the rotation settles, instead of tearing it
+        down and then failing to rebuild.
+        """
+        tls = self.config["tls"]
+        try:
+            build_client_ssl_context(tls)
+            build_server_ssl_context(tls)
+        except (OSError, ssl.SSLError):
+            return False
+        return True
+
     # --- the peer-poll loop ----------------------------------------------
 
     async def _poll_loop(self) -> None:

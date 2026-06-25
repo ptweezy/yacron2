@@ -91,7 +91,7 @@ semantics in [Per-job policy](#per-job-policy), however, apply to every backend.
 | Coordination | none | observe-only attestation | quorum-gated election |
 | mTLS identity required | no | yes | yes |
 | Endpoint | none | `GET /cluster`, `GET /peer` | `GET /cluster`, `GET /peer` |
-| Double-running | n/a | yes (by design) | no for `Leader` jobs in a healthy quorum (best-effort — see [Guarantees and trade-offs](#guarantees-and-trade-offs) for the asymmetric-reachability residual) |
+| Double-running | n/a | yes (by design) | no for `Leader` jobs in a converged, fully-connected quorum (best-effort — a thin bridge, a same-`N` membership change, or the ~one-`interval` window after a partition can still let two nodes both lead; see [Guarantees and trade-offs](#guarantees-and-trade-offs)) |
 
 ## The job-set id foundation
 
@@ -248,7 +248,13 @@ on any node.
 
 The quorum gate is what makes this safe with **no shared state**. Two strict
 majorities of `N` cannot be disjoint, so under a clean network partition at most
-one side is quorate, and therefore **at most one leader exists**. The price is
+one side is quorate, and therefore — within about one poll `interval` — **at
+most one leader exists**. (That qualifier matters: a leader just cut off from
+the majority keeps acting on its last, now-stale view until its *own* next poll,
+so for up to one `interval` a clean partition can briefly **double-run** a
+`Leader` firing rather than only skip one; the single-leader property reasserts
+once the cut-off node re-polls and stands down. See
+[Guarantees and trade-offs](#guarantees-and-trade-offs).) The price is
 liveness: a node that cannot see a majority deliberately **stands down** (runs
 nothing) rather than risk a second leader. A `Leader` job therefore runs on a
 given firing only while a majority of the cluster is up and mutually reachable.
@@ -433,16 +439,17 @@ The decision for one node, one firing, is exactly:
 ```text
 election off  -> run (every node runs everything)
 EveryNode     -> run (always, even if the manager failed to start)
-conflict      -> skip (fail closed; a duplicate nodeName is visible)
+conflict      -> skip (fail closed; a duplicate nodeName OR a cluster-size disagreement is visible)
 no manager    -> skip (fail closed)
 PreferLeader  -> run only if this node is the lowest reachable agreeing node
 Leader        -> run only if this node is the quorum-gated elected leader
 ```
 
 (The `conflict` row applies to `Leader` only; `PreferLeader` and `EveryNode`
-are not gated on a duplicate `nodeName`. Under `distribution: spread`, described
-next, the last two lines become "the *per-job owner* among the reachable
-agreeing nodes" and "the quorum-gated *per-job owner*" respectively.)
+are gated on neither a duplicate `nodeName` nor a cluster-size disagreement.
+Under `distribution: spread`, described next, the last two lines become "the
+*per-job owner* among the reachable agreeing nodes" and "the quorum-gated
+*per-job owner*" respectively.)
 
 ### `@reboot` jobs under leader election
 
@@ -471,6 +478,20 @@ firing**:
 For `@reboot` work that must run on **every** node at boot (warming a local
 cache, announcing the node), use `clusterPolicy: EveryNode`, which is not
 deferred.
+
+A deferred `@reboot` one-shot is **never silently lost across a reload**.
+Deferral only happens at the boot instant, so a job whose name momentarily
+disappears from the loaded config before the cluster converges — a templating
+glitch, or a remove-then-re-add seen mid-reload — is **kept pending**, not
+dropped, and runs once the name comes back. The launch is always gated on the
+name being present *and* still a `Leader`/`PreferLeader` `@reboot`, so:
+
+* a job you **deliberately remove** from the config (and leave removed) never
+  runs — its name stays absent;
+* a name **reused** for a different `@reboot` job runs the *current* definition,
+  never the one captured at boot; and if the reused job is no longer a deferrable
+  `@reboot` (it became `EveryNode`, or a real schedule), the original one-shot is
+  considered gone and the new job is left to its own scheduling.
 
 ## Distribution: one leader, or spread the load
 
@@ -644,6 +665,11 @@ there are narrow windows where behaviour degrades:
 
 * **Just after a leader dies**, a `Leader` firing may be *skipped* until the
   survivors notice (up to one `interval`) and re-elect.
+* **A leader partitioned away while still alive** keeps electing itself on its
+  last (now-stale) view until its *own* next poll fails — up to one `interval` —
+  overlapping the majority's re-election, so a clean partition can briefly
+  **double-run** a `Leader` firing, not only skip one. It self-heals once the
+  cut-off node re-polls and stands down.
 * **Asymmetric or partial reachability.** Two nodes that never agree with each
   other can each stay quorate through shared members that *bridge* them. The
   election turns that bridge from cause into cure: each side discovers the other
@@ -692,6 +718,18 @@ rebuild the TLS contexts with the new material. So an in-place rotation needs
 seamlessly. (`os.stat` follows symlinks, so the atomic symlink swap Kubernetes
 uses for mounted secrets is detected too.) This is `gossip`-only; the lease
 backends do not use per-node mTLS certs.
+
+Before applying a detected rotation, yacron2 first **dry-runs loading** the new
+CA/cert/key into fresh SSL contexts. If they are not yet loadable — a
+half-written or briefly-absent cert observed mid-rotation, since cert-manager,
+Vault, and Kubernetes secret refreshes are not atomic across all three files —
+it **keeps the running manager** (still serving the valid old cert) and retries
+on the next reload, logging a `WARNING`, rather than tearing the cluster down
+and then failing the rebuild. So a transient bad write costs nothing:
+`Leader`/`PreferLeader` jobs keep running on the old, valid cert until the new
+material lands cleanly. (yacron2 does *not* build the replacement manager before
+stopping the old one — both would bind the same `listen` port — so this
+dry-run, not a make-before-break swap, is what keeps the rotation restart safe.)
 
 > **Detection caveat.** Change is detected by comparing each file's
 > `(modification time, size)`. Essentially every renewal tool rewrites the bytes

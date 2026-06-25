@@ -618,6 +618,45 @@ def parse_environment_file(path: str) -> Dict[str, str]:
     return environ
 
 
+# Hosts that mean "all interfaces" in a `listen` address. A peer entry can't be
+# string-matched against these, so a node self-listed by hostname behind a
+# wildcard listen needs the nodeName-based recognition in _is_self_listed.
+_WILDCARD_LISTEN_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*", ""})
+
+
+def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
+    """Whether a configured peer entry actually points back at *this* node.
+
+    A self entry must be dropped from `peers`: it never counts toward
+    agreement, yet it inflates `cluster_size()` -- and so the quorum threshold,
+    the size-divergence gate, and the 2-node refusal -- by one. Two cases:
+
+    * an exact match of our own `listen` address; and
+    * the wildcard case `ClusterManager.cluster_size` otherwise has to catch on
+      its own at runtime: a `listen` bound to all interfaces (`0.0.0.0` / `::`)
+      self-listed by hostname. We recognise it structurally when the entry's
+      host equals our `nodeName` (which defaults to the system hostname -- the
+      name the cert SAN and the peer address use by convention) on the same
+      port. Dropping it here keeps config-time `N` equal to runtime `N`, so the
+      2-node guard and the size-divergence gate can't be silently defeated by a
+      self-listing, and a self that never manages to poll itself (a cert SAN or
+      loopback-routing quirk) can no longer permanently inflate `N` and pin
+      `Leader` jobs closed cluster-wide.
+
+    A self-listing whose host is neither the literal `listen` nor `nodeName`
+    (e.g. an FQDN when `nodeName` is the short name) still escapes to the
+    runtime `STATUS_SELF` recognition; structural detection without resolving
+    addresses can only cover the documented common case.
+    """
+    if peer_host == listen:
+        return True
+    listen_host, _, listen_port = listen.rpartition(":")
+    if listen_host not in _WILDCARD_LISTEN_HOSTS:
+        return False
+    peer_h, _, peer_port = peer_host.rpartition(":")
+    return peer_port == listen_port and peer_h == node_name
+
+
 def _build_cluster_config(raw: dict) -> ClusterConfig:
     # Fill defaults over the raw (schema-validated) cluster block and validate
     # the numeric fields, mirroring _validate_numeric_ranges for jobs.
@@ -656,15 +695,20 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
     # peer never counts toward agreement -- but cluster_size() (and thus the
     # quorum threshold) is derived from this list, so a duplicate or self entry
     # would otherwise inflate the quorum and cost fault tolerance. Keep the
-    # first occurrence to preserve configured order. (A self entry that escapes
-    # this string match -- e.g. a wildcard `listen` self-listed by hostname --
-    # is recognised at runtime and excluded by ClusterManager.cluster_size, so
-    # it stays harmless rather than diverging this node's N from its peers'.)
+    # first occurrence to preserve configured order. _is_self_listed also
+    # catches the common wildcard case (a `0.0.0.0` listen self-listed by
+    # hostname), so config-time N matches the runtime N every correctly-
+    # configured peer declares. (An exotic self-listing that escapes it -- e.g.
+    # an FQDN vs the short nodeName -- still degrades to the runtime
+    # STATUS_SELF exclusion in ClusterManager.cluster_size.)
     seen: "set[str]" = set()
     deduped: List[Dict[str, Any]] = []
     for peer in cfg["peers"]:
         host = peer["host"]
-        if host == cfg["listen"] or host in seen:
+        if (
+            _is_self_listed(host, cfg["listen"], cfg["nodeName"])
+            or host in seen
+        ):
             continue
         seen.add(host)
         deduped.append(peer)

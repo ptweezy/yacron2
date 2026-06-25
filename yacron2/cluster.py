@@ -53,27 +53,59 @@ only when both directions are confirmed -- we see it agreeing on the job-set id
 ``instance_id``; see :meth:`ClusterManager._agreeing_peer_names`).  That, plus
 the quorum gate, is what makes this safe with no shared state: two strict
 majorities of N cannot be disjoint (for a *single* shared N -- divergence is
-caught by the membership-uniformity gate above), and the mutual requirement
-means a one-way link cannot let two nodes each count the other and both reach a
-majority, so at most one leader exists -- under a clean partition *or*
-asymmetric reachability.
-The trade-off is liveness: a minority partition (or a node reachable in only
-one direction) deliberately goes idle rather than risk a second leader, mutual
-agreement costs one extra poll round to converge, and because the view is only
-as fresh as the last poll, the guarantee remains best-effort across membership
-changes (a brief window after a leader dies may skip a firing).  It is *not* a
-fenced, exactly-once guarantee; for that you would need a lease/consensus
-store, which this design intentionally avoids.
+caught by the membership-uniformity gate above), so under a **clean partition**
+at most one side is quorate and **at most one leader exists**.  The mutual
+requirement closes the obvious one-way-link loophole: two nodes joined *only*
+by a one-way link can no longer each count the other and both reach a majority.
+The harder case is *bridged* asymmetry -- two nodes that never agree with each
+other (a<->{c,d}, b<->{c,d}, with a and b not mutually agreeing) can each still
+reach a quorum through the *shared* members that bridge them, and would each
+elect itself.  Here the bridge is turned from cause into cure: each node
+reports the set it *mutually* agrees with, so a node ``n`` reached only
+transitively is confirmed quorate when a quorum -- ``n`` plus the shared
+members we see two-way-agreeing with it -- vouches for it, and is then folded
+into the election as an electable candidate (see
+:meth:`ClusterManager._bridge_candidates` and
+:meth:`ClusterManager._eligible_candidates`); the lower name wins on both
+sides, so only one leads, whenever the two share at least ``quorum - 1``
+mutually-agreeing members.
+A node only ever elects a candidate it can *confirm is itself quorate* (a
+direct peer whose gossiped ``mutual_agreeing`` is at or above quorum, or a
+witnessed bridge node) -- never a node that would itself stand down.  This is
+deliberate and is the design's liveness choice: in a **uniform-version**
+cluster a healthy majority is never stood down (electing the lowest of a
+confirmed-quorate set always lands on a node that actually runs).  The accepted
+cost is the converse -- two quorate nodes whose bridge is too thin to confirm
+each other (fewer than ``quorum - 1`` shared members), are more than one gossip
+hop apart, or are still converging may *each* elect itself and **double-run** a
+``Leader`` job.  We trade the (fail-closed) risk of a missed firing for never
+silently halting a healthy cluster; ``spread`` makes the same trade per job
+(see :func:`elect_job_owner`).
+During a **rolling upgrade** old and new builds run *different* election logic
+and cannot fully agree: a node that has not yet learned a peer's
+``mutual_agreeing`` simply does not elect that peer, which leans the new nodes
+toward running (a possible double-run) rather than standing down -- though a
+rare bridged mix can still transiently stand down until the upgrade completes.
+The remaining liveness costs are mild: a true minority partition still goes
+idle (it is below quorum, by design), mutual agreement and bridge discovery
+cost an extra poll round to converge, and a brief window after a leader dies
+may skip a firing.  It is *not* a fenced, exactly-once guarantee; for that you
+would need a lease/consensus store, which this design intentionally avoids.
+(The election trusts peers' gossiped ``mutual_agreeing`` like the rest of the
+protocol: a CA-vouched but *hostile* peer could fabricate it to force a
+stand-down or suppress a defer -- the same Byzantine class out of scope above.)
 
 When ``distribution`` is ``"spread"`` the single elected leader is replaced by
 **per-job ownership** via rendezvous (highest-random-weight) hashing (see
 :func:`elect_job_owner`): each job is independently assigned to one member
 of the quorate set, so leader-gated work fans out roughly evenly across the
 cluster instead of piling onto one node.  This is purely a load optimization:
-it keeps
-the same quorum gate and therefore the same safety guarantee (under a clean
-partition all quorate nodes see the same member set and compute the same owner
-for each job, so still at most one node runs it).
+it keeps the same quorum gate and therefore the **same** safety guarantee as
+single-leader -- no stronger and no weaker, including the bridge-discovery
+mitigation above: bridged quorate nodes fold the same confirmed candidates
+into the rendezvous set, so a quorum-strong shared bridge makes them agree on
+one owner per job.  The same residuals apply -- a thin bridge, a >1-hop gossip
+distance, or the convergence window can still double-run a job.
 """
 
 import asyncio
@@ -81,6 +113,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import ssl
 import uuid
 from collections import defaultdict
@@ -154,8 +187,12 @@ def _parse_members(raw: Any) -> List["tuple[str, str, bool]"]:
 def _parse_str_list(raw: Any) -> "set[str]":
     """Validate an untrusted JSON value as a set of strings, dropping the rest.
 
-    Used for the gossiped ``ran_reboot_jobs`` set; like _parse_members, hostile
-    or malformed input degrades to an empty set rather than raising.
+    Used for the gossiped ``ran_reboot_jobs`` set and the ``mutual_agreeing``
+    set (the latter feeds bridge confirmation in
+    :meth:`ClusterManager._bridge_candidates`); like _parse_members, hostile or
+    malformed input degrades to an empty set rather than raising, and a peer
+    that omits the field (an older build) parses to an empty set -- the safe
+    direction (it simply contributes no evidence).
     """
     if not isinstance(raw, list):
         return set()
@@ -213,21 +250,41 @@ def quorum_size(cluster_size: int) -> int:
 
 def elect_leader(
     node_name: str,
-    agreeing_peer_names: Iterable[str],
+    live_peer_names: Iterable[str],
     cluster_size: int,
+    candidate_names: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """Pure, deterministic leader election from one node's point of view.
 
-    The *live set* is this node plus every peer it currently sees agreeing on
-    the job-set id.  If that set is at least a quorum of ``cluster_size`` the
-    leader is its lowest ``nodeName`` (so every node in one quorum elects the
-    same single leader); otherwise there is no leader and ``None`` is returned,
-    which is how a minority partition is made to stand down.
+    ``live_peer_names`` is this node's *mutual live set* -- the peers it sees
+    agreeing on the job-set id.  The quorum gate is on that set (this node plus
+    them): below a quorum of ``cluster_size`` there is no leader and ``None``
+    is returned, which is how a minority partition is made to stand down.
+
+    When quorate, the leader is the lowest ``nodeName`` among this node and
+    ``candidate_names`` -- the names this node may actually *elect*.  The
+    caller passes only candidates it can confirm are themselves quorate (live
+    peers not known to be sub-quorum, plus bridge-discovered quorate nodes; see
+    :meth:`ClusterManager._eligible_candidates`).  Two consequences:
+
+    * electing the lowest among a set that spans a bridge makes two would-be
+      leaders joined only by shared members defer to the same node, so only one
+      leads (closing the asymmetric double-run); and
+    * because every candidate is confirmed quorate, this node never defers to a
+      peer that would *itself* stand down -- so a healthy majority is never
+      stood down (the liveness choice; the residual is that two quorate nodes
+      with too thin a bridge to confirm each other may both run).
+
+    ``candidate_names`` defaults to ``live_peer_names`` (the simple, no-
+    confirmation behaviour) and never affects the quorum gate, which is always
+    on ``live_peer_names``.
     """
-    live = [node_name, *agreeing_peer_names]
+    live = [node_name, *live_peer_names]
     if len(live) < quorum_size(cluster_size):
         return None
-    return min(live)
+    if candidate_names is None:
+        return min(live)
+    return min([node_name, *candidate_names])
 
 
 def elect_available_leader(
@@ -277,22 +334,29 @@ def _hrw_owner(job_name: str, members: List[str]) -> str:
 def elect_job_owner(
     job_name: str,
     node_name: str,
-    agreeing_peer_names: Iterable[str],
+    live_peer_names: Iterable[str],
     cluster_size: int,
+    candidate_names: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """Quorum-gated per-job owner (the ``distribution: spread`` analogue of
     :func:`elect_leader`).
 
-    The live set is this node plus the peers it sees agreeing.  If that set is
-    at least a quorum of ``cluster_size`` the owner is its rendezvous winner
-    for ``job_name`` (so every node in one quorum picks the same owner); else
-    ``None`` is returned, which is how a minority partition is made to stand
-    down, exactly as in :func:`elect_leader`, just per job.
+    The quorum gate is on the mutual live set (this node plus
+    ``live_peer_names``); ``None`` below quorum stands a minority down.  When
+    quorate the owner is the rendezvous winner for ``job_name`` over this node
+    and ``candidate_names`` -- the confirmed-quorate names this node may elect
+    (see :meth:`ClusterManager._eligible_candidates`), exactly as in
+    :func:`elect_leader`.  Every quorate node sharing one bridged set computes
+    the winner over the same candidates and so picks the same owner; and since
+    each candidate is confirmed quorate, the per-job owner is never a node that
+    would itself stand down.  ``candidate_names`` defaults to
+    ``live_peer_names`` and never affects the quorum gate.
     """
-    live = [node_name, *agreeing_peer_names]
+    live = [node_name, *live_peer_names]
     if len(live) < quorum_size(cluster_size):
         return None
-    return _hrw_owner(job_name, live)
+    names = live_peer_names if candidate_names is None else candidate_names
+    return _hrw_owner(job_name, [node_name, *names])
 
 
 def elect_available_job_owner(
@@ -344,6 +408,17 @@ class PeerState:
     # one-shots without re-running them (see ClusterManager.reboot_ran). Only
     # trusted from an AGREED peer (same job-set id). None when no fresh result.
     ran_reboot_jobs: Optional["set[str]"] = None
+    # the names the peer reports it *mutually* agrees with (its own
+    # _agreeing_peer_names). Unlike ``members`` -- whose ``agreed`` flag is
+    # one-directional (the peer merely reached that node) -- this is the peer's
+    # confirmed two-way set, so it is the only sound evidence that a node we
+    # reach only transitively is itself quorate (see _bridge_candidates). A
+    # one-directional flag would let a node reached one-way by a quorum be
+    # mistaken for quorate and pull every node into deferring to it -- a
+    # cluster-wide stand-down. None when no fresh result (or an older peer that
+    # does not report it: it then contributes no bridge evidence, which is the
+    # safe direction).
+    mutual_agreeing: Optional["set[str]"] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -389,6 +464,7 @@ class ClusterView:
         peer_members: Optional[List["tuple[str, str, bool]"]] = None,
         peer_ran_reboot_jobs: Optional["set[str]"] = None,
         peer_size: Optional[int] = None,
+        peer_mutual_agreeing: Optional["set[str]"] = None,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -399,6 +475,7 @@ class ClusterView:
         peer.members = peer_members
         peer.ran_reboot_jobs = peer_ran_reboot_jobs
         peer.declared_size = peer_size
+        peer.mutual_agreeing = peer_mutual_agreeing
 
         if peer_name is not None and peer_name == my_name:
             if peer_instance is not None and peer_instance != my_instance:
@@ -457,6 +534,7 @@ class ClusterView:
         peer.mismatch_streak = 0
         peer.members = None
         peer.ran_reboot_jobs = None
+        peer.mutual_agreeing = None
 
     def to_list(self) -> List[Dict[str, Any]]:
         return [peer.to_dict() for peer in self.peers.values()]
@@ -512,6 +590,33 @@ def build_server_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
     return ctx
 
 
+def _tls_file_signature(tls: Dict[str, str]) -> Dict[str, Any]:
+    """A cheap on-disk fingerprint of the CA / cert / key files.
+
+    The SSL contexts are built once and load the cert+key into memory, so an
+    *in-place* rotation -- same file paths, new bytes, which is exactly how
+    cert-manager, Vault, and Kubernetes secret refreshes renew -- is otherwise
+    invisible to a long-running process: every node keeps serving its old cert
+    until it expires, then peers reject each other and the cluster loses quorum
+    fleet-wide.  Comparing ``(st_mtime_ns, st_size)`` per file lets the daemon
+    notice a rotation and rebuild the contexts (see
+    :meth:`ClusterManager.tls_files_changed` and
+    :meth:`yacron2.cron.Cron.start_stop_cluster`).  ``os.stat`` follows
+    symlinks, so the atomic symlink swap Kubernetes uses for mounted secrets is
+    picked up too.  A stat error (e.g. a file briefly absent mid-rotation) is
+    recorded as ``None`` and simply compares unequal once the file is back,
+    which is the safe direction -- a spurious restart, not a missed one.
+    """
+    signature: Dict[str, Any] = {}
+    for key in ("ca", "cert", "key"):
+        try:
+            st = os.stat(tls[key])
+            signature[key] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            signature[key] = None
+    return signature
+
+
 def _split_host_port(addr: str) -> "tuple[str, int]":
     host, _, port = addr.rpartition(":")
     if not host or not port:
@@ -545,6 +650,10 @@ class ClusterManager:
         )
         self._client_ssl = build_client_ssl_context(config["tls"])
         self._server_ssl = build_server_ssl_context(config["tls"])
+        # snapshot the TLS material as loaded, so an in-place cert rotation can
+        # be detected and the contexts rebuilt via a restart (see
+        # tls_files_changed); the contexts themselves are never reloaded.
+        self._tls_signature = _tls_file_signature(config["tls"])
         self._runner: Optional[web.AppRunner] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -581,6 +690,12 @@ class ClusterManager:
                 # from agreed peers), so a poller can retire its matching
                 # deferred job without re-running it; see advertised_ran_jobs.
                 "ran_reboot_jobs": sorted(self.advertised_ran_jobs()),
+                # the peers we *mutually* agree with: a poller uses this as the
+                # sound evidence that a node it reaches only transitively is
+                # itself quorate (a witnessed two-way edge), driving the
+                # bridge-discovery deferral; see _bridge_candidates. Distinct
+                # from the one-directional ``agreed`` flags in ``members``.
+                "mutual_agreeing": sorted(self._agreeing_peer_names()),
             }
         )
 
@@ -658,6 +773,16 @@ class ClusterManager:
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
+
+    def tls_files_changed(self) -> bool:
+        """Whether the CA/cert/key files differ from what we loaded at startup.
+
+        True after an in-place cert rotation, so the daemon can restart the
+        manager to rebuild the SSL contexts before the old cert expires
+        cluster-wide (the contexts are otherwise built once and never
+        reloaded).  See :func:`_tls_file_signature`.
+        """
+        return _tls_file_signature(self.config["tls"]) != self._tls_signature
 
     # --- the peer-poll loop ----------------------------------------------
 
@@ -813,6 +938,11 @@ class ClusterManager:
             peer_members=_parse_members(data.get("members")),
             peer_ran_reboot_jobs=_parse_str_list(data.get("ran_reboot_jobs")),
             peer_size=size,
+            # An older build that omits the field, or a peer reporting an empty
+            # set, both parse to an empty set here: either way it is not
+            # confirmed quorate, so _eligible_candidates won't elect it. (The
+            # PeerState default None -- never polled -- is treated the same.)
+            peer_mutual_agreeing=_parse_str_list(data.get("mutual_agreeing")),
         )
 
     # --- deferred @reboot "already ran" gossip ---------------------------
@@ -888,14 +1018,18 @@ class ClusterManager:
 
         ``peers`` lists every *other* member, so the cluster is those plus this
         node -- minus any entry that turns out to be *this* node listed in its
-        own peer list (status ``self``).  The config-load dedup drops a self
-        entry only by string-matching ``listen``, which misses the common case
-        of a wildcard ``listen`` (``0.0.0.0:...``) self-listed by hostname;
-        that entry is instead recognised at runtime as ``self``.  Excluding it
-        keeps N equal to what correctly-configured peers declare, so a benign
-        self-listing stays harmless rather than declaring a larger N and
-        tripping the size-divergence gate cluster-wide (see
-        :meth:`conflicting_sizes`).
+        own peer list (status ``self``).  The config-load dedup
+        (:func:`yacron2.config._is_self_listed`) already drops the literal
+        ``listen`` match *and* the common wildcard case (a ``0.0.0.0:...``
+        listen self-listed by ``nodeName``), so for a correctly-configured node
+        N already matches what its peers declare.  This runtime subtraction is
+        the backstop for the residue config can't catch without resolving
+        addresses (e.g. a self-listing by an FQDN when ``nodeName`` is the
+        short name): such an entry is recognised here as ``self`` once it
+        successfully self-polls.  Excluding it keeps N equal to what
+        correctly-configured peers declare, so a benign self-listing stays
+        harmless rather than declaring a larger N and tripping the size-
+        divergence gate cluster-wide (see :meth:`conflicting_sizes`).
         """
         self_listed = sum(
             1
@@ -907,8 +1041,8 @@ class ClusterManager:
     def quorum(self) -> int:
         return quorum_size(self.cluster_size())
 
-    def _agreeing_peer_names(self) -> List[str]:
-        """Names of peers we *mutually* agree with on our job-set id.
+    def _agreeing_peers(self) -> List[PeerState]:
+        """Peers we *mutually* agree with on our job-set id.
 
         A peer counts only when both directions are confirmed: we see it AGREED
         *and* its last /peer response lists us (by our unique ``instance_id``)
@@ -921,12 +1055,118 @@ class ClusterManager:
         unreachable for quorum purposes.
         """
         return [
-            peer.node_name
+            peer
             for peer in self.view.peers.values()
             if peer.status == STATUS_AGREED
             and peer.node_name is not None
             and _peer_sees_me_agreed(peer.members, self.instance_id)
         ]
+
+    def _agreeing_peer_names(self) -> List[str]:
+        """Names of the peers we mutually agree with.
+
+        See :meth:`_agreeing_peers`.
+        """
+        return [
+            peer.node_name for peer in self._agreeing_peers() if peer.node_name
+        ]
+
+    def _bridge_candidates(self) -> List[str]:
+        """Nodes we reach only *transitively* that we can confirm are quorate.
+
+        The quorum gate alone keeps the election safe under a clean partition,
+        and the mutual requirement closes the direct one-way-link loophole --
+        but two nodes that never agree with each other can each still reach a
+        quorum through a set of *shared* members that bridges them, and would
+        then both elect themselves (an at-most-once violation under asymmetric
+        reachability; see the module docstring).
+
+        This turns that bridge from the cause into the cure.  Each agreeing
+        peer reports the set it *mutually* agrees with (``mutual_agreeing``).
+        For a node ``n`` we do not count directly, we tally how many of *our*
+        mutually agreeing peers also mutually agree with ``n`` -- each is a
+        *witnessed two-way edge* into ``n`` -- and confirm ``n`` only when that
+        tally plus ``n`` itself reaches a quorum.  That is sound evidence that
+        ``n`` has a quorum of mutual agreers, i.e. ``n`` is itself quorate and
+        *will* run if elected.  Folded into the election (see
+        :func:`elect_leader`), this
+        makes the larger of two bridged would-be leaders defer to the smaller,
+        closing the steady-state double-run whenever the two share at least a
+        ``quorum - 1`` mutually-agreeing members.
+
+        Using mutual edges -- not the one-directional ``agreed`` flag in
+        ``members`` -- is what keeps it *live*: a node merely *reached* one-way
+        by a quorum is not quorate, and deferring to it would stand every node
+        down (it cannot run).  By requiring a witnessed two-way edge we never
+        confirm such a node.  Combined with the monotonicity argued on
+        :func:`elect_leader` (this only ever *adds* candidates, so it can only
+        make this node defer to a confirmed-quorate node, never lead more), the
+        change neither double-runs nor introduces a stand-down.  Residual gaps
+        stay best-effort: a pair sharing fewer than ``quorum - 1`` mutual
+        bridges cannot be confirmed (so may still double-run), a node more than
+        one gossip hop away is invisible until it propagates, and a stale view
+        converges only as fast as the poll ``interval``.  A hard exactly-once
+        guarantee still needs a lease/consensus store.
+        """
+        agreeing = self._agreeing_peers()
+        # nodes we already count directly: never "bridge" candidates
+        direct = {self.node_name} | {
+            peer.node_name for peer in agreeing if peer.node_name
+        }
+        quorum = self.quorum()
+        # per transitively-discovered node, the set of our mutually-agreeing
+        # peers that *also* mutually agree with it (a witnessed two-way edge)
+        witnesses: Dict[str, Set[str]] = defaultdict(set)
+        for peer in agreeing:
+            witness = peer.node_name
+            if witness is None:  # _agreeing_peers filters these out already
+                continue
+            for name in peer.mutual_agreeing or ():
+                if name not in direct:
+                    witnesses[name].add(witness)
+        # confirmed quorate iff we witness >= quorum mutual agreers of it
+        # (the witnessing peers plus the node itself).
+        return sorted(
+            name for name, seen in witnesses.items() if len(seen) + 1 >= quorum
+        )
+
+    def _eligible_candidates(self) -> List[str]:
+        """The names this node may actually *elect* as leader / job owner.
+
+        The quorum gate (in :func:`elect_leader`) decides whether *this* node
+        is quorate; this decides which OTHER names it will defer to.  We must
+        not defer to a node that cannot itself run, or a healthy majority would
+        stand down: e.g. our lowest-named mutual peer might itself be below
+        quorum (reachable from us but isolated from the rest), and electing it
+        would leave nobody running.  So we only ever elect a candidate we can
+        *confirm is quorate*:
+
+        * a directly mutually-agreeing peer whose own gossiped
+          ``mutual_agreeing`` shows it at or above quorum
+          (``len + 1 >= quorum``); and
+        * a :meth:`_bridge_candidates` node, already confirmed quorate by
+          witnessed mutual edges.
+
+        A peer we cannot confirm quorate -- one reporting a sub-quorum set, or
+        an older build that does not report the set at all -- is *not* elected.
+        For a uniform-version cluster this means a quorate node always elects a
+        runnable leader, so a healthy majority is never stood down (the
+        liveness choice); the accepted residual is the converse -- two quorate
+        nodes whose bridge is too thin to confirm each other may each elect
+        itself and double-run a ``Leader`` job.  During a *rolling upgrade*
+        (old and new builds) the two builds run different election logic and
+        cannot agree, so excluding the unconfirmable old peers leans the new
+        nodes toward running (a possible double-run) rather than standing down;
+        a rare bridged topology can still transiently stand down until the
+        upgrade completes.  See the module docstring.
+        """
+        quorum = self.quorum()
+        eligible = [
+            peer.node_name
+            for peer in self._agreeing_peers()
+            if peer.node_name and len(peer.mutual_agreeing or ()) + 1 >= quorum
+        ]
+        return eligible + self._bridge_candidates()
 
     # --- duplicate-nodeName detection ------------------------------------
 
@@ -1011,9 +1251,19 @@ class ClusterManager:
         return bool(self.conflict_names()) or bool(self.conflicting_sizes())
 
     def leader_name(self) -> Optional[str]:
-        """Elected leader as this node sees it, or ``None`` if not quorate."""
+        """Elected leader as this node sees it, or ``None`` if not quorate.
+
+        The quorum gate uses our full mutual live set; the elected name is the
+        lowest among ourselves and the confirmed-quorate candidates
+        (:meth:`_eligible_candidates`) -- bridge-discovered nodes so we defer
+        across a bridge instead of double-leading, and never a peer we can tell
+        is itself sub-quorum (which would stand a healthy majority down).
+        """
         return elect_leader(
-            self.node_name, self._agreeing_peer_names(), self.cluster_size()
+            self.node_name,
+            self._agreeing_peer_names(),
+            self.cluster_size(),
+            self._eligible_candidates(),
         )
 
     def is_leader(self) -> bool:
@@ -1037,12 +1287,20 @@ class ClusterManager:
     # --- per-job ownership (distribution: spread) -------------------------
 
     def job_owner(self, job_name: str) -> Optional[str]:
-        """Quorum-gated owner of ``job_name`` (spread mode), else ``None``."""
+        """Quorum-gated owner of ``job_name`` (spread mode), else ``None``.
+
+        Like :meth:`leader_name`, the owner is the rendezvous winner over
+        ourselves and the confirmed-quorate candidates
+        (:meth:`_eligible_candidates`): bridged nodes agree on one owner
+        instead of double-running it, and the owner is never a node that would
+        itself stand down.
+        """
         return elect_job_owner(
             job_name,
             self.node_name,
             self._agreeing_peer_names(),
             self.cluster_size(),
+            self._eligible_candidates(),
         )
 
     def is_job_owner(self, job_name: str) -> bool:

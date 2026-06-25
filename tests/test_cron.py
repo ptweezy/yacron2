@@ -1916,6 +1916,57 @@ async def test_cluster_start_survives_bad_cert_files(caplog):
     assert any("failed to start" in r.message for r in caplog.records)
 
 
+@pytest.mark.asyncio
+async def test_cluster_restarts_on_in_place_cert_rotation(caplog):
+    # an in-place cert rotation leaves the config bytes identical, so the
+    # restart-on-config-change check alone never fires; the manager must also
+    # restart on the TLS-file-change signal, else it serves the old cert until
+    # expiry and the cluster loses quorum fleet-wide.
+    import logging
+
+    yaml = (
+        "jobs:\n  - name: a\n    command: echo a\n"
+        '    schedule: "* * * * *"\n'
+        "cluster:\n"
+        '  listen: "127.0.0.1:18443"\n'
+        "  tls:\n"
+        "    ca: /nonexistent/ca.pem\n"
+        "    cert: /nonexistent/cert.pem\n"
+        "    key: /nonexistent/key.pem\n"
+        "  peers:\n"
+        "    - host: b:8443\n"
+        "    - host: c:8443\n"
+        "  electLeader: true\n"
+    )
+    cfg = parse_config_string(yaml, "").cluster_config
+
+    class _FakeMgr:
+        def __init__(self, config):
+            self.config = config
+            self.stopped = False
+
+        def tls_files_changed(self):
+            return True
+
+        async def stop(self):
+            self.stopped = True
+
+    cron = yacron2.cron.Cron(None)
+    fake = _FakeMgr(cfg)
+    cron.cluster_manager = fake
+    # same config object -> the config-change branch is skipped; only the
+    # TLS-change signal can trigger the restart.
+    with caplog.at_level(logging.INFO, logger="yacron2"):
+        await cron.start_stop_cluster(cfg)
+    assert fake.stopped is True
+    assert any(
+        "TLS certificate files changed" in r.message for r in caplog.records
+    )
+    # reconstruction uses the (here deliberately bad) cert paths and fails
+    # closed, so no new manager replaces the stopped one.
+    assert cron.cluster_manager is None
+
+
 # ---------------------------------------------------------------------------
 # Web server integration.
 #

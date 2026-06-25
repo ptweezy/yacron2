@@ -782,14 +782,23 @@ class Cron:
         # Restart the manager when the cluster section is removed or changed,
         # mirroring start_stop_web_app. The id it reports tracks config reloads
         # on its own (it calls self.job_set_id each round), so only a change to
-        # the cluster section itself (peers/tls/listen) needs a restart.
-        if self.cluster_manager is not None and (
-            cluster_config is None
-            or cluster_config != self.cluster_manager.config
-        ):
-            logger.info("cluster: configuration changed, stopping")
-            await self.cluster_manager.stop()
-            self.cluster_manager = None
+        # the cluster section itself (peers/tls/listen) needs a restart -- plus
+        # an in-place TLS cert rotation, which leaves the config bytes
+        # identical but the on-disk material new (cert-manager / Vault / a
+        # Kubernetes secret refresh); without this the cluster keeps serving
+        # the old cert until it expires and then loses quorum fleet-wide.
+        mgr = self.cluster_manager
+        if mgr is not None:
+            if cluster_config is None or cluster_config != mgr.config:
+                reason = "configuration changed"
+            elif mgr.tls_files_changed():
+                reason = "TLS certificate files changed"
+            else:
+                reason = None
+            if reason is not None:
+                logger.info("cluster: %s, stopping", reason)
+                await mgr.stop()
+                self.cluster_manager = None
         if cluster_config is not None and self.cluster_manager is None:
             # Emit non-fatal advisories here (only when a manager is actually
             # (re)started) rather than at parse time, which runs every reload

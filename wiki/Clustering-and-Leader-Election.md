@@ -31,7 +31,7 @@ elected leader firing scheduled jobs. It builds directly on the
 | Coordination | none | observe-only attestation | quorum-gated election |
 | mTLS identity required | no | yes | yes |
 | Endpoint | none | `GET /cluster`, `GET /peer` | `GET /cluster`, `GET /peer` |
-| Double-running | n/a | yes (by design) | no, for `Leader` jobs in a quorum |
+| Double-running | n/a | yes (by design) | no for `Leader` jobs in a healthy quorum (best-effort — see [Guarantees and trade-offs](#guarantees-and-trade-offs) for the asymmetric-reachability residual) |
 
 ## The job-set id foundation
 
@@ -493,7 +493,20 @@ there are narrow windows where behaviour degrades:
 
 * **Just after a leader dies**, a `Leader` firing may be *skipped* until the
   survivors notice (up to one `interval`) and re-elect.
-* **Asymmetric or flapping reachability** can briefly elect two leaders.
+* **Asymmetric or partial reachability.** Two nodes that never agree with each
+  other can each stay quorate through shared members that *bridge* them. The
+  election turns that bridge from cause into cure: each side discovers the other
+  through the shared members' gossip and, once it can confirm the other is
+  itself quorate, the lower `nodeName` wins on both sides — so a bridge of at
+  least `quorum - 1` shared members collapses two would-be leaders back to one.
+  A node only ever elects a leader it can confirm is itself quorate, so a
+  **healthy majority is never silently stood down** (it always elects a node
+  that actually runs). The deliberate trade for that liveness is the converse:
+  two quorate nodes whose bridge is *thinner* than `quorum - 1` shared members,
+  are more than one gossip hop apart, or are still converging may each elect
+  themselves and **double-run** a `Leader` job. `spread` behaves the same per
+  job. (Choosing instead to *fail closed* here — skip rather than double-run —
+  would require a lease/consensus store; see below.)
 * **While a resize is rolling out**, nodes briefly disagree on the cluster size
   `N`; `Leader` jobs across the whole cluster stand down (fail closed) until
   every node's `peers` agree again — the at-most-once-preserving trade-off (see

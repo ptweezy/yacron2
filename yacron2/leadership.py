@@ -317,8 +317,7 @@ class LeaseBackend(LeadershipBackend):
 
     def reboot_ran(self, job_name: str) -> bool:
         return (
-            job_name in self._reboot_ran
-            or job_name in self._reboot_ran_local
+            job_name in self._reboot_ran or job_name in self._reboot_ran_local
         )
 
     async def mark_reboot_ran(self, job_name: str) -> None:

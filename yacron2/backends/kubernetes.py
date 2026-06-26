@@ -77,6 +77,7 @@ def _monotonic() -> float:
     """
     return time.monotonic()
 
+
 _API_GROUP = "coordination.k8s.io/v1"
 _SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 

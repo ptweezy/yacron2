@@ -584,9 +584,7 @@ class ClusterView:
             # interval, in turn flapping Leader-gated jobs.
             peer.status = STATUS_SELF
         else:
-            peer.status = (
-                STATUS_UNTRUSTED if untrusted else STATUS_UNREACHABLE
-            )
+            peer.status = STATUS_UNTRUSTED if untrusted else STATUS_UNREACHABLE
         # we could not observe the id this round, so drop the peer's last
         # reported view as stale (no mutual/conflict info this time). The drift
         # streak is deliberately NOT reset here: it counts *reachable*

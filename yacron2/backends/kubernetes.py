@@ -1206,7 +1206,16 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
         def _read() -> Optional[Dict[str, Any]]:
             try:
                 lease = self._api.read_namespaced_lease(
-                    self.b.lease_name, self.b.namespace
+                    self.b.lease_name,
+                    self.b.namespace,
+                    # bound the urllib3 socket so a black-holed apiserver
+                    # aborts the call instead of blocking this worker thread
+                    # forever: the renew loop's asyncio.wait_for can cancel the
+                    # awaiting coroutine but NOT the thread, so without this a
+                    # hung round permanently consumes a to_thread worker and
+                    # eventually starves the whole process's executor (the
+                    # aiohttp transports get this from their ClientTimeout).
+                    _request_timeout=self.b.renew_deadline,
                 )
             except ApiException as ex:
                 if ex.status == 404:
@@ -1224,10 +1233,19 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
         def _write() -> bool:
             try:
                 if create:
-                    self._api.create_namespaced_lease(self.b.namespace, body)
+                    self._api.create_namespaced_lease(
+                        self.b.namespace,
+                        body,
+                        # see observe(): bound the socket so a hung write
+                        # cannot leak the worker thread.
+                        _request_timeout=self.b.renew_deadline,
+                    )
                 else:
                     self._api.replace_namespaced_lease(
-                        self.b.lease_name, self.b.namespace, body
+                        self.b.lease_name,
+                        self.b.namespace,
+                        body,
+                        _request_timeout=self.b.renew_deadline,
                     )
             except ApiException as ex:
                 if ex.status == 409:

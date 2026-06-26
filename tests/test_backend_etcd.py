@@ -348,22 +348,27 @@ async def test_start_closes_session_when_authenticate_fails(monkeypatch):
 # --- renew loop: the live state machine (F04 deadline anchor, F21) ---------
 
 
-async def test_renew_once_anchors_deadline_after_campaign(monkeypatch):
-    # F04: the leadership deadline must be anchored to when the round COMPLETED
-    # (after the keepalive/grant/campaign POSTs land), not the round's start.
-    # The campaign POST below consumes monotonic time; the deadline must
-    # reflect that, or the previous round's deadline lapses mid-round and
-    # flaps False while we still hold the key (Leader -> at-most-zero).
+async def test_renew_once_anchors_deadline_to_lease_not_campaign(monkeypatch):
+    # F04 / C1: the leadership FENCE must be anchored to the instant the
+    # lease-renewing POST (grant/keepalive) LANDED -- when etcd actually reset
+    # the lease's TTL -- NOT to round end after the campaign. In the steady
+    # path the campaign is a read; folding its latency into the fence would let
+    # is_leader() outlive the server lease's expiry while a second node wins
+    # the freed key (two leaders run a Leader job). So the fence must exclude
+    # the campaign latency entirely, while staying anchored to the lease event
+    # (not round start, which would flap is_leader False mid-round).
     clock = [100.0]
     monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
     b = _backend()  # ttl 15
+    grant_latency = 1.0
     campaign_latency = 4.0
 
     async def fake_post(path, body, *, allow_reauth=True):
         if path == "/v3/lease/grant":
+            clock[0] += grant_latency  # the grant POST takes time to land
             return {"ID": "777", "TTL": "15"}
         if path == "/v3/kv/txn":
-            clock[0] += campaign_latency  # the campaign POST takes time
+            clock[0] += campaign_latency  # the campaign takes more time after
             return {"succeeded": True}
         if path == "/v3/kv/range":
             return {"kvs": []}
@@ -372,8 +377,15 @@ async def test_renew_once_anchors_deadline_after_campaign(monkeypatch):
     monkeypatch.setattr(b, "_post", fake_post)
     await b._renew_once()
     assert b.is_leader() is True
-    # anchored after the campaign (104 + 15 - 1 = 118), not round start (114).
-    assert b._lease_deadline_mono == 100.0 + campaign_latency + 15 - 1
+    grant_landing = 100.0 + grant_latency  # 101: server reset the TTL here
+    round_end = grant_landing + campaign_latency  # 105
+    # anchored to the grant landing (101 + 15 - 1 = 115), excluding the
+    # campaign latency, so the local fence never outlives the server lease.
+    assert b._lease_deadline_mono == grant_landing + 15 - 1
+    # specifically NOT round end (105 + 15 - 1 = 119, the old double-run hole)
+    # and NOT round start (100 + 15 - 1 = 114).
+    assert b._lease_deadline_mono != round_end + 15 - 1
+    assert b._lease_deadline_mono != 100.0 + 15 - 1
 
 
 async def test_renew_once_keepalive_narrows_then_regrants(monkeypatch):

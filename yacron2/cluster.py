@@ -1390,8 +1390,23 @@ class ClusterManager(LeadershipBackend):
         so the conflict is still surfaced and the gate still fails closed; a
         peer too old to declare a size (``declared_size is None``) is *not*
         excluded -- it contributes no divergence evidence, the safe direction.
+
+        A peer that agrees on the job set but declares a *different*
+        coordination policy (``distribution`` or ``electLeader``) is excluded
+        for exactly the same reason, symmetric with the size gate.  Such a peer
+        is a policy conflict (:meth:`conflicting_policies`) that already fails
+        our *direct*-witness ``Leader`` gate closed -- but that gate only fires
+        for a peer we see directly.  If we did *not* drop it from the gossiped
+        ``mutual_agreeing`` set, a third node that reaches it only across a
+        bridge (and so never sees the policy conflict itself) would
+        bridge-confirm it as quorate and elect/defer across a node coordinating
+        by different rules, the very double-run / silent-skip that
+        :meth:`conflicting_policies` exists to prevent.  As with size, a peer
+        too old to declare a policy field (``None``) contributes no divergence
+        evidence and is not excluded -- the safe direction.
         """
         my_size = self.cluster_size()
+        my_elect = bool(self.config.get("electLeader"))
         agreeing: List[PeerState] = []
         # Dedup by per-process instance_id: a node reachable at two listed
         # addresses answers both with one identity and must count ONCE toward
@@ -1407,6 +1422,14 @@ class ClusterManager(LeadershipBackend):
                 and not (
                     peer.declared_size is not None
                     and peer.declared_size != my_size
+                )
+                and not (
+                    peer.declared_distribution is not None
+                    and peer.declared_distribution != self.distribution
+                )
+                and not (
+                    peer.declared_elect_leader is not None
+                    and peer.declared_elect_leader != my_elect
                 )
             ):
                 continue

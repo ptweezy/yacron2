@@ -1926,6 +1926,50 @@ async def test_deferred_reboot_preferleader_runs_without_quorum(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_deferred_reboot_preferleader_runs_when_no_manager(monkeypatch):
+    # H1 regression: election configured but the backend never started (store
+    # unreachable / bad creds -> cluster_manager is None). A deferred
+    # PreferLeader @reboot must STILL run here -- its contract is never-skip,
+    # exactly the store-unreachable case it exists to survive. Previously the
+    # mgr-is-None branch returned early for ALL jobs, dropping it forever.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = None  # backend failed to start
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job(policy="PreferLeader")
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    await cron._process_pending_reboots()
+    assert launched == ["boot"]
+    assert "boot" not in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_leader_pending_no_manager(monkeypatch):
+    # H1 (cont.): a Leader @reboot in the SAME no-manager state must NOT run --
+    # it stays fail-closed and pending, re-evaluated once a manager comes up.
+    # Asymmetric with PreferLeader above, mirroring _cluster_allows.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = None
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job(policy="Leader")
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    await cron._process_pending_reboots()
+    assert launched == []
+    assert "boot" in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
 async def test_deferred_reboot_preferleader_waits_for_available_owner(
     monkeypatch,
 ):

@@ -1813,6 +1813,65 @@ def test_size_divergent_node_not_bridge_confirmed(no_tls):
     assert mgr.leader_name() == "node-a"
 
 
+def test_policy_divergent_peer_dropped_from_mutual_set(no_tls):
+    # C2 regression: symmetric with the size gate above. A peer that agrees on
+    # the job set but declares a different coordination policy (distribution or
+    # electLeader) is BOTH a policy conflict AND dropped from the mutual-
+    # agreement set -- so we neither count it toward quorum nor gossip it as a
+    # node we vouch for. Without the drop, a third node reaching it only across
+    # a bridge (blind to the policy conflict, which conflicting_policies only
+    # sees for DIRECT peers) would bridge-confirm it and elect/defer across a
+    # node coordinating by other rules -- a Leader double-run or silent skip.
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a")
+    mgr = ClusterManager(cfg, lambda: "v1:mine")  # N=4, quorum 3
+    my_elect = bool(mgr.config.get("electLeader"))
+    for h in ("b:1", "c:1", "d:1"):
+        name = {"b:1": "node-b", "c:1": "node-c", "d:1": "node-d"}[h]
+        _seed_agree(mgr, h, name)
+        # all three start policy-aligned with us
+        mgr.view.peers[h].declared_distribution = mgr.distribution
+        mgr.view.peers[h].declared_elect_leader = my_elect
+    # node-b flips distribution -> excluded from the set we count and gossip...
+    mgr.view.peers["b:1"].declared_distribution = "spread"
+    assert mgr._agreeing_peer_names() == ["node-c", "node-d"]
+    # ...but still detected as a policy conflict, so Leader fails closed.
+    assert mgr.has_conflict() is True
+    # an electLeader divergence is dropped the same way.
+    mgr.view.peers["b:1"].declared_distribution = mgr.distribution
+    mgr.view.peers["b:1"].declared_elect_leader = not my_elect
+    assert mgr._agreeing_peer_names() == ["node-c", "node-d"]
+    assert mgr.has_conflict() is True
+    # a peer too old to declare a policy is NOT excluded (no divergence sign).
+    mgr.view.peers["b:1"].declared_distribution = None
+    mgr.view.peers["b:1"].declared_elect_leader = None
+    assert mgr._agreeing_peer_names() == ["node-b", "node-c", "node-d"]
+
+
+def test_policy_divergent_node_not_bridge_confirmed(no_tls):
+    # C2 regression, deferrer side: node-z reaches witnesses c, d, e but NOT
+    # the policy-divergent node-a directly. Because the witnesses now drop
+    # node-a from the mutual_agreeing they gossip, node-z never sees a two-way
+    # edge into node-a, cannot bridge-confirm it quorate, and won't defer to it
+    # -- closing the cross-policy elect/defer at source.
+    cfg = _cfg(
+        _DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1", "e:1"], "node-z"
+    )
+    mgr = ClusterManager(cfg, lambda: "v1:mine")  # N=5, quorum 3
+    # witnesses gossip the post-fix set: node-a (divergent) is absent from it.
+    _seed_agree(mgr, "c:1", "node-c", mutual={"node-z", "node-d", "node-e"})
+    _seed_agree(mgr, "d:1", "node-d", mutual={"node-z", "node-c", "node-e"})
+    _seed_agree(mgr, "e:1", "node-e", mutual={"node-z", "node-c", "node-d"})
+    assert "node-a" not in mgr._bridge_candidates()
+    assert mgr.leader_name() != "node-a"  # never defers to the divergent node
+    # control: were a witness to still vouch for node-a (the pre-fix
+    # behaviour), the bridge WOULD confirm it and node-z -- blind to the policy
+    # conflict -- would defer to the lower-named node-a on other rules.
+    for h in ("c:1", "d:1", "e:1"):
+        mgr.view.peers[h].mutual_agreeing |= {"node-a"}
+    assert "node-a" in mgr._bridge_candidates()
+    assert mgr.leader_name() == "node-a"
+
+
 @pytest.mark.asyncio
 async def test_mtls_cluster_size_divergence_detected(tmp_path):
     # end-to-end repro of the headline trace over real mTLS: mid 3->5 resize,

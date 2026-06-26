@@ -1019,7 +1019,37 @@ class Cron:
             return
         mgr = self.cluster_manager
         if mgr is None:
-            # election wanted but no manager -> fail closed, keep waiting
+            # Election wanted but no manager (store unreachable / backend
+            # failed to start). A Leader @reboot one-shot stays fail-closed --
+            # keep it pending and re-evaluate once a manager comes up. But a
+            # PreferLeader one-shot's contract is NEVER-SKIP: it must run
+            # somewhere even when the store is unreachable (accepting a
+            # possible double-run), exactly the asymmetry _cluster_allows
+            # applies to *scheduled* PreferLeader jobs in this same mgr-is-None
+            # case. Not mirroring it here would drop the one-shot forever on a
+            # persistent start failure -- the very store-unreachable case
+            # PreferLeader exists to survive. There is no store to record the
+            # run to, so a later-starting manager may not see it ran; that is
+            # the documented PreferLeader double-run cost, strictly better than
+            # never running.
+            for name in list(self._pending_reboot_jobs):
+                if name not in self.cron_jobs:
+                    continue  # transiently absent -> keep pending (never-lose)
+                job = self.cron_jobs[name]
+                if not self._is_deferrable_reboot(job):
+                    # name reused for a non-deferrable job -> retire it
+                    del self._pending_reboot_jobs[name]
+                    continue
+                if job.clusterPolicy == "PreferLeader":
+                    del self._pending_reboot_jobs[name]
+                    logger.info(
+                        "cluster: running deferred @reboot PreferLeader job "
+                        "%s (no leadership manager; never-skip semantics)",
+                        name,
+                    )
+                    await self.launch_scheduled_job(job)
+                # Leader one-shots: keep pending, fail closed, re-check next
+                # wakeup once a manager is available.
             return
         for name in list(self._pending_reboot_jobs):
             if name not in self.cron_jobs:

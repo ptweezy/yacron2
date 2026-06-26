@@ -26,6 +26,7 @@ network call, and ``is_quorate`` reflects a fresh successful call (stale ->
 import asyncio
 import base64
 import datetime
+import json
 import logging
 import ssl
 import time
@@ -291,15 +292,22 @@ class EtcdBackend(LeaseBackend):
         is_leader: bool,
         now: datetime.datetime,
         mono: Optional[float] = None,
+        lease_mono: Optional[float] = None,
     ) -> None:
         """Update live leader state from a round's outcome (pure, tested).
 
         ``is_leader`` is whether *we* hold the election key via *our* lease
         (see :func:`campaign_won`); ``holder`` is the display name stored at
         the key (whoever currently holds it).  ``now`` is wall-clock (for the
-        displayed expiry); ``mono`` is the matching monotonic instant the
-        fence/freshness gates use (captured for the same round) -- defaulted to
-        the current monotonic clock for the pure unit tests.
+        displayed expiry).  ``mono`` is the matching monotonic instant the
+        freshness gate (``is_quorate``) uses, captured at round END -- the safe
+        (fresher) direction for freshness.  ``lease_mono`` is the monotonic
+        instant the lease-renewing keepalive/grant landed at the server (when
+        the server actually reset our lease's TTL); the leadership FENCE is
+        anchored to *that*, never to the later round-end ``mono``, so a slow
+        campaign cannot push our local ``is_leader`` deadline past the server's
+        lease expiry and let a second node win the freed key (two leaders).
+        Both default to the current monotonic clock for the pure unit tests.
         """
         if mono is None:
             mono = _monotonic()
@@ -307,9 +315,13 @@ class EtcdBackend(LeaseBackend):
         self._holder = holder
         self._is_leader = is_leader
         if self._is_leader:
+            # the fence MUST NOT outlive the server lease (expiry =
+            # lease_mono + effective_ttl); anchoring to the keepalive/grant
+            # landing keeps it conservative regardless of campaign latency.
+            fence_anchor = lease_mono if lease_mono is not None else mono
             self._lease_deadline = self._leader_deadline(now)
             self._lease_deadline_mono = (
-                mono + self._effective_ttl - _SKEW_SECONDS
+                fence_anchor + self._effective_ttl - _SKEW_SECONDS
             )
 
     # --- network glue (integration-only) ---------------------------------
@@ -417,7 +429,21 @@ class EtcdBackend(LeaseBackend):
                     resp.raise_for_status()
                     data: Dict[str, Any] = await resp.json()
                     return data
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+            # json.JSONDecodeError (a ValueError) is raised by resp.json() when
+            # the body has a json-ish content-type but an invalid/truncated
+            # body -- a misbehaving proxy/gateway in front of etcd. Treat it as
+            # a failed endpoint like any transport error so it (a) tries the
+            # next endpoint, (b) surfaces as a normal "etcd round failed"
+            # rather than escaping the renew loop's network-error tuple and
+            # either killing the scheduler (the eager reboot-ran persist path
+            # runs outside the run-loop guard) or being mislogged as an
+            # unexpected internal bug.
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                OSError,
+                json.JSONDecodeError,
+            ) as ex:
                 last_error = ex
                 continue
         raise aiohttp.ClientError(
@@ -484,8 +510,19 @@ class EtcdBackend(LeaseBackend):
                 pass
 
     async def _renew_once(self) -> None:  # pragma: no cover - network
+        # The monotonic instant the lease-renewing POST (keepalive or grant)
+        # landed: this is when etcd reset our lease's TTL, so it is the ONLY
+        # sound anchor for the local leadership fence. Captured right after
+        # that POST -- NOT after the campaign below -- because in the steady
+        # path the campaign is a read whose latency must not extend the fence
+        # past the server lease's expiry; otherwise a slow-but-healthy campaign
+        # keeps is_leader() True after etcd has expired and deleted the key,
+        # letting a second node's create-if-absent campaign win so both run a
+        # Leader job.
+        lease_mono: Optional[float] = None
         if self._lease_id is not None:
             ttl = await self._keepalive(self._lease_id)
+            lease_mono = _monotonic()
             if ttl is None or ttl <= 0:
                 self._lease_id = None  # lease expired; re-grant below
                 self._is_leader = False
@@ -494,23 +531,20 @@ class EtcdBackend(LeaseBackend):
                 self._effective_ttl = max(1, min(self.ttl, ttl))
         if self._lease_id is None:
             self._lease_id, granted = await self._grant_lease()
+            lease_mono = _monotonic()
             if granted is not None:
                 self._effective_ttl = max(1, min(self.ttl, granted))
         if self._lease_id is None:
             raise aiohttp.ClientError("etcd lease grant returned no id")
         holder, won = await self._campaign(self._lease_id)
-        # Anchor the leadership deadline to the instant the round COMPLETED
-        # (the keepalive/grant/campaign POSTs have landed at the server, so
-        # the lease's life there starts ~now), NOT to the round's start. The
-        # POSTs are sequential and each iterates every endpoint, so a slow-but-
-        # healthy round can consume a large fraction of the ttl; sampling the
-        # clock at the top would have the *previous* round's deadline (anchored
-        # ttl-1s ago) lapse before this round's write lands, flapping is_leader
-        # False while we demonstrably still hold the key -- a transient
-        # at-most-once -> at-most-zero on every Leader job firing in the gap.
+        # ``now``/``mono`` are sampled at round END -- the safe (fresher)
+        # direction for the is_quorate freshness gate (_last_contact_mono). The
+        # leadership fence is anchored to ``lease_mono`` above (the keepalive/
+        # grant landing) instead, so the campaign's latency cannot push it past
+        # the server lease's expiry. See _apply_round.
         now = _utcnow()
         mono = _monotonic()
-        self._apply_round(holder, won, now, mono)
+        self._apply_round(holder, won, now, mono, lease_mono)
         await self._sync_reboot_ran()
 
     # --- @reboot-ran persistence (H2: no peer set, so persist to the store) --

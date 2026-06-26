@@ -122,10 +122,10 @@ def test_cluster_config_excludes_self_listed_peer():
 def test_cluster_config_excludes_self_listed_by_hostname_behind_wildcard():
     # the common uniform-peer-list mistake: a node bound to a wildcard listen
     # (0.0.0.0) and self-listed by its nodeName. The literal listen string
-    # ("0.0.0.0:8443") does not match "yacron-a:8443", so this used to survive
-    # config-time dedup and inflate N -- which, if the self-poll never
-    # succeeded (cert SAN / loopback quirk), permanently pinned Leader jobs
-    # closed cluster-wide. It is now recognised structurally at load.
+    # ("0.0.0.0:8443") does not match "yacron-a:8443", so a literal-only check
+    # would let it survive config-time dedup and inflate N -- which, if the
+    # self-poll never succeeds (cert SAN / loopback quirk), permanently pins
+    # Leader jobs closed cluster-wide. It is recognised structurally at load.
     y = CLUSTER_YAML + '    - host: "yacron-a:8443"\n  nodeName: yacron-a\n'
     cfg = parse_config_string(y, "").cluster_config
     assert cfg is not None
@@ -165,12 +165,15 @@ def test_is_self_listed_edge_cases():
     assert _is_self_listed("node-a:9443", "0.0.0.0:8443", "node-a") is False
     # non-wildcard listen only matches the literal string, never by nodeName
     assert _is_self_listed("node-a:8443", "10.0.0.5:8443", "node-a") is False
-    # FQDN whose first label is our (bare) nodeName -> recognised as self, so a
-    # self-listing that never self-polls can no longer inflate N (the fix for
-    # the gossip cluster-size-pin defect).
+    # H2 fix: an FQDN whose first label merely matches our (bare) nodeName is
+    # NOT treated as self -- it may be a genuinely distinct member
+    # (web.dc1.internal vs the short hostname web): dropping it would shrink
+    # our N below the rest of the cluster's (a permanent size-conflict, or a
+    # split-brain). A real self-listing-by-FQDN is caught at runtime instead
+    # (STATUS_SELF in cluster_size), the safe direction.
     assert (
         _is_self_listed("node-a.internal:8443", "0.0.0.0:8443", "node-a")
-        is True
+        is False
     )
     # a DIFFERENT node's FQDN (first label != our nodeName) stays a real peer
     assert (

@@ -160,10 +160,16 @@ The trust model is deliberately small and keeps no shared state:
   configured `ca`, and (client side) match the host it was reached at, so only
   nodes the CA vouches for are ever attested. Standard TLS hostname verification
   provides that SAN pinning: the cert presented by `yacron-b.internal:8443`
-  must carry `yacron-b.internal` as a Subject Alternative Name. Provision the
-  certificates with your own PKI (cert-manager, a service mesh, an internal CA);
-  yacron2 only consumes them. The same per-node cert/key is used both to serve
-  `/peer` and to authenticate as a client when polling peers. An **in-place
+  must carry `yacron-b.internal` as a Subject Alternative Name. The CA is the
+  *whole* authentication boundary — yacron2 trusts any cert it signs to assert
+  its identity and gossip state — so it **must** be a dedicated, closed CA
+  issued only to yacron2 nodes, **not** a shared service-mesh or
+  organisation-wide CA (any cert that CA admits can otherwise fabricate the
+  `/peer` payload below — fake agreement, trip the conflict gate, or suppress an
+  `@reboot` job). Provision the certificates from your own dedicated PKI (a
+  private cert-manager issuer, an internal CA); yacron2 only consumes them. The
+  same per-node cert/key is used both to serve `/peer` and to authenticate as a
+  client when polling peers. An **in-place
   renewal** of these files (same paths, new bytes) is detected and applied
   automatically, with no restart — see [Certificate rotation](#certificate-rotation).
 * **Each node keeps its own view.** No node is authoritative: two healthy nodes

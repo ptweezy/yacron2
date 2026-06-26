@@ -381,6 +381,24 @@ class KubernetesBackend(LeaseBackend):
             ),
         }
 
+    def _resolve_namespace(self, context_namespace: Optional[str]) -> str:
+        """The Lease namespace, resolved identically for *both* transports.
+
+        Centralised here (not duplicated per transport) so the HTTP and native
+        paths can never elect the Lease in *different* namespaces -- a
+        cross-namespace split-brain (two leaders).  The load-bearing subtlety:
+        when a ``kubeconfig`` is configured the in-cluster service-account
+        namespace file must **not** be consulted by *either* transport --
+        otherwise a mixed-transport fleet (native client on one arch, HTTP
+        fallback on another) running in-pod with a kubeconfig would resolve two
+        different namespaces (the SA file's value vs ``"default"``).  See
+        :func:`resolve_namespace`.
+        """
+        incluster = None if self.kubeconfig else _incluster_namespace()
+        return resolve_namespace(
+            self._configured_namespace, context_namespace, incluster
+        )
+
     # --- the renew loop's per-round local-state update (pure) ------------
 
     def _track_observation(
@@ -587,10 +605,10 @@ def resolve_namespace(
     in-cluster service-account namespace, then ``"default"``.  Centralised, and
     never ``None``, so the HTTP and native transports can never elect the Lease
     in *different* namespaces -- a cross-namespace split-brain (two leaders).
-    The in-cluster HTTP path previously left the namespace ``None`` when the
-    service-account ``namespace`` file was unreadable (a custom projected-token
-    mount) while the native path fell back to ``"default"``: a mixed-transport
-    fleet then ran two leaders, one per namespace.
+    Falling back to ``"default"`` (never ``None``) is what keeps the two
+    transports in agreement when the service-account ``namespace`` file is
+    unreadable (a custom projected-token mount): both resolve ``"default"``
+    rather than one running a second leader in another namespace.
     """
     return configured or context_namespace or incluster_namespace or "default"
 
@@ -668,9 +686,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
                 self._auth_token = token_file.read().strip()
             ca_path = os.path.join(_SA_DIR, "ca.crt")
             self._ssl = ssl.create_default_context(cafile=ca_path)
-            self.b.namespace = resolve_namespace(
-                self.b.namespace, None, _incluster_namespace()
-            )
+            self.b.namespace = self.b._resolve_namespace(None)
         except OSError as ex:
             raise ConfigError(
                 "kubernetes backend: could not read in-cluster service "
@@ -697,9 +713,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         cluster = clusters[ctx["cluster"]]
         user = users.get(ctx["user"], {})
         self._base_url = cluster["server"].rstrip("/")
-        self.b.namespace = resolve_namespace(
-            self.b.namespace, ctx.get("namespace"), None
-        )
+        self.b.namespace = self.b._resolve_namespace(ctx.get("namespace"))
 
         if cluster.get("insecure-skip-tls-verify"):
             self._ssl = ssl.create_default_context()
@@ -825,9 +839,7 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
             config_obj.host = self.b.api_server_override.rstrip("/")
         self._api_client = client.ApiClient(config_obj)
         self._api = client.CoordinationV1Api(self._api_client)
-        self.b.namespace = resolve_namespace(
-            self.b.namespace, context_namespace, _incluster_namespace()
-        )
+        self.b.namespace = self.b._resolve_namespace(context_namespace)
 
     async def observe(self) -> Optional[Dict[str, Any]]:
         from kubernetes.client.exceptions import ApiException

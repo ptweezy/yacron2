@@ -340,10 +340,10 @@ def test_select_transport_library_requires_native():
 
 
 def test_resolve_namespace_precedence():
-    # H2 regression: both transports must converge on the SAME namespace, and
-    # it must never be None -- the in-cluster HTTP path used to leave it None
-    # while the native path fell back to "default", a cross-namespace
-    # split-brain. Explicit cluster.kubernetes.leaseNamespace wins over all.
+    # regression: both transports must converge on the SAME namespace, and it
+    # must never be None -- if the in-cluster HTTP path leaves it None while
+    # the native path falls back to "default", a mixed-transport fleet runs two
+    # leaders (one per namespace). Explicit leaseNamespace wins over all.
     assert resolve_namespace("explicit", "ctx", "incluster") == "explicit"
     # then the kubeconfig context's namespace (kubeconfig path only)
     assert resolve_namespace(None, "ctx", "incluster") == "ctx"
@@ -352,6 +352,49 @@ def test_resolve_namespace_precedence():
     # finally "default" -- crucially never None, even when the SA namespace
     # file is absent/unreadable (the trigger for the HTTP/library divergence)
     assert resolve_namespace(None, None, None) == "default"
+
+
+def test_namespace_ignores_incluster_file_when_kubeconfig_set(monkeypatch):
+    # H1 regression: when a kubeconfig is configured the in-cluster
+    # service-account namespace file must NOT be consulted -- by EITHER
+    # transport. If the native client transport consulted
+    # _incluster_namespace() while the HTTP transport passed None, a
+    # mixed-transport in-pod fleet
+    # (native client on one arch, HTTP fallback on another) would elect the
+    # Lease in two different namespaces (the SA file's value vs "default") -- a
+    # cross-namespace split-brain. Both resolve through
+    # KubernetesBackend._resolve_namespace identically.
+    import yacron2.backends.kubernetes as k8s_mod
+
+    monkeypatch.setattr(k8s_mod, "_incluster_namespace", lambda: "prod")
+
+    def _mk(extra):
+        yaml = (
+            "cluster:\n"
+            "  backend: kubernetes\n"
+            "  nodeName: node-a\n"
+            "  connectTimeout: 4\n"
+            "  kubernetes:\n"
+            "    leaseName: yl\n"
+            "    leaseDurationSeconds: 15\n"
+            "    renewDeadlineSeconds: 10\n"
+            "    retryPeriodSeconds: 2\n" + extra
+        )
+        cfg = parse_config_string(yaml, "").cluster_config
+        return KubernetesBackend(cfg, lambda: "v1:job")
+
+    # kubeconfig set, no leaseNamespace, no kubeconfig-context namespace ->
+    # "default", NEVER the SA file's "prod" (the split-brain trigger)
+    kc = _mk("    kubeconfig: /tmp/kc\n")
+    assert kc._resolve_namespace(None) == "default"
+    # a kubeconfig context namespace is honoured (matches the HTTP path)
+    assert kc._resolve_namespace("ctxns") == "ctxns"
+    # truly in-cluster (no kubeconfig) DOES consult the SA namespace file
+    incluster = _mk("")
+    assert incluster._resolve_namespace(None) == "prod"
+    # an explicit leaseNamespace always wins, kubeconfig or not
+    explicit = _mk("    leaseNamespace: chosen\n    kubeconfig: /tmp/kc\n")
+    assert explicit._resolve_namespace("ctxns") == "chosen"
 
 
 def test_is_leader_gated_on_local_expiry():

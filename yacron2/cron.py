@@ -958,37 +958,6 @@ class Cron:
             and job.clusterPolicy in ("Leader", "PreferLeader")
         )
 
-    def _reboot_owner(self, job: JobConfig) -> Optional[str]:
-        """The node that should run a deferred @reboot ``job``, or ``None`` if
-        undecided.
-
-        Mirrors the scheduled-job gate in :meth:`_cluster_allows` so a deferred
-        @reboot lands on exactly the node that policy would have run it on:
-
-        * ``PreferLeader`` uses the quorum-*free* availability owner — it never
-          skips while a node is up, so it always resolves to some node (never
-          ``None``) and an isolated/minority node runs it itself rather than
-          starving (PreferLeader accepts a possible double-run as the price);
-        * ``Leader`` uses the quorum-gated owner and additionally stands down
-          on a nodeName conflict, returning ``None`` until the cluster
-          converges safely.
-        """
-        mgr = self.cluster_manager
-        assert mgr is not None
-        spread = mgr.distribution == "spread"
-        if job.clusterPolicy == "PreferLeader":
-            return (
-                mgr.available_job_owner(job.name)
-                if spread
-                else mgr.available_leader_name()
-            )
-        # "Leader": quorum-gated, and unsafe to pick while a nodeName collides
-        if mgr.has_conflict():
-            return None
-        if spread:
-            return mgr.job_owner(job.name)  # quorum-gated; None without quorum
-        return mgr.leader_name()  # quorum-gated; None without quorum
-
     async def _process_pending_reboots(self) -> None:
         """Run each deferred @reboot job once the cluster has elected an owner.
 
@@ -1066,7 +1035,15 @@ class Cron:
                     name,
                 )
                 continue
-            if self._reboot_owner(job) == mgr.node_name:
+            # Gate on the SAME boolean owner check as a scheduled job
+            # (_cluster_allows), not a name comparison: a lease backend's
+            # leader_name() reports the holder's display *identity*
+            # (cluster.kubernetes.identity), which may legitimately differ from
+            # node_name -- comparing those two would make the holder fail to
+            # recognise itself, so the one-shot would never run on any node.
+            # is_leader()/is_available_leader()/is_job_owner() self-recognise
+            # correctly regardless of an identity != nodeName mismatch.
+            if self._cluster_allows(job):
                 del self._pending_reboot_jobs[name]
                 logger.info(
                     "cluster: running deferred @reboot job %s (this node is "
@@ -1190,7 +1167,8 @@ class Cron:
         # follower that drops below quorum -- i.e. the whole cluster losing the
         # ability to elect a leader -- leaves a breadcrumb in its own log, not
         # only the ex-leader's (in single-leader mode only the ex-leader's
-        # is_leader() flips, so followers used to log nothing on quorum loss).
+        # is_leader() flips, so without this a follower logs nothing on quorum
+        # loss).
         spread = mgr is not None and mgr.distribution == "spread"
         quorate = mgr is not None and mgr.is_quorate()
         if quorate != self._was_quorate:

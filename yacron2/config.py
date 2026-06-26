@@ -715,35 +715,38 @@ _WILDCARD_LISTEN_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*", ""})
 
 
 def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
-    """Whether a configured peer entry actually points back at *this* node.
+    """Whether a configured peer entry *unambiguously* points back at us.
 
     A self entry must be dropped from `peers`: it never counts toward
     agreement, yet it inflates `cluster_size()` -- and so the quorum threshold,
-    the size-divergence gate, and the 2-node refusal -- by one. Two cases:
+    the size-divergence gate, and the 2-node refusal -- by one. We only drop an
+    entry here when it can be *only* this node, never another member:
 
-    * an exact match of our own `listen` address; and
-    * the wildcard case `ClusterManager.cluster_size` otherwise has to catch on
-      its own at runtime: a `listen` bound to all interfaces (`0.0.0.0` / `::`)
-      self-listed by hostname. We recognise it structurally when the entry's
-      host equals our `nodeName` (which defaults to the system hostname -- the
-      name the cert SAN and the peer address use by convention), or -- when
-      `nodeName` is a bare label -- when the entry is an FQDN whose first label
-      is our `nodeName` (e.g. the peers list `node-a` by its FQDN
-      `node-a.internal` while `nodeName` is the short `node-a`), on the same
-      port. `nodeName` is required unique across the cluster, so a peer host
-      carrying our `nodeName` can only be us, never another member -- safe to
-      drop as self. Dropping it here keeps config-time `N` equal to runtime
-      `N`, so the 2-node guard and the size-divergence gate can't be silently
-      defeated by a self-listing, and a self that never manages to poll itself
-      (a cert SAN or loopback-routing quirk) can no longer permanently inflate
-      `N` and pin `Leader` jobs closed cluster-wide.
+    * an exact match of our own `listen` address; or
+    * the common wildcard case -- a `listen` bound to all interfaces
+      (`0.0.0.0` / `::`) self-listed by `nodeName` -- recognised structurally
+      when the entry's host equals our `nodeName` *exactly* (which defaults to
+      the system hostname, the name the cert SAN and peer address use by
+      convention), on the same port.
 
-    Only name-based self-listings are recognised here (no DNS resolution at
-    config time, which would block the per-reload parse). A self-listing by an
-    unrelated alias whose host bears no relation to `nodeName`, or any
-    self-listing behind a *concrete* (non-wildcard) `listen` other than the
-    literal listen string, still falls back to the runtime `STATUS_SELF`
-    recognition once its self-poll succeeds.
+    The match is deliberately *exact*: never drop a peer on a fuzzy match of
+    the host FQDN's *first label* against a bare `nodeName` (e.g. dropping
+    `node-a.internal` when `nodeName` is `node-a`). A peer host's DNS labels
+    have no required relationship to any `nodeName`, so such an over-match can
+    silently drop a genuinely distinct member that merely shares a first label
+    (`web.dc1.internal` vs our short hostname `web`), shrinking *our* `N` below
+    everyone else's -- which either pins `Leader` jobs closed cluster-wide on a
+    permanent size-divergence conflict (with no warning emitted), or, if it
+    lowers our quorum threshold, opens a split-brain. No runtime backstop
+    re-adds a config-dropped peer, so the damage would be permanent.
+
+    A genuine self-listing the exact match does not catch -- e.g. a self listed
+    by its FQDN while `nodeName` is the short label -- is simply not dropped
+    here; it falls back to the runtime `STATUS_SELF` recognition in
+    `ClusterManager.cluster_size` once its self-poll succeeds. The brief `N`
+    inflation before that first poll is the *safe* direction (a higher quorum,
+    never a split-brain). No DNS resolution is done at config time (it would
+    block the per-reload parse).
     """
     if peer_host == listen:
         return True
@@ -753,9 +756,7 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     peer_h, _, peer_port = peer_host.rpartition(":")
     if peer_port != listen_port:
         return False
-    return peer_h == node_name or (
-        "." not in node_name and peer_h.split(".", 1)[0] == node_name
-    )
+    return peer_h == node_name
 
 
 def _cluster_base(raw: dict) -> "Dict[str, Any]":

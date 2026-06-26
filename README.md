@@ -1204,9 +1204,14 @@ The trust model is deliberately small and keeps no shared state:
 * **mTLS is the membership boundary.** A peer's certificate must chain to the
   configured `ca`, and (client side) match the host it was reached at, so only
   nodes the CA vouches for are ever attested; standard TLS hostname
-  verification provides that SAN pinning. Provision the certificates with your
-  own PKI (cert-manager, a service mesh, an internal CA); yacron2 only consumes
-  them.
+  verification provides that SAN pinning. The CA is the *whole* authentication
+  boundary — yacron2 trusts any cert it signs to assert its own `nodeName`,
+  agreement, and `@reboot` run-state over `/peer` — so it **must** be a
+  dedicated, closed CA issued only to yacron2 nodes, **not** a shared
+  service-mesh or organisation-wide CA (any workload that CA admits could
+  otherwise forge gossip or suppress jobs). Provision the certificates from your
+  own dedicated PKI (e.g. a private cert-manager issuer or internal CA); yacron2
+  only consumes them.
 * **Each node keeps its own view.** No node is authoritative: two healthy nodes
   converge to the same picture, and any disagreement is itself the signal. Each
   peer is reported as `agreed`, `syncing`, `drifted`, `unreachable`,

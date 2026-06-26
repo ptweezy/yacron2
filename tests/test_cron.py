@@ -1428,8 +1428,9 @@ def test_cluster_role_logged_on_transition(caplog):
 
 def test_cluster_quorum_logged_on_follower_single_leader(caplog):
     # C1 regression: a follower (never leader) that loses quorum must still log
-    # it -- previously only the ex-leader's is_leader() flip was logged, so a
-    # whole cluster dropping below quorum left followers silent.
+    # it -- in single-leader mode only the ex-leader's is_leader() flips, so
+    # without this a whole cluster dropping below quorum leaves followers
+    # silent.
     import logging
 
     cron = yacron2.cron.Cron(None)
@@ -1692,10 +1693,17 @@ def _reboot_mgr(
         def leader_name(self):
             return leader
 
+        def is_leader(self):
+            # mirrors the real seam: leader iff the elected name is ours
+            return self.leader_name() == self.node_name
+
         def available_leader_name(self):
             # quorum-free owner used by PreferLeader; an isolated node leads
             # its own reachable set, so default to self.
             return node if available is None else available
+
+        def is_available_leader(self):
+            return self.available_leader_name() == self.node_name
 
         def reboot_ran(self, name):
             return name in ran_set
@@ -1725,6 +1733,51 @@ async def test_deferred_reboot_runs_on_owner(monkeypatch):
     assert "boot" not in cron._pending_reboot_jobs
     # running it records + advertises the run, so peers won't re-run it
     assert mgr.reboot_ran("boot") is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_leader_runs_when_identity_differs(monkeypatch):
+    # H3 regression: a lease backend reports leader_name() as the holder's
+    # display *identity* (e.g. cluster.kubernetes.identity), which may
+    # legitimately differ from node_name. The deferred-@reboot gate must
+    # self-recognise the holder via the is_leader() boolean, NOT by comparing
+    # that identity string to node_name -- otherwise a one-shot Leader @reboot
+    # job never runs on ANY node (the holder's identity != its node_name, and
+    # every follower's leader_name() is that identity too).
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+
+    class _LeaseMgr:
+        node_name = "pod-a"
+        distribution = "single-leader"
+
+        def has_conflict(self):
+            return False
+
+        def is_leader(self):
+            return True  # this node holds the lease
+
+        def leader_name(self):
+            return "my-app"  # display identity, != node_name -- the trap
+
+        def reboot_ran(self, name):
+            return False
+
+        async def mark_reboot_ran(self, name):
+            pass
+
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    cron.cluster_manager = _LeaseMgr()
+    await cron._process_pending_reboots()
+    assert launched == ["boot"]
+    assert "boot" not in cron._pending_reboot_jobs
 
 
 @pytest.mark.asyncio
@@ -1798,8 +1851,8 @@ async def test_deferred_reboot_leader_runs_after_owner_lands_here(monkeypatch):
 @pytest.mark.asyncio
 async def test_deferred_reboot_preferleader_runs_without_quorum(monkeypatch):
     # #9: a PreferLeader @reboot must run even with no quorum (its contract is
-    # to never skip while a node is up). _reboot_owner uses the quorum-free
-    # availability owner, which on an isolated/minority node is this node.
+    # to never skip while a node is up). The gate (_cluster_allows) uses the
+    # quorum-free is_available_leader(), true on an isolated/minority node.
     cron = yacron2.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []

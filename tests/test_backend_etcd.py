@@ -343,4 +343,71 @@ async def test_start_closes_session_when_authenticate_fails(monkeypatch):
     monkeypatch.setattr(b, "_authenticate", boom)
     with pytest.raises(aiohttp.ClientError):
         await b.start()
+
+
+# --- renew loop: the live state machine (F04 deadline anchor, F21) ---------
+
+
+async def test_renew_once_anchors_deadline_after_campaign(monkeypatch):
+    # F04: the leadership deadline must be anchored to when the round COMPLETED
+    # (after the keepalive/grant/campaign POSTs land), not the round's start.
+    # The campaign POST below consumes monotonic time; the deadline must
+    # reflect that, or the previous round's deadline lapses mid-round and
+    # flaps False while we still hold the key (Leader -> at-most-zero).
+    clock = [100.0]
+    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    b = _backend()  # ttl 15
+    campaign_latency = 4.0
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if path == "/v3/lease/grant":
+            return {"ID": "777", "TTL": "15"}
+        if path == "/v3/kv/txn":
+            clock[0] += campaign_latency  # the campaign POST takes time
+            return {"succeeded": True}
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        return {}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    await b._renew_once()
+    assert b.is_leader() is True
+    # anchored after the campaign (104 + 15 - 1 = 118), not round start (114).
+    assert b._lease_deadline_mono == 100.0 + campaign_latency + 15 - 1
+
+
+async def test_renew_once_keepalive_narrows_then_regrants(monkeypatch):
+    # F21: the live keepalive -> narrow-ttl -> lease-lost -> re-grant -> re-
+    # campaign sequence had no round-level test. A keepalive returning a TTL
+    # below the configured value must narrow the deadline; a keepalive of 0
+    # (lease gone) must drop the lease, re-grant, and re-campaign.
+    clock = [100.0]
+    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    b = _backend()  # ttl 15
+    state = {"keepalive_ttl": 6}
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if path == "/v3/lease/grant":
+            return {"ID": "1", "TTL": "15"}
+        if path == "/v3/lease/keepalive":
+            return {"result": {"TTL": str(state["keepalive_ttl"])}}
+        if path == "/v3/kv/txn":
+            return {"succeeded": True}
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        return {}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    # round 1: no lease yet -> grant (ttl 15) + campaign
+    await b._renew_once()
+    assert b._lease_id == "1" and b._effective_ttl == 15
+    # round 2: keepalive narrows the effective ttl to 6 -> deadline follows 6
+    await b._renew_once()
+    assert b._effective_ttl == 6
+    assert b._lease_deadline_mono == clock[0] + 6 - 1
+    # round 3: keepalive says lease GONE (ttl 0) -> re-grant + re-campaign
+    state["keepalive_ttl"] = 0
+    await b._renew_once()
+    assert b._lease_id == "1" and b._effective_ttl == 15
+    assert b.is_leader() is True
     assert b._session is None

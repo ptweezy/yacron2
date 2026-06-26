@@ -644,7 +644,21 @@ def build_client_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
 
 
 def build_server_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
-    """Server context: require and verify a CA-signed client cert (mTLS)."""
+    """Server context: require and verify a CA-signed client cert (mTLS).
+
+    SECURITY: this is the cluster's membership boundary. A server cannot do
+    hostname verification, so it accepts *any* client cert the configured
+    ``cluster.tls.ca`` signed -- the CA file IS the allowlist. Point it at a
+    **dedicated, single-purpose cluster CA**, never a shared organisational CA:
+    with a shared CA, any holder of any cert that CA ever signed (an unrelated
+    web service, say) can speak to ``/peer`` and ``/reboot-ran`` as a member.
+    Peer-reported state is corroboration-checked (see
+    :meth:`ClusterManager.conflict_names`) so one such cert cannot fabricate a
+    cluster-wide ``Leader`` stand-down, but it can still push ``reboot-ran``
+    suppression and read topology. (A future opt-in could pin the client cert
+    SAN/CN against an allowed-name list; not enabled by default because a
+    peer's cert SAN has no required relationship to its listed address.)
+    """
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH, cafile=tls["ca"])
     ctx.load_cert_chain(tls["cert"], tls["key"])
     ctx.verify_mode = ssl.CERT_REQUIRED
@@ -679,6 +693,16 @@ def _tls_file_signature(tls: Dict[str, str]) -> Dict[str, Any]:
 
 
 def _split_host_port(addr: str) -> "tuple[str, int]":
+    # Bracketed IPv6 (``[2001:db8::1]:8900``): the host is inside the brackets;
+    # split only on the final ``:`` after the closing ``]``. A bare unbracketed
+    # IPv6 literal is rejected at config load (see config._require_host_port),
+    # so anything reaching here with multiple colons is bracketed.
+    if addr.startswith("["):
+        bracket, sep, port = addr.rpartition("]:")
+        host = bracket[1:]  # strip the leading "["
+        if not sep or not host or not port:
+            raise ValueError("expected [ipv6]:port, got {!r}".format(addr))
+        return host, int(port)
     host, _, port = addr.rpartition(":")
     if not host or not port:
         raise ValueError("expected host:port, got {!r}".format(addr))
@@ -1309,7 +1333,32 @@ class ClusterManager(LeadershipBackend):
             for peer in self.view.peers.values()
             if peer.status == STATUS_SELF
         )
-        return len(self.config["peers"]) + 1 - self_listed
+        # Two peer entries that resolve to the SAME running node -- the same
+        # observed per-process instance_id, e.g. one physical node listed at
+        # two addresses / an IP and a DNS name -- are one fault domain, not
+        # two. Counting both inflates N (and so the quorum threshold and the
+        # size-divergence gate), eroding fault tolerance below the declared
+        # size and silently enabling the degenerate 2-real-node mode the
+        # electLeader 2-node refusal exists to forbid. Subtract the duplicates:
+        # count each observed instance_id at most once (an entry not yet
+        # identified, instance_id None, can't be deduped, so it counts -- the
+        # safe, higher-quorum direction, matching the brief STATUS_SELF
+        # inflation before a self-poll). A peer answering with OUR instance_id
+        # is STATUS_SELF (already excluded above), so it never lands here.
+        seen_instances: Set[str] = set()
+        duplicate_instances = 0
+        for peer in self.view.peers.values():
+            if peer.status in _STALE_STATUSES or peer.status == STATUS_SELF:
+                continue
+            if peer.instance_id is None:
+                continue
+            if peer.instance_id in seen_instances:
+                duplicate_instances += 1
+            else:
+                seen_instances.add(peer.instance_id)
+        return (
+            len(self.config["peers"]) + 1 - self_listed - duplicate_instances
+        )
 
     def quorum(self) -> int:
         return quorum_size(self.cluster_size())
@@ -1343,17 +1392,30 @@ class ClusterManager(LeadershipBackend):
         excluded -- it contributes no divergence evidence, the safe direction.
         """
         my_size = self.cluster_size()
-        return [
-            peer
-            for peer in self.view.peers.values()
-            if peer.status == STATUS_AGREED
-            and peer.node_name is not None
-            and _peer_sees_me_agreed(peer.members, self.instance_id)
-            and not (
-                peer.declared_size is not None
-                and peer.declared_size != my_size
-            )
-        ]
+        agreeing: List[PeerState] = []
+        # Dedup by per-process instance_id: a node reachable at two listed
+        # addresses answers both with one identity and must count ONCE toward
+        # the live set, or elect_leader's quorum check (len(live) >= quorum)
+        # could be met by a single physical peer counted twice. Mirrors the
+        # cluster_size() dedup so N and the live count stay consistent.
+        seen_instances: Set[str] = set()
+        for peer in self.view.peers.values():
+            if not (
+                peer.status == STATUS_AGREED
+                and peer.node_name is not None
+                and _peer_sees_me_agreed(peer.members, self.instance_id)
+                and not (
+                    peer.declared_size is not None
+                    and peer.declared_size != my_size
+                )
+            ):
+                continue
+            if peer.instance_id is not None:
+                if peer.instance_id in seen_instances:
+                    continue
+                seen_instances.add(peer.instance_id)
+            agreeing.append(peer)
+        return agreeing
 
     def _agreeing_peer_names(self) -> List[str]:
         """Names of the peers we mutually agree with.
@@ -1490,23 +1552,62 @@ class ClusterManager(LeadershipBackend):
         (falling back to a peer's host if it somehow reported none), and benign
         self-listing (same name *and* same instance id) is not a conflict.
         Stale peers (unreachable/untrusted/never-contacted) contribute nothing.
+
+        Because a peer's ``members`` list is CA-vouched but otherwise untrusted
+        input, an instance only counts toward a conflict when it is *credible*:
+
+        * **first-party** -- our own identity, or a peer's identity as *we
+          directly observed it* when we polled that peer (a peer describing
+          itself, including a same-name ``STATUS_CONFLICT`` peer); or
+        * **corroborated** -- a purely *transitive* (members-reported) instance
+          is credible only when **at least two distinct peers** report it.
+
+        A name is in conflict when it has two or more credible instances.  This
+        keeps a genuine duplicate detectable -- in the usual full-mesh cluster
+        we poll both copies directly (two first-party instances), and in a
+        partial mesh two peers corroborate the copy we cannot reach -- while
+        stopping a single misbehaving or buggy member from fabricating a
+        conflict (two instances for one name, or a foreign instance of *our
+        own* name) and wedging every node's ``Leader`` gate closed cluster-wide
+        indefinitely (an availability DoS from one peer).  The residual: a real
+        duplicate that only a *single* peer can witness transitively is not
+        flagged -- the same best-effort limit the module documents (a hard
+        guarantee needs a lease/consensus store).  ``identity`` is the
+        per-process ``instance_id`` (falling back to a peer's host if it
+        somehow reported none); a benign self-listing (same name *and* same
+        instance id) is not a conflict, and stale peers contribute nothing.
         """
-        by_name: Dict[str, Set[str]] = defaultdict(set)
-        by_name[self.node_name].add(self.instance_id)
+        # name -> instance -> set(first-party sources: "self" or a peer host)
+        first_party: Dict[str, Dict[str, Set[str]]] = defaultdict(
+            lambda: defaultdict(set)
+        )
+        # name -> instance -> set(distinct peers reporting it transitively)
+        transitive: Dict[str, Dict[str, Set[str]]] = defaultdict(
+            lambda: defaultdict(set)
+        )
+        first_party[self.node_name][self.instance_id].add("self")
         for peer in self.view.peers.values():
             if peer.status in _STALE_STATUSES:
                 continue
             if peer.node_name is not None:
-                # our own direct observation of this peer's identity
-                by_name[peer.node_name].add(
+                # our own DIRECT observation of this peer's identity (the peer
+                # describing itself when we polled it -- first-party evidence).
+                first_party[peer.node_name][
                     peer.instance_id or "host:" + peer.host
-                )
-            # the peer's one-hop view of the cluster
+                ].add(peer.host)
+            # the peer's one-hop (transitive) view of the cluster -- weaker
+            # evidence: credited only when a second distinct peer corroborates.
             for name, instance, _agreed in peer.members or ():
-                by_name[name].add(instance)
-        return sorted(
-            name for name, idents in by_name.items() if len(idents) > 1
-        )
+                transitive[name][instance].add(peer.host)
+        conflicted: List[str] = []
+        for name in set(first_party) | set(transitive):
+            credible = set(first_party.get(name, {}))
+            for instance, reporters in transitive.get(name, {}).items():
+                if instance not in credible and len(reporters) >= 2:
+                    credible.add(instance)
+            if len(credible) >= 2:
+                conflicted.append(name)
+        return sorted(conflicted)
 
     # --- cluster-size (membership) divergence ----------------------------
 
@@ -1644,9 +1745,52 @@ class ClusterManager(LeadershipBackend):
             self.node_name, self._agreeing_peer_names()
         )
 
+    def _instances_claiming(self, name: str) -> Set[str]:
+        """Per-process ``instance_id``s we currently see claiming ``name``.
+
+        Our own (when ``name`` is our nodeName) plus every non-stale peer that
+        directly answers as ``name`` -- including a same-name
+        ``STATUS_CONFLICT`` peer (a duplicate nodeName), whose instance id we
+        recorded when we polled it.  Used to break a duplicate-nodeName tie in
+        the never-skip ``available_*`` path.
+        """
+        instances: Set[str] = set()
+        if name == self.node_name:
+            instances.add(self.instance_id)
+        for peer in self.view.peers.values():
+            if peer.status in _STALE_STATUSES:
+                continue
+            if peer.node_name == name and peer.instance_id:
+                instances.add(peer.instance_id)
+        return instances
+
+    def _wins_available_tiebreak(self) -> bool:
+        """Whether *this process* wins its own nodeName among same-name peers.
+
+        ``available_*`` decides the never-skip ``PreferLeader`` run on the
+        lowest *nodeName*, which two processes sharing a duplicate nodeName
+        both match -- so without a tiebreak both would run every
+        ``PreferLeader`` job on a healthy, quorate cluster (the duplicate-name
+        conflict gate does *not* protect ``PreferLeader``; it accepts double-
+        runs only across a partition).  Break the tie on the per-process
+        ``instance_id`` -- the same fence the lease backends self-recognise by
+        -- so exactly one of the same-named processes runs.  The two duplicates
+        poll each other (each sees the other as ``STATUS_CONFLICT`` carrying
+        its instance id), so both compute the same lowest instance and agree on
+        the winner; the lowest runs, the other defers.  (Residual: two same-
+        named processes that cannot see each other -- an asymmetric peer list
+        -- each believe they win and may double-run, the accepted
+        ``PreferLeader``-across-a-partition behaviour.)
+        """
+        instances = self._instances_claiming(self.node_name)
+        return not instances or self.instance_id == min(instances)
+
     def is_available_leader(self) -> bool:
         """Whether this node leads its reachable set, quorum or not."""
-        return self.available_leader_name() == self.node_name
+        return (
+            self.available_leader_name() == self.node_name
+            and self._wins_available_tiebreak()
+        )
 
     def is_quorate(self) -> bool:
         """Whether this node currently sees a quorum (so it may run jobs)."""
@@ -1682,8 +1826,18 @@ class ClusterManager(LeadershipBackend):
         )
 
     def is_available_job_owner(self, job_name: str) -> bool:
-        """Whether this node owns ``job_name`` in its reachable set."""
-        return self.available_job_owner(job_name) == self.node_name
+        """Whether this node owns ``job_name`` in its reachable set.
+
+        Like :meth:`is_available_leader`, this never-skip (spread
+        ``PreferLeader``) path is broken on the per-process ``instance_id``
+        when a duplicate nodeName would otherwise make two same-named processes
+        both win the per-job rendezvous owner and double-run the job on a
+        healthy cluster (the conflict gate does not protect ``PreferLeader``).
+        """
+        return (
+            self.available_job_owner(job_name) == self.node_name
+            and self._wins_available_tiebreak()
+        )
 
     def view_dict(self) -> Dict[str, Any]:
         leader = self.leader_name()

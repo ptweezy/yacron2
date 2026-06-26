@@ -675,6 +675,60 @@ async def test_mtls_untrusted_peer(tmp_path):
         await rogue_b.stop()
 
 
+async def test_server_mtls_rejects_client_without_cert(tmp_path):
+    # F20: the /peer listener is the membership boundary -- it must REFUSE a
+    # client that presents NO CA-signed client cert (CERT_REQUIRED). Previously
+    # only the client-verifies-server direction was exercised.
+    import ssl as _ssl
+
+    mine = _write_tls(tmp_path, cn="mine")
+    pa = _free_port()
+    a = ClusterManager(
+        _cfg(mine, f"127.0.0.1:{pa}", [], "node-a"), lambda: "v1:same"
+    )
+    await a.start()
+    try:
+        # trust the server's CA (so its cert verifies) but present NO client
+        # cert; the server's CERT_REQUIRED must abort the handshake.
+        cctx = _ssl.create_default_context(cafile=mine["ca"])
+        cctx.check_hostname = False  # SAN is "localhost"; we dial 127.0.0.1
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises((aiohttp.ClientError, _ssl.SSLError, OSError)):
+                async with session.get(
+                    f"https://127.0.0.1:{pa}/peer", ssl=cctx
+                ) as resp:
+                    await resp.read()
+    finally:
+        await a.stop()
+
+
+async def test_server_mtls_rejects_wrong_ca_client_cert(tmp_path):
+    # F20: a client cert from a DIFFERENT CA than the server trusts must be
+    # rejected by the listener (not just rejected by the client in the reverse
+    # direction, which test_mtls_untrusted_peer covers).
+    import ssl as _ssl
+
+    mine = _write_tls(tmp_path, cn="mine")
+    rogue = _write_tls(tmp_path, cn="rogue")
+    pa = _free_port()
+    a = ClusterManager(
+        _cfg(mine, f"127.0.0.1:{pa}", [], "node-a"), lambda: "v1:same"
+    )
+    await a.start()
+    try:
+        cctx = _ssl.create_default_context(cafile=mine["ca"])
+        cctx.check_hostname = False
+        cctx.load_cert_chain(rogue["cert"], rogue["key"])  # untrusted CA
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises((aiohttp.ClientError, _ssl.SSLError, OSError)):
+                async with session.get(
+                    f"https://127.0.0.1:{pa}/peer", ssl=cctx
+                ) as resp:
+                    await resp.read()
+    finally:
+        await a.stop()
+
+
 # --------------------------------------------------------------------------
 # /cluster web endpoint
 # --------------------------------------------------------------------------
@@ -1121,9 +1175,18 @@ def test_split_host_port_ok():
     assert _split_host_port("127.0.0.1:1") == ("127.0.0.1", 1)
 
 
+def test_split_host_port_bracketed_ipv6():
+    # F11: a bracketed IPv6 address must split on the final ':' after ']' and
+    # yield the bare address (no brackets), not a mangled host/port.
+    assert _split_host_port("[2001:db8::1]:8443") == ("2001:db8::1", 8443)
+    assert _split_host_port("[::1]:9") == ("::1", 9)
+
+
 def test_split_host_port_rejects_bad_input():
     with pytest.raises(ValueError):
         _split_host_port("noport")
+    with pytest.raises(ValueError):
+        _split_host_port("[::1]")  # bracketed, no port
 
 
 @pytest.mark.asyncio
@@ -1430,10 +1493,16 @@ def test_conflict_detection_unaffected_by_bridge_data(no_tls):
     # c and d mutually agree with node-b and node-a -> both witness node-a
     _seed_agree(mgr, "c:1", "node-c", mutual={"node-a", "node-b"})
     _seed_agree(mgr, "d:1", "node-d", mutual={"node-a", "node-b"})
-    # d's gossip also reveals a second instance of our own name (a duplicate)
-    mgr.view.peers["d:1"].members.append(
-        ("node-b", "some-other-instance", True)
-    )
+    # c's and d's gossip BOTH reveal a second instance of our own name (a
+    # duplicate). A transitive (members-reported) instance must be corroborated
+    # by two distinct peers to count -- a single peer's claim about our own
+    # name is no longer trusted (it would let one bad peer wedge us; see
+    # conflict_names / the F05 hardening). With two corroborating reporters the
+    # duplicate is still detected and the Leader gate fails closed.
+    for host in ("c:1", "d:1"):
+        mgr.view.peers[host].members.append(
+            ("node-b", "some-other-instance", True)
+        )
     assert mgr._bridge_candidates() == ["node-a"]  # bridge still works
     assert mgr.has_conflict() is True  # ...but the conflict is still detected
     assert "node-b" in mgr.conflict_names()
@@ -2083,27 +2152,121 @@ def test_asymmetric_reachability_never_double_leads(no_tls):
 
 
 def test_transitive_conflict_via_gossip(no_tls):
-    # #2: two nodes share a nodeName but we can only reach one of them. A
-    # reachable peer's reported members carries the second instance, so we
-    # still detect the duplicate (and the Leader gate then fails closed).
+    # #2: two nodes share a nodeName but we can only reach one of them. We
+    # directly see one "dup" (i1, first-party); a transitive report of the
+    # OTHER instance (i2) is trusted only when CORROBORATED by two distinct
+    # (so one bad peer cannot fabricate a conflict; see the F05 hardening in
+    # conflict_names). With two corroborating reporters the duplicate is still
+    # detected and the Leader gate then fails closed.
     mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a"),
         lambda: "v1:mine",
     )
-    # we directly see one "dup" (instance i1)
+    # we directly see one "dup" (instance i1) -- first-party evidence
     p = mgr.view.peers["b:1"]
     p.status = STATUS_AGREED
     p.node_name = "dup"
     p.instance_id = "i1"
     p.members = [("dup", "i1", True), (mgr.node_name, mgr.instance_id, True)]
-    # peer c gossips a DIFFERENT instance of "dup" we cannot reach directly
-    pc = mgr.view.peers["c:1"]
-    pc.status = STATUS_AGREED
-    pc.node_name = "node-c"
-    pc.instance_id = "ic"
-    pc.members = [("dup", "i2", True), (mgr.node_name, mgr.instance_id, True)]
+    # peers c and d BOTH gossip a DIFFERENT instance (i2) we cannot reach
+    # directly -- two distinct reporters corroborate it.
+    for host, name, inst in (("c:1", "node-c", "ic"), ("d:1", "node-d", "id")):
+        pc = mgr.view.peers[host]
+        pc.status = STATUS_AGREED
+        pc.node_name = name
+        pc.instance_id = inst
+        pc.members = [
+            ("dup", "i2", True),
+            (mgr.node_name, mgr.instance_id, True),
+        ]
     assert mgr.conflict_names() == ["dup"]
     assert mgr.has_conflict() is True
+
+
+def test_single_peer_cannot_fabricate_conflict(no_tls):
+    # F05 regression: a single CA-vouched but misbehaving/buggy peer must NOT
+    # be able to fabricate a duplicate-nodeName conflict (which would wedge
+    # every node's Leader gate closed cluster-wide). Neither a peer reporting
+    # the same name twice with different instances, nor a peer with a foreign
+    # instance of OUR OWN name, is enough on its own -- a transitive instance
+    # needs two distinct corroborating reporters.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    # b:1 is a normal agreeing peer that also injects a fabricated conflict:
+    # two instances of "victim", plus a foreign instance of our own name.
+    p = mgr.view.peers["b:1"]
+    p.status = STATUS_AGREED
+    p.node_name = "node-b"
+    p.instance_id = "ib"
+    p.members = [
+        ("victim", "x", True),
+        ("victim", "y", True),
+        ("node-a", "not-our-real-instance", True),
+    ]
+    assert mgr.conflict_names() == []  # single peer -> no fabricated conflict
+    assert mgr.has_conflict() is False
+
+
+def test_duplicate_nodename_preferleader_tiebreak(no_tls):
+    # F01/F12: two processes share nodeName "node-a"; both would match the
+    # name-based available-leader election and double-run every PreferLeader
+    # job on a healthy quorate cluster (the conflict gate does NOT protect
+    # PreferLeader). The per-process instance_id breaks the tie so exactly one
+    # runs -- the lowest instance.
+    def mk(instance):
+        m = ClusterManager(
+            _cfg(
+                _DUMMY_TLS,
+                "127.0.0.1:1",
+                ["peer-a:1", "node-z:1"],
+                "node-a",
+            ),
+            lambda: "v1:mine",
+        )
+        m.instance_id = instance
+        return m
+
+    a1, a2 = mk("aaa"), mk("bbb")  # a1 has the lower instance -> wins
+    for m, other_inst in ((a1, "bbb"), (a2, "aaa")):
+        dup = m.view.peers["peer-a:1"]  # the OTHER node-a, seen as a duplicate
+        dup.status = STATUS_CONFLICT
+        dup.node_name = "node-a"
+        dup.instance_id = other_inst
+        _seed_agree(m, "node-z:1", "node-z")
+
+    # both elect the display name "node-a" as available leader ...
+    assert a1.available_leader_name() == "node-a"
+    assert a2.available_leader_name() == "node-a"
+    # ... but only the lowest instance actually runs the PreferLeader job.
+    assert a1.is_available_leader() is True
+    assert a2.is_available_leader() is False
+    # spread analogue: per-job ownership is likewise broken on the instance, so
+    # the two same-named processes never both own (double-run) the same job.
+    for job in ("j1", "j2", "j3", "j4", "j5"):
+        assert not (
+            a1.is_available_job_owner(job) and a2.is_available_job_owner(job)
+        )
+
+
+def test_duplicate_address_does_not_inflate_quorum(no_tls):
+    # F15: one physical node B listed at two addresses is one fault domain, not
+    # two. It must count ONCE toward cluster_size (and the agreeing set), or N
+    # and the quorum threshold inflate and fault tolerance erodes below the
+    # declared size (silently re-enabling the degenerate 2-real-node mode the
+    # electLeader 2-node refusal forbids).
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b1:1", "b2:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    # both b addresses answer as the SAME node B (same instance_id)
+    _seed_agree(mgr, "b1:1", "node-b", instance="inst-b")
+    _seed_agree(mgr, "b2:1", "node-b", instance="inst-b")
+    _seed_agree(mgr, "c:1", "node-c", instance="inst-c")
+    assert mgr.cluster_size() == 3  # a + B + c, NOT 4
+    assert mgr.quorum() == 2
+    assert sorted(mgr._agreeing_peer_names()) == ["node-b", "node-c"]
 
 
 @pytest.mark.asyncio

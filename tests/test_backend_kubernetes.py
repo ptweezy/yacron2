@@ -5,6 +5,7 @@ exercised only by the Docker integration tests; everything here is the decision
 logic plus the locally-computed leader/quorum state.
 """
 
+import copy
 import datetime
 import time
 
@@ -481,8 +482,12 @@ def test_track_observation_resets_clock_on_record_change():
     s3 = LeaseState("node-c", _after(2), NOW, 15, 0, "1")
     t2 = _after(6)
     assert b._track_observation(s3, t2) == t2
-    # no lease observed (None) re-anchors to that observation too
-    assert b._track_observation(None, _after(8)) == _after(8)
+    # no lease observed (None, a 404) PRESERVES the last real anchor rather
+    # than re-anchoring: a 404 carries no timing, and resetting here is what
+    # let a node recreate a deleted Lease as itself while a prior holder was
+    # still inside its local fence -- two leaders (see decide_lease_action's
+    # recreate-race guard / F06).
+    assert b._track_observation(None, _after(8)) == t2
 
 
 def test_apply_round_win_acquire():
@@ -611,3 +616,167 @@ def test_http_transport_static_token_and_no_token(tmp_path):
     assert t._auth_headers() == {"Authorization": "Bearer static-tok"}
     t._auth_token = None
     assert t._auth_headers() == {}
+
+
+# --- shared-store fence: the at-most-one guarantee end-to-end --------------
+#
+# A minimal in-memory "apiserver" Lease object with the optimistic-concurrency
+# semantics the fence relies on: create fails (409) if the object exists, and
+# replace fails (409) on a stale resourceVersion. This exercises the actual
+# write()->fence path the production transports drive, which is otherwise only
+# covered by (absent) Docker integration tests.
+
+
+class _FakeApiStore:
+    def __init__(self):
+        self.obj = None
+        self._rv = 0
+
+    def get(self):
+        return copy.deepcopy(self.obj)
+
+    def create(self, body):
+        if self.obj is not None:
+            return False  # 409 AlreadyExists -- the fence
+        self._rv += 1
+        body = copy.deepcopy(body)
+        body.setdefault("metadata", {})["resourceVersion"] = str(self._rv)
+        self.obj = body
+        return True
+
+    def replace(self, body):
+        if self.obj is None:
+            return False  # 404: nothing to replace
+        rv = (body.get("metadata") or {}).get("resourceVersion")
+        if rv != self.obj["metadata"]["resourceVersion"]:
+            return False  # 409 conflict -- the fence
+        self._rv += 1
+        body = copy.deepcopy(body)
+        body["metadata"]["resourceVersion"] = str(self._rv)
+        self.obj = body
+        return True
+
+
+class _StoreTransport:
+    def __init__(self, store):
+        self.store = store
+
+    async def setup(self):  # pragma: no cover - not exercised
+        pass
+
+    async def observe(self):
+        return self.store.get()
+
+    async def write(self, body, *, create):
+        return self.store.create(body) if create else self.store.replace(body)
+
+    async def close(self):  # pragma: no cover - not exercised
+        pass
+
+
+def _store_backend(store, identity, extra=""):
+    b = _backend(extra)
+    b.identity = identity
+    b._transport = _StoreTransport(store)
+    return b
+
+
+async def test_two_nodes_concurrent_create_only_one_wins():
+    # F08/F19: two nodes observe the (absent) Lease in the SAME round and both
+    # try to create it; the apiserver's AlreadyExists 409 must let exactly one
+    # win. (No test previously drove the fence against a shared store; the old
+    # tests hand-fed write_ok.)
+    store = _FakeApiStore()
+    a = _store_backend(store, "node-a#1")
+    b = _store_backend(store, "node-b#2")
+    la, lb = await a._transport.observe(), await b._transport.observe()
+    assert la is None and lb is None  # both see no lease
+    _, abody, _ = plan_lease_write(
+        la, a.lease_name, a.namespace, a.identity, NOW, a.lease_duration, None
+    )
+    _, bbody, _ = plan_lease_write(
+        lb, b.lease_name, b.namespace, b.identity, NOW, b.lease_duration, None
+    )
+    aok = await a._transport.write(abody, create=True)
+    bok = await b._transport.write(bbody, create=True)
+    assert aok != bok  # exactly one create succeeded
+
+
+async def test_renew_loses_resourceversion_race_not_leader():
+    # F08/F19: a holder whose observed resourceVersion is stale (another writer
+    # moved the Lease on) must get a 409 on replace and self-demote.
+    store = _FakeApiStore()
+    a = _store_backend(store, "node-a#1")
+    await a._renew_once()  # a creates + holds the lease
+    assert a.is_leader() is True
+    # someone else bumps the object (rv changes) between a's observe and write
+    stale = store.get()
+    store._rv += 1
+    store.obj["metadata"]["resourceVersion"] = str(store._rv)
+    _, body, state = plan_lease_write(
+        stale, a.lease_name, a.namespace, a.identity, NOW, a.lease_duration,
+        None,
+    )
+    ok = await a._transport.write(body, create=False)
+    assert ok is False  # fenced by resourceVersion
+    a._apply_round(ACTION_RENEW, ok, state, NOW)
+    assert a.is_leader() is False
+
+
+async def test_deleted_lease_not_recreated_under_live_holder(monkeypatch):
+    # F06: deleting the Lease object must NOT let a node that recently saw a
+    # different, still-valid holder immediately recreate it as itself -- that
+    # would make two leaders until the prior holder's local fence lapses.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "yacron2.backends.kubernetes._monotonic", lambda: clock[0]
+    )
+    store = _FakeApiStore()
+    holder = _store_backend(store, "node-b#held")
+    other = _store_backend(store, "node-a#other")
+    await holder._renew_once()  # B creates + holds
+    assert holder.is_leader() is True
+    await other._renew_once()  # A observes B's valid lease -> waits
+    assert other.is_leader() is False
+    # the Lease object is deleted out from under the live holder.
+    store.obj = None
+    clock[0] += 1.0  # well within the 15s lease duration
+    await other._renew_once()  # A sees 404 but remembers B's unexpired lease
+    assert other.is_leader() is False  # A must NOT recreate as itself yet
+    assert holder.is_leader() is True  # B still leads (its fence is unexpired)
+    # once B's remembered lease has expired from A's view, A may recreate.
+    clock[0] += holder.lease_duration + 1
+    await other._renew_once()
+    assert other.is_leader() is True
+
+
+async def test_persist_reboot_ran_eagerly_writes_annotation():
+    # F03/F07: mark_reboot_ran on the kubernetes backend must persist the
+    # @reboot-ran set to the Lease IMMEDIATELY (cron records intent-to-run
+    # before launching, relying on this), not only on the next periodic round.
+    store = _FakeApiStore()
+    b = _store_backend(store, "node-a#1")
+    await b._renew_once()  # acquire the lease
+    await b.mark_reboot_ran("migrate")  # eager persist
+    stored = parse_lease(store.get())
+    from yacron2.leadership import REBOOT_RAN_KEY, decode_reboot_ran
+
+    jsid, jobs = decode_reboot_ran(stored.annotations.get(REBOOT_RAN_KEY))
+    assert jsid == "v1:job" and jobs == {"migrate"}
+
+
+async def test_release_preserves_reboot_ran_annotation():
+    # F03: a graceful release (config reload / stop) must hand the Lease back
+    # WITHOUT erasing the @reboot-ran annotation, or a peer that takes over
+    # re-runs the one-shot.
+    store = _FakeApiStore()
+    b = _store_backend(store, "node-a#1")
+    await b._renew_once()
+    await b.mark_reboot_ran("migrate")
+    await b._release()
+    state = parse_lease(store.get())
+    from yacron2.leadership import REBOOT_RAN_KEY, decode_reboot_ran
+
+    assert state.holder is None  # released
+    _, jobs = decode_reboot_ran(state.annotations.get(REBOOT_RAN_KEY))
+    assert jobs == {"migrate"}  # annotation preserved

@@ -833,7 +833,33 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
     # connection error. Mirrors yacron2.cluster._split_host_port, plus a port
     # range check; anything this accepts also parses at runtime.
     def _require_host_port(addr: str, what: str) -> None:
+        # Bracketed IPv6 (``[2001:db8::1]:8900``): host is inside the brackets.
+        if addr.startswith("["):
+            bracket, sep, port = addr.rpartition("]:")
+            host = bracket[1:]
+            if (
+                not sep
+                or not host
+                or not port.isdigit()
+                or not 0 < int(port) <= 65535
+            ):
+                raise ConfigError(
+                    "cluster.{} must be [ipv6]:port, got {!r}".format(
+                        what, addr
+                    )
+                )
+            return
         host, _, port = addr.rpartition(":")
+        # A bare (unbracketed) IPv6 literal has more colons left in ``host``;
+        # rpartition would silently mis-split it (``2001:db8::1`` ->
+        # host=``2001:db8:``, port=``1``), passing validation and then failing
+        # opaquely at connect/bind time -- and for a peer, silently dropping it
+        # from quorum with no error. Require the bracketed form instead.
+        if ":" in host:
+            raise ConfigError(
+                "cluster.{} looks like a bare IPv6 address; write it as "
+                "[ipv6]:port, got {!r}".format(what, addr)
+            )
         if not host or not port.isdigit() or not 0 < int(port) <= 65535:
             raise ConfigError(
                 "cluster.{} must be host:port, got {!r}".format(what, addr)
@@ -988,6 +1014,28 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
             "out of the lease every cycle and no Leader job runs "
             "stably".format(retry, renew)
         )
+    if renew + retry >= duration:
+        # The renew loop runs one round (bounded by renewDeadlineSeconds) and
+        # THEN sleeps retryPeriodSeconds, so the worst-case interval between
+        # two successive lease refreshes is renewDeadline + retryPeriod -- but
+        # the holder's self-demotion deadline is only leaseDuration ahead of a
+        # round's START. The three pairwise invariants above (retry<renew,
+        # renew<duration) do NOT bound their SUM, so a config like
+        # duration=12/renew=11/retry=10 passes them yet has a ~21s refresh
+        # interval against a ~12s deadline: under a slow-but-not-timed-out
+        # apiserver the sole healthy holder self-demotes between rounds every
+        # cycle (is_leader flaps False), Leader jobs collapse toward
+        # at-most-zero and PreferLeader double-runs. Require the sum to fit
+        # inside the lease window.
+        raise ConfigError(
+            "cluster.kubernetes: renewDeadlineSeconds ({}) + "
+            "retryPeriodSeconds ({}) must be less than leaseDurationSeconds "
+            "({}); otherwise the worst-case gap between lease renewals "
+            "exceeds the lease lifetime and the holder lapses out of the "
+            "lease every cycle, so no Leader job runs stably".format(
+                renew, retry, duration
+            )
+        )
     # configuring a lease backend is opting into leadership.
     cfg["electLeader"] = True
     return ClusterConfig(cfg)
@@ -999,7 +1047,11 @@ def _redact_userinfo(url: str) -> str:
     if parsed.username is None and parsed.password is None:
         return url
     after = url.split("://", 1)[1] if "://" in url else url
-    hostpart = after.split("@", 1)[1] if "@" in after else after
+    # Split on the LAST '@' (as urlparse does): userinfo ends at the final
+    # '@', so a password that itself contains '@' (e.g. user:p@ss@host) must
+    # not be split on its first '@', which would leave a tail of the secret
+    # ('ss@host') in the "redacted" string -- the leak this helper prevents.
+    hostpart = after.rsplit("@", 1)[1] if "@" in after else after
     return "{}://***@{}".format(parsed.scheme, hostpart)
 
 

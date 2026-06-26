@@ -1096,9 +1096,12 @@ class Cron:
         rendezvous-hashed owner, so leader-gated work fans out across the
         quorate nodes.  Both keep the same quorum gate and the same guarantee.
 
-        ``Leader``/``PreferLeader`` fail *closed* (return False) when election
-        is configured but no manager is running, so a broken cluster does not
-        make every replica fire.  Manual (API) triggers go through
+        When election is configured but no manager is running, ``Leader`` fails
+        *closed* (return False) so a broken cluster does not make every replica
+        fire, while ``PreferLeader`` (never-skip) runs anyway -- a node with no
+        manager is the "store unreachable" case its contract already accepts a
+        double-run for, so skipping it would drop the job to at-most-zero.
+        Manual (API) triggers go through
         ``maybe_launch_job`` directly and are deliberately *not* gated (an
         explicit operator action runs where it is invoked).  Scheduled-job
         *retries* re-check this gate in ``schedule_retry_job`` before
@@ -1122,7 +1125,16 @@ class Cron:
             return True
         mgr = self.cluster_manager
         if mgr is None:
-            return False  # election wanted but undeterminable -> fail closed
+            # Election is configured but no manager is running (it failed to
+            # start, or a reload tore the old one down and the rebuild raised).
+            # That is precisely the "store/quorum unreachable" condition, so
+            # honour each policy's contract: Leader fails CLOSED
+            # (at-most-once), but PreferLeader is never-skip -- it must run
+            # anyway (accepting a possible double-run) rather than be silently
+            # skipped on every replica, which for a fleet-wide start failure
+            # would drop the job to at-most-ZERO, defeating the whole point of
+            # PreferLeader.
+            return bool(job.clusterPolicy == "PreferLeader")
         try:
             if mgr.distribution == "spread":
                 if job.clusterPolicy == "PreferLeader":

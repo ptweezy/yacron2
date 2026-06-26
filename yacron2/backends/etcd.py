@@ -484,8 +484,6 @@ class EtcdBackend(LeaseBackend):
                 pass
 
     async def _renew_once(self) -> None:  # pragma: no cover - network
-        now = _utcnow()
-        mono = _monotonic()
         if self._lease_id is not None:
             ttl = await self._keepalive(self._lease_id)
             if ttl is None or ttl <= 0:
@@ -501,6 +499,17 @@ class EtcdBackend(LeaseBackend):
         if self._lease_id is None:
             raise aiohttp.ClientError("etcd lease grant returned no id")
         holder, won = await self._campaign(self._lease_id)
+        # Anchor the leadership deadline to the instant the round COMPLETED
+        # (the keepalive/grant/campaign POSTs have landed at the server, so
+        # the lease's life there starts ~now), NOT to the round's start. The
+        # POSTs are sequential and each iterates every endpoint, so a slow-but-
+        # healthy round can consume a large fraction of the ttl; sampling the
+        # clock at the top would have the *previous* round's deadline (anchored
+        # ttl-1s ago) lapse before this round's write lands, flapping is_leader
+        # False while we demonstrably still hold the key -- a transient
+        # at-most-once -> at-most-zero on every Leader job firing in the gap.
+        now = _utcnow()
+        mono = _monotonic()
         self._apply_round(holder, won, now, mono)
         await self._sync_reboot_ran()
 
@@ -514,6 +523,11 @@ class EtcdBackend(LeaseBackend):
         shot); the next round retries.
         """
         try:
+            # drop our own marks first if the job set changed, so a redefined
+            # @reboot one-shot is not re-suppressed by a stale local mark being
+            # re-published under the new job-set id (see
+            # LeaseBackend._reconcile_local_reboot_ran).
+            self._reconcile_local_reboot_ran()
             resp = await self._post(
                 "/v3/kv/range", {"key": _b64(self.reboot_ran_key)}
             )

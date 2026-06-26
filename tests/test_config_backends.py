@@ -11,6 +11,7 @@ from yacron2.config import (
     DEFAULT_ETCD,
     DEFAULT_K8S,
     ConfigError,
+    _redact_userinfo,
     cluster_config_warnings,
     parse_config_string,
 )
@@ -18,6 +19,16 @@ from yacron2.config import (
 
 def _cluster(yaml):
     return parse_config_string(yaml, "").cluster_config
+
+
+def _gossip(peers_yaml, listen="0.0.0.0:8443", node="node-a", extra=""):
+    return _cluster(
+        "cluster:\n"
+        "  listen: '" + listen + "'\n"
+        "  nodeName: " + node + "\n"
+        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n" + extra
+        + "  peers:\n" + peers_yaml
+    )
 
 
 # --- backend defaulting ---------------------------------------------------
@@ -383,3 +394,65 @@ def test_no_warnings_for_lease_backends():
 def test_unknown_backend_rejected():
     with pytest.raises(ConfigError):
         _cluster("cluster:\n  backend: zookeeper\n")
+
+
+# --- F17: kubernetes lease-timing sum invariant ---------------------------
+
+
+def test_kubernetes_rejects_renew_plus_retry_ge_duration():
+    # renewDeadline + retryPeriod must fit inside leaseDuration, or the
+    # holder's worst-case refresh gap exceeds the lease lifetime and it lapses
+    # out of the lease every cycle even when sole and healthy (no stable
+    # leader). 11+10=21 >= 12 passes the pairwise checks (10<11, 11<12) but not
+    # the sum.
+    with pytest.raises(ConfigError, match="must be less than"):
+        _cluster(
+            "cluster:\n  backend: kubernetes\n  nodeName: node-a\n"
+            "  kubernetes:\n"
+            "    leaseDurationSeconds: 12\n"
+            "    renewDeadlineSeconds: 11\n"
+            "    retryPeriodSeconds: 10\n"
+        )
+
+
+def test_kubernetes_defaults_satisfy_sum_invariant():
+    # the shipped defaults (15 / 10 / 2 -> 12 < 15) must pass.
+    cfg = _cluster(_K8S)
+    assert cfg["kubernetes"]["leaseDurationSeconds"] == 15
+
+
+# --- F11: IPv6 host:port validation ---------------------------------------
+
+
+def test_gossip_rejects_bare_ipv6_peer():
+    # a bare (unbracketed) IPv6 peer host would be mis-split (host=2001:db8:,
+    # port=1) and silently dropped from quorum; require the bracketed form.
+    with pytest.raises(ConfigError, match="IPv6"):
+        _gossip("    - host: 2001:db8::5\n")
+
+
+def test_gossip_rejects_bare_ipv6_listen():
+    with pytest.raises(ConfigError, match="IPv6"):
+        _gossip("    - host: node-b:8443\n", listen="2001:db8::1")
+
+
+def test_gossip_accepts_bracketed_ipv6():
+    cfg = _gossip(
+        "    - host: '[2001:db8::5]:8443'\n", listen="[2001:db8::1]:8443"
+    )
+    assert cfg["peers"][0]["host"] == "[2001:db8::5]:8443"
+
+
+# --- F10: userinfo redaction with '@' in the password ---------------------
+
+
+def test_redact_userinfo_splits_on_last_at():
+    # a password containing '@' must not leak its tail: split on the LAST '@'
+    # (as urlparse does), not the first.
+    redacted = _redact_userinfo("https://user:p@ss@host:2379")
+    assert redacted == "https://***@host:2379"
+    assert "p@ss" not in redacted and "ss@host" not in redacted
+
+
+def test_redact_userinfo_no_userinfo_unchanged():
+    assert _redact_userinfo("https://host:2379") == "https://host:2379"

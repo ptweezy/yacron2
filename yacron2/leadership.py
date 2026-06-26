@@ -314,13 +314,39 @@ class LeaseBackend(LeadershipBackend):
         # cluster (persisted across restarts), not once per process boot.
         self._reboot_ran: Set[str] = set()
         self._reboot_ran_local: Set[str] = set()
+        # the job-set id under which the current ``_reboot_ran_local`` marks
+        # were recorded, so they can be dropped when the job set changes (see
+        # _reconcile_local_reboot_ran). None until the first mark/read.
+        self._reboot_ran_local_job_set_id: Optional[str] = None
+
+    def _reconcile_local_reboot_ran(self) -> None:
+        """Drop our own @reboot-ran marks when the job set changed.
+
+        ``_reboot_ran_local`` records the one-shots *this process* ran, keyed
+        implicitly by the job set live when it ran them.  A config reload that
+        redefines an @reboot job changes the job-set id, and such a job must be
+        allowed to run again -- so a mark made under an older config must not
+        survive (and, worse, be re-persisted to the store stamped with the new
+        id, which would suppress the genuinely-new one-shot cluster-wide).
+        Mirrors the gossip backend's
+        :meth:`yacron2.cluster.ClusterManager._reconcile_job_set_id`, which
+        clears its whole ran-set on a job-set
+        change for exactly the same reason.  ``_reboot_ran`` (the store-read
+        set) is reconciled separately by :meth:`_observe_reboot_ran`.
+        """
+        current = self.get_job_set_id()
+        if self._reboot_ran_local_job_set_id != current:
+            self._reboot_ran_local = set()
+            self._reboot_ran_local_job_set_id = current
 
     def reboot_ran(self, job_name: str) -> bool:
+        self._reconcile_local_reboot_ran()
         return (
             job_name in self._reboot_ran or job_name in self._reboot_ran_local
         )
 
     async def mark_reboot_ran(self, job_name: str) -> None:
+        self._reconcile_local_reboot_ran()
         self._reboot_ran_local.add(job_name)
         await self._persist_reboot_ran()
 
@@ -355,6 +381,7 @@ class LeaseBackend(LeadershipBackend):
         annotations to preserve, so a backend can skip an empty annotations
         block. Used by the kubernetes backend's Lease write.
         """
+        self._reconcile_local_reboot_ran()
         combined = self._reboot_ran | self._reboot_ran_local
         annotations = dict(existing or {})
         if combined:

@@ -222,6 +222,27 @@ async def test_lease_backend_reboot_ran_cache():
     assert b.reboot_ran("j") is True
 
 
+async def test_local_reboot_ran_cleared_on_job_set_change():
+    # F02/F13: a mark recorded under one job set must NOT survive (and be
+    # re-stamped under) a NEW job set -- a redefined @reboot one-shot must be
+    # allowed to run again. The lease base drops _reboot_ran_local when the
+    # live job-set id changes, mirroring gossip's whole-set reconcile.
+    live = {"id": "v1:old"}
+    b = _FakeLease()
+    b.get_job_set_id = lambda: live["id"]
+    await b.mark_reboot_ran("migrate")
+    assert b.reboot_ran("migrate") is True
+    # the annotation is stamped under the CURRENT job set
+    jsid, jobs = decode_reboot_ran(b.reboot_ran_annotation()[REBOOT_RAN_KEY])
+    assert jsid == "v1:old" and jobs == {"migrate"}
+    # config reload redefines the job -> new job-set id: the stale local mark
+    # is dropped (so the redefined one-shot runs again) and is NOT re-published
+    # under the new id (which would suppress it cluster-wide).
+    live["id"] = "v2:new"
+    assert b.reboot_ran("migrate") is False
+    assert b.reboot_ran_annotation() is None
+
+
 def test_observe_reboot_ran_is_job_set_scoped():
     b = _FakeLease(job_set_id="v1:js")
     b._observe_reboot_ran("v1:js", {"a"})
@@ -234,7 +255,12 @@ def test_observe_reboot_ran_is_job_set_scoped():
 
 def test_reboot_ran_annotation_carries_forward_and_encodes():
     b = _FakeLease(job_set_id="v1:js")
+    # a mark recorded under the current job set: mark_reboot_ran stamps the
+    # job-set id alongside the local set (see _reconcile_local_reboot_ran), so
+    # simulate that here rather than poking _reboot_ran_local raw (which the
+    # reconcile would otherwise drop as belonging to an unknown job set).
     b._reboot_ran_local.add("a")
+    b._reboot_ran_local_job_set_id = "v1:js"
     ann = b.reboot_ran_annotation({"other/key": "keep"})
     assert ann["other/key"] == "keep"  # someone else's annotation preserved
     jsid, jobs = decode_reboot_ran(ann[REBOOT_RAN_KEY])

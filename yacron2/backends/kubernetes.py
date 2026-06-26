@@ -221,21 +221,59 @@ def lease_is_expired(
     return bool(now >= anchor + datetime.timedelta(seconds=state.duration))
 
 
+def _deadline_passed(
+    now: Any, anchor: Optional[Any], duration: Optional[int]
+) -> bool:
+    """Whether ``anchor + duration`` has elapsed on whichever clock ``now`` is.
+
+    ``now``/``anchor`` are both monotonic floats (the live path) or both wall
+    datetimes (the unit tests).  True when there is no usable anchor/duration.
+    """
+    if anchor is None or not duration:
+        return True
+    if isinstance(now, (int, float)):
+        return bool(now >= anchor + duration)
+    return bool(now >= anchor + datetime.timedelta(seconds=duration))
+
+
 def decide_lease_action(
     state: Optional[LeaseState],
     identity: str,
     now: Any,
     observed_at: Optional[Any],
+    *,
+    last_holder: Optional[str] = None,
+    last_observed_at: Optional[Any] = None,
+    duration: Optional[int] = None,
 ) -> str:
     """Choose the action for this round given the observed lease.
 
-    * no lease -> ``create``;
+    * no lease -> ``create`` (but ``wait`` first if a *different* holder we
+      recently saw still has an unexpired lease from our view -- see below);
     * we are the holder -> ``renew`` (reclaim even if it lapsed);
     * holder is empty, or *our* observation of this record has aged past the
       lease duration (see :func:`lease_is_expired`) -> ``acquire`` (take over);
     * someone else holds a still-valid lease -> ``wait``.
+
+    The ``last_holder``/``last_observed_at``/``duration`` guard closes a
+    two-leaders race when the Lease *object* is deleted out from under a live
+    holder (``kubectl delete lease`` / a GC or namespace controller): the
+    deletion does not touch the prior holder's local monotonic fence, so it
+    keeps returning :meth:`KubernetesBackend.is_leader` ``True`` until its next
+    round observes the recreated lease.  If we recreated the lease as ourselves
+    the instant we saw the 404, both nodes would lead for up to a retry period.
+    So when the object is absent but we remember a *different* holder whose
+    lease has not yet expired from our clock, we ``wait`` it out first.  (Two
+    nodes both creating from a genuinely-absent lease stay fenced by the
+    apiserver's ``AlreadyExists`` 409 -> ``write_ok`` False -> not leader.)
     """
     if state is None:
+        if (
+            last_holder
+            and last_holder != identity
+            and not _deadline_passed(now, last_observed_at, duration)
+        ):
+            return ACTION_WAIT
         return ACTION_CREATE
     if state.holder == identity:
         return ACTION_RENEW
@@ -308,6 +346,8 @@ def plan_lease_write(
     observed_at: Optional[Any],
     mono_now: Optional[float] = None,
     annotations: Optional[Dict[str, str]] = None,
+    last_holder: Optional[str] = None,
+    last_observed_at: Optional[Any] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]], Optional[LeaseState]]:
     """Pure planning step: observed Lease -> (action, body, state).
 
@@ -318,12 +358,23 @@ def plan_lease_write(
     cannot mis-time a takeover, while the ``renewTime``/``acquireTime`` written
     into the object must be wall-clock RFC3339 (``now``).  When ``mono_now`` is
     omitted the decision falls back to ``now`` (the unit tests pass one wall
-    clock for both, which is internally consistent).  ``body`` is ``None`` for
-    ``wait`` (nothing to write).
+    clock for both, which is internally consistent).  ``last_holder`` /
+    ``last_observed_at`` are the holder we remembered *before* this round's
+    observation, for the deleted-lease recreate-race guard in
+    :func:`decide_lease_action`.  ``body`` is ``None`` for ``wait`` (nothing to
+    write).
     """
     state = parse_lease(lease_obj) if lease_obj is not None else None
     decide_now = now if mono_now is None else mono_now
-    action = decide_lease_action(state, identity, decide_now, observed_at)
+    action = decide_lease_action(
+        state,
+        identity,
+        decide_now,
+        observed_at,
+        last_holder=last_holder,
+        last_observed_at=last_observed_at,
+        duration=duration,
+    )
     if action == ACTION_WAIT:
         return action, None, state
     body = build_lease_body(
@@ -397,6 +448,11 @@ class KubernetesBackend(LeaseBackend):
         self._transport: Optional["_K8sTransport"] = None
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # Serialises the renew loop's lease write with an eager reboot-ran
+        # persist (see _persist_reboot_ran), so the two cannot interleave and
+        # 409 each other on the shared resourceVersion (a transient false
+        # demotion).
+        self._lease_write_lock = asyncio.Lock()
 
     # --- pure local-state reads (no I/O) ---------------------------------
 
@@ -477,8 +533,16 @@ class KubernetesBackend(LeaseBackend):
         same record for a full monotonic duration -- which no wall-clock
         jump can fast-forward.
         """
-        holder = state.holder if state is not None else None
-        renew = state.renew_time if state is not None else None
+        if state is None:
+            # An absent lease (404) carries no new timing. PRESERVE the last
+            # real observation so the steal/expiry timer -- and the deleted-
+            # lease recreate-race guard in decide_lease_action -- keep counting
+            # against the holder we last saw, instead of resetting the anchor
+            # (which would let us recreate the lease as ourselves immediately
+            # and lead alongside a prior holder still inside its local fence).
+            return self._observed_at
+        holder = state.holder
+        renew = state.renew_time
         if holder != self._observed_holder or renew != self._observed_renew:
             self._observed_holder = holder
             self._observed_renew = renew
@@ -537,8 +601,12 @@ class KubernetesBackend(LeaseBackend):
             return False
 
     async def start(self) -> None:  # pragma: no cover - network/credential I/O
+        # `import kubernetes` pulls in urllib3/requests etc. -- a heavy
+        # one-time import that must not block the run loop start_stop_cluster
+        # awaits us from; probe it in a worker thread.
+        native = await asyncio.to_thread(self._native_available)
         kind = select_transport(
-            self.client_library, self._native_available(), "kubernetes"
+            self.client_library, native, "kubernetes"
         )
         self._transport = (
             _K8sLibraryTransport(self)
@@ -605,47 +673,86 @@ class KubernetesBackend(LeaseBackend):
 
     async def _renew_once(self) -> None:  # pragma: no cover - network
         assert self._transport is not None
-        lease_obj = await self._transport.observe()
-        # Capture the clocks AFTER observe() returns, so the steal anchor (and
-        # the renewTime we write) reflect the instant we actually read the
-        # record -- client-go's observedTime = now() *after* the Get. Sampling
-        # before the await would anchor whatever (possibly newer) record GET
-        # returns to a time up to one observe-latency earlier (bounded by
-        # renewDeadline, not the skew budget), shrinking the steal window and
-        # risking two leaders at once on a slow apiserver. `mono` drives the
-        # steal/expiry timing (jump-proof); `now` (wall) only stamps written
-        # renewTime/acquireTime and the displayed expiry.
-        now = _utcnow()
-        mono = _monotonic()
-        observed = parse_lease(lease_obj) if lease_obj is not None else None
-        observed_at = self._track_observation(observed, mono)
-        # Fold the @reboot-ran set persisted in the Lease annotations into our
-        # cache (so a node that just acquired the lease learns what already ran
-        # and does not re-run it), then carry those annotations forward and add
-        # our own pending marks for the write below.
-        observed_annotations = observed.annotations if observed else {}
-        stored_jsid, stored_jobs = decode_reboot_ran(
-            observed_annotations.get(REBOOT_RAN_KEY)
-        )
-        self._observe_reboot_ran(stored_jsid, stored_jobs)
-        write_annotations = self.reboot_ran_annotation(observed_annotations)
-        action, body, state = plan_lease_write(
-            lease_obj,
-            self.lease_name,
-            self.namespace,
-            self.identity,
-            now,
-            self.lease_duration,
-            observed_at,
-            mono,
-            write_annotations,
-        )
-        write_ok = False
-        if body is not None:
-            write_ok = await self._transport.write(
-                body, create=(action == ACTION_CREATE)
+        # Serialise with the eager reboot-ran persist so the two writes do not
+        # race on resourceVersion (see _persist_reboot_ran / the write lock).
+        async with self._lease_write_lock:
+            lease_obj = await self._transport.observe()
+            # Capture the clocks AFTER observe() returns, so the steal anchor
+            # (and the renewTime we write) reflect the instant we actually read
+            # the record -- client-go's observedTime = now() *after* the Get.
+            # Sampling before the await would anchor whatever (possibly newer)
+            # record GET returns to a time up to one observe-latency earlier
+            # (bounded by renewDeadline, not the skew budget), shrinking the
+            # steal window and risking two leaders at once on a slow apiserver.
+            # `mono` drives the steal/expiry timing (jump-proof); `now` (wall)
+            # only stamps written renewTime/acquireTime and the displayed
+            # expiry.
+            now = _utcnow()
+            mono = _monotonic()
+            observed = (
+                parse_lease(lease_obj) if lease_obj is not None else None
             )
-        self._apply_round(action, write_ok, state, now, mono)
+            # remember the holder we saw BEFORE this round overwrites it, for
+            # the deleted-lease recreate-race guard (see decide_lease_action).
+            prev_holder = self._observed_holder
+            prev_observed_at = self._observed_at
+            observed_at = self._track_observation(observed, mono)
+            # Fold the @reboot-ran set persisted in the Lease annotations into
+            # our cache (so a node that just acquired the lease learns what
+            # already ran and does not re-run it), then carry those annotations
+            # forward and add our own pending marks for the write below.
+            observed_annotations = observed.annotations if observed else {}
+            stored_jsid, stored_jobs = decode_reboot_ran(
+                observed_annotations.get(REBOOT_RAN_KEY)
+            )
+            self._observe_reboot_ran(stored_jsid, stored_jobs)
+            write_annotations = self.reboot_ran_annotation(
+                observed_annotations
+            )
+            action, body, state = plan_lease_write(
+                lease_obj,
+                self.lease_name,
+                self.namespace,
+                self.identity,
+                now,
+                self.lease_duration,
+                observed_at,
+                mono,
+                write_annotations,
+                last_holder=prev_holder,
+                last_observed_at=prev_observed_at,
+            )
+            write_ok = False
+            if body is not None:
+                write_ok = await self._transport.write(
+                    body, create=(action == ACTION_CREATE)
+                )
+            self._apply_round(action, write_ok, state, now, mono)
+
+    async def _persist_reboot_ran(self) -> None:  # pragma: no cover - network
+        """Eagerly write the @reboot-ran set into the Lease annotations.
+
+        cron records a deferred @reboot one-shot as run via ``mark_reboot_ran``
+        *before* launching it, and both the cron and leadership docstrings
+        promise a lease backend persists that immediately so a failover holder
+        cannot re-run it.  The default
+        :class:`~yacron2.leadership.LeaseBackend` ``mark_reboot_ran`` only
+        updates the in-memory set and calls this no-op, leaving the annotation
+        to the *next* periodic renew round -- a window in which a crash (or a
+        graceful stop that PUT-replaces the Lease) loses the record and the
+        one-shot double-runs.  Override it to run a renew round
+        now, which carries the mark into the Lease.  Best-effort and bounded
+        (the periodic round retries on failure); serialised against the loop by
+        ``_renew_once``'s ``_lease_write_lock``.
+        """
+        if self._transport is None:
+            return
+        try:
+            await asyncio.wait_for(self._renew_once(), self.renew_deadline)
+        except Exception as ex:
+            logger.debug(
+                "cluster: kubernetes reboot-ran eager persist failed: %s", ex
+            )
 
     async def stop(self) -> None:  # pragma: no cover - network
         self._stop.set()
@@ -693,14 +800,23 @@ class KubernetesBackend(LeaseBackend):
             state = parse_lease(lease_obj)
             if state.holder != self.identity:
                 return
+            metadata: Dict[str, Any] = {
+                "name": self.lease_name,
+                "namespace": self.namespace,
+                "resourceVersion": state.resource_version,
+            }
+            # Preserve the @reboot-ran annotation when handing the lease back:
+            # a graceful stop (e.g. a config reload that rebuilds the manager)
+            # must NOT erase the record of which one-shots already ran, or a
+            # peer that takes over would re-run them. Carry the stored set
+            # (plus any of our own pending marks) forward.
+            annotations = self.reboot_ran_annotation(state.annotations)
+            if annotations:
+                metadata["annotations"] = annotations
             body = {
                 "apiVersion": _API_GROUP,
                 "kind": "Lease",
-                "metadata": {
-                    "name": self.lease_name,
-                    "namespace": self.namespace,
-                    "resourceVersion": state.resource_version,
-                },
+                "metadata": metadata,
                 "spec": {
                     "holderIdentity": None,
                     "leaseDurationSeconds": self.lease_duration,
@@ -923,13 +1039,21 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
                 )
 
         if user.get("token"):
-            self._auth_token = user["token"]
             if self._base_url.lower().startswith("http://"):
-                logger.warning(
-                    "cluster: kubernetes kubeconfig server is http:// -- the "
-                    "bearer token will be sent in cleartext. Use an https:// "
-                    "server."
+                # Refuse to send the bearer token over cleartext http,
+                # matching the hard ConfigError on an http:// apiServer
+                # override (and the in-cluster defence-in-depth above). A
+                # captured token lets an attacker forge a Lease holderIdentity
+                # (-> two leaders) or revoke the real holder, so warn-only is
+                # not enough.
+                raise ConfigError(
+                    "kubernetes backend: kubeconfig server is http:// but the "
+                    "user has a bearer token; refusing to send it in "
+                    "cleartext. Use an https:// server ({})".format(
+                        self._base_url
+                    )
                 )
+            self._auth_token = user["token"]
         cert = self._material(
             user.get("client-certificate"),
             user.get("client-certificate-data"),
@@ -1015,6 +1139,15 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
         self._api_client: Any = None
 
     async def setup(self) -> None:
+        # The native client's config loading is fully synchronous and can be
+        # SLOW (disk reads, and for an exec-credential kubeconfig an external
+        # subprocess that may contact a metadata endpoint). start() is awaited
+        # inline from the daemon's single run loop, so run it in a worker
+        # thread rather than freezing the whole scheduler/web API meanwhile.
+        context_namespace = await asyncio.to_thread(self._setup_sync)
+        self.b.namespace = self.b._resolve_namespace(context_namespace)
+
+    def _setup_sync(self) -> Optional[str]:
         from kubernetes import client
         from kubernetes import config as kube_config
         from kubernetes.config.config_exception import ConfigException
@@ -1051,9 +1184,21 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
         config_obj = client.Configuration.get_default_copy()
         if self.b.api_server_override:
             config_obj.host = self.b.api_server_override.rstrip("/")
+        if not getattr(config_obj, "verify_ssl", True):
+            # Match the HTTP transport's loud warning: load_kube_config honours
+            # insecure-skip-tls-verify silently, so without this a node that
+            # selected the native client (an arch where the lib is installed)
+            # would disable apiserver cert verification with no operator signal
+            # -- the bearer token then travels over an unverified TLS link.
+            logger.warning(
+                "cluster: kubernetes kubeconfig disables TLS verification "
+                "(insecure-skip-tls-verify) -- the apiserver certificate is "
+                "NOT verified, exposing the lease store (and any bearer "
+                "token) to MITM. Use only for local testing; prefer a real CA."
+            )
         self._api_client = client.ApiClient(config_obj)
         self._api = client.CoordinationV1Api(self._api_client)
-        self.b.namespace = self.b._resolve_namespace(context_namespace)
+        return context_namespace
 
     async def observe(self) -> Optional[Dict[str, Any]]:
         from kubernetes.client.exceptions import ApiException

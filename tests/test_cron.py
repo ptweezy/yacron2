@@ -1370,12 +1370,14 @@ def test_cluster_allows_per_policy():
     cron._elect_leader_configured = True
 
     # no manager running (e.g. failed to start): EveryNode jobs are immune and
-    # still run; Leader/PreferLeader fail closed so we don't risk every replica
-    # firing.
+    # still run; Leader fails CLOSED so we don't risk every replica firing; but
+    # PreferLeader is never-skip -- a node with no manager is the "store
+    # unreachable" case its contract already accepts a double-run for, so it
+    # must still run rather than drop to at-most-zero fleet-wide (F14).
     cron.cluster_manager = None
     assert cron._cluster_allows(job("EveryNode")) is True
     assert cron._cluster_allows(job("Leader")) is False
-    assert cron._cluster_allows(job("PreferLeader")) is False
+    assert cron._cluster_allows(job("PreferLeader")) is True
 
     class _Mgr:
         distribution = "single-leader"

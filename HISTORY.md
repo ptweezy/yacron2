@@ -5,6 +5,22 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.11 (unreleased)
+
+- **Coverage is now published to [Codecov](https://codecov.io/gh/ptweezy/yacron2).**
+  Every CI matrix cell uploads its own `coverage.xml` under an
+  `<os>-py<version>` flag, and Codecov merges them into one combined number, so
+  POSIX-only paths that Windows skips (privilege drop, `user`/`group`
+  resolution) still count toward the published total instead of dragging it down
+  to the lowest single row. tox now also writes the report it consumes
+  (`pytest --cov-report=xml`). The hard pass/fail gate stays with tox's
+  `--cov-fail-under=82` (see 1.1.10): Codecov's own project and patch status
+  checks are configured as *informational* only, so they annotate pull requests
+  without ever blocking them. The upload runs even on failed or cancelled jobs
+  and keeps `fail_ci_if_error: false`, so a Codecov outage never reds the build,
+  and flag `carryforward` keeps the combined number stable when a matrix row is
+  skipped on a given run. The README gains a matching coverage badge.
+
 ## 1.1.10 (2026-06-24)
 
 - **Numeric `user`/`group` is read as a uid/gid, not a login name.** In the

@@ -292,6 +292,8 @@ class Cron:
         self._was_conflict = False
         # last cluster-size-disagreement state we logged (same rationale)
         self._was_size_conflict = False
+        # last coordination-policy-divergence state we logged (same rationale)
+        self._was_policy_conflict = False
         # @reboot Leader/PreferLeader jobs that could not start at boot because
         # the cluster had not yet elected an owner; run once on convergence.
         # name -> JobConfig; see _process_pending_reboots.
@@ -838,6 +840,7 @@ class Cron:
                 self._was_quorate = False
                 self._was_conflict = False
                 self._was_size_conflict = False
+                self._was_policy_conflict = False
         if cluster_config is not None and self.cluster_manager is None:
             # Emit non-fatal advisories here (only when a manager is actually
             # (re)started) rather than at parse time, which runs every reload
@@ -1251,6 +1254,28 @@ class Cron:
                         "jobs may run again"
                     )
                 self._was_size_conflict = bool(size_conflict)
+            # A coordination-policy divergence (an agreeing peer running a
+            # different distribution / electLeader) selects a different owner
+            # and would double-run or drop Leader jobs, so it fails the Leader
+            # gate closed exactly like the two conflicts above -- but unlike
+            # them it would otherwise stand Leader jobs down cluster-wide with
+            # nothing in the log. Surface it just as loudly, once per change.
+            policy_conflict = mgr.conflicting_policies()
+            if bool(policy_conflict) != self._was_policy_conflict:
+                if policy_conflict:
+                    logger.error(
+                        "cluster: coordination-policy divergence -- agreeing "
+                        "peers declare %s; Leader jobs will stand down until "
+                        "every node's cluster.distribution and "
+                        "cluster.electLeader agree",
+                        "; ".join(policy_conflict),
+                    )
+                else:
+                    logger.info(
+                        "cluster: coordination-policy divergence resolved; "
+                        "Leader jobs may run again"
+                    )
+                self._was_policy_conflict = bool(policy_conflict)
         # Quorum membership is logged on *every* node, in both modes, so a
         # follower that drops below quorum -- i.e. the whole cluster losing the
         # ability to elect a leader -- leaves a breadcrumb in its own log, not

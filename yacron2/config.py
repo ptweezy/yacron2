@@ -926,6 +926,57 @@ def _reject_lease_spread(cfg: dict, backend: str) -> None:
         )
 
 
+# Cluster keys only the gossip transport consumes. A lease backend silently
+# ignores them, so a lease config that carries them (e.g. copied from a gossip
+# example and re-pointed with `backend:`) does not do what it looks like --
+# most dangerously a `tls` block, which the operator may believe secures
+# peer/store traffic when it does nothing. interval/driftAfter live in
+# DEFAULT_CLUSTER so are always present in the built cfg; detect them from the
+# *raw* block instead, where they appear only if the operator wrote them.
+_GOSSIP_ONLY_CLUSTER_KEYS = (
+    "listen",
+    "tls",
+    "peers",
+    "interval",
+    "driftAfter",
+)
+
+
+def _lease_advisories(raw: dict, backend: str) -> List[str]:
+    """Non-fatal advisories for a lease (kubernetes/etcd) cluster block.
+
+    Surfaced (once, via :func:`cluster_config_warnings`) rather than raised so
+    an upgrade does not fail a previously-accepted config; promote to a hard
+    ConfigError behind a deprecation window if stricter validation is wanted.
+    """
+    advisories: List[str] = []
+    present = [k for k in _GOSSIP_ONLY_CLUSTER_KEYS if raw.get(k) is not None]
+    if present:
+        msg = (
+            "cluster.{} configured but ignored by the {!r} backend (those "
+            "keys apply only to backend: gossip)".format(
+                ", cluster.".join(present), backend
+            )
+        )
+        if "tls" in present:
+            # the one with a security-relevant false belief attached.
+            msg += (
+                "; note cluster.tls does NOT secure the lease store -- the "
+                "{} store's TLS is configured under cluster.{}".format(
+                    backend, backend
+                )
+            )
+        advisories.append(msg)
+    if raw.get("electLeader") is False:
+        # the override to True is unconditional (a lease backend is opting into
+        # leadership); flag the swallowed explicit contradiction.
+        advisories.append(
+            "cluster.electLeader: false is ignored by the {!r} backend; a "
+            "lease backend always enables leader election".format(backend)
+        )
+    return advisories
+
+
 def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
     """Resolve a value/fromFile/fromEnvVar secret block, or ``None`` if unset.
 
@@ -1038,6 +1089,9 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
         )
     # configuring a lease backend is opting into leadership.
     cfg["electLeader"] = True
+    advisories = _lease_advisories(raw, "kubernetes")
+    if advisories:
+        cfg["_advisories"] = advisories
     return ClusterConfig(cfg)
 
 
@@ -1183,6 +1237,9 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
                 )
             )
     cfg["electLeader"] = True
+    advisories = _lease_advisories(raw, "etcd")
+    if advisories:
+        cfg["_advisories"] = advisories
     return ClusterConfig(cfg)
 
 
@@ -1194,7 +1251,11 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
     re-parses its config every wakeup, so logging here would spam the same
     warning every minute for the life of the process.
     """
-    warnings: List[str] = []
+    # Lease-backend advisories (gossip-only keys / a swallowed
+    # electLeader:false) are computed at build time, where the raw block is
+    # available, and stashed on the cfg; surface them here so they ride the
+    # same emit-once channel.
+    warnings: List[str] = list(cfg.get("_advisories", ()))
     if cfg.get("backend", "gossip") != "gossip":
         # The lease backends have no static peer set or even/odd-size
         # trade-off, and always imply electLeader, so the gossip-only

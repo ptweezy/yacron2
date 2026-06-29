@@ -510,6 +510,10 @@ class EtcdBackend(LeaseBackend):
                     ssl=self._ssl,
                     headers=headers,
                     timeout=timeout,
+                    # never follow a redirect to an attacker-chosen target
+                    # (SSRF) or a plaintext downgrade; a real etcd endpoint
+                    # answers directly. Matches the gossip transport.
+                    allow_redirects=False,
                 ) as resp:
                     if resp.status == 401 and self.username and allow_reauth:
                         self._auth_token = await self._authenticate()

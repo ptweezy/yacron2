@@ -391,6 +391,57 @@ def test_no_warnings_for_lease_backends():
     assert cluster_config_warnings(_cluster(_ETCD)) == []
 
 
+def test_etcd_warns_on_gossip_only_keys():
+    # a lease config carrying gossip transport keys (e.g. copied from a
+    # gossip example) silently ignores them; warn -- and call out that
+    # cluster.tls does NOT secure the lease store (the dangerous false belief).
+    cfg = _cluster(
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  nodeName: node-a\n"
+        "  listen: '0.0.0.0:8443'\n"
+        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
+        "  peers:\n    - host: b:8443\n"
+        "  etcd:\n    endpoints:\n      - http://127.0.0.1:2379\n"
+    )
+    warnings = cluster_config_warnings(cfg)
+    assert any("ignored by the 'etcd' backend" in w for w in warnings)
+    assert any("does NOT secure the lease store" in w for w in warnings)
+    # the backend still builds and is unaffected by the inert keys.
+    assert cfg["etcd"]["endpoints"] == ["http://127.0.0.1:2379"]
+
+
+def test_kubernetes_warns_on_gossip_only_keys():
+    cfg = _cluster(
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  nodeName: node-a\n"
+        "  peers:\n    - host: b:8443\n"
+    )
+    warnings = cluster_config_warnings(cfg)
+    assert any(
+        "cluster.peers" in w and "ignored by the 'kubernetes' backend" in w
+        for w in warnings
+    )
+
+
+def test_lease_warns_on_explicit_elect_leader_false():
+    # a lease backend always implies leadership; an explicit electLeader:false
+    # is contradictory and silently overridden -- surface the swallowed value
+    # while still honouring the override (the gate stays on).
+    cfg = _cluster(
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  nodeName: node-a\n"
+        "  electLeader: false\n"
+    )
+    assert cfg["electLeader"] is True  # override still wins
+    assert any(
+        "electLeader: false is ignored" in w
+        for w in cluster_config_warnings(cfg)
+    )
+
+
 def test_unknown_backend_rejected():
     with pytest.raises(ConfigError):
         _cluster("cluster:\n  backend: zookeeper\n")

@@ -1468,6 +1468,9 @@ def test_cluster_role_logged_on_transition(caplog):
         def conflicting_sizes(self):
             return []
 
+        def conflicting_policies(self):
+            return []
+
     cron.cluster_manager = _Mgr(True)
     with caplog.at_level(logging.INFO, logger="yacron2"):
         cron._log_cluster_role()
@@ -1509,6 +1512,9 @@ def test_cluster_quorum_logged_on_follower_single_leader(caplog):
         def conflicting_sizes(self):
             return []
 
+        def conflicting_policies(self):
+            return []
+
     cron.cluster_manager = _Follower(True)
     with caplog.at_level(logging.INFO, logger="yacron2"):
         cron._log_cluster_role()  # joins quorum as a follower
@@ -1543,6 +1549,9 @@ def test_cluster_role_logged_spread_quorum(caplog):
             return []
 
         def conflicting_sizes(self):
+            return []
+
+        def conflicting_policies(self):
             return []
 
     cron.cluster_manager = _SpreadMgr(True)
@@ -1647,6 +1656,9 @@ def test_cluster_conflict_logged_on_transition(caplog):
         def conflicting_sizes(self):
             return []
 
+        def conflicting_policies(self):
+            return []
+
         def is_leader(self):
             return False
 
@@ -1682,6 +1694,9 @@ def test_cluster_size_conflict_logged_on_transition(caplog):
         def conflicting_sizes(self):
             return [5] if self._conflict else []
 
+        def conflicting_policies(self):
+            return []
+
         def cluster_size(self):
             return 3
 
@@ -1701,6 +1716,56 @@ def test_cluster_size_conflict_logged_on_transition(caplog):
     detected = "agreeing peers declare 5 but we declare 3"
     assert sum(detected in m for m in msgs) == 1
     assert sum("cluster-size disagreement resolved" in m for m in msgs) == 1
+
+
+def test_cluster_policy_conflict_logged_on_transition(caplog):
+    # a coordination-policy divergence (a peer running a different distribution
+    # / electLeader) stands Leader jobs down cluster-wide; it must leave a
+    # breadcrumb just like a duplicate-name or size conflict, once per change.
+    import logging
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+
+    class _Mgr:
+        distribution = "single-leader"
+
+        def __init__(self, conflict):
+            self._conflict = conflict
+
+        def conflict_names(self):
+            return []
+
+        def conflicting_sizes(self):
+            return []
+
+        def conflicting_policies(self):
+            return (
+                ["distribution 'spread' != 'single-leader'"]
+                if self._conflict
+                else []
+            )
+
+        def is_leader(self):
+            return False
+
+        def is_quorate(self):
+            return True
+
+    cron.cluster_manager = _Mgr(True)
+    with caplog.at_level(logging.INFO, logger="yacron2"):
+        cron._log_cluster_role()
+        cron._log_cluster_role()  # unchanged: no second log
+        cron.cluster_manager = _Mgr(False)
+        cron._log_cluster_role()
+    msgs = [r.message for r in caplog.records]
+    assert sum("coordination-policy divergence --" in m for m in msgs) == 1
+    assert sum(
+        "coordination-policy divergence resolved" in m for m in msgs
+    ) == 1
+    assert any(
+        "distribution 'spread' != 'single-leader'" in m for m in msgs
+    )
 
 
 def test_is_deferrable_reboot():
@@ -2253,6 +2318,9 @@ async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
             return []
 
         def conflicting_sizes(self):
+            return []
+
+        def conflicting_policies(self):
             return []
 
         def is_leader(self):

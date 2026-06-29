@@ -2190,12 +2190,21 @@
       let summary =
         (data.node_name || "?") + " · " + agreed + "/" + counted.length + " agreed";
       if (data.elect_leader) {
-        // include this node when judging the quorum (it always agrees with
-        // itself); cluster_size counts every member, so live = agreed + self.
-        const live = agreed + 1;
-        const quorate = data.quorum ? live >= data.quorum : false;
+        // Quorum is authoritative from the backend: data.quorate is the gate's
+        // own is_quorate() (leader_name() is not None). The directional "agreed"
+        // tally above cannot reproduce it — it ignores mutual agreement, bridge
+        // candidates, and per-process dedup — so trust the backend rather than
+        // recomputing a number that both over- and under-counts.
+        const quorate = !!data.quorate;
+        // Any conflict (duplicate nodeName / size / coordination policy) fails
+        // the Leader gate closed regardless of leader/quorum, so it dominates
+        // the role: rendering "leader" while jobs are actually paused is
+        // self-contradictory. The detailed ⚠ lines below name the conflict.
+        const conflict = !!data.conflict;
         let role;
-        if (data.distribution === "spread") {
+        if (conflict) {
+          role = "standing down (conflict)";
+        } else if (data.distribution === "spread") {
           // no single leader: per-job ownership, gated on quorum
           role = quorate ? "spread (per-job owner)" : "spread (no quorum)";
         } else {
@@ -2206,7 +2215,8 @@
               : quorate ? "follower" : "no quorum";
         }
         summary +=
-          " · quorum " + live + "/" + (data.quorum || "?") +
+          " · quorum " + (quorate ? "ok" : "lost") +
+          " (need " + (data.quorum || "?") + ")" +
           " · " + role;
         // under spread, how many jobs this node itself currently owns (omitted
         // until the jobs payload is known — see ownsCounts above)

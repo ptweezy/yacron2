@@ -164,6 +164,10 @@ class LeadershipBackend(abc.ABC):
     def conflicting_sizes(self) -> List[int]:
         return []
 
+    def conflicting_policies(self) -> List[str]:
+        """Coordination-policy divergences among peers (gossip only)."""
+        return []
+
     def cluster_size(self) -> int:
         """A lease backend is logically a single holder (size 1, quorum 1)."""
         return 1

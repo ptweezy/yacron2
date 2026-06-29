@@ -1006,13 +1006,30 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
 
         with open(path) as cfg_file:
             data = YAML(typ="safe").load(cfg_file)
-        contexts = {c["name"]: c["context"] for c in data.get("contexts", [])}
-        ctx = contexts[data["current-context"]]
-        clusters = {c["name"]: c["cluster"] for c in data.get("clusters", [])}
-        users = {u["name"]: u["user"] for u in data.get("users", [])}
-        cluster = clusters[ctx["cluster"]]
-        user = users.get(ctx["user"], {})
-        self._base_url = cluster["server"].rstrip("/")
+        # A well-formed-YAML but structurally-broken kubeconfig (empty file, no
+        # current-context, a context naming an undefined cluster/user) raises
+        # KeyError/TypeError/AttributeError here. start_stop_cluster does not
+        # catch those, so without this they escape as a "please report a bug"
+        # crash; convert to ConfigError so a bad kubeconfig is logged and the
+        # daemon survives, mirroring the native transport's _setup_sync.
+        try:
+            contexts = {
+                c["name"]: c["context"] for c in data.get("contexts", [])
+            }
+            ctx = contexts[data["current-context"]]
+            clusters = {
+                c["name"]: c["cluster"] for c in data.get("clusters", [])
+            }
+            users = {u["name"]: u["user"] for u in data.get("users", [])}
+            cluster = clusters[ctx["cluster"]]
+            user = users.get(ctx["user"], {})
+            self._base_url = cluster["server"].rstrip("/")
+        except (KeyError, TypeError, AttributeError) as ex:
+            raise ConfigError(
+                "kubernetes backend: malformed kubeconfig {!r} ({})".format(
+                    path, ex
+                )
+            ) from ex
         self.b.namespace = self.b._resolve_namespace(ctx.get("namespace"))
 
         if cluster.get("insecure-skip-tls-verify"):
@@ -1093,7 +1110,13 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
     async def observe(self) -> Optional[Dict[str, Any]]:
         assert self._session is not None
         async with self._session.get(
-            self._lease_url(), ssl=self._ssl, headers=self._auth_headers()
+            self._lease_url(),
+            ssl=self._ssl,
+            headers=self._auth_headers(),
+            # don't follow a redirect to an attacker-chosen target (SSRF) or a
+            # plaintext downgrade; the apiserver answers directly. Matches the
+            # gossip transport's allow_redirects=False.
+            allow_redirects=False,
         ) as resp:
             if resp.status == 404:
                 return None
@@ -1109,7 +1132,13 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         else:
             url, method = self._lease_url(), self._session.put
         async with method(
-            url, json=body, ssl=self._ssl, headers=self._auth_headers()
+            url,
+            json=body,
+            ssl=self._ssl,
+            headers=self._auth_headers(),
+            # see observe(): never follow a redirect (SSRF / plaintext
+            # downgrade) on a credentialed lease write.
+            allow_redirects=False,
         ) as resp:
             if resp.status == 409:
                 return False

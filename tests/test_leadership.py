@@ -213,6 +213,19 @@ def test_decode_reboot_ran_tolerates_garbage():
     assert jsid is None and jobs == set()  # wrong types ignored
 
 
+def test_decode_reboot_ran_tolerates_deeply_nested_json():
+    # H1/C1 regression: a deeply-nested value makes json.loads raise
+    # RecursionError (a RuntimeError subclass, NOT a ValueError/TypeError). A
+    # junk store value must never escape decode and crash a backend's renew
+    # loop -- for the kubernetes backend that would wedge the cluster
+    # permanently non-quorate (decode runs before _apply_round advances the
+    # quorum-freshness clock, and the poison annotation is never overwritten).
+    poison = "[" * 100_000  # a valid prefix of a deeply-nested JSON array
+    assert decode_reboot_ran(poison) == (None, set())
+    nested_obj = '{"a":' * 50_000 + "1" + "}" * 50_000
+    assert decode_reboot_ran(nested_obj) == (None, set())
+
+
 async def test_lease_backend_reboot_ran_cache():
     # H2: mark_reboot_ran records locally (so this node won't re-run), and the
     # _persist_reboot_ran is a harmless no-op for the base test backend.

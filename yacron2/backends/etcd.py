@@ -301,12 +301,14 @@ class EtcdBackend(LeaseBackend):
         the key (whoever currently holds it).  ``now`` is wall-clock (for the
         displayed expiry).  ``mono`` is the matching monotonic instant the
         freshness gate (``is_quorate``) uses, captured at round END -- the safe
-        (fresher) direction for freshness.  ``lease_mono`` is the monotonic
-        instant the lease-renewing keepalive/grant landed at the server (when
-        the server actually reset our lease's TTL); the leadership FENCE is
-        anchored to *that*, never to the later round-end ``mono``, so a slow
-        campaign cannot push our local ``is_leader`` deadline past the server's
-        lease expiry and let a second node win the freed key (two leaders).
+        (fresher) direction for freshness.  ``lease_mono`` is a monotonic
+        instant captured just BEFORE the lease-renewing keepalive/grant POST is
+        sent -- a guaranteed lower bound on when the server reset our lease's
+        TTL; the leadership FENCE is anchored to *that*, never to the later
+        round-end ``mono``, so neither the keepalive/grant round-trip nor a
+        slow campaign can push our local ``is_leader`` deadline past the
+        server's lease expiry and let a second node win the freed key (two
+        leaders).
         Both default to the current monotonic clock for the pure unit tests.
         """
         if mono is None:
@@ -315,9 +317,10 @@ class EtcdBackend(LeaseBackend):
         self._holder = holder
         self._is_leader = is_leader
         if self._is_leader:
-            # the fence MUST NOT outlive the server lease (expiry =
-            # lease_mono + effective_ttl); anchoring to the keepalive/grant
-            # landing keeps it conservative regardless of campaign latency.
+            # the fence MUST NOT outlive the server lease (server expiry >=
+            # lease_mono + effective_ttl, since lease_mono is a pre-send lower
+            # bound on the server's TTL reset); anchoring to it keeps the fence
+            # conservative regardless of keepalive/grant or campaign latency.
             fence_anchor = lease_mono if lease_mono is not None else mono
             self._lease_deadline = self._leader_deadline(now)
             self._lease_deadline_mono = (
@@ -510,28 +513,32 @@ class EtcdBackend(LeaseBackend):
                 pass
 
     async def _renew_once(self) -> None:  # pragma: no cover - network
-        # The monotonic instant the lease-renewing POST (keepalive or grant)
-        # landed: this is when etcd reset our lease's TTL, so it is the ONLY
-        # sound anchor for the local leadership fence. Captured right after
-        # that POST -- NOT after the campaign below -- because in the steady
-        # path the campaign is a read whose latency must not extend the fence
-        # past the server lease's expiry; otherwise a slow-but-healthy campaign
-        # keeps is_leader() True after etcd has expired and deleted the key,
-        # letting a second node's create-if-absent campaign win so both run a
-        # Leader job.
+        # Anchor the local leadership fence to a monotonic instant captured
+        # BEFORE the lease-renewing POST (keepalive or grant) is sent. etcd
+        # resets our lease's TTL when it *processes* that request, which is at
+        # or after we send it, so a pre-send sample is a guaranteed LOWER BOUND
+        # on the server's TTL reset -- the conservative anchor. Sampling AFTER
+        # the response (the naive choice) would inflate the anchor by the
+        # request round-trip time; on a slow-but-reachable etcd whose RTT
+        # exceeds the _SKEW_SECONDS margin that pushes is_leader() past the
+        # point etcd has already expired and deleted the key, letting a second
+        # node's create-if-absent campaign win while we still believe we lead
+        # (two leaders running a Leader job). The campaign read below is
+        # likewise excluded: its latency must not extend the fence either.
         lease_mono: Optional[float] = None
         if self._lease_id is not None:
-            ttl = await self._keepalive(self._lease_id)
             lease_mono = _monotonic()
+            ttl = await self._keepalive(self._lease_id)
             if ttl is None or ttl <= 0:
                 self._lease_id = None  # lease expired; re-grant below
                 self._is_leader = False
+                lease_mono = None  # re-anchored before the grant POST below
             else:
                 # honour the TTL etcd refreshed to (may be < requested)
                 self._effective_ttl = max(1, min(self.ttl, ttl))
         if self._lease_id is None:
-            self._lease_id, granted = await self._grant_lease()
             lease_mono = _monotonic()
+            self._lease_id, granted = await self._grant_lease()
             if granted is not None:
                 self._effective_ttl = max(1, min(self.ttl, granted))
         if self._lease_id is None:

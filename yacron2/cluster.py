@@ -1085,7 +1085,14 @@ class ClusterManager(LeadershipBackend):
         url = "https://{}/peer".format(host)
         now = datetime.datetime.now(datetime.timezone.utc)
         try:
-            async with session.get(url, ssl=self._client_ssl) as resp:
+            # allow_redirects=False: a legitimate peer endpoint never
+            # redirects; following one would let a CA-vouched-but-hostile
+            # peer pivot us into an attacker-chosen target (SSRF) or a
+            # plaintext http:// downgrade where the mTLS client context
+            # (ssl=) no longer applies.
+            async with session.get(
+                url, ssl=self._client_ssl, allow_redirects=False
+            ) as resp:
                 resp.raise_for_status()
                 raw, too_large = await _read_capped(
                     resp, MAX_PEER_RESPONSE_BYTES
@@ -1299,8 +1306,14 @@ class ClusterManager(LeadershipBackend):
     ) -> None:
         url = "https://{}/reboot-ran".format(host)
         try:
+            # allow_redirects=False: see _observe_peer -- a peer redirect would
+            # replay this payload (job_set_id + names) to an attacker-chosen
+            # target over a possibly-plaintext connection.
             async with session.post(
-                url, json=payload, ssl=self._client_ssl
+                url,
+                json=payload,
+                ssl=self._client_ssl,
+                allow_redirects=False,
             ) as resp:
                 resp.raise_for_status()
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):

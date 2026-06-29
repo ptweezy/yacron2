@@ -73,7 +73,11 @@ def decode_reboot_ran(raw: Optional[str]) -> Tuple[Optional[str], Set[str]]:
         return None, set()
     try:
         data = json.loads(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError (a RuntimeError subclass, NOT a ValueError) is what
+        # CPython's json decoder raises on a deeply-nested value; a junk
+        # annotation/key written by something else must never crash the renew
+        # loop (mirrors cluster.py's (ValueError, RecursionError) guards).
         return None, set()
     if not isinstance(data, dict):
         return None, set()

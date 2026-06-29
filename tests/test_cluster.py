@@ -729,6 +729,40 @@ async def test_server_mtls_rejects_wrong_ca_client_cert(tmp_path):
         await a.stop()
 
 
+@pytest.mark.asyncio
+async def test_peer_client_disables_redirects(tmp_path):
+    # H2: the peer HTTP client must NOT follow redirects. aiohttp defaults
+    # allow_redirects=True, so a CA-vouched-but-hostile peer could answer /peer
+    # or /reboot-ran with a 3xx and pivot us into an attacker-chosen target
+    # (SSRF) or a plaintext http:// downgrade where the mTLS client context no
+    # longer applies. Both client call sites must pass allow_redirects=False.
+    tls = _write_tls(tmp_path)
+    a = ClusterManager(
+        _cfg(tls, "127.0.0.1:18200", ["peer-b:8200"], "node-a"),
+        lambda: "v1:same",
+    )
+    get_kwargs: dict = {}
+    post_kwargs: dict = {}
+
+    class _RecordingSession:
+        # .get/.post are evaluated inside the `async with`; raising here
+        # short-circuits before any network use, after recording the kwargs.
+        def get(self, url, **kwargs):
+            get_kwargs.update(kwargs)
+            raise aiohttp.ClientError("stop before network")
+
+        def post(self, url, **kwargs):
+            post_kwargs.update(kwargs)
+            raise aiohttp.ClientError("stop before network")
+
+    await a._observe_peer(_RecordingSession(), "peer-b:8200", a.instance_id)
+    await a._push_reboot_ran_one(
+        _RecordingSession(), "peer-b:8200", {"job_set_id": "v1:same"}
+    )
+    assert get_kwargs.get("allow_redirects") is False
+    assert post_kwargs.get("allow_redirects") is False
+
+
 # --------------------------------------------------------------------------
 # /cluster web endpoint
 # --------------------------------------------------------------------------
@@ -1991,7 +2025,8 @@ class _FakeSession:
         self._get_result = get_result
         self.calls = []
 
-    def get(self, url, ssl=None):
+    def get(self, url, ssl=None, **kwargs):
+        # **kwargs absorbs allow_redirects=False (and any future client opts).
         self.calls.append((url, ssl))
         return self._get_result
 

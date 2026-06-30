@@ -125,16 +125,32 @@ so a *thin* bridge (a pair sharing fewer than ``quorum - 1`` witnesses) rarely
 hides it; ``spread``'s winner is *per job* and can be exactly such a thin-
 bridged node, which some other quorate node cannot see and so self-owns -- a
 double-run in a converged topology where single-leader elects exactly one
-leader.  To close that gap a ``spread`` owner folds the *unconfirmed possible*
-co-owners (the nodes its agreeing peers vouch for that it cannot itself
-confirm; see :meth:`ClusterManager._unconfirmed_contenders`) into the
-rendezvous set and defers to any that out-score it.  Two strict majorities of
-one ``N`` always overlap, so a quorate node it cannot see is still gossiped to
-it by a shared member -- which is why this is sound: ``spread`` is then
+leader.  To close that gap a ``spread`` owner folds the co-owners a witness
+*vouches quorate* (the nodes an agreeing peer reports in its
+``quorate_vouched`` set -- its own ``_eligible_candidates`` -- that this node
+cannot itself confirm; see :meth:`ClusterManager._unconfirmed_contenders`) into
+the rendezvous set and defers to any that out-score it.  Two strict majorities
+of one ``N`` always overlap, so a quorate node it cannot see is still vouched
+to it by a shared member -- which is why this is sound: ``spread`` is then
 at-most-once for ``Leader`` jobs, no weaker than single-leader.  The trade is
 the fail-closed one single-leader already makes: a job whose rightful owner no
-quorate peer can currently confirm stands down until the view converges
-(``PreferLeader`` spread keeps its never-skip contract and is unaffected).
+quorate peer can currently confirm stands down until the view converges.  The
+fold is gated on ``quorate_vouched`` rather than the raw two-way edge for a
+reason: a witness may have a single edge to a *sub-quorum* node, and deferring
+the per-job owner to a node that then stands itself down on its own quorum gate
+would run the job on *no* node -- a silent cluster-wide zero-run that the
+raw-edge fold once caused.
+
+``PreferLeader`` ``spread`` (the never-skip, quorum-less owner path) needs the
+*same* convergence step, or two quorate nodes sharing a majority core but blind
+to each other each self-own the per-job winner and double-run it on a healthy
+cluster -- weaker than single-leader ``PreferLeader``, whose global-``min``
+winner both can see.  It folds the reachable co-owners a witness vouches a
+two-way edge to (:meth:`ClusterManager._available_contenders`), using the *raw*
+edge, not ``quorate_vouched``: with no quorum gate a sub-quorum node still runs
+the jobs it owns, so it is a legitimate co-owner, and a rendezvous winner has
+no gate to stand itself down on (the global-max node always self-owns), so this
+fold can only de-duplicate a double-run, never cause a zero-run.
 """
 
 import asyncio
@@ -540,6 +556,20 @@ class PeerState:
     # does not report it: it then contributes no bridge evidence, which is the
     # safe direction).
     mutual_agreeing: Optional["set[str]"] = None
+    # the names the peer reports it can itself *confirm are quorate* -- its own
+    # _eligible_candidates (the nodes it would elect / defer to). Unlike
+    # ``mutual_agreeing`` (every node the peer has a two-way edge with, quorate
+    # or not), this is the peer's vouch that the named node has a quorum of its
+    # own mutual agreers, so it will actually run if elected. It is the load-
+    # bearing input to the ``spread`` Leader-path owner fold
+    # (_unconfirmed_contenders): folding a node a single peer merely has an
+    # edge to -- but that is itself sub-quorum -- would make every quorate node
+    # defer to a node that then stands down, a silent cluster-wide zero-run.
+    # Folding only quorate-vouched names keeps the per-job owner runnable. None
+    # when no fresh result, or an older peer that omits it (which then vouches
+    # nothing -- the safe direction: it cannot cause a zero-run, only forgo a
+    # deferral, i.e. lean toward running like the rest of the upgrade path).
+    quorate_vouched: Optional["set[str]"] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -586,6 +616,7 @@ class ClusterView:
         peer_ran_reboot_jobs: Optional["set[str]"] = None,
         peer_size: Optional[int] = None,
         peer_mutual_agreeing: Optional["set[str]"] = None,
+        peer_quorate_vouched: Optional["set[str]"] = None,
         peer_distribution: Optional[str] = None,
         peer_elect_leader: Optional[bool] = None,
         peer_reports_members: bool = True,
@@ -606,6 +637,7 @@ class ClusterView:
         peer.ran_reboot_jobs = peer_ran_reboot_jobs
         peer.declared_size = peer_size
         peer.mutual_agreeing = peer_mutual_agreeing
+        peer.quorate_vouched = peer_quorate_vouched
         peer.declared_distribution = peer_distribution
         peer.declared_elect_leader = peer_elect_leader
         # re-determine self-ness on every successful poll: an address that no
@@ -691,6 +723,7 @@ class ClusterView:
         peer.members = None
         peer.ran_reboot_jobs = None
         peer.mutual_agreeing = None
+        peer.quorate_vouched = None
         # no fresh response this round, so make no legacy/current claim about
         # the peer's members field either (it is not AGREED while failed, so
         # _agreeing_peers skips it regardless; reset for tidiness).
@@ -951,6 +984,15 @@ class ClusterManager(LeadershipBackend):
                 # bridge-discovery deferral; see _bridge_candidates. Distinct
                 # from the one-directional ``agreed`` flags in ``members``.
                 "mutual_agreeing": sorted(self._agreeing_peer_names()),
+                # the names WE can confirm are themselves quorate (our
+                # _eligible_candidates): the nodes we would elect / defer to.
+                # A poller folds these -- not the raw mutual_agreeing -- into
+                # its ``spread`` Leader-path owner set, so it only ever defers
+                # a job to a node vouched able to run it (see PeerState.
+                # quorate_vouched / _unconfirmed_contenders). Stronger than
+                # mutual_agreeing, which lists every two-way edge including
+                # ones to sub-quorum nodes that stand a deferred job down.
+                "quorate_vouched": sorted(self._eligible_candidates()),
             }
         )
 
@@ -1425,6 +1467,17 @@ class ClusterManager(LeadershipBackend):
                 max_len=MAX_PEER_FIELD_LEN,
                 max_items=MAX_MEMBER_ENTRIES,
             ),
+            # the peer's vouch of which nodes it confirms quorate (its
+            # _eligible_candidates). An older build that omits the field, or a
+            # peer reporting an empty set, both parse to an empty set: it then
+            # vouches no transitive owner, so _unconfirmed_contenders folds
+            # nothing from it -- the safe direction (lean toward running, never
+            # a zero-run). Capped like the other absorbed identity sets.
+            peer_quorate_vouched=_parse_str_list(
+                data.get("quorate_vouched"),
+                max_len=MAX_PEER_FIELD_LEN,
+                max_items=MAX_MEMBER_ENTRIES,
+            ),
         )
 
     # --- deferred @reboot "already ran" gossip ---------------------------
@@ -1797,9 +1850,24 @@ class ClusterManager(LeadershipBackend):
         return eligible + self._bridge_candidates()
 
     def _unconfirmed_contenders(self) -> List[str]:
-        """Nodes a quorate peer vouches for that we can neither place nor rule
-        out -- folded into the ``spread`` owner gate so it never double-runs a
-        ``Leader`` job across a *thin* bridge.
+        """Quorate co-owners a peer *vouches* for that we cannot confirm
+        ourselves -- folded into the ``spread`` ``Leader`` owner gate so it
+        never double-runs (nor zero-runs) a job across a *thin* bridge.
+
+        We fold a peer's :attr:`PeerState.quorate_vouched` set (the nodes that
+        peer can confirm quorate -- its own :meth:`_eligible_candidates`,
+        gossiped on ``/peer``), **not** its raw ``mutual_agreeing``.  That
+        distinction is load-bearing.  ``mutual_agreeing`` lists every node a
+        peer has a two-way edge with, quorate or not; a witness ``W`` may have
+        a single edge to a *sub-quorum* node ``S`` (``S``'s own live set is
+        below quorum, so ``S`` never runs a ``Leader`` job).  Folding ``S`` in
+        -- as the older raw-edge version did -- lets ``_hrw_owner`` pick ``S``
+        as the per-job owner, so every quorate node defers to ``S`` and ``S``
+        then stands itself down on its own quorum gate: the job runs on *no*
+        node, a silent cluster-wide zero-run, in a converged topology where
+        single-leader runs it exactly once.  ``quorate_vouched`` is ``W``'s
+        vouch that it has seen ``S`` carry a quorum of mutual agreers, so a
+        folded contender is always a node that will actually run if it wins.
 
         :meth:`_eligible_candidates` only *adds* a transitively-reached node
         when a quorum of witnesses vouches for it; a node witnessed by fewer (a
@@ -1813,35 +1881,41 @@ class ClusterManager(LeadershipBackend):
         which some other quorate node then cannot see -- so it self-owns and
         the job double-runs even where single-leader elects exactly one leader.
 
-        The cure reuses the same gossip the bridge does.  Two strict majorities
-        of one ``N`` cannot be disjoint, so any *other* quorate node ``Z`` we
-        cannot see still shares a mutually-agreeing member ``W`` with us; ``W``
-        gossips ``Z`` in its ``mutual_agreeing``.  We therefore treat every
-        name an agreeing peer reports it mutually agrees with -- that we do not
-        already account for (ourselves, a directly-agreeing peer, or a
-        confirmed bridge node) -- as a *possible* co-owner.  Folded into
-        :meth:`job_owner`'s rendezvous set, an unconfirmed possible that
+        The cure reuses the bridge gossip, now quorum-qualified.  Two strict
+        majorities of one ``N`` cannot be disjoint, so any *other* quorate node
+        ``Z`` we cannot see still shares a mutually-agreeing member ``W`` with
+        us, and ``W`` -- polling ``Z`` directly -- sees ``Z`` carry a quorum
+        of mutual agreers and so lists ``Z`` in the ``quorate_vouched`` set it
+        gossips.  We therefore treat every name an agreeing peer *vouches
+        quorate* -- that we do not already account for (ourselves, a directly-
+        agreeing peer, or a confirmed bridge node) -- as a *possible* co-owner.
+        Folded into :meth:`job_owner`'s rendezvous set, such a possible that
         out-scores us for a job makes us *defer* (fail closed) rather than risk
         double-running it; one that scores below us cannot displace us, so the
-        only liveness lost is for a job whose rightful owner no quorate peer
-        can currently confirm -- the same fail-closed trade single-leader
-        already makes.  A node *no* agreeing peer vouches for is deliberately
-        omitted:
-        by the disjoint-majorities argument it cannot itself be quorate, so a
-        crashed or cleanly-partitioned node never stands our jobs down.
+        only liveness lost is for a job whose owner no quorate peer can
+        currently confirm -- the same fail-closed trade single-leader already
+        makes.  Because the fold is gated on ``quorate_vouched`` (not the raw
+        two-way edge), the node we defer to is one a witness confirmed quorate,
+        so it *will* run -- closing the zero-run the raw-edge fold opened.  A
+        node *no* agreeing peer vouches quorate is deliberately omitted: by the
+        disjoint-majorities argument a quorate ``Z`` is always vouched by a
+        shared witness, so the only names dropped are sub-quorum ones that
+        would have stood a job down (a crashed or partitioned node never stands
+        our jobs down).
         """
         agreeing = self._agreeing_peers()
         # Names we have already placed: ourselves, every directly-agreeing
         # peer (whether we confirmed it quorate or saw it sub-quorum -- either
         # way it is in our view and will not silently out-own us), and every
-        # bridge-confirmed candidate.  Anything left that a peer vouches for is
-        # a node we can neither confirm nor see, so it is treated as possible.
+        # bridge-confirmed candidate.  Anything left a peer vouches quorate
+        # is a node we cannot ourselves confirm but a witness can, so it is
+        # treated as a possible co-owner.
         accounted = {self.node_name}
         accounted |= {peer.node_name for peer in agreeing if peer.node_name}
         accounted |= set(self._eligible_candidates())
         possible: Set[str] = set()
         for peer in agreeing:
-            for name in peer.mutual_agreeing or ():
+            for name in peer.quorate_vouched or ():
                 if name and name not in accounted:
                     possible.add(name)
         return sorted(possible)
@@ -2115,51 +2189,57 @@ class ClusterManager(LeadershipBackend):
             self.node_name, self._agreeing_peer_names()
         )
 
-    def _instances_claiming(self, name: str) -> Set[str]:
-        """Per-process ``instance_id``s we currently see claiming ``name``.
+    def _cedes_to_lower_instance(
+        self, owns_for: "Callable[[str, set[str]], bool]"
+    ) -> bool:
+        """Whether a *lower-instance* twin sharing our nodeName would itself
+        run this, so we defer to it -- the duplicate-nodeName tiebreak on the
+        never-skip ``available_*`` path.
 
-        Our own (when ``name`` is our nodeName) plus every non-stale peer that
-        directly answers as ``name`` -- including a same-name
-        ``STATUS_CONFLICT`` peer (a duplicate nodeName), whose instance id we
-        recorded when we polled it.  Used to break a duplicate-nodeName tie in
-        the never-skip ``available_*`` path.
+        A duplicate ``nodeName`` is a misconfiguration the conflict gate does
+        *not* protect ``PreferLeader`` against (it accepts double-runs only
+        across a partition), so two processes sharing one name would otherwise
+        *both* run every job they own on a healthy cluster.  We break the tie
+        on the per-process ``instance_id`` (the same fence the lease backends
+        self-recognise by): the lowest instance runs, the rest defer.  The two
+        duplicates poll each other (each sees the other as ``STATUS_CONFLICT``
+        carrying its instance id), so on a converged cluster both agree the
+        lowest runs.
+
+        The deferral is gated on the lower twin *actually owning* this job /
+        leadership in its own gossiped view (``owns_for`` recomputes the
+        election over the twin's ``mutual_agreeing``), not merely on its
+        existence.  A blunt "a lower instance exists, so stand down" -- the
+        older rule -- *zero-runs* a never-skip job when the twins' views are
+        asymmetric: the lower twin can self-own a name we do not, so it defers
+        to a *different* node while we defer to it, and the job runs nowhere.
+        By ceding only to a twin we can see will run it, an asymmetric
+        duplicate-name view degrades to a (``PreferLeader``-accepted)
+        double-run rather than a zero-run.  When the twin's view is unknown (no
+        ``mutual_agreeing``) it trivially self-owns its own name, so we cede --
+        the converged healthy case.  (Residual: a twin that defers via a folded
+        contender we cannot ourselves see is mis-read as a self-owner; that
+        needs a duplicate nodeName *and* an asymmetric view, and biases to the
+        accepted double-run only when our own folded set already names us
+        owner.)
         """
-        instances: Set[str] = set()
-        if name == self.node_name:
-            instances.add(self.instance_id)
         for peer in self.view.peers.values():
             if peer.status in _STALE_STATUSES:
                 continue
-            if peer.node_name == name and peer.instance_id:
-                instances.add(peer.instance_id)
-        return instances
-
-    def _wins_available_tiebreak(self) -> bool:
-        """Whether *this process* wins its own nodeName among same-name peers.
-
-        ``available_*`` decides the never-skip ``PreferLeader`` run on the
-        lowest *nodeName*, which two processes sharing a duplicate nodeName
-        both match -- so without a tiebreak both would run every
-        ``PreferLeader`` job on a healthy, quorate cluster (the duplicate-name
-        conflict gate does *not* protect ``PreferLeader``; it accepts double-
-        runs only across a partition).  Break the tie on the per-process
-        ``instance_id`` -- the same fence the lease backends self-recognise by
-        -- so exactly one of the same-named processes runs.  The two duplicates
-        poll each other (each sees the other as ``STATUS_CONFLICT`` carrying
-        its instance id), so both compute the same lowest instance and agree on
-        the winner; the lowest runs, the other defers.  (Residual: two same-
-        named processes that cannot see each other -- an asymmetric peer list
-        -- each believe they win and may double-run, the accepted
-        ``PreferLeader``-across-a-partition behaviour.)
-        """
-        instances = self._instances_claiming(self.node_name)
-        return not instances or self.instance_id == min(instances)
+            if peer.node_name != self.node_name or not peer.instance_id:
+                continue
+            if peer.instance_id >= self.instance_id:
+                continue  # not a strictly-lower-instance twin
+            if owns_for(peer.node_name, peer.mutual_agreeing or set()):
+                return True
+        return False
 
     def is_available_leader(self) -> bool:
         """Whether this node leads its reachable set, quorum or not."""
-        return (
-            self.available_leader_name() == self.node_name
-            and self._wins_available_tiebreak()
+        if self.available_leader_name() != self.node_name:
+            return False
+        return not self._cedes_to_lower_instance(
+            lambda name, view: elect_available_leader(name, view) == name
         )
 
     def is_quorate(self) -> bool:
@@ -2175,16 +2255,20 @@ class ClusterManager(LeadershipBackend):
         ourselves and the confirmed-quorate candidates
         (:meth:`_eligible_candidates`), so bridged nodes agree on one owner and
         the owner is never a node that would itself stand down.  Unlike
-        single-leader, the rendezvous set *also* includes the unconfirmed
-        possible co-owners (:meth:`_unconfirmed_contenders`): a thin-bridged
-        node we cannot confirm but a peer vouches for would otherwise self-own
-        a job we also claim (the rendezvous winner is per-job, so a thin bridge
-        that single-leader's global-``min`` shrugs off can split ``spread``).
-        Folding the possibles in makes us defer to a higher-ranked one we
+        single-leader, the rendezvous set *also* includes the contenders a
+        witness vouches quorate (:meth:`_unconfirmed_contenders`): a
+        thin-bridged node we cannot confirm but a peer vouches quorate would
+        otherwise self-own a job we also claim (the rendezvous winner is
+        per-job, so a thin bridge that single-leader's global-``min`` shrugs
+        off can split ``spread``).  Folding those in makes us defer to a
+        higher-ranked one we
         cannot rule out, so ``spread`` keeps the same at-most-once guarantee as
         single-leader rather than double-running across a thin bridge -- at the
         cost (the same fail-closed trade) of standing a job down while its
-        owner is unconfirmable.
+        owner is unconfirmable.  Folding only *quorate-vouched* contenders (not
+        every two-way edge) is what keeps that fail-closed case a rare,
+        converging skip rather than a permanent zero-run behind a sub-quorum
+        node (see :meth:`_unconfirmed_contenders`).
         """
         return elect_job_owner(
             job_name,
@@ -2204,24 +2288,69 @@ class ClusterManager(LeadershipBackend):
         """
         return self.job_owner(job_name) == self.node_name
 
+    def _available_contenders(self) -> List[str]:
+        """Reachable co-owners a peer vouches a two-way edge to that we cannot
+        reach directly -- folded into the never-skip ``available`` owner set so
+        two ``PreferLeader`` nodes blind to each other (but sharing a witness)
+        agree on one owner per job instead of both running it.
+
+        This is the ``PreferLeader`` analogue of
+        :meth:`_unconfirmed_contenders`, but it folds the *raw*
+        ``mutual_agreeing`` edge, not the quorate-vouched set.  The available
+        path has **no quorum gate**: a sub-quorum node still runs the jobs it
+        owns, so it is a legitimate co-owner and must be in
+        everyone's rendezvous set or it would be double-run.  Folding raw edges
+        cannot zero-run here -- a rendezvous winner has no quorum gate to stand
+        itself down on, and the global-max node is the max of *any* set
+        containing it, so it always self-owns and runs.  Without this fold, two
+        quorate nodes sharing a majority core but not seeing each other each
+        self-own the per-job winner (the rendezvous winner is per job, so the
+        global ``min`` that saves single-leader ``PreferLeader`` does not), and
+        a converged cluster double-runs the job -- weaker than single-leader,
+        which the docstring once wrongly claimed it never was.
+        """
+        agreeing = self._agreeing_peers()
+        accounted = {self.node_name}
+        accounted |= {peer.node_name for peer in agreeing if peer.node_name}
+        possible: Set[str] = set()
+        for peer in agreeing:
+            for name in peer.mutual_agreeing or ():
+                if name and name not in accounted:
+                    possible.add(name)
+        return sorted(possible)
+
     def available_job_owner(self, job_name: str) -> str:
-        """Owner of ``job_name`` ignoring quorum (spread ``PreferLeader``)."""
+        """Owner of ``job_name`` ignoring quorum (spread ``PreferLeader``).
+
+        The rendezvous winner over ourselves, the peers we see agreeing, *and*
+        the reachable co-owners a witness vouches for but we cannot reach
+        (:meth:`_available_contenders`).  Folding the contenders in makes two
+        never-skip nodes blind to each other converge on one owner per job
+        (no double-run), while the absent quorum gate guarantees the winner
+        still runs (no zero-run); see :meth:`_available_contenders`.
+        """
         return elect_available_job_owner(
-            job_name, self.node_name, self._agreeing_peer_names()
+            job_name,
+            self.node_name,
+            [*self._agreeing_peer_names(), *self._available_contenders()],
         )
 
     def is_available_job_owner(self, job_name: str) -> bool:
         """Whether this node owns ``job_name`` in its reachable set.
 
         Like :meth:`is_available_leader`, this never-skip (spread
-        ``PreferLeader``) path is broken on the per-process ``instance_id``
-        when a duplicate nodeName would otherwise make two same-named processes
-        both win the per-job rendezvous owner and double-run the job on a
-        healthy cluster (the conflict gate does not protect ``PreferLeader``).
+        ``PreferLeader``) path breaks a duplicate-nodeName tie on the
+        per-process ``instance_id`` so two same-named processes do not both run
+        the job on a healthy cluster -- ceding only to a lower-instance twin
+        that would itself own the job, so an asymmetric duplicate-name view
+        never zero-runs it (see :meth:`_cedes_to_lower_instance`).
         """
-        return (
-            self.available_job_owner(job_name) == self.node_name
-            and self._wins_available_tiebreak()
+        if self.available_job_owner(job_name) != self.node_name:
+            return False
+        return not self._cedes_to_lower_instance(
+            lambda name, view: (
+                elect_available_job_owner(job_name, name, view) == name
+            )
         )
 
     def view_dict(self) -> Dict[str, Any]:

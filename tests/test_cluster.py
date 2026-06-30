@@ -1243,7 +1243,7 @@ async def test_handle_peer_payload(no_tls):
     assert payload["cluster_size"] == 1
 
 
-def _seed_agree(mgr, host, name, instance=None, mutual=None):
+def _seed_agree(mgr, host, name, instance=None, mutual=None, vouched=None):
     # mark a configured peer AGREED, as a successful poll round would --
     # including the mutual-attestation members list showing the peer sees US
     # agreed too (without it, _agreeing_peer_names no longer counts the peer).
@@ -1251,6 +1251,11 @@ def _seed_agree(mgr, host, name, instance=None, mutual=None):
     # mutually agrees with): None means "not reported" -> the peer gets the
     # benefit of the doubt and stays electable; a set lets a test mark the peer
     # quorate (>= quorum-1 names) or sub-quorum, and name bridge targets.
+    # `vouched` is the peer's gossiped quorate_vouched set (the names IT can
+    # confirm quorate -- its own _eligible_candidates): the Leader-path owner
+    # fold (_unconfirmed_contenders) folds these, so a test seeds it to make a
+    # peer vouch a transitive co-owner as quorate. None -> not reported (folds
+    # nothing from this peer).
     if instance is None:
         instance = "inst-" + host
     peer = mgr.view.peers[host]
@@ -1263,6 +1268,7 @@ def _seed_agree(mgr, host, name, instance=None, mutual=None):
         (name, instance, True),
     ]
     peer.mutual_agreeing = mutual
+    peer.quorate_vouched = vouched
 
 
 def test_advertised_ran_jobs_drops_stale_agreed_peer_on_reload(no_tls):
@@ -1497,24 +1503,29 @@ def test_thin_bridge_spread_no_double_run(no_tls):
         cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", peers, name)
         cfg["distribution"] = "spread"
         mgr = ClusterManager(cfg, lambda: "v1:mine")
-        for host, nm, mutual in seeds:
-            _seed_agree(mgr, host, nm, mutual=mutual)
+        for host, nm, mutual, vouched in seeds:
+            _seed_agree(mgr, host, nm, mutual=mutual, vouched=vouched)
         return mgr
 
+    # node-c is quorate and confirms BOTH node-d and node-e quorate, so it
+    # gossips them in its quorate_vouched set (its _eligible_candidates); the
+    # sub-quorum node-b confirms only node-d, so it never vouches node-e.
     d = _node(
         "node-d",
         ["a:1", "b:1", "c:1", "e:1"],
         [
-            ("b:1", "node-b", {"node-d"}),  # sub-quorum, witnesses only d
-            ("c:1", "node-c", {"node-d", "node-e"}),  # quorate; bridges d<->e
+            # sub-quorum, witnesses only d; vouches nobody electable
+            ("b:1", "node-b", {"node-d"}, set()),
+            # quorate; bridges d<->e and vouches both as quorate
+            ("c:1", "node-c", {"node-d", "node-e"}, {"node-d", "node-e"}),
         ],
     )
     e = _node(
         "node-e",
         ["a:1", "b:1", "c:1", "d:1"],
         [
-            ("a:1", "node-a", {"node-e"}),  # sub-quorum, witnesses only e
-            ("c:1", "node-c", {"node-d", "node-e"}),
+            ("a:1", "node-a", {"node-e"}, set()),  # sub-quorum
+            ("c:1", "node-c", {"node-d", "node-e"}, {"node-d", "node-e"}),
         ],
     )
     assert d.cluster_size() == 5 and d.quorum() == 3
@@ -1544,6 +1555,116 @@ def test_thin_bridge_spread_no_double_run(no_tls):
     )
     assert e.is_job_owner(split) is False
     assert d.is_job_owner(split) is True
+
+
+def _spread_mesh(mgr_graph, distribution, electLeader=True):
+    # Build a faithful ClusterManager per node from a SYMMETRIC mutual-
+    # agreement graph (name -> set of mutually-agreeing neighbours). Each
+    # node's view of a mutual neighbour is seeded with that neighbour's
+    # gossiped mutual_agreeing AND the quorate_vouched set it would actually
+    # advertise (its own _eligible_candidates), so the Leader- and available-
+    # path owner folds see exactly what a converged poll round would carry.
+    names = sorted(mgr_graph)
+    mgrs = {}
+    for n in names:
+        cfg = _cfg(
+            _DUMMY_TLS, "127.0.0.1:1", [m + ":1" for m in names if m != n], n
+        )
+        cfg["distribution"] = distribution
+        cfg["electLeader"] = electLeader
+        mgrs[n] = ClusterManager(cfg, lambda: "v1:mine")
+    for n in names:
+        for other in names:
+            if other != n and n in mgr_graph[other] and other in mgr_graph[n]:
+                _seed_agree(
+                    mgrs[n],
+                    other + ":1",
+                    other,
+                    instance="inst-" + other,
+                    mutual=set(mgr_graph[other]),
+                )
+    # second pass: advertise quorate_vouched = each node's
+    # _eligible_candidates, computable only once mutual edges are seeded above.
+    elig = {n: set(mgrs[n]._eligible_candidates()) for n in names}
+    for n in names:
+        for other in names:
+            if other == n:
+                continue
+            peer = mgrs[n].view.peers[other + ":1"]
+            if peer.status == STATUS_AGREED:
+                peer.quorate_vouched = elig[other]
+    return mgrs
+
+
+def test_spread_witness_does_not_zero_run_sub_quorum(no_tls):
+    # Theme A / A1 regression (the gap the earlier thin-bridge test missed: it
+    # checked node-d/node-e but never node-c, the WITNESS that drops jobs). The
+    # bridge/witness node must not fold a SUB-QUORUM node into its per-job
+    # owner set. Topology (N=5, quorum 3): mutual edges c-d, c-e, b-d, a-e ->
+    # quorate {c,d,e}, sub-quorum {a,b}. node-c's agreeing peers (d, e) each
+    # have a real two-way edge to a sub-quorum node (d-b, e-a); the old raw
+    # edge fold pulled node-b/node-a into node-c's rendezvous, so ~14% of jobs
+    # deferred to a node below quorum that then stood the job down -- a silent
+    # cluster-wide zero-run where single-leader runs it once.
+    graph = {
+        "node-a": {"node-e"},
+        "node-b": {"node-d"},
+        "node-c": {"node-d", "node-e"},
+        "node-d": {"node-b", "node-c"},
+        "node-e": {"node-a", "node-c"},
+    }
+    mgrs = _spread_mesh(graph, "spread")
+    quorate = sorted(n for n in graph if mgrs[n].is_quorate())
+    assert quorate == ["node-c", "node-d", "node-e"]
+    # the witness folds NEITHER sub-quorum node into its owner set (the old
+    # fold returned ["node-b"] here, which is what caused the zero-run).
+    assert mgrs["node-c"]._unconfirmed_contenders() == []
+    # so every job runs on exactly one quorate node -- never zero, never two.
+    for i in range(1500):
+        job = "job-%d" % i
+        owners = [n for n in graph if mgrs[n].is_job_owner(job)]
+        assert len(owners) == 1, (job, owners)
+        assert owners[0] in quorate
+
+
+def test_preferleader_spread_partial_mesh_no_double_run(no_tls):
+    # Theme A / A2 regression: spread PreferLeader (never-skip) must fold the
+    # reachable contenders so two quorate nodes that share a majority core but
+    # cannot see each other do not each self-own the per-job rendezvous winner.
+    # Topology: full mesh on {a,b,c,m,n} EXCEPT the single m<->n edge -- all
+    # quorate, NOT a partition. The old (unfolded) available path double-ran
+    # ~15% of jobs on both m and n; the fold converges them on one owner per
+    # job, and the absent quorum gate keeps at least one node running it.
+    names = ["node-a", "node-b", "node-c", "node-m", "node-n"]
+    graph = {x: set(names) - {x} for x in names}
+    graph["node-m"].discard("node-n")
+    graph["node-n"].discard("node-m")
+    mgrs = _spread_mesh(graph, "spread")
+    for i in range(1500):
+        job = "job-%d" % i
+        owners = [n for n in names if mgrs[n].is_available_job_owner(job)]
+        assert len(owners) == 1, (job, owners)  # never zero, never two
+
+
+def test_unconfirmed_contenders_folds_only_quorate_vouched(no_tls):
+    # Theme A / A1 unit: a raw two-way edge a peer reports (mutual_agreeing) to
+    # a node it does NOT vouch quorate must NOT be folded -- only the peer's
+    # quorate_vouched set is. node-b (agreeing) has an edge to BOTH node-x (it
+    # vouches quorate) and node-s (sub-quorum, not vouched); only node-x folds.
+    cfg = _cfg(
+        _DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "x:1", "s:1"], "node-a"
+    )
+    cfg["distribution"] = "spread"
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    _seed_agree(
+        mgr,
+        "b:1",
+        "node-b",
+        mutual={"node-a", "node-s", "node-x"},
+        vouched={"node-x"},  # b confirms only node-x quorate, not node-s
+    )
+    _seed_agree(mgr, "c:1", "node-c", mutual={"node-a"}, vouched=set())
+    assert mgr._unconfirmed_contenders() == ["node-x"]  # node-s excluded
 
 
 def test_bridge_discovery_ignores_direct_and_underwitnessed(no_tls):
@@ -2346,17 +2467,28 @@ def test_conflict_status_does_not_reset_mismatch_streak():
     # two reachable, job-set-mismatched rounds: the streak climbs (SYNCING)
     for _ in range(2):
         view.record_success(
-            "peer:1", "node-b", "v1:other", SCHEME_VERSION,
-            "v1:mine", NOW, "node-a",
+            "peer:1",
+            "node-b",
+            "v1:other",
+            SCHEME_VERSION,
+            "v1:mine",
+            NOW,
+            "node-a",
         )
     assert view.peers["peer:1"].status == STATUS_SYNCING
     assert view.peers["peer:1"].mismatch_streak == 2
     # a CONFLICT round (answers as OUR name with a different instance) must
     # leave the streak untouched, not reset it to 0
     view.record_success(
-        "peer:1", "node-a", "v1:other", SCHEME_VERSION,
-        "v1:mine", NOW, "node-a",
-        peer_instance="other-inst", my_instance="my-inst",
+        "peer:1",
+        "node-a",
+        "v1:other",
+        SCHEME_VERSION,
+        "v1:mine",
+        NOW,
+        "node-a",
+        peer_instance="other-inst",
+        my_instance="my-inst",
     )
     assert view.peers["peer:1"].status == STATUS_CONFLICT
     assert view.peers["peer:1"].mismatch_streak == 2  # preserved, not zeroed
@@ -2522,6 +2654,49 @@ def test_duplicate_nodename_preferleader_tiebreak(no_tls):
         assert not (
             a1.is_available_job_owner(job) and a2.is_available_job_owner(job)
         )
+
+
+def test_duplicate_name_tiebreak_does_not_zero_run(no_tls):
+    # Theme A / A3: the never-skip duplicate-nodeName tiebreak must cede only
+    # to a lower-instance twin that would ITSELF run the job. The old rule
+    # stood down whenever any lower instance existed, so in an ASYMMETRIC view:
+    # lower twin owns a name we do not and defers elsewhere -- both stood down
+    # and the job ran nowhere (a never-skip zero-run). Now we cede only when we
+    # can see the twin self-own it; otherwise we run (a PreferLeader-accepted
+    # double-run, never a zero-run).
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["y:1", "dup:1"], "node-a")
+    cfg["distribution"] = "spread"
+    a = ClusterManager(cfg, lambda: "v1:mine")
+    a.instance_id = "i999"  # the HIGHER instance -> loses a blunt tiebreak
+    # an agreeing peer that does not out-rank us and vouches no contender, so
+    # our own available owner for the chosen job stays "node-a".
+    _seed_agree(a, "y:1", "node-y", mutual={"node-a"})
+    dup = a.view.peers["dup:1"]  # the OTHER node-a, a LOWER-instance twin
+    dup.status = STATUS_CONFLICT
+    dup.node_name = "node-a"
+    dup.instance_id = "i001"
+
+    job = next(
+        j
+        for j in ("job-%d" % i for i in range(5000))
+        if a.available_job_owner(j) == "node-a"
+    )
+
+    # case 1 -- converged healthy duplicate: the lower twin self-owns "node-a"
+    # in its own view too, so we cede and exactly the lowest instance runs.
+    dup.mutual_agreeing = set()  # twin sees only itself -> self-owns its name
+    assert a.is_available_job_owner(job) is False
+
+    # case 2 -- asymmetric: the lower twin reaches a node that out-ranks our
+    # shared name, so it defers and will NOT run the job; we must run it, or it
+    # runs nowhere (the zero-run the old blunt tiebreak produced).
+    other = next(
+        n
+        for n in ("node-%d" % i for i in range(50))
+        if _hrw_owner(job, ["node-a", n]) == n
+    )
+    dup.mutual_agreeing = {other}
+    assert a.is_available_job_owner(job) is True
 
 
 def test_duplicate_address_does_not_inflate_quorum(no_tls):
@@ -2704,6 +2879,118 @@ def test_poll_failure_resets_mutual_agreeing(no_tls):
     assert mgr.view.peers["b:1"].mutual_agreeing == {"node-a", "node-x"}
     mgr.view.record_failure("b:1", "boom", untrusted=False)
     assert mgr.view.peers["b:1"].mutual_agreeing is None
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_includes_quorate_vouched(no_tls):
+    # the /peer response must publish our quorate_vouched set (our
+    # _eligible_candidates -- the nodes we confirm quorate) so a poller folds
+    # only confirmed-runnable owners into its spread Leader rendezvous set.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    # N=3, quorum 2: a peer mutually agreeing with >= quorum-1 = 1 name is
+    # confirmed quorate, so node-a vouches both node-b and node-c.
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"})
+    _seed_agree(mgr, "c:1", "node-c", mutual={"node-a"})
+    resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert payload["quorate_vouched"] == ["node-b", "node-c"]
+    assert payload["quorate_vouched"] == sorted(mgr._eligible_candidates())
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_round_trips_quorate_vouched(no_tls):
+    # end to end: a polled quorate_vouched is parsed, stored, and drives the
+    # spread Leader owner fold. node-a (spread) polls node-c, which vouches a
+    # transitive node-e quorate; node-a then folds node-e as an unconfirmed
+    # contender it cannot itself confirm.
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["c:1", "d:1", "e:1"], "node-a")
+    cfg["distribution"] = "spread"
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    me = {
+        "node_name": "node-a",
+        "instance_id": mgr.instance_id,
+        "agreed": True,
+    }
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-c",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": "ic",
+                    "members": [
+                        me,
+                        {
+                            "node_name": "node-c",
+                            "instance_id": "ic",
+                            "agreed": True,
+                        },
+                    ],
+                    "mutual_agreeing": ["node-a", "node-e"],
+                    "quorate_vouched": ["node-a", "node-e"],
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "c:1", "v1:mine")
+    assert mgr.view.peers["c:1"].quorate_vouched == {"node-a", "node-e"}
+    assert mgr._unconfirmed_contenders() == ["node-e"]
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_omitted_quorate_vouched_is_empty(no_tls):
+    # mixed-version: an older peer omits quorate_vouched -> parses to an empty
+    # set, so it vouches no transitive contender. The node then folds nothing
+    # from it (leans toward running, never a zero-run) -- the safe direction.
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["c:1", "d:1", "e:1"], "node-a")
+    cfg["distribution"] = "spread"
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    me = {
+        "node_name": "node-a",
+        "instance_id": mgr.instance_id,
+        "agreed": True,
+    }
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-c",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": "ic",
+                    "members": [
+                        me,
+                        {
+                            "node_name": "node-c",
+                            "instance_id": "ic",
+                            "agreed": True,
+                        },
+                    ],
+                    "mutual_agreeing": ["node-a", "node-e"],
+                    # NO quorate_vouched key (older peer)
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "c:1", "v1:mine")
+    assert mgr.view.peers["c:1"].quorate_vouched == set()  # omitted -> empty
+    assert mgr._unconfirmed_contenders() == []  # nothing folded
+
+
+def test_poll_failure_resets_quorate_vouched(no_tls):
+    # a failed poll drops the now-stale gossip, including quorate_vouched, so a
+    # witness gone unreachable can no longer vouch a transitive owner.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"}, vouched={"node-x"})
+    assert mgr.view.peers["b:1"].quorate_vouched == {"node-x"}
+    mgr.view.record_failure("b:1", "boom", untrusted=False)
+    assert mgr.view.peers["b:1"].quorate_vouched is None
 
 
 @pytest.mark.asyncio

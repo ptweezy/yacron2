@@ -116,13 +116,25 @@ When ``distribution`` is ``"spread"`` the single elected leader is replaced by
 **per-job ownership** via rendezvous (highest-random-weight) hashing (see
 :func:`elect_job_owner`): each job is independently assigned to one member
 of the quorate set, so leader-gated work fans out roughly evenly across the
-cluster instead of piling onto one node.  This is purely a load optimization:
-it keeps the same quorum gate and therefore the **same** safety guarantee as
-single-leader -- no stronger and no weaker, including the bridge-discovery
-mitigation above: bridged quorate nodes fold the same confirmed candidates
-into the rendezvous set, so a quorum-strong shared bridge makes them agree on
-one owner per job.  The same residuals apply -- a thin bridge, a >1-hop gossip
-distance, or the convergence window can still double-run a job.
+cluster instead of piling onto one node.  It keeps the same quorum gate, so a
+minority partition still stands down and two clean-partition majorities cannot
+both own a job.  The bridge mitigation needs one extra step here, though,
+because rendezvous breaks the property that saves single-leader: single-
+leader's winner is always the one global-``min`` node, which everyone can see,
+so a *thin* bridge (a pair sharing fewer than ``quorum - 1`` witnesses) rarely
+hides it; ``spread``'s winner is *per job* and can be exactly such a thin-
+bridged node, which some other quorate node cannot see and so self-owns -- a
+double-run in a converged topology where single-leader elects exactly one
+leader.  To close that gap a ``spread`` owner folds the *unconfirmed possible*
+co-owners (the nodes its agreeing peers vouch for that it cannot itself
+confirm; see :meth:`ClusterManager._unconfirmed_contenders`) into the
+rendezvous set and defers to any that out-score it.  Two strict majorities of
+one ``N`` always overlap, so a quorate node it cannot see is still gossiped to
+it by a shared member -- which is why this is sound: ``spread`` is then
+at-most-once for ``Leader`` jobs, no weaker than single-leader.  The trade is
+the fail-closed one single-leader already makes: a job whose rightful owner no
+quorate peer can currently confirm stands down until the view converges
+(``PreferLeader`` spread keeps its never-skip contract and is unaffected).
 """
 
 import asyncio
@@ -1784,6 +1796,56 @@ class ClusterManager(LeadershipBackend):
         ]
         return eligible + self._bridge_candidates()
 
+    def _unconfirmed_contenders(self) -> List[str]:
+        """Nodes a quorate peer vouches for that we can neither place nor rule
+        out -- folded into the ``spread`` owner gate so it never double-runs a
+        ``Leader`` job across a *thin* bridge.
+
+        :meth:`_eligible_candidates` only *adds* a transitively-reached node
+        when a quorum of witnesses vouches for it; a node witnessed by fewer (a
+        thin bridge) is dropped, and :func:`elect_leader` then leans this node
+        toward leading rather than standing down behind an unconfirmable peer
+        (the single-leader liveness choice).  That under-counting is exactly
+        what made ``spread`` *strictly weaker* than single-leader: single-
+        leader's winner is always the one global-``min`` node, reachable by
+        everyone, so a thin bridge rarely hides it; ``spread``'s rendezvous
+        winner is *per job* and can be precisely such a thin-bridged node,
+        which some other quorate node then cannot see -- so it self-owns and
+        the job double-runs even where single-leader elects exactly one leader.
+
+        The cure reuses the same gossip the bridge does.  Two strict majorities
+        of one ``N`` cannot be disjoint, so any *other* quorate node ``Z`` we
+        cannot see still shares a mutually-agreeing member ``W`` with us; ``W``
+        gossips ``Z`` in its ``mutual_agreeing``.  We therefore treat every
+        name an agreeing peer reports it mutually agrees with -- that we do not
+        already account for (ourselves, a directly-agreeing peer, or a
+        confirmed bridge node) -- as a *possible* co-owner.  Folded into
+        :meth:`job_owner`'s rendezvous set, an unconfirmed possible that
+        out-scores us for a job makes us *defer* (fail closed) rather than risk
+        double-running it; one that scores below us cannot displace us, so the
+        only liveness lost is for a job whose rightful owner no quorate peer
+        can currently confirm -- the same fail-closed trade single-leader
+        already makes.  A node *no* agreeing peer vouches for is deliberately
+        omitted:
+        by the disjoint-majorities argument it cannot itself be quorate, so a
+        crashed or cleanly-partitioned node never stands our jobs down.
+        """
+        agreeing = self._agreeing_peers()
+        # Names we have already placed: ourselves, every directly-agreeing
+        # peer (whether we confirmed it quorate or saw it sub-quorum -- either
+        # way it is in our view and will not silently out-own us), and every
+        # bridge-confirmed candidate.  Anything left that a peer vouches for is
+        # a node we can neither confirm nor see, so it is treated as possible.
+        accounted = {self.node_name}
+        accounted |= {peer.node_name for peer in agreeing if peer.node_name}
+        accounted |= set(self._eligible_candidates())
+        possible: Set[str] = set()
+        for peer in agreeing:
+            for name in peer.mutual_agreeing or ():
+                if name and name not in accounted:
+                    possible.add(name)
+        return sorted(possible)
+
     # --- duplicate-nodeName detection ------------------------------------
 
     def conflict_names(self) -> List[str]:
@@ -2111,20 +2173,35 @@ class ClusterManager(LeadershipBackend):
 
         Like :meth:`leader_name`, the owner is the rendezvous winner over
         ourselves and the confirmed-quorate candidates
-        (:meth:`_eligible_candidates`): bridged nodes agree on one owner
-        instead of double-running it, and the owner is never a node that would
-        itself stand down.
+        (:meth:`_eligible_candidates`), so bridged nodes agree on one owner and
+        the owner is never a node that would itself stand down.  Unlike
+        single-leader, the rendezvous set *also* includes the unconfirmed
+        possible co-owners (:meth:`_unconfirmed_contenders`): a thin-bridged
+        node we cannot confirm but a peer vouches for would otherwise self-own
+        a job we also claim (the rendezvous winner is per-job, so a thin bridge
+        that single-leader's global-``min`` shrugs off can split ``spread``).
+        Folding the possibles in makes us defer to a higher-ranked one we
+        cannot rule out, so ``spread`` keeps the same at-most-once guarantee as
+        single-leader rather than double-running across a thin bridge -- at the
+        cost (the same fail-closed trade) of standing a job down while its
+        owner is unconfirmable.
         """
         return elect_job_owner(
             job_name,
             self.node_name,
             self._agreeing_peer_names(),
             self.cluster_size(),
-            self._eligible_candidates(),
+            [*self._eligible_candidates(), *self._unconfirmed_contenders()],
         )
 
     def is_job_owner(self, job_name: str) -> bool:
-        """Whether this node owns ``job_name`` (quorate, rendezvous winner)."""
+        """Whether this node owns ``job_name`` (quorate rendezvous winner).
+
+        At-most-once: a node defers (this returns ``False``) when a possible
+        co-owner it cannot confirm out-scores it for the job, so two quorate
+        nodes never both own one ``Leader`` job across a thin bridge (see
+        :meth:`job_owner` / :meth:`_unconfirmed_contenders`).
+        """
         return self.job_owner(job_name) == self.node_name
 
     def available_job_owner(self, job_name: str) -> str:

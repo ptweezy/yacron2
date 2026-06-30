@@ -562,12 +562,24 @@ cluster:
 
 What to know:
 
-* **Same safety, not more.** Under a clean partition every quorate node sees the
-  same member set and computes the same owner for each job, so still at most one
-  node runs it. This is a *load* optimization only; it does not change the
-  best-effort guarantee. `Leader` jobs still skip without quorum; `PreferLeader`
-  still ignores quorum (its owner is computed over the reachable set, so an
-  isolated node owns and runs all of its jobs).
+* **Same safety, not more.** Spread keeps the quorum gate and is at-most-once
+  for `Leader` jobs, no weaker than single-leader. Under a clean partition every
+  quorate node sees the same member set and computes the same owner, so at most
+  one node runs each job. The subtle case is a *thin bridge* (a quorate pair
+  that share too few witnesses to confirm each other): because the rendezvous
+  winner is per-job, it can be exactly such an unconfirmable node, so the raw
+  hash would let a peer that cannot see it self-own the job and double-run it,
+  even though single-leader (whose winner is always the one global-lowest node,
+  which everyone can see) would not. Spread closes this by folding the
+  *unconfirmed* peers a quorate neighbour vouches for into each job's rendezvous
+  and deferring to any that outrank it (two strict majorities of one `N` always
+  overlap, so a co-owner you cannot see is always gossiped to you). The price is
+  the same fail-closed trade single-leader makes: a job whose owner no quorate
+  peer can currently confirm stands down until the view converges. This is a
+  *load* optimization; it does not change the headline best-effort guarantee.
+  `Leader` jobs still skip without quorum; `PreferLeader` still ignores quorum
+  (its owner is computed over the reachable set, so an isolated node owns and
+  runs all of its jobs, and it keeps its never-skip contract unchanged).
 * **Rendezvous hashing, not modulo.** When a node leaves or joins, only *its*
   share of jobs is reassigned (to the next-highest-weight node); the rest stay
   put. A membership change is therefore minimally disruptive, unlike

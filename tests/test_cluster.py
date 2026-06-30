@@ -1483,6 +1483,69 @@ def test_bridge_discovery_spread_owner_consistent(no_tls):
         assert mgr.job_owner(job) == _hrw_owner(job, full)
 
 
+def test_thin_bridge_spread_no_double_run(no_tls):
+    # Finding #1 regression. A *thin* bridge (a quorate pair sharing fewer than
+    # quorum-1 witnesses) let spread DOUBLE-RUN a Leader job in a converged
+    # topology where single-leader elects exactly one leader -- because the raw
+    # rendezvous winner is per-job and can be a node some quorate peer cannot
+    # confirm, so that peer self-owns it too. Topology (N=5, quorum 3): node-d
+    # and node-e are both quorate but mutually agree with each other through
+    # only ONE shared witness (node-c), below quorum-1=2, so neither confirms
+    # the other. The fix folds the unconfirmed possible co-owner into the
+    # rendezvous set, so the two agree on a single owner per job.
+    def _node(name, peers, seeds):
+        cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", peers, name)
+        cfg["distribution"] = "spread"
+        mgr = ClusterManager(cfg, lambda: "v1:mine")
+        for host, nm, mutual in seeds:
+            _seed_agree(mgr, host, nm, mutual=mutual)
+        return mgr
+
+    d = _node(
+        "node-d",
+        ["a:1", "b:1", "c:1", "e:1"],
+        [
+            ("b:1", "node-b", {"node-d"}),  # sub-quorum, witnesses only d
+            ("c:1", "node-c", {"node-d", "node-e"}),  # quorate; bridges d<->e
+        ],
+    )
+    e = _node(
+        "node-e",
+        ["a:1", "b:1", "c:1", "d:1"],
+        [
+            ("a:1", "node-a", {"node-e"}),  # sub-quorum, witnesses only e
+            ("c:1", "node-c", {"node-d", "node-e"}),
+        ],
+    )
+    assert d.cluster_size() == 5 and d.quorum() == 3
+    assert d.is_quorate() and e.is_quorate()
+    # neither can CONFIRM the other (1 witness < quorum-1), but each sees it as
+    # an unconfirmed possible co-owner via the shared witness node-c.
+    assert "node-e" not in d._eligible_candidates()
+    assert d._unconfirmed_contenders() == ["node-e"]
+    assert "node-d" not in e._eligible_candidates()
+    assert e._unconfirmed_contenders() == ["node-d"]
+
+    # the fix: node-d and node-e now agree on one owner per job, so they never
+    # both own one (at-most-once restored for the thin-bridge case).
+    for i in range(200):
+        job = "job-%d" % i
+        assert d.job_owner(job) == e.job_owner(job)
+        assert not (d.is_job_owner(job) and e.is_job_owner(job))
+
+    # and concretely: a job whose raw eligible-only rendezvous would have made
+    # node-e self-own (its local winner) is now deferred to node-d, the owner
+    # both agree on -- the double-run the old code produced.
+    split = next(
+        j
+        for j in ("job-%d" % i for i in range(2000))
+        if _hrw_owner(j, ["node-e", "node-c"]) == "node-e"
+        and d.is_job_owner(j)
+    )
+    assert e.is_job_owner(split) is False
+    assert d.is_job_owner(split) is True
+
+
 def test_bridge_discovery_ignores_direct_and_underwitnessed(no_tls):
     # a name we already count directly, or one witnessed by fewer than quorum-1
     # mutual edges, is never a bridge candidate.

@@ -88,6 +88,32 @@ ACTION_ACQUIRE = "acquire"  # exists but free/expired -> take it over
 ACTION_RENEW = "renew"  # we already hold it -> refresh renewTime
 ACTION_WAIT = "wait"  # someone else holds a still-valid lease -> not us
 
+# Reported as the holder when we know another node won (we lost an optimistic-
+# concurrency write) but cannot name it -- a 409 on a CREATE (the Lease did not
+# exist when we planned, so we carry no observed holder) and we have no prior
+# observation to fall back to. Reporting a non-None holder keeps leader_name()
+# non-None so a quorate follower defers its PreferLeader jobs (is_available_
+# leader stays False) instead of reading "holder unknown" as "run anyway" and
+# double-running fleet-wide with NO partition. Mirrors etcd's _UNKNOWN_HOLDER.
+# See _apply_round's write_ok==False branch.
+_UNKNOWN_HOLDER = "<unknown holder>"
+
+
+def _join_host_port(host: str, port: str) -> str:
+    """Build a ``host:port`` authority, bracketing a bare IPv6 literal.
+
+    ``KUBERNETES_SERVICE_HOST`` is an *unbracketed* literal on an IPv6 single-
+    stack cluster (e.g. ``fd00:10:96::1``); ``"{}:{}".format`` of it yields an
+    ambiguous ``fd00:10:96::1:443`` that the URL parser (yarl) rejects, so the
+    in-cluster HTTP transport could never reach the apiserver on such a cluster
+    (the native transport, via ``load_incluster_config``, brackets it and
+    works). Bracket a host that contains a ``:`` and is not already bracketed,
+    matching client-go's in-cluster loader.
+    """
+    if ":" in host and not host.startswith("["):
+        host = "[{}]".format(host)
+    return "{}:{}".format(host, port)
+
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
@@ -669,11 +695,25 @@ class KubernetesBackend(LeaseBackend):
                 mono + self.lease_duration - _SKEW_SECONDS
             )
         else:
-            # lost the optimistic-concurrency race (409): not leader now.
+            # lost the optimistic-concurrency race (a 409): not leader now.
+            # NEVER leave _holder None here: leader_name() None reads in
+            # is_available_leader() as "holder unknown -> run anyway", so a
+            # quorate follower would run every PreferLeader (and spread) job
+            # alongside the real holder, a double-run with NO partition. The
+            # 409 proves another node won, so report a non-None holder: the one
+            # from the observed Lease if we have it, else the holder we last
+            # observed, else a sentinel. This is the CREATE-race twin of the
+            # deleted-lease WAIT branch above -- on a CREATE, plan_lease_write
+            # passes state=None, so display_holder(state.holder) would be None
+            # exactly when two replicas cold-start and the loser 409s. Mirrors
+            # etcd's _UNKNOWN_HOLDER fence.
             self._is_leader = False
-            self._holder = (
-                display_holder(state.holder) if state is not None else None
-            )
+            holder: Optional[str] = None
+            if state is not None:
+                holder = display_holder(state.holder)
+            if holder is None and self._observed_holder is not None:
+                holder = display_holder(self._observed_holder)
+            self._holder = holder if holder is not None else _UNKNOWN_HOLDER
 
     # --- transport selection + renew loop (integration-only) -------------
 
@@ -945,6 +985,45 @@ def resolve_namespace(
     return configured or context_namespace or incluster_namespace or "default"
 
 
+def _kubeconfig_cert_files(path: str) -> List[Optional[str]]:
+    """File-referenced CA / client-cert / client-key of a kubeconfig's active
+    context, for TLS-rotation tracking (:meth:`KubernetesBackend.tls_files_
+    changed`).
+
+    Both transports build their TLS material once at setup and never reload it,
+    so an in-place cert/CA rotation is invisible until the backend is rebuilt.
+    The HTTP transport tracks the kubeconfig PLUS these referenced files
+    (:meth:`_K8sHttpTransport._load_kubeconfig`); the native transport tracked
+    only the kubeconfig, so a path-referenced cert rotated in place (the
+    kubeconfig's own mtime unchanged) was missed and the frozen client kept
+    presenting the expired cert -> permanent loss of leadership.  Pull the
+    same referenced paths so the native transport can track them too.
+
+    Embedded ``*-data`` forms resolve to ``None`` here and are dropped (a -data
+    rotation rewrites the kubeconfig itself, tracked via its own path).  Any
+    parse error yields ``[]`` -- the kubeconfig path stays tracked regardless,
+    so the worst case is the pre-existing under-tracking, never a crash.
+    """
+    try:
+        from strictyaml.ruamel import YAML
+
+        with open(path) as cfg_file:
+            data = YAML(typ="safe").load(cfg_file)
+        contexts = {c["name"]: c["context"] for c in data.get("contexts", [])}
+        ctx = contexts[data["current-context"]]
+        clusters = {c["name"]: c["cluster"] for c in data.get("clusters", [])}
+        users = {u["name"]: u["user"] for u in data.get("users", [])}
+        cluster = clusters[ctx["cluster"]]
+        user = users.get(ctx["user"], {})
+        return [
+            cluster.get("certificate-authority"),
+            user.get("client-certificate"),
+            user.get("client-key"),
+        ]
+    except (OSError, KeyError, TypeError, AttributeError, ValueError):
+        return []
+
+
 class _K8sTransport:
     """The observe/write/close surface the renew loop drives a Lease over."""
 
@@ -1047,7 +1126,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             # never sent in cleartext.
             self._base_url = self.b.api_server_override.rstrip("/")
         elif host:
-            self._base_url = "https://{}:{}".format(host, port)
+            self._base_url = "https://" + _join_host_port(host, port)
         else:
             raise ConfigError(
                 "kubernetes backend: not running in a cluster and no "
@@ -1364,13 +1443,20 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
             )
         self._api_client = client.ApiClient(config_obj)
         self._api = client.CoordinationV1Api(self._api_client)
-        # Track the kubeconfig (whose referenced/embedded certs the native
-        # client loaded) or the in-cluster CA, so a cert/CA rotation rebuilds
-        # the backend via start_stop_cluster (the native client freezes its
+        # Track the kubeconfig AND any cert/CA/key it references BY FILE PATH,
+        # or the in-cluster CA, so an in-place cert/CA rotation rebuilds the
+        # backend via start_stop_cluster (the native client freezes its
         # ApiClient cert material at construction, like the HTTP transport's
-        # SSLContext).
+        # SSLContext). The kubeconfig path alone is NOT enough: a path-
+        # referenced cert rotated in place leaves the kubeconfig's own
+        # (mtime,size) unchanged, so tracking only it would miss the rotation
+        # and the frozen client would keep presenting the expired cert. Mirror
+        # the HTTP transport's set (embedded -data forms resolve to None
+        # and are dropped: a -data rotation rewrites the kubeconfig itself).
         if self.b.kubeconfig:
-            self.b._record_tls_files([self.b.kubeconfig])
+            self.b._record_tls_files(
+                [self.b.kubeconfig, *_kubeconfig_cert_files(self.b.kubeconfig)]
+            )
         else:
             self.b._record_tls_files([os.path.join(_SA_DIR, "ca.crt")])
         return context_namespace

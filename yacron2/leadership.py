@@ -416,9 +416,13 @@ class LeaseBackend(LeadershipBackend):
     async def _persist_reboot_ran(self) -> None:  # pragma: no cover
         """Eagerly persist the local @reboot-ran set to the store.
 
-        Default no-op (the kubernetes backend folds the set into its periodic
-        Lease write instead); the etcd backend overrides this to write its
-        sibling key at once.
+        Default no-op. Both shipping lease backends override it to persist
+        BEFORE the deferred @reboot job launches (cron records-then-spawns), so
+        a failover holder does not re-run the one-shot: etcd writes its sibling
+        key via a CAS, and kubernetes runs a renew round folding the set into
+        the Lease annotation. The no-op default is the fallback for a lease
+        backend that has no eager-write path (it would then persist on its next
+        periodic round).
         """
 
     def _observe_reboot_ran(

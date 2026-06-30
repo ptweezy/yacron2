@@ -17,6 +17,7 @@ from yacron2.backends import (
     select_transport,
 )
 from yacron2.backends.kubernetes import (
+    _UNKNOWN_HOLDER,
     ACTION_ACQUIRE,
     ACTION_CREATE,
     ACTION_RENEW,
@@ -24,7 +25,9 @@ from yacron2.backends.kubernetes import (
     KubernetesBackend,
     LeaseState,
     _format_microtime,
+    _join_host_port,
     _K8sHttpTransport,
+    _kubeconfig_cert_files,
     _parse_microtime,
     build_lease_body,
     decide_lease_action,
@@ -515,6 +518,113 @@ def test_apply_round_lost_race_not_leader():
     b._apply_round(ACTION_ACQUIRE, False, state, NOW)
     assert b._is_leader is False
     assert b._holder == "node-b"
+
+
+def test_apply_round_create_race_loser_reports_holder_not_none():
+    # K8S-409-HOLDER: two replicas cold-start with no Lease, both plan CREATE
+    # (plan_lease_write passes state=None). The loser's POST 409s -> write_ok
+    # False with state=None. It is still quorate (it reached the apiserver), so
+    # leaving _holder None would make leader_name() None, which
+    # is_available_leader() reads "holder unknown -> run anyway": the quorate
+    # loser would run every PreferLeader (and spread) job alongside the real
+    # holder, a double-run with NO partition. A 409 proves a holder won, so
+    # cold start (no observed holder) report a non-None sentinel and DEFER.
+    b = _backend()
+    assert b._observed_holder is None  # cold start, never observed a holder
+    b._apply_round(ACTION_CREATE, False, None, _utc_now_plus(0))
+    assert b.is_quorate() is True  # we did reach the apiserver this round
+    assert b._is_leader is False
+    assert b.is_leader() is False
+    assert b._holder == _UNKNOWN_HOLDER  # non-None sentinel, NOT None
+    assert b.leader_name() is not None
+    assert b.is_available_leader() is False  # the loser defers (no double-run)
+
+
+def test_apply_round_create_race_loser_prefers_observed_holder():
+    # K8S-409-HOLDER: a later create race (not the very first round) where we
+    # DID previously observe a holder prefers that real display name over the
+    # bare sentinel -- still non-None either way, so a follower still defers.
+    b = _backend()
+    b._observed_holder = "node-b#tok"  # the holder we last observed
+    b._apply_round(ACTION_CREATE, False, None, _utc_now_plus(0))
+    assert b._holder == "node-b"  # display name of the observed holder
+    assert b.leader_name() is not None
+    assert b.is_available_leader() is False
+
+
+def test_join_host_port_brackets_ipv6():
+    # K8S-IPV6-URL: KUBERNETES_SERVICE_HOST is unbracketed on an IPv6
+    # single-stack cluster; without bracketing the URL is ambiguous and yarl
+    # rejects it. IPv4 and hostnames are left alone; an already-bracketed host
+    # is not double-bracketed.
+    assert _join_host_port("10.0.0.1", "443") == "10.0.0.1:443"
+    assert _join_host_port("kubernetes.default", "443") == (
+        "kubernetes.default:443"
+    )
+    assert _join_host_port("fd00:10:96::1", "443") == "[fd00:10:96::1]:443"
+    assert _join_host_port("[fd00::1]", "443") == "[fd00::1]:443"
+    # the built URL parses (yarl accepts the bracketed authority)
+    from yarl import URL
+
+    url = URL("https://" + _join_host_port("fd00:10:96::1", "443"))
+    assert url.host == "fd00:10:96::1" and url.port == 443
+
+
+def test_kubeconfig_cert_files_extracts_referenced_paths(tmp_path):
+    # K8S-NATIVE-CERT-ROTATE: the native transport must track a kubeconfig's
+    # FILE-referenced CA/cert/key (not just the kubeconfig path) so an in-place
+    # cert rotation rebuilds the backend. _kubeconfig_cert_files returns the
+    # active context's referenced files; embedded -data forms resolve to None.
+    kubeconfig = tmp_path / "kubeconfig"
+    kubeconfig.write_text(
+        "apiVersion: v1\n"
+        "current-context: ctx\n"
+        "contexts:\n"
+        "  - name: ctx\n"
+        "    context:\n"
+        "      cluster: c\n"
+        "      user: u\n"
+        "clusters:\n"
+        "  - name: c\n"
+        "    cluster:\n"
+        "      server: https://1.2.3.4:6443\n"
+        "      certificate-authority: /etc/certs/ca.crt\n"
+        "users:\n"
+        "  - name: u\n"
+        "    user:\n"
+        "      client-certificate: /etc/certs/tls.crt\n"
+        "      client-key: /etc/certs/tls.key\n"
+    )
+    assert _kubeconfig_cert_files(str(kubeconfig)) == [
+        "/etc/certs/ca.crt",
+        "/etc/certs/tls.crt",
+        "/etc/certs/tls.key",
+    ]
+
+
+def test_kubeconfig_cert_files_tolerates_embedded_and_malformed(tmp_path):
+    # embedded -data certs resolve to None (a -data rotation rewrites the
+    # kubeconfig itself, tracked via its path); a malformed/absent kubeconfig
+    # yields [] rather than raising (the kubeconfig path stays tracked anyway).
+    embedded = tmp_path / "embedded"
+    embedded.write_text(
+        "apiVersion: v1\n"
+        "current-context: ctx\n"
+        "contexts:\n"
+        "  - name: ctx\n"
+        "    context: {cluster: c, user: u}\n"
+        "clusters:\n"
+        "  - name: c\n"
+        "    cluster:\n"
+        "      server: https://1.2.3.4:6443\n"
+        "      certificate-authority-data: Zm9v\n"
+        "users:\n"
+        "  - name: u\n"
+        "    user:\n"
+        "      client-certificate-data: YmFy\n"
+    )
+    assert _kubeconfig_cert_files(str(embedded)) == [None, None, None]
+    assert _kubeconfig_cert_files(str(tmp_path / "missing")) == []
 
 
 def test_view_dict_and_lease_detail():

@@ -480,6 +480,67 @@ async def test_renew_once_keepalive_narrows_then_regrants(monkeypatch):
     assert b.is_leader() is True
 
 
+async def test_renew_once_keepalive_anchors_fence_to_presend(monkeypatch):
+    # TEST-ETCD-KEEPALIVE-FENCE: the grant-path fence anchor is tested above,
+    # but steady state renews via KEEPALIVE -- the dominant path, which fires
+    # every round after the first. Its lease_mono is sampled BEFORE the
+    # keepalive POST (a lower bound on the server's TTL reset); a regression
+    # sampling it AFTER the response would push is_leader() past the server
+    # lease on a slow keepalive RTT (RTT > the skew margin -> two leaders). The
+    # narrows-then-regrants test pins the clock so it cannot catch that; this
+    # injects keepalive latency and asserts the fence excludes it.
+    clock = [100.0]
+    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    b = _backend()  # ttl 15
+    keepalive_latency = 3.0  # a slow keepalive RTT, larger than the 1s skew
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if path == "/v3/lease/grant":
+            return {"ID": "1", "TTL": "15"}
+        if path == "/v3/lease/keepalive":
+            clock[0] += keepalive_latency  # the keepalive POST takes time
+            return {"result": {"TTL": "15"}}
+        if path == "/v3/kv/txn":
+            return {"succeeded": True}
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        return {}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    # round 1 grants + campaigns (establishes the lease; no keepalive yet)
+    await b._renew_once()
+    # round 2 renews via KEEPALIVE; sample the pre-keepalive monotonic instant
+    pre_keepalive = clock[0]
+    await b._renew_once()
+    assert b.is_leader() is True
+    # anchored to the pre-send lower bound, NOT the keepalive landing
+    assert b._lease_deadline_mono == pre_keepalive + 15 - 1
+    keepalive_landing = pre_keepalive + keepalive_latency
+    assert b._lease_deadline_mono != keepalive_landing + 15 - 1
+
+
+async def test_sync_reboot_ran_swallows_wrong_shape_response(monkeypatch):
+    # ETCD-SHAPE-CRASH: a non-conformant gateway can answer a 200 whose body is
+    # the wrong SHAPE (here a JSON list for /v3/kv/range). _post's dict guard
+    # turns a top-level non-dict into a ClientError, but a nested non-dict can
+    # still raise AttributeError in a parser. Reached from start()'s
+    # initial round and cron's eager reboot-ran persist (both OUTSIDE the run
+    # loop's broad guard), so _sync_reboot_ran must SWALLOW it, not let it
+    # escape and abort manager start / mislog as an internal bug.
+    b = _backend()
+    b._reboot_ran_local = {"mine"}
+    b._reboot_ran_local_job_set_id = "v1:job"
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if path == "/v3/kv/range":
+            return ["not", "a", "dict"]  # nested wrong shape -> kvs.get() boom
+        return {}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    # must not raise (the AttributeError is caught and logged at debug)
+    await b._sync_reboot_ran()
+
+
 # --- F03: effective-ttl narrowing is safe (honoured, never inflated) -------
 
 
@@ -568,42 +629,73 @@ def test_build_reboot_ran_cas_txn_structure():
 
 
 async def test_cas_write_reboot_ran_unions_on_contention(monkeypatch):
-    # F02: two concurrent writers must UNION their @reboot-ran marks, not
-    # last-writer-wins clobber. The first CAS txn loses (another writer moved
-    # the key); the retry must re-read, re-merge, and write the UNION. (The
-    # union/contention path had no unit coverage -- a regression silently
-    # re-runs a deferred @reboot one-shot after a failover.)
+    # F02 (TEST-ETCD-CAS): two concurrent writers must UNION their @reboot-ran
+    # marks, not last-writer-wins clobber. This drives the retry against a
+    # STATEFUL fake etcd that HONOURS the txn compare (a CAS submitted against
+    # a stale mod_revision FAILS); a concurrent writer bumps the revision
+    # once between our first read and our first txn. So the retry only wins by
+    # RE-READING the new revision and re-merging -- a regression that hoisted
+    # the read out of the loop, or reused the stale revision, would contend out
+    # and persist nothing (re-running a deferred one-shot on failover).
+    # The previous version of this test let the txn succeed purely on attempt
+    # count and returned a static revision, so it passed under that bug.
     from yacron2.leadership import decode_reboot_ran, encode_reboot_ran
 
     b = _backend()  # get_job_set_id -> "v1:job"
     b._reboot_ran_local = {"mine"}
     b._reboot_ran_local_job_set_id = "v1:job"
-    txn_values = []
-    calls = {"txn": 0}
+
+    # a single key with a value + mod_revision the txn compare is checked
+    # against; reads["n"] counts range re-reads, compares records each txn's
+    # submitted compare revision.
+    server = {"value": encode_reboot_ran("v1:job", {"theirs"}), "rev": 5}
+    reads = {"n": 0}
+    compares = []
 
     async def fake_post(path, body, *, allow_reauth=True):
         if path == "/v3/kv/range":
-            # another writer already stored {"theirs"} under the live job set
-            return {
+            reads["n"] += 1
+            resp = {
                 "kvs": [
                     {
-                        "value": _b64(encode_reboot_ran("v1:job", {"theirs"})),
-                        "mod_revision": "5",
+                        "value": _b64(server["value"]),
+                        "mod_revision": str(server["rev"]),
                     }
                 ]
             }
-        # /v3/kv/txn: record the value we tried to PUT; fail the first attempt
-        txn_values.append(
-            _b64decode(body["success"][0]["requestPut"]["value"])
-        )
-        calls["txn"] += 1
-        return {"succeeded": calls["txn"] >= 2}
+            if reads["n"] == 1:
+                # a concurrent writer moves the key AFTER our first read but
+                # BEFORE our first txn lands: it adds its own mark "other" and
+                # bumps the revision, so our first CAS (rev 5) must fail
+                # and we must re-read rev 6.
+                server["value"] = encode_reboot_ran(
+                    "v1:job", {"theirs", "other"}
+                )
+                server["rev"] = 6
+            return resp
+        if path == "/v3/kv/txn":
+            cmp_rev = body["compare"][0]["mod_revision"]
+            compares.append(cmp_rev)
+            if cmp_rev == str(server["rev"]):
+                server["value"] = _b64decode(
+                    body["success"][0]["requestPut"]["value"]
+                )
+                server["rev"] += 1
+                return {"succeeded": True}
+            return {"succeeded": False}  # stale revision -> CAS rejected
+        return {}
 
     monkeypatch.setattr(b, "_post", fake_post)
     await b._cas_write_reboot_ran()
-    assert calls["txn"] == 2  # retried after the first CAS lost the race
-    _jsid, jobs = decode_reboot_ran(txn_values[-1])
-    assert jobs == {"mine", "theirs"}  # UNION, not a clobber
+
+    # the first CAS used the stale revision and was REJECTED; the retry RE-READ
+    # the new revision and won.
+    assert reads["n"] >= 2  # a re-read happened (not hoisted out of the loop)
+    assert compares[0] == "5" and compares[-1] == "6"  # used the NEW revision
+    _jsid, jobs = decode_reboot_ran(server["value"])
+    # all three marks survive: ours, the prior holder's, and the concurrent
+    # writer's -- a true union, no lost update.
+    assert jobs == {"mine", "theirs", "other"}
 
 
 async def test_cas_write_reboot_ran_reads_camelcase_mod_revision(monkeypatch):

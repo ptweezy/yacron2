@@ -483,6 +483,19 @@ class PeerState:
     # conflict_names). None when we hold no fresh response. Internal, like
     # instance_id, so deliberately not surfaced in to_dict.
     members: Optional[List["tuple[str, str, bool]"]] = None
+    # whether the peer's last /peer response actually carried a ``members``
+    # list (a current build) rather than omitting the field (a legacy build
+    # from before mutual attestation -- mid rolling upgrade). A legacy peer
+    # cannot report whether it sees us, so requiring the mutual gate for it
+    # would drop it from our live set and stand a NEW node DOWN among legacy
+    # peers -- a cluster-wide Leader halt. We instead fall back to one-
+    # directional agreement for such a peer (see _agreeing_peers): the
+    # documented "lean toward running" rolling-upgrade behaviour rather than a
+    # silent stand-down. Defaults True -- the STRICT direction (mutual
+    # gate) -- so a peer is only ever treated as legacy when _observe_peer
+    # POSITIVELY sees no members list; record_failure resets it. Internal, like
+    # ``members``; not surfaced in to_dict.
+    reports_members: bool = True
     # the cluster size (len(peers)+1) the peer last declared. The election's
     # safety rests on every node sharing one N, but N is each node's *local*
     # count and nothing reconciles it, so a divergence is a first-class
@@ -563,6 +576,7 @@ class ClusterView:
         peer_mutual_agreeing: Optional["set[str]"] = None,
         peer_distribution: Optional[str] = None,
         peer_elect_leader: Optional[bool] = None,
+        peer_reports_members: bool = True,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -571,6 +585,12 @@ class ClusterView:
         peer.node_name = peer_name
         peer.instance_id = peer_instance
         peer.members = peer_members
+        # whether this response actually carried a members list (current build)
+        # or omitted it (a legacy peer mid rolling upgrade); drives the one-
+        # directional fallback in _agreeing_peers. Defaults True so existing
+        # callers/tests keep the mutual gate; _observe_peer passes the real
+        # value (isinstance(data["members"], list)).
+        peer.reports_members = peer_reports_members
         peer.ran_reboot_jobs = peer_ran_reboot_jobs
         peer.declared_size = peer_size
         peer.mutual_agreeing = peer_mutual_agreeing
@@ -588,7 +608,14 @@ class ClusterView:
                 # single leader). Surface it as a hard conflict instead of
                 # masking it as 'self'; the leader gate then fails closed.
                 peer.status = STATUS_CONFLICT
-                peer.mismatch_streak = 0
+                # Do NOT reset mismatch_streak here: it counts reachable
+                # mismatches for the drift hysteresis, and the invariant (see
+                # record_failure) is that only a confirmed AGREED/SELF
+                # observation clears it. CONFLICT is neither, so a transient
+                # same-name/different-instance answer at one address must not
+                # zero a genuinely-drifting peer's streak and delay its
+                # STATUS_DRIFTED label by up to driftAfter rounds. The conflict
+                # itself fails the Leader gate closed regardless of the streak.
                 peer.last_error = (
                     "duplicate nodeName {!r}: peer is a different "
                     "instance".format(peer_name)
@@ -652,6 +679,10 @@ class ClusterView:
         peer.members = None
         peer.ran_reboot_jobs = None
         peer.mutual_agreeing = None
+        # no fresh response this round, so make no legacy/current claim about
+        # the peer's members field either (it is not AGREED while failed, so
+        # _agreeing_peers skips it regardless; reset for tidiness).
+        peer.reports_members = False
 
     def to_list(self) -> List[Dict[str, Any]]:
         return [peer.to_dict() for peer in self.peers.values()]
@@ -759,6 +790,39 @@ def _tls_file_signature(tls: Dict[str, str]) -> Dict[str, Any]:
         except OSError:
             signature[key] = None
     return signature
+
+
+def gossip_tls_loadable(cluster_config: ClusterConfig) -> bool:
+    """Whether the gossip backend's TLS material in ``cluster_config`` loads.
+
+    A side-effect-free dry-run of what :meth:`ClusterManager.__init__` does
+    (build the client + server SSL contexts from the on-disk CA/cert/key), used
+    by :meth:`yacron2.cron.Cron.start_stop_cluster` BEFORE it tears the running
+    manager down for a CONFIG change. It covers a config edit (peers/listen)
+    that coincides with an in-flight cert rotation (cert-manager / Vault /
+    Kubernetes secret refresh briefly leaves a half-written or absent file):
+    tearing the old manager down and then failing to rebuild the new one on the
+    bad file would wedge ``Leader`` / ``PreferLeader`` closed for up to a
+    reload, the very window the cert-only make-before-break already guards.
+
+    Returns ``True`` for any non-gossip backend, and a gossip config with no
+    ``tls`` block (nothing on disk to pre-validate), so it only ever defers a
+    gossip cert-rotation race. Unlike :meth:`ClusterManager.tls_files_loadable`
+    (which validates the *running* manager's paths), this validates the
+    *incoming* config, since a config edit can repoint at different cert files
+    the old manager cannot speak to.
+    """
+    if cluster_config.get("backend", "gossip") != "gossip":
+        return True
+    tls = cluster_config.get("tls")
+    if not tls:
+        return True
+    try:
+        build_client_ssl_context(tls)
+        build_server_ssl_context(tls)
+    except (OSError, ssl.SSLError):
+        return False
+    return True
 
 
 def _split_host_port(addr: str) -> "tuple[str, int]":
@@ -1324,6 +1388,14 @@ class ClusterManager(LeadershipBackend):
                 max_len=MAX_PEER_FIELD_LEN,
                 max_items=MAX_MEMBER_ENTRIES,
             ),
+            # whether the peer sent a members list (a current build) or
+            # omitted the field (a legacy build, pre-mutual-attestation). A
+            # legacy peer cannot confirm it sees us, so _agreeing_peers falls
+            # back to one-directional agreement rather than standing this
+            # node down mid rolling upgrade. A non-list (null / hostile) is
+            # treated as "not reported" -- a CA-vouched peer's junk is the
+            # documented out-of-scope Byzantine case either way.
+            peer_reports_members=isinstance(data.get("members"), list),
             peer_ran_reboot_jobs=_parse_str_list(
                 data.get("ran_reboot_jobs"),
                 max_len=MAX_REBOOT_JOB_NAME_LEN,
@@ -1560,7 +1632,20 @@ class ClusterManager(LeadershipBackend):
             if not (
                 peer.status == STATUS_AGREED
                 and peer.node_name is not None
-                and _peer_sees_me_agreed(peer.members, self.instance_id)
+                # mutual gate: count a current peer only if its response shows
+                # it sees us AGREED too. A LEGACY peer (no members field, mid
+                # rolling upgrade) cannot report this, so fall back to one-
+                # directional agreement for it -- otherwise a new node among
+                # legacy peers counts zero agreers, drops below quorum, and
+                # stands every Leader job down cluster-wide. Counting it here
+                # leans the node toward running (it still won't *defer* to a
+                # legacy peer -- _eligible_candidates needs mutual_agreeing it
+                # also lacks -- so elects itself: the documented "lean toward
+                # running, possible double-run" upgrade behaviour, not a halt).
+                and (
+                    _peer_sees_me_agreed(peer.members, self.instance_id)
+                    or not peer.reports_members
+                )
                 and not (
                     peer.declared_size is not None
                     and peer.declared_size != my_size
@@ -1741,6 +1826,23 @@ class ClusterManager(LeadershipBackend):
         per-process ``instance_id`` (falling back to a peer's host if it
         somehow reported none); a benign self-listing (same name *and* same
         instance id) is not a conflict, and stale peers contribute nothing.
+
+        RESIDUAL (restart-window false *positive*): the symmetric case also
+        exists. A node restart mints a new ``instance_id`` at the same address,
+        so just after node-x restarts (x1 -> x2) a peer we already re-polled
+        reports x2 first-party while two peers not yet re-polled still
+        gossip stale x1 transitively -- two credible instances for one name,
+        flagged as a conflict that fails this node's ``Leader`` gate closed for
+        up to ~1--2 poll intervals until those peers refresh. It is transient,
+        self-healing, and fail-closed (a missed firing, never a double-run). It
+        is deliberately NOT "fixed" by letting a fresh first-party observation
+        suppress a stale transitive instance of the same name: that same rule
+        would suppress a *genuine* partial-mesh duplicate (the copy we reach
+        first-party shadowing the copy only peers can witness), regressing the
+        corroboration detection above. Distinguishing them needs per-instance
+        recency the one-hop ``members`` gossip does not carry, so the transient
+        false positive is accepted as the price of keeping the partial-mesh
+        true positive. (A lease/consensus backend avoids both.)
         """
         # name -> instance -> set(first-party sources: "self" or a peer host)
         first_party: Dict[str, Dict[str, Set[str]]] = defaultdict(
@@ -1817,6 +1919,21 @@ class ClusterManager(LeadershipBackend):
         flagged.  The mitigation is operational -- change membership one node
         at a time so the old and new majorities always overlap (see the module
         docstring).
+
+        RESIDUAL (version skew, pre-release only): the declared N is the
+        instance-id-deduped :meth:`cluster_size`, so a node on a build from
+        *before* that dedup landed declares the raw ``len(peers)+1`` while a
+        current build declares the deduped value.  With a multi-homed peer
+        (one node listed at two addresses) the two builds therefore declare a
+        different N for the *same, correct* config and each flags the other a
+        size conflict -- failing ``Leader`` closed cluster-wide for upgrade.
+        This is fail-closed (no double-run) and self-heals once every node runs
+        a build that dedups; it can only arise *during* a rolling upgrade
+        between two unreleased dev builds (every shipped build dedups), so is
+        accepted rather than worked around in the size comparison (decoupling
+        the advertised N from the quorum N would weaken the single-N safety
+        proof for a window that does not survive release).  Change membership /
+        upgrade one node at a time, as above.
         """
         my_size = self.cluster_size()
         return sorted(
@@ -1837,9 +1954,11 @@ class ClusterManager(LeadershipBackend):
         *which* node runs a ``Leader`` job -- ``single-leader`` elects
         ``min(live)`` while ``spread`` picks a per-job rendezvous owner (two
         independent selectors that name different nodes for most jobs), and a
-        node with ``electLeader`` off runs *every* job ungated.  Neither field
-        is part of the job-set fingerprint (it is deliberately per-*job*) nor
-        of the ``cluster_size`` gate, so two nodes identical but for these
+        node with ``electLeader`` off runs *every* job ungated.  Neither
+        ``distribution`` nor ``electLeader`` is part of the job-set fingerprint
+        (they are cluster-level coordination settings, not job identity; the
+        genuinely per-job ``clusterPolicy`` *is* fingerprinted) nor of the
+        ``cluster_size`` gate, so two nodes identical but for these
         still see each other ``AGREED`` -- and would then either double-run a
         ``Leader`` job (two different owners each fire it) or drop it entirely
         (each defers to the other).  A divergence is therefore a first-class

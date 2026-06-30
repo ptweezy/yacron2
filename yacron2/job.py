@@ -583,7 +583,16 @@ class RunningJob:
         except (
             subprocess.SubprocessError,
             UnicodeEncodeError,
-            FileNotFoundError,
+            # OSError covers FileNotFoundError (bad argv[0]) AND the resource-
+            # exhaustion / permission cases create_subprocess_exec can raise --
+            # EMFILE/ENFILE (fd exhaustion), ENOMEM, EPERM/EACCES, EAGAIN (fork
+            # limit). These are NOT SubprocessError subclasses, so without
+            # OSError they propagate out of launch_scheduled_job through the
+            # unguarded spawn_jobs / _process_pending_reboots path and kill the
+            # whole scheduler. Catching here sets start_failed so the reaper
+            # retries, instead of bringing the daemon down on a transient
+            # spawn-time resource spike.
+            OSError,
         ):
             logger.exception(
                 "Error launching subprocess of job %s, cmd=%r, kwargs=%s "

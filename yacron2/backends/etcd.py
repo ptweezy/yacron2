@@ -538,6 +538,13 @@ class EtcdBackend(LeaseBackend):
                 # below and aborts the whole manager start -- wedging leader
                 # gating off until the next reload. Keeps start() best-effort.
                 ValueError,
+                # belt-and-suspenders for a non-conformant gateway whose body
+                # parses as JSON but is the wrong SHAPE (a nested non-dict the
+                # top-level _post dict guard does not reach): a parser's
+                # resp.get() then raises AttributeError/TypeError, which must
+                # not abort the manager start either.
+                AttributeError,
+                TypeError,
             ) as ex:
                 logger.warning("cluster: etcd initial round failed: %s", ex)
             logger.info(
@@ -648,7 +655,21 @@ class EtcdBackend(LeaseBackend):
                         self._auth_token = await self._authenticate()
                         return await self._post(path, body, allow_reauth=False)
                     resp.raise_for_status()
-                    data: Dict[str, Any] = await resp.json()
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        # A 200 with a non-object body (null / list / scalar)
+                        # from a non-conformant L7 proxy/gateway: every parser
+                        # below assumes a dict and does resp.get(), so a bare
+                        # list/scalar raises AttributeError in a parser.
+                        # That escapes the network-only catch tuples (start()'s
+                        # initial round, the eager persist) and either
+                        # aborts manager start or is mislogged as an internal
+                        # bug. Treat a non-object body as a failed endpoint so
+                        # fails over, shown as a normal "etcd round failed"
+                        # (trailing raise covers "every endpoint did this").
+                        raise aiohttp.ClientError(
+                            "non-object etcd response from {}".format(endpoint)
+                        )
                     return data
             # A bad body from a misbehaving proxy/gateway in front of etcd
             # makes resp.json() raise a ValueError: json.JSONDecodeError on
@@ -803,6 +824,14 @@ class EtcdBackend(LeaseBackend):
             asyncio.TimeoutError,
             OSError,
             ValueError,
+            # a wrong-shape gateway body that slips past _post's dict guard
+            # (a nested non-dict) raises AttributeError/TypeError in a parser;
+            # swallow it like any failed auxiliary round (the local set still
+            # stops this node re-running its own one-shot; the next round
+            # retries) so it cannot escape _sync_reboot_ran -- which start()'s
+            # initial round runs.
+            AttributeError,
+            TypeError,
         ) as ex:
             logger.debug("cluster: etcd reboot-ran sync failed: %s", ex)
 
@@ -879,6 +908,12 @@ class EtcdBackend(LeaseBackend):
             asyncio.TimeoutError,
             OSError,
             ValueError,
+            # see _sync_reboot_ran: a wrong-shape gateway body can raise
+            # AttributeError/TypeError in a parser. Runs from cron's
+            # _process_pending_reboots, OUTSIDE the run loop's guard, so must
+            # never escape -- mirror _sync_reboot_ran's tuple exactly.
+            AttributeError,
+            TypeError,
         ) as ex:
             logger.debug("cluster: etcd reboot-ran persist failed: %s", ex)
 

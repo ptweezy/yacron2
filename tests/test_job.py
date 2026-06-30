@@ -822,6 +822,40 @@ jobs:
 
 
 @pytest.mark.asyncio
+async def test_start_failure_bare_oserror_reported_not_raised(monkeypatch):
+    # REBOOT-LAUNCH-OSERROR: a bare OSError from create_subprocess_exec (fd /
+    # process exhaustion -- EMFILE/ENFILE/ENOMEM/EAGAIN -- or EPERM/EACCES) is
+    # NOT a SubprocessError and NOT FileNotFoundError, so before the catch was
+    # broadened it propagated out of the unguarded spawn_jobs /
+    # _process_pending_reboots path and killed the whole scheduler. It must now
+    # be treated as a normal start failure (start_failed set), not raised.
+    conf = yacron2.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command:
+      - /bin/true
+    schedule: "* * * * *"
+""",
+        "",
+    )
+
+    async def boom(*args, **kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+
+    await job.start()  # must NOT raise
+    assert job.proc is None
+    assert job.start_failed
+
+    await job.wait()
+    assert job.retcode == 127
+    assert job.failed
+
+
+@pytest.mark.asyncio
 async def test_statsd_failure_does_not_crash(monkeypatch):
     # statsd is best-effort: a send error (e.g. an unresolvable host) must be
     # swallowed and not propagate out of start()/wait() to crash the scheduler.

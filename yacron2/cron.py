@@ -828,8 +828,56 @@ class Cron:
                     "next reload"
                 )
                 reason = None
+            # local import to keep cluster.py out of the import graph until a
+            # running manager is actually being reconfigured (mirrors
+            # make_backend's deferred imports); the helper returns True
+            # at once for a non-gossip new config, so this is gossip-only.
+            from yacron2.cluster import gossip_tls_loadable
+
+            if (
+                reason == "configuration changed"
+                and cluster_config is not None
+                and not gossip_tls_loadable(cluster_config)
+            ):
+                # A genuine config change (peers/listen) tears the old manager
+                # down regardless -- but if it coincides with an in-flight cert
+                # rotation (half-written/absent cert files), the rebuild's
+                # ClusterManager.__init__ would raise on the bad material and
+                # leave NO manager, wedging Leader/PreferLeader closed up to
+                # a reload. The cert-only path above does not cover
+                # this combined case. Dry-run the NEW config's gossip TLS first
+                # (the incoming paths, which a config edit may have repointed):
+                # if it cannot load now, keep the running manager -- still
+                # serving the valid old cert -- retry next reload, accepting
+                # that the peers/listen change also waits one reload (a stale-
+                # but-functional cluster beats no manager). Non-gossip backends
+                # and tls-less configs always pass, so this is gossip-only.
+                logger.warning(
+                    "cluster: configuration changed but the new TLS material "
+                    "is not yet loadable (a config edit racing a cert "
+                    "rotation?); keeping the running manager and retrying "
+                    "next reload"
+                )
+                reason = None
             if reason is not None:
                 logger.info("cluster: %s, stopping", reason)
+                # Record losing leadership/quorum HERE if we held it: the flag
+                # resets below would otherwise suppress the transition log in
+                # _emit_cluster_role_logs, leaving the ex-leader's own log
+                # silent about why it stopped Leader jobs (until/unless a
+                # replacement manager comes up and re-logs). Only fires when
+                # election was on (the flags are only ever set then).
+                if self._was_leader:
+                    logger.info(
+                        "cluster: this node lost scheduled-job leadership "
+                        "(leadership manager stopped for reload)"
+                    )
+                if self._was_quorate:
+                    logger.info(
+                        "cluster: this node left quorum (leadership manager "
+                        "stopped for reload); Leader jobs cannot run until it "
+                        "is rebuilt"
+                    )
                 await mgr.stop()
                 self.cluster_manager = None
                 # The transition flags track the OLD manager's last-logged

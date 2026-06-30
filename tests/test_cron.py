@@ -2483,12 +2483,7 @@ async def test_cluster_cert_rotation_keeps_manager_when_unloadable(caplog):
     assert any("not yet loadable" in r.message for r in caplog.records)
 
 
-@pytest.mark.asyncio
-async def test_cluster_config_change_tears_down_even_if_tls_unloadable():
-    # the pre-validation gate (#6) is for cert ROTATION only: a genuine
-    # configuration change must still tear the old manager down regardless of
-    # TLS loadability (the operator changed config; the old manager no longer
-    # applies), and reconstruction then fails closed on the bad certs.
+def _config_change_yamls():
     yaml_a = (
         "jobs:\n  - name: a\n    command: echo a\n"
         '    schedule: "* * * * *"\n'
@@ -2505,28 +2500,68 @@ async def test_cluster_config_change_tears_down_even_if_tls_unloadable():
     )
     # a DIFFERENT peer set -> cluster_config != mgr.config -> config change
     yaml_b = yaml_a.replace("host: c:8443", "host: d:8443")
-    cfg_a = parse_config_string(yaml_a, "").cluster_config
-    cfg_b = parse_config_string(yaml_b, "").cluster_config
+    return (
+        parse_config_string(yaml_a, "").cluster_config,
+        parse_config_string(yaml_b, "").cluster_config,
+    )
 
-    class _FakeMgr:
-        def __init__(self, config):
-            self.config = config
-            self.stopped = False
 
-        def tls_files_changed(self):  # pragma: no cover - not reached
-            return False
+class _ConfigChangeFakeMgr:
+    def __init__(self, config):
+        self.config = config
+        self.stopped = False
 
-        def tls_files_loadable(self):  # pragma: no cover - not reached
-            return False
+    def tls_files_changed(self):
+        return False  # config changed; the TLS-rotation path is moot here
 
-        async def stop(self):
-            self.stopped = True
+    def tls_files_loadable(self):  # pragma: no cover - not reached
+        return False
 
+    async def stop(self):
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_cluster_config_change_keeps_manager_when_new_tls_unloadable(
+    caplog,
+):
+    import logging
+
+    # RELOAD-TLS-COMBINED: a genuine config change (different peer set) that
+    # coincides with an in-flight cert rotation (new TLS material not yet
+    # loadable) must NOT tear the old manager down and then fail to rebuild --
+    # which would wedge Leader/PreferLeader closed for up to a reload. The
+    # pre-teardown dry-run keeps the running manager (still serving the valid
+    # old cert) and retries next reload. The certs here are absent (the
+    # mid-rotation case), so gossip_tls_loadable(cfg_b) is False.
+    cfg_a, cfg_b = _config_change_yamls()
     cron = yacron2.cron.Cron(None)
-    fake = _FakeMgr(cfg_a)
+    fake = _ConfigChangeFakeMgr(cfg_a)
+    cron.cluster_manager = fake
+    with caplog.at_level(logging.WARNING, logger="yacron2"):
+        await cron.start_stop_cluster(cfg_b)
+    assert fake.stopped is False  # kept, not torn down
+    assert cron.cluster_manager is fake
+    assert any("not yet loadable" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cluster_config_change_tears_down_when_new_tls_loadable(
+    monkeypatch,
+):
+    # the dry-run gate is specific to UNLOADABLE new TLS: when the new config's
+    # TLS loads cleanly, a config change still tears the old manager down (the
+    # operator changed config; the old manager no longer applies), and
+    # reconstruction then fails closed on the (here deliberately absent) certs.
+    cfg_a, cfg_b = _config_change_yamls()
+    monkeypatch.setattr(
+        "yacron2.cluster.gossip_tls_loadable", lambda cfg: True
+    )
+    cron = yacron2.cron.Cron(None)
+    fake = _ConfigChangeFakeMgr(cfg_a)
     cron.cluster_manager = fake
     await cron.start_stop_cluster(cfg_b)
-    assert fake.stopped is True  # config change tears down regardless
+    assert fake.stopped is True  # config change tears down
     assert cron.cluster_manager is None  # reconstruction fails closed
 
 

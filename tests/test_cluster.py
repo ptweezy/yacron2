@@ -2239,6 +2239,99 @@ def test_quorum_requires_mutual_agreement(no_tls):
     assert mgr.is_leader() is True
 
 
+def test_legacy_peer_without_members_counts_one_directional(no_tls):
+    # ROLLING-MEMBERS: a legacy peer (a build from before mutual attestation)
+    # serves /peer with NO members list, so it cannot report it sees us. The
+    # mutual gate would then drop it, standing a NEW node DOWN among legacy
+    # peers -- a cluster-wide Leader halt mid rolling upgrade. A peer flagged
+    # reports_members=False instead falls back to one-directional agreement (we
+    # count it if WE see it AGREED), so the new node stays quorate and elects
+    # itself: the documented "lean toward running" behaviour, not a halt.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    for host, name in (("b:1", "node-b"), ("c:1", "node-c")):
+        peer = mgr.view.peers[host]
+        peer.status = STATUS_AGREED
+        peer.node_name = name
+        peer.instance_id = "inst-" + host
+        peer.job_set_id = "v1:mine"
+        peer.members = []  # a legacy peer reports no members at all
+        peer.reports_members = False  # ... and is flagged legacy
+    # both legacy peers count one-directionally -> we reach quorum and LEAD,
+    # instead of standing down with no leader anywhere (the bug)
+    assert sorted(mgr._agreeing_peer_names()) == ["node-b", "node-c"]
+    assert mgr.is_quorate() is True
+    assert mgr.leader_name() == "node-a"  # elects itself (legacy peers are not
+    assert mgr.is_leader() is True  # eligible candidates -> no deferral)
+    # a CURRENT peer (reports_members True) whose members do NOT list us is
+    # still excluded by the mutual gate -- the fallback is legacy-only.
+    cur = mgr.view.peers["b:1"]
+    cur.reports_members = True
+    cur.members = [("node-b", "inst-b:1", True)]  # does not list node-a
+    assert mgr._agreeing_peer_names() == ["node-c"]
+
+
+def test_conflict_status_does_not_reset_mismatch_streak():
+    # CONFLICT-STREAK-RESET: a STATUS_CONFLICT obs (a duplicate nodeName
+    # at one address) must NOT zero the drift streak -- the invariant is that
+    # only a confirmed AGREED/SELF observation clears it. Otherwise a transient
+    # same-name/different-instance answer delays a genuinely-drifting peer's
+    # STATUS_DRIFTED label by up to driftAfter rounds.
+    view = ClusterView(["peer:1"], drift_after=3)
+    # two reachable, job-set-mismatched rounds: the streak climbs (SYNCING)
+    for _ in range(2):
+        view.record_success(
+            "peer:1", "node-b", "v1:other", SCHEME_VERSION,
+            "v1:mine", NOW, "node-a",
+        )
+    assert view.peers["peer:1"].status == STATUS_SYNCING
+    assert view.peers["peer:1"].mismatch_streak == 2
+    # a CONFLICT round (answers as OUR name with a different instance) must
+    # leave the streak untouched, not reset it to 0
+    view.record_success(
+        "peer:1", "node-a", "v1:other", SCHEME_VERSION,
+        "v1:mine", NOW, "node-a",
+        peer_instance="other-inst", my_instance="my-inst",
+    )
+    assert view.peers["peer:1"].status == STATUS_CONFLICT
+    assert view.peers["peer:1"].mismatch_streak == 2  # preserved, not zeroed
+
+
+def test_gossip_tls_loadable_non_gossip_and_missing(tmp_path):
+    # RELOAD-TLS-COMBINED: the dry-run start_stop_cluster uses before tearing a
+    # manager down for a CONFIG change. A non-gossip backend has no TLS
+    # to pre-validate (always True); a gossip config with absent certs
+    # (a half-written/mid-rotation cert) is NOT loadable (False), so
+    # manager is kept. Uses stdlib ssl only -> runs without cryptography.
+    from yacron2.cluster import gossip_tls_loadable
+
+    assert gossip_tls_loadable({"backend": "etcd"}) is True
+    assert gossip_tls_loadable({"backend": "kubernetes"}) is True
+    cfg = _cfg(
+        {
+            "ca": str(tmp_path / "ca"),
+            "cert": str(tmp_path / "cert"),
+            "key": str(tmp_path / "key"),
+        },
+        "127.0.0.1:1",
+        ["b:1"],
+        "node-a",
+    )
+    assert gossip_tls_loadable(cfg) is False  # files do not exist -> OSError
+
+
+def test_gossip_tls_loadable_valid_material(tmp_path):
+    # RELOAD-TLS-COMBINED: valid on-disk gossip TLS loads -> True, so a config
+    # change proceeds normally. Crypto-gated (mints real certs).
+    from yacron2.cluster import gossip_tls_loadable
+
+    tls = _write_tls(tmp_path)
+    cfg = _cfg(tls, "127.0.0.1:1", ["b:1"], "node-a")
+    assert gossip_tls_loadable(cfg) is True
+
+
 def test_asymmetric_reachability_never_double_leads(no_tls):
     # the split-brain repro from review finding #1: a<b<c, quorum 2, with
     # a->b reachable, b->a NOT, a<->c down, b->c up + back. Pre-fix BOTH a and

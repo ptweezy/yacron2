@@ -548,7 +548,28 @@
   .wb-stat.fail b { color: var(--fail); } .wb-stat.run b { color: var(--run); } .wb-stat.ok b { color: var(--ok); }
   .wb-stat.cl { color: var(--fg-faint); }
   .wb-clock { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+  /* stale/no-signal treatment -- the header connection dot is hidden in TV
+     mode, so when polls stop landing the wallboard itself must go loud
+     (banner + dimmed tiles) instead of freezing on its last healthy frame.
+     Mirrors the cluster card's .card.stale path. */
+  .wb-nosignal { display: none; position: relative; z-index: 5;
+    align-items: center; justify-content: center; padding: 10px 18px;
+    font-size: 15px; font-weight: 700; letter-spacing: 2px;
+    color: var(--fail); background: color-mix(in srgb, var(--fail) 14%, var(--bg));
+    border-bottom: 1px solid var(--fail); }
+  .wallboard.stale .wb-nosignal { display: flex; }
+  .wallboard.stale .wb-grid, .wallboard.stale .wb-foot { opacity: .45; }
+  body.fx .wallboard.stale .wb-nosignal { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
   body.tv > header, body.tv > main { display: none; }
+  /* Surfaces the app can open while the wallboard is up -- the auto-opened 401
+     token modal, the ⌘K palette, the drawer, toasts -- must stack ABOVE its
+     z-index 8000. At their base 40/50/60/80 they would render behind it while
+     keeping keyboard focus: an invisible focus trap on a kiosk. Same relative
+     order as the base stack, lifted wholesale above the wallboard. */
+  body.tv .scrim { z-index: 8040; }
+  body.tv .drawer { z-index: 8050; }
+  body.tv .overlay { z-index: 8060; }
+  body.tv .toasts { z-index: 8080; }
   @media (prefers-reduced-motion: reduce) { .wb-tile.flip { animation: none; } }
 
   /* ---------- activity heatmap ---------- */
@@ -1046,6 +1067,11 @@
 <!-- wallboard / TV kiosk -->
 <div id="wallboard" class="wallboard" style="display:none" aria-hidden="true" role="region" aria-label="Wallboard">
   <div id="wbAlarm"></div>
+  <!-- no-signal banner: shown (with the grid dimmed) while wallboard data is
+       stale. The verdict lives in its own span so the role="status" live
+       region announces only on a real change; the per-second age counter is
+       aria-hidden (screen readers would otherwise hear it every tick). -->
+  <div class="wb-nosignal" id="wbNoSignal" role="status"><span id="wbNoSignalMsg"></span><span id="wbNoSignalAge" aria-hidden="true"></span></div>
   <div class="wb-grid" id="wbGrid"></div>
   <div class="wb-foot" id="wbFoot"></div>
   <!-- zen all-clear screensaver: appears over an idle, healthy wallboard -->
@@ -1603,17 +1629,25 @@
   // per-second tick for relative cells (no full rerender)
   function tick() {
     document.querySelectorAll("[data-ago]").forEach((e) => { e.textContent = fmtAgo(e.getAttribute("data-ago")); });
+    // a stale wallboard must not keep counting its tiles down toward runs it
+    // cannot verify (they'd tick to "now" and stick) -- freeze those cells at
+    // an explicit marker instead. body.tv hides the job table, so while the
+    // wallboard is up every visible [data-next] is a wallboard tile.
+    const wbStale = state.wallboard && wallboardStale();
     document.querySelectorAll("[data-next]").forEach((e) => {
       const job = state.byName[e.getAttribute("data-next")];
       // running/disabled tiles keep their "—" (wallboard attaches data-next to
       // every tile; the job table only attaches it to jobs with a live countdown)
-      if (job) e.textContent = (job.running || !job.enabled) ? "—" : fmtIn(nextRunSeconds(job));
+      if (!job) return;
+      if (job.running || !job.enabled) { e.textContent = "—"; return; }
+      e.textContent = wbStale ? "stale" : fmtIn(nextRunSeconds(job));
     });
     $("clock").textContent = utcClock();
     if (prefs.radar) renderRadar();
     if (state.timeline.open) $("tlNow").textContent = utcClock();
     if (state.wallboard) {
       const wc = $("wbClock"); if (wc) wc.textContent = utcClock();
+      wallboardSignalTick();       // NO SIGNAL banner + dimming when polls stop landing
       zenGovernor();               // drift to / from the zen screensaver on idle
       if (state.zen.on) zenTick();  // pulse the field on real next-fire instants
       escalationTick();             // grow the alarm the longer a failure is unacked
@@ -1801,8 +1835,42 @@
   // ===================================================================
   const WB_ORDER = { fail: 0, run: 1, pending: 2, cancelled: 3, ok: 4, disabled: 5 };
   function utcClock() { const n = new Date(); return pad2(n.getUTCHours()) + ":" + pad2(n.getUTCMinutes()) + ":" + pad2(n.getUTCSeconds()) + " UTC"; }
+  // The wallboard's staleness gate. TV mode hides the header (and with it the
+  // #conn indicator), so the surface must judge freshness itself: stale when
+  // the last poll failed outright, when nothing has been fetched yet, or when
+  // no successful poll has landed for several intervals (throttled background
+  // tab, paused polling, a fetch wedged without rejecting).
+  const WB_STALE_AFTER = 15000;              // floor; scales with slow poll intervals
+  function wallboardStale() {
+    if (!state.connected) return true;
+    if (!state.fetchedAt) return true;       // no data received yet
+    const age = performance.now() - state.fetchedAt;
+    return age > Math.max(WB_STALE_AFTER, (prefs.pollMs || 0) * 3);
+  }
+  // Per-second reflection of that gate onto the TV surface: toggle the
+  // banner + dimming, and keep the "last update" age current -- mirrors the
+  // cluster card's clusterStale() rather than freezing on a healthy frame.
+  function wallboardSignalTick() {
+    const stale = wallboardStale();
+    $("wallboard").classList.toggle("stale", stale);
+    if (!stale) return;
+    // write the verdict span only on a real change so the role="status" live
+    // region announces once; the age counter ticks every second inside an
+    // aria-hidden span (screen readers would otherwise hear it each tick).
+    const msg = state.connected ? "▚ STALE DATA" : "▚ NO SIGNAL";
+    const verdict = $("wbNoSignalMsg");
+    if (verdict.textContent !== msg) verdict.textContent = msg;
+    $("wbNoSignalAge").textContent =
+      state.fetchedAt
+        ? " · last update " + agoWords((performance.now() - state.fetchedAt) / 1000)
+        : " · no data received yet";
+  }
   function setWallboard(on) {
-    if (on && state.drawerJob) closeDrawer();   // don't strand a drawer hidden behind the wallboard
+    // Close any open drawer on entry: it drives the jobs-table UI that
+    // body.tv hides, and leaving it open would desync the #tv hash state.
+    // (Visibility is not the issue -- body.tv stacks .drawer above the
+    // wallboard, so overlays that DO open in TV mode are seen.)
+    if (on && state.drawerJob) closeDrawer();
     state.wallboard = on;
     const wb = $("wallboard");
     wb.style.display = on ? "" : "none";
@@ -1810,7 +1878,7 @@
     document.body.classList.toggle("tv", on);
     $("tvBtn").classList.toggle("on", on);
     setHashTv(on);
-    if (on) renderWallboard();
+    if (on) renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
     else { $("wbGrid").innerHTML = ""; zenOff(); state.zen.idleSince = 0; }
   }
   function renderWallboard() {
@@ -1819,9 +1887,10 @@
       const r = WB_ORDER[health(a).key] - WB_ORDER[health(b).key];
       return r !== 0 ? r : a.name.localeCompare(b.name);
     });
+    const stale = wallboardStale();
     $("wbGrid").innerHTML = jobs.map((job) => {
       const h = health(job);
-      const nextTxt = (job.running || !job.enabled) ? "—" : fmtIn(nextRunSeconds(job));
+      const nextTxt = (job.running || !job.enabled) ? "—" : stale ? "stale" : fmtIn(nextRunSeconds(job));
       const flip = state.justFailed && state.justFailed.has(job.name) ? " flip" : "";
       return '<div class="wb-tile st-' + h.key + flip + '" data-job="' + escAttr(job.name) + '">' +
         '<div class="wb-glyph">' + GLYPH[h.key] + "</div>" +
@@ -1831,6 +1900,9 @@
       "</div>";
     }).join("");
     renderWbFoot();
+    // fresh paint = fresh verdict: a recovery poll clears the stale banner
+    // and dimming NOW rather than up to a second later at the next tick.
+    wallboardSignalTick();
   }
   function renderWbFoot() {
     const j = state.jobs;
@@ -2882,8 +2954,11 @@
       if (e.key === "w") { e.preventDefault(); setWallboard(!state.wallboard); return; }
       if (e.key === "a") { e.preventDefault(); ackAlarm(); return; }
     }
-    // the wallboard is a full-screen surface: suppress the list shortcuts so
-    // Enter/r/x can't drive a drawer hidden behind it (which also desyncs #tv).
+    // the wallboard is a full-screen surface: suppress the list shortcuts --
+    // j/k/Enter/r/x drive the jobs table, which body.tv hides (and an opened
+    // drawer would desync the #tv hash). Overlays that DO open here (⌘K
+    // palette, 401 token modal) stack above the wallboard via the body.tv
+    // z-index overrides, so they are visible and keep their own key handling.
     if (inField(e) || anyOverlayOpen() || state.wallboard) return;
 
     switch (e.key) {
@@ -3144,11 +3219,22 @@
     const sum = $("clusterSummary");
     if (sum) sum.textContent = "cluster status unavailable" + (why ? " (" + why + ")" : "");
   }
+  // loadCluster() is fired without awaiting (from loadJobs' success path), so
+  // overlapping /cluster requests can resolve out of order -- and a delayed
+  // OLDER response would regress the leader/quorum badge and append a stale
+  // snapshot to the swimlane with a newer timestamp (failover history recorded
+  // backwards). Stamp each request with a sequence number and drop, whole, any
+  // response older than the newest one already applied (UI, alert, swimlane).
+  let clusterReqSeq = 0, clusterAppliedSeq = 0;
   async function loadCluster() {
+    const seq = ++clusterReqSeq;
     try {
       const r = await apiFetch("/cluster");
-      if (!r.ok) { console.warn("loadCluster failed: HTTP " + r.status); clusterStale("HTTP " + r.status); return; }
+      if (seq < clusterAppliedSeq) return;   // a newer response already applied
+      if (!r.ok) { clusterAppliedSeq = seq; console.warn("loadCluster failed: HTTP " + r.status); clusterStale("HTTP " + r.status); return; }
       const data = await r.json();
+      if (seq < clusterAppliedSeq) return;   // overtaken while reading the body
+      clusterAppliedSeq = seq;
       const card = $("clusterCard");
       // a fresh, successful read clears any prior staleness signal.
       card.classList.remove("stale");
@@ -3178,12 +3264,12 @@
       $("clusterTable").style.display = "";
       $("clusterLease").style.display = "none";
       const peers = data.peers || [];
-      // Per-node ownership counts need the /jobs payload. At boot loadCluster()
-      // can resolve before the first loadJobs() (they run concurrently), so
-      // until state.jobs is actually populated (state.fetchedAt > 0) we have no
-      // ownership data — render neutral placeholders rather than a bogus 0, and
-      // let the post-loadJobs re-poll fill in the real counts. Computed once and
-      // reused by the summary and the per-peer Owns column.
+      // Per-node ownership counts need the /jobs payload. loadCluster() now
+      // fires only from loadJobs' success path (state.jobs already set), but
+      // keep the state.fetchedAt > 0 guard so a caller added ahead of the
+      // first /jobs payload renders neutral placeholders rather than a bogus
+      // 0. Computed once and reused by the summary and the per-peer Owns
+      // column.
       const ownsCounts = (spread && state.fetchedAt > 0) ? ownerCounts() : null;
       // "self" entries are this node listed in its own peers; exclude from the
       // agreement tally.
@@ -3268,8 +3354,14 @@
     } catch (e) {
       // a 401 is rethrown by apiFetch and drives the normal re-auth/connection
       // flow (openModal) elsewhere; don't mask it as "unavailable". Any other
-      // throw (fetch/parse/render) leaves the panel stale rather than frozen.
-      if (e.message !== "unauthorized") { console.warn("loadCluster failed:", e); clusterStale(); }
+      // throw (fetch/parse/render) leaves the panel stale rather than frozen --
+      // unless a newer response already applied, in which case this failure is
+      // old news and must not stamp "stale" over fresh data.
+      if (e.message !== "unauthorized" && seq >= clusterAppliedSeq) {
+        clusterAppliedSeq = seq;
+        console.warn("loadCluster failed:", e);
+        clusterStale();
+      }
     }
   }
 
@@ -3916,6 +4008,10 @@
   // decide whether an idle, healthy wallboard should drift to zen
   function zenGovernor() {
     if (!state.wallboard || !prefs.zen) { zenOff(); state.zen.idleSince = 0; return; }
+    // never drift into (or stay in) "ALL SYSTEMS NOMINAL" on stale data: with
+    // the daemon unreachable the all-green frame is unverified, not nominal --
+    // show the NO SIGNAL wallboard instead.
+    if (wallboardStale()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
     if (state.anyFailing || anyRunning()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
     const nowMs = Date.now();
     if (!state.zen.idleSince) state.zen.idleSince = nowMs;
@@ -4109,7 +4205,9 @@
   function startApp() {
     loadVersion();
     loadJobSetId();
-    loadCluster();
+    // /cluster rides along on loadJobs' success path (loadCluster there); a
+    // direct call here would just guarantee two overlapping /cluster fetches
+    // at every startup.
     loadJobs().then(openFromHash);
     restartPolling();
   }

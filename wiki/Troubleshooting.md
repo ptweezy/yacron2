@@ -33,9 +33,9 @@ explicit path with `-c FILE-OR-DIR` (a single file or a directory). On Windows t
 default location to create and populate is `%APPDATA%\yacron2` rather than
 `/etc/yacron2.d`; see [Running on Windows](Running-on-Windows). Note the error
 text is only emitted for the *default* path; an explicit `-c` pointing at a missing
-file instead surfaces as a `ConfigError` (see below). The default changed from
-`/etc/yacron.d` to `/etc/yacron2.d` in 1.0.0; if you upgraded from yacron, move your
-config directory. See [Migration from yacron](Migration-from-yacron) and the
+file instead surfaces as a `ConfigError` (see below). yacron2's default is
+`/etc/yacron2.d` rather than yacron's `/etc/yacron.d`; if you upgraded from yacron,
+move your config directory. See [Migration from yacron](Migration-from-yacron) and the
 [Command-Line Reference](CLI-Reference).
 
 ### "Configuration error" / a missing or unreadable explicit config file
@@ -219,7 +219,7 @@ expression or schedule object otherwise. See
 as `disabled`; `POST /jobs/<name>/start` returns `409 Conflict`
 (`job '<name>' is disabled`).
 
-**Cause.** `enabled` defaults to `true` (new in yacron2 0.18). `enabled: false` jobs
+**Cause.** `enabled` defaults to `true`. `enabled: false` jobs
 are treated "as if they aren't there" apart from config validation:
 `job_should_run` short-circuits to `False`, and the web API refuses to launch them.
 
@@ -256,7 +256,7 @@ that lack the system tz database, yacron2 depends on the bundled `tzdata` packag
 resolve names.
 
 **Fix.** Use a valid IANA name (for example `America/Los_Angeles`). The `timezone`
-option (since yacron2 0.11) takes precedence over `utc`; with neither set, scheduling
+option takes precedence over `utc`; with neither set, scheduling
 uses local time only when `utc: false` (the default `utc` is `true`, i.e. UTC). See
 [Schedules and Timezones](Schedules-and-Timezones).
 
@@ -365,8 +365,8 @@ set, `onFailure.retry.maximumRetries >= -1` (`-1` = retry forever),
 **Symptom.** Mail that delivered fine under yacron now fails with a TLS/certificate
 validation error.
 
-**Cause.** In yacron2 1.0.0 the mail `validate_certs` default changed to `True`
-(`_REPORT_DEFAULTS["mail"]["validate_certs"] = True`). The mail reporter passes
+**Cause.** yacron2's mail `validate_certs` default is `True` (a change from yacron;
+`_REPORT_DEFAULTS["mail"]["validate_certs"] = True`). The mail reporter passes
 `validate_certs=mail["validate_certs"]` to `aiosmtplib.SMTP`, so delivery to servers
 with self-signed or otherwise invalid certificates that previously worked silently now
 fails.

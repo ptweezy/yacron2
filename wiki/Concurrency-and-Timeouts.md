@@ -112,8 +112,6 @@ jobs:
 `executionTimeout` bounds the wall-clock duration of a single run. It is unset
 by default (`null`), meaning a run may take arbitrarily long.
 
-> (new in version 0.4)
-
 ### Deadline mechanism
 
 When a run starts, if `executionTimeout` is set, `RunningJob.start` records an

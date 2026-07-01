@@ -330,11 +330,14 @@ def test_is_leader_fenced_closed_on_known_lease_loss():
 
 
 def test_is_quorate_tracks_fresh_contact():
+    # quorum freshness is a monotonic DEADLINE fixed at contact time (see
+    # test_cadence_widening_does_not_resurrect_quorum for why), so staleness is
+    # simply the deadline lapsing.
     b = _backend()
     assert b.is_quorate() is False
-    b._last_contact_mono = time.monotonic()
+    b._quorum_deadline_mono = time.monotonic() + b.ttl
     assert b.is_quorate() is True
-    b._last_contact_mono = time.monotonic() - (b.ttl + 5)
+    b._quorum_deadline_mono = time.monotonic() - 5
     assert b.is_quorate() is False
 
 
@@ -342,7 +345,7 @@ def test_leader_name_none_when_stale():
     b = _backend()
     b._holder = "node-b"
     assert b.leader_name() is None
-    b._last_contact_mono = time.monotonic()
+    b._quorum_deadline_mono = time.monotonic() + b.ttl
     assert b.leader_name() == "node-b"
 
 
@@ -352,7 +355,7 @@ def test_apply_round_win():
     assert b._is_leader is True
     assert b._holder == "node-a"
     assert b._lease_deadline == b._leader_deadline(NOW)  # wall, for display
-    assert b._last_contact_mono is not None  # monotonic freshness advanced
+    assert b._quorum_deadline_mono is not None  # monotonic freshness advanced
     assert b.is_quorate() is True
 
 
@@ -362,7 +365,7 @@ def test_apply_round_follower():
     b._apply_round("node-b", False, NOW)
     assert b._is_leader is False
     assert b._holder == "node-b"
-    assert b._last_contact_mono is not None
+    assert b._quorum_deadline_mono is not None
 
 
 def test_lease_ttl_from_grant():
@@ -632,7 +635,7 @@ async def test_renew_once_recovers_collapsed_cadence_when_not_quorate(
     b = _backend()  # ttl 15
     # simulate a prior narrowing to the minimum AND lost contact (not quorate)
     b._effective_ttl = 3
-    b._last_contact_mono = 100.0 - 100  # long stale -> not quorate
+    b._quorum_deadline_mono = 100.0 - 100  # long lapsed -> not quorate
     assert b.is_quorate() is False
     assert b.request_timeout < 0.3  # the collapsed per-POST budget at ttl 3
     budget_seen = []
@@ -654,6 +657,69 @@ async def test_renew_once_recovers_collapsed_cadence_when_not_quorate(
     assert budget_seen[0] >= 1.0
     assert b._effective_ttl == 15  # widened, then re-narrowed to granted 15
     assert b.is_leader() is True  # reconnected and re-acquired
+
+
+async def test_cadence_widening_does_not_resurrect_quorum(monkeypatch):
+    # F-QUORUM-WIDEN: is_quorate() must check a deadline FIXED at the last
+    # successful contact (contact + the ttl in effect at THAT contact), not a
+    # live last-contact + current-_effective_ttl computation. Otherwise the
+    # not-quorate cadence widening at the top of _renew_once (narrowed server
+    # ttl -> configured ttl, the F-TTL-WEDGE reconnect-budget fix above)
+    # retroactively re-extends the freshness window around the OLD contact and
+    # flips is_quorate() back to True with ZERO store contact -- re-deferring
+    # never-skip PreferLeader jobs to a possibly-dead stale holder for up to
+    # (configured - granted) extra seconds of a store outage, while /cluster
+    # falsely reports the node quorate with that stale leader.
+    clock = [1000.0]
+    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    b = _backend()  # configured ttl 15
+    # a successful FOLLOWER round under a server-narrowed ttl of 5 (node-b
+    # holds the key): the freshness window is 5s from this contact, not 15.
+    b._narrow_effective_ttl(5)
+    b._apply_round("node-b", False, NOW, clock[0])
+    assert b.is_quorate() is True
+    assert b.is_available_leader() is False  # defer to the live holder
+    # 6s later the granted window has lapsed: not quorate, so the never-skip
+    # PreferLeader gate correctly opens on this surviving follower.
+    clock[0] += 6.0
+    assert b.is_quorate() is False
+    assert b.is_available_leader() is True
+    # the renew loop then runs a round against a still-unreachable etcd: the
+    # reconnect-budget widening runs first, then every POST fails.
+    down = {"on": True}
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if down["on"]:
+            raise aiohttp.ClientError("connection refused")
+        if path == "/v3/lease/grant":
+            return {"ID": "1", "TTL": "15"}
+        if path == "/v3/kv/txn":
+            return {"succeeded": True}
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        return {}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    with pytest.raises(aiohttp.ClientError):
+        await b._renew_once()
+    assert b._effective_ttl == 15  # the cadence widening itself still ran
+    # ...but with zero store contact quorum stays expired (no retroactive
+    # resurrection), the stale holder is not reported, and the never-skip
+    # gate stays open here instead of re-deferring to a possibly-dead node-b.
+    assert b.is_quorate() is False
+    assert b.leader_name() is None
+    assert b.is_available_leader() is True
+    # and stays that way across the whole window the live computation wrongly
+    # restored (old contact + configured ttl, i.e. until T+15).
+    clock[0] = 1000.0 + 14.0
+    with pytest.raises(aiohttp.ClientError):
+        await b._renew_once()
+    assert b.is_quorate() is False
+    assert b.is_available_leader() is True
+    # only a REAL successful round re-establishes quorum.
+    down["on"] = False
+    await b._renew_once()
+    assert b.is_quorate() is True
 
 
 async def test_sync_reboot_ran_swallows_wrong_shape_response(monkeypatch):

@@ -6,6 +6,7 @@ import pytest
 
 import yacron2.__main__
 from yacron2.config import parse_config
+from yacron2.fingerprint import SCHEME_VERSION
 
 
 class FakeCron:
@@ -66,5 +67,5 @@ def test_job_set_id_flag(monkeypatch, capsys):
     with pytest.raises(ExitError):
         yacron2.__main__.main_loop(loop)
     out = capsys.readouterr().out.strip()
-    assert out.startswith("v1:")
+    assert out.startswith(SCHEME_VERSION + ":")
     assert len(out.split(":", 1)[1]) == 64

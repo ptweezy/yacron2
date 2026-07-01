@@ -13,7 +13,7 @@ import yacron2.cron
 from tests._commands import cmd_hang, cmd_print, cmd_sleep, yaml_command
 from yacron2 import platform
 from yacron2.config import ConfigError, JobConfig, parse_config_string
-from yacron2.job import JobOutputStream, RunningJob
+from yacron2.job import JobOutputStream, JobRetryState, RunningJob
 
 
 async def _noop():
@@ -526,24 +526,214 @@ async def test_schedule_retry_job_abandoned_when_no_longer_owner():
     # partition / quorum loss moved ownership while it slept). It must re-check
     # the gate and abandon rather than relaunch -- relaunching here while the
     # new owner also runs it on its next tick is the split-brain double-run
-    # the abstraction exists to prevent.
+    # the abstraction exists to prevent. Abandonment requires ANOTHER node to
+    # be positively identified as the owner (a quorate, conflict-free view);
+    # a transient denial defers instead (see the blip test below).
     import types
 
     cron = yacron2.cron.Cron(None)
     cron._elect_leader_configured = True
     cron.cluster_manager = types.SimpleNamespace(
         distribution="single-leader",
-        is_leader=lambda: False,  # leadership moved away
-        is_available_leader=lambda: False,
+        is_leader=lambda: False,  # leadership moved away...
+        is_quorate=lambda: True,  # ...under a trustworthy quorate view
+        is_available_leader=lambda: False,  # another node positively owns it
         has_conflict=lambda: False,
+        view_settled=lambda: True,  # a converged view, not the settle hold
     )
     job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
     cron.cron_jobs["j"] = job
-    cron.retry_state["j"] = object()  # a pending retry
+    state = JobRetryState(0.1, 2, 1)
+    cron.retry_state["j"] = state  # a pending retry
     await cron.schedule_retry_job("j", 0.0, 0)
     # abandoned (not relaunched) and the stale retry state cleared
     assert "j" not in cron.retry_state
     assert "j" not in cron.running_jobs
+    # ...and the escaped-state relaunch path is closed (see the test below)
+    assert state.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
+    # A retry waking during a TRANSIENT fail-closed condition (lost quorum, a
+    # nodeName/size/policy conflict, a backend read error) must NOT abandon
+    # the chain: this node may still be the rightful owner, and for the
+    # wiki's keep-alive pattern (@reboot + maximumRetries: -1 + Leader) there
+    # is no next scheduled firing -- reboot_ran was recorded before the first
+    # launch, so an abandonment during a one-interval blip would mean no node
+    # ever restarts the process. The retry defers and re-checks the gate,
+    # relaunching once the blip clears.
+    import types
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    quorate = False  # a one-interval quorum blip
+
+    cron.cluster_manager = types.SimpleNamespace(
+        distribution="single-leader",
+        is_leader=lambda: quorate,  # this node leads again once quorum returns
+        is_quorate=lambda: quorate,
+        is_available_leader=lambda: True,  # nobody else positively owns it
+        has_conflict=lambda: False,
+        view_settled=lambda: True,
+    )
+    launched = []
+    monkeypatch.setattr(
+        cron, "maybe_launch_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
+    cron.cron_jobs["j"] = job
+    state = JobRetryState(0.01, 1, 0.01)
+    cron.retry_state["j"] = state
+    task = asyncio.create_task(cron.schedule_retry_job("j", 0.01, 1))
+    await asyncio.sleep(0.1)  # the retry wakes mid-blip and defers
+    assert launched == []  # not relaunched while the gate is closed...
+    assert "j" in cron.retry_state  # ...but the chain survives the blip
+    assert state.cancelled is False
+    quorate = True  # blip over: this node is the owner again
+    await asyncio.wait_for(task, timeout=5)
+    assert launched == ["j"]  # the kept retry relaunched the job
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_job_defers_during_unsettled_view(
+    monkeypatch, caplog
+):
+    # Reviewer regression on the abandon/defer split: a QUORATE but not yet
+    # SETTLED view (a freshly rebuilt gossip manager whose current-build
+    # agreeing peers have not all re-attested its new instance_id; quorum only
+    # needs a majority, the settle hold waits for every such peer) holds
+    # is_available_leader() False even on the rightful owner. That hold is a
+    # transient fail-closed denial, not a positive ownership move: abandoning
+    # there would end an @reboot keep-alive (maximumRetries: -1) chain
+    # cluster-wide, since reboot_ran was recorded before the first launch.
+    # The retry must defer and relaunch once the view settles.
+    import types
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    settled = False  # the ~2-interval re-attestation window
+
+    cron.cluster_manager = types.SimpleNamespace(
+        distribution="single-leader",
+        is_leader=lambda: False,
+        is_quorate=lambda: True,  # quorate the whole time
+        is_available_leader=lambda: settled,  # held closed while unsettled
+        has_conflict=lambda: False,
+        view_settled=lambda: settled,
+    )
+    # while unsettled, the gate denial must read as transient, never a move
+    job = types.SimpleNamespace(name="j", clusterPolicy="PreferLeader")
+    assert cron._cluster_owner_moved(job) is False
+    launched = []
+    monkeypatch.setattr(
+        cron, "maybe_launch_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    monkeypatch.setattr(yacron2.cron, "RETRY_GATE_RECHECK_FLOOR", 0.01)
+    cron.cron_jobs["j"] = job
+    state = JobRetryState(0.01, 1, 0.01)
+    cron.retry_state["j"] = state
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="yacron2"):
+        task = asyncio.create_task(cron.schedule_retry_job("j", 0.01, 1))
+        await asyncio.sleep(0.1)  # the retry wakes mid-hold and defers
+        assert launched == []  # not relaunched while the gates are held...
+        assert "j" in cron.retry_state  # ...but the chain was NOT abandoned
+        assert state.cancelled is False
+        settled = True  # peers re-attested: the hold lifts, this node owns it
+        await asyncio.wait_for(task, timeout=5)
+    assert launched == ["j"]  # the kept retry relaunched the job
+    # log cadence: the deferral is announced once at INFO; the re-checks that
+    # follow (about one per second at the recheck floor) repeat only at DEBUG,
+    # so a long gate-closed outage cannot spam the log.
+    deferred = [r for r in caplog.records if "deferred" in r.message]
+    assert len(deferred) > 1  # the loop really re-checked several times
+    assert [r.levelno for r in deferred].count(logging.INFO) == 1
+    assert all(
+        r.levelno in (logging.INFO, logging.DEBUG) for r in deferred
+    )
+    # (a settled view where the gate STAYS False is the genuine move case,
+    # covered by test_schedule_retry_job_abandoned_when_no_longer_owner)
+
+
+@pytest.mark.asyncio
+async def test_retry_abandonment_cancels_state_and_records(caplog):
+    # The ownership-move abandonment must (a) set state.cancelled BEFORE
+    # dropping the state: a RunningJob launched while the retry sat pending
+    # (a manual API start, a concurrencyPolicy Allow overlap) captured this
+    # same JobRetryState, and its own later failure would otherwise re-arm a
+    # retry on the untracked state -- which cancel_job_retries can never find
+    # or cancel, so the orphan would relaunch the job after a later success;
+    # and (b) end the sequence loudly: a WARNING naming the actual cause plus
+    # a run-history record, not one INFO line.
+    import logging
+    import types
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = types.SimpleNamespace(
+        distribution="single-leader",
+        is_leader=lambda: False,
+        is_quorate=lambda: True,
+        is_available_leader=lambda: False,  # another node positively owns it
+        has_conflict=lambda: False,
+        view_settled=lambda: True,
+    )
+    job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
+    cron.cron_jobs["j"] = job
+    state = JobRetryState(0.1, 2, 1)
+    cron.retry_state["j"] = state
+    with caplog.at_level(logging.WARNING, logger="yacron2"):
+        await cron.schedule_retry_job("j", 0.0, 1)
+    assert "j" not in cron.retry_state
+    assert state.cancelled is True  # kills the rogue-relaunch path
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "abandoned" in r.message
+    ]
+    assert len(warnings) == 1
+    assert "moved ownership" in warnings[0].message
+    # the sequence's end is visible in the run history / dashboard
+    assert cron.last_run["j"].outcome == "cancelled"
+    assert "ownership moved" in cron.last_run["j"].fail_reason
+    assert [r.outcome for r in cron.run_history["j"]] == ["cancelled"]
+
+    # rogue-relaunch closure: a concurrent RunningJob that captured this same
+    # state must now end its own failing run permanently instead of re-arming
+    # a retry on the untracked state.
+    reported = []
+
+    async def _report_failure():
+        reported.append("failure")
+
+    async def _report_permanent_failure():
+        reported.append("permanent_failure")
+
+    running = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            name="j",
+            onFailure={
+                "retry": {
+                    "maximumRetries": -1,
+                    "initialDelay": 0.1,
+                    "maximumDelay": 1,
+                    "backoffMultiplier": 2,
+                }
+            },
+        ),
+        stdout=None,
+        stderr=None,
+        retry_state=state,
+        report_failure=_report_failure,
+        report_permanent_failure=_report_permanent_failure,
+    )
+    await cron.handle_job_failure(running)
+    assert reported == ["failure", "permanent_failure"]
+    assert "j" not in cron.retry_state  # no orphan retry was re-armed
 
 
 def test_cluster_allows_fails_closed_on_backend_error():
@@ -783,7 +973,11 @@ async def test_web_job_set_id():
 
     resp = await cron._web_job_set_id(Req())
     assert resp.text == cron.job_set_id()
-    assert resp.text.startswith("v1:")
+    # the id always carries the live scheme label (see yacron2.fingerprint;
+    # the golden-value tests pin the actual version)
+    from yacron2.fingerprint import SCHEME_VERSION
+
+    assert resp.text.startswith(SCHEME_VERSION + ":")
 
     class JsonReq:
         headers = {"Accept": "application/json"}
@@ -2407,6 +2601,120 @@ async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_web_start_deferred_reboot_retires_pending_and_marks_ran(
+    monkeypatch,
+):
+    # The Run button (POST /jobs/{name}/start) used to launch a job still
+    # pending as a deferred @reboot one-shot WITHOUT retiring the pending
+    # entry or recording the run, so once the cluster converged
+    # _process_pending_reboots saw reboot_ran(name) False and ran the
+    # one-shot a second time -- possibly on another node, since the manual
+    # run was never gossiped/persisted. A manual start IS the boot run: it
+    # must retire the entry and mark it ran on the manager.
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "maybe_launch_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    # not converged yet (no quorum): exactly the window in which the
+    # dashboard shows the job as pending and an operator clicks Run.
+    mgr = _reboot_mgr(leader=None)
+    cron.cluster_manager = mgr
+
+    class Req:
+        match_info = {"name": "boot"}
+        headers: dict = {}
+
+    resp = await cron._web_start_job(Req())
+    assert resp.status == 200
+    assert launched == ["boot"]  # the manual run happened
+    assert "boot" not in cron._pending_reboot_jobs  # retired locally...
+    assert mgr.reboot_ran("boot") is True  # ...and recorded cluster-wide
+    # convergence later must not re-run the one-shot: nothing is pending here
+    # and a peer still holding it pending stands down on the recorded run.
+    await cron._process_pending_reboots()
+    assert launched == ["boot"]
+
+
+@pytest.mark.asyncio
+async def test_web_start_deferred_reboot_without_manager(monkeypatch):
+    # the same manual start with no manager running (backend failed to start)
+    # must still retire the pending entry -- the local re-run protection --
+    # and launch, without tripping on the absent manager.
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron._elect_leader_configured = True
+    cron.cluster_manager = None
+    launched = []
+    monkeypatch.setattr(
+        cron, "maybe_launch_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+
+    class Req:
+        match_info = {"name": "boot"}
+        headers: dict = {}
+
+    resp = await cron._web_start_job(Req())
+    assert resp.status == 200
+    assert launched == ["boot"]
+    assert "boot" not in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_web_start_deferred_reboot_concurrent_requests(monkeypatch):
+    # Reviewer race: two concurrent POST /jobs/{name}/start for the SAME
+    # still-pending @reboot name can both pass the pending check before the
+    # awaited mark_reboot_ran yields (the gossip push awaits peers). The
+    # loser must not 500 on a KeyError retiring an entry the winner already
+    # retired: the entry is retired exactly once, and BOTH manual starts
+    # still launch -- exactly as two manual starts of any other job would.
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "maybe_launch_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    mgr = _reboot_mgr(leader=None)
+    orig_mark = mgr.mark_reboot_ran
+
+    async def _slow_mark(name):
+        # model the real gossip push: the record awaits peers, yielding to
+        # the event loop while the pending entry is still present
+        await asyncio.sleep(0.01)
+        await orig_mark(name)
+
+    mgr.mark_reboot_ran = _slow_mark
+    cron.cluster_manager = mgr
+
+    class Req:
+        match_info = {"name": "boot"}
+        headers: dict = {}
+
+    r1, r2 = await asyncio.gather(
+        cron._web_start_job(Req()), cron._web_start_job(Req())
+    )
+    assert (r1.status, r2.status) == (200, 200)  # the loser must not 500
+    assert launched == ["boot", "boot"]  # both operator actions ran the job
+    assert "boot" not in cron._pending_reboot_jobs  # retired exactly once
+    assert mgr.reboot_ran("boot") is True  # ...and recorded cluster-wide
+
+
+@pytest.mark.asyncio
 async def test_cluster_start_survives_bad_cert_files(caplog):
     # #6: a missing/unreadable cert file is an operational misconfiguration --
     # start_stop_cluster must log it and keep running (no manager), NOT let the
@@ -2848,6 +3156,107 @@ async def test_run_drains_pending_retry_on_shutdown():
     # graceful shutdown must cancel and drain the pending retry, not orphan a
     # task or leave retry_state populated.
     assert cron.retry_state == {}
+
+
+_GATED_CLUSTER_BAD_WEB_TOKEN = """
+jobs:
+  - name: gated
+    command: echo hi
+    schedule: "0 0 * * *"
+    clusterPolicy: Leader
+web:
+  listen:
+    - http://127.0.0.1:0
+  authToken:
+    fromEnvVar: YACRON2_TEST_MISSING_TOKEN
+cluster:
+  listen: "127.0.0.1:18443"
+  tls:
+    ca: /nonexistent/ca.pem
+    cert: /nonexistent/cert.pem
+    key: /nonexistent/key.pem
+  peers:
+    - host: b:8443
+    - host: c:8443
+  electLeader: true
+"""
+
+
+@pytest.mark.asyncio
+async def test_web_config_error_does_not_disengage_cluster_gate(
+    tmp_path, monkeypatch, caplog
+):
+    # start_stop_web_app and start_stop_cluster used to share one try/except
+    # ConfigError, web first: a web misconfiguration raising ConfigError (an
+    # authToken resolving empty -- a deploy forgetting the env var) skipped
+    # start_stop_cluster on EVERY iteration, left _elect_leader_configured
+    # False, and ran every Leader job ungated on every node -- the gate
+    # failed OPEN on an unrelated web error. The cluster gate must engage
+    # (fail CLOSED) regardless of the web app's fate, and the daemon must
+    # keep running with the web API down.
+    import logging
+
+    monkeypatch.delenv("YACRON2_TEST_MISSING_TOKEN", raising=False)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_GATED_CLUSTER_BAD_WEB_TOKEN)
+    cron = yacron2.cron.Cron(str(cfg))
+
+    with caplog.at_level(logging.ERROR, logger="yacron2"):
+        task = asyncio.create_task(cron.run())
+        try:
+            await _wait_until(lambda: cron._elect_leader_configured)
+            assert not task.done()  # the daemon keeps running
+        finally:
+            cron.signal_shutdown()
+            await asyncio.wait_for(task, timeout=5)
+
+    assert cron.web_runner is None  # the web API stayed down (fail closed)
+    assert any("web.authToken" in r.message for r in caplog.records)
+    # the manager itself failed to start (bad certs) but the gate still
+    # engaged, so the Leader job fails CLOSED instead of running everywhere
+    assert cron.cluster_manager is None
+    assert cron._cluster_allows(cron.cron_jobs["gated"]) is False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stops_cluster_manager_before_job_drain():
+    # run() used to stop the cluster manager only AFTER awaiting all running
+    # jobs, so a draining leader kept its gossip liveness / lease renewal
+    # alive for the whole (unbounded) drain and every Leader job cluster-wide
+    # stalled until the slowest local job finished. Leadership must be
+    # released after retries are cancelled but BEFORE the drain, so failover
+    # proceeds while the jobs finish.
+    cron = yacron2.cron.Cron(
+        None, config_yaml=CONCURRENT_JOB.format(policy="Allow")
+    )
+    events = []
+
+    class _Mgr:
+        async def stop(self):
+            running = cron.running_jobs.get("test") or []
+            alive = any(
+                rj.proc is not None and rj.proc.returncode is None
+                for rj in running
+            )
+            events.append(("cluster-stopped", alive))
+            # leadership released; now let the drain finish by terminating
+            # the still-running job (marked cancelled so the reaper records
+            # a deliberate cancellation, not a failure).
+            for rj in running:
+                rj.cancelled = True
+                await rj.cancel()
+
+    cron.cluster_manager = _Mgr()
+    await cron.maybe_launch_job(cron.cron_jobs["test"])
+    assert cron.running_jobs["test"][0].proc.returncode is None
+    # stop before the loop's first iteration: run() goes straight to the
+    # shutdown sequence with a job still running and a manager installed.
+    cron.signal_shutdown()
+    await asyncio.wait_for(cron.run(), timeout=10)
+    # the manager was stopped while the job was still draining...
+    assert events == [("cluster-stopped", True)]
+    assert cron.cluster_manager is None
+    assert not cron.running_jobs  # ...and the drain then completed
 
 
 @pytest.mark.skipif(

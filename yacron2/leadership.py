@@ -32,10 +32,13 @@ The surface is split three ways so a new lease backend stays tiny:
   :meth:`~LeadershipBackend.view_dict`.  Every backend implements these.
 * **defaulted** -- concrete bodies on the ABC that a single-holder lease
   backend inherits unchanged (per-job ownership collapses to the leader, there
-  are no gossip-style conflicts, the cluster is logically size 1, ``@reboot``
-  gossip is a no-op, TLS rotation does not apply).  Gossip overrides every one
-  of them with its real, richer behaviour, so the gossip refactor is
-  byte-identical.
+  are no gossip-style conflicts, the cluster is logically size 1, the view is
+  never mid-convergence, TLS rotation does not apply).  The ``@reboot``
+  "already ran" defaults are the one pair :class:`LeaseBackend` replaces: it
+  persists the ran-set in the lease store (:data:`REBOOT_RAN_KEY`), scoped to
+  the job-set id, so a *failover* holder does not re-run a one-shot.  Gossip
+  overrides every one of them with its real, richer behaviour, so the gossip
+  refactor is byte-identical.
 * **never-skip (PreferLeader)** -- the ``available_*`` family, defaulted here
   to the locked decision for lease backends: a node that currently *cannot*
   reach the store runs a ``PreferLeader`` job anyway (it may double-run), while
@@ -185,6 +188,24 @@ class LeadershipBackend(abc.ABC):
     def tls_files_changed(self) -> bool:
         """Lease backends are not restarted on an mTLS cert rotation."""
         return False
+
+    def view_settled(self) -> bool:
+        """Whether a ``False`` from the never-skip ``available_*`` gates
+        positively identifies another node as the owner.
+
+        The gossip backend holds those gates closed while a freshly built
+        manager's view is still *converging* (peers not yet re-attesting its
+        new ``instance_id``; see
+        :meth:`yacron2.cluster.ClusterManager._view_settled`) -- even on the
+        rightful owner.  During that hold a ``False`` is a transient
+        fail-closed denial, not an observed ownership move, so
+        :meth:`yacron2.cron.Cron._cluster_owner_moved` must defer a pending
+        retry instead of abandoning it (abandonment would end an ``@reboot``
+        keep-alive sequence cluster-wide).  Lease backends decide the
+        ``available_*`` family from live store reads with no convergence
+        window, so the default is always ``True``; gossip overrides it.
+        """
+        return True
 
     def tls_files_loadable(self) -> bool:
         """Whether the current on-disk TLS material can be loaded right now.

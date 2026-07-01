@@ -14,8 +14,6 @@ elected leader firing scheduled jobs. It builds directly on the
 `yacron2/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
 `elect_leader`/`quorum_size` functions).
 
-*New in version 1.2.0.*
-
 > **The default `gossip` backend is best-effort coordination, not fenced
 > exactly-once.** It keeps no shared state, so it is simple to operate and
 > cannot wedge on a missing consensus store. The trade-off is that there are
@@ -282,9 +280,15 @@ cluster:
 Each node independently elects, as leader, the **lowest `nodeName`** among the
 members it currently sees *agreeing* on the job-set id, but **only if that set
 is a quorum** (a strict majority) of the cluster. **Only the leader runs
-*scheduled* jobs.** Manual runs via the API (`POST /jobs/{name}/start`) and
-automatic retries are deliberately *not* gated, so you can still trigger a job
-on any node.
+*scheduled* jobs.** Manual runs via the API (`POST /jobs/{name}/start`) are
+deliberately *not* gated, so you can still trigger a job on any node. Automatic
+*retries* re-check the gate before every relaunch: a transient fail-closed
+denial (lost quorum, a detected conflict, a rebuilt manager's still-converging
+view) merely defers the retry and re-checks it, while a *positively observed*
+ownership move abandons the pending retry (a WARNING plus a `cancelled`
+run-history record) so it cannot double-run against the new owner. The full
+defer-vs-abandon lifecycle is documented in
+[Failure Detection and Retries](Failure-Detection-and-Retries#retry-lifecycle).
 
 ### Cluster size and quorum
 
@@ -293,11 +297,20 @@ on any node.
   peer lists must be consistent across nodes for every node to compute the same
   size and quorum. This is [enforced at runtime](#consistent-cluster-size),
   not merely assumed.
-* If you accidentally list a node's own address in its own peer list, that entry
-  is recognised at runtime as `self`, never counts toward agreement, and is
-  **excluded from the cluster size**, so a self-listing is harmless: it neither
-  changes `N`/quorum nor (since `N` stays equal to what other nodes declare)
-  trips the size-consistency check below.
+* If you accidentally list a node's own address in its own peer list, an entry
+  the config load can prove is local (a loopback address on this node's port
+  under a matching listen) is rejected or warned about up front; anything else
+  (e.g. the node's own routable IP) is recognised at runtime as `self` once its
+  self-poll succeeds, never counts toward agreement, and is **excluded from the
+  cluster size**. In a genuinely 3+-node cluster that is benign (logged once at
+  INFO): it neither changes the effective `N`/quorum nor (since `N` stays equal
+  to what other nodes declare) trips the size-consistency check below. It is
+  **not** harmless at the boundary: a self-padded "3-node" config that is
+  really 2 nodes sails past the `electLeader` 2-node refusal and runs as the
+  degenerate quorum-2-of-2 cluster (both nodes must be up; any single failure
+  stops all `Leader` jobs cluster-wide), which yacron2 flags at runtime with a
+  prominent WARNING. Remove the self entry rather than relying on the
+  exclusion.
 * The computed size, quorum, elected leader, and whether this node is the leader
   are all shown at `GET /cluster` and in the dashboard panel.
 
@@ -416,11 +429,17 @@ this page.
 ### Failure handling
 
 If `electLeader` is configured but the cluster listener fails to start (bad cert
-files, a bad listen address, a port already in use), the node **fails closed**:
-it logs the error, keeps running, but its `Leader`/`PreferLeader` jobs stay idle
-rather than falling back to running everything on every replica. (`EveryNode`
-jobs are unaffected; see below.) Leadership transitions are logged each time
-the node acquires or loses scheduled-job leadership.
+files, a bad listen address, a port already in use), the node logs the error and
+keeps running, and each policy honours its own contract: `Leader` jobs **fail
+closed** and stay idle rather than falling back to running everything on every
+replica, while `PreferLeader` jobs are **never-skip** and run anyway (a node
+with no manager is exactly the "store/quorum unreachable" outage `PreferLeader`
+accepts a double-run to survive; skipping would drop the job to zero runs on a
+fleet-wide start failure). The operational consequence: a listener broken on
+*every* replica means every replica runs every `PreferLeader` firing, which is
+why `PreferLeader` is reserved for idempotent jobs. (`EveryNode` jobs are
+unaffected; see below.) Leadership transitions are logged each time the node
+acquires or loses scheduled-job leadership.
 
 ## Per-job policy
 
@@ -457,9 +476,12 @@ Notes:
 
 * `clusterPolicy` is **inert unless `cluster.electLeader` is on**. Without
   election, every job runs on every instance regardless of its policy.
-* `Leader` and `PreferLeader` jobs **fail closed** when election is configured
-  but no manager is running (e.g. the listener failed to start). `EveryNode`
-  jobs are independent of cluster health, so they keep firing regardless.
+* When election is configured but no manager is running (e.g. the listener
+  failed to start), `Leader` jobs **fail closed** (skip), while `PreferLeader`
+  jobs are **never-skip** and run anyway -- on this and every other manager-less
+  replica, the documented double-run cost, preferred to dropping the job to
+  zero runs. `EveryNode` jobs are independent of cluster health, so they keep
+  firing regardless.
 * The active policy for each job (when election is on) is shown in the
   dashboard's job drawer and included in the `GET /jobs` payload. To keep the
   per-poll payload lean for the common single-instance case, `clusterPolicy` is
@@ -472,8 +494,8 @@ The decision for one node, one firing, is exactly:
 ```text
 election off  -> run (every node runs everything)
 EveryNode     -> run (always, even if the manager failed to start)
+no manager    -> Leader skips (fail closed), PreferLeader runs (never-skip; the leadership listener failed to start, which is the very outage PreferLeader accepts a double-run to survive)
 conflict      -> skip (fail closed; a duplicate nodeName, a cluster-size disagreement, OR a coordination-policy mismatch is visible)
-no manager    -> skip (fail closed; the leadership listener failed to start)
 PreferLeader  -> run only if this node is the lowest reachable agreeing node
 Leader        -> run only if this node is the quorum-gated elected leader
 ```
@@ -487,6 +509,20 @@ it is the third trigger of the umbrella `conflict` flag alongside `conflict_name
 and `size_conflict`. Under `distribution: spread`, described next, the last two
 lines become "the *per-job owner* among the reachable agreeing nodes" and "the
 quorum-gated *per-job owner*" respectively.)
+
+One transient exception to `PreferLeader`'s never-skip (gossip backend only): a
+node whose manager was just (re)built -- a cold boot, or a reload that changed
+the `cluster` section -- holds its never-skip gates **closed** while its view is
+still converging: until every configured peer has been polled once, and
+(bounded by about two poll `interval`s) until the current-build agreeing peers
+re-attest this incarnation. Without the hold, a fresh manager's blank view
+would elect *itself* on every node at once and double-run each due
+`PreferLeader` firing on a healthy cluster. The cost is the mirror image: a
+`PreferLeader` firing due inside that window is skipped -- on *every* node when
+the held node is the rightful owner, since its peers still defer to it --
+transient and self-healing, the same fail-closed trade the quorum gate makes.
+A pending retry treats the hold as a transient denial (deferred, never
+abandoned).
 
 ### `@reboot` jobs under leader election
 
@@ -531,11 +567,20 @@ name being present *and* still a `Leader`/`PreferLeader` `@reboot`, so:
   considered gone and the new job is left to its own scheduling.
 
 On a **lease backend** the same deferral applies, translated to lease vocabulary:
-a `Leader` `@reboot` runs once **on the lease holder** (and skips while the store
-is unreachable), a `PreferLeader` `@reboot` runs on **this** node when the store
-is unreachable (a possible boot-time double-run), and `EveryNode` is not
-deferred. There is no cross-node "already ran" gossip on a single-holder store,
-so a non-owner replica simply does not run the deferred one-shot.
+a `Leader` `@reboot` runs on **the lease holder** (and skips while the store is
+unreachable), a `PreferLeader` `@reboot` runs on **this** node when the store is
+unreachable (a possible boot-time double-run), and `EveryNode` is not deferred.
+The cross-node "already ran" record that gossip advertises peer-to-peer is
+**persisted in the lease store** instead (a Kubernetes Lease annotation, an etcd
+sibling key), scoped to the current [job-set id](#the-job-set-id-foundation), so
+a failover holder does not re-run the one-shot. Because the store outlives the
+processes, this shifts the semantics: a `Leader` `@reboot` runs **once per job
+configuration**, not once per boot. Restarting the whole fleet with an unchanged
+config does *not* re-fire it -- every node reads the record back and retires the
+one-shot without running it. It fires again only when the job set changes (a new
+job-set id invalidates the stored record), so a warm-up or migration step that
+must run on every deploy cannot rely on a leader-gated `@reboot` here unless the
+deploy also changes the job set.
 
 ## Distribution: one leader, or spread the load
 
@@ -699,7 +744,7 @@ probes that endpoint on each replica. Useful alerts:
 | --- | --- | --- |
 | `quorate` is `false` for more than a few `interval`s | `quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
 | `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes`, `policy_conflict`, `conflicting_policies` | a duplicate `nodeName`, a cluster-size disagreement, or a coordination-policy (`distribution`/`elect_leader`) mismatch is pausing `Leader` jobs (page on this) |
-| `agreed` peers fall below `quorum − 1` | count of `peers[].status == "agreed"` vs `quorum` | the cluster is one failure from losing quorum |
+| `agreed` peers fall below `quorum` | count of `peers[].status == "agreed"` vs `quorum` | the cluster is one failure from losing quorum (this node counts itself toward quorum, so `quorum − 1` agreed peers is the last quorate state; any fewer duplicates the `quorate` alert) |
 | any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | a peer's certificate failed verification (often a botched cert rotation; see [Certificate rotation](#certificate-rotation)) |
 
 A blackbox / JSON-exporter probe (Prometheus `json_exporter`, a Nagios check,
@@ -982,9 +1027,9 @@ before deploying; see the [Command-Line Reference](CLI-Reference).
   and otherwise falls back to a hand-rolled apiserver REST transport over the
   core `aiohttp` dependency, so on an architecture without the client it still
   works. `http` forces the REST transport; `library` **requires** the native
-  client and fails the backend start (the node then fails closed) if it is not
-  importable. Both transports drive the same Lease, so the choice is purely
-  about which client code runs.
+  client and fails the backend start (the node's `Leader` jobs then fail closed)
+  if it is not importable. Both transports drive the same Lease, so the choice
+  is purely about which client code runs.
 * **Failover timing.** A holder that dies is replaced within
   ~`leaseDurationSeconds`. On a *graceful* shutdown the holder clears
   `holderIdentity` so a survivor takes over immediately. Shorter durations fail

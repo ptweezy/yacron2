@@ -36,13 +36,13 @@ strictyaml schema and `DEFAULT_CONFIG`.
 |---|---|---|---|
 | `captureStdout` | boolean | `false` | Capture the job's standard output: read, prefix, re-emit to yacron2's stdout, and retain for reports/failure checks. |
 | `captureStderr` | boolean | `true` | Capture the job's standard error: read, prefix, re-emit to yacron2's stderr, and retain for reports/failure checks. |
-| `streamPrefix` | string | `"[{job_name} {stream_name}] "` | Format string prepended to each re-emitted captured line. Supports `{job_name}` and `{stream_name}`. Set to `""` to disable. New in version 0.16. |
+| `streamPrefix` | string | `"[{job_name} {stream_name}] "` | Format string prepended to each re-emitted captured line. Supports `{job_name}` and `{stream_name}`. Set to `""` to disable. |
 | `saveLimit` | integer | `4096` | Maximum number of lines retained per captured stream for reporting. Must be `>= 0`; `0` retains nothing but still counts discarded lines. |
 | `maxLineLength` | integer | `16777216` (16 MiB) | Maximum length, in bytes, of a single line the underlying asyncio reader will buffer. Must be `> 0`. Lines exceeding it are skipped with a warning. |
 
 `saveLimit` and `maxLineLength` are validated at config load time: a non-integer
 fails the strictyaml schema, and `saveLimit < 0` or `maxLineLength <= 0` raises
-a `ConfigError`. (Range validation new in yacron2 1.0.)
+a `ConfigError`.
 
 ## What "capture" means
 
@@ -132,7 +132,7 @@ discards occurred and when the bottom buffer is non-empty.
 
 ### saveLimit = 0
 
-`saveLimit` may be set to `0`. (New in version 0.6.) With `saveLimit: 0`, no
+`saveLimit` may be set to `0`. With `saveLimit: 0`, no
 lines are retained at all: every line is counted as discarded. The lines are
 still decoded and re-emitted with their prefix as usual; only the in-memory
 retention for reports is suppressed. The discard count is preserved, which

@@ -25,11 +25,11 @@ operator-facing walkthrough.
 | `yacron2/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`), and `JobRetryState`. |
 | `yacron2/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and by `cluster.py` (peer comparison). |
-| `yacron2/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory that builds the one named by `cluster.backend` (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`) via deferred imports. New in version 1.2.0. |
-| `yacron2/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). New in version 1.2.0. |
-| `yacron2/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. New in version 1.2.0. |
-| `yacron2/backends/__init__.py` | Shared backend helpers, notably the pure `select_transport(client_library, native_available, backend)` used by the kubernetes backend to pick its transport (`auto` prefers the native client, `library` requires it, `http` forces the hand-rolled path). New in version 1.2.0. |
-| `yacron2/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. New in version 1.2.0. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
+| `yacron2/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory that builds the one named by `cluster.backend` (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`) via deferred imports. |
+| `yacron2/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). |
+| `yacron2/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. |
+| `yacron2/backends/__init__.py` | Shared backend helpers, notably the pure `select_transport(client_library, native_available, backend)` used by the kubernetes backend to pick its transport (`auto` prefers the native client, `library` requires it, `http` forces the hand-rolled path). |
+| `yacron2/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `yacron2/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
 | `yacron2/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
@@ -99,11 +99,8 @@ in order:
    does not dereference an unbound config later in the body. Any other
    exception is logged as `"please report this as a bug (1)"`.
 
-2. **Web app start/stop.** `await self.start_stop_web_app(config.web_config)`
-   reconciles the running aiohttp server against the (possibly changed) web
-   config. (See "Web control app".)
-
-3. **Cluster start/stop.** `await self.start_stop_cluster(config.cluster_config)`
+2. **Cluster start/stop.** `await self.start_stop_cluster(config.cluster_config)`
+   runs inside the same `try` as `update_config`, immediately after it, and
    reconciles the leadership backend (`self.cluster_manager`, typed
    `Optional[LeadershipBackend]`, so it may be the gossip `ClusterManager` or a
    `KubernetesBackend`/`EtcdBackend`) against the (possibly changed) `cluster`
@@ -117,6 +114,17 @@ in order:
    `self.job_set_id` each round), so only a change to the cluster section itself
    needs a restart. (See "Cluster manager" and
    [Clustering and Leader Election](Clustering-and-Leader-Election).)
+
+3. **Web app start/stop.** `await self.start_stop_web_app(config.web_config)`
+   reconciles the running aiohttp server against the (possibly changed) web
+   config. It runs only when the config parsed, and *after* the cluster
+   reconcile, under its **own** error handling: a `ConfigError` (e.g. an
+   `authToken` that resolves empty) logs `"Error in the web configuration, so
+   not starting the web API"` and leaves only the web API down -- the rest of
+   the new config (jobs, cluster, logging) is still applied, so a web
+   misconfiguration can never skip the cluster gate (which would fail *open*).
+   Any other exception here is logged as `"please report this as a bug (4)"`.
+   (See "Web control app".)
 
 4. **Logging config.** If the reloaded config has a non-`None`
    `logging_config` that differs from `applied_logging_config`,
@@ -189,12 +197,19 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
 1. Drains pending retries: while `self.retry_state` is non-empty, it
    `cancel_job_retries(name)` for every entry concurrently via
    `asyncio.gather`.
-2. `await self._wait_for_running_jobs_task` awaits the reaper, which only
+2. If a leadership backend is running, logs `"Stopping cluster manager"` and
+   `await self.cluster_manager.stop()` (which releases leadership best-effort
+   for fast failover: gossip cancels the poll loop and tears down the mTLS
+   `/peer` listener; a lease backend cancels its renew loop and releases its
+   lease). Leadership is released *before* the running-job drain below: the
+   drain is unbounded, and holding leadership through it would stall every
+   `Leader` job cluster-wide until the slowest local job finishes. The
+   trade-off is confined to the still-draining jobs: the new owner may start
+   one of those while it finishes here -- the same overlap a crash produces.
+   (Retries were all cancelled in step 1, so no retry task consults the
+   stopped manager.)
+3. `await self._wait_for_running_jobs_task` awaits the reaper, which only
    returns once `self.running_jobs` is empty and the stop event is set.
-3. If a leadership backend is running, logs `"Stopping cluster manager"` and
-   `await self.cluster_manager.stop()` (which releases leadership best-effort for
-   fast failover: gossip cancels the poll loop and tears down the mTLS `/peer`
-   listener; a lease backend cancels its renew loop and releases its lease).
 4. If a web server is running, logs `"Stopping http server"` and
    `await self.web_runner.cleanup()`.
 
@@ -248,7 +263,7 @@ See [HTTP Control API](HTTP-API) for the request/response contract.
 
 ## Cluster manager
 
-Leader election sits behind a pluggable-backend seam (new in version 1.2.0). The
+Leader election sits behind a pluggable-backend seam. The
 scheduler never talks to a concrete cluster implementation directly: it only ever
 asks *am I allowed to run this job?* through a handful of methods on whatever
 object `cluster.backend` selected. That seam is the `LeadershipBackend` ABC in
@@ -270,12 +285,18 @@ tiny: the *core abstract* methods every backend implements (`start`, `stop`,
 `is_leader`, `leader_name`, `is_quorate`, `view_dict`); *defaulted* bodies a
 single-holder lease backend inherits unchanged (per-job ownership collapses to
 the leader, there are no gossip-style conflicts, the cluster is logically size 1,
-`@reboot` gossip is a no-op, TLS rotation does not apply); and the *never-skip*
-`available_*` family, defaulted to the locked lease semantics (a node that
-currently cannot reach the store runs a `PreferLeader` job anyway, while a node
-that can see the holder defers; `Leader` stays fail-closed). Gossip overrides
-every defaulted method with its richer behaviour, so the gossip path is
-byte-identical to before the seam existed. The two lease backends share
+the view is never mid-convergence, TLS rotation does not apply); and the
+*never-skip* `available_*` family, defaulted to the locked lease semantics (a
+node that currently cannot reach the store runs a `PreferLeader` job anyway,
+while a node that can see the holder defers; `Leader` stays fail-closed). The
+`@reboot` "already ran" defaults (`reboot_ran` false, `mark_reboot_ran` a no-op)
+are the one pair `LeaseBackend` **replaces** rather than inherits: it persists
+the ran-set in the lease store (a Lease annotation / etcd sibling key under
+`REBOOT_RAN_KEY`), scoped to the job-set id, so a *failover* holder does not
+re-run a one-shot (see
+[Clustering and Leader Election](Clustering-and-Leader-Election)). Gossip
+overrides every defaulted method with its richer behaviour, so the gossip path
+is byte-identical to before the seam existed. The two lease backends share
 `LeaseBackend`, which pins `distribution` to `"single-leader"` and provides the
 common lease-shaped `view_dict()`; both talk to their store over plain HTTP via
 the core `aiohttp` dependency (no grpc/protobuf wheels), keeping the wide

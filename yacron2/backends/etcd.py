@@ -345,7 +345,12 @@ class EtcdBackend(LeaseBackend):
         # monotonic deadlines: the load-bearing fence/freshness gates (immune
         # wall-clock steps; see _monotonic)
         self._lease_deadline_mono: Optional[float] = None
-        self._last_contact_mono: Optional[float] = None
+        # quorum freshness deadline, FIXED at each successful round's contact
+        # instant (contact + the effective ttl in effect at THAT contact; see
+        # _apply_round). A deadline -- not a live contact + current-ttl
+        # computation -- so the not-quorate cadence widening in _renew_once
+        # cannot retroactively resurrect is_quorate() with zero store contact.
+        self._quorum_deadline_mono: Optional[float] = None
 
         self._auth_token: Optional[str] = None
         self._ssl: Optional[ssl.SSLContext] = None
@@ -455,9 +460,16 @@ class EtcdBackend(LeaseBackend):
         return self._holder
 
     def is_quorate(self) -> bool:
-        if self._last_contact_mono is None:
+        if self._quorum_deadline_mono is None:
             return False
-        return _monotonic() < self._last_contact_mono + self._effective_ttl
+        # The deadline was FIXED when the last successful round landed (see
+        # _apply_round): recomputing it live from the mutable _effective_ttl
+        # would let the not-quorate cadence widening in _renew_once (narrowed
+        # server ttl -> configured ttl) re-extend an already-lapsed freshness
+        # window around the OLD contact, flipping this back to True with zero
+        # store contact and re-deferring never-skip PreferLeader jobs to a
+        # possibly-dead stale holder.
+        return _monotonic() < self._quorum_deadline_mono
 
     def lease_detail(self) -> Dict[str, Any]:
         from yacron2.backends.kubernetes import _format_microtime
@@ -521,20 +533,25 @@ class EtcdBackend(LeaseBackend):
         (see :func:`campaign_won`); ``holder`` is the display name stored at
         the key (whoever currently holds it).  ``now`` is wall-clock (for the
         displayed expiry).  ``mono`` is the matching monotonic instant the
-        freshness gate (``is_quorate``) uses, captured at round END -- the safe
-        (fresher) direction for freshness.  ``lease_mono`` is a monotonic
-        instant captured just BEFORE the lease-renewing keepalive/grant POST is
-        sent -- a guaranteed lower bound on when the server reset our lease's
-        TTL; the leadership FENCE is anchored to *that*, never to the later
-        round-end ``mono``, so neither the keepalive/grant round-trip nor a
-        slow campaign can push our local ``is_leader`` deadline past the
-        server's lease expiry and let a second node win the freed key (two
-        leaders).
+        quorum freshness deadline (``is_quorate``) is fixed from, captured at
+        round END -- the safe (fresher) direction for freshness.
+        ``lease_mono`` is a monotonic instant captured just BEFORE the
+        lease-renewing keepalive/grant POST is sent -- a guaranteed lower
+        bound on when the server reset our lease's TTL; the leadership FENCE
+        is anchored to *that*, never to the later round-end ``mono``, so
+        neither the keepalive/grant round-trip nor a slow campaign can push
+        our local ``is_leader`` deadline past the server's lease expiry and
+        let a second node win the freed key (two leaders).
         Both default to the current monotonic clock for the pure unit tests.
         """
         if mono is None:
             mono = _monotonic()
-        self._last_contact_mono = mono
+        # Fix the quorum freshness deadline HERE, from the effective ttl in
+        # effect at THIS contact. It must never be recomputed later from the
+        # mutable _effective_ttl (see is_quorate): only a successful round may
+        # extend it, so no post-hoc ttl change can move an established
+        # deadline.
+        self._quorum_deadline_mono = mono + self._effective_ttl
         if holder is None and not is_leader:
             # We lost the campaign (a holder exists, bound to another node's
             # lease) but its identity was unparseable -- only reachable via a
@@ -904,7 +921,11 @@ class EtcdBackend(LeaseBackend):
         # Widen the cadence back to the configured ttl so this round's
         # reconnect POSTs get the full budget; a successful keepalive/grant
         # re-narrows to whatever etcd actually grants, so the fence is never
-        # computed from this widened value while we hold leadership.
+        # computed from this widened value while we hold leadership. Quorum is
+        # likewise immune: is_quorate() checks a deadline FIXED at the last
+        # successful contact (see _apply_round), so this widening cannot
+        # retroactively resurrect an already-expired quorum -- and so re-close
+        # the never-skip PreferLeader gate -- without a real contact.
         if not self.is_quorate() and self._effective_ttl < self.ttl:
             self._effective_ttl = self.ttl
         lease_mono: Optional[float] = None
@@ -935,7 +956,7 @@ class EtcdBackend(LeaseBackend):
             raise aiohttp.ClientError("etcd lease grant returned no id")
         holder, won = await self._campaign(self._lease_id)
         # ``now``/``mono`` are sampled at round END -- the safe (fresher)
-        # direction for the is_quorate freshness gate (_last_contact_mono). The
+        # direction for the is_quorate deadline (_quorum_deadline_mono). The
         # leadership fence is anchored to ``lease_mono`` above (the keepalive/
         # grant landing) instead, so the campaign's latency cannot push it past
         # the server lease's expiry. See _apply_round.

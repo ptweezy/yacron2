@@ -443,6 +443,76 @@ def test_gossip_fqdn_self_listing_warns_degenerate_size():
     assert any("FQDN" in w for w in warnings)
 
 
+def test_gossip_localhost_self_listing_warns_degenerate_size():
+    # SELF-BY-IP hardening (config-time half): a "localhost" peer on our own
+    # port cannot be dropped without DNS resolution, but it can never be
+    # another host either -- a 3-node config carrying it is really 2 nodes at
+    # runtime, the degenerate mode the size==2 refusal exists to catch. Warn,
+    # like the FQDN self-listing.
+    cfg = _cluster(
+        "cluster:\n"
+        "  listen: '0.0.0.0:8443'\n"
+        "  nodeName: node-a\n"
+        "  electLeader: true\n"
+        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
+        "  peers:\n"
+        "    - host: localhost:8443\n"
+        "    - host: node-b:8443\n"
+    )
+    warnings = cluster_config_warnings(cfg)
+    assert any("loopback" in w for w in warnings)
+
+
+def test_gossip_family_mismatched_loopback_warns():
+    # a loopback literal that _is_self_listed could not drop as unambiguous
+    # (here: v6 loopback under a v4-only wildcard bind) still points at this
+    # host at best, so it gets the same advisory.
+    cfg = _cluster(
+        "cluster:\n"
+        "  listen: '0.0.0.0:8443'\n"
+        "  nodeName: node-a\n"
+        "  electLeader: true\n"
+        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
+        "  peers:\n"
+        "    - host: '[::1]:8443'\n"
+        "    - host: node-b:8443\n"
+    )
+    warnings = cluster_config_warnings(cfg)
+    assert any("loopback" in w for w in warnings)
+
+
+def test_gossip_loopback_advisory_scope():
+    # no advisory for a loopback peer on a DIFFERENT port (a colocated second
+    # daemon is a legitimate member -- the pattern the test suite itself
+    # uses), nor when enough real peers remain (> 2 nodes after discounting).
+    off_port = _cluster(
+        "cluster:\n"
+        "  listen: '0.0.0.0:8443'\n"
+        "  nodeName: node-a\n"
+        "  electLeader: true\n"
+        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
+        "  peers:\n"
+        "    - host: localhost:9443\n"
+        "    - host: node-b:8443\n"
+    )
+    assert not any(
+        "loopback" in w for w in cluster_config_warnings(off_port)
+    )
+    big = _cluster(
+        "cluster:\n"
+        "  listen: '0.0.0.0:8443'\n"
+        "  nodeName: node-a\n"
+        "  electLeader: true\n"
+        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
+        "  peers:\n"
+        "    - host: localhost:8443\n"
+        "    - host: node-b:8443\n"
+        "    - host: node-c:8443\n"
+        "    - host: node-d:8443\n"
+    )
+    assert not any("loopback" in w for w in cluster_config_warnings(big))
+
+
 # --- warnings -------------------------------------------------------------
 
 

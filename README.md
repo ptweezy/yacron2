@@ -433,7 +433,7 @@ jobs:
     captureStdout: true
 ```
 
-Since Yacron2 version 0.11, you can also request that the schedule be
+You can also request that the schedule be
 interpreted in an arbitrary timezone, using the `timezone` attribute:
 
 ```yaml
@@ -520,7 +520,7 @@ email, Sentry and shell command (additional reporting methods might be added in 
           # Alternatively:
           # fromFile: /etc/secrets/my-secret-dsn
           # fromEnvVar: SENTRY_DSN
-        fingerprint:  # optional, since yacron2 0.6
+        fingerprint:  # optional
           - yacron2
           - "{{ environment.HOSTNAME }}"
           - "{{ name }}"
@@ -560,7 +560,7 @@ the same standard output and standard error as yacron2 itself.
 
 Both *stdout* and *stderr* stream lines are by default prefixed with
 `[{job_name} {stream_name}]`, i.e. `[test-01 stdout]`, if for any reason you
-need to change this, provide the option `streamPrefix` (new in version 0.16)
+need to change this, provide the option `streamPrefix`
 with your own custom string.
 
 ```yaml
@@ -601,7 +601,7 @@ It is possible also to report job success, as well as failure, via the
         smtpHost: 127.0.0.1
 ```
 
-Since yacron2 0.5, it is possible to customize the format of the report. For
+It is possible to customize the format of the report. For
 `mail` reporting, the option `subject` indicates what is the subject of the
 email, while `body` formats the email body.  For Sentry reporting, there is
 only `body`.  In all cases, the values of those options are strings that are
@@ -640,7 +640,7 @@ Example:
           (exit code: {{exit_code}})
 ```
 
-The shell reporter (since yacron2 0.13) executes a user given shell command in
+The shell reporter executes a user given shell command in
 the specified shell. It passes all environment variables from the python
 executable and specifies some additional ones to inform about the state of the
 job:
@@ -668,7 +668,7 @@ A simple example configuration:
         command: echo "Error code $YACRON2_RETCODE"
 ```
 
-Since yacron2 0.15, it is possible to send emails formatted as html, by  adding
+It is possible to send emails formatted as html, by adding
 the `html: true` property.  For example, here the standard output of a shell
 command is captured and interpreted as html and placed in the email message:
 
@@ -820,8 +820,6 @@ Replace
 
 ### Execution timeout
 
-(new in version 0.4)
-
 If you have a cron job that may possibly hang sometimes, you can instruct yacron2
 to terminate the process after N seconds if it's still running by then, via the
 `executionTimeout` option.  For example, the following cron job takes 2
@@ -870,8 +868,6 @@ will send it a SIGKILL after half a second:
 
 ### Change to another user/group
 
-(new in version 0.11)
-
 You can request that Yacron2 change to another user and/or group for a specific
 cron job.  The field `user` indicates the user (uid or userame) under which
 the subprocess must be executed.  The field `group` (gid or group name)
@@ -895,8 +891,6 @@ with `user` or `group` set is rejected with a configuration error; see
 [Running on Windows](#running-on-windows).
 
 ### Remote web/HTTP interface
-
-(new in version 0.10)
 
 If you wish to remotely control yacron2, you can optionally enable an HTTP REST
 interface, with the following configuration (example):
@@ -1179,8 +1173,6 @@ It is available three ways:
 
 ### Clustering and leader election
 
-(new in version 1.2.0)
-
 By default yacron2 runs as a single instance and every replica runs every job.
 An optional `cluster` section lets several replicas coordinate: each node serves
 a small `GET /peer` endpoint over **mutual TLS** and periodically polls its
@@ -1212,7 +1204,7 @@ members it currently sees agreeing on the job-set id, but only if that set is a
 **quorum** (a strict majority) of the cluster, so under a clean partition at
 most one side leads. This is best-effort (the default `gossip` backend keeps no
 shared state); for a fenced, exactly-once guarantee set
-`cluster.backend: kubernetes` or `cluster.backend: etcd` (new in version 1.2.0)
+`cluster.backend: kubernetes` or `cluster.backend: etcd`
 to elect through a `coordination.k8s.io/v1` `Lease` or a lease-bound etcd key
 instead.
 
@@ -1234,8 +1226,6 @@ are all covered in depth in the
 guide in the wiki. To watch it live, see [Try it](#web-dashboard) below.
 
 ### Includes
-
-(new in version 0.13)
 
 You may have a use case where it's convenient to have multiple config files,
 and choose at runtime which one to use.  In that case, it might be useful if
@@ -1300,8 +1290,6 @@ logging:
 ### Obscure configuration options
 
 #### enabled: true|false (default true)
-
-(new in yacron2 0.18)
 
 It is possible to disable a specific cron job by adding a `enabled: false` option.  Jobs
 with `enabled: false` will simply be skipped, as if they aren't there, apart from

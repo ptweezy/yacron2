@@ -62,9 +62,8 @@ The following variables are available when rendering any report template:
 | `shell` | str | The job's shell. |
 | `environment` | dict or None | The subprocess environment (`None` when the job defines no `environment`). |
 
-Templating support was added in yacron2 0.5. The README's variable list omits
-`fail_reason`; the code provides it (it is also used by the default body
-template). To capture output for inclusion in reports, enable `captureStderr`
+The README's variable list omits `fail_reason`; the code provides it (it is
+also used by the default body template). To capture output for inclusion in reports, enable `captureStderr`
 (on by default) and/or `captureStdout`. See [Output Capturing](Output-Capturing).
 
 ### Default templates
@@ -141,7 +140,7 @@ Notes on behavior:
 - The SMTP connection is always closed, even if `STARTTLS`, login, or sending
   raises, so a misbehaving server cannot leak one connection per report.
 - `html: true` uses `set_content(body, subtype="html")`, which sets the correct
-  charset and transfer-encoding for non-ASCII HTML (new in yacron2 0.15).
+  charset and transfer-encoding for non-ASCII HTML.
 
 Minimal failure-mail example:
 
@@ -213,8 +212,6 @@ Notes on behavior:
   Your `extra` map is merged on top of these.
 - Capture uses an isolated scope (`sentry_sdk.new_scope()`); the configured
   `fingerprint` and extras are applied per event.
-- `fingerprint` was added in yacron2 0.6; `extra` and `level` in 0.8;
-  `environment` and a larger `maxStringLength` in 0.14.
 
 **Fingerprint merge semantics:** `fingerprint` is a replace-not-append setting.
 When a `defaults` block or a job supplies its own `fingerprint`, it overrides the
@@ -250,7 +247,7 @@ jobs:
 ## Shell reporter
 
 Runs a user-supplied command, passing job state through `YACRON2_*` environment
-variables. The shell reporter was added in yacron2 0.13.
+variables.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -298,8 +295,7 @@ argument/environment sizes. yacron2 truncates each stream to a maximum of
 **16 KiB** (`1024 * 16`) when either stream individually, or the two combined,
 exceeds that limit. `YACRON2_STDERR_TRUNCATED` / `YACRON2_STDOUT_TRUNCATED`
 indicate per-stream whether truncation occurred. The README lists the first eight
-variables but omits the `*_TRUNCATED` pair; both are set by the code (long-line
-truncation handling dates from yacron2 0.17).
+variables but omits the `*_TRUNCATED` pair; both are set by the code.
 
 Example:
 

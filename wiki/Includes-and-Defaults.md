@@ -33,7 +33,7 @@ schema.
 When `-c` points at a directory, `_parse_config_dir` enumerates the directory's
 entries with `os.scandir` and processes them in sorted filename order (sorting
 makes job ordering and "first config found" error messages deterministic rather
-than dependent on filesystem order, a fix new in 1.0.4).
+than dependent on filesystem order).
 
 For each entry, the name is split into base and extension:
 
@@ -57,10 +57,7 @@ Per-file parse errors are collected (keyed by path) and, if any occurred,
 raised together as a single `ConfigError` whose message joins the individual
 errors with `\n---`. An empty directory, or one where every entry is skipped,
 yields an empty `Yacron2Config` (empty `jobs`, no `web`, empty `job_defaults`,
-no `logging`) rather than an error. Aggregating jobs/defaults/logging across all
-files (instead of using only the last file's settings), rejecting duplicate
-`web`/`logging` blocks, and the empty-directory result are all behaviors new in
-1.0.4.
+no `logging`) rather than an error.
 
 ### Defaults are scoped per YAML file in directory mode
 
@@ -149,7 +146,7 @@ also returned as the file's `job_defaults`.
 both define `environment`, they are merged into a dictionary keyed by `key`
 (default entries first, then the job's), so a job's variable **overrides** the
 default with the same name instead of producing two list entries with the same
-key. This is a behavior change in 1.0.0 (previously the lists were concatenated,
+key. This is a behavior change from yacron (which concatenated the lists,
 yielding duplicate-keyed entries). See [Commands and Environment](Commands-and-Environment)
 for `environment` and `env_file`.
 
@@ -180,14 +177,13 @@ The Sentry `fingerprint` (a list of strings, default
 replace-not-append setting: a job or `defaults` block that supplies its own
 `fingerprint` overrides the default list entirely. Plain list concatenation
 would silently prepend the three default entries, making custom Sentry issue
-grouping impossible. This replace behavior is a fix new in 1.0.4. See
-[Reporting](Reporting) for the Sentry reporter.
+grouping impossible. See [Reporting](Reporting) for the Sentry reporter.
 
 All other list-valued options concatenate.
 
 ## The `include` directive
 
-`include` is an optional list of file paths (new in 0.13). Each path is resolved
+`include` is an optional list of file paths. Each path is resolved
 relative to the directory of the **including** file
 (`os.path.join(os.path.dirname(path), include)`). Included files are parsed
 recursively with `parse_config_file`, and their results are merged into the
@@ -249,7 +245,7 @@ also defined jobs, those jobs would carry `_inc.yaml`'s own defaults and would
 is threaded through the recursive include parse. A file that includes itself,
 directly or transitively, raises a clear
 `ConfigError("include cycle detected at <path>")` instead of recursing until a
-`RecursionError` (a fix new in 1.0.4). The `_seen` set is scoped to a single
+`RecursionError`. The `_seen` set is scoped to a single
 top-level `parse_config_file` call (it starts empty), so two independent files
 that both include a common fragment are **not** flagged as a cycle: diamond
 includes are allowed; only true cycles are rejected.

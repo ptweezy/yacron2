@@ -133,7 +133,7 @@ The Schedule tab turns the cron expression into something you can read at a glan
 
 ## Cluster panel
 
-*New in version 1.2.0.* When a [`cluster`](Clustering-and-Leader-Election)
+When a [`cluster`](Clustering-and-Leader-Election)
 section is configured, the dashboard shows a **cluster panel** below the job
 table (it stays hidden otherwise). The panel polls `GET /cluster` alongside the
 job list and renders:

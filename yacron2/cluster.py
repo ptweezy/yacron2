@@ -194,6 +194,16 @@ _STALE_STATUSES = frozenset(
     {STATUS_UNKNOWN, STATUS_UNREACHABLE, STATUS_UNTRUSTED}
 )
 
+# Completed poll rounds after which the never-skip available_* gates stop
+# holding for a reachable AGREED peer that has not yet attested this (new)
+# instance back (see ClusterManager._view_settled). Mutual attestation after
+# a (re)start needs the peer to poll our fresh instance_id and us to then
+# re-poll the peer, which completes within two full intervals; a peer still
+# not attesting after three rounds is a genuinely one-way link, and the
+# never-skip contract then leans toward running (a possible double-run)
+# rather than standing this node down indefinitely.
+_SETTLE_ROUNDS = 3
+
 # Cap on the peer /peer response we will buffer per poll. The legitimate
 # payload is a small JSON object (a fixed header plus one short member entry
 # per node), so this is generous for clusters into the hundreds of nodes while
@@ -938,6 +948,15 @@ class ClusterManager(LeadershipBackend):
         # so a config change cannot carry a stale "already ran" across it.
         self._ran_reboot_jobs: Set[str] = set()
         self._ran_jobs_job_set_id: Optional[str] = None
+        # completed peer-poll rounds since this manager was built. A rebuilt
+        # manager mints a fresh instance_id, so peers cannot attest it back
+        # until they have re-polled it (~1-2 intervals); this counter bounds
+        # the convergence hold _view_settled() places on the never-skip
+        # available_* gates during that window.
+        self._poll_rounds = 0
+        # emit-once latch for the degenerate 2-of-2 self-listing warning
+        # (see _maybe_warn_degenerate_self_listing).
+        self._warned_degenerate_self = False
 
     # --- the mTLS /peer server -------------------------------------------
 
@@ -1091,6 +1110,25 @@ class ClusterManager(LeadershipBackend):
                 len(self.config["peers"]),
                 self.config["interval"],
             )
+            # Run one full poll round up front so the never-skip available_*
+            # gates and reboot_ran() reflect a real read of the peers BEFORE
+            # the first spawn_jobs, mirroring the lease backends' inline
+            # store round (see backends/etcd.py / backends/kubernetes.py
+            # start()). Without it the view is never-polled for the whole
+            # startup pass: every node sees only itself, so every PreferLeader
+            # job runs on every node at boot (and on every reload that
+            # rebuilds the manager), and a restarted node re-runs deferred
+            # @reboot one-shots its peers' ran_reboot_jobs gossip would have
+            # retired. Bounded by connectTimeout (the per-peer polls run
+            # concurrently) and best-effort: a failed round records the peers
+            # unreachable -- the genuine "peer down" state the gates already
+            # price in.
+            try:
+                await self._poll_all()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive, as _poll_loop
+                logger.exception("cluster: initial peer poll round failed")
             self._poll_task = asyncio.create_task(self._poll_loop())
         except BaseException:
             # bad listen address (ValueError) or bind failure (OSError, e.g.
@@ -1228,6 +1266,14 @@ class ClusterManager(LeadershipBackend):
                     peers[index]["host"],
                     result,
                 )
+        # one full round completed: every configured peer now carries a real
+        # observation (success or failure); feeds _view_settled()'s bound.
+        self._poll_rounds += 1
+        # Re-run the degenerate-self check with the round's full information:
+        # at the SELF transition itself a coexisting multi-homed duplicate
+        # may not have been deduped yet (cluster_size() one larger for that
+        # instant), and a transition-only check would then never fire.
+        self._maybe_warn_degenerate_self_listing()
 
     async def _poll_peer(
         self, session: aiohttp.ClientSession, host: str, my_id: str
@@ -1290,8 +1336,71 @@ class ClusterManager(LeadershipBackend):
                 host,
                 peer.last_error,
             )
+        elif new == STATUS_SELF:
+            # a self-listing config-time dedup could not catch (e.g. this node
+            # listed by its own IP under a wildcard listen; see
+            # config._is_self_listed) was just identified by its self-poll.
+            # The entry is excluded from cluster_size(), so the declared N was
+            # one larger than the real cluster -- which, at the boundary,
+            # means the config sailed past the electLeader size==2 refusal and
+            # the cluster is really the degenerate 2-real-node mode it exists
+            # to forbid. That case gets a prominent warning; any other
+            # self-listing is benign and logged once at INFO. The degenerate
+            # check also re-runs at the end of every poll round (_poll_all):
+            # at this instant a coexisting multi-homed duplicate peer may not
+            # be deduped yet (cluster_size() transiently one larger), and a
+            # transition-only check would downgrade the warning to this INFO
+            # line forever.
+            if not self._maybe_warn_degenerate_self_listing():
+                logger.info(
+                    "cluster: peer %s is this node itself (a self-listing); "
+                    "excluded from the cluster size",
+                    host,
+                )
         elif new == STATUS_AGREED and prev != STATUS_SELF:
             logger.info("cluster: peer %s now agreed", host)
+
+    def _maybe_warn_degenerate_self_listing(self) -> bool:
+        """Warn (once) when a runtime-identified self-listing leaves the
+        effective ``electLeader`` cluster at 2 real nodes -- the degenerate
+        quorum-2-of-2 mode the config-time size==2 refusal exists to forbid
+        (both nodes must be up; any single failure stops all Leader jobs
+        cluster-wide, strictly worse than a single replica).
+
+        Returns whether the warning fired *now* (the caller then skips its
+        benign INFO line).  Evaluated at the SELF transition AND at the end
+        of every poll round: at the transition instant a coexisting
+        multi-homed duplicate peer may not be deduped yet, so
+        ``cluster_size()`` can transiently read one larger; the round-end
+        re-check sees the fully-deduped size and still fires.  Emit-once via
+        ``_warned_degenerate_self`` (the ``self_confirmed`` status latch
+        alone is not enough once the check re-runs every round).
+        """
+        if self._warned_degenerate_self:
+            return False
+        if not bool(self.config.get("electLeader")):
+            return False
+        self_hosts = [
+            host
+            for host, peer in self.view.peers.items()
+            if peer.status == STATUS_SELF
+        ]
+        if not self_hosts or self.cluster_size() != 2:
+            return False
+        self._warned_degenerate_self = True
+        logger.warning(
+            "cluster: peer %s is this node itself (a self-listing "
+            "not recognisable at config load), so the effective "
+            "electLeader cluster is 2 nodes with a quorum of 2 -- "
+            "the degenerate mode the 2-node refusal exists to "
+            "forbid: BOTH nodes must be up for either to run, so "
+            "any single failure stops all Leader jobs cluster-wide "
+            "(strictly worse than a single replica). Remove the "
+            "self entry from cluster.peers, or grow the cluster to "
+            "3+ nodes.",
+            ", ".join(self_hosts),
+        )
+        return True
 
     async def _observe_peer(
         self, session: aiohttp.ClientSession, host: str, my_id: str
@@ -1380,8 +1489,9 @@ class ClusterManager(LeadershipBackend):
             # GET /cluster JSON and into log lines, so an over-long or
             # newline-bearing value from a CA-vouched-but-hostile peer is a
             # payload-bloat / log-injection vector. Legitimate identities
-            # (hostnames, hashes, uuids, "single-leader"/"spread", "v1") are
-            # short and printable, so this rejects nothing real.
+            # (hostnames, hashes, uuids, "single-leader"/"spread", scheme
+            # tokens like "v2") are short and printable, so this rejects
+            # nothing real.
             if value is not None and (
                 len(value) > MAX_PEER_FIELD_LEN or not value.isprintable()
             ):
@@ -1624,10 +1734,22 @@ class ClusterManager(LeadershipBackend):
         # safe, higher-quorum direction, matching the brief STATUS_SELF
         # inflation before a self-poll). A peer answering with OUR instance_id
         # is STATUS_SELF (already excluded above), so it never lands here.
+        # An address->instance binding learned while the peer was alive keeps
+        # deduping while the peer is UNREACHABLE/UNTRUSTED (record_failure
+        # retains instance_id): a node's identity at an address it once
+        # answered does not change because it stopped answering, exactly the
+        # rationale behind the STATUS_SELF self_confirmed latch. Skipping
+        # stale entries here would drop the dedup the moment the multi-homed
+        # node dies, inflating N -- and quorum_size(N) -- in lockstep on every
+        # survivor for the whole outage (no size conflict is surfaced, they
+        # all inflate identically), standing a healthy true majority down
+        # precisely when the declared fault tolerance is being exercised. The
+        # binding self-corrects: a successful poll of a reassigned address
+        # records the new instance and stops the dedup.
         seen_instances: Set[str] = set()
         duplicate_instances = 0
         for peer in self.view.peers.values():
-            if peer.status in _STALE_STATUSES or peer.status == STATUS_SELF:
+            if peer.status == STATUS_SELF:
                 continue
             if peer.instance_id is None:
                 continue
@@ -2183,6 +2305,78 @@ class ClusterManager(LeadershipBackend):
         """Whether this node is the elected leader (quorate, lowest name)."""
         return self.leader_name() == self.node_name
 
+    def _view_settled(self) -> bool:
+        """Whether the never-skip ``available_*`` gates may trust this view.
+
+        A freshly built manager (a cold boot, or a reload / in-place TLS
+        rotation that rebuilds it) starts from a blank view and a new
+        ``instance_id``.  Against that view every peer is ``unknown`` and
+        nobody attests us, so the quorum-less election reduces to
+        ``min([self])`` and EVERY node claims available leadership / job
+        ownership at once -- running each PreferLeader job (and each deferred
+        @reboot one-shot) on every node of a *healthy* cluster, the misfire
+        the deferral in :meth:`yacron2.cron.Cron.spawn_jobs` exists to
+        prevent.  The quorum-gated paths (:meth:`is_leader` /
+        :meth:`is_job_owner`) already fail closed there; this is the
+        fail-closed analogue for the ``available`` family, held only while
+        the view is still *converging*:
+
+        * a peer never polled at all (``unknown``) carries no information --
+          hold until the first round completes (:meth:`start` runs one
+          inline, so this clears within ``connectTimeout``); and
+        * a current-build peer we see AGREED whose ``members`` do not mention
+          our ``instance_id`` has not re-polled this incarnation of us yet.
+          The mutual gate keeps such a peer out of the agreeing set, so we
+          would elect ourselves alongside the true owner for the ~1-2
+          intervals re-attestation takes.  This hold is BOUNDED by
+          ``_SETTLE_ROUNDS`` completed rounds: a peer still not attesting us
+          after that is a genuinely one-way link, and the never-skip contract
+          then leans toward running (a possible double-run) rather than
+          standing this node down indefinitely.  A *legacy* peer (no
+          ``members`` field at all) never attests anyone, so it is exempt,
+          matching the one-directional fallback in :meth:`_agreeing_peers`.
+
+        Unreachable / untrusted / self / conflict / drifted / syncing peers
+        are real observations, not convergence: a genuinely isolated node
+        settles on its first round and keeps the never-skip guarantee.  The
+        cost of the hold is a scheduled PreferLeader firing skipped for the
+        window (<= ~2 intervals, self-healing) -- and when the held node is
+        the rightful owner, skipped on EVERY node for that window, since its
+        peers still defer to it -- the same transient fail-closed convergence
+        trade the module docstring already makes elsewhere.
+        """
+        for peer in self.view.peers.values():
+            if peer.status == STATUS_UNKNOWN:
+                return False
+        if self._poll_rounds >= _SETTLE_ROUNDS:
+            return True
+        for peer in self.view.peers.values():
+            if (
+                peer.status == STATUS_AGREED
+                and peer.reports_members
+                and not any(
+                    instance == self.instance_id
+                    for _name, instance, _agreed in peer.members or ()
+                )
+            ):
+                return False
+        return True
+
+    def view_settled(self) -> bool:
+        """Seam read of :meth:`_view_settled` (see the leadership ABC).
+
+        While the hold is on, :meth:`is_available_leader` /
+        :meth:`is_available_job_owner` return ``False`` even on the rightful
+        owner -- a *quorate* node can be held (quorum needs only a majority
+        attesting us; the hold waits for EVERY current-build agreeing peer),
+        so :meth:`yacron2.cron.Cron._cluster_owner_moved` must read the hold
+        as a transient fail-closed denial, never as another node positively
+        owning the job (which would abandon a rightful owner's pending retry
+        -- fatal for an @reboot keep-alive, whose reboot_ran record means no
+        node ever restarts it).
+        """
+        return self._view_settled()
+
     def available_leader_name(self) -> str:
         """Elected leader ignoring quorum (for the ``PreferLeader`` policy).
 
@@ -2250,6 +2444,11 @@ class ClusterManager(LeadershipBackend):
 
     def is_available_leader(self) -> bool:
         """Whether this node leads its reachable set, quorum or not."""
+        if not self._view_settled():
+            # never-polled / still-converging view: hold (fail closed) rather
+            # than claim leadership of a cluster we have not really looked at
+            # yet; see _view_settled.
+            return False
         if self.available_leader_name() != self.node_name:
             return False
         return not self._cedes_to_lower_instance(
@@ -2359,6 +2558,10 @@ class ClusterManager(LeadershipBackend):
         that would itself own the job, so an asymmetric duplicate-name view
         never zero-runs it (see :meth:`_cedes_to_lower_instance`).
         """
+        if not self._view_settled():
+            # never-polled / still-converging view: hold (fail closed) rather
+            # than claim ownership out of a blank view; see _view_settled.
+            return False
         if self.available_job_owner(job_name) != self.node_name:
             return False
         return not self._cedes_to_lower_instance(

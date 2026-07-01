@@ -2,12 +2,12 @@
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) continuing
 from upstream 0.19. This page enumerates every breaking change introduced in
-yacron2 1.0.0 relative to yacron 0.19, and gives an operator checklist for
+yacron2 relative to yacron 0.19, and gives an operator checklist for
 moving an existing yacron 0.19 deployment to yacron2.
 
 yacron2 carries forward all of upstream yacron's functionality: scheduling,
 reporting, retries, concurrency, metrics, and the HTTP API all behave as in
-0.19 except where a breaking change below says otherwise, and yacron2 1.0.0 adds
+0.19 except where a breaking change below says otherwise, and yacron2 adds
 new options on top (e.g. the `web.authToken` and `web.socketMode` keys;
 `web.socketMode` only applies to `unix://` listeners and is therefore
 irrelevant on Windows, where unix-socket listeners are unsupported (see
@@ -18,7 +18,7 @@ dependency-pin changes. No per-job YAML key was removed, renamed, or retyped;
 the only user-visible config change is the mail `validate_certs` default flipping
 from `False` to `True`.
 
-## Breaking changes (1.0.0)
+## Breaking changes
 
 ### Command and distribution renamed `yacron` -> `yacron2`
 
@@ -55,7 +55,7 @@ string). See [Running on Windows](Running-on-Windows).
 `requires-python` is `>=3.10`; Python 3.10 through 3.14 are supported. Python
 3.9 and earlier are no longer supported. If your host runs an older
 interpreter, use the self-contained binary (which embeds Python) or the
-container image instead of a `pip` install. Since 1.1.7, `pip install yacron2`
+container image instead of a `pip` install. `pip install yacron2`
 and the self-contained binaries also work natively on Windows (amd64/arm64);
 see [Running on Windows](Running-on-Windows). See [Installation](Installation).
 
@@ -155,7 +155,7 @@ keys.
 
 ### Dependency pin changes
 
-| Dependency | yacron 0.19 | yacron2 1.0.0+ |
+| Dependency | yacron 0.19 | yacron2 |
 | --- | --- | --- |
 | `crontab` | `==0.22.8` | `>=1,<2` (major version change) |
 | `strictyaml` | (older pin) | `>=1.7,<2` |

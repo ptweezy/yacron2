@@ -41,7 +41,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `jobs` | `Seq(Map)` of job definitions | No | The list of cron jobs. Each entry is validated against the per-job schema below. |
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
-| `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). New in version 1.2.0. |
+| `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
 
 ### `web`
@@ -67,8 +67,7 @@ election; the **`kubernetes`** and **`etcd`** backends use a coordination store
 be exactly one `cluster` block across the whole configuration; a duplicate in an
 included file or a second config-directory file raises a `ConfigError`. Defaults
 come from `DEFAULT_CLUSTER` (plus `DEFAULT_K8S` / `DEFAULT_ETCD` for the lease
-backends) and are applied only when a `cluster` section is present. New in
-version 1.2.0.
+backends) and are applied only when a `cluster` section is present.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -165,7 +164,7 @@ in a `defaults` block (only the common keys are).
 | `command` | `Str` or `Seq(Str)` | required | A shell command string (run via `shell`) or an argv list (run directly, no shell). The shell used for a string `command` is platform-specific (`/bin/sh` on POSIX vs cmd.exe via `%ComSpec%` on Windows when `shell` is left empty); an argv list bypasses the shell on every platform. See [Commands and Environment](Commands-and-Environment) and [Running on Windows](Running-on-Windows). |
 | `schedule` | `Str` or `Map` | required | A crontab string, the literal `@reboot`, or a mapping with `minute`, `hour`, `dayOfMonth`, `month`, `year`, `dayOfWeek` (each `Str`, all optional). The mapping is assembled into a 5-field crontab; the five used fields default to `*`. `year` is accepted by the schema but ignored (the parser builds only a 5-field crontab). See [Schedules and Timezones](Schedules-and-Timezones). |
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used to run a string `command`. Ignored when `command` is a list. The default is platform-specific: on POSIX a string `command` runs as `["/bin/sh", "-c", command]`; on Windows the default is empty, which routes a string `command` through the native command processor `%ComSpec%` (cmd.exe) via `asyncio.create_subprocess_shell`. For PowerShell or another interpreter set `shell:` explicitly, or pass `command` as a list to bypass the shell entirely (on every platform). The `shell` field itself works on all OSes. See [Running on Windows](Running-on-Windows). |
-| `enabled` | `Bool` | `true` | When `false`, the job is parsed and validated but never scheduled or runnable. New in version 0.18. |
+| `enabled` | `Bool` | `true` | When `false`, the job is parsed and validated but never scheduled or runnable. |
 
 ### Output capturing
 
@@ -175,7 +174,7 @@ in a `defaults` block (only the common keys are).
 | `captureStderr` | `Bool` | `true` | Capture the process's stderr for failure detection and reports. When false, the job's stderr passes through to yacron2's stderr. |
 | `saveLimit` | `Int` | `4096` | Maximum number of captured lines retained per stream (split into the first half and the last half; lines in between are discarded and counted). `0` disables retention. |
 | `maxLineLength` | `Int` | `16777216` (16 MiB) | Maximum bytes buffered per line by the stream reader. A longer line is skipped with a warning. |
-| `streamPrefix` | `Str` | `[{job_name} {stream_name}] ` | Format string prefixed to every emitted output line. Supports `{job_name}` and `{stream_name}` placeholders; set to `""` to disable. New in version 0.16. |
+| `streamPrefix` | `Str` | `[{job_name} {stream_name}] ` | Format string prefixed to every emitted output line. Supports `{job_name}` and `{stream_name}` placeholders; set to `""` to disable. |
 
 See [Output Capturing](Output-Capturing) for buffering, truncation, and the
 captured-output handoff to reporters.
@@ -185,7 +184,7 @@ captured-output handoff to reporters.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `utc` | `Bool` | `true` | When true, the schedule is interpreted in UTC. When false (and no `timezone`), local time is used. |
-| `timezone` | `Str` | none | IANA timezone name (e.g. `America/Los_Angeles`) overriding `utc`. An unknown name raises a `ConfigError`. New in version 0.11. |
+| `timezone` | `Str` | none | IANA timezone name (e.g. `America/Los_Angeles`) overriding `utc`. An unknown name raises a `ConfigError`. |
 
 See [Schedules and Timezones](Schedules-and-Timezones).
 
@@ -194,9 +193,9 @@ See [Schedules and Timezones](Schedules-and-Timezones).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `concurrencyPolicy` | `Enum(["Allow", "Forbid", "Replace"])` | `Allow` | Behavior when a scheduled run overlaps a still-running instance. `Allow`: run concurrently. `Forbid`: skip the new run. `Replace`: cancel the running instance and start the new one. |
-| `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). New in version 1.2.0. See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
-| `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). New in version 0.4. |
-| `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals, so both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). New in version 0.4. |
+| `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
+| `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). |
+| `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals, so both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). |
 
 See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
@@ -270,7 +269,7 @@ their schema and `_REPORT_DEFAULTS` are summarized here.
 | `tls` | `Bool` | `false` | Use implicit TLS. |
 | `starttls` | `Bool` | `false` | Use STARTTLS. |
 | `validate_certs` | `Bool` | `true` | Validate TLS certificates. Defaults to `true` in yacron2 (a breaking change from upstream). |
-| `html` | `Bool` | `false` | Send the body as HTML. New in version 0.15. |
+| `html` | `Bool` | `false` | Send the body as HTML. |
 
 #### `report.sentry`
 
@@ -279,11 +278,11 @@ Defaults from `_REPORT_DEFAULTS["sentry"]`:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `dsn` | `Map` with `value`/`fromFile`/`fromEnvVar` (each `EmptyNone() \| Str`) | all `None` | Sentry DSN source. |
-| `fingerprint` | `Seq(Str)` | `["yacron2", "{{ environment.HOSTNAME }}", "{{ name }}"]` | Issue-grouping fingerprint (jinja2 per entry). Replaces, never appends, on merge. New in version 0.6. |
-| `level` | `Str` | unset (effective `error`) | Sentry event level. When unset, events are captured at level `error`. New in version 0.8. |
-| `extra` | `MapPattern(Str, Str \| Int \| Bool)` | unset | Extra structured context. New in version 0.8. |
+| `fingerprint` | `Seq(Str)` | `["yacron2", "{{ environment.HOSTNAME }}", "{{ name }}"]` | Issue-grouping fingerprint (jinja2 per entry). Replaces, never appends, on merge. |
+| `level` | `Str` | unset (effective `error`) | Sentry event level. When unset, events are captured at level `error`. |
+| `extra` | `MapPattern(Str, Str \| Int \| Bool)` | unset | Extra structured context. |
 | `body` | `Str` | default subject + body templates | Event message (jinja2). |
-| `environment` | `Str` | `None` | Sentry environment. New in version 0.14. |
+| `environment` | `Str` | `None` | Sentry environment. |
 | `maxStringLength` | `Int` | `8192` | Max string length before Sentry truncation. |
 
 #### `report.shell`
@@ -291,14 +290,14 @@ Defaults from `_REPORT_DEFAULTS["sentry"]`:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used to run the reporter command. The default is platform-specific, same as the per-job `shell` field: on Windows the default is empty (the reporter command runs via cmd.exe through `%ComSpec%`). Set `shell:` explicitly for another interpreter, or pass `command` as a list. See [Running on Windows](Running-on-Windows). |
-| `command` | `Str` or `Seq(Str)` | `None` | Reporter command (required key). Receives `YACRON2_*` environment variables. New in version 0.13. |
+| `command` | `Str` or `Seq(Str)` | `None` | Reporter command (required key). Receives `YACRON2_*` environment variables. |
 
 ### Environment
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `environment` | `Seq(Map({"key": Str, "value": Str}))` | `[]` | Environment variables set for the process. Both `key` and `value` are required per entry. Merged by key with `defaults` and with `env_file` (config values win). |
-| `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. New in version 0.12. |
+| `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
 
 ```yaml
 jobs:
@@ -317,7 +316,7 @@ See [Commands and Environment](Commands-and-Environment).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `user` | `Str` or `Int` | none | User name or numeric uid the process runs as. A numeric uid derives its primary gid and login name from the passwd database. An unknown name raises a `ConfigError`. New in version 0.11. |
+| `user` | `Str` or `Int` | none | User name or numeric uid the process runs as. A numeric uid derives its primary gid and login name from the passwd database. An unknown name raises a `ConfigError`. |
 | `group` | `Str` or `Int` | none | Group name or numeric gid the process runs as. If only `user` is set, the group defaults to that user's primary group. An unknown name raises a `ConfigError`. |
 
 This section is POSIX-only (the setuid/setgid model). On POSIX, setting `user`

@@ -208,6 +208,53 @@ def test_distinct_peer_behind_wildcard_is_kept():
     ]
 
 
+def test_loopback_self_listing_dropped():
+    # SELF-BY-IP hardening: a literal loopback entry on our own port under a
+    # matching-family wildcard listen can only be this node (loopback never
+    # leaves the host and the wildcard bind holds the port), so it is dropped
+    # like an exact listen match instead of inflating N.
+    y = CLUSTER_YAML + '    - host: "127.0.0.1:8443"\n'
+    cfg = parse_config_string(y, "").cluster_config
+    assert cfg is not None
+    assert [p["host"] for p in cfg["peers"]] == [
+        "yacron-b:8443",
+        "yacron-c:8443",
+    ]
+
+
+def test_loopback_self_listing_does_not_bypass_two_node_guard():
+    # ... and therefore a loopback-padded 2-node electLeader cluster is
+    # refused rather than validating as 3 nodes and running as the degenerate
+    # quorum-2-of-2 mode at runtime.
+    y = TWO_NODE_YAML + '    - host: "127.0.0.1:8443"\n  electLeader: true\n'
+    with pytest.raises(ConfigError, match="strictly worse than a single"):
+        parse_config_string(y, "")
+
+
+def test_is_self_listed_loopback_edge_cases():
+    from yacron2.config import _is_self_listed
+
+    # literal loopback + matching-family wildcard + same port -> self
+    assert _is_self_listed("127.0.0.1:8443", "0.0.0.0:8443", "node-a") is True
+    assert _is_self_listed("[::1]:8443", "[::]:8443", "node-a") is True
+    # family mismatch: not provably OUR listener (a "::"-only bind does not
+    # necessarily accept v4, and vice versa) -> kept
+    assert _is_self_listed("[::1]:8443", "0.0.0.0:8443", "node-a") is False
+    assert _is_self_listed("127.0.0.1:8443", "[::]:8443", "node-a") is False
+    # wrong port: a colocated second daemon is a legitimate member -> kept
+    assert _is_self_listed("127.0.0.1:9443", "0.0.0.0:8443", "node-a") is False
+    # non-wildcard listen: only the literal listen string matches
+    assert (
+        _is_self_listed("127.0.0.1:8443", "10.0.0.5:8443", "node-a") is False
+    )
+    # "localhost" is a NAME: matching it would need the DNS resolution config
+    # time refuses -> never dropped (it gets an advisory instead)
+    assert _is_self_listed("localhost:8443", "0.0.0.0:8443", "node-a") is False
+    # a routable IP cannot be recognised at config time -> kept (the runtime
+    # STATUS_SELF backstop warns if it lands the cluster at 2-of-2)
+    assert _is_self_listed("10.0.0.1:8443", "0.0.0.0:8443", "node-a") is False
+
+
 # --------------------------------------------------------------------------
 # ClusterView state machine (pure, no network)
 # --------------------------------------------------------------------------
@@ -1176,6 +1223,114 @@ async def test_mtls_reboot_ran_push_propagates(tmp_path):
         await b.stop()
 
 
+@pytest.mark.asyncio
+async def test_mtls_cold_boot_runs_deferred_reboot_exactly_once(tmp_path):
+    # BLANK-VIEW @reboot regression, scenario (a): a 3-node cluster cold-boots
+    # with a PreferLeader @reboot one-shot. Pre-fix, every node's gates were
+    # evaluated against a never-polled view microseconds after start(), so
+    # reboot_ran() was False and is_available_leader() True on ALL THREE and
+    # the one-shot ran three times. This drives cron's exact decision
+    # sequence (reboot_ran -> is_available_leader -> mark+run), snapshotting
+    # all nodes' decisions per pass BEFORE any mark propagates -- as three
+    # real daemons racing at boot would -- and requires exactly ONE run.
+    tls = _write_tls(tmp_path)
+    ports = {n: _free_port() for n in ("node-a", "node-b", "node-c")}
+
+    def _mk(name):
+        peers = [f"localhost:{p}" for n, p in ports.items() if n != name]
+        return ClusterManager(
+            _cfg(tls, f"127.0.0.1:{ports[name]}", peers, name),
+            lambda: "v1:same",
+        )
+
+    nodes = {n: _mk(n) for n in ports}
+    # a fresh, never-polled node -- minimum-name or not -- must not claim
+    # never-skip availability: this is what launched the deferred one-shot
+    # everywhere in the very pass that deferred it.
+    for mgr in nodes.values():
+        assert mgr.is_available_leader() is False
+        assert mgr.is_available_job_owner("boot") is False
+        assert mgr.reboot_ran("boot") is False
+    await asyncio.gather(*(m.start() for m in nodes.values()))
+    try:
+        ran = []
+        pending = set(nodes)
+        for _ in range(6):
+            decisions = {}
+            for name in sorted(pending):
+                mgr = nodes[name]
+                if mgr.reboot_ran("boot"):
+                    decisions[name] = "retire"
+                elif mgr.is_available_leader():
+                    decisions[name] = "run"
+                else:
+                    decisions[name] = "hold"  # keep pending, re-check
+            for name, decision in decisions.items():
+                if decision == "retire":
+                    pending.discard(name)
+                elif decision == "run":
+                    pending.discard(name)
+                    ran.append(name)
+                    await nodes[name].mark_reboot_ran("boot")
+            if not pending:
+                break
+            for name in sorted(nodes):
+                await nodes[name]._poll_all()
+        assert len(ran) == 1, ran  # exactly once, never three times
+        assert not pending  # every node retired its deferred copy
+    finally:
+        for mgr in nodes.values():
+            await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_mtls_restarted_node_reads_reboot_gossip_in_start(tmp_path):
+    # BLANK-VIEW @reboot regression, scenario (b): a node (re)starts into a
+    # converged cluster that already ran the @reboot one-shot. Pre-fix its
+    # fresh manager decided against a zero-poll view (reboot_ran False,
+    # is_available_leader True) and re-ran the one-shot the ran_reboot_jobs
+    # gossip exists to retire. The inline first round in start() must bring
+    # the peers' gossip in BEFORE cron's startup pass decides.
+    tls = _write_tls(tmp_path)
+    pa, pb, pc = _free_port(), _free_port(), _free_port()
+
+    def _mk(name, port, peer_ports):
+        return ClusterManager(
+            _cfg(
+                tls,
+                f"127.0.0.1:{port}",
+                [f"localhost:{p}" for p in peer_ports],
+                name,
+            ),
+            lambda: "v1:same",
+        )
+
+    a = _mk("node-a", pa, (pb, pc))
+    b = _mk("node-b", pb, (pa, pc))
+    await a.start()
+    await b.start()
+    try:
+        for _ in range(2):  # converge a<->b (node-c is down)
+            await a._poll_all()
+            await b._poll_all()
+        await a.mark_reboot_ran("boot")  # the cluster already ran it
+        # node-c now (re)starts with a blank view and a fresh instance_id
+        c = _mk("node-c", pc, (pa, pb))
+        assert c.reboot_ran("boot") is False  # blank view knows nothing
+        await c.start()
+        try:
+            # start()'s inline round read a's/b's gossip: cron's startup pass
+            # retires the deferred one-shot instead of re-running it...
+            assert c.reboot_ran("boot") is True
+            # ...and the still-converging view claims no availability either
+            assert c.is_available_leader() is False
+        finally:
+            await c.stop()
+    finally:
+        await a.stop()
+        await b.stop()
+
+
 # --------------------------------------------------------------------------
 # ClusterManager I/O + accessors WITHOUT cryptography
 #
@@ -1346,12 +1501,163 @@ def test_manager_accessors_minority_stands_down(no_tls):
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
         lambda: "v1:mine",
     )
+    # both peers were polled and are down: real information (a view with
+    # never-polled peers would instead hold the available_* gates closed; see
+    # test_blank_view_does_not_claim_available_ownership).
+    mgr.view.record_failure("b:1", "down", untrusted=False)
+    mgr.view.record_failure("c:1", "down", untrusted=False)
     # no peer agreeing -> below quorum -> no leader
     assert mgr.leader_name() is None
     assert mgr.is_leader() is False
     assert mgr.is_quorate() is False
     # available_* ignores quorum: an isolated node still leads itself
     assert mgr.is_available_leader() is True
+
+
+def test_blank_view_does_not_claim_available_ownership(no_tls):
+    # BLANK-VIEW @reboot regression (scenario a): a freshly built manager has
+    # a never-polled view (every peer unknown), against which every node is
+    # min([itself]) -- so all three nodes of a cold-booting cluster claimed
+    # available leadership/ownership at once and launched the deferred
+    # PreferLeader @reboot one-shot in the very pass that deferred it. A view
+    # with never-polled peers must claim NO never-skip availability; cron's
+    # deferral machinery then re-checks every iteration until real
+    # information arrives.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "b:1"], "node-c"),
+        lambda: "v1:mine",
+    )
+    assert mgr.is_available_leader() is False
+    assert mgr.is_available_job_owner("boot") is False
+    # real information (both peers polled and down) settles the view: the
+    # genuinely isolated node still runs -- never-skip is preserved.
+    mgr.view.record_failure("a:1", "down", untrusted=False)
+    mgr.view.record_failure("b:1", "down", untrusted=False)
+    assert mgr.is_available_leader() is True
+    assert mgr.is_available_job_owner("boot") is True
+
+
+def test_rebuilt_manager_holds_available_gates_until_reattested(no_tls):
+    # BLANK-VIEW scenario (c): a reload / in-place TLS rotation rebuilds the
+    # manager with a fresh instance_id. Its first poll round sees the peers
+    # AGREED, but their members still attest the OLD incarnation, so the
+    # mutual gate leaves the agreeing set empty -- pre-fix the node then
+    # elected itself (min of {self}) and ran any scheduled PreferLeader job
+    # due in the ~1-2 interval window ALONGSIDE the true owner: a
+    # healthy-cluster double-run. The converging hold keeps the never-skip
+    # gates closed until a peer attests THIS instance.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "b:1"], "node-c"),
+        lambda: "v1:mine",
+    )
+    for host, name in (("a:1", "node-a"), ("b:1", "node-b")):
+        peer = mgr.view.peers[host]
+        peer.status = STATUS_AGREED
+        peer.node_name = name
+        peer.instance_id = "inst-" + name
+        peer.job_set_id = "v1:mine"
+        # the peer's members list still carries the previous incarnation
+        peer.members = [
+            (name, "inst-" + name, True),
+            ("node-c", "inst-old-c", True),
+        ]
+    assert mgr._view_settled() is False
+    assert mgr.is_available_leader() is False
+    assert mgr.is_available_job_owner("job-x") is False
+    # a peer re-polls this incarnation and attests it: the view settles and
+    # the normal never-skip election resumes -- node-c defers to the true
+    # min-name owner instead of double-running.
+    for host in ("a:1", "b:1"):
+        mgr.view.peers[host].members.append(("node-c", mgr.instance_id, True))
+    assert mgr._view_settled() is True
+    assert mgr.available_leader_name() == "node-a"
+    assert mgr.is_available_leader() is False
+
+
+def test_quorate_but_unsettled_view_reads_as_transient_hold(no_tls):
+    # Reviewer regression companion (see cron's
+    # test_schedule_retry_job_defers_during_unsettled_view): quorum needs only
+    # a MAJORITY re-attesting this incarnation, while the settle hold waits
+    # for EVERY current-build agreeing peer -- so a rebuilt manager can be
+    # quorate (and even the rightful available owner by name) while the
+    # never-skip gates are still held closed. The seam must expose that hold
+    # (view_settled) so cron._cluster_owner_moved reads the gates' False as a
+    # transient fail-closed denial, never as another node positively owning
+    # the job (which would abandon the rightful owner's pending retry).
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    # peer b re-polled us and attests THIS incarnation...
+    b = mgr.view.peers["b:1"]
+    b.status = STATUS_AGREED
+    b.node_name = "node-b"
+    b.instance_id = "inst-b"
+    b.job_set_id = "v1:mine"
+    b.members = [("node-a", mgr.instance_id, True), ("node-b", "inst-b", True)]
+    # ...while peer c (current build, AGREED) still attests the OLD one
+    c = mgr.view.peers["c:1"]
+    c.status = STATUS_AGREED
+    c.node_name = "node-c"
+    c.instance_id = "inst-c"
+    c.job_set_id = "v1:mine"
+    c.members = [("node-a", "inst-old-a", True), ("node-c", "inst-c", True)]
+    mgr._poll_rounds = 2  # second round done; the settle bound not reached
+
+    assert mgr.is_quorate() is True  # a majority (b) attests us
+    assert mgr.available_leader_name() == "node-a"  # rightful owner by name
+    assert mgr.is_available_leader() is False  # ...but the gate is held
+    assert mgr.view_settled() is False  # the seam names the hold for cron
+    # once c re-attests this incarnation the hold lifts and the gates decide
+    c.members.append(("node-a", mgr.instance_id, True))
+    assert mgr.view_settled() is True
+    assert mgr.is_available_leader() is True
+
+
+def test_convergence_hold_is_bounded_for_one_way_peers(no_tls):
+    # a peer that NEVER attests us (a genuinely one-way link, not mere
+    # convergence) must not hold the never-skip gates forever: after
+    # _SETTLE_ROUNDS completed rounds the node leans toward running (the
+    # documented PreferLeader double-run direction), never a permanent
+    # stand-down.
+    from yacron2.cluster import _SETTLE_ROUNDS
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1"], "node-b"),
+        lambda: "v1:mine",
+    )
+    peer = mgr.view.peers["a:1"]
+    peer.status = STATUS_AGREED
+    peer.node_name = "node-a"
+    peer.instance_id = "inst-a"
+    peer.job_set_id = "v1:mine"
+    peer.members = [("node-a", "inst-a", True)]  # never lists node-b
+    assert mgr.is_available_leader() is False  # still converging
+    mgr._poll_rounds = _SETTLE_ROUNDS  # ~2 real intervals later
+    assert mgr._view_settled() is True
+    assert mgr.is_available_leader() is True  # one-way peer: lean to running
+    assert mgr.is_available_job_owner("job-x") is True
+
+
+def test_legacy_peer_does_not_hold_available_gates(no_tls):
+    # a legacy peer (no members field at all) can never attest anyone, so it
+    # must not read as "converging" -- otherwise a new node among legacy peers
+    # would hold its PreferLeader jobs for _SETTLE_ROUNDS on every boot. The
+    # reports_members=False flag exempts it, mirroring _agreeing_peers'
+    # one-directional fallback.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    peer = mgr.view.peers["b:1"]
+    peer.status = STATUS_AGREED
+    peer.node_name = "node-b"
+    peer.instance_id = "inst-b"
+    peer.job_set_id = "v1:mine"
+    peer.members = []
+    peer.reports_members = False  # a legacy build
+    assert mgr._view_settled() is True
+    assert mgr.is_available_leader() is True  # min name, counted one-way
 
 
 def test_available_leader_folds_witness_contenders(no_tls):
@@ -1603,13 +1909,24 @@ def _spread_mesh(mgr_graph, distribution, electLeader=True):
         mgrs[n] = ClusterManager(cfg, lambda: "v1:mine")
     for n in names:
         for other in names:
-            if other != n and n in mgr_graph[other] and other in mgr_graph[n]:
+            if other == n:
+                continue
+            if n in mgr_graph[other] and other in mgr_graph[n]:
                 _seed_agree(
                     mgrs[n],
                     other + ":1",
                     other,
                     instance="inst-" + other,
                     mutual=set(mgr_graph[other]),
+                )
+            else:
+                # a CONVERGED view of a node this one cannot reach: polled and
+                # failed. Leaving it never-polled (unknown) would instead hold
+                # the never-skip available_* gates closed (see _view_settled),
+                # which is the startup state, not the converged mesh these
+                # tests model.
+                mgrs[n].view.record_failure(
+                    other + ":1", "link down", untrusted=False
                 )
     # second pass: advertise quorate_vouched = each node's
     # _eligible_candidates, computable only once mutual edges are seeded above.
@@ -2419,6 +2736,38 @@ async def test_start_stop_lifecycle_plaintext(no_tls):
     await mgr.stop()  # idempotent: nothing running
 
 
+@pytest.mark.asyncio
+async def test_start_completes_one_poll_round_inline(no_tls):
+    # BLANK-VIEW @reboot regression: start() must complete one full poll
+    # round before returning -- mirroring the lease backends' inline store
+    # round -- so cron's first spawn_jobs never gates a PreferLeader job (or
+    # a deferred @reboot one-shot) on a never-polled view. Plaintext, with a
+    # peer nobody listens on: after start() the peer is UNREACHABLE (real
+    # information), not UNKNOWN, and the never-skip gates behave as for a
+    # genuinely isolated node.
+    dead = _free_port()  # bound to nothing
+    mgr = ClusterManager(
+        _cfg(
+            _DUMMY_TLS,
+            f"127.0.0.1:{_free_port()}",
+            [f"127.0.0.1:{dead}"],
+            "node-a",
+        ),
+        lambda: "v1:mine",
+    )
+    assert mgr.is_available_leader() is False  # never-polled view: held
+    await mgr.start()
+    try:
+        peer = mgr.view.peers[f"127.0.0.1:{dead}"]
+        assert peer.status == STATUS_UNREACHABLE  # polled, not unknown
+        assert mgr._poll_rounds >= 1
+        # real information (the peer is down): the isolated node runs
+        assert mgr.is_available_leader() is True
+        assert mgr.is_available_job_owner("boot") is True
+    finally:
+        await mgr.stop()
+
+
 # --------------------------------------------------------------------------
 # adversarial-review regressions: mutual attestation, transitive conflict,
 # untrusted-input validation, and lifecycle cleanup
@@ -2744,6 +3093,60 @@ def test_duplicate_address_does_not_inflate_quorum(no_tls):
     assert mgr.cluster_size() == 3  # a + B + c, NOT 4
     assert mgr.quorum() == 2
     assert sorted(mgr._agreeing_peer_names()) == ["node-b", "node-c"]
+
+
+def test_multihomed_peer_outage_does_not_inflate_quorum(no_tls):
+    # F15 follow-up: the instance dedup above must SURVIVE the multi-homed
+    # node's death. record_failure retains the last-observed instance_id, but
+    # the dedup loop used to skip stale-status peers -- so the moment node X
+    # (listed at two addresses) died, both of its entries counted again and
+    # every survivor computed N=4, quorum=3 in lockstep (no size conflict is
+    # surfaced; they all inflate identically). The healthy true majority
+    # {a, b} then stood down every Leader job for the whole outage, exactly
+    # when the declared fault tolerance was being exercised.
+    def _node(name, other_host, other_name):
+        mgr = ClusterManager(
+            _cfg(
+                _DUMMY_TLS,
+                "127.0.0.1:1",
+                [other_host, "x1:1", "x2:1"],
+                name,
+            ),
+            lambda: "v1:mine",
+        )
+        # the surviving peer mutually agrees with everyone (and is quorate,
+        # so it stays electable after x dies)
+        _seed_agree(
+            mgr,
+            other_host,
+            other_name,
+            mutual={name, "node-x"},
+        )
+        # node X answers BOTH its listed addresses with one instance id
+        _seed_agree(mgr, "x1:1", "node-x", instance="inst-x")
+        _seed_agree(mgr, "x2:1", "node-x", instance="inst-x")
+        return mgr
+
+    a = _node("node-a", "b:1", "node-b")
+    b = _node("node-b", "a:1", "node-a")
+    # x alive: the dedup holds on both survivors
+    assert a.cluster_size() == 3 and a.quorum() == 2
+    assert b.cluster_size() == 3 and b.quorum() == 2
+    assert a.leader_name() == "node-a" and b.leader_name() == "node-a"
+    # x dies: on the next round both of its entries go UNREACHABLE
+    for mgr in (a, b):
+        mgr.view.record_failure("x1:1", "connection refused", untrusted=False)
+        mgr.view.record_failure("x2:1", "connection refused", untrusted=False)
+    # the address->instance binding keeps deduping: N stays 3, quorum 2
+    assert a.cluster_size() == 3 and a.quorum() == 2
+    assert b.cluster_size() == 3 and b.quorum() == 2
+    # ... so the surviving true majority still elects a leader ...
+    assert a.leader_name() == "node-a" and a.is_leader() is True
+    assert b.leader_name() == "node-a" and b.is_leader() is False
+    # ... and the survivors' declared sizes agree (no phantom size conflict)
+    a.view.peers["b:1"].declared_size = b.cluster_size()
+    b.view.peers["a:1"].declared_size = a.cluster_size()
+    assert a.conflicting_sizes() == [] and b.conflicting_sizes() == []
 
 
 @pytest.mark.asyncio
@@ -3360,6 +3763,176 @@ async def test_peer_status_change_warns_only_on_real_drop(no_tls, caplog):
     msgs = [r.message for r in caplog.records]
     assert sum("now agreed" in m for m in msgs) == 1
     assert any("became unreachable" in m and "boom" in m for m in msgs)
+
+
+def _self_poll_session(mgr):
+    # a /peer response from OUR OWN listener: our name AND our instance id --
+    # what polling a self-listed entry (e.g. our own IP under a wildcard
+    # listen) returns.
+    return _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": mgr.node_name,
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": mgr.instance_id,
+                }
+            )
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_poll_warns_on_degenerate_two_node_election(no_tls, caplog):
+    # SELF-BY-IP regression: a self entry listed by a routable IP under a
+    # wildcard listen is invisible to config-time detection, so a real 2-node
+    # cluster validates as 3 and sails past the electLeader size==2 refusal.
+    # The runtime backstop: when the self-poll identifies the entry as
+    # STATUS_SELF and the effective electLeader size lands at 2, warn loudly
+    # -- the cluster is the degenerate quorum-2-of-2 mode the refusal exists
+    # to forbid (any single failure stops all Leader jobs cluster-wide).
+    import logging
+
+    cfg = _cfg(
+        _DUMMY_TLS,
+        "0.0.0.0:8443",
+        ["10.0.0.1:8443", "10.0.0.2:8443"],  # 10.0.0.1 is OUR OWN address
+        "node-a",
+    )
+    cfg["electLeader"] = True
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    session = _self_poll_session(mgr)
+    with caplog.at_level(logging.WARNING, logger="yacron2.cluster"):
+        await mgr._poll_peer(session, "10.0.0.1:8443", "v1:mine")
+    assert mgr.view.peers["10.0.0.1:8443"].status == STATUS_SELF
+    assert mgr.cluster_size() == 2  # the declared 3 was one self-listing big
+    warned = [
+        r.message
+        for r in caplog.records
+        if r.levelname == "WARNING" and "10.0.0.1:8443" in r.message
+    ]
+    assert len(warned) == 1
+    assert "quorum of 2" in warned[0]
+    assert "Leader jobs" in warned[0]
+    # emit-once: the latched STATUS_SELF does not re-log on the next round
+    session = _self_poll_session(mgr)
+    await mgr._poll_peer(session, "10.0.0.1:8443", "v1:mine")
+    assert (
+        len(
+            [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "10.0.0.1:8443" in r.message
+            ]
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_poll_benign_self_listing_logs_info_only(no_tls, caplog):
+    # the same self-listing in a genuinely 3+-node cluster (effective size 3)
+    # is benign: identified once at INFO, no degenerate-quorum warning.
+    import logging
+
+    cfg = _cfg(
+        _DUMMY_TLS,
+        "0.0.0.0:8443",
+        ["10.0.0.1:8443", "10.0.0.2:8443", "10.0.0.3:8443"],
+        "node-a",
+    )
+    cfg["electLeader"] = True
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    session = _self_poll_session(mgr)
+    with caplog.at_level(logging.INFO, logger="yacron2.cluster"):
+        await mgr._poll_peer(session, "10.0.0.1:8443", "v1:mine")
+    assert mgr.view.peers["10.0.0.1:8443"].status == STATUS_SELF
+    assert mgr.cluster_size() == 3
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    infos = [
+        r.message
+        for r in caplog.records
+        if r.levelname == "INFO" and "self-listing" in r.message
+    ]
+    assert len(infos) == 1 and "10.0.0.1:8443" in infos[0]
+
+
+@pytest.mark.asyncio
+async def test_degenerate_self_warning_survives_multihomed_dedup_lag(
+    no_tls, caplog
+):
+    # Reviewer residual on the SELF-BY-IP backstop: when a multi-homed
+    # duplicate-listed peer coexists with the self-listing, poll ordering can
+    # make cluster_size() read 3 at the SELF transition instant (the
+    # duplicate's second address not yet polled, so not yet deduped) and only
+    # dedup to 2 afterwards. A transition-only check then logged the benign
+    # INFO line and never re-fired. The check must re-run at the end of every
+    # poll round with the fully-deduped size -- and still emit exactly once.
+    import logging
+
+    cfg = _cfg(
+        _DUMMY_TLS,
+        "0.0.0.0:8443",
+        # 10.0.0.1 is OUR OWN address; .2/.3 are ONE multi-homed peer
+        ["10.0.0.1:8443", "10.0.0.2:8443", "10.0.0.3:8443"],
+        "node-a",
+    )
+    cfg["electLeader"] = True
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+
+    def _self_get():
+        return _self_poll_session(mgr)._get_result
+
+    def _peer_b_get():
+        return _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": "inst-b",
+                }
+            )
+        )
+
+    class _MultiSession:
+        # dispatches per host, minting a fresh response per poll
+        def __init__(self, by_host):
+            self._by_host = by_host
+
+        def get(self, url, ssl=None, **kwargs):
+            host = url[len("https://"):-len("/peer")]
+            return self._by_host[host]()
+
+    with caplog.at_level(logging.INFO, logger="yacron2.cluster"):
+        # the self-poll lands while the duplicate's addresses are unpolled:
+        # cluster_size() reads 3 at the transition -> benign INFO, no warning
+        await mgr._poll_peer(
+            _self_poll_session(mgr), "10.0.0.1:8443", "v1:mine"
+        )
+        assert mgr.cluster_size() == 3
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        # the round's remaining polls dedup the multi-homed peer: size 2
+        session = _MultiSession(
+            {
+                "10.0.0.1:8443": _self_get,
+                "10.0.0.2:8443": _peer_b_get,
+                "10.0.0.3:8443": _peer_b_get,
+            }
+        )
+        mgr._session = session
+        await mgr._poll_all()  # round-end re-check sees the deduped size
+        assert mgr.cluster_size() == 2
+        warned = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warned) == 1
+        assert "quorum of 2" in warned[0].message
+        assert "10.0.0.1:8443" in warned[0].message
+        # emit-once: later rounds do not repeat it
+        await mgr._poll_all()
+        assert (
+            len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+        )
 
 
 @pytest.mark.asyncio

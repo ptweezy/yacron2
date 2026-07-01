@@ -1,0 +1,6 @@
+# The example shell scripts (example/*/gen-certs.sh, node-entrypoint.sh) are
+# bind-mounted from the working tree and executed by `sh` inside Linux
+# containers, so they must check out with LF line endings everywhere. Without
+# this, a default Windows clone (core.autocrlf=true) converts them to CRLF and
+# every cluster demo dies at its first line ("set: illegal option -").
+*.sh text eol=lf

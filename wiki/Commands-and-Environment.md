@@ -17,8 +17,8 @@ Types and defaults are taken from the strictyaml schema and `DEFAULT_CONFIG`.
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used when `command` is a string. The default is platform-specific: `/bin/sh` on POSIX, empty on Windows (an empty default routes a string command through the native command processor `%ComSpec%` / `cmd.exe`). To use PowerShell or another interpreter, set `shell:` explicitly, or pass `command` as a list (which bypasses the shell on every platform). See [Running on Windows](Running-on-Windows). |
 | `environment` | `Seq(Map({key, value}))` | `[]` | Environment variables (each an item with `key` and `value`, both `Str`) added to the subprocess environment. |
 | `env_file` | `Str` | `None` | Path to a `KEY=VALUE` file whose variables are merged into `environment`. |
-| `user` | `Str` or `Int` | unset | User (login name or numeric uid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). New in version 0.11. |
-| `group` | `Str` or `Int` | unset | Group (group name or numeric gid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). New in version 0.11. |
+| `user` | `Str` or `Int` | unset | User (login name or numeric uid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). |
+| `group` | `Str` or `Int` | unset | Group (group name or numeric gid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). |
 
 `command` is required on every job. `shell` has a platform-specific
 schema/`DEFAULT_CONFIG` default: `/bin/sh` on POSIX and an empty string on

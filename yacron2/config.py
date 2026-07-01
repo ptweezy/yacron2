@@ -1,5 +1,6 @@
 import copy
 import datetime
+import ipaddress
 import logging
 import os
 import re
@@ -83,9 +84,11 @@ DEFAULT_K8S: Dict[str, Any] = {
     "retryPeriodSeconds": 2,
     "identity": None,  # None -> nodeName
     "kubeconfig": None,  # for out-of-cluster / local (Docker) testing
-    # override the IN-CLUSTER apiserver URL (e.g. point at a kube-rbac-proxy
-    # sidecar); still uses the ServiceAccount token/CA, must be https. For
-    # out-of-cluster use set kubeconfig instead.
+    # override the apiserver URL (e.g. point at a kube-rbac-proxy sidecar);
+    # must be https. Wins on BOTH credential paths and both transports:
+    # in-cluster it keeps the ServiceAccount token/CA, and with kubeconfig set
+    # it overrides the kubeconfig's cluster.server while keeping its
+    # credentials (see backends.kubernetes._setup_sync/_load_kubeconfig).
     "apiServer": None,
     # auto (native `kubernetes` client if importable, else hand-rolled HTTP) |
     # library (require the native client) | http (force hand-rolled).
@@ -716,6 +719,29 @@ def parse_environment_file(path: str) -> Dict[str, str]:
 # wildcard listen needs the nodeName-based recognition in _is_self_listed.
 _WILDCARD_LISTEN_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*", ""})
 
+# The same, split by address family: a wildcard bind holds the port on every
+# interface OF ITS FAMILY, which is what makes a same-family literal loopback
+# peer entry unambiguously self (see _is_self_listed). "*" and "" bind
+# everything, so they belong to both.
+_V4_WILDCARD_LISTEN_HOSTS = frozenset({"0.0.0.0", "*", ""})
+_V6_WILDCARD_LISTEN_HOSTS = frozenset({"::", "[::]", "*", ""})
+
+
+def _loopback_ip_version(host: str) -> Optional[int]:
+    """The IP version (4 or 6) of a literal loopback host, else ``None``.
+
+    Accepts the bracketed IPv6 form peer entries use (``[::1]``).  Pure
+    literal parsing via :mod:`ipaddress`: a hostname -- even ``localhost`` --
+    never parses, so no DNS resolution happens and nothing is guessed.
+    """
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return ip.version if ip.is_loopback else None
+
 
 def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     """Whether a configured peer entry *unambiguously* points back at us.
@@ -730,7 +756,15 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
       (`0.0.0.0` / `::`) self-listed by `nodeName` -- recognised structurally
       when the entry's host equals our `nodeName` *exactly* (which defaults to
       the system hostname, the name the cert SAN and peer address use by
-      convention), on the same port.
+      convention), on the same port; or
+    * a *literal loopback* entry (`127.0.0.1` / `[::1]`) on the same port,
+      under a wildcard `listen` of the matching family: loopback traffic
+      never leaves this host and the wildcard bind holds the port on every
+      interface of that family, so connecting to the entry can only land on
+      our own listener.  Matched by :func:`_loopback_ip_version` (literal
+      parsing only); `localhost` is deliberately NOT matched here (resolving
+      it would be the DNS guessing this function refuses -- it gets an
+      advisory instead, see :func:`_likely_self_loopback`).
 
     The match is deliberately *exact*: never drop a peer on a fuzzy match of
     the host FQDN's *first label* against a bare `nodeName` (e.g. dropping
@@ -759,7 +793,16 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     peer_h, _, peer_port = peer_host.rpartition(":")
     if peer_port != listen_port:
         return False
-    return peer_h == node_name
+    if peer_h == node_name:
+        return True
+    # A literal loopback of the same family as the wildcard bind, on our own
+    # port: unambiguously this node (see the docstring). The family must
+    # match -- a "::"-only bind does not necessarily accept v4, so 127.0.0.1
+    # there could in principle be a different colocated process.
+    version = _loopback_ip_version(peer_h)
+    if version == 4 and listen_host in _V4_WILDCARD_LISTEN_HOSTS:
+        return True
+    return version == 6 and listen_host in _V6_WILDCARD_LISTEN_HOSTS
 
 
 def _likely_self_fqdn(peer_host: str, listen: str, node_name: str) -> bool:
@@ -781,6 +824,30 @@ def _likely_self_fqdn(peer_host: str, listen: str, node_name: str) -> bool:
     if peer_port != listen_port:
         return False
     return peer_h.split(".", 1)[0] == node_name and peer_h != node_name
+
+
+def _likely_self_loopback(peer_host: str, listen: str) -> bool:
+    """Whether a peer entry *looks like* this node listed via loopback.
+
+    A diagnostics-only heuristic like :func:`_likely_self_fqdn` (never used
+    to drop a peer).  True for a loopback-ish entry on our listen port that
+    :func:`_is_self_listed` could not drop as unambiguous: ``localhost`` (a
+    name, whose family is unknowable without the DNS resolution config time
+    refuses), or a loopback literal under a non-wildcard or other-family
+    ``listen``.  Loopback traffic never leaves this host, so such an entry
+    can never be another cluster member: at best it is this node itself --
+    hiding a degenerate effective size behind an inflated declared one -- and
+    at worst dead weight that raises the quorum threshold.  Used to warn when
+    the remainder would leave the real cluster at <= 2 nodes.
+    """
+    _, _, listen_port = listen.rpartition(":")
+    peer_h, _, peer_port = peer_host.rpartition(":")
+    if peer_port != listen_port:
+        # a colocated second daemon on another port of this host is a
+        # legitimate (if unusual) distinct member; only our own port is
+        # suspect.
+        return False
+    return peer_h == "localhost" or _loopback_ip_version(peer_h) is not None
 
 
 def _cluster_base(raw: dict) -> "Dict[str, Any]":
@@ -1429,6 +1496,33 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
                     ", ".join(self_hosts),
                     node_name,
                     size - len(self_hosts),
+                )
+            )
+        # The loopback analogue: a loopback entry can only reach this node
+        # (or nothing), so like a self-listing-by-FQDN it hides a smaller --
+        # at the boundary, degenerate -- real cluster behind the declared
+        # size. Unambiguous forms are dropped at load (_is_self_listed); this
+        # advisory covers what remains (localhost, or a family/listen
+        # mismatch). A self-listing by a routable IP under a wildcard listen
+        # is undetectable without resolving addresses; that case is caught at
+        # runtime instead, when the self-poll marks the entry STATUS_SELF
+        # (see yacron2.cluster.ClusterManager._log_peer_status_change).
+        loopback_hosts = [
+            peer["host"]
+            for peer in cfg["peers"]
+            if _likely_self_loopback(peer["host"], listen)
+        ]
+        if loopback_hosts and size - len(loopback_hosts) <= 2:
+            warnings.append(
+                "cluster.electLeader: {} peer(s) are loopback addresses on "
+                "this node's own port ({}); a loopback entry never reaches "
+                "another host, so at best it is this node itself and the "
+                "real cluster is only {} node(s) -- leader election will be "
+                "degenerate or refused at runtime. List each peer by an "
+                "address the other nodes are reached at.".format(
+                    len(loopback_hosts),
+                    ", ".join(loopback_hosts),
+                    size - len(loopback_hosts),
                 )
             )
     elif cfg.get("distribution") != DEFAULT_CLUSTER["distribution"]:

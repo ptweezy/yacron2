@@ -7,8 +7,8 @@ job on demand, and (when a `cluster` section is configured) reporting the cluste
 view. This page documents the configuration schema, the endpoints, bearer-token
 authentication, Unix-socket permissions, and lifecycle behavior.
 
-The interface is *new in version 0.10*; `web.authToken` and `web.socketMode` are new
-in yacron2 1.0.0.
+The interface is inherited from upstream yacron; `web.authToken` and
+`web.socketMode` are yacron2 additions.
 
 > **Looking for the browser UI?** The same HTTP interface also serves the
 > built-in **[Web Dashboard](Web-Dashboard)** at `/` on every `http://` listener
@@ -122,8 +122,8 @@ For `scheduled` jobs, `scheduled_in` is the number of seconds until the next run
 (a float, computed from the job's crontab in the job's timezone). For an `@reboot`
 schedule, `scheduled_in` is the literal string `"@reboot"`.
 
-The `disabled` status (*new in 1.0.1*) is reported honestly instead of an
-inapplicable `scheduled (in N seconds)`.
+The `disabled` status is reported honestly instead of an inapplicable
+`scheduled (in N seconds)`.
 
 Text form:
 
@@ -158,7 +158,7 @@ Content-Type: application/json; charset=utf-8
 ### `GET /cluster`
 
 Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
-*New in version 1.2.0.* When no `cluster` section is configured, it returns
+When no `cluster` section is configured, it returns
 `{"enabled": false, "peers": []}`. When a cluster section is present it returns
 `enabled: true` plus a `backend` field naming the active leadership backend
 (`gossip`, `kubernetes`, or `etcd`) and the node's view: its
@@ -272,7 +272,7 @@ job's `name`.
 | The job exists but has `enabled: false`. | `409 Conflict`, body `job '<name>' is disabled`. |
 | Otherwise. | `200 OK`, empty body; the job is launched via the normal launch path. |
 
-The `409` behavior is *new in 1.0.1*: a disabled job behaves as if it is not there,
+The `409` is deliberate: a disabled job behaves as if it is not there,
 so the API refuses to launch it manually rather than overriding the config.
 
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
@@ -288,8 +288,8 @@ Content-Length: 0
 
 ## Response headers
 
-The `web.headers` map (*released in yacron2 1.0.0*; merged upstream but never
-released in yacron 0.19) is a string→string map applied to every `200` success
+The `web.headers` map (merged upstream but never released in yacron 0.19) is a
+string→string map applied to every `200` success
 response across all routes (`/version`, `/status`, `/cluster`, `/job-set-id`,
 the other dashboard-supporting routes, and the `200` of `/jobs/{name}/start`) and
 to the `409` conflict body of `/jobs/{name}/start`. It is not applied to the
@@ -324,7 +324,7 @@ When `authToken` is set, an aiohttp middleware (`_make_auth_middleware`) require
 `Authorization: Bearer <token>` on every route:
 
 - The auth scheme is compared case-insensitively (`Bearer`, `bearer`, etc.) per
-  RFC 7235 (*case-insensitive matching new in 1.0.4*).
+  RFC 7235.
 - The presented token is compared against the configured token in constant time via
   `hmac.compare_digest`.
 - A missing/malformed `Authorization` header, a wrong scheme, or a non-matching
@@ -347,7 +347,7 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 
 If `authToken` is configured but resolves to an empty token, yacron2 raises a
 `ConfigError` and refuses to start the web server, rather than silently serving
-the control API with no authentication (*new in 1.0.1*). This happens when:
+the control API with no authentication. This happens when:
 
 - `value`, `fromFile`, and `fromEnvVar` are all empty/absent;
 - `fromEnvVar` names a variable that is unset (resolves to `""`);
@@ -363,7 +363,7 @@ If `fromFile` cannot be read (`OSError`), yacron2 also raises a `ConfigError`
 > `socketMode` has no effect and `unix://` listen URLs are skipped with a
 > warning; use an `http://` listener. See [Running on Windows](Running-on-Windows).
 
-`web.socketMode` (*new in 1.0.0*) is an octal-string file mode applied with `chmod`
+`web.socketMode` is an octal-string file mode applied with `chmod`
 to each `unix://` listen socket after it starts (`_apply_socket_mode`):
 
 ```yaml
@@ -397,7 +397,7 @@ reload from the scheduler loop:
 - Each `listen` address is bound independently. A bad URL (`ValueError`) or a bind
   failure (`OSError`, e.g. address already in use) on one address is logged as a
   warning (`web: could not listen on <addr>: ...`) and skipped; the remaining
-  addresses still bind, and the config update is not aborted (*new in 1.0.1*).
+  addresses still bind, and the config update is not aborted.
 - The `web: started listening on <addr>` log line is emitted only after the bind
   succeeds.
 - On shutdown, the running server is stopped after currently running jobs finish.
@@ -407,9 +407,13 @@ reload from the scheduler loop:
   [Running on Windows](Running-on-Windows).
 
 A `ConfigError` raised while resolving `authToken` (empty token or unreadable
-`fromFile`) propagates out of `start_stop_web_app` and is caught by the reload loop,
-which logs the configuration error and keeps running the previously-loaded
-configuration (the new config is not applied).
+`fromFile`) propagates out of `start_stop_web_app` and is caught by the reload
+loop's dedicated web-app handler, which logs `Error in the web configuration, so
+not starting the web API` and leaves the web API down until a later reload fixes
+it. The rest of the new configuration (jobs, cluster, logging) is still applied:
+the web app starts under its own error handling, after the cluster manager, so a
+web misconfiguration cannot skip the cluster gate (which would otherwise fail
+open and run every `Leader` job on every node).
 
 ## See also
 

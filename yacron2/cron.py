@@ -46,6 +46,11 @@ RUN_HISTORY_LIMIT = 50
 # for the dashboard's inline sparkline without shipping the full detailed
 # history on every poll. The full history is available from /jobs/{name}/runs.
 JOBS_INLINE_HISTORY = 20
+# Floor (seconds) for the gate re-check interval of a deferred fail-closed
+# retry: the cluster gate can stay closed for a while, and a job configured
+# with a tiny/zero backoff delay must not hot-loop the scheduler (and spam the
+# log) while it waits. See schedule_retry_job.
+RETRY_GATE_RECHECK_FLOOR = 1.0
 # requests served without bearer-token auth even when authToken is configured.
 # Only the UI page itself (which carries no data and no secrets) is public; the
 # browser then authenticates every data request with the token the user enters.
@@ -315,7 +320,6 @@ class Cron:
             try:
                 config = self.update_config()
                 self._log_job_set_id()
-                await self.start_stop_web_app(config.web_config)
                 await self.start_stop_cluster(config.cluster_config)
             except ConfigError as err:
                 logger.error(
@@ -325,6 +329,26 @@ class Cron:
                 )
             except Exception:  # pragma: nocover
                 logger.exception("please report this as a bug (1)")
+            if config is not None:
+                # The web app starts AFTER the cluster and under its OWN
+                # error handling: a web misconfiguration raising ConfigError
+                # (e.g. an authToken that resolves empty) used to share the
+                # try/except above and skip start_stop_cluster entirely, so
+                # _elect_leader_configured stayed False and every node ran
+                # every Leader job ungated -- the gate failed OPEN on an
+                # unrelated web error, on startup and on every reload
+                # iteration. The cluster gate must engage regardless of the
+                # web app's fate.
+                try:
+                    await self.start_stop_web_app(config.web_config)
+                except ConfigError as err:
+                    logger.error(
+                        "Error in the web configuration, so not starting "
+                        "the web API:\n%s",
+                        str(err),
+                    )
+                except Exception:  # pragma: nocover
+                    logger.exception("please report this as a bug (4)")
             if (
                 config is not None
                 and config.logging_config is not None
@@ -361,12 +385,22 @@ class Cron:
                 self.cancel_job_retries(name) for name in self.retry_state
             ]
             await asyncio.gather(*cancel_all)
-        await self._wait_for_running_jobs_task
-
+        # Release leadership BEFORE waiting out the running-job drain: the
+        # drain is unbounded (it waits for every running job, no deadline),
+        # and keeping the gossip listener / lease renew loop alive through it
+        # would hold leadership on a node that no longer schedules anything,
+        # stalling every Leader job cluster-wide until the slowest local job
+        # finishes -- instead of the documented release-on-graceful-stop
+        # failover. Retries were all cancelled above, so no retry task is
+        # left to consult the stopped manager. The cost is confined to the
+        # jobs still draining: the new owner may start one of those while it
+        # finishes here (the same overlap a crash produces), rather than the
+        # whole Leader-gated job set standing still.
         if self.cluster_manager is not None:
             logger.info("Stopping cluster manager")
             await self.cluster_manager.stop()
             self.cluster_manager = None
+        await self._wait_for_running_jobs_task
 
         if self.web_runner is not None:
             logger.info("Stopping http server")
@@ -517,6 +551,29 @@ class Cron:
                 text="job {!r} is disabled".format(name),
                 headers=self.web_config.get("headers", None),
             )
+        # A manual start of a job still pending as a deferred @reboot one-shot
+        # IS its boot run: retire the pending entry and record the run with
+        # the cluster (when a manager is up), or _process_pending_reboots
+        # would find reboot_ran(name) False after convergence and run the
+        # one-shot a second time -- possibly on another node, since the
+        # manual run was never gossiped/persisted as ran. Recording BEFORE
+        # spawning mirrors the deferred-launch path's at-most-once ordering.
+        if name in self._pending_reboot_jobs:
+            mgr = self.cluster_manager
+            if mgr is not None:
+                await mgr.mark_reboot_ran(name)
+            # pop, not del: a concurrent manual start of the same name can
+            # retire the entry while the await above yields (the gossip push
+            # awaits peers), and the loser of that race must not 500 on a
+            # KeyError -- the entry is retired (and logged) exactly once,
+            # mark_reboot_ran is idempotent, and both requests still launch
+            # below, exactly as two manual starts of any other job would.
+            if self._pending_reboot_jobs.pop(name, None) is not None:
+                logger.info(
+                    "cluster: manual start of deferred @reboot job %s counts "
+                    "as its boot run; retiring the pending entry",
+                    name,
+                )
         await self.maybe_launch_job(job)
         return web.Response(headers=self.web_config.get("headers", None))
 
@@ -1229,8 +1286,10 @@ class Cron:
         ``maybe_launch_job`` directly and are deliberately *not* gated (an
         explicit operator action runs where it is invoked).  Scheduled-job
         *retries* re-check this gate in ``schedule_retry_job`` before
-        relaunching, so a retry that outlives the leadership it began under is
-        abandoned rather than double-running across a failover.
+        relaunching: a retry that outlives the leadership it began under is
+        abandoned once another node positively owns the job (rather than
+        double-running across a failover), but merely deferred and re-checked
+        on a transient fail-closed denial (see ``_cluster_owner_moved``).
 
         A detected conflict (``mgr.has_conflict()`` — a duplicate ``nodeName``,
         an agreeing peer declaring a different cluster size ``N``, or an
@@ -1654,34 +1713,164 @@ class Cron:
             delay,
         )
         await asyncio.sleep(delay)
-        try:
-            job = self.cron_jobs[job_name]
-        except KeyError:
-            logger.warning(
-                "Cron job %s was scheduled for retry, but "
-                "disappeared from the configuration",
+        deferrals = 0
+        while True:
+            try:
+                job = self.cron_jobs[job_name]
+            except KeyError:
+                logger.warning(
+                    "Cron job %s was scheduled for retry, but "
+                    "disappeared from the configuration",
+                    job_name,
+                )
+                # clear the now-stale retry state and stop; falling through
+                # here would call maybe_launch_job(job) with an unbound 'job'.
+                self.retry_state.pop(job_name, None)
+                return
+            # Re-check the leadership gate before relaunching: a retry can
+            # outlive the leadership it started under (a partition / quorum
+            # loss / reload moved ownership while we slept), and
+            # maybe_launch_job does NOT gate. Relaunching unconditionally
+            # would run a Leader-policy job here while the new owner also
+            # runs it on its next tick -- the exact double-run the
+            # abstraction promises to prevent.
+            if self._cluster_allows(job):
+                break
+            if self._cluster_owner_moved(job):
+                # ownership genuinely moved: end this node's retry sequence
+                # (the new owner picks up the job's future scheduled firings,
+                # not this failed attempt; see _abandon_retry for the
+                # @reboot-one-shot caveat).
+                self._abandon_retry(job_name, retry_num)
+                return
+            # A transient fail-closed denial (lost quorum, a nodeName/size/
+            # policy conflict, a backend read error, no manager): this node
+            # may well still be the rightful owner, and ending the sequence
+            # here would end it EVERYWHERE for an @reboot keep-alive job
+            # (maximumRetries: -1) -- reboot_ran was recorded before the
+            # first launch, so no other node ever restarts it. Keep the
+            # retry alive and re-check the gate after another delay.
+            state = self.retry_state.get(job_name)
+            if state is None or state.cancelled or self._stop_event.is_set():
+                # the sequence ended (success / cancellation / shutdown)
+                # while we deliberated: nothing left to keep alive.
+                return
+            recheck = max(delay, RETRY_GATE_RECHECK_FLOOR)
+            # first deferral at INFO (the operator-visible event), repeats at
+            # DEBUG: a long gate-closed outage with a tiny initialDelay would
+            # otherwise emit this line about once per second for its whole
+            # duration (the RETRY_GATE_RECHECK_FLOOR cadence).
+            log = logger.info if deferrals == 0 else logger.debug
+            deferrals += 1
+            log(
+                "Cron job %s retry (#%i) deferred: the cluster does not "
+                "currently allow this node to run it and no other node "
+                "positively owns it; re-checking in %.1f seconds",
                 job_name,
+                retry_num,
+                recheck,
             )
-            # clear the now-stale retry state and stop; falling through here
-            # would call maybe_launch_job(job) with an unbound 'job'.
-            self.retry_state.pop(job_name, None)
-            return
-        # Re-check the leadership gate before relaunching: a retry can outlive
-        # the leadership it started under (a partition / quorum loss / reload
-        # moved ownership while we slept), and maybe_launch_job does NOT gate.
-        # Relaunching unconditionally would run a Leader-policy job here while
-        # the new owner also runs it on its next tick -- the exact double-run
-        # the abstraction promises to prevent. If we are no longer the owner,
-        # abandon the retry (the new owner runs it on its own schedule).
-        if not self._cluster_allows(job):
-            logger.info(
-                "Cron job %s retry abandoned: this node is no longer the "
-                "cluster owner for it",
-                job_name,
-            )
-            self.retry_state.pop(job_name, None)
-            return
+            await asyncio.sleep(recheck)
         await self.maybe_launch_job(job)
+
+    def _cluster_owner_moved(self, job: JobConfig) -> bool:
+        """Whether another node is *positively* identified as ``job``'s owner.
+
+        Used by ``schedule_retry_job`` to tell a genuine ownership move
+        (another node runs the job on its own schedule, so a pending retry
+        may be abandoned without double-running) from a transient fail-closed
+        denial of ``_cluster_allows`` (lost quorum, a conflict, a
+        still-converging view, a backend read error, no manager), where this
+        node may well still be the rightful owner and abandoning would end
+        the sequence for good.
+        Decided from the seam's self-recognising ``is_available_*`` reads --
+        never a display-name comparison -- so a lease holder in its
+        self-demotion window (still observing itself as holder while
+        ``is_leader()`` already reports False) is not mistaken for a move.
+        """
+        mgr = self.cluster_manager
+        if mgr is None:
+            return False  # election fails closed here; nobody else owns it
+        try:
+            if mgr.has_conflict():
+                # the election is unsafe while nodes conflict: nobody is
+                # positively the owner, so treat the denial as transient
+                return False
+            if not mgr.is_quorate():
+                # no trustworthy view of leadership -> no positive owner
+                return False
+            if not mgr.view_settled():
+                # a freshly rebuilt gossip manager holds the never-skip
+                # available_* gates closed while peers re-attest its new
+                # instance_id -- even on the rightful owner, and even while
+                # QUORATE (quorum needs only a majority attesting us; the
+                # hold waits for every current-build agreeing peer). A False
+                # from those gates is then the hold, not an observed move;
+                # abandoning here would end the sequence for good (fatal for
+                # an @reboot keep-alive). Bounded (~2 poll intervals), so
+                # defer and re-check like any transient denial.
+                return False
+            if mgr.distribution == "spread":
+                return not mgr.is_available_job_owner(job.name)
+            return not mgr.is_available_leader()
+        except Exception:
+            # mirrors _cluster_allows: a backend read error is a transient
+            # fail-closed condition, never a confirmed ownership move.
+            logger.exception(
+                "cluster: error checking whether ownership of job %s moved; "
+                "treating the denial as transient",
+                job.name,
+            )
+            return False
+
+    def _abandon_retry(self, job_name: str, retry_num: int) -> None:
+        """End a pending retry sequence whose job's ownership moved off-node.
+
+        Marks the state cancelled BEFORE dropping it: a RunningJob launched
+        while the retry sat pending (a manual API start, a concurrencyPolicy
+        Allow overlap) captured this same JobRetryState, and its own later
+        failure would otherwise re-arm a retry on a state no longer in
+        ``retry_state`` -- which ``cancel_job_retries`` could never find or
+        cancel, so the orphan would relaunch the job even after a later
+        successful run.
+        """
+        state = self.retry_state.get(job_name)
+        if state is not None:
+            state.cancelled = True
+        self.retry_state.pop(job_name, None)
+        # Wording note: the new owner picks up future *scheduled* firings; it
+        # does NOT re-run this failed attempt, and an @reboot one-shot has no
+        # future firing at all (its boot run is already recorded), so the
+        # message must not promise the job "runs elsewhere".
+        logger.warning(
+            "Cron job %s retry (#%i) abandoned: the cluster moved ownership "
+            "of it to another node; onPermanentFailure will not fire for "
+            "this sequence, this attempt is not re-run elsewhere, and any "
+            "future scheduled firings happen on the new owner (an @reboot "
+            "one-shot has none)",
+            job_name,
+            retry_num,
+        )
+        # Record the abandonment in the run history, like a web-UI
+        # cancellation: the sequence ended without a verdict on the job
+        # itself, so the dashboard should show why the retries stopped.
+        # There is no RunningJob at this point, so no report hook (and no
+        # statsd metric, which is per-run) can fire; the record and the
+        # WARNING above are the observable trace.
+        output = JobOutputStream()
+        output.close()
+        self._record_run(
+            job_name,
+            JobRunInfo(
+                outcome="cancelled",
+                exit_code=None,
+                started_at=None,
+                finished_at=get_now(datetime.timezone.utc),
+                fail_reason="retry abandoned: cluster ownership moved to "
+                "another node",
+                output=output,
+            ),
+        )
 
     async def handle_job_success(self, job: RunningJob) -> None:
         await self.cancel_job_retries(job.config.name)

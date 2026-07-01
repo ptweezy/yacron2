@@ -99,7 +99,7 @@ The clock used to evaluate a schedule is resolved by `JobConfig._resolve_timezon
 | Option     | Type | Default | Description |
 |------------|------|---------|-------------|
 | `utc`      | Bool | `true`  | When no `timezone` is set: `true` evaluates the schedule in UTC; `false` uses the host's naive local time. |
-| `timezone` | Str  | *(unset; `None`)* | IANA timezone name (e.g. `America/Los_Angeles`). When set, it overrides `utc`. New in yacron2 0.11. |
+| `timezone` | Str  | *(unset; `None`)* | IANA timezone name (e.g. `America/Los_Angeles`). When set, it overrides `utc`. |
 
 Resolution order (`timezone` wins):
 

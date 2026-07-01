@@ -937,8 +937,23 @@ class KubernetesBackend(LeaseBackend):
             # Preserve the @reboot-ran annotation when handing the lease back:
             # a graceful stop (e.g. a config reload that rebuilds the manager)
             # must NOT erase the record of which one-shots already ran, or a
-            # peer that takes over would re-run them. Carry the stored set
-            # (plus any of our own pending marks) forward.
+            # peer that takes over would re-run them. Observe the stored
+            # pairing FIRST, as the renew round does: reboot_ran_annotation
+            # stamps the cached set with the LIVE job-set id, and a reload can
+            # change that id in the same iteration that stops this manager
+            # (cluster section changed / a kubeconfig cert rotation), with no
+            # renew round in between to re-scope the cache -- composing
+            # without observing would re-stamp the OLD config's ran-set under
+            # the NEW id, a toxic pairing every later observe adopts as
+            # genuine, retiring a redefined @reboot one-shot cluster-wide
+            # without ever running it (the exact laundering gossip's
+            # advertised_ran_jobs and etcd's _cas_write_reboot_ran guard
+            # against). Carry the stored set (plus any of our own pending
+            # marks) forward.
+            stored_jsid, stored_jobs = decode_reboot_ran(
+                state.annotations.get(REBOOT_RAN_KEY)
+            )
+            self._observe_reboot_ran(stored_jsid, stored_jobs)
             annotations = self.reboot_ran_annotation(state.annotations)
             if annotations:
                 metadata["annotations"] = annotations
@@ -1004,9 +1019,10 @@ def _kubeconfig_cert_files(path: str) -> List[Optional[str]]:
     parse error yields ``[]`` -- the kubeconfig path stays tracked regardless,
     so the worst case is the pre-existing under-tracking, never a crash.
     """
-    try:
-        from strictyaml.ruamel import YAML
+    from strictyaml.ruamel import YAML
+    from strictyaml.ruamel.error import YAMLError, YAMLFutureWarning
 
+    try:
         with open(path) as cfg_file:
             data = YAML(typ="safe").load(cfg_file)
         contexts = {c["name"]: c["context"] for c in data.get("contexts", [])}
@@ -1020,7 +1036,22 @@ def _kubeconfig_cert_files(path: str) -> List[Optional[str]]:
             user.get("client-certificate"),
             user.get("client-key"),
         ]
-    except (OSError, KeyError, TypeError, AttributeError, ValueError):
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        ValueError,
+        # the ruamel parse-error family: ScannerError/ParserError subclass
+        # YAMLError, but DuplicateKeyError descends from Warning via
+        # YAMLFutureWarning, so BOTH roots must be named. PyYAML -- what the
+        # native client's load_kube_config parses with -- silently accepts a
+        # duplicated mapping key (last-wins), so a kubeconfig the official
+        # client loads fine still reaches the unguarded call in _setup_sync;
+        # raising here would abort the whole backend over cert-file TRACKING.
+        YAMLError,
+        YAMLFutureWarning,
+    ):
         return []
 
 
@@ -1170,16 +1201,22 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         data/files, with an embedded or referenced CA (or ``insecure``).
         """
         from strictyaml.ruamel import YAML
+        from strictyaml.ruamel.error import YAMLError, YAMLFutureWarning
 
-        with open(path) as cfg_file:
-            data = YAML(typ="safe").load(cfg_file)
-        # A well-formed-YAML but structurally-broken kubeconfig (empty file, no
-        # current-context, a context naming an undefined cluster/user) raises
-        # KeyError/TypeError/AttributeError here. start_stop_cluster does not
-        # catch those, so without this they escape as a "please report a bug"
-        # crash; convert to ConfigError so a bad kubeconfig is logged and the
+        # A syntactically-broken kubeconfig (truncated mid-rotation, a tab
+        # indent) raises the ruamel ScannerError/ParserError family (YAMLError
+        # subclasses), and a duplicated mapping key raises DuplicateKeyError,
+        # which descends from Warning via YAMLFutureWarning, NOT YAMLError --
+        # so both roots must be named. A well-formed-YAML but structurally-
+        # broken kubeconfig (empty file, no current-context, a context naming
+        # an undefined cluster/user) raises KeyError/TypeError/AttributeError.
+        # start_stop_cluster catches none of those, so without this they
+        # escape as a "please report a bug" crash; convert to ConfigError so a
+        # bad kubeconfig is logged as "cluster: failed to start" and the
         # daemon survives, mirroring the native transport's _setup_sync.
         try:
+            with open(path) as cfg_file:
+                data = YAML(typ="safe").load(cfg_file)
             contexts = {
                 c["name"]: c["context"] for c in data.get("contexts", [])
             }
@@ -1191,12 +1228,28 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             cluster = clusters[ctx["cluster"]]
             user = users.get(ctx["user"], {})
             self._base_url = cluster["server"].rstrip("/")
-        except (KeyError, TypeError, AttributeError) as ex:
+        except (
+            KeyError,
+            TypeError,
+            AttributeError,
+            YAMLError,
+            YAMLFutureWarning,
+        ) as ex:
             raise ConfigError(
                 "kubernetes backend: malformed kubeconfig {!r} ({})".format(
                     path, ex
                 )
             ) from ex
+        if self.b.api_server_override:
+            # cluster.kubernetes.apiServer overrides the kubeconfig's embedded
+            # server URL (a reachable proxy/VIP when the kubeconfig embeds an
+            # internal address), matching the native transport (_setup_sync
+            # applies it after load_kube_config) and the documented
+            # override-wins semantics. Silently keeping the kubeconfig's URL
+            # here would point the HTTP and native transports at DIFFERENT
+            # apiservers from the same config -- two lease stores each
+            # granting a lease (two leaders).
+            self._base_url = self.b.api_server_override.rstrip("/")
         self.b.namespace = self.b._resolve_namespace(ctx.get("namespace"))
 
         if cluster.get("insecure-skip-tls-verify"):

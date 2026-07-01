@@ -64,6 +64,9 @@ def test_defaulted_single_holder_invariants():
     assert b.quorum() == 1
     assert b.reboot_ran("j") is False
     assert b.tls_files_changed() is False
+    # no gossip convergence window: a lease backend's view is always settled,
+    # so a False from its available_* gates is a positive ownership read
+    assert b.view_settled() is True
 
 
 async def test_mark_reboot_ran_is_a_noop():

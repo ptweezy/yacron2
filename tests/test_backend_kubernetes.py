@@ -627,6 +627,43 @@ def test_kubeconfig_cert_files_tolerates_embedded_and_malformed(tmp_path):
     assert _kubeconfig_cert_files(str(tmp_path / "missing")) == []
 
 
+def test_kubeconfig_cert_files_tolerates_ruamel_yaml_errors(tmp_path):
+    # Finding 16: the tolerance must cover the ruamel error family, not just
+    # OSError/structural errors. A duplicated mapping key raises
+    # DuplicateKeyError -- descending from Warning, NOT from any class the old
+    # tuple caught -- while PyYAML (what the native client's load_kube_config
+    # parses with) ACCEPTS the same file, so the official client succeeds and
+    # the unguarded _setup_sync call reaches this helper. An escape here
+    # aborts the whole backend ("please report this as a bug"): Leader jobs
+    # run on NO replica, PreferLeader on EVERY replica.
+    dup = tmp_path / "dup"
+    dup.write_text(
+        "apiVersion: v1\n"
+        "current-context: ctx\n"
+        "contexts:\n"
+        "  - name: ctx\n"
+        "    context: {cluster: c, user: u}\n"
+        "clusters:\n"
+        "  - name: c\n"
+        "    cluster:\n"
+        "      server: https://1.2.3.4:6443\n"
+        "      certificate-authority: /a.crt\n"
+        "      certificate-authority: /b.crt\n"
+        "users:\n"
+        "  - name: u\n"
+        "    user: {token: tok}\n"
+    )
+    assert _kubeconfig_cert_files(str(dup)) == []
+    # syntax-broken (a tab indent -> ScannerError, a YAMLError subclass)
+    tabbed = tmp_path / "tabbed"
+    tabbed.write_text("contexts:\n\t- broken\n")
+    assert _kubeconfig_cert_files(str(tabbed)) == []
+    # truncated mid-rotation (ParserError, also a YAMLError subclass)
+    truncated = tmp_path / "truncated"
+    truncated.write_text("clusters:\n  - name: c\n    cluster: {server: h\n")
+    assert _kubeconfig_cert_files(str(truncated)) == []
+
+
 def test_view_dict_and_lease_detail():
     b = _backend()
     # apply the round at real "now" so is_leader()/is_quorate() (which read the
@@ -726,6 +763,91 @@ def test_http_transport_static_token_and_no_token(tmp_path):
     assert t._auth_headers() == {"Authorization": "Bearer static-tok"}
     t._auth_token = None
     assert t._auth_headers() == {}
+
+
+def _write_kubeconfig(tmp_path, server="https://10.0.0.5:6443"):
+    kubeconfig = tmp_path / "kubeconfig"
+    kubeconfig.write_text(
+        "apiVersion: v1\n"
+        "current-context: ctx\n"
+        "contexts:\n"
+        "  - name: ctx\n"
+        "    context: {cluster: c, user: u}\n"
+        "clusters:\n"
+        "  - name: c\n"
+        "    cluster:\n"
+        "      server: " + server + "\n"
+        "users:\n"
+        "  - name: u\n"
+        "    user: {token: tok}\n"
+    )
+    return kubeconfig
+
+
+def test_http_kubeconfig_honours_apiserver_override(tmp_path):
+    # Finding 1: cluster.kubernetes.apiServer must override the kubeconfig's
+    # embedded server URL on the HTTP transport too, matching the native
+    # client (_setup_sync applies it after load_kube_config) and the
+    # documented override-wins semantics. Silently dropping it points the two
+    # transports at DIFFERENT apiservers from the same config under
+    # clientLibrary auto (two lease stores each granting a lease -> two
+    # leaders), and even in a single-transport fleet pins every round to the
+    # kubeconfig's (often unreachable) embedded URL -- permanently non-quorate.
+    kubeconfig = _write_kubeconfig(tmp_path)
+    b = _backend(
+        extra=(
+            "    kubeconfig: '{}'\n"
+            "    apiServer: https://mgmt-vip.example.com:8443/\n"
+        ).format(kubeconfig)
+    )
+    t = _K8sHttpTransport(b)
+    t._load_connection()
+    # the override wins (and is rstripped like the native transport's)
+    assert t._base_url == "https://mgmt-vip.example.com:8443"
+    # without the override the kubeconfig's embedded server is used
+    plain = _backend(extra="    kubeconfig: '{}'\n".format(kubeconfig))
+    t2 = _K8sHttpTransport(plain)
+    t2._load_connection()
+    assert t2._base_url == "https://10.0.0.5:6443"
+
+
+def test_http_load_kubeconfig_yaml_errors_become_configerror(tmp_path):
+    # Finding 16: a kubeconfig the ruamel loader rejects must surface as
+    # ConfigError -- which start_stop_cluster catches and logs as "cluster:
+    # failed to start" -- not escape as a raw ScannerError/ParserError/
+    # DuplicateKeyError to the run loop's "please report this as a bug"
+    # handler. The YAML load sat OUTSIDE the try that does the conversion, and
+    # DuplicateKeyError descends from Warning so it needs naming explicitly.
+    t = _K8sHttpTransport(_backend())
+    # duplicated mapping key (e.g. a hand-merged kubeconfig kubectl accepts)
+    dup = tmp_path / "dup"
+    dup.write_text(
+        "apiVersion: v1\n"
+        "current-context: ctx\n"
+        "contexts:\n"
+        "  - name: ctx\n"
+        "    context: {cluster: c, user: u}\n"
+        "clusters:\n"
+        "  - name: c\n"
+        "    cluster:\n"
+        "      server: https://1.2.3.4:6443\n"
+        "      certificate-authority: /a.crt\n"
+        "      certificate-authority: /b.crt\n"
+        "users:\n"
+        "  - name: u\n"
+        "    user: {token: tok}\n"
+    )
+    with pytest.raises(ConfigError, match="malformed kubeconfig"):
+        t._load_kubeconfig(str(dup))
+    # truncated mid-rotation / syntax-broken
+    truncated = tmp_path / "truncated"
+    truncated.write_text("clusters:\n  - name: c\n    cluster: {server: h\n")
+    with pytest.raises(ConfigError, match="malformed kubeconfig"):
+        t._load_kubeconfig(str(truncated))
+    tabbed = tmp_path / "tabbed"
+    tabbed.write_text("contexts:\n\t- broken\n")
+    with pytest.raises(ConfigError, match="malformed kubeconfig"):
+        t._load_kubeconfig(str(tabbed))
 
 
 # --- shared-store fence: the at-most-one guarantee end-to-end --------------
@@ -944,6 +1066,42 @@ async def test_release_preserves_reboot_ran_annotation():
     assert state.holder is None  # released
     _, jobs = decode_reboot_ran(state.annotations.get(REBOOT_RAN_KEY))
     assert jobs == {"migrate"}  # annotation preserved
+
+
+async def test_release_does_not_restamp_stale_reboot_ran_under_new_id():
+    # Finding 8: one config edit both redefines the @reboot job (job-set id
+    # v1 -> v2) and touches the cluster section (or a kubeconfig cert rotation
+    # lands the same reload), so start_stop_cluster stops the holder in the
+    # SAME iteration the live id changed -- no renew round in between
+    # re-scopes the cache. _release must not launder the ran-set observed
+    # under v1 by re-stamping it with the live v2 id: every later observe
+    # would adopt that pairing as genuine and the redefined one-shot would be
+    # retired without ever running, on every node, forever.
+    from yacron2.leadership import REBOOT_RAN_KEY, decode_reboot_ran
+
+    live = {"id": "v1:job"}
+    store = _FakeApiStore()
+    b = _store_backend(store, "node-a#1")
+    b.get_job_set_id = lambda: live["id"]
+    await b._renew_once()  # acquire the lease under v1
+    await b.mark_reboot_ran("migrate")  # ran + persisted under v1
+    # a later renew round re-observes the persisted set from the store, so it
+    # now lives in _reboot_ran scoped to v1 (the finding's precondition: the
+    # one-shot "already ran", recorded in the annotation under the old id).
+    await b._renew_once()
+    live["id"] = "v2:new"  # reload redefines the job...
+    await b._release()  # ...and stops the manager before any renew round
+    state = parse_lease(store.get())
+    assert state.holder is None  # released
+    jsid, jobs = decode_reboot_ran(state.annotations.get(REBOOT_RAN_KEY))
+    # the stored (v1, {migrate}) pairing is preserved VERBATIM, not re-stamped
+    # under v2 -- so an observer under v2 ignores it as an older config's.
+    assert jsid == "v1:job" and jobs == {"migrate"}
+    # a peer booting under v2 must see the one-shot as NOT run yet.
+    peer = _store_backend(store, "node-b#2")
+    peer.get_job_set_id = lambda: "v2:new"
+    await peer._renew_once()  # takes over the released lease, folds the store
+    assert peer.reboot_ran("migrate") is False
 
 
 # --- F10: @reboot-ran job-set re-stamping through the real _renew_once -----

@@ -4,7 +4,7 @@ This page covers every way to install yacron2: the published container image,
 `pip`, `pipx`, and the self-contained PyInstaller binaries. It documents the
 Python and platform requirements, the runtime dependencies, the exact binary
 release assets, and the writable-and-executable temp-directory requirement that
-applies to the standalone binary only. As of 1.1.7 yacron2 runs natively on
+applies to the standalone binary only. yacron2 runs natively on
 Windows in addition to Linux and macOS; see [Running on Windows](Running-on-Windows)
 for the Windows-specific details.
 
@@ -145,15 +145,15 @@ following assets, built natively on a matching runner:
 
 The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
-(added in 1.0.8) are built inside an Alpine container for musl/Alpine hosts.
-The `i686` and `armv7` builds (added in 1.1.3) and the `ppc64le` and `s390x`
-builds (added in 1.1.4), both glibc and musl, extend the 64-bit `amd64`/`arm64`
+are built inside an Alpine container for musl/Alpine hosts.
+The `i686` and `armv7` builds and the `ppc64le` and `s390x`
+builds, both glibc and musl, extend the 64-bit `amd64`/`arm64`
 binaries to 32-bit x86, 32-bit ARM, POWER and IBM Z hosts; they build inside a
 container (`i686` natively on the x86-64 runner, the rest under QEMU emulation).
-The `riscv64` builds (added in 1.1.6) cover 64-bit RISC-V for both glibc and
+The `riscv64` builds cover 64-bit RISC-V for both glibc and
 musl, and the musl-only `armv6` build extends to older 32-bit ARM (e.g.
-Raspberry Pi 1/Zero); there is no glibc `armv6` build. macOS builds (added in
-1.0.10) cover both Apple Silicon and Intel. The Windows binaries are
+Raspberry Pi 1/Zero); there is no glibc `armv6` build. macOS builds cover both
+Apple Silicon and Intel. The Windows binaries are
 self-contained `.exe` files for x64 (`amd64`) and ARM64; like the other
 binaries they embed Python, so Python is not required on the target.
 
@@ -176,18 +176,17 @@ on ARM64) and run it directly; no `chmod` is needed:
 
 ### macOS signing and notarization
 
-Since 1.0.11 the macOS binaries are Developer ID code-signed (hardened runtime)
+The macOS binaries are Developer ID code-signed (hardened runtime)
 and notarized by Apple, so Gatekeeper accepts them and they run without first
-clearing the quarantine attribute. The earlier 1.0.10 macOS binaries were
-unsigned and required `xattr -d com.apple.quarantine` before first run; that
-step is no longer needed.
+clearing the quarantine attribute; no `xattr -d com.apple.quarantine` step is
+needed before first run.
 
 ### Standalone binary temp-directory requirement
 
 The standalone binary is a self-extracting executable: on each start it unpacks
 its embedded Python runtime into a temporary directory and loads shared
 libraries from there. It therefore needs a temporary directory that is both
-**writable and executable** (documented in 1.0.9). On an ordinary system the
+**writable and executable**. On an ordinary system the
 default `/tmp` already satisfies this, so no extra setup is required.
 
 This matters only when you run the binary under a **read-only root filesystem**

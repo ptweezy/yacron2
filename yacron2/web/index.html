@@ -478,6 +478,89 @@
   .cdot.conflict { background: #f85149; }
   .cdot.unreachable { background: #8b949e; }
   .cdot.self { background: #58a6ff; }
+
+  /* ============================================================= *
+   *  add-on panels: next-fire radar · wallboard · heatmap ·        *
+   *  cluster peer swimlane                                         *
+   * ============================================================= */
+
+  /* toggled view buttons in the toolbar / cluster header */
+  .ghostbtn.on { background: var(--selbg); }
+  .ghostbtn.mini { height: 24px; min-width: 0; font-size: 10.5px; padding: 0 8px; }
+
+  /* ---------- next-fire radar ---------- */
+  .radar { margin-bottom: 12px; }
+  .radar-body { display: flex; gap: 14px; align-items: stretch; padding: 10px 12px; flex-wrap: wrap; }
+  .radar-feed { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; flex: 1 1 260px; }
+  .radar-feed li { display: inline-flex; align-items: center; gap: 7px; padding: 3px 9px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); cursor: pointer; white-space: nowrap; }
+  .radar-feed li:hover { background: var(--hover); border-color: var(--border2); }
+  .radar-feed .cd { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+  .radar-feed .nm { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; max-width: 170px; }
+  .radar-feed .empty { color: var(--fg-faint); font-style: italic; cursor: default; }
+  .radar-track { position: relative; flex: 1 1 320px; min-width: 260px; height: 44px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); overflow: hidden; }
+  .rt-grid { position: absolute; top: 0; bottom: 0; }
+  .rt-grid i { position: absolute; top: 0; bottom: 14px; width: 1px; background: var(--border); }
+  .rt-grid b { position: absolute; bottom: 1px; left: 2px; font-size: 9px; font-weight: 400; color: var(--fg-faint); white-space: nowrap; }
+  .rt-mk { position: absolute; top: 3px; bottom: 15px; width: 2px; margin-left: -1px; background: var(--accent); cursor: pointer; border-radius: 1px; }
+  .rt-mk:hover { background: var(--fg); box-shadow: 0 0 6px var(--glow); }
+
+  /* ---------- wallboard / TV kiosk ---------- */
+  .wallboard { position: fixed; inset: 0; z-index: 8000; background: var(--bg); display: flex; flex-direction: column; }
+  body.fx .wallboard { background: radial-gradient(ellipse at center, var(--bg2) 0%, var(--bg) 82%); }
+  .wb-grid { flex: 1; min-height: 0; overflow: auto; padding: 18px; display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); grid-auto-rows: minmax(98px, auto); align-content: start; }
+  .wb-tile { border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 5px; cursor: pointer; overflow: hidden; }
+  .wb-tile:hover { border-color: var(--border2); }
+  .wb-glyph { font-size: 30px; line-height: 1; }
+  .wb-name { font-weight: 700; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wb-next { color: var(--fg-dim); font-size: 11.5px; font-variant-numeric: tabular-nums; margin-top: auto; }
+  .wb-tile.st-fail { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); }
+  .wb-tile.st-fail .wb-glyph { color: var(--fail); }
+  .wb-tile.st-run .wb-glyph { color: var(--run); }
+  .wb-tile.st-ok .wb-glyph { color: var(--ok); }
+  .wb-tile.st-pending .wb-glyph { color: var(--pending); }
+  .wb-tile.st-cancelled .wb-glyph { color: var(--cancelled); }
+  .wb-tile.st-disabled { opacity: .55; }
+  .wb-tile.st-disabled .wb-glyph { color: var(--disabled); }
+  body.fx .wb-tile.st-fail { box-shadow: 0 0 16px color-mix(in srgb, var(--fail) 30%, transparent); }
+  .wb-tile.flip { animation: wbflip .7s ease-out; }
+  @keyframes wbflip { 0% { background: var(--fail); } 100% { background: var(--panel); } }
+  .wb-foot { display: flex; align-items: center; gap: 16px; padding: 10px 18px; border-top: 1px solid var(--border);
+    background: var(--panel); font-size: 13px; flex-wrap: wrap; }
+  .wb-stat { color: var(--fg-dim); } .wb-stat b { color: var(--fg); font-size: 16px; margin-right: 4px; }
+  .wb-stat.fail b { color: var(--fail); } .wb-stat.run b { color: var(--run); } .wb-stat.ok b { color: var(--ok); }
+  .wb-stat.cl { color: var(--fg-faint); }
+  .wb-clock { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+  body.tv > header, body.tv > main { display: none; }
+  @media (prefers-reduced-motion: reduce) { .wb-tile.flip { animation: none; } }
+
+  /* ---------- activity heatmap ---------- */
+  .heat { margin-bottom: 12px; }
+  .heat-body { overflow-x: auto; padding: 8px 12px 12px; }
+  .heat-row { display: grid; grid-template-columns: 150px 1fr; align-items: center; gap: 8px; margin-bottom: 2px; min-width: 520px; }
+  .heat-row.axis { color: var(--fg-faint); font-size: 9.5px; margin-bottom: 6px; }
+  .heat-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-dim); cursor: pointer; }
+  .heat-name:hover { color: var(--fg); }
+  .heat-cells, .heat-axis { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 2px; }
+  .heat-cells { height: 15px; }
+  .heat-axis span { overflow: visible; white-space: nowrap; }
+  .heat-cell { border-radius: 1px; background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
+  .heat-cell.ok { background: var(--ok); }
+  .heat-cell.fail { background: var(--fail); }
+  .heat-cell.cancelled { background: var(--cancelled); }
+  .heat-cell.act { cursor: pointer; }
+
+  /* ---------- cluster peer swimlane ---------- */
+  #swimPanel { border-top: 1px solid var(--border); padding: 10px 12px; }
+  #swimPanel .swim-note { color: var(--fg-faint); font-style: italic; font-size: 11px; }
+  #swimPanel svg { width: 100%; display: block; }
+  #swimPanel .lane-bg { fill: var(--bg2); }
+  #swimPanel .seg { shape-rendering: crispEdges; }
+  #swimPanel .qlost { fill: color-mix(in srgb, var(--fail) 15%, transparent); }
+  #swimPanel .lead { stroke: #ffbf47; stroke-width: 1.5; }
+  #swimPanel .lbl { fill: var(--fg-dim); font-size: 10px; }
+  #swimPanel .axl { fill: var(--fg-faint); font-size: 9px; }
 </style>
 </head>
 <body>
@@ -522,6 +605,9 @@
       <button data-f="disabled">off</button>
     </div>
     <span class="grow"></span>
+    <button class="ghostbtn" id="radarBtn" title="Next-fire radar">⌁ radar</button>
+    <button class="ghostbtn" id="heatBtn" title="Activity heatmap">▦ heat</button>
+    <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
     <select class="mini" id="sortSel" title="Sort">
       <option value="name">sort: name</option>
@@ -530,6 +616,26 @@
       <option value="next">sort: next run</option>
       <option value="duration">sort: duration</option>
     </select>
+  </div>
+
+  <div class="card radar" id="radarPanel" style="display:none">
+    <div class="card-label"><span>┌─ next fires</span><span class="grow"></span><span class="faint" id="radarMeta"></span></div>
+    <div class="radar-body">
+      <ul class="radar-feed" id="radarFeed"></ul>
+      <div class="radar-track" id="radarTrack"></div>
+    </div>
+  </div>
+
+  <div class="card heat" id="heatCard" style="display:none">
+    <div class="card-label"><span>┌─ activity heatmap</span><span class="grow"></span>
+      <select class="mini" id="heatWindow" title="time window">
+        <option value="6h">last 6h</option>
+        <option value="24h">last 24h</option>
+        <option value="7d">last 7d</option>
+      </select>
+      <span class="faint" id="heatMeta"></span>
+    </div>
+    <div class="heat-body" id="heatBody"></div>
   </div>
 
   <div class="card">
@@ -557,7 +663,7 @@
   </div>
 
   <div class="card" id="clusterCard" style="display:none">
-    <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><span id="clusterSummary"></span></div>
+    <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><button class="ghostbtn mini" id="swimBtn" title="Peer status timeline" style="display:none">▚ timeline</button><span id="clusterSummary"></span></div>
     <table id="clusterTable">
       <thead><tr><th>Peer</th><th>Node</th><th class="col-owns">Owns</th><th>Status</th><th>Job set</th></tr></thead>
       <tbody id="clusterRows"></tbody>
@@ -565,6 +671,7 @@
     <table id="clusterLease" style="display:none">
       <tbody id="clusterLeaseRows"></tbody>
     </table>
+    <div id="swimPanel" style="display:none"></div>
   </div>
 </main>
 
@@ -644,6 +751,14 @@
       <div class="setrow"><span class="lab">Scanlines</span><label class="switch"><input type="checkbox" id="setScan"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Compact density<small>tighter rows</small></span><label class="switch"><input type="checkbox" id="setDensity"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Desktop notifications<small>alert when a job fails</small></span><label class="switch"><input type="checkbox" id="setNotify"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Audible cues<small>tick on ok, buzz on failure, alarm until ack (a)</small></span><label class="switch"><input type="checkbox" id="setSound"><span class="sl"></span></label></div>
+      <div class="setrow">
+        <span class="lab">Cue volume</span>
+        <select class="mini" id="setVol">
+          <option value="25">25%</option><option value="50">50%</option>
+          <option value="75">75%</option><option value="100">100%</option>
+        </select>
+      </div>
       <div class="setrow">
         <span class="lab">Refresh interval</span>
         <select class="mini" id="setPoll">
@@ -683,6 +798,12 @@
 
 <div class="toasts" id="toasts"></div>
 
+<!-- wallboard / TV kiosk -->
+<div id="wallboard" class="wallboard" style="display:none" aria-hidden="true" role="region" aria-label="Wallboard">
+  <div class="wb-grid" id="wbGrid"></div>
+  <div class="wb-foot" id="wbFoot"></div>
+</div>
+
 <script>
 "use strict";
 (function () {
@@ -713,6 +834,8 @@
   const prefs = {
     theme: "amber", fx: true, scan: true, density: false, notify: false,
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
+    // add-on panels + audible cues
+    sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false,
   };
   function loadPrefs() {
     for (const k of Object.keys(prefs)) {
@@ -742,6 +865,15 @@
     palette: { open: false, items: [], cur: 0 },
     lastRowSig: null,          // signature of the last rendered table (skip redundant rebuilds)
     focusStack: [],            // saved focus per open overlay/drawer (restore on close)
+    // audible cues + standing alarm
+    prevFin: {},               // name -> finished_at last seen (cue poll-diff)
+    justFailed: null,          // Set of names that flipped to failure THIS poll (wallboard flicker)
+    anyFailing: false, alarmAck: false,
+    radar: { items: [], sig: null },   // next-fire radar: [{name, t, c}] sorted by instant (+ render signature)
+    wallboard: false,          // TV kiosk mode active
+    heat: { cache: {}, loading: false },   // activity heatmap: name -> {at, runs:[{t,o}]}
+    swim: { key: null, buf: [] },          // cluster peer swimlane ring buffer
+    clusterLine: null,         // last cluster summary string (wallboard footer)
   };
 
   // ===================================================================
@@ -1198,11 +1330,441 @@
     document.querySelectorAll("[data-ago]").forEach((e) => { e.textContent = fmtAgo(e.getAttribute("data-ago")); });
     document.querySelectorAll("[data-next]").forEach((e) => {
       const job = state.byName[e.getAttribute("data-next")];
-      if (job) e.textContent = fmtIn(nextRunSeconds(job));
+      // running/disabled tiles keep their "—" (wallboard attaches data-next to
+      // every tile; the job table only attaches it to jobs with a live countdown)
+      if (job) e.textContent = (job.running || !job.enabled) ? "—" : fmtIn(nextRunSeconds(job));
     });
-    const now = new Date();
-    $("clock").textContent = pad2(now.getUTCHours()) + ":" + pad2(now.getUTCMinutes()) + ":" + pad2(now.getUTCSeconds()) + " UTC";
+    $("clock").textContent = utcClock();
+    if (prefs.radar) renderRadar();
+    if (state.wallboard) { const wc = $("wbClock"); if (wc) wc.textContent = utcClock(); }
     updateConnTooltip();
+  }
+
+  // ===================================================================
+  //  audible control-room cues  (WebAudio, off by default)
+  // ===================================================================
+  let audioCtx = null;
+  // Lazily create/resume the AudioContext. Returns null when cues are off or
+  // WebAudio is absent — every caller no-ops on null. Creating it inside the
+  // enable-toggle (a user gesture) satisfies the browser autoplay policy.
+  function audio() {
+    if (!prefs.sound) return null;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+      return audioCtx;
+    } catch (_) { return null; }
+  }
+  // Each cue is a short sequence of tone steps — oscillators + gain envelopes
+  // only, no sample assets, so nothing to load and nothing for CSP to block.
+  const CUES = {
+    ok:    [{ f0: 880, d: 0.06, type: "sine", g: 0.5 }],
+    start: [{ f0: 520, f1: 860, d: 0.11, type: "triangle", g: 0.6 }],
+    fail:  [{ f0: 420, d: 0.13, type: "sawtooth", g: 0.9 }, { f0: 200, d: 0.22, type: "sawtooth", g: 0.9, gap: 0.02 }],
+    alarm: [{ f0: 300, d: 0.11, type: "square", g: 0.7 }, { f0: 300, d: 0.11, type: "square", g: 0.7, gap: 0.08 }],
+  };
+  function playCue(kind) {
+    const ctx = audio();
+    if (!ctx) return;
+    const seq = CUES[kind];
+    if (!seq) return;
+    const vol = Math.max(0, Math.min(1, (prefs.volume == null ? 50 : prefs.volume) / 100));
+    const master = 0.16 * vol;                 // keep cues gentle even at 100%
+    if (master <= 0) return;
+    let t = ctx.currentTime + 0.01;
+    for (const s of seq) {
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.type = s.type || "sine";
+      osc.frequency.setValueAtTime(s.f0, t);
+      if (s.f1 != null) osc.frequency.linearRampToValueAtTime(s.f1, t + s.d);
+      const peak = Math.max(0.0002, master * (s.g || 1));
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.linearRampToValueAtTime(peak, t + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + s.d);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + s.d + 0.03);
+      t += s.d + (s.gap || 0);
+    }
+  }
+  // Poll-diff for cues + the fleet failing/alarm state. Runs every poll; the
+  // prevFin map is updated even when sound is off so enabling mid-session never
+  // replays a backlog. `justFailed` (names that flipped to failure THIS poll)
+  // is computed regardless of the sound pref — the wallboard uses it for the
+  // fail-flip flicker. playCue() itself no-ops when sound is off.
+  function fleetSound(jobs, first) {
+    const justFailed = new Set();
+    const nextFin = {};                 // rebuilt each poll so vanished job names are pruned
+    for (const j of jobs) {
+      const lr = j.last_run;
+      const fin = lr ? lr.finished_at : null;
+      const prev = state.prevFin[j.name];
+      if (!first && fin && prev !== undefined && prev !== fin) {
+        if (lr.outcome === "failure") { justFailed.add(j.name); playCue("fail"); }
+        else if (lr.outcome === "success") playCue("ok");
+        // cancelled: no cue
+      }
+      if (fin) nextFin[j.name] = fin;
+      else if (prev !== undefined) nextFin[j.name] = prev;   // keep last-seen for a currently-outputless job
+    }
+    state.prevFin = nextFin;
+    state.justFailed = justFailed;
+    const nowFailing = jobs.some((j) => j.last_run && j.last_run.outcome === "failure");
+    if (justFailed.size) state.alarmAck = false;   // a fresh failure re-arms the alarm
+    if (!nowFailing) state.alarmAck = false;        // all-clear: re-arm for next time
+    state.anyFailing = nowFailing;
+  }
+  // slow standing-alarm pulse while anything is failing, until acknowledged (a)
+  function alarmTick() {
+    if (prefs.sound && state.anyFailing && !state.alarmAck) playCue("alarm");
+  }
+  function ackAlarm() {
+    if (state.anyFailing && !state.alarmAck) { state.alarmAck = true; toast("info", "◔ alarm acknowledged"); }
+  }
+  function setSound(v) {
+    prefs.sound = v; savePref("sound"); syncSettings();
+    if (v) { audio(); playCue("ok"); }             // enable is a gesture: unlock + confirm
+    else if (audioCtx) { try { audioCtx.suspend(); } catch (_) {} }
+  }
+  function setVolume(v) { prefs.volume = v; savePref("volume"); syncSettings(); if (prefs.sound) playCue("ok"); }
+
+  // ===================================================================
+  //  next-fire radar — fleet-wide "what fires in the next 10 minutes"
+  // ===================================================================
+  const RADAR_HORIZON = 10 * 60 * 1000;      // 10 minutes
+  function fmtCountdown(sec) {
+    sec = Math.max(0, Math.round(sec));
+    // round to whole minutes first, then split, so 7199s -> 2h00m (not 1h60m)
+    if (sec >= 3600) { const m0 = Math.round(sec / 60), h = Math.floor(m0 / 60), m = m0 % 60; return h + "h" + pad2(m) + "m"; }
+    return pad2(Math.floor(sec / 60)) + ":" + pad2(sec % 60);
+  }
+  function fmtWall(c) { return c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi); }
+  // Recompute each enabled job's next fire instant. Cheap (parseCron is cached,
+  // nextRuns(n=1) is bounded), but only called when the panel is open or the
+  // soonest fire has already elapsed.
+  function computeRadar() {
+    const now = Date.now();
+    const items = [];
+    for (const j of state.jobs) {
+      if (!j.enabled) continue;
+      const parsed = parseCron(j.schedule);
+      if (parsed.type !== "fields") continue;
+      const runs = nextRuns(parsed, 1, frameOf(j), now);
+      if (runs.length) items.push({ name: j.name, t: runs[0].t, c: runs[0].c });
+    }
+    items.sort((a, b) => a.t - b.t);
+    state.radar.items = items;
+  }
+  function renderRadar() {
+    const panel = $("radarPanel");
+    if (!prefs.radar) { panel.style.display = "none"; return; }
+    panel.style.display = "";
+    const now = Date.now();
+    // Recompute only when a known-soonest fire has actually elapsed. Population
+    // of an empty/first set is driven by the poll loop + setRadar (both call
+    // computeRadar), so the per-second tick never rescans a fleet that has
+    // nothing upcoming (e.g. all interval-only schedules the cron engine can't
+    // preview).
+    if (state.radar.items.length && state.radar.items[0].t <= now) computeRadar();
+    const upcoming = state.radar.items.filter((x) => x.t >= now);
+    const feed = upcoming.slice(0, 8);
+    const inWin = [];
+    for (const x of upcoming) if (x.t - now <= RADAR_HORIZON) inWin.push(x);
+    const byName = {};
+    for (const x of upcoming) byName[x.name] = x;
+    // Rebuild the DOM only when the visible set/order changes; otherwise relabel
+    // the countdowns and nudge the marks in place, so hover survives and there
+    // is no per-second teardown of every <li> and mark.
+    const sig = feed.map((x) => x.name).join("|") + "##" + inWin.map((x) => x.name).join("|");
+    if (sig !== state.radar.sig) {
+      state.radar.sig = sig;
+      $("radarFeed").innerHTML = feed.length
+        ? feed.map((x) => {
+            const j = state.byName[x.name];
+            const title = fmtWall(x.c) + (j ? " · " + describeCron(j.schedule) : "");
+            return '<li data-job="' + escAttr(x.name) + '" title="' + escAttr(title) + '">' +
+              '<span class="cd">' + fmtCountdown((x.t - now) / 1000) + "</span>" +
+              '<span class="nm">' + esc(x.name) + "</span></li>";
+          }).join("")
+        : '<li class="empty">no jobs scheduled to fire soon</li>';
+      // timeline over the next 10 minutes (HTML — crisp text at any width)
+      let marks = "";
+      for (let m = 0; m <= 10; m += 2) {
+        marks += '<span class="rt-grid" style="left:' + (m * 10) + '%"><i></i>' +
+          (m < 10 ? "<b>" + (m === 0 ? "now" : "+" + m + "m") + "</b>" : "") + "</span>";
+      }
+      for (const x of inWin) {
+        const left = ((x.t - now) / RADAR_HORIZON) * 100;
+        marks += '<span class="rt-mk" data-job="' + escAttr(x.name) + '" style="left:' + left.toFixed(2) +
+          '%" title="' + escAttr(x.name + " · " + fmtCountdown((x.t - now) / 1000)) + '"></span>';
+      }
+      $("radarTrack").innerHTML = marks;
+    } else {
+      $("radarFeed").querySelectorAll("li[data-job]").forEach((li) => {
+        const x = byName[li.getAttribute("data-job")], cd = li.querySelector(".cd");
+        if (x && cd) cd.textContent = fmtCountdown((x.t - now) / 1000);
+      });
+      $("radarTrack").querySelectorAll(".rt-mk").forEach((mk) => {
+        const x = byName[mk.getAttribute("data-job")];
+        if (!x) return;
+        mk.style.left = (((x.t - now) / RADAR_HORIZON) * 100).toFixed(2) + "%";
+        mk.title = x.name + " · " + fmtCountdown((x.t - now) / 1000);
+      });
+    }
+    $("radarMeta").textContent = upcoming.length + " upcoming";
+  }
+  function setRadar(v) { prefs.radar = v; savePref("radar"); $("radarBtn").classList.toggle("on", v); if (v) computeRadar(); renderRadar(); }
+
+  // ===================================================================
+  //  wallboard / TV kiosk mode
+  // ===================================================================
+  const WB_ORDER = { fail: 0, run: 1, pending: 2, cancelled: 3, ok: 4, disabled: 5 };
+  function utcClock() { const n = new Date(); return pad2(n.getUTCHours()) + ":" + pad2(n.getUTCMinutes()) + ":" + pad2(n.getUTCSeconds()) + " UTC"; }
+  function setWallboard(on) {
+    if (on && state.drawerJob) closeDrawer();   // don't strand a drawer hidden behind the wallboard
+    state.wallboard = on;
+    const wb = $("wallboard");
+    wb.style.display = on ? "" : "none";
+    wb.setAttribute("aria-hidden", on ? "false" : "true");
+    document.body.classList.toggle("tv", on);
+    $("tvBtn").classList.toggle("on", on);
+    setHashTv(on);
+    if (on) renderWallboard();
+    else $("wbGrid").innerHTML = "";
+  }
+  function renderWallboard() {
+    if (!state.wallboard) return;
+    const jobs = state.jobs.slice().sort((a, b) => {
+      const r = WB_ORDER[health(a).key] - WB_ORDER[health(b).key];
+      return r !== 0 ? r : a.name.localeCompare(b.name);
+    });
+    $("wbGrid").innerHTML = jobs.map((job) => {
+      const h = health(job);
+      const nextTxt = (job.running || !job.enabled) ? "—" : fmtIn(nextRunSeconds(job));
+      const flip = state.justFailed && state.justFailed.has(job.name) ? " flip" : "";
+      return '<div class="wb-tile st-' + h.key + flip + '" data-job="' + escAttr(job.name) + '">' +
+        '<div class="wb-glyph">' + GLYPH[h.key] + "</div>" +
+        '<div class="wb-name" title="' + escAttr(job.name) + '">' + esc(job.name) + "</div>" +
+        '<div class="wb-next" data-next="' + escAttr(job.name) + '">' + esc(nextTxt) + "</div>" +
+        '<div class="wb-spark">' + sparkline(job) + "</div>" +
+      "</div>";
+    }).join("");
+    renderWbFoot();
+  }
+  function renderWbFoot() {
+    const j = state.jobs;
+    const fail = j.filter((x) => health(x).key === "fail").length;
+    const run = j.filter((x) => x.running).length;
+    const ok = j.filter((x) => health(x).key === "ok").length;
+    const off = j.filter((x) => !x.enabled).length;
+    $("wbFoot").innerHTML =
+      '<span class="wb-stat"><b>' + j.length + "</b>jobs</span>" +
+      '<span class="wb-stat fail"><b>' + fail + "</b>fail</span>" +
+      '<span class="wb-stat run"><b>' + run + "</b>run</span>" +
+      '<span class="wb-stat ok"><b>' + ok + "</b>ok</span>" +
+      '<span class="wb-stat off"><b>' + off + "</b>off</span>" +
+      (state.clusterLine ? '<span class="wb-stat cl">' + esc(state.clusterLine) + "</span>" : "") +
+      '<span class="grow"></span>' +
+      '<span class="wb-clock" id="wbClock">' + esc(utcClock()) + "</span>";
+  }
+
+  // ===================================================================
+  //  activity heatmap — per-job run-outcome punchcard
+  // ===================================================================
+  const HEAT_MAX_JOBS = 80;                  // cap the per-job fan-out
+  const HEAT_TTL = 45 * 1000;                // re-fetch a job's runs at most this often
+  const HEAT_COLS = 24;
+  const HEAT_WINDOWS = { "6h": 6 * 3600e3, "24h": 24 * 3600e3, "7d": 7 * 86400e3 };
+  // Lazily fetch each job's /runs (sequentially, to avoid a request storm),
+  // cached with a TTL. Only ever runs while the panel is open.
+  async function loadHeatmap(force) {
+    if (!prefs.heat || state.heat.loading) return;
+    state.heat.loading = true;
+    try {
+      const jobs = state.jobs.slice(0, HEAT_MAX_JOBS);
+      for (const j of jobs) {
+        if (!prefs.heat) break;                    // panel closed mid-fetch
+        const c = state.heat.cache[j.name];
+        if (!force && c && (performance.now() - c.at) < HEAT_TTL) continue;
+        try {
+          const r = await apiFetch("/jobs/" + encodeURIComponent(j.name) + "/runs");
+          if (r.ok) {
+            const d = await r.json();
+            state.heat.cache[j.name] = { at: performance.now(), runs: (d.runs || []).map((x) => ({ t: x.started_at, o: x.outcome })) };
+          }
+        } catch (e) { if (e.message === "unauthorized") return; }
+      }
+      renderHeatmap();
+    } finally { state.heat.loading = false; }
+  }
+  function relLabel(msAgo) {
+    const s = Math.round(msAgo / 1000);
+    if (s < 3600) return Math.round(s / 60) + "m";
+    if (s < 86400) return Math.round(s / 3600) + "h";
+    return Math.round(s / 86400) + "d";
+  }
+  function bucketLabel(startMs, bucketMs) {
+    const hm = (d) => pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+    return hm(new Date(startMs)) + "–" + hm(new Date(startMs + bucketMs));
+  }
+  function renderHeatmap() {
+    if (!prefs.heat) { $("heatCard").style.display = "none"; return; }
+    $("heatCard").style.display = "";
+    const jobs = state.jobs.slice(0, HEAT_MAX_JOBS);
+    const span = HEAT_WINDOWS[prefs.heatWindow] || HEAT_WINDOWS["24h"];
+    const now = Date.now(), start = now - span, bucketMs = span / HEAT_COLS;
+    let html = '<div class="heat-row axis"><span></span><div class="heat-axis">';
+    for (let i = 0; i < HEAT_COLS; i++) {
+      const label = (i % 6 === 0) ? relLabel(now - (start + i * bucketMs)) : "";
+      html += "<span>" + esc(label) + "</span>";
+    }
+    html += "</div></div>";
+    for (const job of jobs) {
+      const c = state.heat.cache[job.name];
+      const buckets = new Array(HEAT_COLS).fill(null);
+      if (c) for (const run of c.runs) {
+        if (!run.t) continue;                       // never-launched run: no timestamp
+        const tt = Date.parse(run.t);
+        if (isNaN(tt) || tt < start || tt > now) continue;
+        let bi = Math.floor((tt - start) / bucketMs);
+        if (bi < 0) bi = 0; else if (bi >= HEAT_COLS) bi = HEAT_COLS - 1;
+        const b = buckets[bi] || (buckets[bi] = { ok: 0, fail: 0, cancelled: 0, total: 0 });
+        b.total++;
+        if (run.o === "failure") b.fail++;
+        else if (run.o === "cancelled") b.cancelled++;
+        else b.ok++;
+      }
+      const maxTotal = buckets.reduce((m, b) => (b && b.total > m ? b.total : m), 1);
+      let cells = "";
+      for (let i = 0; i < HEAT_COLS; i++) {
+        const b = buckets[i];
+        const win = bucketLabel(start + i * bucketMs, bucketMs);
+        if (!b) { cells += '<span class="heat-cell" title="' + escAttr(win + " · no runs") + '"></span>'; continue; }
+        const worst = b.fail ? "fail" : b.cancelled ? "cancelled" : "ok";
+        const op = (0.35 + 0.65 * (b.total / maxTotal)).toFixed(2);
+        const tip = job.name + " · " + win + " · " + b.ok + " ok / " + b.fail + " fail" + (b.cancelled ? " / " + b.cancelled + " cancelled" : "");
+        cells += '<span class="heat-cell act ' + worst + '" data-job="' + escAttr(job.name) + '" style="opacity:' + op + '" title="' + escAttr(tip) + '"></span>';
+      }
+      html += '<div class="heat-row"><span class="heat-name" data-job="' + escAttr(job.name) + '" title="' + escAttr(job.name) +
+        '">' + esc(job.name) + '</span><div class="heat-cells">' + cells + "</div></div>";
+    }
+    $("heatBody").innerHTML = html;
+    const dropped = state.jobs.length - jobs.length;
+    $("heatMeta").textContent = "recent activity (in-memory, ≤50 runs/job)" +
+      (dropped > 0 ? " · showing first " + jobs.length + " of " + state.jobs.length + " jobs" : "");
+  }
+  function setHeat(v) {
+    prefs.heat = v; savePref("heat"); $("heatBtn").classList.toggle("on", v);
+    if (v) { renderHeatmap(); loadHeatmap(true); } else $("heatCard").style.display = "none";
+  }
+
+  // ===================================================================
+  //  cluster peer status swimlane  (client-accumulated timeline)
+  // ===================================================================
+  const PEER_COLOR = {
+    agreed: "#3fb950", syncing: "#d29922", drifted: "#f85149", untrusted: "#f85149",
+    conflict: "#f85149", unreachable: "#8b949e", self: "#58a6ff", unknown: "#7d8590",
+  };
+  const SWIM_KEY = "yacron2.swim", SWIM_MAX = 400, SWIM_WINDOW = 20 * 60 * 1000;
+  function loadSwimBuf(jsid) {
+    try {
+      const raw = localStorage.getItem(SWIM_KEY);
+      if (!raw) return [];
+      const o = JSON.parse(raw);
+      return (o && o.key === jsid && Array.isArray(o.buf)) ? o.buf : [];
+    } catch (_) { return []; }
+  }
+  function saveSwimBuf(jsid, buf) {
+    try { localStorage.setItem(SWIM_KEY, JSON.stringify({ key: jsid, buf: buf })); } catch (_) {}
+  }
+  // Append one gossip peer-view snapshot. Runs every cluster poll (even while
+  // the panel is collapsed) so the timeline is already populated when opened.
+  // Bounded by count + age; a single localStorage key holds only the current
+  // job-set's buffer, so a config rollover naturally evicts the old one.
+  function recordSwim(data, peers) {
+    const jsid = data.job_set_id || "";
+    if (state.swim.key !== jsid) { state.swim.key = jsid; state.swim.buf = loadSwimBuf(jsid); }
+    const now = Date.now();
+    state.swim.buf.push({
+      t: now,
+      leader: data.leader || null,
+      quorate: !!data.quorate,
+      peers: peers.filter((p) => p.status !== "self").map((p) => ({ h: p.host, s: p.status, e: p.last_error || null })),
+    });
+    const cutoff = now - SWIM_WINDOW, b = state.swim.buf;
+    while (b.length && (b.length > SWIM_MAX || b[0].t < cutoff)) b.shift();
+    // in-memory recording is unconditional (so the timeline is ready on open),
+    // but only persist while the panel is open — no per-poll localStorage write
+    // when the timeline is collapsed. setSwim() flushes once on open.
+    if (prefs.swim) saveSwimBuf(jsid, b);
+  }
+  function renderSwim() {
+    const box = $("swimPanel");
+    $("swimBtn").classList.toggle("on", prefs.swim);
+    if (!prefs.swim) { box.style.display = "none"; return; }
+    box.style.display = "";
+    const buf = state.swim.buf;
+    if (buf.length < 2) { box.innerHTML = '<div class="swim-note">collecting peer history… (accumulates while this tab is open)</div>'; return; }
+    const t0 = buf[0].t, t1 = Date.now(), span = Math.max(1000, t1 - t0);
+    const hosts = [];
+    for (const snap of buf) for (const p of snap.peers) if (hosts.indexOf(p.h) < 0) hosts.push(p.h);
+    hosts.sort();
+    if (!hosts.length) { box.innerHTML = '<div class="swim-note">no peers to chart yet.</div>'; return; }
+    const W = 1000, gutter = 150, plotW = W - gutter - 8, top = 20, laneH = 18;
+    const H = top + hosts.length * laneH + 6;
+    const X = (t) => gutter + ((t - t0) / span) * plotW;
+    let svg = '<svg viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="peer status timeline">';
+    // quorum-lost shading, behind the lanes
+    let qStart = null;
+    for (let i = 0; i < buf.length; i++) {
+      const lost = !buf[i].quorate;
+      if (lost && qStart === null) qStart = buf[i].t;
+      if ((!lost || i === buf.length - 1) && qStart !== null) {
+        const end = lost ? t1 : buf[i].t;
+        svg += '<rect class="qlost" x="' + X(qStart).toFixed(1) + '" y="' + top + '" width="' +
+          Math.max(1, X(end) - X(qStart)).toFixed(1) + '" height="' + (hosts.length * laneH) + '"><title>quorum lost</title></rect>';
+        qStart = null;
+      }
+    }
+    // per-peer lanes: coalesce consecutive equal-status snapshots into segments
+    hosts.forEach((host, li) => {
+      const y = top + li * laneH;
+      svg += '<rect class="lane-bg" x="' + gutter + '" y="' + (y + 1) + '" width="' + plotW + '" height="' + (laneH - 3) + '"/>';
+      svg += '<text class="lbl" x="0" y="' + (y + laneH / 2 + 3) + '">' + esc(host.length > 22 ? host.slice(0, 21) + "…" : host) + "</text>";
+      let segStart = null, segStatus = null, segErr = null;
+      const flush = (end) => {
+        if (segStatus === null) return;
+        const x = X(segStart), w = Math.max(0.5, X(end) - x);
+        const tip = segStatus + (segErr ? " · " + segErr : "") + " · since " + fmtClock(segStart);
+        svg += '<rect class="seg" x="' + x.toFixed(1) + '" y="' + (y + 1) + '" width="' + w.toFixed(1) + '" height="' +
+          (laneH - 3) + '" fill="' + (PEER_COLOR[segStatus] || PEER_COLOR.unknown) + '"><title>' + escAttr(tip) + "</title></rect>";
+      };
+      for (let i = 0; i < buf.length; i++) {
+        const p = buf[i].peers.find((x) => x.h === host);
+        const st = p ? p.s : "unknown";
+        if (st !== segStatus) { flush(buf[i].t); segStatus = st; segStart = buf[i].t; segErr = p ? p.e : null; }
+      }
+      flush(t1);
+    });
+    // leadership-change markers (full height, on top)
+    for (let i = 1; i < buf.length; i++) {
+      if (buf[i].leader !== buf[i - 1].leader) {
+        const x = X(buf[i].t).toFixed(1);
+        svg += '<line class="lead" x1="' + x + '" y1="' + top + '" x2="' + x + '" y2="' + (top + hosts.length * laneH) +
+          '"><title>' + escAttr("leader: " + (buf[i - 1].leader || "none") + " → " + (buf[i].leader || "none")) + "</title></line>";
+      }
+    }
+    svg += '<text class="axl" x="' + gutter + '" y="12">' + esc(agoWords((t1 - t0) / 1000)) + "</text>";
+    svg += '<text class="axl" x="' + W + '" y="12" text-anchor="end">now</text>';
+    svg += "</svg>";
+    box.innerHTML = svg;
+  }
+  function setSwim(v) {
+    prefs.swim = v; savePref("swim");
+    if (v && state.swim.key !== null) saveSwimBuf(state.swim.key, state.swim.buf);  // flush current buffer on open
+    renderSwim();
   }
 
   // ===================================================================
@@ -1222,9 +1784,13 @@
       jobs.forEach((j) => { state.byName[j.name] = j; });
       state.fetchedAt = performance.now();
       setConnected(true);
+      const first = !state.seenFirst;
       maybeNotify(jobs);
+      fleetSound(jobs, first);
       renderSummary();
       renderRows();
+      if (prefs.radar) { computeRadar(); renderRadar(); }
+      if (state.wallboard) renderWallboard();
       loadCluster();
       if (state.drawerJob) renderDrawerMeta();
     } catch (e) {
@@ -1711,6 +2277,10 @@
       { ic: "≡", lbl: "Toggle scanlines", run: () => setScan(!prefs.scan) },
       { ic: "⊟", lbl: "Toggle compact density", run: () => setDensity(!prefs.density) },
       { ic: "✦", lbl: "Toggle desktop notifications", run: () => setNotify(!prefs.notify) },
+      { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
+      { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
+      { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
+      { ic: "▣", lbl: "Wallboard / TV mode", hint: "w", run: () => setWallboard(!state.wallboard) },
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
@@ -1809,6 +2379,8 @@
     $("setScan").checked = prefs.scan;
     $("setDensity").checked = prefs.density;
     $("setNotify").checked = prefs.notify;
+    $("setSound").checked = prefs.sound;
+    $("setVol").value = String(prefs.volume);
     $("setPoll").value = String(prefs.pollMs);
     // CRT effects / scanlines do nothing on the flat "modern" theme — disable
     // those toggles there so they aren't inoperative-yet-interactive.
@@ -1871,7 +2443,13 @@
     const h = name ? "#job/" + encodeURIComponent(name) : "";
     if (location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
   }
+  // the wallboard owns the hash while active; clearing it drops back to "".
+  function setHashTv(on) {
+    const h = on ? "#tv" : "";
+    if (location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
+  }
   function openFromHash() {
+    if (location.hash === "#tv") { setWallboard(true); return; }
     const m = location.hash.match(/^#job\/(.+)$/);
     if (m) { const name = decodeURIComponent(m[1]); if (state.byName[name]) openDrawer(name); }
   }
@@ -1958,6 +2536,7 @@
       if ($("settingsWrap").classList.contains("open")) return closeSettings();
       if ($("helpWrap").classList.contains("open")) return closeHelp();
       if (state.drawerJob) return closeDrawer();
+      if (state.wallboard) return setWallboard(false);
       return;
     }
 
@@ -1966,7 +2545,15 @@
       if (e.key === "Enter") { e.preventDefault(); jumpMatch(e.shiftKey ? -1 : 1); }
       return;
     }
-    if (inField(e) || anyOverlayOpen()) return;
+    // wallboard toggle + alarm-ack must work even while the wallboard is up, but
+    // not while typing in a field or with an overlay open.
+    if (!inField(e) && !anyOverlayOpen()) {
+      if (e.key === "w") { e.preventDefault(); setWallboard(!state.wallboard); return; }
+      if (e.key === "a") { e.preventDefault(); ackAlarm(); return; }
+    }
+    // the wallboard is a full-screen surface: suppress the list shortcuts so
+    // Enter/r/x can't drive a drawer hidden behind it (which also desyncs #tv).
+    if (inField(e) || anyOverlayOpen() || state.wallboard) return;
 
     switch (e.key) {
       case "/": e.preventDefault(); $("search").focus(); break;
@@ -2021,6 +2608,14 @@
     }));
     $("refreshBtn").addEventListener("click", loadJobs);
     $("runFailingBtn").addEventListener("click", runAllFailing);
+    $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
+    $("heatBtn").addEventListener("click", () => setHeat(!prefs.heat));
+    $("tvBtn").addEventListener("click", () => setWallboard(!state.wallboard));
+    $("swimBtn").addEventListener("click", () => setSwim(!prefs.swim));
+    $("heatWindow").addEventListener("change", (e) => { prefs.heatWindow = e.target.value; savePref("heatWindow"); renderHeatmap(); });
+    $("radarPanel").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job")); });
+    $("heatBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job"), "history"); });
+    $("wbGrid").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) { setWallboard(false); openDrawer(it.getAttribute("data-job")); } });
     $("paletteBtn").addEventListener("click", openPalette);
     $("settingsBtn").addEventListener("click", openSettings);
     $("authBtn").addEventListener("click", () => openModal());
@@ -2055,6 +2650,8 @@
     $("setScan").addEventListener("change", (e) => setScan(e.target.checked));
     $("setDensity").addEventListener("change", (e) => setDensity(e.target.checked));
     $("setNotify").addEventListener("change", (e) => setNotify(e.target.checked));
+    $("setSound").addEventListener("change", (e) => setSound(e.target.checked));
+    $("setVol").addEventListener("change", (e) => setVolume(parseInt(e.target.value, 10)));
     $("setPoll").addEventListener("change", (e) => setPoll(parseInt(e.target.value, 10)));
     $("openHelp").addEventListener("click", () => { closeSettings(); openHelp(); });
     $("settingsWrap").addEventListener("click", (e) => { if (e.target === $("settingsWrap")) closeSettings(); });
@@ -2083,6 +2680,7 @@
       ["r", "Run selected job"], ["x", "Cancel selected (running) job"],
       ["c", "Copy selected command"],
       ["g", "Refresh now"], ["t", "Cycle theme"],
+      ["w", "Wallboard (TV) mode"], ["a", "Acknowledge failure alarm"],
       ["?", "This help"], ["Esc", "Close panel / drawer"],
     ];
     $("helpGrid").innerHTML = rows.map((r) =>
@@ -2144,8 +2742,12 @@
     else if (data.quorate && data.leader) role = "follower (leader: " + data.leader + ")";
     else if (data.quorate) role = "follower";
     else role = "no quorum (store unreachable)";
-    $("clusterSummary").textContent =
-      (data.node_name || "?") + " · " + data.backend + " · " + role;
+    const line = (data.node_name || "?") + " · " + data.backend + " · " + role;
+    $("clusterSummary").textContent = line;
+    state.clusterLine = line;
+    // the swimlane charts the gossip peer set; lease backends have none.
+    $("swimBtn").style.display = "none";
+    $("swimPanel").style.display = "none";
     const lease = data.lease || {};
     const rows = Object.keys(lease)
       .filter((k) => lease[k] !== null && lease[k] !== undefined)
@@ -2177,6 +2779,9 @@
       if (!data.enabled) {
         card.style.display = "none";
         setClusterMeta(null, false);
+        state.clusterLine = null;
+        $("swimBtn").style.display = "none";
+        $("swimPanel").style.display = "none";
         return;
       }
       card.style.display = "";
@@ -2267,6 +2872,7 @@
           " — Leader jobs paused";
       }
       $("clusterSummary").textContent = summary;
+      state.clusterLine = summary;
       // the Owns column lists each peer's job count; reveal it only under spread
       $("clusterTable").classList.toggle("show-owns", spread);
       $("clusterRows").innerHTML = peers.map((p) =>
@@ -2276,6 +2882,10 @@
         "<td>" + esc(p.status) + "</td>" +
         '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
       ).join("");
+      // accumulate this snapshot into the peer swimlane and (re)draw it
+      $("swimBtn").style.display = "";
+      recordSwim(data, peers);
+      renderSwim();
     } catch (e) {
       // a 401 is rethrown by apiFetch and drives the normal re-auth/connection
       // flow (openModal) elsewhere; don't mask it as "unavailable". Any other
@@ -2299,6 +2909,21 @@
   fillHelp();
   updateAuthBtn();
   wire();
+  // reflect persisted add-on-panel prefs onto their toggles + initial render
+  $("radarBtn").classList.toggle("on", prefs.radar);
+  $("heatBtn").classList.toggle("on", prefs.heat);
+  $("heatWindow").value = prefs.heatWindow;
+  if (prefs.radar) renderRadar();
+  if (prefs.heat) { renderHeatmap(); loadHeatmap(true); }
+  // if cues were left enabled across a reload, autoplay policy blocks the
+  // AudioContext until a gesture — resume it on the first interaction.
+  const resumeAudio = () => {
+    if (prefs.sound) audio();
+    document.removeEventListener("pointerdown", resumeAudio);
+    document.removeEventListener("keydown", resumeAudio);
+  };
+  document.addEventListener("pointerdown", resumeAudio);
+  document.addEventListener("keydown", resumeAudio);
   if (!window.matchMedia || !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
     document.body.classList.add("booting");
     setTimeout(() => document.body.classList.remove("booting"), 600);
@@ -2309,6 +2934,8 @@
   loadJobs().then(openFromHash);
   restartPolling();
   setInterval(tick, 1000);
+  setInterval(alarmTick, 6000);                               // standing failure alarm
+  setInterval(() => { if (prefs.heat) loadHeatmap(false); }, 60000);  // slow heatmap refresh
   tick();
 })();
 </script>

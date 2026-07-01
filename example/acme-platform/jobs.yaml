@@ -1,0 +1,450 @@
+# =====================================================================
+#  "ACME Orders" — a full-fledged yacron2 showcase.
+#
+#  A realistic scheduled workload for a fictional orders service (ingest ->
+#  transform -> load -> report, plus monitoring and housekeeping) that is
+#  deliberately built to exercise EVERYTHING yacron2 can do AND to make every
+#  web-dashboard feature demo itself. Brought up as a 5-node mTLS cluster by
+#  ../../docker-compose-acme.yml. This one file is mounted IDENTICALLY into all
+#  five nodes (its fingerprint is the job-set id, so it must match to agree);
+#  each node's cluster section is generated at start by node-entrypoint.sh.
+#
+#  yacron2 features exercised here (see the per-job [tags]):
+#    * clustering: leader election + distribution: spread (per-job owners),
+#      mutual-TLS peer attestation, and the three clusterPolicies
+#      (Leader / PreferLeader / EveryNode)
+#    * concurrencyPolicy: Allow (default), Forbid (warehouse-sync),
+#      Replace (search-reindex)
+#    * onFailure.retry with exponential backoff (webhook-dispatch)
+#    * failure reporting: onFailure / onPermanentFailure via mail (to the
+#      bundled Mailpit sink) and shell (pages logged to stdout)
+#    * failsWhen: output-based failure (config-lint fails on any stderr)
+#    * executionTimeout + killTimeout (slow-report-generator is killed)
+#    * environment (inline) and env_file (backup-warehouse)
+#    * timezone (America/New_York, Europe/London, Asia/Tokyo) + @macros
+#    * captureStdout/Stderr toggles (silent-cleanup captures nothing)
+#    * saveLimit (audit-log-ship keeps a short history)
+#    * statsd metrics (etl-build-facts, queue-depth-probe -> the statsd sink)
+#
+#  Dashboard demos — the failures are DETERMINISTIC (driven by the wall-clock
+#  minute, UTC), so they fire on their own with nothing to click:
+#    :05 & :35  slow-report-generator is killed by its executionTimeout
+#    :15-:19    the four db-health checks fail together (exit 69): the incident
+#               cockpit's FLEET EVENT + correlation, the mitigate console, the
+#               timeline (press i), and the wallboard alarm (press w, then a)
+#    :25-:29    config-lint "fails" purely because it wrote to stderr
+#    :45-:47    cert-expiry-check fails alone (exit 1) and MAILS the on-call
+#    every 5th min  webhook-dispatch fails (exit 7), retries, and on permanent
+#               failure mails the on-call
+#    every :00  four hourly-* reports collide in one minute (herd warning)
+#    continuous warehouse-sync overrun (overlap warning + Running state);
+#               search-reindex replaced each minute (Replace -> Cancelled)
+#    daily 02:30 finance-eod-close in America/New_York (DST advisory)
+#
+#  Monitoring/health checks are EveryNode, so the same incident shows on EVERY
+#  node's dashboard (localhost:8080..8084); the pipeline/reporting/housekeeping
+#  jobs are Leader/PreferLeader so they also fan out under distribution: spread
+#  (watch the Owner column). All commands are POSIX /bin/sh and lightweight.
+#  Turn on the Run Ledger in Settings to see the slow-run anomaly flags.
+# =====================================================================
+
+defaults:
+  captureStdout: true
+  captureStderr: true
+
+web:
+  listen:
+    - http://0.0.0.0:8080
+
+jobs:
+  # ---- Bootstrap (EveryNode) ------------------------------------------
+  - name: welcome
+    command: echo "👋 ACME data platform online on $HOSTNAME at $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+    schedule: "@reboot"
+    clusterPolicy: EveryNode
+
+  - name: heartbeat
+    command: echo "♥ $HOSTNAME heartbeat at $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  # ---- Ingest: pull source data (Leader/PreferLeader — spreads) --------
+  # [tag: environment] inline env vars layered into the process.
+  - name: orders-ingest
+    command: |
+      n=$(( ($(date -u +%-M) * 37 + 11) % 400 + 20 ))
+      echo "[ingest] orders-ingest pulled $n orders from $DB_HOST ($REGION) at $(date -u +%H:%M:%S)"
+      sleep 2
+    schedule: "*/2 * * * *"
+    clusterPolicy: Leader
+    environment:
+      - key: DB_HOST
+        value: orders-db.acme.internal
+      - key: REGION
+        value: us-east-1
+
+  - name: inventory-sync
+    command: |
+      echo "[ingest] inventory-sync reconciling SKUs on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 3
+    schedule: "*/3 * * * *"
+    clusterPolicy: Leader
+
+  - name: payments-reconcile
+    command: |
+      echo "[ingest] payments-reconcile matched settlements on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 2
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+
+  - name: clickstream-collect
+    command: echo "[ingest] clickstream-collect flushed events on $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: PreferLeader
+
+  # ---- Transform / ETL ------------------------------------------------
+  # [tag: Run Ledger anomaly + statsd] usually ~4s, spikes ~20s every 6th
+  # minute; emits timing to the statsd sink. Enable the Run Ledger in Settings
+  # and a "◱ slow ×N" chip appears on the spikes.
+  - name: etl-build-facts
+    command: |
+      s=4
+      m=$(date -u +%-M)
+      if [ $(( m % 6 )) -eq 0 ]; then s=20; fi
+      echo "[etl] build-facts pass on $HOSTNAME (target ${s}s)"
+      sleep "$s"
+      echo "[etl] build-facts wrote $(( (m + 7) * 137 )) rows in ${s}s"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    statsd:
+      prefix: acme.etl.build_facts
+      host: statsd
+      port: 9125
+
+  - name: etl-dim-refresh
+    command: |
+      echo "[etl] dim-refresh rebuilding dimensions on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 4
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+
+  - name: dedup-orders
+    command: |
+      echo "[etl] dedup-orders collapsing duplicates on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 3
+    schedule: "*/4 * * * *"
+    clusterPolicy: Leader
+
+  # [tag: failsWhen producesStderr] Exits 0, but yacron2 marks it FAILED because
+  # it wrote to stderr (:25-:29) — output-based failure, not exit-code based.
+  - name: config-lint
+    command: |
+      m=$(date -u +%-M)
+      echo "[lint] validating pipeline configs on $HOSTNAME"
+      if [ "$m" -ge 25 ] && [ "$m" -le 29 ]; then
+        echo "lint: 3 style violations found in orders.yaml" >&2
+      fi
+    schedule: "*/2 * * * *"
+    clusterPolicy: EveryNode
+    failsWhen:
+      producesStdout: false
+      producesStderr: true
+      nonzeroReturn: true
+
+  # ---- Load / warehouse (concurrency policies) ------------------------
+  # [tag: concurrencyPolicy Forbid + self-overlap warning + Running state]
+  # Fires every minute but takes ~75s; Forbid skips the tick it can't start.
+  - name: warehouse-sync
+    command: |
+      echo "[load] warehouse-sync streaming batch on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 75
+      echo "[load] warehouse-sync committed on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Forbid
+
+  # [tag: concurrencyPolicy Replace -> Cancelled] Fires every minute, takes ~80s;
+  # Replace cancels the still-running prior instance, which shows as Cancelled.
+  - name: search-reindex
+    command: |
+      echo "[load] search-reindex rebuilding index on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 80
+      echo "[load] search-reindex swapped index alias on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Replace
+
+  - name: warehouse-vacuum
+    command: |
+      echo "[load] warehouse-vacuum compacting tables on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 5
+    schedule: "*/10 * * * *"
+    clusterPolicy: Leader
+
+  # ---- Reporting (timezones, macros, herd, timeout) -------------------
+  # [tag: thundering-herd] these four all fire at :00.
+  - name: hourly-rollup
+    command: echo "[report] hourly-rollup aggregated the last hour on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "0 * * * *"
+    clusterPolicy: Leader
+
+  - name: hourly-kpi-refresh
+    command: echo "[report] hourly-kpi-refresh recomputed KPIs on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "0 * * * *"
+    clusterPolicy: Leader
+
+  - name: hourly-exec-dashboard
+    command: echo "[report] hourly-exec-dashboard published on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "0 * * * *"
+    clusterPolicy: Leader
+
+  - name: hourly-cache-warm
+    command: echo "[report] hourly-cache-warm primed report caches on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "0 * * * *"
+    clusterPolicy: PreferLeader
+
+  # [tag: @macro] the @daily / @midnight macro.
+  - name: nightly-report-batch
+    command: echo "[report] nightly-report-batch generated daily reports on $HOSTNAME"
+    schedule: "@daily"
+    clusterPolicy: Leader
+
+  - name: nightly-billing-export
+    command: echo "[report] nightly-billing-export wrote the invoice feed on $HOSTNAME"
+    schedule: "0 0 * * *"
+    clusterPolicy: Leader
+
+  # [tag: timezone + DST advisory] 02:30 America/New_York does not exist on the
+  # spring-forward day; the Schedule tab names the next transition.
+  - name: finance-eod-close
+    command: echo "[report] finance-eod-close booked end-of-day on $HOSTNAME at $(date -u +%H:%M:%S) UTC"
+    schedule: "30 2 * * *"
+    timezone: America/New_York
+    clusterPolicy: Leader
+
+  - name: eu-open-report
+    command: echo "[report] eu-open-report sent the London morning digest on $HOSTNAME"
+    schedule: "0 6 * * *"
+    timezone: Europe/London
+    clusterPolicy: Leader
+
+  - name: apac-open-report
+    command: echo "[report] apac-open-report sent the Tokyo morning digest on $HOSTNAME"
+    schedule: "0 9 * * *"
+    timezone: Asia/Tokyo
+    clusterPolicy: Leader
+
+  # [tag: executionTimeout + killTimeout] Sleeps 30s but is capped at 10s, so
+  # yacron2 terminates it (then SIGKILLs after killTimeout) and records a
+  # timeout failure — the classic "exit 137/143" the dashboard can explain.
+  - name: slow-report-generator
+    command: |
+      echo "[report] slow-report-generator crunching a heavy report on $HOSTNAME"
+      sleep 30
+      echo "[report] slow-report-generator finished (you should never see this)"
+    schedule: "5,35 * * * *"
+    clusterPolicy: EveryNode
+    executionTimeout: 10
+    killTimeout: 5
+    onFailure:
+      report:
+        shell:
+          command: echo "[timeout] slow-report-generator exceeded its executionTimeout on $HOSTNAME"
+
+  # ---- Monitoring / health (EveryNode — incident cockpit) -------------
+  # [tag: Incident Cockpit + shell report] the four db-health checks share one
+  # simulated "orders-db" outage from :15-:19 and exit 69, so they fail
+  # together, in the same minute, with the same signature. orders-db also pages
+  # via a shell report.
+  - name: db-health-orders
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 15 ] && [ "$m" -le 19 ]; then
+        echo "orders-db: connection refused — pool exhausted (simulated outage :15-:19)" >&2
+        exit 69
+      fi
+      echo "[health] orders-db reachable from $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    onFailure:
+      report:
+        shell:
+          command: echo "[page] on-call paged for orders-db unreachable from $HOSTNAME"
+
+  - name: db-health-inventory
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 15 ] && [ "$m" -le 19 ]; then
+        echo "inventory-db: connection refused — same pool as orders-db (outage :15-:19)" >&2
+        exit 69
+      fi
+      echo "[health] inventory-db reachable from $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  - name: db-health-payments
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 15 ] && [ "$m" -le 19 ]; then
+        echo "payments-db: connection refused — same pool as orders-db (outage :15-:19)" >&2
+        exit 69
+      fi
+      echo "[health] payments-db reachable from $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  - name: db-health-warehouse
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 15 ] && [ "$m" -le 19 ]; then
+        echo "warehouse-db: connection refused — same pool as orders-db (outage :15-:19)" >&2
+        exit 69
+      fi
+      echo "[health] warehouse-db reachable from $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  # [tag: single-job verdict + mail report] Fails alone from :45-:47 (exit 1),
+  # a different signature from the db outage, and MAILS the on-call via Mailpit.
+  - name: cert-expiry-check
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 45 ] && [ "$m" -le 47 ]; then
+        echo "api.acme.internal TLS certificate expires in 3 days" >&2
+        exit 1
+      fi
+      echo "[cert] api.acme.internal certificate OK on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    onFailure:
+      report:
+        mail:
+          from: yacron2@acme.example
+          to: oncall@acme.example
+          smtpHost: mailpit
+          smtpPort: 1025
+        shell:
+          command: echo "[page] cert-expiry-check failed on $HOSTNAME — mailed on-call"
+
+  - name: api-canary
+    command: echo "[canary] api /healthz 200 OK from $HOSTNAME at $(date -u +%H:%M:%S)"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  # [tag: statsd] emits queue depth as a metric to the statsd sink.
+  - name: queue-depth-probe
+    command: echo "[probe] work-queue depth $(( $(date -u +%-M) % 12 )) on $HOSTNAME"
+    schedule: "*/2 * * * *"
+    clusterPolicy: EveryNode
+    statsd:
+      prefix: acme.queue.depth
+      host: statsd
+      port: 9125
+
+  # [tag: onFailure.retry + onPermanentFailure.mail] fails every 5th minute
+  # (exit 7), retries with backoff, and on permanent failure mails the on-call.
+  - name: webhook-dispatch
+    command: |
+      m=$(date -u +%-M)
+      if [ $(( m % 5 )) -eq 0 ]; then
+        echo "notify: upstream 503 from hooks.acme.io — will retry" >&2
+        exit 7
+      fi
+      echo "[notify] dispatched $(( m % 9 + 1 )) webhooks from $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    onFailure:
+      retry:
+        maximumRetries: 3
+        initialDelay: 2
+        maximumDelay: 10
+        backoffMultiplier: 2
+    onPermanentFailure:
+      report:
+        mail:
+          from: yacron2@acme.example
+          to: oncall@acme.example
+          smtpHost: mailpit
+          smtpPort: 1025
+        shell:
+          command: echo "[page] webhook-dispatch exhausted its retries on $HOSTNAME"
+
+  # ---- Housekeeping (Leader/PreferLeader) -----------------------------
+  - name: log-rotate
+    command: echo "[housekeeping] log-rotate rotated + gzipped logs on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "*/15 * * * *"
+    clusterPolicy: Leader
+
+  - name: tmp-cleanup
+    command: echo "[housekeeping] tmp-cleanup swept scratch space on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "*/30 * * * *"
+    clusterPolicy: Leader
+
+  - name: cache-evict
+    command: echo "[housekeeping] cache-evict expired stale keys on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "*/6 * * * *"
+    clusterPolicy: PreferLeader
+
+  - name: session-gc
+    command: echo "[housekeeping] session-gc reaped idle sessions on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "*/10 * * * *"
+    clusterPolicy: Leader
+
+  # [tag: env_file] pulls BACKUP_BUCKET etc. from /config/acme.env.
+  - name: backup-warehouse
+    command: |
+      echo "[backup] backup-warehouse -> ${BACKUP_BUCKET:-<unset>} (retain ${BACKUP_RETENTION_DAYS:-?}d) on $HOSTNAME"
+      sleep 6
+      echo "[backup] backup-warehouse uploaded snapshot on $HOSTNAME"
+    schedule: "0 3 * * *"
+    clusterPolicy: Leader
+    env_file: /config/acme.env
+
+  # [tag: captureStdout/Stderr off] its Logs tab shows "no output captured".
+  - name: silent-cleanup
+    command: echo "silent-cleanup ran, but its output is not captured on $HOSTNAME"
+    schedule: "*/8 * * * *"
+    clusterPolicy: Leader
+    captureStdout: false
+    captureStderr: false
+
+  # [tag: saveLimit] keeps only a short in-memory history for this job.
+  - name: audit-log-ship
+    command: echo "[audit] audit-log-ship shipped the audit trail on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "*/12 * * * *"
+    clusterPolicy: Leader
+    saveLimit: 8
+
+  # ---- Manual / on-demand (scheduled ~never; run from the UI) ----------
+  # [tag: Mitigate "start all" / palette Run / per-job Run] sit Pending until
+  # launched; a manual trigger is never leader-gated.
+  - name: run-schema-migration
+    command: |
+      echo "[ops] run-schema-migration applying pending migrations on $HOSTNAME"
+      sleep 4
+      echo "[ops] run-schema-migration complete"
+    schedule: "0 0 1 1 *"
+    clusterPolicy: Leader
+
+  - name: restore-from-backup
+    command: |
+      echo "[ops] restore-from-backup RESTORING latest snapshot on $HOSTNAME"
+      sleep 5
+      echo "[ops] restore-from-backup complete"
+    schedule: "0 0 1 1 *"
+    clusterPolicy: Leader
+
+  - name: reindex-search
+    command: |
+      echo "[ops] reindex-search rebuilding the search index on $HOSTNAME"
+      sleep 4
+      echo "[ops] reindex-search complete"
+    schedule: "0 0 1 1 *"
+    clusterPolicy: PreferLeader
+
+  # ---- Disabled example (shows the Disabled state) --------------------
+  - name: legacy-nightly-sync
+    enabled: false
+    command: echo "legacy-nightly-sync is retired; flip enabled to true to schedule it."
+    schedule: "0 1 * * *"
+    clusterPolicy: Leader

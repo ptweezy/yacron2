@@ -1,0 +1,23 @@
+# Zen screensaver demo — a single, deliberately CALM yacron2 node.
+#
+# The zen all-clear screensaver only appears when a wallboard is idle AND healthy
+# (nothing Running, nothing Failing). This config keeps the board calm so you can
+# actually see it.
+#
+#   docker compose -f docker-compose-zen.yml up --build      # start
+#   docker compose -f docker-compose-zen.yml down            # stop and remove
+#
+# Then open http://localhost:8080/ , optionally set Settings -> "Zen idle" -> 10s,
+# press  w  to enter the wallboard, and wait. See
+# example/zen-demo/yacron2tab.yaml for the walkthrough.
+
+services:
+  yacron2-zen:
+    build:
+      context: .
+    container_name: yacron2-zen
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./example/zen-demo/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro
+    restart: unless-stopped

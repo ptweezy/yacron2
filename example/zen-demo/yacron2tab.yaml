@@ -1,0 +1,70 @@
+# Zen screensaver demo — a deliberately CALM board.
+#
+# Brought up by ../../docker-compose-zen.yml. The point of this config is to see
+# the dashboard's zen all-clear screensaver, which only appears when a wallboard
+# is idle AND healthy: nothing Running and nothing Failing.
+#
+# HOW TO SEE ZEN
+#   1. Open http://localhost:8080/
+#   2. (optional, for speed) Settings -> "Zen idle" -> 10s
+#   3. Press  w  to enter the wallboard, then don't touch anything.
+#   4. After the idle delay the grid dissolves into a breathing phosphor field;
+#      each dot pulses on its job's REAL next fire, so a moving field proves the
+#      poll is still live. Move the mouse or press a key to wake it; Esc exits.
+#
+# Every job here is a pure `echo` that finishes in milliseconds and always
+# succeeds (no sleeps, no failures, no long-runners), so the board stays calm
+# and zen can engage. The schedules are spread across 1-5 minutes so the field
+# keeps twinkling. This is the opposite of the busy ACME demo, where
+# warehouse-sync / search-reindex run almost continuously and zen never engages.
+
+defaults:
+  captureStdout: true
+  captureStderr: true
+
+web:
+  listen:
+    - http://0.0.0.0:8080
+
+jobs:
+  - name: welcome
+    command: echo "🧘 zen demo online at $(date -u +'%Y-%m-%d %H:%M:%S') UTC — press w, then wait"
+    schedule: "@reboot"
+
+  - name: heartbeat
+    command: echo "♥ heartbeat $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+
+  - name: north-beacon
+    command: echo "north-beacon nominal at $(date -u +%H:%M:%S)"
+    schedule: "*/2 * * * *"
+
+  - name: south-beacon
+    command: echo "south-beacon nominal at $(date -u +%H:%M:%S)"
+    schedule: "*/2 * * * *"
+
+  - name: east-beacon
+    command: echo "east-beacon nominal at $(date -u +%H:%M:%S)"
+    schedule: "*/3 * * * *"
+
+  - name: west-beacon
+    command: echo "west-beacon nominal at $(date -u +%H:%M:%S)"
+    schedule: "*/3 * * * *"
+
+  - name: pulse-check
+    command: echo "pulse-check steady at $(date -u +%H:%M:%S)"
+    schedule: "*/4 * * * *"
+
+  - name: horizon-scan
+    command: echo "horizon-scan clear at $(date -u +%H:%M:%S)"
+    schedule: "*/5 * * * *"
+
+  - name: weather-poll
+    command: echo "weather-poll fair at $(date -u +%H:%M:%S)"
+    schedule: "*/5 * * * *"
+
+  # Scheduled ~never, so it stays Pending and never disturbs the calm. Run it
+  # from the UI if you want to briefly kick the board out of zen and back.
+  - name: manual-probe
+    command: echo "🚀 manual-probe launched at $(date -u +%H:%M:%S)"
+    schedule: "0 0 1 1 *"

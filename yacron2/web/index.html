@@ -7,8 +7,7 @@
 <title>yacron2 // job scheduler</title>
 <style>
   /* ============================================================= *
-   *  yacron2 dashboard — retro-CRT theme, single self-contained   *
-   *  page.                                                        *
+   *  yacron2 dashboard                                     *
    * ============================================================= */
 
   /* ---------- phosphor palettes ---------- */
@@ -607,6 +606,140 @@
   .boot-hint { margin-top: 14px; color: var(--fg-faint); font-size: 10.5px; }
   .boot-cur { display: inline-block; width: .6em; color: var(--accent); animation: bootblink 1s steps(1) infinite; }
   @keyframes bootblink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
+
+  /* ============================================================= *
+   *  add-on features: incident cockpit · mitigate console ·        *
+   *  cron sandbox · run ledger · zen screensaver + alarm           *
+   * ============================================================= */
+
+  /* ---------- incident verdict bar ---------- */
+  .verdict {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+    padding: 10px 14px; border-radius: var(--radius);
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 3px solid var(--fg-faint); cursor: pointer;
+  }
+  .verdict.sev-warn { border-left-color: var(--pending); background: color-mix(in srgb, var(--pending) 7%, var(--panel)); }
+  .verdict.sev-crit { border-left-color: var(--fail); background: color-mix(in srgb, var(--fail) 8%, var(--panel)); }
+  body.fx .verdict.sev-crit { box-shadow: 0 0 18px color-mix(in srgb, var(--fail) 22%, transparent); }
+  .verdict .vg { font-size: 20px; line-height: 1; flex: none; }
+  .verdict.sev-warn .vg { color: var(--pending); }
+  .verdict.sev-crit .vg { color: var(--fail); }
+  .verdict .vbody { flex: 1; min-width: 0; }
+  .verdict .vhead { font-weight: 700; color: var(--fg); letter-spacing: .3px; }
+  .verdict .vsub { color: var(--fg-dim); font-size: 11.5px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
+  .verdict .vact { display: flex; gap: 6px; flex: none; }
+  .verdict.sev-crit .vhead { color: var(--fail); }
+
+  /* ---------- incident timeline overlay ---------- */
+  .tlpanel {
+    place-self: start center; margin-top: 7vh; width: min(760px, 95vw);
+    max-height: 84vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden;
+  }
+  .tlhead { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .tlhead h3 { margin: 0; font-size: 14px; letter-spacing: .5px; }
+  .tlhead .tlnow { color: var(--fg-dim); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .tlbody { overflow: auto; padding: 6px 0; }
+  .tlrow { display: grid; grid-template-columns: 74px 20px 1fr auto; align-items: baseline; gap: 10px; padding: 6px 16px; cursor: pointer; border-left: 2px solid transparent; }
+  .tlrow:hover { background: var(--hover); border-left-color: var(--accent); }
+  .tlrow .tlt { color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tlrow .tlg { text-align: center; }
+  .tlrow.ok .tlg { color: var(--ok); } .tlrow.fail .tlg { color: var(--fail); } .tlrow.cancelled .tlg { color: var(--cancelled); }
+  .tlrow .tlnm { font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tlrow .tlre { color: var(--fg-faint); font-size: 11px; }
+  .tlrow .tlmeta { color: var(--fg-dim); font-size: 11px; white-space: nowrap; }
+  .tlrow.corr { background: color-mix(in srgb, var(--fail) 6%, transparent); }
+  .tlempty { padding: 26px; text-align: center; color: var(--fg-faint); font-style: italic; }
+  .tlnote { padding: 8px 16px; color: var(--fg-faint); font-size: 10.5px; border-top: 1px solid var(--border); }
+
+  /* ---------- mitigate console ---------- */
+  .mitpanel { place-self: center; width: min(560px, 95vw); max-height: 86vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
+  .mithead { padding: 13px 16px; border-bottom: 1px solid var(--border); }
+  .mithead h3 { margin: 0 0 3px; font-size: 14px; }
+  .mithead p { margin: 0; color: var(--fg-dim); font-size: 11.5px; }
+  .mitlist { overflow: auto; max-height: 30vh; padding: 8px 16px; border-bottom: 1px solid var(--border); }
+  .mitlist .mj { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; }
+  .mitlist .mj .g { width: 1.2ch; text-align: center; }
+  .mitlist .mj.ok .g { color: var(--ok); } .mitlist .mj.fail .g { color: var(--fail); } .mitlist .mj.cancelled .g { color: var(--cancelled); } .mitlist .mj.run .g { color: var(--run); }
+  .mitlist .mj .mn { flex: 1; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mitlist .mj .ms { color: var(--fg-faint); font-size: 10.5px; }
+  .mitlog { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); padding: 8px 16px; max-height: 16vh; overflow: auto; white-space: pre-wrap; }
+  .mitact { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+
+  /* ---------- cron sandbox ---------- */
+  .sbxpanel { place-self: start center; margin-top: 7vh; width: min(680px, 95vw); max-height: 84vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
+  .sbxhead { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .sbxhead h3 { margin: 0; font-size: 14px; flex: none; }
+  .sbxin { flex: 1; display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); }
+  .sbxin:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--selbg); }
+  .sbxin input { flex: 1; border: 0; outline: 0; background: transparent; font-size: 13px; }
+  .sbxin .prompt { color: var(--accent); }
+  .sbxbody { overflow: auto; padding: 14px 16px; }
+  .sbx-desc { font-size: 15px; color: var(--accent); margin: 0 0 6px; }
+  .sbx-bad { color: var(--fail); }
+  .sbx-flds { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin: 10px 0; }
+  .sbx-fld { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; text-align: center; }
+  .sbx-fld .fk { font-size: 9.5px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: .5px; }
+  .sbx-fld .fv { font-size: 12px; color: var(--fg); margin-top: 2px; word-break: break-all; }
+  .sbx-uses { margin: 8px 0; }
+  .sbx-uses .chip { cursor: pointer; margin: 2px 4px 2px 0; }
+  .sbx-recent { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+  .sbx-recent .chip { cursor: pointer; }
+
+  /* ---------- schedule-tab foot-gun warnings ---------- */
+  .sched-warn { margin: 12px 0; border: 1px solid color-mix(in srgb, var(--pending) 40%, var(--border)); border-radius: var(--radius); overflow: hidden; }
+  .sched-warn .sw { display: flex; gap: 9px; padding: 8px 11px; border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent); font-size: 11.5px; }
+  .sched-warn .sw:last-child { border-bottom: 0; }
+  .sched-warn .sw .wi { flex: none; }
+  .sched-warn .sw.warn { background: color-mix(in srgb, var(--pending) 8%, transparent); }
+  .sched-warn .sw.warn .wi { color: var(--pending); }
+  .sched-warn .sw.crit { background: color-mix(in srgb, var(--fail) 8%, transparent); }
+  .sched-warn .sw.crit .wi { color: var(--fail); }
+  .sched-warn .sw .wt b { color: var(--fg); }
+
+  /* ---------- run ledger: degraded chip + settings ---------- */
+  .slow-chip {
+    display: inline-flex; align-items: center; gap: 4px; margin-left: 7px;
+    font-size: 10px; padding: 0 6px; border-radius: 3px; white-space: nowrap;
+    color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border));
+  }
+  .stor { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .stor small { color: var(--fg-faint); }
+
+  /* ---------- zen all-clear screensaver (inside the wallboard) ---------- */
+  .zen { position: absolute; inset: 0; z-index: 3; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 22px;
+    background: radial-gradient(ellipse at center, var(--bg2) 0%, var(--bg) 78%);
+    cursor: pointer; }
+  .zen-field { position: relative; width: min(720px, 82vw); height: min(300px, 40vh); }
+  .zen-dot { position: absolute; width: 7px; height: 7px; border-radius: 50%; transform: translate(-50%, -50%);
+    background: var(--fg-faint); opacity: .35; transition: opacity .5s ease; }
+  .zen-dot.due { opacity: 1; box-shadow: 0 0 10px 2px var(--glow); animation: zenpulse .9s ease-out; }
+  @keyframes zenpulse { 0% { transform: translate(-50%,-50%) scale(2.6); opacity: 1; } 100% { transform: translate(-50%,-50%) scale(1); opacity: 1; } }
+  .zen-title { font-size: clamp(20px, 4vw, 40px); font-weight: 700; letter-spacing: 3px; color: var(--ok); text-align: center; }
+  body.fx .zen-title { text-shadow: 0 0 14px color-mix(in srgb, var(--ok) 60%, transparent); }
+  .zen-sub { color: var(--fg-dim); font-variant-numeric: tabular-nums; font-size: 15px; text-align: center; }
+  .zen-hint { position: absolute; bottom: 16px; color: var(--fg-faint); font-size: 11px; }
+  @media (prefers-reduced-motion: reduce) { .zen-dot.due { animation: none; } }
+
+  /* ---------- adaptive alarm escalation (wallboard) ---------- */
+  #wbAlarm { position: absolute; inset: 0; z-index: 2; pointer-events: none; opacity: 0;
+    background: radial-gradient(ellipse at center, transparent 40%, color-mix(in srgb, var(--fail) 70%, transparent) 100%);
+    transition: opacity .8s ease; }
+  .wb-incident { position: absolute; top: 14px; left: 18px; z-index: 4; pointer-events: none;
+    color: var(--fail); font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
+  body.fx .wb-incident { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
+  .wb-incident.ackd { color: var(--pending); }
+  .wb-tile.st-fail.escalate { animation: tilebreathe 1.6s ease-in-out infinite; }
+  @keyframes tilebreathe {
+    0%, 100% { box-shadow: 0 0 8px color-mix(in srgb, var(--fail) 25%, transparent); }
+    50% { box-shadow: 0 0 22px color-mix(in srgb, var(--fail) 65%, transparent); border-color: var(--fail); }
+  }
+  @media (prefers-reduced-motion: reduce) { .wb-tile.st-fail.escalate { animation: none; } #wbAlarm { transition: none; } }
 </style>
 </head>
 <body>
@@ -662,6 +795,16 @@
       <option value="next">sort: next run</option>
       <option value="duration">sort: duration</option>
     </select>
+  </div>
+
+  <!-- incident cockpit: fleet verdict bar (hidden while healthy) -->
+  <div class="verdict" id="verdictBar" style="display:none" title="Open the incident timeline (i)">
+    <span class="vg" id="vGlyph">▲</span>
+    <div class="vbody"><div class="vhead" id="vHead"></div><div class="vsub" id="vSub"></div></div>
+    <div class="vact">
+      <button class="btn" id="vTimeline" title="Incident timeline (i)">▤ timeline</button>
+      <button class="btn primary" id="vMitigate" title="Bulk run/cancel the failing set">▸ mitigate</button>
+    </div>
   </div>
 
   <div class="card radar" id="radarPanel" style="display:none">
@@ -815,6 +958,16 @@
           <option value="10000">10s</option><option value="0">paused</option>
         </select>
       </div>
+      <div class="setrow"><span class="lab">Run ledger<small>accumulate long-term run history in this browser (IndexedDB)</small></span><label class="switch"><input type="checkbox" id="setLedger"><span class="sl"></span></label></div>
+      <div class="setrow" id="ledgerStatRow" style="display:none"><span class="lab">Ledger storage<small>only grows while a tab is open; latest run per poll</small></span><span class="stor"><small id="ledgerStat">—</small><button class="ghostbtn mini" id="ledgerExport">export</button><button class="ghostbtn mini" id="ledgerPurge">purge</button></span></div>
+      <div class="setrow"><span class="lab">Zen screensaver<small>drift an idle, healthy wallboard into a live all-clear field</small></span><label class="switch"><input type="checkbox" id="setZen"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Zen idle<small>how long a calm wallboard waits before zen engages</small></span>
+        <select class="mini" id="setZenIdle">
+          <option value="5000">5s</option><option value="10000">10s</option>
+          <option value="30000">30s</option><option value="60000">1m</option><option value="120000">2m</option>
+        </select>
+      </div>
+      <div class="setrow"><span class="lab">Alarm escalation<small>wallboard reddens &amp; the alarm quickens the longer a failure goes unacked (a)</small></span><label class="switch"><input type="checkbox" id="setEscalate"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Keyboard shortcuts</span><button class="ghostbtn" id="openHelp">view (?)</button></div>
     </div>
   </div>
@@ -844,12 +997,64 @@
   </div>
 </div>
 
+<!-- incident timeline overlay -->
+<div class="overlay" id="timelineWrap">
+  <div class="tlpanel" role="dialog" aria-label="Incident timeline">
+    <div class="tlhead">
+      <h3>incident timeline</h3>
+      <span class="grow"></span>
+      <label class="toggle"><input type="checkbox" id="tlFailOnly"> failures only</label>
+      <span class="tlnow" id="tlNow"></span>
+      <button class="iconbtn" id="tlClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="tlbody" id="tlBody"></div>
+    <div class="tlnote">Newest finish per job, from the live poll (each job's most recent run). History is in-memory; this is the current fleet frame, not a full audit log.</div>
+  </div>
+</div>
+
+<!-- mitigate console -->
+<div class="overlay" id="mitigateWrap">
+  <div class="mitpanel" role="dialog" aria-modal="true" aria-label="Mitigate">
+    <div class="mithead"><h3 id="mitTitle">Mitigate</h3><p id="mitDesc"></p></div>
+    <div class="mitlist" id="mitList"></div>
+    <pre class="mitlog" id="mitLog" style="display:none"></pre>
+    <div class="mitact">
+      <button class="btn cancel" id="mitCancelAll">■ cancel all</button>
+      <button class="btn run" id="mitStartAll">▶ start all now</button>
+      <button class="btn" id="mitCopy">❏ copy summary</button>
+      <button class="btn" id="mitAbort" style="display:none;margin-left:auto">✕ abort</button>
+      <button class="btn" id="mitClose" style="margin-left:auto">close</button>
+    </div>
+  </div>
+</div>
+
+<!-- cron sandbox -->
+<div class="overlay" id="sandboxWrap">
+  <div class="sbxpanel" role="dialog" aria-label="Cron sandbox">
+    <div class="sbxhead">
+      <h3>cron sandbox</h3>
+      <label class="sbxin"><span class="prompt">◴</span><input id="sbxInput" type="text" placeholder="* * * * *  or  @daily" autocomplete="off" spellcheck="false"></label>
+      <select class="mini" id="sbxFrame" title="timezone frame"></select>
+      <button class="iconbtn" id="sbxClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="sbxbody" id="sbxBody"></div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
 <!-- wallboard / TV kiosk -->
 <div id="wallboard" class="wallboard" style="display:none" aria-hidden="true" role="region" aria-label="Wallboard">
+  <div id="wbAlarm"></div>
   <div class="wb-grid" id="wbGrid"></div>
   <div class="wb-foot" id="wbFoot"></div>
+  <!-- zen all-clear screensaver: appears over an idle, healthy wallboard -->
+  <div class="zen" id="zen" style="display:none" aria-hidden="true">
+    <div class="zen-field" id="zenField"></div>
+    <div class="zen-title">ALL SYSTEMS NOMINAL</div>
+    <div class="zen-sub" id="zenSub"></div>
+    <div class="zen-hint">move / press a key to wake · esc to exit</div>
+  </div>
 </div>
 
 <!-- BIOS-style boot / POST self-test -->
@@ -890,6 +1095,8 @@
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false,
     boot: true,   // BIOS-style boot self-test on load
+    // opt-in run ledger (IndexedDB) + wallboard zen screensaver + alarm escalation
+    ledger: false, zen: true, escalate: true, zenIdle: 30000,
   };
   function loadPrefs() {
     for (const k of Object.keys(prefs)) {
@@ -929,6 +1136,17 @@
     swim: { key: null, buf: [] },          // cluster peer swimlane ring buffer
     clusterLine: null,         // last cluster summary string (wallboard footer)
     booting: false,            // BIOS boot self-test is on screen (swallows keys)
+    // --- add-on features ---
+    clusterAlert: null,        // {bad, reason} distilled from /cluster for the verdict bar
+    incidentSet: [],           // job names in the current blast radius (mitigate target)
+    verdictSig: null,          // last-rendered verdict signature (skip redundant DOM writes)
+    ledger: { on: false, ready: false, runs: {}, seen: {}, stats: {}, count: 0 },
+    timeline: { open: false, failOnly: false },
+    mitigate: { open: false, running: false, abort: false, set: [] },
+    sandbox: { open: false },
+    failSince: {},             // name -> ms this browser first saw the job failing
+    lastAlarmAt: 0,            // adaptive-alarm gate (ms)
+    zen: { on: false, idleSince: 0, sig: null },
   };
 
   // ===================================================================
@@ -1330,6 +1548,8 @@
         // ownership can change between polls (a node joins/leaves); track it so
         // the row re-renders. "in" check distinguishes absent from a null owner.
         "clusterOwner" in j ? "o:" + (j.clusterOwner || "") : j.clusterPolicy || "",
+        // ledger anomaly marker (only meaningful while the ledger is on)
+        state.ledger.on && ledgerFlag(j.name) ? "slow" : "",
       ]),
     });
     if (sig === state.lastRowSig) return;
@@ -1355,7 +1575,7 @@
           '><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>';
       return (
         '<tr data-job="' + escAttr(job.name) + '" class="' + rowCls.trim() + '">' +
-          '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span></td>" +
+          '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + "</td>" +
           '<td><div class="jobname">' + esc(job.name) + "</div>" +
               '<div class="jobcmd" title="' + escAttr(job.command) + '">' + esc(job.command) + "</div></td>" +
           '<td class="col-owner">' + ownerCell(job) + "</td>" +
@@ -1391,7 +1611,13 @@
     });
     $("clock").textContent = utcClock();
     if (prefs.radar) renderRadar();
-    if (state.wallboard) { const wc = $("wbClock"); if (wc) wc.textContent = utcClock(); }
+    if (state.timeline.open) $("tlNow").textContent = utcClock();
+    if (state.wallboard) {
+      const wc = $("wbClock"); if (wc) wc.textContent = utcClock();
+      zenGovernor();               // drift to / from the zen screensaver on idle
+      if (state.zen.on) zenTick();  // pulse the field on real next-fire instants
+      escalationTick();             // grow the alarm the longer a failure is unacked
+    }
     updateConnTooltip();
   }
 
@@ -1471,10 +1697,8 @@
     if (!nowFailing) state.alarmAck = false;        // all-clear: re-arm for next time
     state.anyFailing = nowFailing;
   }
-  // slow standing-alarm pulse while anything is failing, until acknowledged (a)
-  function alarmTick() {
-    if (prefs.sound && state.anyFailing && !state.alarmAck) playCue("alarm");
-  }
+  // The standing-alarm pulse lives with the escalation logic further down
+  // (alarmTick, adaptive cadence). ackAlarm silences it until the next failure.
   function ackAlarm() {
     if (state.anyFailing && !state.alarmAck) { state.alarmAck = true; toast("info", "◔ alarm acknowledged"); }
   }
@@ -1587,7 +1811,7 @@
     $("tvBtn").classList.toggle("on", on);
     setHashTv(on);
     if (on) renderWallboard();
-    else $("wbGrid").innerHTML = "";
+    else { $("wbGrid").innerHTML = ""; zenOff(); state.zen.idleSince = 0; }
   }
   function renderWallboard() {
     if (!state.wallboard) return;
@@ -1844,10 +2068,16 @@
       const first = !state.seenFirst;
       maybeNotify(jobs);
       fleetSound(jobs, first);
+      updateIncidents(jobs);
+      ledgerRecord(jobs);
       renderSummary();
       renderRows();
+      renderVerdict();
+      if (state.timeline.open) renderTimeline();
+      if (state.mitigate.open) renderMitList();
       if (prefs.radar) { computeRadar(); renderRadar(); }
       if (state.wallboard) renderWallboard();
+      zenGovernor();
       loadCluster();
       if (state.drawerJob) renderDrawerMeta();
     } catch (e) {
@@ -2051,7 +2281,22 @@
       "</tr>";
     }
     const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th><th>Reason</th></tr></thead><tbody>' + rows + "</tbody></table>";
-    box.innerHTML = stats + bars + table;
+    // opt-in run ledger: long-horizon totals this browser has accumulated,
+    // beyond the server's in-memory 50-run window shown above.
+    let ledgerNote = "";
+    if (state.ledger.on) {
+      const lg = state.ledger.runs[name] || [];
+      if (lg.length) {
+        const ok = lg.filter((r) => r.o === "success").length, fa = lg.filter((r) => r.o === "failure").length;
+        const st = state.ledger.stats[name] || {};
+        ledgerNote = '<div class="tlnote" style="border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px">◱ ledger (this browser): <b>' +
+          lg.length + "</b> runs · " + ok + " ok / " + fa + " fail · oldest " + esc(fmtAgo(lg[0].iso)) +
+          (st.median != null ? " · median " + esc(fmtDuration(st.median)) : "") +
+          (st.slow ? ' · <span style="color:var(--pending)">latest run slow</span>' : "") +
+          (st.regressed ? ' · <span style="color:var(--fail)">regression</span>' : "") + "</div>";
+      }
+    }
+    box.innerHTML = stats + ledgerNote + bars + table;
   }
   function stat(k, v, cls) { return '<div class="stat"><div class="k">' + esc(k) + '</div><div class="v ' + (cls || "") + '">' + esc(v == null ? "—" : v) + "</div></div>"; }
 
@@ -2071,6 +2316,12 @@
     let html =
       '<p class="sched-desc">' + esc(desc) + "</p>" +
       '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + '</span> · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b></div>";
+
+    // foot-gun advisories: self-overlap, thundering-herd collisions, DST
+    const warns = scheduleWarnings(job);
+    if (warns.length)
+      html += '<div class="sched-warn">' + warns.map((w) =>
+        '<div class="sw ' + w.sev + '"><span class="wi">⚠</span><span class="wt">' + w.t + "</span></div>").join("") + "</div>";
 
     if (parsed.type === "reboot") {
       html += '<div class="term-empty">This job runs once, when yacron2 starts.</div>';
@@ -2338,6 +2589,10 @@
       { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
       { ic: "▣", lbl: "Wallboard / TV mode", hint: "w", run: () => setWallboard(!state.wallboard) },
+      { ic: "▤", lbl: "Incident timeline", hint: "i", run: openTimeline },
+      { ic: "▸", lbl: "Mitigate failing jobs", run: () => openMitigate(state.jobs.filter((j) => health(j).key === "fail").map((j) => j.name), "failing jobs") },
+      { ic: "◴", lbl: "Cron sandbox", run: () => openSandbox() },
+      { ic: "◱", lbl: "Toggle run ledger", run: () => setLedger(!prefs.ledger) },
       { ic: "▮", lbl: "Toggle boot self-test", run: () => setBoot(!prefs.boot) },
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
@@ -2441,6 +2696,11 @@
     $("setVol").value = String(prefs.volume);
     $("setBoot").checked = prefs.boot;
     $("setPoll").value = String(prefs.pollMs);
+    $("setLedger").checked = prefs.ledger;
+    $("setZen").checked = prefs.zen;
+    $("setZenIdle").value = String(prefs.zenIdle);
+    $("setEscalate").checked = prefs.escalate;
+    refreshLedgerStat();
     // CRT effects / scanlines do nothing on the flat "modern" theme — disable
     // those toggles there so they aren't inoperative-yet-interactive.
     const crt = prefs.theme !== "modern";
@@ -2533,7 +2793,7 @@
     return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
   }
   function anyOverlayOpen() {
-    return state.palette.open ||
+    return state.palette.open || state.timeline.open || state.mitigate.open || state.sandbox.open ||
       ["settingsWrap", "helpWrap", "modalWrap"].some((id) => $(id).classList.contains("open"));
   }
   // ---- focus management (trap + restore) for modal surfaces ----
@@ -2547,6 +2807,9 @@
     if ($("modalWrap").classList.contains("open")) return $("modalWrap");
     if ($("settingsWrap").classList.contains("open")) return $("settingsWrap");
     if ($("helpWrap").classList.contains("open")) return $("helpWrap");
+    if (state.mitigate.open) return $("mitigateWrap");
+    if (state.sandbox.open) return $("sandboxWrap");
+    if (state.timeline.open) return $("timelineWrap");
     if (state.palette.open) return $("paletteWrap");
     if (state.drawerJob) return $("drawer");
     return null;
@@ -2568,6 +2831,9 @@
     // the boot self-test intercepts keys via its own capture-phase listener; be
     // explicit that no shortcut fires while it is on screen.
     if (state.booting) return;
+    // any key wakes the zen screensaver back to the live wallboard grid (without
+    // consuming the key — Esc still exits the wallboard, w/a still work below).
+    if (state.zen.on) zenWake();
     // palette navigation has priority
     if (state.palette.open) {
       if (e.key === "Escape") { e.preventDefault(); closePalette(); return; }
@@ -2597,6 +2863,9 @@
       if ($("modalWrap").classList.contains("open")) return closeModal();
       if ($("settingsWrap").classList.contains("open")) return closeSettings();
       if ($("helpWrap").classList.contains("open")) return closeHelp();
+      if (state.mitigate.open) return closeMitigate();
+      if (state.sandbox.open) return closeSandbox();
+      if (state.timeline.open) return closeTimeline();
       if (state.drawerJob) return closeDrawer();
       if (state.wallboard) return setWallboard(false);
       return;
@@ -2624,6 +2893,7 @@
       case "k": case "ArrowUp": e.preventDefault(); moveSelection(-1); break;
       case "g": e.preventDefault(); loadJobs(); break;
       case "t": e.preventDefault(); cycleTheme(); break;
+      case "i": e.preventDefault(); openTimeline(); break;
       case "Enter": { const j = selectedJob(); if (j) openDrawer(j.name); break; }
       case "r": { const j = selectedJob(); if (j && j.enabled && !j.running) runJob(j.name); break; }
       case "x": { const j = selectedJob(); if (j && j.running) cancelJob(j.name); break; }
@@ -2683,6 +2953,41 @@
     $("settingsBtn").addEventListener("click", openSettings);
     $("authBtn").addEventListener("click", () => openModal());
 
+    // incident cockpit: verdict bar → timeline / mitigate
+    $("verdictBar").addEventListener("click", (e) => {
+      if (e.target.closest("#vMitigate")) { openMitigate(state.incidentSet, "failing jobs"); return; }
+      openTimeline();   // the timeline button and the bar body both open the timeline
+    });
+    $("tlClose").addEventListener("click", closeTimeline);
+    $("tlFailOnly").addEventListener("change", (e) => { state.timeline.failOnly = e.target.checked; renderTimeline(); });
+    $("tlBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) { closeTimeline(); openDrawer(it.getAttribute("data-job")); } });
+    $("timelineWrap").addEventListener("click", (e) => { if (e.target === $("timelineWrap")) closeTimeline(); });
+
+    // mitigate console
+    $("mitCancelAll").addEventListener("click", () => bulkAction("cancel"));
+    $("mitStartAll").addEventListener("click", () => bulkAction("start"));
+    $("mitCopy").addEventListener("click", copyIncidentSummary);
+    $("mitAbort").addEventListener("click", () => { state.mitigate.abort = true; });
+    $("mitClose").addEventListener("click", closeMitigate);
+    $("mitigateWrap").addEventListener("click", (e) => { if (e.target === $("mitigateWrap")) closeMitigate(); });
+
+    // cron sandbox
+    $("sbxInput").addEventListener("input", debounce(renderSandbox, 120));
+    $("sbxInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { sbxPushRecent($("sbxInput").value); renderSandbox(); } });
+    $("sbxFrame").addEventListener("change", renderSandbox);
+    $("sbxClose").addEventListener("click", closeSandbox);
+    $("sbxBody").addEventListener("click", (e) => {
+      const ex = e.target.closest("[data-expr]");
+      if (ex) { $("sbxInput").value = ex.getAttribute("data-expr"); renderSandbox(); $("sbxInput").focus(); return; }
+      const jb = e.target.closest("[data-job]");
+      if (jb) { closeSandbox(); openDrawer(jb.getAttribute("data-job"), "schedule"); }
+    });
+    $("sandboxWrap").addEventListener("click", (e) => { if (e.target === $("sandboxWrap")) closeSandbox(); });
+
+    // zen screensaver: a click / pointer move wakes it back to the grid
+    $("zen").addEventListener("pointerdown", zenWake);
+    document.addEventListener("pointermove", () => { if (state.zen.on) zenWake(); });
+
     // drawer
     $("dClose").addEventListener("click", closeDrawer);
     $("scrim").addEventListener("click", closeDrawer);
@@ -2717,6 +3022,12 @@
     $("setVol").addEventListener("change", (e) => setVolume(parseInt(e.target.value, 10)));
     $("setBoot").addEventListener("change", (e) => setBoot(e.target.checked));
     $("setPoll").addEventListener("change", (e) => setPoll(parseInt(e.target.value, 10)));
+    $("setLedger").addEventListener("change", (e) => setLedger(e.target.checked));
+    $("setZen").addEventListener("change", (e) => { prefs.zen = e.target.checked; savePref("zen"); if (!prefs.zen) zenOff(); });
+    $("setZenIdle").addEventListener("change", (e) => { prefs.zenIdle = parseInt(e.target.value, 10); savePref("zenIdle"); state.zen.idleSince = 0; });
+    $("setEscalate").addEventListener("change", (e) => { prefs.escalate = e.target.checked; savePref("escalate"); });
+    $("ledgerExport").addEventListener("click", ledgerExport);
+    $("ledgerPurge").addEventListener("click", ledgerPurge);
     $("openHelp").addEventListener("click", () => { closeSettings(); openHelp(); });
     $("settingsWrap").addEventListener("click", (e) => { if (e.target === $("settingsWrap")) closeSettings(); });
     $("helpWrap").addEventListener("click", (e) => { if (e.target === $("helpWrap")) closeHelp(); });
@@ -2744,6 +3055,7 @@
       ["r", "Run selected job"], ["x", "Cancel selected (running) job"],
       ["c", "Copy selected command"],
       ["g", "Refresh now"], ["t", "Cycle theme"],
+      ["i", "Incident timeline"],
       ["w", "Wallboard (TV) mode"], ["a", "Acknowledge failure alarm"],
       ["?", "This help"], ["Esc", "Close panel / drawer"],
     ];
@@ -2840,6 +3152,9 @@
       const card = $("clusterCard");
       // a fresh, successful read clears any prior staleness signal.
       card.classList.remove("stale");
+      // feed the incident verdict bar the cluster's health signal every poll
+      setClusterAlert(data);
+      renderVerdict();
       if (!data.enabled) {
         card.style.display = "none";
         setClusterMeta(null, false);
@@ -2957,6 +3272,660 @@
       if (e.message !== "unauthorized") { console.warn("loadCluster failed:", e); clusterStale(); }
     }
   }
+
+  // ===================================================================
+  //  run ledger — opt-in long-horizon history (IndexedDB)
+  //  Defeats the server's 50-run in-memory cap without touching the
+  //  read-only root filesystem: IndexedDB is the sanctioned client home.
+  //  Records the LATEST finished run per job per poll (dedup by
+  //  finished_at); accumulates only while a tab is open. Every IDB call is
+  //  best-effort — a failure (private mode / quota / no IndexedDB) just
+  //  means the ledger doesn't persist, and nothing else breaks.
+  // ===================================================================
+  const LEDGER_DB = "yacron2-ledger", LEDGER_STORE = "runs";
+  const LEDGER_PERJOB = 600;     // in-memory rows kept per job (analysis window)
+  const LEDGER_MIN = 8;          // min completed runs before flagging anomalies
+  const LEDGER_SLOW_K = 3.5;     // slow := latest > median + K*MAD (and > 1.5x median)
+  let _ledgerDB = null, _ledgerOpening = null;
+
+  function ledgerDBHandle() {
+    if (_ledgerDB) return Promise.resolve(_ledgerDB);
+    if (_ledgerOpening) return _ledgerOpening;
+    _ledgerOpening = new Promise((resolve) => {
+      let req;
+      try { req = indexedDB.open(LEDGER_DB, 1); } catch (_) { resolve(null); return; }
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(LEDGER_STORE)) {
+          const os = db.createObjectStore(LEDGER_STORE, { keyPath: "id" });
+          os.createIndex("job", "job", { unique: false });
+        }
+      };
+      req.onsuccess = () => { _ledgerDB = req.result; resolve(_ledgerDB); };
+      req.onerror = () => resolve(null);
+    });
+    return _ledgerOpening;
+  }
+  function ledgerPut(rows) {
+    if (!rows.length) return;
+    ledgerDBHandle().then((db) => {
+      if (!db) return;
+      try {
+        const os = db.transaction(LEDGER_STORE, "readwrite").objectStore(LEDGER_STORE);
+        for (const r of rows) os.put(r);
+      } catch (_) {}
+    });
+  }
+  // Load every persisted row back into the in-memory mirror on enable / first
+  // load, so analysis + the History pane stay synchronous.
+  async function ledgerLoad() {
+    const db = await ledgerDBHandle();
+    state.ledger.runs = {}; state.ledger.count = 0;
+    if (db) {
+      await new Promise((resolve) => {
+        let req;
+        try { req = db.transaction(LEDGER_STORE, "readonly").objectStore(LEDGER_STORE).openCursor(); }
+        catch (_) { resolve(); return; }
+        req.onsuccess = () => {
+          const cur = req.result;
+          if (!cur) { resolve(); return; }
+          const r = cur.value;
+          (state.ledger.runs[r.job] || (state.ledger.runs[r.job] = [])).push(r);
+          state.ledger.count++;
+          cur.continue();
+        };
+        req.onerror = () => resolve();
+      });
+    }
+    for (const name in state.ledger.runs) {
+      const arr = state.ledger.runs[name];
+      arr.sort((a, b) => a.fin - b.fin);
+      if (arr.length > LEDGER_PERJOB) arr.splice(0, arr.length - LEDGER_PERJOB);
+      const last = arr[arr.length - 1];
+      if (last) state.ledger.seen[name] = last.iso;   // don't re-record on reload
+    }
+    state.ledger.ready = true;
+    ledgerAnalyze();
+  }
+  // Poll-diff: append each job's newest finished run when finished_at advances.
+  function ledgerRecord(jobs) {
+    if (!state.ledger.on || !state.ledger.ready) return;
+    const add = [];
+    for (const j of jobs) {
+      const lr = j.last_run;
+      if (!lr || !lr.finished_at) continue;
+      if (state.ledger.seen[j.name] === lr.finished_at) continue;
+      state.ledger.seen[j.name] = lr.finished_at;
+      const row = {
+        id: j.name + "|" + lr.finished_at, job: j.name, iso: lr.finished_at,
+        fin: Date.parse(lr.finished_at) || 0, o: lr.outcome,
+        x: (lr.exit_code == null ? null : lr.exit_code),
+        d: (lr.duration == null ? null : lr.duration),
+        r: lr.fail_reason || null,
+      };
+      const arr = state.ledger.runs[j.name] || (state.ledger.runs[j.name] = []);
+      arr.push(row);
+      if (arr.length > LEDGER_PERJOB) arr.shift();
+      state.ledger.count++;
+      add.push(row);
+    }
+    if (add.length) { ledgerPut(add); ledgerAnalyze(); refreshLedgerStat(); }
+  }
+  function median(xs) {
+    if (!xs.length) return null;
+    const s = xs.slice().sort((a, b) => a - b), m = s.length >> 1;
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+  // Robust per-job baselines: median + MAD of SUCCESSFUL run durations.
+  function ledgerAnalyze() {
+    const stats = {};
+    for (const name in state.ledger.runs) {
+      const arr = state.ledger.runs[name];
+      const durs = [];
+      for (const r of arr) if (r.o === "success" && r.d != null) durs.push(r.d);
+      const st = { n: arr.length, samples: durs.length, slow: false, ratio: null, regressed: false, median: null };
+      if (durs.length >= LEDGER_MIN) {
+        const med = median(durs);
+        const mad = median(durs.map((d) => Math.abs(d - med))) || 0;
+        st.median = med;
+        let latest = null;
+        for (let i = arr.length - 1; i >= 0; i--) if (arr[i].d != null && arr[i].o !== "cancelled") { latest = arr[i]; break; }
+        if (latest && med > 0) {
+          st.ratio = latest.d / med;
+          if (latest.o === "success" && latest.d > med + LEDGER_SLOW_K * mad && latest.d > med * 1.5) st.slow = true;
+        }
+      }
+      const last = arr[arr.length - 1];
+      if (last && last.o === "failure") {
+        let streak = 0;
+        for (let i = arr.length - 2; i >= 0 && arr[i].o === "success"; i--) streak++;
+        if (streak >= LEDGER_MIN) st.regressed = true;
+      }
+      stats[name] = st;
+    }
+    state.ledger.stats = stats;
+  }
+  // synchronous accessor used by the row renderer + its signature
+  function ledgerFlag(name) {
+    if (!state.ledger.on) return null;
+    const s = state.ledger.stats[name];
+    return s && s.slow ? { kind: "slow", ratio: s.ratio } : null;
+  }
+  function slowChip(job) {
+    const f = ledgerFlag(job.name);
+    if (!f || job.running) return "";
+    const r = f.ratio ? "×" + f.ratio.toFixed(1) : "";
+    return '<span class="slow-chip" title="latest successful run ran unusually slow vs its ledger baseline">◱ slow ' + esc(r) + "</span>";
+  }
+  function fmtBytes(b) {
+    if (b < 1024) return b + " B";
+    if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+    return (b / 1048576).toFixed(1) + " MB";
+  }
+  function refreshLedgerStat() {
+    const row = $("ledgerStatRow"), out = $("ledgerStat");
+    if (!row || !out) return;
+    row.style.display = state.ledger.on ? "" : "none";
+    if (!state.ledger.on) return;
+    const jobs = Object.keys(state.ledger.runs).length;
+    out.textContent = state.ledger.count + " runs · " + jobs + " jobs · ~" + fmtBytes(state.ledger.count * 90);
+  }
+  function setLedger(v) {
+    prefs.ledger = v; savePref("ledger"); state.ledger.on = v; syncSettings();
+    if (v) { state.ledger.ready = false; ledgerLoad().then(() => { refreshLedgerStat(); renderRows(); }); }
+    else { state.ledger.stats = {}; refreshLedgerStat(); renderRows(); }
+  }
+  function ledgerExport() {
+    const out = { schema: "yacron2-ledger/1", exported_at: new Date().toISOString(), runs: {} };
+    for (const name in state.ledger.runs)
+      out.runs[name] = state.ledger.runs[name].map((r) => ({ finished_at: r.iso, outcome: r.o, exit_code: r.x, duration: r.d, fail_reason: r.r }));
+    const blob = new Blob([JSON.stringify(out, null, 2)], { type: "application/json" });
+    const a = el("a"); a.href = URL.createObjectURL(blob); a.download = "yacron2-run-ledger.json";
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    toast("ok", "exported " + state.ledger.count + " runs");
+  }
+  function ledgerPurge() {
+    state.ledger.runs = {}; state.ledger.seen = {}; state.ledger.stats = {}; state.ledger.count = 0;
+    ledgerDBHandle().then((db) => { if (!db) return; try { db.transaction(LEDGER_STORE, "readwrite").objectStore(LEDGER_STORE).clear(); } catch (_) {} });
+    refreshLedgerStat(); renderRows(); toast("info", "ledger purged");
+  }
+
+  // ===================================================================
+  //  incident cockpit — fleet verdict + correlated-failure clustering
+  // ===================================================================
+  const CORR_WINDOW = 60000;   // failures within this window may share a cause
+
+  // Distill the /cluster view into one alert signal for the verdict bar.
+  function setClusterAlert(data) {
+    if (!data || !data.enabled) { state.clusterAlert = null; return; }
+    let bad = false, reason = "";
+    if (data.elect_leader) {
+      if (data.conflict) {
+        reason = (data.conflict_names && data.conflict_names.length) ? "duplicate nodeName"
+          : data.size_conflict ? "cluster size mismatch"
+          : data.policy_conflict ? "coordination policy mismatch" : "conflict";
+        reason += " — Leader jobs paused"; bad = true;
+      } else if (!data.quorate) {
+        reason = (data.backend && data.backend !== "gossip")
+          ? "lease store unreachable — Leader jobs failing closed" : "no quorum — Leader jobs paused";
+        bad = true;
+      }
+    }
+    state.clusterAlert = { bad: bad, reason: reason, node: data.node_name || null };
+  }
+  // Group failing jobs by (exit_code, fail_reason); the dominant group whose
+  // finishes fall inside CORR_WINDOW is the correlation headline + blast radius.
+  function correlate(failing) {
+    const groups = {};
+    for (const j of failing) {
+      const lr = j.last_run || {};
+      const key = (lr.exit_code == null ? "?" : lr.exit_code) + "|" + (lr.fail_reason || "");
+      (groups[key] || (groups[key] = [])).push(j);
+    }
+    let best = null;
+    for (const key in groups) {
+      const g = groups[key];
+      if (g.length < 2) continue;
+      const times = g.map((j) => Date.parse(j.last_run.finished_at) || 0).filter(Boolean);
+      const span = times.length ? Math.max.apply(null, times) - Math.min.apply(null, times) : 0;
+      if (!best || g.length > best.n) best = { n: g.length, span: span, exit: g[0].last_run.exit_code, reason: g[0].last_run.fail_reason, jobs: g };
+    }
+    return best;
+  }
+  function renderVerdict() {
+    const bar = $("verdictBar");
+    const failing = state.jobs.filter((j) => health(j).key === "fail");
+    const alert = state.clusterAlert;
+    const corr = failing.length > 1 ? correlate(failing) : null;
+    state.incidentSet = (corr && corr.n >= 2 ? corr.jobs : failing).map((j) => j.name);
+    let sev, glyph = "▲", head = "", sub = "";
+    if (alert && alert.bad) {
+      sev = "crit"; glyph = "☢";
+      head = "CLUSTER ALERT — " + alert.reason.toUpperCase();
+      sub = (alert.node ? "this node: " + alert.node + " · " : "") +
+        (failing.length ? failing.length + " job" + (failing.length > 1 ? "s" : "") + " also failing" : "leadership / quorum degraded");
+    } else if (failing.length === 0) {
+      state.incidentSet = [];
+      if (state.verdictSig !== "hidden") { state.verdictSig = "hidden"; bar.style.display = "none"; bar.className = "verdict"; }
+      return;
+    } else if (failing.length === 1) {
+      sev = "warn";
+      const j = failing[0], lr = j.last_run || {};
+      head = "JOB FAILING — " + j.name;
+      sub = "exit " + (lr.exit_code == null ? "?" : lr.exit_code) + (lr.fail_reason ? " · " + lr.fail_reason : "") + " · " + fmtAgo(lr.finished_at);
+    } else {
+      sev = "crit";
+      head = "FLEET EVENT — " + failing.length + " jobs failing";
+      sub = corr
+        ? "×" + corr.n + " share exit=" + (corr.exit == null ? "?" : corr.exit) + (corr.reason ? " (" + corr.reason + ")" : "") +
+          (corr.span <= CORR_WINDOW ? " within " + Math.max(1, Math.round(corr.span / 1000)) + "s" : "") + " — likely one cause"
+        : "no shared failure signature — likely independent";
+    }
+    const sig = sev + "|" + head + "|" + sub;
+    if (sig === state.verdictSig) return;
+    state.verdictSig = sig;
+    bar.className = "verdict sev-" + sev;
+    bar.style.display = "";
+    $("vGlyph").textContent = glyph;
+    $("vHead").textContent = head;
+    $("vSub").textContent = sub;
+  }
+
+  // ---- incident timeline overlay (hotkey i) ----
+  function openTimeline() {
+    if (state.timeline.open) { closeTimeline(); return; }
+    pushFocus();
+    state.timeline.open = true;
+    $("timelineWrap").classList.add("open");
+    $("tlFailOnly").checked = state.timeline.failOnly;
+    renderTimeline();
+    focusFirst($("timelineWrap"));
+  }
+  function closeTimeline() {
+    if (!state.timeline.open) return;
+    state.timeline.open = false;
+    $("timelineWrap").classList.remove("open");
+    popFocus();
+  }
+  function renderTimeline() {
+    if (!state.timeline.open) return;
+    $("tlNow").textContent = utcClock();
+    const events = [];
+    for (const j of state.jobs) {
+      const lr = j.last_run;
+      if (!lr || !lr.finished_at) continue;
+      const cls = lr.outcome === "failure" ? "fail" : lr.outcome === "cancelled" ? "cancelled" : "ok";
+      if (state.timeline.failOnly && cls !== "fail") continue;
+      events.push({ name: j.name, cls: cls, fin: Date.parse(lr.finished_at) || 0, iso: lr.finished_at, x: lr.exit_code, d: lr.duration, r: lr.fail_reason || "" });
+    }
+    events.sort((a, b) => b.fin - a.fin);
+    const corr = correlate(state.jobs.filter((j) => health(j).key === "fail"));
+    const corrSet = corr && corr.n >= 2 ? corr.jobs.map((j) => j.name) : [];
+    const body = $("tlBody");
+    if (!events.length) { body.innerHTML = '<div class="tlempty">No runs recorded yet.</div>'; return; }
+    body.innerHTML = events.map((e) => {
+      const meta = (e.x == null ? "" : "exit " + esc(e.x)) + (e.d != null ? " · " + fmtDuration(e.d) : "");
+      return '<div class="tlrow ' + e.cls + (corrSet.indexOf(e.name) >= 0 ? " corr" : "") + '" data-job="' + escAttr(e.name) + '" title="' + escAttr(new Date(e.fin).toString()) + '">' +
+        '<span class="tlt" data-ago="' + escAttr(e.iso) + '">' + esc(fmtAgo(e.iso)) + "</span>" +
+        '<span class="tlg">' + GLYPH[e.cls] + "</span>" +
+        '<span class="tlnm">' + esc(e.name) + (e.r ? ' <span class="tlre">' + esc(e.r) + "</span>" : "") + "</span>" +
+        '<span class="tlmeta">' + meta + "</span>" +
+      "</div>";
+    }).join("");
+  }
+
+  // ===================================================================
+  //  mitigate console — guarded, staggered bulk run/cancel + writeup
+  // ===================================================================
+  const MIT_STAGGER = 300;   // ms between actions (gentle on the daemon)
+  function openMitigate(names, label) {
+    names = (names || []).filter((n) => state.byName[n]);
+    if (!names.length) { toast("info", "nothing to mitigate — no target jobs"); return; }
+    if (!state.mitigate.open) pushFocus();
+    state.mitigate.open = true; state.mitigate.set = names; state.mitigate.abort = false;
+    $("mitTitle").textContent = "Mitigate — " + (label || (names.length + " jobs"));
+    $("mitDesc").textContent = "Acts on these " + names.length + " job" + (names.length > 1 ? "s" : "") +
+      ". Bulk actions are staggered and abortable; each uses the same token as a single action.";
+    $("mitLog").style.display = "none"; $("mitLog").textContent = "";
+    $("mitAbort").style.display = "none";
+    renderMitList();
+    $("mitigateWrap").classList.add("open");
+    focusFirst($("mitigateWrap"));
+  }
+  function renderMitList() {
+    $("mitList").innerHTML = state.mitigate.set.map((n) => {
+      const j = state.byName[n]; if (!j) return "";
+      const k = health(j).key, lr = j.last_run || {};
+      const s = k === "fail" ? "exit " + (lr.exit_code == null ? "?" : lr.exit_code) + (lr.fail_reason ? " · " + lr.fail_reason : "")
+        : j.running ? "running" : (lr.finished_at ? fmtAgo(lr.finished_at) : "pending");
+      return '<div class="mj ' + k + '"><span class="g">' + GLYPH[k] + '</span><span class="mn">' + esc(n) + '</span><span class="ms">' + esc(s) + "</span></div>";
+    }).join("");
+  }
+  function closeMitigate() {
+    if (!state.mitigate.open) return;
+    state.mitigate.abort = true; state.mitigate.open = false;
+    $("mitigateWrap").classList.remove("open");
+    popFocus();
+  }
+  function mitLog(line) {
+    const box = $("mitLog"); box.style.display = "";
+    box.textContent += line + "\n"; box.scrollTop = box.scrollHeight;
+  }
+  async function bulkAction(kind) {
+    if (state.mitigate.running) return;
+    const targets = state.mitigate.set.filter((n) => {
+      const j = state.byName[n]; if (!j) return false;
+      return kind === "cancel" ? j.running : (j.enabled && !j.running);
+    });
+    const verb = kind === "cancel" ? "cancel" : "start";
+    if (!targets.length) { mitLog("nothing to " + verb + " (no eligible jobs)"); return; }
+    state.mitigate.running = true; state.mitigate.abort = false;
+    $("mitAbort").style.display = "";
+    $("mitCancelAll").disabled = $("mitStartAll").disabled = true;
+    mitLog("— " + verb + "ing " + targets.length + " job" + (targets.length > 1 ? "s" : "") + " —");
+    let done = 0, failed = 0;
+    for (const n of targets) {
+      if (state.mitigate.abort) { mitLog("aborted (" + done + "/" + targets.length + " sent)"); break; }
+      try {
+        const res = await apiFetch("/jobs/" + encodeURIComponent(n) + "/" + verb, { method: "POST" });
+        if (res.ok) { done++; mitLog("  ✓ " + verb + " " + n); }
+        else { failed++; mitLog("  ✗ " + n + " (HTTP " + res.status + ")"); }
+      } catch (e) {
+        failed++;
+        if (e.message === "unauthorized") { mitLog("  ! unauthorized — set a token"); break; }
+        mitLog("  ✗ " + n + " (error)");
+      }
+      await new Promise((r) => setTimeout(r, MIT_STAGGER));
+    }
+    mitLog("done: " + done + " ok" + (failed ? ", " + failed + " failed" : ""));
+    state.mitigate.running = false;
+    $("mitAbort").style.display = "none";
+    $("mitCancelAll").disabled = $("mitStartAll").disabled = false;
+    toast(failed ? "err" : "ok", verb + ": " + done + " ok" + (failed ? ", " + failed + " failed" : ""));
+    setTimeout(loadJobs, 400);
+  }
+  function copyIncidentSummary() {
+    const names = state.mitigate.set;
+    const lines = ["# yacron2 incident", "",
+      "- when: " + new Date().toISOString(),
+      "- host: " + location.host,
+      "- version: " + ($("ver").textContent || "?")];
+    if (state.clusterLine) lines.push("- cluster: " + state.clusterLine);
+    lines.push("", "| job | status | exit | reason | when |", "| --- | --- | --- | --- | --- |");
+    for (const n of names) {
+      const j = state.byName[n]; if (!j) continue;
+      const lr = j.last_run || {};
+      lines.push("| " + n + " | " + health(j).label + " | " + (lr.exit_code == null ? "" : lr.exit_code) +
+        " | " + (lr.fail_reason || "").replace(/\|/g, "\\|") + " | " + (lr.finished_at ? fmtAgo(lr.finished_at) : "") + " |");
+    }
+    copyText(lines.join("\n"), "incident summary");
+  }
+
+  // ===================================================================
+  //  cron sandbox — decode any expression, preview fires, find users
+  // ===================================================================
+  const SBX_RECENT_KEY = "yacron2.sbxRecent", SBX_RECENT_MAX = 10;
+  function sbxRecent() { try { return JSON.parse(localStorage.getItem(SBX_RECENT_KEY)) || []; } catch (_) { return []; } }
+  function sbxPushRecent(expr) {
+    expr = String(expr || "").trim(); if (!expr) return;
+    let list = sbxRecent().filter((x) => x !== expr); list.unshift(expr);
+    try { localStorage.setItem(SBX_RECENT_KEY, JSON.stringify(list.slice(0, SBX_RECENT_MAX))); } catch (_) {}
+  }
+  function sbxFrames() {
+    const set = ["UTC", "LOCAL"];
+    for (const j of state.jobs) { const f = frameOf(j); if (set.indexOf(f) < 0) set.push(f); }
+    return set;
+  }
+  function sameSchedule(a, b) {
+    a = String(a || "").trim().toLowerCase(); b = String(b || "").trim().toLowerCase();
+    return a === b || (MACROS[a] || a) === (MACROS[b] || b);
+  }
+  function openSandbox(prefillExpr, prefillFrame) {
+    if (!state.sandbox.open) pushFocus();
+    state.sandbox.open = true;
+    const sel = $("sbxFrame");
+    sel.innerHTML = sbxFrames().map((f) => '<option value="' + escAttr(f) + '">' + esc(f === "LOCAL" ? "local" : f) + "</option>").join("");
+    const sj = selectedJob();
+    if (prefillFrame) sel.value = prefillFrame; else if (sj) sel.value = frameOf(sj);
+    $("sbxInput").value = prefillExpr != null ? prefillExpr : (sj ? sj.schedule : "");
+    $("sandboxWrap").classList.add("open");
+    renderSandbox();
+    setTimeout(() => $("sbxInput").focus(), 30);
+  }
+  function closeSandbox() {
+    if (!state.sandbox.open) return;
+    state.sandbox.open = false; $("sandboxWrap").classList.remove("open"); popFocus();
+  }
+  function sbxRecentHtml() {
+    const list = sbxRecent();
+    if (!list.length) return "";
+    return '<div class="sbx-uses"><span class="faint">recent:</span><div class="sbx-recent">' +
+      list.map((x) => '<span class="chip" data-expr="' + escAttr(x) + '">' + esc(x) + "</span>").join("") + "</div></div>";
+  }
+  function renderSandbox() {
+    const expr = $("sbxInput").value.trim();
+    const frame = $("sbxFrame").value || "UTC";
+    const body = $("sbxBody");
+    if (!expr) { body.innerHTML = '<div class="tlempty">Type a cron expression or a @macro.</div>' + sbxRecentHtml(); return; }
+    const parsed = parseCron(expr);
+    let html = "";
+    if (parsed.type === "reboot") {
+      html += '<p class="sbx-desc">Runs once, when yacron2 starts (@reboot).</p>';
+    } else if (parsed.type !== "fields") {
+      html += '<p class="sbx-desc sbx-bad">Not a valid 5-field cron expression or known @macro.</p>';
+    } else {
+      const runs = nextRuns(parsed, 12, frame, Date.now());
+      const impossible = !runs.length;
+      html += '<p class="sbx-desc' + (impossible ? " sbx-bad" : "") + '">' + esc(impossible ? "This schedule can never occur (impossible date)." : describeCron(expr)) + "</p>";
+      const low = expr.toLowerCase();
+      const f = (MACROS[low] || expr).split(/\s+/);
+      const labels = ["min", "hour", "day-of-month", "month", "day-of-week"];
+      html += '<div class="sbx-flds">';
+      for (let i = 0; i < 5; i++) html += '<div class="sbx-fld"><div class="fk">' + labels[i] + '</div><div class="fv">' + esc(f[i] || "*") + "</div></div>";
+      html += "</div>";
+      if (runs.length) {
+        html += '<div class="card-label" style="padding-left:0;border:0">next ' + runs.length + " fires · " + esc(frame === "LOCAL" ? "local" : frame) + '</div><ul class="nextruns">';
+        for (const r of runs)
+          html += "<li><span class='when'>" + esc(fmtWall(r.c)) + "</span><span class='rel'>" + esc(fmtIn((r.t - Date.now()) / 1000)) + "</span></li>";
+        html += "</ul>";
+      }
+      const users = state.jobs.filter((j) => sameSchedule(j.schedule, expr));
+      if (users.length)
+        html += '<div class="sbx-uses"><span class="faint">used by:</span> ' +
+          users.map((j) => '<span class="chip" data-job="' + escAttr(j.name) + '">' + esc(j.name) + "</span>").join("") + "</div>";
+    }
+    html += sbxRecentHtml();
+    body.innerHTML = html;
+  }
+
+  // ---- schedule foot-gun analysis (client-side, best-effort) ----
+  // observed duration estimate: prefer last_run, fall back to the inline history
+  // tail (max) — both already in the /jobs payload.
+  function jobDurEstimate(job) {
+    let m = null;
+    if (job.last_run && job.last_run.duration != null) m = job.last_run.duration;
+    for (const h of (job.history || [])) if (h.duration != null) m = Math.max(m == null ? 0 : m, h.duration);
+    return m;
+  }
+  // tightest gap (seconds) between consecutive fires — how densely runs can stack
+  function minFireGap(parsed, frame) {
+    const runs = nextRuns(parsed, 8, frame, Date.now());
+    if (runs.length < 2) return null;
+    let g = Infinity;
+    for (let i = 1; i < runs.length; i++) g = Math.min(g, (runs[i].t - runs[i - 1].t) / 1000);
+    return g === Infinity ? null : g;
+  }
+  // how many OTHER enabled jobs fire in the same minute as this job's next fire
+  function nextCollisions(job, parsed, frame) {
+    const runs = nextRuns(parsed, 1, frame, Date.now());
+    if (!runs.length) return null;
+    const minuteOf = (t) => Math.floor(t / 60000);
+    const target = minuteOf(runs[0].t);
+    const others = [];
+    let scanned = 0;
+    for (const j of state.jobs) {
+      if (j.name === job.name || !j.enabled) continue;
+      if (scanned++ > 200) break;                 // hard cap on the fan-out
+      const p = parseCron(j.schedule);
+      if (p.type !== "fields") continue;
+      const r = nextRuns(p, 1, frameOf(j), Date.now());
+      if (r.length && minuteOf(r[0].t) === target) others.push(j.name);
+    }
+    return { at: runs[0].c, others: others };
+  }
+  // DST advisory: does the job's frame cross a UTC-offset transition within a
+  // year, at a fixed local hour a transition could skip or repeat? Conservative:
+  // names the date + direction, does not over-claim which fire is affected.
+  function dstAdvisory(parsed, frame) {
+    // only for an explicit IANA zone: UTC never shifts, and LOCAL is the
+    // browser's zone (already flagged "approximate"), which may not match the
+    // server's — so a DST claim there could mislead.
+    if (frame === "UTC" || frame === "LOCAL" || parsed.type !== "fields" || !parsed.hour.restricted) return null;
+    const now = Date.now(), DAY = 86400000;
+    let prev = tzOffset(frame, now);
+    for (let i = 1; i <= 400; i++) {
+      const tt = now + i * DAY, off = tzOffset(frame, tt);
+      if (off !== prev) {
+        let lo = tt - DAY, hi = tt;
+        while (hi - lo > 60000) { const mid = (lo + hi) / 2; (tzOffset(frame, mid) === prev) ? (lo = mid) : (hi = mid); }
+        const date = wallParts(new Date(hi), frame);
+        return { date: date.Y + "-" + pad2(date.Mo) + "-" + pad2(date.D), dir: (off - prev) > 0 ? "forward" : "back" };
+      }
+      prev = off;
+    }
+    return null;
+  }
+  function scheduleWarnings(job) {
+    const parsed = parseCron(job.schedule);
+    if (parsed.type !== "fields") return [];
+    const frame = frameOf(job);
+    const out = [];
+    const gap = minFireGap(parsed, frame), est = jobDurEstimate(job);
+    if (gap != null && est != null && est >= gap)
+      out.push({ sev: "crit", t: "<b>Runs may overlap.</b> Fires as often as every " + esc(fmtDuration(gap)) +
+        ", but a run has taken up to " + esc(fmtDuration(est)) + ". Check this job's <b>concurrencyPolicy</b>." });
+    else if (gap != null && est != null && est >= gap * 0.7)
+      out.push({ sev: "warn", t: "<b>Runs pack tightly.</b> Fires every " + esc(fmtDuration(gap)) +
+        " and has taken up to " + esc(fmtDuration(est)) + " — little headroom before overlap." });
+    const col = nextCollisions(job, parsed, frame);
+    if (col && col.others.length)
+      out.push({ sev: "warn", t: "<b>Thundering herd.</b> Next fire at <b>" + pad2(col.at.h) + ":" + pad2(col.at.mi) +
+        "</b> coincides with " + col.others.length + " other job" + (col.others.length > 1 ? "s" : "") + " (" +
+        esc(col.others.slice(0, 4).join(", ")) + (col.others.length > 4 ? ", …" : "") + ")." });
+    const dst = dstAdvisory(parsed, frame);
+    if (dst)
+      out.push({ sev: "warn", t: "<b>DST transition ahead.</b> " + esc(frame) + " shifts clocks " + dst.dir +
+        " on <b>" + esc(dst.date) + "</b>; a fixed local time near the change may be skipped or run twice. Verify around that date." });
+    return out;
+  }
+
+  // ===================================================================
+  //  zen all-clear screensaver + adaptive alarm escalation (wallboard)
+  // ===================================================================
+  const ZEN_IDLE = 30000;                        // default idle before zen (overridable in Settings)
+  const ALARM_BASE = 6000, ALARM_FLOOR = 1600;   // adaptive alarm interval bounds
+  const reduceMotion = () => !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  function anyRunning() { return state.jobs.some((j) => j.running); }
+
+  // track when this browser first observed each job failing (honest age basis)
+  function updateIncidents(jobs) {
+    const since = state.failSince, nowMs = Date.now();
+    const failing = {};
+    for (const j of jobs) if (health(j).key === "fail") { failing[j.name] = true; if (!since[j.name]) since[j.name] = nowMs; }
+    for (const n in since) if (!failing[n]) delete since[n];
+  }
+  function incidentAge() {
+    let oldest = 0, nowMs = Date.now();
+    for (const n in state.failSince) { const a = nowMs - state.failSince[n]; if (a > oldest) oldest = a; }
+    return oldest;
+  }
+  // adaptive alarm (replaces the fixed 6s cadence): interval shrinks with the
+  // unacked incident age; ack (a) silences it. Called every second.
+  function alarmTick() {
+    if (!(prefs.sound && state.anyFailing && !state.alarmAck)) return;
+    const nowMs = Date.now();
+    let interval = ALARM_BASE;
+    if (prefs.escalate) {
+      const k = Math.min(1, incidentAge() / 600000);   // ramp to FLOOR by ~10min
+      interval = ALARM_BASE - (ALARM_BASE - ALARM_FLOOR) * k;
+    }
+    if (nowMs - state.lastAlarmAt >= interval) { state.lastAlarmAt = nowMs; playCue("alarm"); }
+  }
+  // per-second wallboard escalation visuals (vignette + incident timer + breathe)
+  function escalationTick() {
+    if (!state.wallboard) return;
+    const alarm = $("wbAlarm");
+    let inc = $("wbIncident");
+    if (!(state.anyFailing && prefs.escalate)) {
+      if (alarm) alarm.style.opacity = "0";
+      document.querySelectorAll(".wb-tile.escalate").forEach((t) => t.classList.remove("escalate"));
+      if (inc) inc.remove();
+      return;
+    }
+    const age = incidentAge(), acked = state.alarmAck;
+    const count = Object.keys(state.failSince).length;
+    let level = Math.min(1, (Math.min(count, 6) / 6) * 0.5 + Math.min(1, age / 600000) * 0.5);
+    if (acked) level = Math.min(level, 0.22);
+    if (alarm) alarm.style.opacity = reduceMotion() ? "0.16" : (0.12 + 0.55 * level).toFixed(2);
+    document.querySelectorAll(".wb-tile.st-fail").forEach((t) => t.classList.toggle("escalate", !acked && !reduceMotion()));
+    if (!inc) { inc = document.createElement("span"); inc.id = "wbIncident"; inc.className = "wb-incident"; $("wallboard").appendChild(inc); }
+    inc.classList.toggle("ackd", acked);
+    inc.textContent = "◉ INCIDENT +" + fmtCountdown(age / 1000) + (acked ? " · ack" : "");
+  }
+  function zenOn() {
+    if (state.zen.on) return;
+    state.zen.on = true;
+    const z = $("zen"); z.style.display = "flex"; z.setAttribute("aria-hidden", "false");
+    renderZenField();
+  }
+  function zenOff() {
+    if (!state.zen.on) return;
+    state.zen.on = false;
+    const z = $("zen"); z.style.display = "none"; z.setAttribute("aria-hidden", "true");
+  }
+  function renderZenField() {
+    const field = $("zenField");
+    const jobs = state.jobs.filter((j) => j.enabled).slice(0, 240);
+    // deterministic scatter from the job name (stable across renders, no RNG)
+    const hash = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0); };
+    field.innerHTML = jobs.map((j) => {
+      const x = (hash(j.name) % 1000) / 10, y = (hash(j.name + "#y") % 1000) / 10;
+      return '<span class="zen-dot" data-job="' + escAttr(j.name) + '" style="left:' + x + '%;top:' + y + '%"></span>';
+    }).join("");
+    state.zen.sig = jobs.map((j) => j.name).join("|");
+  }
+  // per-second: pulse each dot as its real next fire arrives; update the readout
+  function zenTick() {
+    if (!state.zen.on) return;
+    const now = Date.now();
+    if (!state.radar.items.length || (state.radar.items[0] && state.radar.items[0].t <= now)) computeRadar();
+    if (!reduceMotion()) {
+      const due = {};
+      for (const it of state.radar.items) { const dt = it.t - now; if (dt >= -1500 && dt <= 1000) due[it.name] = true; }
+      $("zenField").querySelectorAll(".zen-dot").forEach((d) => {
+        const on = !!due[d.getAttribute("data-job")];
+        if (on !== d.classList.contains("due")) d.classList.toggle("due", on);
+      });
+    }
+    const enabled = state.jobs.filter((j) => j.enabled).length;
+    const soon = state.radar.items.filter((x) => x.t >= now)[0];
+    $("zenSub").textContent = enabled + " jobs armed · " + utcClock() +
+      (soon ? " · next " + soon.name + " " + fmtCountdown((soon.t - now) / 1000) : "");
+  }
+  // decide whether an idle, healthy wallboard should drift to zen
+  function zenGovernor() {
+    if (!state.wallboard || !prefs.zen) { zenOff(); state.zen.idleSince = 0; return; }
+    if (state.anyFailing || anyRunning()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
+    const nowMs = Date.now();
+    if (!state.zen.idleSince) state.zen.idleSince = nowMs;
+    if (!state.zen.on && nowMs - state.zen.idleSince >= (prefs.zenIdle || ZEN_IDLE)) zenOn();
+    if (state.zen.on) {
+      const sig = state.jobs.filter((j) => j.enabled).map((j) => j.name).join("|");
+      if (sig !== state.zen.sig) renderZenField();
+    }
+  }
+  function zenWake() { if (state.zen.on) { zenOff(); state.zen.idleSince = Date.now(); } }
 
   // ===================================================================
   //  BIOS-style boot / POST self-test
@@ -3122,6 +4091,10 @@
   $("heatWindow").value = prefs.heatWindow;
   if (prefs.radar) renderRadar();
   if (prefs.heat) { renderHeatmap(); loadHeatmap(true); }
+  // opt-in run ledger: hydrate the in-memory mirror from IndexedDB before the
+  // first poll so anomaly baselines + the History note are ready immediately.
+  state.ledger.on = prefs.ledger;
+  if (prefs.ledger) ledgerLoad().then(() => { refreshLedgerStat(); renderRows(); });
   // if cues were left enabled across a reload, autoplay policy blocks the
   // AudioContext until a gesture — resume it on the first interaction.
   const resumeAudio = () => {
@@ -3141,7 +4114,7 @@
     restartPolling();
   }
   setInterval(tick, 1000);
-  setInterval(alarmTick, 6000);                               // standing failure alarm
+  setInterval(alarmTick, 1000);                               // adaptive failure alarm (self-gates its cadence)
   setInterval(() => { if (prefs.heat) loadHeatmap(false); }, 60000);  // slow heatmap refresh
   tick();
   const reducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);

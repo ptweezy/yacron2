@@ -1,0 +1,104 @@
+# "ACME Orders" — a full-fledged yacron2 showcase.
+#
+# A FIVE-node mutual-TLS cluster (leader election + distribution: spread)
+# running a realistic mini data & ops platform whose job set is built to
+# exercise everything yacron2 can do AND make every web-dashboard feature demo
+# itself. Two small sinks make the failure-reporting features real: Mailpit
+# (SMTP) catches the on-call mail, and a statsd exporter receives job metrics.
+#
+#   docker compose -f docker-compose-acme.yml up --build      # start
+#   docker compose -f docker-compose-acme.yml logs -f         # watch job output
+#   docker compose -f docker-compose-acme.yml down -v         # stop + wipe (incl. certs)
+#
+# Open a node dashboard:   http://localhost:8080/   (yacron-a; b..e on 8081..8084)
+# Watch the on-call mail:  http://localhost:8025/   (Mailpit inbox)
+# Scrape job metrics:      http://localhost:9102/metrics   (statsd exporter)
+#
+# Each node's cluster config is generated at start by
+# example/acme-platform/node-entrypoint.sh from environment variables, so the
+# compose file needs no per-node peer lists: every node shares one CLUSTER_HOSTS
+# list and drops itself by NODE_NAME. The job set
+# (example/acme-platform/jobs.yaml) is mounted identically into all five nodes.
+#
+# DISTRIBUTION defaults to "spread": each Leader/PreferLeader job gets its own
+# per-job owner via rendezvous hashing, so the pipeline/reporting/housekeeping
+# jobs fan out across the five nodes (watch the dashboard's Owner column). The
+# EveryNode monitoring checks run everywhere, so the same incident is visible on
+# every node. Flip to a single leader to compare:
+#
+#   DISTRIBUTION=single-leader docker compose -f docker-compose-acme.yml up -d
+#
+# WHAT DEMOS ITSELF (UTC, no clicks): slow-report-generator is killed by its
+# executionTimeout at :05 & :35; the four db-health checks fail together at
+# :15-:19 (incident cockpit / mitigate / timeline / alarm); config-lint fails
+# on stderr at :25-:29; cert-expiry-check fails and mails on-call at :45-:47;
+# the hourly-* reports collide at :00. See example/acme-platform/README.md.
+#
+# NOTE ON SIZE: 5 is an odd cluster size (quorum 3, tolerates 2 node failures).
+# Stop 3+ nodes and the cluster loses quorum: Leader jobs stand down while
+# PreferLeader jobs keep running.
+
+x-cluster-hosts: &cluster_hosts "yacron-a:8443,yacron-b:8443,yacron-c:8443,yacron-d:8443,yacron-e:8443"
+
+x-node-env: &node-env
+  CLUSTER_HOSTS: *cluster_hosts
+  DISTRIBUTION: ${DISTRIBUTION:-spread}
+  ELECT_LEADER: "true"
+  INTERVAL: "10"
+  DRIFT_AFTER: "2"
+
+x-node: &node
+  build:
+    context: .
+  image: yacron2-acme:local          # built once, reused by all five nodes
+  entrypoint: ["sh", "/node-entrypoint.sh"]
+  restart: unless-stopped
+  depends_on:
+    certgen:
+      condition: service_completed_successfully
+    mailpit:
+      condition: service_started
+    statsd:
+      condition: service_started
+  volumes:
+    - ./example/acme-platform/jobs.yaml:/config/jobs.yaml:ro
+    - ./example/acme-platform/acme.env:/config/acme.env:ro
+    - ./example/acme-platform/node-entrypoint.sh:/node-entrypoint.sh:ro
+    - acme-certs:/certs:ro
+
+services:
+  # Mints a throwaway cluster CA + one leaf cert per node into the shared volume
+  # before the nodes start. Demo-only: see gen-certs.sh for the caveats.
+  certgen:
+    image: alpine:3.20
+    command: ["sh", "/gen-certs.sh"]
+    volumes:
+      - acme-certs:/certs
+      - ./example/acme-platform/gen-certs.sh:/gen-certs.sh:ro
+
+  # SMTP sink for the onFailure/onPermanentFailure MAIL reports. The mails the
+  # cert-expiry-check and webhook-dispatch jobs send land in this inbox.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "8025:8025"     # web inbox
+      # 1025 (SMTP) stays internal; the nodes reach it as mailpit:1025
+
+  # statsd sink for the jobs that declare a `statsd:` block. Also exposes the
+  # received metrics in Prometheus format on :9102/metrics.
+  statsd:
+    image: prom/statsd-exporter:latest
+    restart: unless-stopped
+    ports:
+      - "9102:9102"     # prometheus metrics
+      # 9125/udp (statsd) stays internal; the nodes reach it as statsd:9125
+
+  yacron-a: { <<: *node, hostname: yacron-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: yacron-a } }
+  yacron-b: { <<: *node, hostname: yacron-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: yacron-b } }
+  yacron-c: { <<: *node, hostname: yacron-c, ports: ["8082:8080"], environment: { <<: *node-env, NODE_NAME: yacron-c } }
+  yacron-d: { <<: *node, hostname: yacron-d, ports: ["8083:8080"], environment: { <<: *node-env, NODE_NAME: yacron-d } }
+  yacron-e: { <<: *node, hostname: yacron-e, ports: ["8084:8080"], environment: { <<: *node-env, NODE_NAME: yacron-e } }
+
+volumes:
+  acme-certs:

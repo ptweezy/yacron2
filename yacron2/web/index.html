@@ -218,7 +218,9 @@
   }
 
   /* ---------- layout ---------- */
-  main { max-width: var(--maxw); margin: 0 auto; padding: 16px 18px 60px; }
+  /* --colsw widens the page by the net width of opted-in extra table columns
+     (set by applyCols); the classic column set leaves it at 0. */
+  main { max-width: calc(var(--maxw) + var(--colsw, 0px)); margin: 0 auto; padding: 16px 18px 60px; transition: max-width .15s ease; }
   .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
   .search {
     flex: 1; min-width: 200px; max-width: 360px;
@@ -259,6 +261,9 @@
     color: var(--fg-faint); font-size: 10.5px; letter-spacing: 1px; text-transform: uppercase;
   }
   table { width: 100%; border-collapse: collapse; }
+  /* horizontal-scroll fallback for the jobs table when the enabled columns
+     outgrow even the widened page (the .card's own overflow stays hidden) */
+  .twrap { overflow-x: auto; }
   thead th {
     text-align: left; font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
     color: var(--fg-faint); padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap;
@@ -300,6 +305,14 @@
      header only appear once a job carries ownership data (table.show-owner). */
   .col-owner { display: none; }
   table.show-owner .col-owner { display: table-cell; }
+  /* configurable columns: every toggleable column starts hidden and applyCols()
+     stamps a show-* class on the table per the "cols" pref (the defaults
+     reproduce the classic layout). Owner stays data-driven, not pref-driven. */
+  .col-sched, .col-last, .col-dur, .col-next, .col-trend,
+  .col-policy, .col-tz, .col-nextat, .col-rate { display: none; }
+  table.show-sched .col-sched, table.show-last .col-last, table.show-dur .col-dur,
+  table.show-next .col-next, table.show-trend .col-trend, table.show-policy .col-policy,
+  table.show-tz .col-tz, table.show-nextat .col-nextat, table.show-rate .col-rate { display: table-cell; }
   .owner {
     display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
     padding: 1px 7px; border-radius: var(--radius); white-space: nowrap;
@@ -318,6 +331,10 @@
   .exit { font-size: 10.5px; padding: 0 5px; border-radius: 3px; margin-left: 6px; }
   .exit.zero { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, transparent); }
   .exit.nonzero { color: var(--fail); background: color-mix(in srgb, var(--fail) 16%, transparent); }
+  /* success-rate column (share of ok runs in the recent-history tail) */
+  .rate.ok { color: var(--ok); }
+  .rate.warn { color: var(--pending); }
+  .rate.fail { color: var(--fail); }
 
   /* sparkline */
   .spark { display: inline-flex; align-items: flex-end; gap: 1px; height: 16px; }
@@ -481,7 +498,12 @@
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
   @media (max-width: 820px) {
-    .col-cmd, .col-sched, .col-dur, .col-next, .col-trend, table.show-owner .col-owner { display: none; }
+    /* narrow screens keep the essential set (status / job / last run / actions)
+       regardless of which columns were opted into on desktop */
+    table.show-sched .col-sched, table.show-dur .col-dur, table.show-next .col-next,
+    table.show-trend .col-trend, table.show-policy .col-policy, table.show-tz .col-tz,
+    table.show-nextat .col-nextat, table.show-rate .col-rate,
+    table.show-owner .col-owner { display: none; }
     .summary .pill.opt { display: none; }
     .clock, .brand .ver { display: none; }
   }
@@ -503,6 +525,23 @@
   /* toggled view buttons in the toolbar / cluster header */
   .ghostbtn.on { background: var(--selbg); }
   .ghostbtn.mini { height: 24px; min-width: 0; font-size: 10.5px; padding: 0 8px; }
+
+  /* jobs-table column picker (anchored in the card header; the card-label's
+     uppercase/letter-spacing styling is reset inside the menu) */
+  .colwrap { position: relative; display: inline-flex; }
+  /* .card clips overflow for its rounded corners, which would truncate the
+     popover on a short table — lift the clip only while the menu is open */
+  .card:has(.colmenu.open) { overflow: visible; }
+  .colmenu {
+    display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 40; min-width: 180px;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius);
+    box-shadow: var(--shadow-lg); padding: 5px; flex-direction: column; gap: 1px;
+    text-transform: none; letter-spacing: normal; font-size: 12px;
+  }
+  .colmenu.open { display: flex; }
+  .colmenu label { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: var(--radius); cursor: pointer; color: var(--fg-dim); white-space: nowrap; }
+  .colmenu label:hover { background: var(--hover); color: var(--fg); }
+  .colmenu input[type=checkbox] { accent-color: var(--accent); margin: 0; }
 
   /* ---------- next-fire radar ---------- */
   .radar { margin-bottom: 12px; }
@@ -849,23 +888,34 @@
   </div>
 
   <div class="card">
-    <div class="card-label"><span>┌─ jobs</span><span class="grow"></span><span id="countLabel"></span></div>
+    <div class="card-label"><span>┌─ jobs</span><span class="grow"></span>
+      <span class="colwrap">
+        <button class="ghostbtn mini" id="colsBtn" title="Choose table columns" aria-haspopup="true">⊞ cols</button>
+        <div class="colmenu" id="colsMenu" role="menu" aria-label="Table columns"></div>
+      </span>
+      <span id="countLabel"></span></div>
+    <div class="twrap">
     <table id="jobsTable">
       <thead>
         <tr>
           <th class="sortable" data-sort="status">Status</th>
           <th class="sortable" data-sort="name">Job</th>
           <th class="col-owner sortable" data-sort="owner">Owner</th>
+          <th class="col-policy sortable" data-sort="policy">Policy</th>
           <th class="col-sched">Schedule</th>
+          <th class="col-tz">TZ</th>
           <th class="sortable col-last" data-sort="last">Last run</th>
           <th class="col-dur sortable" data-sort="duration">Took</th>
           <th class="col-next sortable" data-sort="next">Next</th>
+          <th class="col-nextat sortable" data-sort="nextat">Next at</th>
+          <th class="col-rate sortable" data-sort="rate">Rate</th>
           <th class="col-trend">Trend</th>
           <th style="text-align:right">Actions</th>
         </tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
+    </div>
     <div class="empty" id="emptyState" style="display:none">
       <div class="big">▙▟</div>
       <div id="emptyMsg">No jobs configured.</div>
@@ -1123,6 +1173,9 @@
     boot: true,   // BIOS-style boot self-test on load
     // opt-in run ledger (IndexedDB) + wallboard zen screensaver + alarm escalation
     ledger: false, zen: true, escalate: true, zenIdle: 30000,
+    // jobs-table column visibility overrides, keyed by COLUMNS k. Untouched
+    // columns have no entry, so ones added later still get their default.
+    cols: {},
   };
   function loadPrefs() {
     for (const k of Object.keys(prefs)) {
@@ -1514,6 +1567,106 @@
     return j.clusterOwner == null ? "1" : "0" + j.clusterOwner.toLowerCase();
   }
 
+  // ---- configurable columns (⊞ cols) ----
+  // The toggleable jobs-table columns; `on` is the out-of-the-box visibility
+  // and prefs.cols[k] overrides it. Status, Job and Actions are structural,
+  // and the Owner column stays data-driven (spread mode) — none are listed.
+  // `w` is the column's rough rendered width, used to widen the page so extra
+  // columns get real room instead of squeezing the classic set.
+  const COLUMNS = [
+    { k: "policy", lbl: "Cluster policy",   w: 110 },
+    { k: "sched",  lbl: "Schedule",         w: 130, on: true },
+    { k: "tz",     lbl: "Timezone",         w: 110 },
+    { k: "last",   lbl: "Last run",         w: 140, on: true },
+    { k: "dur",    lbl: "Took",             w: 80,  on: true },
+    { k: "next",   lbl: "Next (countdown)", w: 90,  on: true },
+    { k: "nextat", lbl: "Next (wall clock)", w: 100 },
+    { k: "rate",   lbl: "Success rate",     w: 70 },
+    { k: "trend",  lbl: "Trend",            w: 110, on: true },
+  ];
+  // Overrides map, hardened against a corrupt stored pref (must be an object).
+  function colPrefs() { if (!prefs.cols || typeof prefs.cols !== "object") prefs.cols = {}; return prefs.cols; }
+  function colOn(k) {
+    const o = colPrefs();
+    if (o[k] != null) return !!o[k];
+    const c = COLUMNS.find((x) => x.k === k);
+    return !!(c && c.on);
+  }
+  // Visibility is pure CSS (cells render unconditionally), so toggling a
+  // column never needs a row rebuild — same mechanism as show-owner.
+  function applyCols() {
+    const t = $("jobsTable");
+    let extra = 0;
+    for (const c of COLUMNS) {
+      const on = colOn(c.k);
+      t.classList.toggle("show-" + c.k, on);
+      if (on !== !!c.on) extra += (on ? 1 : -1) * c.w;
+    }
+    // Widen the page by the net width of the columns beyond the classic set,
+    // so opting in adds room instead of squeezing (hiding classic columns
+    // buys extras space for free; never shrink below the classic width).
+    // .twrap scroll is the fallback when the viewport can't give more.
+    document.documentElement.style.setProperty("--colsw", Math.max(0, extra) + "px");
+  }
+  function renderColsMenu() {
+    $("colsMenu").innerHTML = COLUMNS.map((c) =>
+      '<label><input type="checkbox" data-col="' + c.k + '"' + (colOn(c.k) ? " checked" : "") + ">" + esc(c.lbl) + "</label>"
+    ).join("");
+  }
+  function toggleColsMenu(open) {
+    const m = $("colsMenu");
+    const want = open == null ? !m.classList.contains("open") : !!open;
+    if (want === m.classList.contains("open")) return;
+    if (want) renderColsMenu();
+    m.classList.toggle("open", want);
+    $("colsBtn").classList.toggle("on", want);
+  }
+
+  // Cluster policy chip. The daemon includes clusterPolicy only when leader
+  // election is configured, so a standalone daemon shows a quiet dash.
+  function policyCell(job) {
+    const p = job.clusterPolicy;
+    if (!p) return '<span class="faint">—</span>';
+    const hint = p === "EveryNode" ? "runs on every node"
+      : p === "PreferLeader" ? "runs on the leader, but keeps firing without quorum"
+      : "runs only on the leader (or the job's owner under spread)";
+    return '<span class="chip" title="' + escAttr(hint) + '">' + esc(p) + "</span>";
+  }
+  // The schedule's reference frame: an explicit IANA zone wins, then the utc
+  // flag (true is the daemon default; false means the daemon host's local time).
+  function tzCell(job) {
+    if (job.timezone) return esc(job.timezone);
+    return job.utc === false ? "local" : "UTC";
+  }
+  // Success share of the recent-history tail (the same runs the sparkline
+  // draws, capped server-side). Cancelled runs count against it; null = no runs.
+  function rateOf(j) {
+    const h = j.history || [];
+    if (!h.length) return null;
+    return h.filter((r) => r.outcome === "success").length / h.length;
+  }
+  function rateCell(job) {
+    const h = job.history || [], r = rateOf(job);
+    if (r == null) return '<span class="faint">—</span>';
+    const cls = r === 1 ? "ok" : r >= 0.8 ? "warn" : "fail";
+    return '<span class="rate ' + cls + '" title="' + Math.round(r * h.length) + " of the last " + h.length +
+      ' runs succeeded">' + Math.round(r * 100) + "%</span>";
+  }
+  // Absolute browser-local label for a future instant: HH:MM today, "tom"
+  // for tomorrow, month + day beyond that.
+  function fmtAt(ms) {
+    const d = new Date(ms), now = new Date();
+    const hm = pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+    if (d.toDateString() === now.toDateString()) return hm;
+    if (d.toDateString() === new Date(now.getTime() + 86400000).toDateString()) return "tom " + hm;
+    return MONTHS[d.getMonth() + 1].slice(0, 3) + " " + d.getDate() + " " + hm;
+  }
+  function fmtAtTitle(ms) {
+    const d = new Date(ms);
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " +
+      pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + " browser time";
+  }
+
   function computeView() {
     const f = state.filter.toLowerCase();
     let v = state.jobs.filter((j) => {
@@ -1528,9 +1681,14 @@
       if (key === "name") r = a.name.localeCompare(b.name);
       else if (key === "status") r = STATUS_ORDER[health(a).key] - STATUS_ORDER[health(b).key];
       else if (key === "last") r = (lastTs(a) - lastTs(b));
-      else if (key === "next") r = ((a.scheduled_in == null ? Infinity : a.scheduled_in) - (b.scheduled_in == null ? Infinity : b.scheduled_in));
+      else if (key === "next" || key === "nextat") r = ((a.scheduled_in == null ? Infinity : a.scheduled_in) - (b.scheduled_in == null ? Infinity : b.scheduled_in));
       else if (key === "duration") r = ((a.last_run && a.last_run.duration) || 0) - ((b.last_run && b.last_run.duration) || 0);
       else if (key === "owner") r = ownerSortKey(a).localeCompare(ownerSortKey(b));
+      // "~" sorts non-clustered jobs after every policy name
+      else if (key === "policy") r = (a.clusterPolicy || "~").localeCompare(b.clusterPolicy || "~");
+      // 1.5 parks no-history jobs past 100%, so the default ascending click
+      // leads with the flakiest jobs and ends with the unknowns
+      else if (key === "rate") { const ra = rateOf(a), rb = rateOf(b); r = (ra == null ? 1.5 : ra) - (rb == null ? 1.5 : rb); }
       if (r === 0) r = a.name.localeCompare(b.name);
       return r * dir;
     });
@@ -1567,13 +1725,22 @@
       // owner column visibility + this node's name (for the self highlight)
       ow: showOwner, cn: state.clusterNode,
       j: jobs.map((j) => [
-        j.name, j.enabled, j.running, j.scheduled_in == null,
+        j.name, j.enabled, j.running,
+        // the absolute fire minute — stable between polls (the countdown ticks
+        // client-side) but changes exactly when the target run changes, which
+        // re-renders the "next at" cell (it has no per-second tick).
+        j.scheduled_in == null ? "-" : Math.round((Date.now() / 1000 + nextRunSeconds(j)) / 60),
+        // schedule + reference frame render as cells, and a config reload can
+        // change either without touching any run-derived field.
+        j.schedule, tzCell(j),
         j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
         j.last_run && j.last_run.exit_code, j.last_run && j.last_run.duration,
         (j.history || []).map((h) => h.outcome + ":" + h.duration).join(","),
         // ownership can change between polls (a node joins/leaves); track it so
         // the row re-renders. "in" check distinguishes absent from a null owner.
-        "clusterOwner" in j ? "o:" + (j.clusterOwner || "") : j.clusterPolicy || "",
+        // The policy rides along even when an owner is present — a reload can
+        // flip it independently and it renders as its own cell now.
+        ("clusterOwner" in j ? "o:" + (j.clusterOwner || "") : "") + "|" + (j.clusterPolicy || ""),
         // ledger anomaly marker (only meaningful while the ledger is on)
         state.ledger.on && ledgerFlag(j.name) ? "slow" : "",
       ]),
@@ -1594,6 +1761,10 @@
       const next = (job.running || !job.enabled)
         ? '<span class="faint">—</span>'
         : '<span class="nowrap" data-next="' + escAttr(job.name) + '">' + fmtIn(nsec) + "</span>";
+      const atMs = nsec == null ? null : Date.now() + nsec * 1000;
+      const nextAt = (job.running || !job.enabled || atMs == null)
+        ? '<span class="faint">—</span>'
+        : '<span class="nowrap" title="' + escAttr(fmtAtTitle(atMs)) + '">' + fmtAt(atMs) + "</span>";
       const rowCls = (state.drawerJob === job.name ? " active" : "") + (state.selected === job.name ? " sel" : "");
       const runBtn = job.running
         ? '<button class="btn cancel" data-cancel="' + escAttr(job.name) + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>Stop</button>'
@@ -1605,10 +1776,14 @@
           '<td><div class="jobname">' + esc(job.name) + "</div>" +
               '<div class="jobcmd" title="' + escAttr(job.command) + '">' + esc(job.command) + "</div></td>" +
           '<td class="col-owner">' + ownerCell(job) + "</td>" +
+          '<td class="col-policy">' + policyCell(job) + "</td>" +
           '<td class="col-sched"><span class="chip" title="' + escAttr(describeCron(job.schedule)) + '">' + esc(job.schedule) + "</span></td>" +
+          '<td class="col-tz muted nowrap">' + tzCell(job) + "</td>" +
           '<td class="col-last">' + last + "</td>" +
           '<td class="col-dur muted nowrap">' + (lr ? fmtDuration(lr.duration) : "—") + "</td>" +
           '<td class="col-next muted nowrap">' + next + "</td>" +
+          '<td class="col-nextat muted nowrap">' + nextAt + "</td>" +
+          '<td class="col-rate">' + rateCell(job) + "</td>" +
           '<td class="col-trend">' + sparkline(job) + "</td>" +
           '<td><div class="actions">' + runBtn +
             '<button class="btn" data-logs="' + escAttr(job.name) + '">Logs</button>' +
@@ -2656,6 +2831,7 @@
       { ic: "▤", lbl: "Toggle CRT effects", run: () => setFx(!prefs.fx) },
       { ic: "≡", lbl: "Toggle scanlines", run: () => setScan(!prefs.scan) },
       { ic: "⊟", lbl: "Toggle compact density", run: () => setDensity(!prefs.density) },
+      { ic: "⊞", lbl: "Choose table columns", run: () => toggleColsMenu(true) },
       { ic: "✦", lbl: "Toggle desktop notifications", run: () => setNotify(!prefs.notify) },
       { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
       { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
@@ -2932,6 +3108,7 @@
     if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K" || e.key === "p" || e.key === "P")) { e.preventDefault(); openPalette(); return; }
 
     if (e.key === "Escape") {
+      if ($("colsMenu").classList.contains("open")) return toggleColsMenu(false);
       if ($("modalWrap").classList.contains("open")) return closeModal();
       if ($("settingsWrap").classList.contains("open")) return closeSettings();
       if ($("helpWrap").classList.contains("open")) return closeHelp();
@@ -3013,6 +3190,18 @@
       $("sortSel").value = ["name", "status", "last", "next", "duration"].includes(k) ? k : $("sortSel").value;
       renderRows();
     }));
+    // jobs-table column picker: the button and menu stop propagation so the
+    // document-level click (anywhere else) is what dismisses the popover
+    $("colsBtn").addEventListener("click", (e) => { e.stopPropagation(); toggleColsMenu(); });
+    $("colsMenu").addEventListener("click", (e) => e.stopPropagation());
+    $("colsMenu").addEventListener("change", (e) => {
+      const k = e.target.getAttribute("data-col");
+      if (!k) return;
+      colPrefs()[k] = e.target.checked;
+      savePref("cols");
+      applyCols();
+    });
+    document.addEventListener("click", () => toggleColsMenu(false));
     $("refreshBtn").addEventListener("click", loadJobs);
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
@@ -4171,6 +4360,7 @@
   // ===================================================================
   loadPrefs();
   applyTheme();
+  applyCols();
   document.body.classList.toggle("density-compact", prefs.density);
   $("optFollow").checked = prefs.follow;
   $("optWrap").checked = prefs.wrap;

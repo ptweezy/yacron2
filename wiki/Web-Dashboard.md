@@ -63,11 +63,24 @@ Each row shows:
 | **Trend** | A **sparkline** of recent runs: one bar per run, height by duration, colored by outcome. |
 | **Actions** | One-click **Run** (or **Stop**, for a running job) and **Logs**. |
 
+The **⊞ cols** button in the table header opens a column picker, so you can
+trim the table down or add columns that are off by default (the choice is
+remembered per browser). The page widens to give opted-in columns real room,
+and the table scrolls horizontally if the window still can't fit everything.
+The optional columns:
+
+| Column | What it shows |
+| --- | --- |
+| **Policy** | *(cluster only)* the job's [`clusterPolicy`](Clustering-and-Leader-Election#per-job-policy) — `Leader`, `PreferLeader`, or `EveryNode`; hover for what the policy means. Standalone daemons show `—`. Sortable, to group jobs by policy. |
+| **TZ** | The schedule's reference frame: `UTC` (the default), the job's IANA `timezone` (e.g. `America/Los_Angeles`), or `local` (`utc: false`). Handy when a fleet mixes frames. |
+| **Next at** | The next run as a wall-clock time in *your browser's* timezone (`04:00`, `tom 04:00`, `Jul 12 04:00`) — the absolute complement to **Next**'s countdown. |
+| **Rate** | The success percentage over the recent runs the sparkline draws, colored green / amber / red — a numeric complement to **Trend**. |
+
 The toolbar above the table lets you:
 
 - **filter** by typing in the search box (matches name or command; press `/` to focus it);
 - narrow by status with the **all / ok / fail / run / off** segmented control;
-- **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header, clicking again to reverse);
+- **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header — including the optional columns — clicking again to reverse);
 - **run every failing job at once** with the **run failing** button.
 
 ## The job drawer

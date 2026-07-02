@@ -7,6 +7,7 @@
   - [Production and Container Deployment](Production-Deployment)
 - **Configuration**
   - [Configuration Reference](Configuration-Reference)
+  - [Classic Crontabs](Classic-Crontabs)
   - [Schedules and Timezones](Schedules-and-Timezones)
   - [Commands and Environment](Commands-and-Environment)
   - [Output Capturing](Output-Capturing)

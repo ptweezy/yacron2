@@ -279,12 +279,15 @@ with only their own file's defaults. See
 **Symptom.** Some files in the `-c` directory are silently ignored.
 
 **Cause.** `_parse_config_dir` skips a directory entry when the base name's first
-character is `_` or `.` (so `_inc.yaml` and dotfiles are excluded), or when the
-extension is not `.yml` or `.yaml`. Entries are processed in sorted filename order.
+character is `_` or `.` (so `_inc.yaml` and dotfiles are excluded), or when its name
+is neither YAML (`.yml`/`.yaml` extension) nor a classic crontab (`.crontab`/`.cron`
+extension, or a file named `crontab`; see [Classic Crontabs](Classic-Crontabs)).
+Entries are processed in sorted filename order.
 
 **Fix.** Name loadable configs with a non-`_`/non-`.` leading character and a
-`.yml`/`.yaml` extension. Files meant only to be `include`d (conventionally `_*.yaml`)
-are intentionally skipped as top-level configs and pulled in by the file that includes
+recognised name (`.yml`/`.yaml` for YAML, `.crontab`/`.cron`/`crontab` for classic
+crontabs). Files meant only to be `include`d (conventionally `_*.yaml`) are
+intentionally skipped as top-level configs and pulled in by the file that includes
 them.
 
 ## Failure detection and output

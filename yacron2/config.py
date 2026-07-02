@@ -36,7 +36,7 @@ from strictyaml import (
 from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
-from yacron2 import platform
+from yacron2 import crontabs, platform
 
 logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
@@ -1555,7 +1555,37 @@ def parse_config_string(
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
     except YAMLError as ex:
         raise ConfigError(str(ex)) from ex
+    return _config_from_doc(doc, path, _seen)
 
+
+def parse_crontab_string(data: str, path: str) -> Yacron2Config:
+    """Parse classic (Vixie-style) crontab text into a Yacron2Config.
+
+    The crontab is lowered to ordinary job dictionaries
+    (:func:`yacron2.crontabs.parse_crontab`) and then built exactly like a
+    YAML ``jobs:`` section, so every entry gets yacron2's standard
+    defaults -- UTC schedules unless the crontab sets ``CRON_TZ``, stderr
+    and exit-status failure detection, and so on -- rather than an
+    emulation of cron's environment.  A crontab can only define jobs;
+    web / cluster / logging / defaults customization stays YAML-only.
+    """
+    try:
+        job_docs = crontabs.parse_crontab(data, path)
+    except crontabs.CrontabError as ex:
+        raise ConfigError(str(ex)) from ex
+    return _config_from_doc({"jobs": job_docs}, path, None)
+
+
+def _config_from_doc(
+    doc: dict, path: str, _seen: Optional[set]
+) -> Yacron2Config:
+    """Build a Yacron2Config from an already-validated plain config doc.
+
+    The shared back half of both front ends: ``parse_config_string``
+    arrives here from strictyaml, ``parse_crontab_string`` from the
+    classic-crontab lowering, and from this point on the two formats are
+    indistinguishable.
+    """
     inc_defaults_merged: dict = {}
     jobs = []
     webconf = WebConfig(doc["web"]) if "web" in doc else None
@@ -1600,6 +1630,30 @@ def parse_config_string(
     )
 
 
+#: Extensions the YAML front end owns.  A file with one of these names is
+#: always YAML -- never content-sniffed -- so every config that worked
+#: before classic-crontab support keeps its exact behavior and errors.
+_YAML_EXTENSIONS = frozenset({".yml", ".yaml"})
+
+
+def _is_crontab_config(path: str, data: str) -> bool:
+    """Decide which front end parses ``path``: classic crontab or YAML.
+
+    The file NAME decides whenever it can: a crontab marker (``.crontab``
+    / ``.cron`` extension, or a file named ``crontab``) always means
+    crontab, and a YAML extension always means YAML.  Content sniffing is
+    a last resort for an explicitly-passed file with a neutral name (e.g.
+    ``-c /var/spool/cron/crontabs/root``) and is conservative: only a
+    first line no YAML config could open with reads as a crontab
+    (see :func:`yacron2.crontabs.looks_like_crontab`).
+    """
+    if crontabs.is_crontab_path(path):
+        return True
+    if os.path.splitext(path)[1].lower() in _YAML_EXTENSIONS:
+        return False
+    return crontabs.looks_like_crontab(data)
+
+
 def parse_config_file(path: str, _seen: Optional[set] = None) -> Yacron2Config:
     # Guard against include cycles (a file that includes itself directly or
     # transitively) so a misconfiguration raises a clear ConfigError instead
@@ -1613,6 +1667,8 @@ def parse_config_file(path: str, _seen: Optional[set] = None) -> Yacron2Config:
     _seen.add(abspath)
     with open(path, "rt", encoding="utf-8") as stream:
         data = stream.read()
+    if _is_crontab_config(path, data):
+        return parse_crontab_string(data, path)
     return parse_config_string(data, path, _seen)
 
 
@@ -1643,7 +1699,12 @@ def _parse_config_dir(config_arg: str) -> Yacron2Config:
         base, ext = os.path.splitext(direntry.name)
         if base[0] in {"_", "."}:
             continue
-        if ext not in {".yml", ".yaml"}:
+        # YAML by extension, or a classic crontab by filename marker
+        # (.crontab / .cron / a file named "crontab"); anything else is
+        # skipped, so a stray README or data file never becomes jobs.
+        if ext not in {".yml", ".yaml"} and not crontabs.is_crontab_path(
+            direntry.name
+        ):
             continue
         try:
             config = parse_config_file(direntry.path)

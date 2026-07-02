@@ -40,8 +40,9 @@ For each entry, the name is split into base and extension:
 - The entry is **skipped** if the first character of its base name is `_` or
   `.`. This lets you keep shared include fragments (e.g. `_inc.yaml`) and dotted
   files in the same directory without them being loaded as standalone configs.
-- The entry is **skipped** if its extension is anything other than `.yml` or
-  `.yaml`.
+- The entry is **skipped** unless its extension is `.yml` or `.yaml`, or its
+  name marks it as a classic crontab (`*.crontab`, `*.cron`, or a file named
+  `crontab`; see [Classic Crontabs](Classic-Crontabs)).
 
 Each remaining file is parsed independently with `parse_config_file`, then its
 results are **aggregated** across the directory:
@@ -185,9 +186,12 @@ All other list-valued options concatenate.
 
 `include` is an optional list of file paths. Each path is resolved
 relative to the directory of the **including** file
-(`os.path.join(os.path.dirname(path), include)`). Included files are parsed
-recursively with `parse_config_file`, and their results are merged into the
-including file as follows:
+(`os.path.join(os.path.dirname(path), include)`). An included file may be
+YAML or a [classic crontab](Classic-Crontabs) (same recognition rules as
+`-c`); note that crontab entries always carry the built-in defaults, so, like
+any included file's jobs, they do not pick up the including file's
+`defaults`. Included files are parsed recursively with `parse_config_file`,
+and their results are merged into the including file as follows:
 
 - **Jobs** from included files are appended to this file's job list. Crucially,
   these jobs arrive **already fully constructed** by the included file's own

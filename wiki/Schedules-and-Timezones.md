@@ -27,6 +27,11 @@ Any other value raises `ConfigError("invalid schedule: ...")`.
 
 The crontab dialect is [parse-crontab](https://github.com/josiahcarlson/parse-crontab) (`josiahcarlson/parse-crontab`), pinned as `crontab>=1,<2`. Field syntax (ranges `1-5`, steps `*/5`, lists `1,15,30`, names like `mon`/`jan`) follows that library, not the system `cron(5)` man page.
 
+Schedules do not have to live in YAML at all: yacron2 also loads whole
+classic crontab files (`*.crontab`, `*.cron`, or a file named `crontab`),
+whose entries use this same field dialect plus the `@` nicknames and default
+to UTC like every other yacron2 schedule. See [Classic Crontabs](Classic-Crontabs).
+
 ## Form 1: crontab string (5 fields)
 
 A standard five-field crontab expression: `minute hour day-of-month month day-of-week`.

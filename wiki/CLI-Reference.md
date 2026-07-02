@@ -20,7 +20,7 @@ process supervisor (systemd, a container runtime, etc.); see
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `-c`, `--config` | path (file or directory) | platform default[^cfgdefault] | Configuration file, or a directory containing configuration files. When a directory, every `*.yml`/`*.yaml` file in it is loaded (entries whose name starts with `_` or `.` are skipped). See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
+| `-c`, `--config` | path (file or directory) | platform default[^cfgdefault] | Configuration file, or a directory containing configuration files. When a directory, every `*.yml`/`*.yaml` file, plus every classic crontab (`*.crontab`, `*.cron`, or a file named `crontab`), is loaded (entries whose name starts with `_` or `.` are skipped). See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) and [Classic Crontabs](Classic-Crontabs). |
 | `-l`, `--log-level` | string | `INFO` | Root log level. Passed to `logging.basicConfig(level=getattr(logging, LOG_LEVEL))`, so the value must name an attribute of the `logging` module (e.g. `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). |
 | `-v`, `--validate-config` | flag | off | Parse and validate the configuration, then exit. Exits `0` if valid, `1` on a configuration error. Does not start the scheduler or web server. |
 | `--version` | flag | off | Print the yacron2 version to stdout and exit `0`. |
@@ -38,13 +38,17 @@ the [Configuration Reference](Configuration-Reference).
 
 ### `-c` / `--config`
 
-The argument may be a single YAML file or a directory:
+The argument may be a single file or a directory:
 
-- **File:** parsed directly. An I/O error (for example, the file does not exist)
-  is reported as a configuration error and exits `1`.
-- **Directory:** each non-hidden `*.yml`/`*.yaml` entry is parsed in
-  name-sorted order. An empty directory (or one whose files are all skipped)
-  yields an empty configuration with no jobs rather than an error.
+- **File:** parsed directly. YAML by default; a classic crontab when the name
+  says so (`*.crontab`, `*.cron`, or a file named `crontab`, e.g.
+  `-c /etc/crontab`) or, for a file with a neutral name such as
+  `-c /var/spool/cron/crontabs/root`, when the content unmistakably is one
+  (see [Classic Crontabs](Classic-Crontabs)). An I/O error (for example, the
+  file does not exist) is reported as a configuration error and exits `1`.
+- **Directory:** each non-hidden `*.yml`/`*.yaml` or crontab-named entry is
+  parsed in name-sorted order. An empty directory (or one whose files are all
+  skipped) yields an empty configuration with no jobs rather than an error.
 
 #### Default-path special case
 

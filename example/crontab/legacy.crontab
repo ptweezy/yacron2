@@ -1,0 +1,19 @@
+# A classic (Vixie-style) crontab, run by yacron2 as-is -- see the README.
+# Every entry below becomes an ordinary yacron2 job named
+# legacy.crontab:<line number>, carrying yacron2's standard defaults.
+
+SHELL=/bin/sh
+GREETING="hello from a 40-year-old file format"
+
+# m h dom mon dow  command
+* * * * *  echo "$GREETING"
+*/2 * * * *  echo "escaped percents work: today is $(date -u +\%F)"
+
+# Schedules run in UTC (yacron2's standard default) until CRON_TZ says
+# otherwise; from here down, they are evaluated in Berlin time:
+CRON_TZ=Europe/Berlin
+0 6 * * mon-fri  echo "good morning Berlin"
+
+# The man-page nicknames work too; @reboot fires once at yacron2 startup.
+@reboot  echo "yacron2 is up and has read this crontab"
+@daily   echo "a new day (in Berlin -- CRON_TZ still applies)"

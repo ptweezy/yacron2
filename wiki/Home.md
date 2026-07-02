@@ -14,6 +14,7 @@ yacron2 is a cron replacement built on asyncio that runs natively on Linux, macO
 ### Configuration
 
 - [Configuration Reference](Configuration-Reference): The full YAML schema: top-level sections and per-job options.
+- [Classic Crontabs](Classic-Crontabs): Running plain Vixie-style crontab files as-is, how entries map onto yacron2's standard defaults, and the documented deviations from cron.
 - [Schedules and Timezones](Schedules-and-Timezones): Crontab strings, schedule objects, `@reboot`, UTC vs. local, and arbitrary timezones.
 - [Commands and Environment](Commands-and-Environment): Shell vs. argv commands, environment variables, env files, and per-job user/group.
 - [Output Capturing](Output-Capturing): Capturing stdout/stderr and customizing stream prefixes.

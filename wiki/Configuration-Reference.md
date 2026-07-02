@@ -14,6 +14,15 @@ The document is parsed and validated against a fixed strictyaml schema
 (`CONFIG_SCHEMA`); an unknown key, a wrong type, or a malformed value is a hard
 `ConfigError` at load time. An empty document is valid.
 
+Classic (Vixie-style) crontab files are accepted alongside YAML, recognised by
+name (`*.crontab`, `*.cron`, or a file named `crontab`): each entry is lowered
+to an ordinary job definition and merged over the same `DEFAULT_CONFIG`
+defaults documented below, so internally it is configured to yacron2's
+standard behavior rather than an emulation of cron's. A crontab can only
+define jobs; every other section on this page (and any per-job option beyond
+schedule, command, shell, timezone, and environment) is YAML-only. See
+[Classic Crontabs](Classic-Crontabs).
+
 In the option tables below, "Required" means the strictyaml key is mandatory
 (not wrapped in `Opt(...)`); every other key is optional and falls back to the
 default shown. Per-job defaults come from `DEFAULT_CONFIG`; a `defaults:` block

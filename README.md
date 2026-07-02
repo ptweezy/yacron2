@@ -20,7 +20,8 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 
 ## Features
 
-* "Crontab" is in YAML format
+* "Crontab" is in YAML format; classic crontab files are accepted as-is too
+  (see [Classic crontab files](#classic-crontab-files))
 * Builtin sending of Sentry and Mail outputs when cron jobs fail
 * Flexible configuration: you decide how to determine if a cron job fails or not
 * Designed for running in Docker, Kubernetes, or 12 factor environments:
@@ -371,7 +372,9 @@ yacron2 -c /tmp/my-crontab.yaml
 This starts yacron2 (always in the foreground!), reading
 `/tmp/my-crontab.yaml` as configuration file.  If the path is a directory,
 any `*.yaml` or `*.yml` files inside this directory are taken as
-configuration files.
+configuration files, along with any classic crontabs (`*.crontab`, `*.cron`,
+or a file named `crontab`; see
+[Classic crontab files](#classic-crontab-files)).
 
 ### Configuration basics
 
@@ -472,6 +475,38 @@ jobs:
 The env file must be a list of `KEY=VALUE` pairs. Empty lines and lines starting with `#` will be ignored.
 
 Variables declared in the `environment` option will override those found in the `env_file`.
+
+### Classic crontab files
+
+Already have a crontab?  yacron2 runs it as-is.  A file named `*.crontab`,
+`*.cron`, or just `crontab` (so `-c /etc/crontab` works) is read in the
+classic Vixie format, whether passed directly to `-c`, dropped into a config
+directory next to YAML files, or pulled in with `include:`:
+
+```crontab
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# m h dom mon dow command
+*/15 * * * *  /usr/local/bin/backup --incremental
+30 4 * * mon-fri  /usr/local/bin/report --daily
+@daily  /usr/local/bin/rotate-logs
+0 0 * * *  pg_dump mydb > /backup/mydb-$(date +\%F).sql
+```
+
+Comments, `NAME=value` environment lines (position-sensitive, `SHELL` and
+`CRON_TZ` honored), the `@reboot`/`@daily`/... nicknames, and `\%` escapes
+all work as in `man 5 crontab`.  Each entry becomes an ordinary yacron2 job
+named `<file>:<line>`, configured to yacron2's standard defaults rather than
+an emulation of cron's environment: schedules run in **UTC** unless the
+crontab sets `CRON_TZ`, failure means a non-zero exit or stderr output (no
+`MAILTO` mail), and the `%`-as-stdin feature is a load-time error instead of
+a silent surprise (`\%` still gives a literal `%`).  When an entry needs
+retries, reporting, timeouts, or any other per-job option, move it to YAML.
+The full mapping and every deviation are documented in the
+[Classic Crontabs](https://github.com/ptweezy/yacron2/wiki/Classic-Crontabs)
+wiki page, and a runnable example (a config directory mixing a crontab with
+YAML and the dashboard) lives in [example/crontab](example/crontab).
 
 ### Specifying defaults
 

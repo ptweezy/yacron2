@@ -1,0 +1,18 @@
+# The same -c directory can mix formats: this YAML file is loaded together
+# with legacy.crontab. It turns on the web dashboard (where the crontab
+# entries appear under their legacy.crontab:<line> names) and adds one
+# native job.
+#
+# Crontab entries always carry yacron2's standard defaults; anything richer
+# -- captureStdout below, retries, reporting, timeouts -- is what YAML is
+# for.
+
+web:
+  listen:
+    - http://127.0.0.1:8080
+
+jobs:
+  - name: from-the-yaml-side
+    command: echo "hello from YAML, next to a classic crontab"
+    schedule: "* * * * *"
+    captureStdout: true

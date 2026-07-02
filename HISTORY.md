@@ -7,6 +7,25 @@ project, on which yacron2 is based.
 
 ## 1.2.2 (2026-07-02)
 
+- **New webhook reporter: native Slack/Discord/Teams/ntfy notifications.** A
+  fourth reporter joins sentry/mail/shell in every `report` block: `webhook`
+  sends an HTTP request (POST by default) to a configured URL with a
+  jinja2-templated body. The default body is a `{"text": ...}` JSON payload
+  carrying the same subject-plus-body text as the default mail/sentry
+  templates, JSON-encoded with jinja2's `tojson` filter so quotes, newlines,
+  and non-ASCII job output always produce valid JSON -- point `url` at a
+  Slack, Mattermost, or Teams incoming webhook and it works with no further
+  configuration. `method`, `contentType`, `headers`, `body`, and `timeout`
+  cover everything else (Discord's `{"content": ...}` shape, ntfy's
+  plain-text body and header-driven priority, or your own endpoint). The URL
+  resolves like the sentry DSN (`value` / `fromFile` / `fromEnvVar`) and is
+  treated as a secret throughout: it is never logged, and the job-set
+  fingerprint redacts the inline URL value and all header values (which
+  commonly carry `Authorization` tokens). No new dependency -- outbound
+  delivery rides the core aiohttp. Note: because every job's effective
+  config gains the new default block, job-set ids change on upgrade;
+  replicas must be on the same version to compare ids, as before.
+
 - **Unchanged peers now answer gossip polls with a bodyless `304`.** Every
   `/peer` response carries a strong `ETag` (a content hash of the payload),
   and each polling node echoes the tag of the last full body a peer served

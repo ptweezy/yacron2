@@ -1092,7 +1092,7 @@
       <div class="setrow"><span class="lab">CRT effects<small>glow, vignette, flicker</small></span><label class="switch"><input type="checkbox" id="setFx"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Scanlines</span><label class="switch"><input type="checkbox" id="setScan"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Compact density<small>tighter rows</small></span><label class="switch"><input type="checkbox" id="setDensity"><span class="sl"></span></label></div>
-      <div class="setrow"><span class="lab">Boot self-test<small>BIOS-style POST screen on load</small></span><label class="switch"><input type="checkbox" id="setBoot"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Boot self-test<small>BIOS-style POST screen on load (replays after 12h)</small></span><label class="switch"><input type="checkbox" id="setBoot"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Desktop notifications<small>alert when a job fails</small></span><label class="switch"><input type="checkbox" id="setNotify"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Audible cues<small>tick on ok, buzz on failure, alarm until ack (a)</small></span><label class="switch"><input type="checkbox" id="setSound"><span class="sl"></span></label></div>
       <div class="setrow">
@@ -4808,7 +4808,20 @@
   // ===================================================================
   //  BIOS-style boot / POST self-test
   // ===================================================================
-  function setBoot(v) { prefs.boot = v; savePref("boot"); syncSettings(); }
+  function setBoot(v) {
+    prefs.boot = v; savePref("boot");
+    // re-enabling clears the cooldown stamp so the next load always shows it
+    if (v) { try { localStorage.removeItem(BOOT_SEEN_KEY); } catch (_) {} }
+    syncSettings();
+  }
+  // The full POST screen replays only after a cooldown has elapsed since it
+  // last ran; in-between visits get the quick power-on sweep instead.
+  const BOOT_SEEN_KEY = PREF_PREFIX + "bootShownAt";
+  const BOOT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+  function bootDue() {
+    try { return Date.now() - (+localStorage.getItem(BOOT_SEEN_KEY) || 0) >= BOOT_COOLDOWN_MS; }
+    catch (_) { return true; }
+  }
   // Compose the CLUSTER readout for every backend/role shape: standalone, gossip
   // (leader/follower/spread/no-quorum), and the lease backends. Red when election
   // is on but the node is not quorate (Leader jobs fail closed there).
@@ -4837,6 +4850,7 @@
   // caught error still reaches the finally that runs `done`.
   async function runBootSequence(done) {
     state.booting = true;
+    try { localStorage.setItem(BOOT_SEEN_KEY, String(Date.now())); } catch (_) {}
     const screen = $("bootScreen"), log = $("bootLog");
     log.innerHTML = "";
     screen.style.display = "flex";
@@ -4999,7 +5013,7 @@
   setInterval(() => { if (prefs.heat) loadHeatmap(false); }, 60000);  // slow heatmap refresh
   tick();
   const reducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-  if (prefs.boot && !reducedMotion) {
+  if (prefs.boot && !reducedMotion && bootDue()) {
     runBootSequence(startApp);          // POST screen types out, then starts the app
   } else {
     if (!reducedMotion) {               // otherwise keep the quick power-on sweep

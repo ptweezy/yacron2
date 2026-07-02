@@ -207,8 +207,7 @@ def _job_from_line(
         # Snapshot: assignments apply to the entries below them, so a
         # later reassignment must not leak back into this job.
         job["environment"] = [
-            {"key": key, "value": value}
-            for key, value in environment.items()
+            {"key": key, "value": value} for key, value in environment.items()
         ]
         # cron runs the command through the SHELL in scope; map it onto
         # the job's shell setting (it stays exported too, as in cron).

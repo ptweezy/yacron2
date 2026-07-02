@@ -1108,9 +1108,7 @@ class ClusterManager(LeadershipBackend):
             return {}, False
         summaries = provider()
         names = sorted(
-            name
-            for name in summaries
-            if len(name) <= MAX_JOB_SUMMARY_NAME_LEN
+            name for name in summaries if len(name) <= MAX_JOB_SUMMARY_NAME_LEN
         )
         truncated = len(names) > MAX_ADVERTISED_JOB_SUMMARIES or len(
             names
@@ -1764,9 +1762,7 @@ class ClusterManager(LeadershipBackend):
             # _parse_job_summaries). None (absent/malformed -- an older build)
             # keeps any previously-absorbed snapshot rather than blanking the
             # node in the fleet view.
-            peer_job_summaries=_parse_job_summaries(
-                data.get("job_summaries")
-            ),
+            peer_job_summaries=_parse_job_summaries(data.get("job_summaries")),
             peer_job_summaries_truncated=(
                 data.get("job_summaries_truncated") is True
             ),

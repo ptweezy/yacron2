@@ -4611,6 +4611,50 @@ async def test_handle_peer_carries_etag_and_answers_304(no_tls):
     assert resp4.headers["ETag"] != etag
 
 
+@pytest.mark.asyncio
+async def test_handle_peer_304_survives_live_countdown_ticks(no_tls):
+    # Pins the handler's CLOCK PLUMBING, which the etag unit test (it passes
+    # now_epoch explicitly) cannot: the tag hashes each live scheduled_in as
+    # round(now_epoch + scheduled_in) -- the absolute next-fire instant --
+    # which is only constant between fires when _handle_peer feeds _peer_etag
+    # the same wall clock the provider's countdown falls with. A provider
+    # whose countdown genuinely ticks down in real time, plus a >1s pause
+    # between the two requests, makes any broken clock (a constant, a
+    # monotonic-since-boot value, a cached stamp) shift the reconstructed
+    # fire time across the pause, roll the tag, and fail the 304 below.
+    import math
+    import time
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
+    )
+    # a fire ~2 minutes out on a whole-second boundary: the provider's
+    # now() and the handler's now() are microseconds apart, so the
+    # reconstructed instant sits ~0.5s from either rounding edge
+    fire_at = float(math.floor(time.time()) + 120)
+    mgr.set_job_summaries_provider(
+        lambda: {
+            "tick": {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": fire_at - time.time(),
+                "last": None,
+            }
+        }
+    )
+    resp = await mgr._handle_peer(_Req())
+    assert resp.status == 200
+    etag = resp.headers["ETag"]
+    # real wall time passes (>1s, so a wrong clock cannot round to the same
+    # instant); the advertised countdown falls in step, the tag holds
+    await asyncio.sleep(1.1)
+    req = _Req()
+    req.headers = {"If-None-Match": etag}
+    resp2 = await mgr._handle_peer(req)
+    assert resp2.status == 304
+    assert resp2.headers["ETag"] == etag
+
+
 def test_peer_etag_ignores_countdown_ticks_but_rolls_on_fire(no_tls):
     # scheduled_in is a live countdown, so hashing it raw would roll the tag
     # every round (no 304 would ever happen for a node with scheduled jobs);
@@ -4923,11 +4967,13 @@ async def test_mtls_conditional_304_and_gzip(tmp_path):
                 assert r.status == 304
                 assert await r.read() == b""
                 assert r.headers["ETag"] == etag
-            # raw unconditional request: the large body goes out gzipped
+            # raw unconditional request with the client's DEFAULT
+            # Accept-Encoding (gzip, deflate, ... -- what the real poller
+            # sends): the large body must go out gzipped SPECIFICALLY, not
+            # whatever coding bare negotiation would prefer (deflate)
             async with s.get(
                 f"https://{host}/peer",
                 ssl=a._client_ssl,
-                headers={"Accept-Encoding": "gzip"},
             ) as r:
                 assert r.status == 200
                 assert r.headers.get("Content-Encoding") == "gzip"

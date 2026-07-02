@@ -1339,12 +1339,20 @@ class ClusterManager(LeadershipBackend):
         # Compress bodies worth compressing. The poller advertises gzip
         # support on every request (aiohttp's default Accept-Encoding) and
         # decompresses -- and caps the DECOMPRESSED size -- as it reads (see
-        # _read_capped), so this needs no client-side change. The size floor
-        # skips the small already-converged bodies where the CPU spend
-        # outweighs the few saved bytes.
+        # _read_capped), so this needs no client-side change. gzip is picked
+        # EXPLICITLY when the client advertises it: bare enable_compression()
+        # would let aiohttp's own preference order negotiate, which chooses
+        # deflate first and so would quietly contradict the documented gzip
+        # exchange. A client not advertising gzip falls back to that
+        # negotiation (identity for a bare curl). The size floor skips the
+        # small already-converged bodies where the CPU spend outweighs the
+        # few saved bytes.
         body = resp.body
         if isinstance(body, bytes) and len(body) >= MIN_COMPRESS_BYTES:
-            resp.enable_compression()
+            if "gzip" in request.headers.get("Accept-Encoding", "").lower():
+                resp.enable_compression(web.ContentCoding.gzip)
+            else:
+                resp.enable_compression()
         return resp
 
     async def _handle_reboot_ran(self, request: web.Request) -> web.Response:
@@ -1738,7 +1746,6 @@ class ClusterManager(LeadershipBackend):
         self, session: aiohttp.ClientSession, host: str, my_id: str
     ) -> None:
         url = "https://{}/peer".format(host)
-        now = datetime.datetime.now(datetime.timezone.utc)
         # Conditional re-poll: echo the ETag of the last full body this host
         # served us, so an unchanged peer can answer with a bodyless 304
         # instead of the full O(members + jobs) JSON (see _handle_peer).
@@ -1781,6 +1788,15 @@ class ClusterManager(LeadershipBackend):
         ) as ex:
             self.view.record_failure(host, str(ex), untrusted=False)
             return
+        # The observation's timestamp (last_seen, and the taken_at that ages
+        # the advertised countdowns -- see _aged_job_summaries), stamped at
+        # RECEIPT rather than before the request went out: the peer computed
+        # its scheduled_in countdowns while serving the response, so the
+        # pre-request instant would overstate the snapshot's age by the whole
+        # connect + TLS handshake + read latency (seconds, on a degraded
+        # link) -- and a 304 replay would then carry that skew for as long
+        # as the peer's tag holds.
+        now = datetime.datetime.now(datetime.timezone.utc)
         if status == 304:
             if cached is None:
                 # a 304 answers a conditional request, and we sent none: a

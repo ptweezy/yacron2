@@ -48,7 +48,8 @@ project, on which yacron2 is based.
   values worth grabbing hand themselves out instead. Clicking the version
   chip copies the version, and clicking the job-set chip copies the full
   job-set id even though the header shows only a short prefix; both
-  tooltips say so.
+  tooltips say so. The command palette carries the same two copies, so both
+  values stay reachable from the keyboard.
 
 - **Dashboard: the quick "power-on sweep" flash between boots is gone.** The
   full POST boot screen still replays once its cooldown elapses, but the

@@ -3338,6 +3338,10 @@
       { ic: "◴", lbl: "Cron sandbox", run: () => openSandbox() },
       { ic: "◱", lbl: "Toggle run ledger", run: () => setLedger(!prefs.ledger) },
       { ic: "▮", lbl: "Toggle boot self-test", run: () => setBoot(!prefs.boot) },
+      // the header chips also copy these on click, but the chips are
+      // mouse-only spans -- the palette keeps both reachable by keyboard
+      { ic: "❏", lbl: "Copy version", run: () => { const v = $("ver").textContent; if (v) copyText(v, "version"); } },
+      { ic: "❏", lbl: "Copy job set id", run: () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); } },
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },

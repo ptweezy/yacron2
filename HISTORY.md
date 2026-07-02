@@ -5,7 +5,273 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
-## 1.1.11 (unreleased)
+## 1.2.1 (2026-07-02)
+
+This is the largest yacron2 release since the fork. Its headline feature is
+clustering: several replicas can now verify they hold the same job set, elect
+a leader so each scheduled job runs on one node instead of every node, spread
+jobs across the fleet, and fail over when a node dies, coordinating either
+peer-to-peer over mutual TLS or through a Kubernetes or etcd lease. The
+release also adds native Prometheus metrics, accepts classic crontab files as
+configuration, and grows the web dashboard into a small operations console.
+Clustering is entirely opt-in; see the upgrade notes below for the few
+behavior changes that apply to existing deployments.
+
+### Clustering and leader election
+
+- **New optional top-level `cluster:` section.** Give every replica the same
+  static peer list and a dedicated mutual-TLS listener (`cluster.listen`,
+  `cluster.tls.{ca,cert,key}`, `cluster.peers`), and each node polls every
+  peer once per round (`cluster.interval`, default 30 seconds), comparing
+  job-set ids (see 1.1.8) to attest that all replicas hold an identical job
+  set. Peers are reported as `agreed`, `syncing`, `drifted` (a mismatch that
+  persists for `cluster.driftAfter` consecutive rounds, default 3),
+  `unreachable`, `untrusted` (TLS verification failed), or `conflict`. On its
+  own this is observe-only (every node still runs every job), which makes it
+  a safe first rollout step.
+- **Leader election (`cluster.electLeader: true`).** The leader is the lowest
+  `cluster.nodeName` (default: the hostname) among the agreeing nodes this
+  node can see, and only when they form a strict majority of the declared
+  cluster size; below quorum a node stands down and runs nothing. Two
+  disjoint majorities cannot exist, so a clean partition produces at most one
+  leader within about one polling interval. Conflicts fail closed: a
+  duplicate `nodeName`, a cluster-size disagreement (say, a rolling resize
+  from 3 to 5 nodes), or a coordination-policy divergence parks `Leader` jobs
+  until the fleet reconverges, and each is logged loudly and shown on the
+  dashboard. A freshly started or reconfigured node holds its jobs until it
+  has polled every configured peer at least once, so a blank-view node cannot
+  elect itself. Two-node election is refused at config load (it is strictly
+  worse than a single replica); even cluster sizes log a warning.
+- **A per-job `clusterPolicy`** (also settable under `defaults:`) decides
+  what election means for each job: `Leader` (the default: only the elected
+  leader runs it, and it is skipped when in doubt), `PreferLeader` (never
+  skip: the lowest reachable agreeing node runs it even without quorum,
+  accepting a rare double-run, so reserve it for idempotent jobs), and
+  `EveryNode` (all nodes run it, for node-local housekeeping). Manual runs
+  via `POST /jobs/{name}/start` are never gated. Automatic retries re-check
+  the gate before every relaunch and abandon a pending retry when ownership
+  has demonstrably moved to another node; `@reboot` jobs under election are
+  deferred until the cluster converges and then run once, on the owner.
+- **Load-balanced jobs: `cluster.distribution: spread`.** Instead of one
+  leader running every `Leader`/`PreferLeader` job, each such job is
+  assigned an owning node by rendezvous (highest-random-weight) hashing over
+  the quorate agreeing members, spreading work across the fleet. A
+  membership change moves only the departing or joining node's share of
+  jobs. The same quorum gating applies, and `GET /jobs` reports each job's
+  current `clusterOwner`.
+- **Mutual TLS is the entire trust boundary.** A peer must present a
+  certificate chaining to the configured CA and matching the host it was
+  reached at, so the CA should be dedicated to yacron2 nodes and nothing
+  else. Certificates rotated in place are detected and reloaded without a
+  restart. The peer endpoint is served only on the cluster listener, never
+  on the web API listener.
+- **The failure semantics are documented, not hand-waved.** The built-in
+  backend is best-effort by design: there are narrow, self-healing windows
+  where a `Leader` job can be skipped or a `PreferLeader` job can
+  double-run, and the new wiki page enumerates them. When you need fenced
+  exactly-once execution, use one of the lease backends below.
+- `yacron2 --validate-config` validates the entire `cluster` section (peer
+  list, TLS material, lease timing invariants) without starting anything.
+
+### Kubernetes and etcd lease backends
+
+- **`cluster.backend: gossip | kubernetes | etcd`** picks the coordination
+  mechanism (default `gossip`, the peer-to-peer mode above). The lease
+  backends replace the peer quorum with a fenced, expiring lease in an
+  external store: exactly one node holds the lease at a time, so `Leader`
+  jobs are exactly-once while the store is reachable. With a lease backend,
+  election is always on, there is no peer list or cluster mTLS to manage,
+  and `distribution: spread` is rejected at config load (a single lease
+  cannot express per-job ownership).
+- **Kubernetes** (`cluster.kubernetes.*`): replicas campaign for a
+  `coordination.k8s.io/v1` Lease object using the client-go leader-election
+  algorithm (`leaseName` defaults to `yacron2-leader`;
+  `leaseDurationSeconds`/`renewDeadlineSeconds`/`retryPeriodSeconds` default
+  to 15/10/2, with the client-go timing invariants enforced at config load).
+  In-cluster ServiceAccount token, CA, namespace, and API server are
+  detected automatically; a `kubeconfig` and an explicit `apiServer` (https
+  only) are supported. The backend talks to the API server over the bundled
+  aiohttp by default; installing the new optional extra
+  (`pip install yacron2[kubernetes]`) switches to the official Kubernetes
+  client (`clientLibrary: auto|http|library`). The stored holder identity
+  embeds a per-process token, so two pods that accidentally share a name
+  cannot both hold the lease. `example/kubernetes/` ships a ready-to-apply
+  Deployment with the minimal ServiceAccount, Role, and RoleBinding.
+- **etcd** (`cluster.etcd.*`): replicas campaign for a lease-bound key
+  (`electionName` defaults to `yacron2/leader`) through etcd's v3 JSON/HTTP
+  gRPC gateway, using a create-if-absent transaction fenced by the lease id
+  (`ttl` defaults to 15 seconds, minimum 3). Multiple `endpoints` fail over
+  in order; optional `username`/`password` (literal, `fromFile`, or
+  `fromEnvVar`) and client TLS are supported, and credentials are refused
+  unless every endpoint is `https://`. `example/etcd/` ships a compose demo
+  with an etcd and two yacron2 replicas.
+- **Failover is fast and clock-safe on both.** All fencing runs on the
+  monotonic clock with a one-second skew margin (no wall-clock or cross-node
+  clock-sync assumptions): a holder whose renewals stall demotes itself
+  locally before the store-side lease can expire, without a network call. A
+  graceful shutdown releases the lease explicitly (Kubernetes clears
+  `holderIdentity`, etcd revokes its lease) so a survivor takes over
+  immediately rather than waiting out the TTL. If the store becomes
+  unreachable, `Leader` jobs fail closed and `PreferLeader` jobs keep
+  running. `@reboot` bookkeeping is persisted in the store, scoped to the
+  job-set id, so a `Leader` `@reboot` job runs once per job configuration
+  rather than once per fleet restart.
+- **No new runtime dependencies.** Both lease backends are plain HTTP over
+  the existing aiohttp core (no etcd or gRPC client; the Kubernetes client
+  is optional), so all packaged architectures keep working.
+
+### Prometheus metrics
+
+- **Native Prometheus metrics at `GET /metrics`**, served by the existing
+  web listener whenever the web API is enabled; there is no exporter
+  sidecar and no new dependency (the exposition is generated in-process).
+  Both the classic text format and OpenMetrics 1.0 are served, negotiated
+  via the `Accept` header.
+- Per-job series cover run outcomes (`yacron2_job_runs_total` labeled by
+  `job_name` and `status`), retries, permanent failures, failures to start,
+  a duration histogram with configurable buckets
+  (`web.metrics.durationBuckets`), last success/failure/run timestamps and
+  exit code, and live state (enabled, running, next run). Daemon series
+  cover the version, start time, job-set id, job counts, and config-reload
+  health. Cluster series cover size, quorum, leadership, per-peer status
+  counts, conflicts, and leader/quorum transition counters; the wiki
+  suggests alerting on `sum(yacron2_cluster_is_leader) > 1` and on losing
+  `yacron2_cluster_quorate`. Metrics are recorded at the same point as the
+  run history, so `/metrics` and `/jobs/{name}/runs` never disagree.
+- `web.authToken`, when configured, protects `/metrics` like every other
+  endpoint; `web.metrics.public: true` exempts just this endpoint for a
+  scraper, and `web.metrics: false` removes it entirely.
+
+### Classic crontab files
+
+- **Classic (Vixie) crontabs are now accepted as configuration.** A file
+  with a `.crontab` or `.cron` extension, or named exactly `crontab`, is
+  parsed as a crontab wherever configuration is loaded: passed to `-c`,
+  dropped into a config directory alongside `*.yaml` files, or pulled in
+  via `include:`; a neutral-named file given to `-c` or `include:` is
+  content-sniffed. Supported syntax: five-field entries (the same field
+  dialect as YAML `schedule` strings), `@keywords` (including `@reboot` and
+  `@midnight`), position-sensitive `VAR=value` environment lines, comments,
+  and the `\%` escape. `SHELL` and `CRON_TZ` assignments are honored as the
+  job's `shell` and `timezone`.
+- Each entry becomes a normal yacron2 job named `<file>:<line>`,
+  indistinguishable downstream: it shows up on the dashboard and HTTP API,
+  participates in the job-set id and clustering, and can be run or
+  cancelled on demand. yacron2's defaults apply rather than cron's (UTC
+  unless `CRON_TZ` says otherwise; any stderr output marks the run as
+  failed). Deviations are deliberate and loud: an unescaped `%` is a
+  load-time error instead of silently not feeding stdin, `MAILTO` is
+  exported to the job but sends no mail, and the six-column system-crontab
+  user field is not supported. Per-entry knobs (retries, reporting,
+  timeouts) still require migrating that line to YAML; the new wiki page
+  shows how.
+
+### Web dashboard
+
+- **A cluster operations view.** A cluster panel shows this node's role
+  (leader, follower, or standing down and why), quorum state, and a
+  per-peer table with status dots and a per-peer history timeline; lease
+  backends show the lease holder and expiry instead. A page-level alert bar
+  calls out a conflict or lost quorum without scrolling, and a fleet view
+  (backed by the new `GET /fleet`) renders a jobs-by-nodes matrix of every
+  node's last outcome per job, with a failing-only filter.
+- **Incident tooling.** A verdict bar summarizes active failures and, when
+  several jobs fail together, says whether they look like one cause or
+  independent ones; an incident timeline (press `i`) orders every job's
+  most recent run; a mitigate console bulk-starts or bulk-cancels jobs and
+  copies a Markdown incident summary; and a merged multi-tail console
+  streams up to four jobs' logs into one color-coded view.
+- **Wallboard and zen mode.** A full-screen TV mode (press `w`, or open
+  `#tv`) shows worst-first job tiles with a staleness watchdog that shows
+  `NO SIGNAL` rather than a false all-green; when everything is healthy and
+  idle for a while it drifts into a zen screensaver in which every job
+  pulses at its real next fire time.
+- **More ways to read the schedule.** An activity heatmap (a 6h/24h/7d
+  punchcard per job), a cron sandbox that validates a cron expression and
+  previews its next 12 fire times alongside live jobs sharing it, a column
+  picker adding Owner/Policy/TZ/Next-at/Rate columns, and an opt-in,
+  browser-local run ledger (IndexedDB) that keeps run history beyond the
+  daemon's in-memory cap and flags unusually slow runs against each job's
+  own duration baseline.
+- **Finishing touches.** A fourth theme, `carolina` (a Carolina-Blue CRT
+  phosphor), joins amber/green/modern; optional audible cues with a volume
+  setting and an escalating failure alarm (press `a` to acknowledge); and
+  an optional boot self-test splash on load.
+
+### HTTP API
+
+- New endpoints: `GET /cluster` (this node's cluster view: backend, quorum,
+  leader, conflicts, per-peer detail) and `GET /fleet` (fleet-wide per-job
+  run summaries carried on the gossip round; observability only), plus
+  `GET /metrics` above. `GET /jobs` gains `clusterPolicy` and, under
+  `distribution: spread`, each job's `clusterOwner`. The HTTP API wiki page
+  now documents every endpoint with full response shapes.
+- Configured `web.headers` are now applied to every successful response,
+  including the new endpoints, and to the `409 Conflict` bodies of
+  `start`/`cancel`.
+- A web-section configuration error found during a reload now leaves the
+  web API down with a clear log line while the rest of the reload (jobs,
+  cluster, logging) still applies.
+
+### Reliability
+
+- **A failed job launch can no longer crash the scheduler.** Spawning a job
+  now guards against any `OSError` (file-descriptor exhaustion, fork or
+  memory limits, permission errors), not just a missing executable: the run
+  is recorded as an ordinary start failure with exit code 127 (and counted
+  in `yacron2_job_start_failures_total`) instead of the error propagating
+  out of the scheduling loop and taking the daemon down.
+
+### Upgrade notes
+
+- `/metrics` is served by default wherever the web API is enabled. It sits
+  behind `web.authToken` like every other endpoint when a token is
+  configured; set `web.metrics: false` to remove it.
+- The job-set id changes once on upgrade: `clusterPolicy` is now part of
+  every job's fingerprint, so an unchanged configuration hashes to a
+  different `v1:` id than 1.1.8 through 1.1.11 reported. Compare ids only
+  between nodes running the same yacron2 version; a mixed-version fleet
+  reads as drift until the rollout completes.
+- Config directories now load crontab-named files (`*.crontab`, `*.cron`,
+  `crontab`) that earlier releases silently ignored.
+
+### Packaging
+
+- New `yacron2.backends` subpackage, and a new optional extra:
+  `pip install yacron2[kubernetes]` installs the official Kubernetes client
+  for `clientLibrary: library`. A core install gains no new runtime
+  dependency and the supported Python range is unchanged. The PyPI metadata
+  gains prometheus/metrics/monitoring keywords and an updated description.
+
+### Documentation and examples
+
+- Three new wiki pages: Clustering and Leader Election (a full operations
+  guide: both backend families, every failure window, sizing, rollout, and
+  troubleshooting), Metrics with Prometheus, and Classic Crontabs, plus
+  major updates to the HTTP API, Web Dashboard, Production Deployment,
+  Architecture and Internals, and Troubleshooting pages. The README gains
+  matching sections.
+- New runnable demos: `docker-compose-cluster.yml` (a three-node mutual-TLS
+  cluster with scripted try-it failover scenarios),
+  `docker-compose-cluster-large.yml` (ten nodes with `distribution: spread`
+  and CPU-heavy jobs, for watching work fan out), `docker-compose-acme.yml`
+  (a five-node simulated data platform with a mail sink, a statsd exporter,
+  and deterministic scripted incidents that exercise the dashboard's
+  incident tooling), `docker-compose-zen.yml` (one calm node for the zen
+  screensaver), `example/etcd/` and `example/kubernetes/` for the lease
+  backends, and `example/crontab/` for classic crontabs.
+
+### Internal
+
+- The test suite roughly doubles, with new suites for the cluster manager,
+  both lease backends, the leadership abstraction, the Prometheus
+  registry/exposition, crontab parsing, and backend config validation, plus
+  large additions to the scheduler tests. The `dev` extra adds
+  `cryptography` for the cluster mTLS tests (skipped on Windows ARM64,
+  which has no wheel). A new `.gitattributes` pins `*.sh` to LF line
+  endings so the bind-mounted cluster demos work from a Windows clone.
+
+## 1.1.11 (2026-06-29)
 
 - **Coverage is now published to [Codecov](https://codecov.io/gh/ptweezy/yacron2).**
   Every CI matrix cell uploads its own `coverage.xml` under an

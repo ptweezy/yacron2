@@ -338,7 +338,17 @@ The gossip concrete (`ClusterManager` in `yacron2/cluster.py`) owns two things:
   mTLS (a client SSL context with `check_hostname=True`, so the peer cert's SAN
   must match the configured host), and feeds each observation into the pure
   `ClusterView`. TLS/cert failures classify the peer as `untrusted`; connect or
-  timeout failures as `unreachable`.
+  timeout failures as `unreachable`. The exchange is conditional: every `/peer`
+  response carries a strong `ETag` (a content hash of the payload, with the
+  live per-job countdown normalised to the absolute next-fire time so the tag
+  is stable between fires), the poller echoes it back as `If-None-Match`, and
+  an unchanged peer answers with a bodyless `304` -- the poller then replays
+  its cached observation with a fresh timestamp, so a converged, idle
+  cluster's steady-state round costs headers rather than the full
+  O(members + jobs) JSON. A `304` is still a fresh, mutually-authenticated
+  round trip, so agreement, conflict detection, and the drift debounce advance
+  exactly as if the identical body had been re-sent. Full bodies large enough
+  to be worth it are gzip-compressed.
 
 `ClusterView` is pure (no I/O): it holds the per-peer table and the rules that
 update it (the `agreed`/`syncing`/`drifted`/`unreachable`/`untrusted`/`self`

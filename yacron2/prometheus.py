@@ -93,9 +93,7 @@ PEER_STATUSES = (
 
 def escape_label_value(value: str) -> str:
     """Escape a label value per the exposition formats (\\, ", newline)."""
-    return (
-        value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
-    )
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
 def escape_help(text: str, openmetrics: bool = False) -> str:
@@ -206,7 +204,7 @@ def render_families(
 
 
 def resolve_metrics_config(
-    web_config: Dict[str, Any]
+    web_config: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """Resolve the raw ``web.metrics`` option into effective settings.
 
@@ -389,9 +387,7 @@ class PrometheusMetrics:
             1 for job in cron.cron_jobs.values() if job.enabled
         )
         jobs.add({"state": "enabled"}, enabled_count)
-        jobs.add(
-            {"state": "disabled"}, len(cron.cron_jobs) - enabled_count
-        )
+        jobs.add({"state": "disabled"}, len(cron.cron_jobs) - enabled_count)
         families.append(jobs)
 
         if self._last_reload_ok is not None:
@@ -551,9 +547,7 @@ class PrometheusMetrics:
             )
             enabled.add(labels, 1 if job_config.enabled else 0)
             running.add(labels, len(cron.running_jobs.get(name) or ()))
-            if job_config.enabled and isinstance(
-                job_config.schedule, CronTab
-            ):
+            if job_config.enabled and isinstance(job_config.schedule, CronTab):
                 seconds = job_config.schedule.next(
                     now=get_now(job_config.timezone),
                     default_utc=job_config.utc,

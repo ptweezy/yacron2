@@ -50,6 +50,20 @@ The trust model is deliberately simple and keeps no shared state:
 * **Drift is debounced.**  A reachable peer whose id differs is only reported
   as ``drifted`` after ``driftAfter`` consecutive rounds, so a rolling deploy
   (a transient, legitimate mismatch) does not raise a false alarm.
+* **An unchanged round is cheap.**  Every ``/peer`` response carries a strong
+  ``ETag`` (a content hash of the payload, see
+  :meth:`ClusterManager._peer_etag`) and a poller echoes it back as
+  ``If-None-Match``, so a peer whose state has not changed answers with a
+  bodyless ``304`` instead of re-sending the full O(members + jobs) JSON --
+  in a converged, idle cluster the steady-state round costs headers only.
+  This is purely a transport optimisation, not a protocol change: a ``304``
+  is still a fresh, mutually-authenticated round trip, and because the tag is
+  content-derived, a match proves the peer's payload is exactly the one the
+  poller already holds, so the poller replays its cached observation with a
+  fresh timestamp and every gate (mutual attestation, conflict detection, the
+  drift debounce) advances exactly as if the identical body had been re-sent
+  (see :meth:`ClusterManager._observe_peer`).  Bodies that do go out are
+  gzip-compressed when large enough to be worth it.
 
 When ``electLeader`` is set, the same attestation drives a **quorum-gated
 leader election** (see :func:`elect_leader`): each node independently elects,
@@ -245,6 +259,16 @@ MAX_JOB_SUMMARY_TS_LEN = 64  # an ISO-8601 finished_at timestamp
 # the only run outcomes a peer summary may carry (mirrors JobRunInfo.outcome)
 _SUMMARY_OUTCOMES = frozenset({"success", "failure", "cancelled"})
 
+# Conditional /peer exchange (see _handle_peer / _observe_peer): a poller
+# echoes the ETag of the last full body a peer served it, and an unchanged
+# peer answers with a bodyless 304. The stored tag is re-sent as a request
+# header every round, so bound what a CA-vouched-but-hostile peer can make us
+# store and echo (ours is a quoted sha256 hex digest, 66 chars). Bodies at or
+# above the size floor are gzip-compressed; below it the per-request CPU spend
+# outweighs the few bytes saved.
+MAX_PEER_ETAG_LEN = 128  # a stored / echoed ETag header value
+MIN_COMPRESS_BYTES = 1024  # smallest /peer body worth gzip-compressing
+
 
 def _parse_members(
     raw: Any,
@@ -402,6 +426,42 @@ def _parse_job_summaries(raw: Any) -> Optional[Dict[str, Dict[str, Any]]]:
         if len(out) >= MAX_ADVERTISED_JOB_SUMMARIES:
             break
     return out
+
+
+def _aged_job_summaries(
+    jobs: Optional[Dict[str, Dict[str, Any]]],
+    taken_at: Optional[datetime.datetime],
+    now: datetime.datetime,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """A peer's stored job summaries with each countdown aged to ``now``.
+
+    A stored ``scheduled_in`` is the peer's seconds-to-next-fire as of when
+    the snapshot was TAKEN (``taken_at``, the receipt of the full /peer body
+    that carried it) -- and with conditional 304 rounds refreshing a peer's
+    liveness without re-shipping the block, a snapshot can now legitimately
+    outlive many poll rounds.  Between fires the true countdown simply
+    decreases with wall time, so subtracting the snapshot's age reconstructs
+    it exactly, measured on OUR clock alone (an elapsed duration, so peer
+    clock *offsets* never leak in).  It clamps at 0: once the fire time
+    passes, the fire itself rolls the peer's ETag (see ``_peer_etag``), so
+    the next poll ships a full body with the real successor value.  Entries
+    are copied, never mutated, so the stored snapshot stays pristine for the
+    next derivation.
+    """
+    if jobs is None or taken_at is None:
+        return jobs
+    elapsed = (now - taken_at).total_seconds()
+    if elapsed <= 0:
+        return jobs
+    aged: Dict[str, Dict[str, Any]] = {}
+    for name, entry in jobs.items():
+        scheduled = entry.get("scheduled_in")
+        if isinstance(scheduled, (int, float)) and not isinstance(
+            scheduled, bool
+        ):
+            entry = dict(entry, scheduled_in=max(0.0, scheduled - elapsed))
+        aged[name] = entry
+    return aged
 
 
 def _peer_sees_me_agreed(
@@ -687,6 +747,14 @@ class PeerState:
     # view can label that node's column as partial instead of implying the
     # missing jobs do not exist there.
     job_summaries_truncated: bool = False
+    # when the summaries snapshot above was taken: the receipt of the full
+    # /peer body that carried it. A conditional 304 round refreshes last_seen
+    # but deliberately NOT this (the replay passes the original receipt time
+    # back through record_success), so fleet_view can age each advertised
+    # scheduled_in countdown by the snapshot's true age instead of freezing
+    # it -- see _aged_job_summaries. Internal, like job_summaries' shape;
+    # not surfaced in to_dict.
+    job_summaries_at: Optional[datetime.datetime] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -739,6 +807,7 @@ class ClusterView:
         peer_reports_members: bool = True,
         peer_job_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
         peer_job_summaries_truncated: bool = False,
+        peer_job_summaries_at: Optional[datetime.datetime] = None,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -754,6 +823,16 @@ class ClusterView:
         if peer_job_summaries is not None:
             peer.job_summaries = peer_job_summaries
             peer.job_summaries_truncated = peer_job_summaries_truncated
+            # when the snapshot was taken: `now` for a freshly-parsed body,
+            # but a conditional 304 replay passes the ORIGINAL receipt time
+            # so the fleet view keeps ageing the advertised countdowns from
+            # the snapshot's true age rather than re-stamping (and thereby
+            # freezing) them every conditional round.
+            peer.job_summaries_at = (
+                peer_job_summaries_at
+                if peer_job_summaries_at is not None
+                else now
+            )
         # whether this response actually carried a members list (current build)
         # or omitted it (a legacy peer mid rolling upgrade); drives the one-
         # directional fallback in _agreeing_peers. Defaults True so existing
@@ -1076,6 +1155,18 @@ class ClusterManager(LeadershipBackend):
         # emit-once latch for the degenerate 2-of-2 self-listing warning
         # (see _maybe_warn_degenerate_self_listing).
         self._warned_degenerate_self = False
+        # host -> (etag, record_success keyword set) of the last full /peer
+        # body absorbed from that host, driving conditional re-polls: the tag
+        # is echoed as If-None-Match and a 304 replays the cached observation
+        # (see _observe_peer). Content-addressed -- the tag is the peer's own
+        # hash of exactly the payload we cached -- so an entry is safe to keep
+        # across failed rounds (a later match still proves identical content,
+        # and a restarted peer mints a fresh instance_id, which changes its
+        # payload and so never matches a stale tag). Bounded at one entry per
+        # configured peer.
+        self._peer_observation_cache: Dict[
+            str, "tuple[str, Dict[str, Any]]"
+        ] = {}
         # the scheduler's per-job run-summary snapshot callable, piggybacked
         # on the /peer response for the fleet view (installed by
         # Cron.start_stop_cluster before start(); None until then, and /peer
@@ -1120,69 +1211,149 @@ class ClusterManager(LeadershipBackend):
 
     # --- the mTLS /peer server -------------------------------------------
 
-    async def _handle_peer(self, request: web.Request) -> web.Response:
+    def _peer_payload(self) -> Dict[str, Any]:
+        """The full /peer response body (see :meth:`_handle_peer`)."""
         job_summaries, summaries_truncated = self._advertised_job_summaries()
-        return web.json_response(
-            {
-                "node_name": self.node_name,
-                "job_set_id": self.get_job_set_id(),
-                "scheme_version": SCHEME_VERSION,
-                "instance_id": self.instance_id,
-                # our declared cluster size (len(peers)+1). The election's
-                # safety assumes every node shares one N; a polling peer that
-                # declares a different one treats it as a conflict and fails
-                # Leader closed, mirroring a duplicate nodeName (see
-                # ClusterManager.conflicting_sizes).
-                "cluster_size": self.cluster_size(),
-                # our coordination policy: distribution and electLeader pick
-                # *which* node runs a Leader job (single-leader elects the
-                # min live name; spread picks a per-job rendezvous owner;
-                # electLeader off runs every job ungated). Neither is in the
-                # job-set fingerprint, so a peer that declares a different one
-                # is treated as a conflict and fails Leader closed (see
-                # ClusterManager.conflicting_policies).
-                "distribution": self.distribution,
-                "elect_leader": bool(self.config.get("electLeader")),
-                # our current observations, so a polling peer can confirm we
-                # see it too (mutual agreement) and spot a duplicate nodeName
-                # transitively; see ClusterView.local_members.
-                "members": self.view.local_members(
-                    self.node_name, self.instance_id
-                ),
-                # @reboot one-shots already run in the cluster (ours + learned
-                # from agreed peers), so a poller can retire its matching
-                # deferred job without re-running it; see advertised_ran_jobs.
-                # Capped so this response can never exceed MAX_PEER_RESPONSE_
-                # BYTES even if an upstream peer's set was inflated (the
-                # membership test reboot_ran() still uses the full union).
-                "ran_reboot_jobs": sorted(self.advertised_ran_jobs())[
-                    :MAX_ADVERTISED_REBOOT_JOBS
-                ],
-                # the peers we *mutually* agree with: a poller uses this as the
-                # sound evidence that a node it reaches only transitively is
-                # itself quorate (a witnessed two-way edge), driving the
-                # bridge-discovery deferral; see _bridge_candidates. Distinct
-                # from the one-directional ``agreed`` flags in ``members``.
-                "mutual_agreeing": sorted(self._agreeing_peer_names()),
-                # the names WE can confirm are themselves quorate (our
-                # _eligible_candidates): the nodes we would elect / defer to.
-                # A poller folds these -- not the raw mutual_agreeing -- into
-                # its ``spread`` Leader-path owner set, so it only ever defers
-                # a job to a node vouched able to run it (see PeerState.
-                # quorate_vouched / _unconfirmed_contenders). Stronger than
-                # mutual_agreeing, which lists every two-way edge including
-                # ones to sub-quorum nodes that stand a deferred job down.
-                "quorate_vouched": sorted(self._eligible_candidates()),
-                # this node's per-job run summaries (the scheduler's snapshot:
-                # running/enabled/next-fire plus the last finished run), for
-                # the polling peer's fleet view. Observability only -- a peer
-                # never feeds these into election or run/skip decisions --
-                # and capped so a huge job set cannot push this response past
-                # MAX_PEER_RESPONSE_BYTES (see _advertised_job_summaries).
-                "job_summaries": job_summaries,
-                "job_summaries_truncated": summaries_truncated,
+        return {
+            "node_name": self.node_name,
+            "job_set_id": self.get_job_set_id(),
+            "scheme_version": SCHEME_VERSION,
+            "instance_id": self.instance_id,
+            # our declared cluster size (len(peers)+1). The election's
+            # safety assumes every node shares one N; a polling peer that
+            # declares a different one treats it as a conflict and fails
+            # Leader closed, mirroring a duplicate nodeName (see
+            # ClusterManager.conflicting_sizes).
+            "cluster_size": self.cluster_size(),
+            # our coordination policy: distribution and electLeader pick
+            # *which* node runs a Leader job (single-leader elects the
+            # min live name; spread picks a per-job rendezvous owner;
+            # electLeader off runs every job ungated). Neither is in the
+            # job-set fingerprint, so a peer that declares a different one
+            # is treated as a conflict and fails Leader closed (see
+            # ClusterManager.conflicting_policies).
+            "distribution": self.distribution,
+            "elect_leader": bool(self.config.get("electLeader")),
+            # our current observations, so a polling peer can confirm we
+            # see it too (mutual agreement) and spot a duplicate nodeName
+            # transitively; see ClusterView.local_members.
+            "members": self.view.local_members(
+                self.node_name, self.instance_id
+            ),
+            # @reboot one-shots already run in the cluster (ours + learned
+            # from agreed peers), so a poller can retire its matching
+            # deferred job without re-running it; see advertised_ran_jobs.
+            # Capped so this response can never exceed MAX_PEER_RESPONSE_
+            # BYTES even if an upstream peer's set was inflated (the
+            # membership test reboot_ran() still uses the full union).
+            "ran_reboot_jobs": sorted(self.advertised_ran_jobs())[
+                :MAX_ADVERTISED_REBOOT_JOBS
+            ],
+            # the peers we *mutually* agree with: a poller uses this as the
+            # sound evidence that a node it reaches only transitively is
+            # itself quorate (a witnessed two-way edge), driving the
+            # bridge-discovery deferral; see _bridge_candidates. Distinct
+            # from the one-directional ``agreed`` flags in ``members``.
+            "mutual_agreeing": sorted(self._agreeing_peer_names()),
+            # the names WE can confirm are themselves quorate (our
+            # _eligible_candidates): the nodes we would elect / defer to.
+            # A poller folds these -- not the raw mutual_agreeing -- into
+            # its ``spread`` Leader-path owner set, so it only ever defers
+            # a job to a node vouched able to run it (see PeerState.
+            # quorate_vouched / _unconfirmed_contenders). Stronger than
+            # mutual_agreeing, which lists every two-way edge including
+            # ones to sub-quorum nodes that stand a deferred job down.
+            "quorate_vouched": sorted(self._eligible_candidates()),
+            # this node's per-job run summaries (the scheduler's snapshot:
+            # running/enabled/next-fire plus the last finished run), for
+            # the polling peer's fleet view. Observability only -- a peer
+            # never feeds these into election or run/skip decisions --
+            # and capped so a huge job set cannot push this response past
+            # MAX_PEER_RESPONSE_BYTES (see _advertised_job_summaries).
+            "job_summaries": job_summaries,
+            "job_summaries_truncated": summaries_truncated,
+        }
+
+    @staticmethod
+    def _peer_etag(payload: Dict[str, Any], now_epoch: float) -> str:
+        """A strong ETag for ``payload``: a hash of change-relevant content.
+
+        Deterministic across rounds while nothing real changed, so a poller
+        can echo it back (``If-None-Match``) and be answered with a bodyless
+        304 (see :meth:`_handle_peer`).  One field needs normalising: a job
+        summary's ``scheduled_in`` is a live countdown (seconds to next
+        fire), different every round, which would defeat the tag entirely.
+        Simply DROPPING it from the hash is wrong in the other direction: a
+        fire on a node that never runs the job (a non-owner under
+        Leader/spread gating) flips nothing else in the payload, the tag
+        would never roll, and pollers' derived countdowns would freeze at
+        zero.  So the hash replaces the countdown with the ABSOLUTE next-fire
+        time (``now + countdown``, rounded to whole seconds): constant
+        between fires, and it rolls exactly when the schedule does, forcing
+        one full body per rollover.  Pollers re-derive the live countdown
+        from the snapshot's age (see ``_aged_job_summaries``).  The
+        sub-second rounding means back-to-back computations straddling a
+        second boundary can very occasionally disagree -- the cost is one
+        spurious full body, never a wrong 304.
+        """
+        stable = dict(payload)
+        stable["job_summaries"] = {
+            name: {
+                key: (
+                    value
+                    if key != "scheduled_in"
+                    else (
+                        round(now_epoch + value)
+                        if isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        else None
+                    )
+                )
+                for key, value in entry.items()
             }
+            for name, entry in payload["job_summaries"].items()
+        }
+        digest = hashlib.sha256(
+            json.dumps(stable, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return '"{}"'.format(digest)
+
+    async def _handle_peer(self, request: web.Request) -> web.Response:
+        payload = self._peer_payload()
+        etag = self._peer_etag(
+            payload,
+            datetime.datetime.now(datetime.timezone.utc).timestamp(),
         )
+        # Conditional exchange: a poller echoes the ETag of the last full
+        # body we served it; when nothing change-relevant differs, a bodyless
+        # 304 lets it replay its cached observation (see _observe_peer), so a
+        # converged, idle cluster's steady-state round costs headers only.
+        # Exact-match only -- our own poller sends exactly one strong tag; a
+        # foreign If-None-Match shape simply gets the full body (a safe,
+        # slightly-wasteful degradation).
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers={"ETag": etag})
+        resp = web.json_response(payload, headers={"ETag": etag})
+        # Compress bodies worth compressing. The poller advertises gzip
+        # support on every request (aiohttp's default Accept-Encoding) and
+        # decompresses -- and caps the DECOMPRESSED size -- as it reads (see
+        # _read_capped), so this needs no client-side change. gzip is picked
+        # EXPLICITLY when the client advertises it: bare enable_compression()
+        # would let aiohttp's own preference order negotiate, which chooses
+        # deflate first and so would quietly contradict the documented gzip
+        # exchange. A client not advertising gzip falls back to that
+        # negotiation (identity for a bare curl). The size floor skips the
+        # small already-converged bodies where the CPU spend outweighs the
+        # few saved bytes.
+        body = resp.body
+        if isinstance(body, bytes) and len(body) >= MIN_COMPRESS_BYTES:
+            if "gzip" in request.headers.get("Accept-Encoding", "").lower():
+                resp.enable_compression(web.ContentCoding.gzip)
+            else:
+                resp.enable_compression()
+        return resp
 
     async def _handle_reboot_ran(self, request: web.Request) -> web.Response:
         """Receive an eager push of @reboot jobs a peer just ran.
@@ -1575,7 +1746,13 @@ class ClusterManager(LeadershipBackend):
         self, session: aiohttp.ClientSession, host: str, my_id: str
     ) -> None:
         url = "https://{}/peer".format(host)
-        now = datetime.datetime.now(datetime.timezone.utc)
+        # Conditional re-poll: echo the ETag of the last full body this host
+        # served us, so an unchanged peer can answer with a bodyless 304
+        # instead of the full O(members + jobs) JSON (see _handle_peer).
+        cached = self._peer_observation_cache.get(host)
+        status = 0
+        response_etag: Optional[str] = None
+        raw, too_large = b"", False
         try:
             # allow_redirects=False: a legitimate peer endpoint never
             # redirects; following one would let a CA-vouched-but-hostile
@@ -1583,12 +1760,22 @@ class ClusterManager(LeadershipBackend):
             # plaintext http:// downgrade where the mTLS client context
             # (ssl=) no longer applies.
             async with session.get(
-                url, ssl=self._client_ssl, allow_redirects=False
+                url,
+                ssl=self._client_ssl,
+                allow_redirects=False,
+                headers=(
+                    {"If-None-Match": cached[0]}
+                    if cached is not None
+                    else None
+                ),
             ) as resp:
-                resp.raise_for_status()
-                raw, too_large = await _read_capped(
-                    resp, MAX_PEER_RESPONSE_BYTES
-                )
+                status = resp.status
+                if status != 304:
+                    resp.raise_for_status()
+                    raw, too_large = await _read_capped(
+                        resp, MAX_PEER_RESPONSE_BYTES
+                    )
+                    response_etag = resp.headers.get("ETag")
         except aiohttp.ClientSSLError as ex:
             # cert chain / hostname verification failure: the peer is not (or
             # not provably) a cluster member.
@@ -1600,6 +1787,44 @@ class ClusterManager(LeadershipBackend):
             OSError,
         ) as ex:
             self.view.record_failure(host, str(ex), untrusted=False)
+            return
+        # The observation's timestamp (last_seen, and the taken_at that ages
+        # the advertised countdowns -- see _aged_job_summaries), stamped at
+        # RECEIPT rather than before the request went out: the peer computed
+        # its scheduled_in countdowns while serving the response, so the
+        # pre-request instant would overstate the snapshot's age by the whole
+        # connect + TLS handshake + read latency (seconds, on a degraded
+        # link) -- and a 304 replay would then carry that skew for as long
+        # as the peer's tag holds.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if status == 304:
+            if cached is None:
+                # a 304 answers a conditional request, and we sent none: a
+                # buggy or hostile peer. Treat it as a failed observation
+                # rather than inventing a body we do not hold.
+                self.view.record_failure(
+                    host,
+                    "unsolicited 304 to an unconditional /peer poll",
+                    untrusted=False,
+                )
+                return
+            # The peer attests (over a fresh, mutually-authenticated round
+            # trip) that its payload is exactly the one we cached -- the tag
+            # is its own content hash -- so replay that observation with a
+            # fresh timestamp and the LIVE my_id: every gate (agreement,
+            # mutual attestation, conflicts, the drift debounce) advances
+            # exactly as if the identical full body had been re-sent. The
+            # cached kwargs carry the ORIGINAL job_summaries_at, so the fleet
+            # view keeps ageing the snapshot's countdowns (see
+            # _aged_job_summaries) instead of re-stamping them.
+            self.view.record_success(
+                host,
+                my_id=my_id,
+                now=now,
+                my_name=self.node_name,
+                my_instance=self.instance_id,
+                **cached[1],
+            )
             return
         if too_large:
             self.view.record_failure(
@@ -1706,17 +1931,17 @@ class ClusterManager(LeadershipBackend):
                 untrusted=False,
             )
             return
-        self.view.record_success(
-            host,
-            fields["node_name"],
-            fields["job_set_id"],
-            fields["scheme_version"],
-            my_id,
-            now,
-            self.node_name,
-            peer_instance=fields["instance_id"],
-            my_instance=self.instance_id,
-            peer_members=_parse_members(
+        # The validated observation, built once: record_success consumes it
+        # now, and _peer_observation_cache keeps it (keyed by the response's
+        # ETag) so a later 304 can replay it verbatim -- which is also why
+        # my_id/now/my_name/my_instance stay OUT of it: they are supplied
+        # live on every call, replayed or not.
+        observation: Dict[str, Any] = {
+            "peer_name": fields["node_name"],
+            "peer_id": fields["job_set_id"],
+            "peer_scheme": fields["scheme_version"],
+            "peer_instance": fields["instance_id"],
+            "peer_members": _parse_members(
                 data.get("members"),
                 max_len=MAX_PEER_FIELD_LEN,
                 max_items=MAX_MEMBER_ENTRIES,
@@ -1728,20 +1953,20 @@ class ClusterManager(LeadershipBackend):
             # node down mid rolling upgrade. A non-list (null / hostile) is
             # treated as "not reported" -- a CA-vouched peer's junk is the
             # documented out-of-scope Byzantine case either way.
-            peer_reports_members=isinstance(data.get("members"), list),
-            peer_ran_reboot_jobs=_parse_str_list(
+            "peer_reports_members": isinstance(data.get("members"), list),
+            "peer_ran_reboot_jobs": _parse_str_list(
                 data.get("ran_reboot_jobs"),
                 max_len=MAX_REBOOT_JOB_NAME_LEN,
                 max_items=MAX_ADVERTISED_REBOOT_JOBS,
             ),
-            peer_size=size,
-            peer_distribution=fields["distribution"],
-            peer_elect_leader=elect,
+            "peer_size": size,
+            "peer_distribution": fields["distribution"],
+            "peer_elect_leader": elect,
             # An older build that omits the field, or a peer reporting an empty
             # set, both parse to an empty set here: either way it is not
             # confirmed quorate, so _eligible_candidates won't elect it. (The
             # PeerState default None -- never polled -- is treated the same.)
-            peer_mutual_agreeing=_parse_str_list(
+            "peer_mutual_agreeing": _parse_str_list(
                 data.get("mutual_agreeing"),
                 max_len=MAX_PEER_FIELD_LEN,
                 max_items=MAX_MEMBER_ENTRIES,
@@ -1752,7 +1977,7 @@ class ClusterManager(LeadershipBackend):
             # vouches no transitive owner, so _unconfirmed_contenders folds
             # nothing from it -- the safe direction (lean toward running, never
             # a zero-run). Capped like the other absorbed identity sets.
-            peer_quorate_vouched=_parse_str_list(
+            "peer_quorate_vouched": _parse_str_list(
                 data.get("quorate_vouched"),
                 max_len=MAX_PEER_FIELD_LEN,
                 max_items=MAX_MEMBER_ENTRIES,
@@ -1762,11 +1987,40 @@ class ClusterManager(LeadershipBackend):
             # _parse_job_summaries). None (absent/malformed -- an older build)
             # keeps any previously-absorbed snapshot rather than blanking the
             # node in the fleet view.
-            peer_job_summaries=_parse_job_summaries(data.get("job_summaries")),
-            peer_job_summaries_truncated=(
+            "peer_job_summaries": _parse_job_summaries(
+                data.get("job_summaries")
+            ),
+            "peer_job_summaries_truncated": (
                 data.get("job_summaries_truncated") is True
             ),
+            # when this snapshot was taken (a 304 replay passes it through
+            # unchanged, so fleet_view ages the countdowns from the true
+            # receipt time; see PeerState.job_summaries_at).
+            "peer_job_summaries_at": now,
+        }
+        self.view.record_success(
+            host,
+            my_id=my_id,
+            now=now,
+            my_name=self.node_name,
+            my_instance=self.instance_id,
+            **observation,
         )
+        # Remember (etag -> observation) for conditional re-polls. Only a
+        # sane tag is stored: it is echoed back as a request header every
+        # round, so an over-long or control-character value from a hostile
+        # peer is dropped -- we then simply keep polling unconditionally, the
+        # pre-ETag behaviour. A tagless response (an older build) likewise
+        # clears any stale entry so we stop sending If-None-Match it cannot
+        # honour.
+        if (
+            response_etag is not None
+            and len(response_etag) <= MAX_PEER_ETAG_LEN
+            and response_etag.isprintable()
+        ):
+            self._peer_observation_cache[host] = (response_etag, observation)
+        else:
+            self._peer_observation_cache.pop(host, None)
 
     # --- deferred @reboot "already ran" gossip ---------------------------
 
@@ -2756,7 +3010,11 @@ class ClusterManager(LeadershipBackend):
         last successful poll absorbed, aged by ``as_of`` (= last_seen) so the
         dashboard can show data freshness per node. Peer freshness is bounded
         by the poll ``interval``: the summaries ride the existing gossip
-        round, no extra fan-out happens here. Self-listings are skipped and
+        round, no extra fan-out happens here. A conditional 304 round counts
+        as fresh -- the peer attested the whole snapshot is still current --
+        but re-ships no body, so each advertised ``scheduled_in`` countdown
+        is re-derived from the snapshot's actual age rather than served
+        frozen (see :func:`_aged_job_summaries`). Self-listings are skipped and
         peers are deduped by instance_id (two configured addresses answering
         as the same process appear once), mirroring cluster_size's dedup.
         ``jobs: null`` means no snapshot was ever absorbed (never reached, or
@@ -2795,7 +3053,9 @@ class ClusterManager(LeadershipBackend):
                         if peer.last_seen is not None
                         else None
                     ),
-                    "jobs": peer.job_summaries,
+                    "jobs": _aged_job_summaries(
+                        peer.job_summaries, peer.job_summaries_at, now
+                    ),
                     "truncated": peer.job_summaries_truncated,
                 }
             )

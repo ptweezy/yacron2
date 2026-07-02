@@ -238,10 +238,10 @@ See [Failure Detection and Retries](Failure-Detection-and-Retries).
 
 ### Retries and reporting hooks
 
-Three lifecycle hooks each carry a `report` block (mail, sentry, shell);
-`onFailure` additionally carries a `retry` block. The `report` blocks all share
-the same `_report_schema` and the same `_REPORT_DEFAULTS` (deep-copied so the
-three blocks do not alias one another).
+Three lifecycle hooks each carry a `report` block (mail, sentry, shell,
+webhook); `onFailure` additionally carries a `retry` block. The `report` blocks
+all share the same `_report_schema` and the same `_REPORT_DEFAULTS` (deep-copied
+so the three blocks do not alias one another).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -249,7 +249,7 @@ three blocks do not alias one another).
 | `onFailure.retry.initialDelay` | `Float` | `1` | Seconds before the first retry. Must be `>= 0`. |
 | `onFailure.retry.maximumDelay` | `Float` | `300` | Upper bound on the backoff delay. Must be `> 0`. |
 | `onFailure.retry.backoffMultiplier` | `Float` | `2` | Multiplier applied to the delay between retries (exponential backoff). Must be `> 0`. |
-| `onFailure.report` | `_report_schema` (`mail`/`sentry`/`shell`) | defaults below | Reporters fired on every detected failure (including each failed attempt). |
+| `onFailure.report` | `_report_schema` (`mail`/`sentry`/`shell`/`webhook`) | defaults below | Reporters fired on every detected failure (including each failed attempt). |
 | `onPermanentFailure.report` | `_report_schema` | defaults below | Reporters fired only after all retries are exhausted. |
 | `onSuccess.report` | `_report_schema` | defaults below | Reporters fired on a successful run. |
 
@@ -258,7 +258,7 @@ Inside `onFailure.retry`, all four keys (`maximumRetries`, `initialDelay`,
 a `retry` block is present. See
 [Failure Detection and Retries](Failure-Detection-and-Retries).
 
-The `report` blocks are covered in full on [Reporting (Mail, Sentry, Shell)](Reporting);
+The `report` blocks are covered in full on [Reporting (Mail, Sentry, Shell, Webhook)](Reporting);
 their schema and `_REPORT_DEFAULTS` are summarized here.
 
 #### `report.mail`
@@ -301,6 +301,19 @@ Defaults from `_REPORT_DEFAULTS["sentry"]`:
 | --- | --- | --- | --- |
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used to run the reporter command. The default is platform-specific, same as the per-job `shell` field: on Windows the default is empty (the reporter command runs via cmd.exe through `%ComSpec%`). Set `shell:` explicitly for another interpreter, or pass `command` as a list. See [Running on Windows](Running-on-Windows). |
 | `command` | `Str` or `Seq(Str)` | `None` | Reporter command (required key). Receives `YACRON2_*` environment variables. |
+
+#### `report.webhook`
+
+Defaults from `_REPORT_DEFAULTS["webhook"]`:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `url` | `Map` with `value`/`fromFile`/`fromEnvVar` (each `EmptyNone() \| Str`) | all `None` | Webhook URL source (treated as a secret; never logged). No URL means webhook reporting is disabled. |
+| `method` | `Str` | `POST` | HTTP method. |
+| `contentType` | `Str` | `application/json` | `Content-Type` header value. |
+| `headers` | `MapPattern(Str, Str)` | `{}` | Extra request headers, sent verbatim (not templated). |
+| `body` | `Str` | default webhook body template | Request body (jinja2). The default is a Slack-compatible `{"text": ...}` JSON payload of the default subject + body text. |
+| `timeout` | `Float` | `10` | Total request timeout, seconds. |
 
 ### Environment
 

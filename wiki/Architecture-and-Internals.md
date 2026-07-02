@@ -23,7 +23,7 @@ operator-facing walkthrough.
 | `yacron2/platform.py` | The single home for all per-OS branches: `DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`, `install_shutdown_handlers`, and the `IS_WINDOWS` flag. The rest of the codebase reads the same on every platform. |
 | `yacron2/config.py` | strictyaml `CONFIG_SCHEMA`, `DEFAULT_CONFIG`, `_REPORT_DEFAULTS`; config loading from a file or directory; include handling and dict merging (`mergedicts`); `JobConfig` parsing/validation; `Yacron2Config` dataclass. |
 | `yacron2/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
-| `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`), and `JobRetryState`. |
+| `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`), and `JobRetryState`. |
 | `yacron2/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and by `cluster.py` (peer comparison). |
 | `yacron2/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory that builds the one named by `cluster.backend` (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`) via deferred imports. |
 | `yacron2/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). |
@@ -338,7 +338,17 @@ The gossip concrete (`ClusterManager` in `yacron2/cluster.py`) owns two things:
   mTLS (a client SSL context with `check_hostname=True`, so the peer cert's SAN
   must match the configured host), and feeds each observation into the pure
   `ClusterView`. TLS/cert failures classify the peer as `untrusted`; connect or
-  timeout failures as `unreachable`.
+  timeout failures as `unreachable`. The exchange is conditional: every `/peer`
+  response carries a strong `ETag` (a content hash of the payload, with the
+  live per-job countdown normalised to the absolute next-fire time so the tag
+  is stable between fires), the poller echoes it back as `If-None-Match`, and
+  an unchanged peer answers with a bodyless `304` -- the poller then replays
+  its cached observation with a fresh timestamp, so a converged, idle
+  cluster's steady-state round costs headers rather than the full
+  O(members + jobs) JSON. A `304` is still a fresh, mutually-authenticated
+  round trip, so agreement, conflict detection, and the drift debounce advance
+  exactly as if the identical body had been re-sent. Full bodies large enough
+  to be worth it are gzip-compressed.
 
 `ClusterView` is pure (no I/O): it holds the per-peer table and the rules that
 update it (the `agreed`/`syncing`/`drifted`/`unreachable`/`untrusted`/`self`
@@ -544,14 +554,14 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
 
 6. **Reporting.** `report_failure`, `report_permanent_failure`, and
    `report_success` each delegate to `_report_common`, which runs all three
-   `REPORTERS` (`SentryReporter`, `MailReporter`, `ShellReporter`) concurrently
+   `REPORTERS` (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`) concurrently
    with `asyncio.gather(..., return_exceptions=True)`; an exception from any one
    reporter is logged and does not stop the others. Each reporter reads the
    relevant sub-key of the report config (`onFailure["report"]`,
    `onPermanentFailure["report"]`, or `onSuccess["report"]`) and self-disables
    when its required fields are unset (e.g. mail with no `to`/`from`, sentry
    with no resolvable `dsn`, shell with no `command`). Templates render against
-   `template_vars`. See [Reporting (Mail, Sentry, Shell)](Reporting).
+   `template_vars`. See [Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
 
 ### StreamReader
 

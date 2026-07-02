@@ -2629,10 +2629,12 @@ class _FakeContent:
 
 
 class _FakeResp:
-    def __init__(self, payload=None, *, body=None):
+    def __init__(self, payload=None, *, body=None, status=200, headers=None):
         if body is None:
             body = json.dumps(payload).encode("utf-8")
         self.content = _FakeContent(body)
+        self.status = status
+        self.headers = headers or {}
 
     def raise_for_status(self):
         pass
@@ -2662,11 +2664,26 @@ class _FakeSession:
     def __init__(self, get_result):
         self._get_result = get_result
         self.calls = []
+        self.request_headers = []  # the headers= kwarg of each get()
 
-    def get(self, url, ssl=None, **kwargs):
+    def get(self, url, ssl=None, headers=None, **kwargs):
         # **kwargs absorbs allow_redirects=False (and any future client opts).
         self.calls.append((url, ssl))
+        self.request_headers.append(headers)
         return self._get_result
+
+
+class _FakeSeqSession(_FakeSession):
+    # like _FakeSession but serves a DIFFERENT result per get(), for the
+    # conditional-request tests (a full body, then a 304).
+    def __init__(self, *get_results):
+        super().__init__(None)
+        self._get_results = list(get_results)
+
+    def get(self, url, ssl=None, headers=None, **kwargs):
+        self.calls.append((url, ssl))
+        self.request_headers.append(headers)
+        return self._get_results.pop(0)
 
 
 class _FakeSSLError(aiohttp.ClientSSLError):
@@ -4528,6 +4545,440 @@ async def test_mtls_round_trip_job_summaries(tmp_path):
         fleet = a.fleet_view()
         by_name = {n["node_name"]: n for n in fleet["nodes"]}
         assert by_name["node-b"]["jobs"]["beta"]["last"]["exit_code"] == 1
+    finally:
+        await a.stop()
+        await b.stop()
+
+
+# --------------------------------------------------------------------------
+# conditional gossip: /peer ETag + If-None-Match -> 304, gzip, countdown aging
+# --------------------------------------------------------------------------
+
+# a full, well-formed /peer body from an agreeing peer, for the client-side
+# conditional-request tests (values chosen so every absorbed field is
+# non-empty and a replay is distinguishable from stale leftovers)
+_PEER_B_BODY = {
+    "node_name": "node-b",
+    "job_set_id": "v1:mine",
+    "scheme_version": SCHEME_VERSION,
+    "instance_id": "ib",
+    "cluster_size": 2,
+    "members": [
+        {"node_name": "node-b", "instance_id": "ib", "agreed": True},
+    ],
+    "mutual_agreeing": ["node-a"],
+    "quorate_vouched": [],
+    "ran_reboot_jobs": ["boot"],
+    "job_summaries": {
+        "j": {
+            "running": False,
+            "enabled": True,
+            "scheduled_in": 60.0,
+            "last": None,
+        }
+    },
+    "job_summaries_truncated": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_carries_etag_and_answers_304(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
+    )
+    resp = await mgr._handle_peer(_Req())
+    etag = resp.headers["ETag"]
+    # a strong (quoted) tag, well under the client-side echo bound
+    assert etag.startswith('"') and etag.endswith('"') and len(etag) <= 128
+    # unchanged state + a matching If-None-Match -> bodyless 304, same tag
+    req = _Req()
+    req.headers = {"If-None-Match": etag}
+    resp2 = await mgr._handle_peer(req)
+    assert resp2.status == 304
+    assert resp2.body is None
+    assert resp2.headers["ETag"] == etag
+    # a non-matching (foreign) tag degrades to the full body
+    stale = _Req()
+    stale.headers = {"If-None-Match": '"nope"'}
+    resp3 = await mgr._handle_peer(stale)
+    assert resp3.status == 200
+    assert resp3.headers["ETag"] == etag
+    # a real state change rolls the tag: the same conditional request now
+    # gets a fresh full body
+    mgr._ran_reboot_jobs.add("boot-once")
+    resp4 = await mgr._handle_peer(req)
+    assert resp4.status == 200
+    assert resp4.headers["ETag"] != etag
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_304_survives_live_countdown_ticks(no_tls):
+    # Pins the handler's CLOCK PLUMBING, which the etag unit test (it passes
+    # now_epoch explicitly) cannot: the tag hashes each live scheduled_in as
+    # round(now_epoch + scheduled_in) -- the absolute next-fire instant --
+    # which is only constant between fires when _handle_peer feeds _peer_etag
+    # the same wall clock the provider's countdown falls with. A provider
+    # whose countdown genuinely ticks down in real time, plus a >1s pause
+    # between the two requests, makes any broken clock (a constant, a
+    # monotonic-since-boot value, a cached stamp) shift the reconstructed
+    # fire time across the pause, roll the tag, and fail the 304 below.
+    import math
+    import time
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
+    )
+    # a fire ~2 minutes out on a whole-second boundary: the provider's
+    # now() and the handler's now() are microseconds apart, so the
+    # reconstructed instant sits ~0.5s from either rounding edge
+    fire_at = float(math.floor(time.time()) + 120)
+    mgr.set_job_summaries_provider(
+        lambda: {
+            "tick": {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": fire_at - time.time(),
+                "last": None,
+            }
+        }
+    )
+    resp = await mgr._handle_peer(_Req())
+    assert resp.status == 200
+    etag = resp.headers["ETag"]
+    # real wall time passes (>1s, so a wrong clock cannot round to the same
+    # instant); the advertised countdown falls in step, the tag holds
+    await asyncio.sleep(1.1)
+    req = _Req()
+    req.headers = {"If-None-Match": etag}
+    resp2 = await mgr._handle_peer(req)
+    assert resp2.status == 304
+    assert resp2.headers["ETag"] == etag
+
+
+def test_peer_etag_ignores_countdown_ticks_but_rolls_on_fire(no_tls):
+    # scheduled_in is a live countdown, so hashing it raw would roll the tag
+    # every round (no 304 would ever happen for a node with scheduled jobs);
+    # dropping it entirely would let a fire on a non-owner pass unnoticed and
+    # freeze pollers' derived countdowns at zero. The tag therefore hashes
+    # the ABSOLUTE next-fire time (now_epoch + countdown).
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
+    )
+
+    def payload(scheduled_in, running=False):
+        p = mgr._peer_payload()
+        p["job_summaries"] = {
+            "j": {
+                "running": running,
+                "enabled": True,
+                "scheduled_in": scheduled_in,
+                "last": None,
+            }
+        }
+        return p
+
+    # the same upcoming fire observed 30s apart (countdown fell in step with
+    # the clock) hashes identically
+    t1 = mgr._peer_etag(payload(100.0), 1_000_000.0)
+    t2 = mgr._peer_etag(payload(70.0), 1_000_030.0)
+    assert t1 == t2
+    # the fire passed and the countdown rolled to the next period with
+    # nothing else changing: the tag must roll too
+    t3 = mgr._peer_etag(payload(3500.0), 1_000_100.0)
+    assert t3 != t1
+    # any non-countdown change rolls it as well
+    t4 = mgr._peer_etag(payload(70.0, running=True), 1_000_030.0)
+    assert t4 != t2
+    # a None countdown (running / disabled / @reboot) is clock-independent
+    assert mgr._peer_etag(payload(None), 1.0) == mgr._peer_etag(
+        payload(None), 2.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_observe_peer_conditional_replay_on_304(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSeqSession(
+        _FakeGet(resp=_FakeResp(_PEER_B_BODY, headers={"ETag": '"tag-1"'})),
+        _FakeGet(resp=_FakeResp(body=b"", status=304)),
+    )
+    await mgr._observe_peer(session, "b:1", "v1:mine")
+    peer = mgr.view.peers["b:1"]
+    assert peer.status == STATUS_AGREED
+    assert session.request_headers[0] is None  # nothing cached yet
+    taken_at = peer.job_summaries_at
+    assert taken_at is not None
+    # wipe the fresh-observation state the way a failed round does, to prove
+    # the 304 path REPLAYS a full observation rather than merely leaving
+    # stale fields in place
+    mgr.view.record_failure("b:1", "blip", untrusted=False)
+    assert peer.status == STATUS_UNREACHABLE and peer.members is None
+    await mgr._observe_peer(session, "b:1", "v1:mine")
+    assert session.request_headers[1] == {"If-None-Match": '"tag-1"'}
+    assert peer.status == STATUS_AGREED
+    assert peer.members == [("node-b", "ib", True)]
+    assert peer.mutual_agreeing == {"node-a"}
+    assert peer.ran_reboot_jobs == {"boot"}
+    assert peer.job_summaries is not None
+    assert peer.last_seen is not None
+    # the summaries receipt time rides through the replay unchanged, so the
+    # fleet view keeps ageing the countdown from the original snapshot
+    assert peer.job_summaries_at == taken_at
+
+
+@pytest.mark.asyncio
+async def test_observe_peer_unsolicited_304_is_failure(no_tls):
+    # a 304 answers a conditional request; with nothing cached we sent none,
+    # so a peer volunteering one is buggy or hostile -> a failed observation,
+    # never an invented body
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(_FakeGet(resp=_FakeResp(body=b"", status=304)))
+    await mgr._observe_peer(session, "b:1", "v1:mine")
+    peer = mgr.view.peers["b:1"]
+    assert peer.status == STATUS_UNREACHABLE
+    assert "304" in (peer.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_observe_peer_replay_recomputes_against_live_id(no_tls):
+    # a 304 proves the PEER'S payload is unchanged; OUR job set may have
+    # reloaded meanwhile, so the replay must re-derive agreement against the
+    # live my_id rather than resurrect the cached AGREED verdict
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSeqSession(
+        _FakeGet(resp=_FakeResp(_PEER_B_BODY, headers={"ETag": '"tag-1"'})),
+        _FakeGet(resp=_FakeResp(body=b"", status=304)),
+    )
+    await mgr._observe_peer(session, "b:1", "v1:mine")
+    peer = mgr.view.peers["b:1"]
+    assert peer.status == STATUS_AGREED
+    await mgr._observe_peer(session, "b:1", "v2:reloaded")
+    assert peer.status == STATUS_SYNCING
+    assert peer.mismatch_streak == 1
+
+
+@pytest.mark.asyncio
+async def test_observe_peer_bounds_and_drops_unusable_etags(no_tls):
+    # the tag is stored and echoed as a request header every round, so a
+    # hostile peer must not be able to park an oversized or control-character
+    # value there; and a tagless response (an older build) clears the cache
+    # so we stop sending If-None-Match it cannot honour
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSeqSession(
+        _FakeGet(
+            resp=_FakeResp(
+                _PEER_B_BODY, headers={"ETag": '"' + "x" * 200 + '"'}
+            )
+        ),
+        _FakeGet(resp=_FakeResp(_PEER_B_BODY, headers={"ETag": '"a\x01b"'})),
+        _FakeGet(resp=_FakeResp(_PEER_B_BODY, headers={"ETag": '"good"'})),
+        _FakeGet(resp=_FakeResp(_PEER_B_BODY)),  # no ETag at all
+        _FakeGet(resp=_FakeResp(_PEER_B_BODY)),
+    )
+    for _ in range(5):
+        await mgr._observe_peer(session, "b:1", "v1:mine")
+    assert session.request_headers == [
+        None,  # first contact: nothing cached
+        None,  # oversized tag was not cached
+        None,  # control-character tag was not cached
+        {"If-None-Match": '"good"'},  # a sane tag is used
+        None,  # the tagless response dropped the cache again
+    ]
+    assert mgr.view.peers["b:1"].status == STATUS_AGREED
+
+
+def test_record_success_stamps_and_preserves_summaries_taken_at():
+    view = ClusterView(["b:1"], 3)
+    snap = {
+        "j": {
+            "running": False,
+            "enabled": True,
+            "scheduled_in": 50.0,
+            "last": None,
+        }
+    }
+    t1 = NOW
+    view.record_success(
+        "b:1",
+        "node-b",
+        "same-id",
+        None,
+        "same-id",
+        t1,
+        "node-a",
+        peer_instance="ib",
+        my_instance="ia",
+        peer_job_summaries=snap,
+    )
+    peer = view.peers["b:1"]
+    assert peer.job_summaries_at == t1  # stamped at receipt by default
+    # a conditional 304 replay passes the ORIGINAL receipt time through
+    t2 = NOW + datetime.timedelta(seconds=60)
+    view.record_success(
+        "b:1",
+        "node-b",
+        "same-id",
+        None,
+        "same-id",
+        t2,
+        "node-a",
+        peer_instance="ib",
+        my_instance="ia",
+        peer_job_summaries=snap,
+        peer_job_summaries_at=t1,
+    )
+    assert peer.last_seen == t2
+    assert peer.job_summaries_at == t1
+    # an older build that gossips no summaries keeps the snapshot AND its
+    # receipt time (the fleet view keeps ageing the last real report)
+    t3 = NOW + datetime.timedelta(seconds=120)
+    view.record_success(
+        "b:1",
+        "node-b",
+        "same-id",
+        None,
+        "same-id",
+        t3,
+        "node-a",
+        peer_instance="ib",
+        my_instance="ia",
+        peer_job_summaries=None,
+    )
+    assert peer.job_summaries == snap
+    assert peer.job_summaries_at == t1
+
+
+def test_fleet_view_ages_peer_countdowns(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
+    )
+    peer = mgr.view.peers["b:1"]
+    peer.status = STATUS_AGREED
+    peer.node_name = "node-b"
+    peer.instance_id = "ib"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    peer.last_seen = now
+    peer.job_summaries = {
+        "soon": {
+            "running": False,
+            "enabled": True,
+            "scheduled_in": 100.0,
+            "last": None,
+        },
+        "overdue": {
+            "running": False,
+            "enabled": True,
+            "scheduled_in": 10.0,
+            "last": None,
+        },
+        "unscheduled": {
+            "running": True,
+            "enabled": True,
+            "scheduled_in": None,
+            "last": None,
+        },
+    }
+    peer.job_summaries_at = now - datetime.timedelta(seconds=40)
+    fleet = mgr.fleet_view()
+    jobs = {n["node_name"]: n for n in fleet["nodes"]}["node-b"]["jobs"]
+    # aged by the snapshot's ~40s age; clamped at zero once the fire time
+    # passed; a None countdown passes through untouched
+    assert 55.0 <= jobs["soon"]["scheduled_in"] <= 61.0
+    assert jobs["overdue"]["scheduled_in"] == 0.0
+    assert jobs["unscheduled"]["scheduled_in"] is None
+    # the derivation copies entries -- the stored snapshot stays pristine
+    assert peer.job_summaries["soon"]["scheduled_in"] == 100.0
+    # with no receipt time recorded (state set directly / a legacy path),
+    # the snapshot passes through unaged
+    peer.job_summaries_at = None
+    fleet = mgr.fleet_view()
+    jobs = {n["node_name"]: n for n in fleet["nodes"]}["node-b"]["jobs"]
+    assert jobs["soon"]["scheduled_in"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_mtls_conditional_304_and_gzip(tmp_path):
+    # end-to-end over real sockets: the second poll round rides a bodyless
+    # 304, and a full body large enough to clear the floor goes out gzipped.
+    import gzip
+
+    tls = _write_tls(tmp_path)
+    pa, pb = _free_port(), _free_port()
+    a = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
+        lambda: "v1:same",
+    )
+    # b's peer entry points at a dead port so its own background poll cannot
+    # change its /peer payload (a failed poll adds no members entry) -- the
+    # payload must stay byte-stable across a's two rounds for the 304
+    b = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{_free_port()}"], "node-b"),
+        lambda: "v1:same",
+    )
+    # a fat, stable summaries block: enough entries to clear the gzip floor,
+    # scheduled_in=None so the payload is clock-independent
+    b.set_job_summaries_provider(
+        lambda: {
+            "job-{:02d}".format(i): {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": None,
+                "last": {
+                    "outcome": "success",
+                    "finished_at": "2026-01-01T00:00:00+00:00",
+                    "duration": 1.5,
+                    "exit_code": 0,
+                },
+            }
+            for i in range(20)
+        }
+    )
+    await b.start()
+    await a.start()
+    try:
+        host = f"localhost:{pb}"
+        await a._poll_all()
+        peer = a.view.peers[host]
+        assert peer.status == STATUS_AGREED
+        etag, _ = a._peer_observation_cache[host]
+        taken_at = peer.job_summaries_at
+        assert taken_at is not None
+        # round 2: a 304 replay -- the receipt time rides through unchanged
+        # (a full body would restamp it), and the peer stays fully attested
+        await a._poll_all()
+        assert peer.status == STATUS_AGREED
+        assert peer.job_summaries_at == taken_at
+        assert a._peer_observation_cache[host][0] == etag
+        async with aiohttp.ClientSession(auto_decompress=False) as s:
+            # raw conditional request: bodyless 304 carrying the same tag
+            async with s.get(
+                f"https://{host}/peer",
+                ssl=a._client_ssl,
+                headers={"If-None-Match": etag},
+            ) as r:
+                assert r.status == 304
+                assert await r.read() == b""
+                assert r.headers["ETag"] == etag
+            # raw unconditional request with the client's DEFAULT
+            # Accept-Encoding (gzip, deflate, ... -- what the real poller
+            # sends): the large body must go out gzipped SPECIFICALLY, not
+            # whatever coding bare negotiation would prefer (deflate)
+            async with s.get(
+                f"https://{host}/peer",
+                ssl=a._client_ssl,
+            ) as r:
+                assert r.status == 200
+                assert r.headers.get("Content-Encoding") == "gzip"
+                body = gzip.decompress(await r.read())
+                assert json.loads(body)["node_name"] == "node-b"
     finally:
         await a.stop()
         await b.stop()

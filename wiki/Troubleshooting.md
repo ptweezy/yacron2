@@ -377,11 +377,11 @@ fails.
 **Fix.** Fix the server certificate, or set `validate_certs: false` on the `mail`
 report block to restore the old behavior. Related mail TLS keys: `tls` (default
 `false`, implicit TLS), `starttls` (default `false`). See
-[Reporting (Mail, Sentry, Shell)](Reporting). Reporter exceptions are logged
+[Reporting (Mail, Sentry, Shell, Webhook)](Reporting). Reporter exceptions are logged
 (`Problem reporting job <name> failure`) and never crash the scheduler; reporters run
 concurrently with `return_exceptions=True`.
 
-### A report (Sentry / mail / shell) is silently skipped
+### A report (Sentry / mail / shell / webhook) is silently skipped
 
 **Symptom.** No report is sent and there is no exception.
 
@@ -389,10 +389,12 @@ concurrently with `return_exceptions=True`.
 DSN resolves (and logs `sentry: dsn env var '<name>' is not set; not reporting` when
 `fromEnvVar` is unset); mail returns unless both `to` and `from` are set (and logs
 `mail: password env var is not set; not sending email` when a `fromEnvVar` password is
-unset); the shell reporter returns when `command` is `None`. A successful-job mail with
+unset); the shell reporter returns when `command` is `None`; the webhook reporter
+returns unless a `url` resolves (and logs `webhook: url env var '<name>' is not set;
+not reporting` when `fromEnvVar` is unset). A successful-job mail with
 an empty rendered body is also skipped.
 
-**Fix.** Provide the required fields. See [Reporting (Mail, Sentry, Shell)](Reporting).
+**Fix.** Provide the required fields. See [Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
 
 ## Metrics
 

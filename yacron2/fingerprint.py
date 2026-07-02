@@ -23,8 +23,9 @@ Design notes that matter for that "byte-identical across hosts" guarantee:
   value so the intent matches across hosts (see ``JobConfig.user``/``group``).
 * **secret/value material is never embedded.**  The ID is logged at startup
   and served on a (possibly unauthenticated) HTTP endpoint, so it must never
-  embed secret material.  Inline reporting secrets (Sentry DSN, mail password)
-  are redacted, and only the *names* of ``environment`` variables are hashed,
+  embed secret material.  Inline reporting secrets (Sentry DSN, mail password,
+  webhook URL and header values) are redacted, and only the *names* of
+  ``environment`` variables are hashed,
   never their values (env is a common place to carry secrets, and a per-host
   value, e.g. from ``env_file``, would otherwise make identical configs
   fingerprint differently across hosts).  We hash *whether* and *how* a secret
@@ -91,9 +92,10 @@ def _command_repr(command: Union[str, List[str]]) -> Dict[str, Any]:
 def _redact_report(report: Dict[str, Any]) -> Dict[str, Any]:
     """Deep-copy a report block, replacing inline secret values with a marker.
 
-    Only the literal ``value`` of a sentry DSN / mail password is redacted; the
-    ``fromFile`` / ``fromEnvVar`` references are paths and env-var names (not
-    secrets) and are kept, since they are part of the job's identity.
+    Only the literal ``value`` of a sentry DSN / mail password / webhook URL
+    (plus webhook header values) is redacted; the ``fromFile`` /
+    ``fromEnvVar`` references are paths and env-var names (not secrets) and
+    are kept, since they are part of the job's identity.
     """
     redacted = copy.deepcopy(report)
     sentry = redacted.get("sentry")
@@ -106,6 +108,17 @@ def _redact_report(report: Dict[str, Any]) -> Dict[str, Any]:
         password = mail.get("password")
         if isinstance(password, dict) and password.get("value") is not None:
             password["value"] = _SECRET_PLACEHOLDER
+    webhook = redacted.get("webhook")
+    if isinstance(webhook, dict):
+        url = webhook.get("url")
+        if isinstance(url, dict) and url.get("value") is not None:
+            url["value"] = _SECRET_PLACEHOLDER
+        headers = webhook.get("headers")
+        if isinstance(headers, dict):
+            # header *values* commonly carry credentials (e.g. an
+            # Authorization token); keep the names, which are identity.
+            for name in headers:
+                headers[name] = _SECRET_PLACEHOLDER
     return redacted
 
 

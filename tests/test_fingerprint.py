@@ -451,10 +451,10 @@ jobs:
 """
 
 GOLDEN_JOB_SET_ID = (
-    "v1:5601a2694521dfcf0142773137469da34b57f672d84f3ed7e32c90c55f5b9386"
+    "v1:491b050853db073090309a09312073ad422fc42dbd4b383158f24cb643ac4243"
 )
 GOLDEN_ALPHA_DIGEST = (
-    "e00b231a852202bf3e71b91e1502ee69436967ea8af54b27e77066a0284d6d4f"
+    "b65d5808540f239ebc702c2a15f46595d52c7c6617ffda2835b49d45f4f52aa8"
 )
 
 
@@ -646,3 +646,47 @@ def test_sentry_secret_redacted_in_action_block(action):
     a = _sentry_action_config(action, "https://aaa@example.com/1")
     b = _sentry_action_config(action, "https://bbb@example.com/2")
     assert _id(a) == _id(b)
+
+
+def _webhook_config(url, auth="s3cret"):
+    return """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        webhook:
+          url:
+            value: {url}
+          headers:
+            Authorization: {auth}
+""".format(url=url, auth=auth)
+
+
+def test_inline_webhook_url_is_redacted():
+    # a Slack/Discord-style webhook URL embeds its token, so two configs
+    # differing only in the inline URL value must produce the same id.
+    a = _webhook_config("https://hooks.slack.com/services/AAA")
+    b = _webhook_config("https://hooks.slack.com/services/BBB")
+    assert _id(a) == _id(b)
+
+
+def test_webhook_header_values_are_redacted():
+    # header values commonly carry credentials (e.g. Authorization); only the
+    # header *names* are part of the identity.
+    a = _webhook_config("https://example.com/hook", auth="tokenA")
+    b = _webhook_config("https://example.com/hook", auth="tokenB")
+    assert _id(a) == _id(b)
+
+
+def test_webhook_presence_still_changes_id():
+    with_hook = _webhook_config("https://example.com/hook")
+    without = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+"""
+    # redaction hides the value, not the fact that a webhook is configured
+    assert _id(with_hook) != _id(without)

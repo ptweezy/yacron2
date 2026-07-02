@@ -1,11 +1,11 @@
-# Reporting (Mail, Sentry, Shell)
+# Reporting (Mail, Sentry, Shell, Webhook)
 
-yacron2 can report a job's outcome through three reporters - Sentry, e-mail
-(SMTP), and an arbitrary shell command - configured under the `report` block of
-the `onFailure`, `onPermanentFailure`, and `onSuccess` hooks. This page documents
-every reporter option, its type and default, the secret-resolution rules, the
-jinja2 template variables, and the environment variables passed to the shell
-reporter.
+yacron2 can report a job's outcome through four reporters - Sentry, e-mail
+(SMTP), an arbitrary shell command, and an HTTP webhook (Slack-compatible out
+of the box) - configured under the `report` block of the `onFailure`,
+`onPermanentFailure`, and `onSuccess` hooks. This page documents every reporter
+option, its type and default, the secret-resolution rules, the jinja2 template
+variables, and the environment variables passed to the shell reporter.
 
 ## Hooks and when each fires
 
@@ -18,24 +18,25 @@ same schema:
 | `onPermanentFailure` | A job has failed and all configured retries are exhausted. |
 | `onSuccess` | A job run is detected as succeeded. |
 
-All three hooks accept the identical `report` block (`sentry`, `mail`, `shell`).
-The default report configuration is applied independently to each of the three
-hooks (`_REPORT_DEFAULTS` is deep-copied into each), so configuring one hook does
-not affect the others.
+All three hooks accept the identical `report` block (`sentry`, `mail`, `shell`,
+`webhook`). The default report configuration is applied independently to each of
+the three hooks (`_REPORT_DEFAULTS` is deep-copied into each), so configuring one
+hook does not affect the others.
 
 A run that is deliberately terminated to make way for a newer instance
 (`concurrencyPolicy: Replace`) is not treated as a failure and is neither
 reported nor retried. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
-### All three reporters always run
+### All four reporters always run
 
-For any given hook, yacron2 always invokes all three reporters concurrently
+For any given hook, yacron2 always invokes all four reporters concurrently
 (`asyncio.gather` with `return_exceptions=True`). A reporter that is not
 configured returns early and does nothing:
 
 - Sentry returns if no `dsn` source is set.
 - Mail returns if `to` or `from` is unset.
 - Shell returns if `command` is unset (`None`).
+- Webhook returns if no `url` source is set.
 
 An exception raised by one reporter is logged at `ERROR` level (with traceback)
 and does not prevent the other reporters from running, nor does it propagate to
@@ -43,7 +44,8 @@ the scheduler.
 
 ## Templating
 
-`subject`, `body` (mail), `body` and each `fingerprint` entry (sentry) are
+`subject`, `body` (mail), `body` and each `fingerprint` entry (sentry), and
+`body` (webhook) are
 [jinja2](https://jinja.palletsprojects.com/) templates. Each distinct template
 source is compiled once and cached for the process lifetime (`lru_cache`), so the
 same template string is not recompiled on every report.
@@ -327,11 +329,92 @@ List form (no shell):
             - "failed"
 ```
 
+## Webhook reporter
+
+Sends an HTTP request (POST by default) to a configured URL, with a
+jinja2-templated body. The default body is a JSON `{"text": ...}` payload
+carrying the same subject-plus-body text as the default mail/sentry templates,
+which is the shape [Slack](https://api.slack.com/messaging/webhooks),
+Mattermost, and Microsoft Teams incoming webhooks accept with no further
+configuration. Override `body` for services expecting a different shape (e.g.
+Discord wants `{"content": ...}`; [ntfy](https://ntfy.sh/) takes a plain-text
+body). Reporting is enabled only when a `url` source resolves to a value;
+otherwise the reporter returns early.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `url` | secret block (Opt) | all sources `None` | The webhook URL; see [Secrets](#secrets). Treated as a secret because Slack/Discord-style webhook URLs embed their token; it is never logged. No URL means webhook reporting is disabled. |
+| `method` | str (Opt) | `POST` | HTTP method for the request. |
+| `contentType` | str (Opt) | `application/json` | Value of the `Content-Type` header. |
+| `headers` | map of str to str (Opt) | `{}` | Extra request headers (e.g. `Authorization`). Merged over the `Content-Type` header, so a `Content-Type` entry here wins. |
+| `body` | str (Opt) | default webhook body template | jinja2 template for the request body. |
+| `timeout` | float (Opt) | `10` | Total request timeout in seconds. |
+
+The default body template JSON-encodes the rendered text with jinja2's
+`tojson` filter, so job output containing quotes, newlines, or non-ASCII text
+always produces valid JSON:
+
+```text
+{"text": {% filter tojson %}<default subject>
+<default body>{% endfilter %}}
+```
+
+Notes on behavior:
+
+- A response status of 400 or above is logged at `ERROR` level (with up to
+  1 KiB of the response text) but, like all reporters, does not fail the job
+  and does not prevent the other reporters from running. Connection errors and
+  timeouts are logged the same way by the report dispatcher.
+- The webhook URL is never written to the logs, in either the success or the
+  error path.
+
+Slack (or Mattermost/Teams) failure notification:
+
+```yaml
+jobs:
+  - name: backup
+    command: /usr/local/bin/backup.sh
+    schedule: "0 3 * * *"
+    captureStderr: true
+    onFailure:
+      report:
+        webhook:
+          url:
+            fromEnvVar: SLACK_WEBHOOK_URL
+```
+
+Discord (custom body shape), with the URL read from a mounted secret file:
+
+```yaml
+        webhook:
+          url:
+            fromFile: /etc/secrets/discord-webhook
+          body: >-
+            {"content": {% filter tojson %}Cron job '{{ name }}'
+            {% if success %}completed{% else %}failed:
+            {{ fail_reason }}{% endif %}{% endfilter %}}
+```
+
+ntfy (plain-text body, priority via header):
+
+```yaml
+        webhook:
+          url:
+            value: https://ntfy.sh/my-alerts
+          contentType: text/plain
+          headers:
+            Title: yacron2 job failure
+            Priority: high
+          body: "Cron job '{{ name }}' failed: {{ fail_reason }}"
+```
+
+Note that `headers` values are sent verbatim; only `body` is a jinja2 template.
+
 ## Secrets
 
-The `mail.password` and `sentry.dsn` options are secret blocks with three
-mutually-exclusive sources. Each is an optional key accepting a string or empty
-value:
+The `mail.password`, `sentry.dsn`, and `webhook.url` options are secret blocks
+with three mutually-exclusive sources. Each is an optional key accepting a
+string or empty value:
 
 | Source | Description |
 | --- | --- |

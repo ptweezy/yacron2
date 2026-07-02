@@ -13,6 +13,7 @@ from functools import lru_cache
 from socket import gethostname
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
+import aiohttp
 import aiosmtplib
 import jinja2
 import sentry_sdk
@@ -432,6 +433,62 @@ class ShellReporter(Reporter):
             )
 
 
+class WebhookReporter(Reporter):
+    async def report(
+        self, success: bool, job: "RunningJob", config: Dict[str, Any]
+    ) -> None:
+        webhook = config["webhook"]
+
+        url_config = webhook["url"]
+        if url_config["value"]:
+            url = url_config["value"]
+        elif url_config["fromFile"]:
+            with open(url_config["fromFile"], "rt") as url_file:
+                url = url_file.read().strip()
+        elif url_config["fromEnvVar"]:
+            env_var = url_config["fromEnvVar"]
+            url = os.environ.get(env_var, "")
+            if not url:
+                logger.error(
+                    "webhook: url env var %r is not set; not reporting",
+                    env_var,
+                )
+                return
+        else:
+            return  # webhook disabled: early return
+
+        template = _compiled_template(webhook["body"])
+        body = template.render(job.template_vars)
+
+        headers = {"Content-Type": webhook["contentType"]}
+        headers.update(webhook["headers"])
+
+        timeout = aiohttp.ClientTimeout(total=webhook["timeout"])
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.request(
+                webhook["method"],
+                url,
+                data=body.encode("utf-8"),
+                headers=headers,
+            ) as resp:
+                if resp.status >= 400:
+                    # never log the URL: Slack/Discord-style webhook URLs
+                    # embed a secret token.
+                    logger.error(
+                        "webhook reporter of job %s: server returned"
+                        " HTTP %s: %s",
+                        job.config.name,
+                        resp.status,
+                        (await resp.text())[:1024],
+                    )
+                else:
+                    logger.debug(
+                        "webhook reporter of job %s: HTTP %s",
+                        job.config.name,
+                        resp.status,
+                    )
+
+
 class JobRetryState:
     def __init__(
         self, initial_delay: float, multiplier: float, max_delay: float
@@ -455,6 +512,7 @@ class RunningJob:
         SentryReporter(),
         MailReporter(),
         ShellReporter(),
+        WebhookReporter(),
     ]  # type: List[Reporter]
 
     def __init__(

@@ -29,7 +29,7 @@ yacron2 is a cron replacement built on asyncio that runs natively on Linux, macO
 
 ### Integrations
 
-- [Reporting (Mail, Sentry, Shell)](Reporting): `onFailure`/`onSuccess` reporting via email, Sentry, and shell, with jinja2 templating.
+- [Reporting (Mail, Sentry, Shell, Webhook)](Reporting): `onFailure`/`onSuccess` reporting via email, Sentry, shell, and webhook (Slack-compatible), with jinja2 templating.
 - [Metrics with statsd](Metrics-with-Statsd): Emitting start/stop/success/duration metrics over UDP to statsd.
 - [Metrics with Prometheus](Metrics-with-Prometheus): The `/metrics` endpoint on the web API, with job, scheduler, and cluster metrics in Prometheus or OpenMetrics format.
 - [HTTP Control API](HTTP-API): The optional REST interface for status and on-demand job starts.

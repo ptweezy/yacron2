@@ -81,7 +81,7 @@ exported by the shell reporter is:
 
 The `*_TRUNCATED` variables are exported by the shell reporter
 (`yacron2/job.py`) but are not listed in `README.md`; the other eight match the
-README. See [Reporting (Mail, Sentry, Shell)](Reporting).
+README. See [Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
 
 ### Mail `validate_certs` now defaults to `True`
 
@@ -110,7 +110,7 @@ jobs:
           validate_certs: false
 ```
 
-See [Reporting (Mail, Sentry, Shell)](Reporting).
+See [Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
 
 ### Privilege drop: supplementary groups and derived gid
 

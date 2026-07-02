@@ -127,6 +127,9 @@ jobs:
                     config.DEFAULT_CONFIG["onFailure"]["report"]["sentry"]
                 ),
                 "shell": config.DEFAULT_CONFIG["onFailure"]["report"]["shell"],
+                "webhook": (
+                    config.DEFAULT_CONFIG["onFailure"]["report"]["webhook"]
+                ),
             },
             "retry": {
                 "backoffMultiplier": 2,
@@ -201,6 +204,9 @@ jobs:
                     config.DEFAULT_CONFIG["onFailure"]["report"]["sentry"]
                 ),
                 "shell": config.DEFAULT_CONFIG["onFailure"]["report"]["shell"],
+                "webhook": (
+                    config.DEFAULT_CONFIG["onFailure"]["report"]["webhook"]
+                ),
             },
             "retry": {
                 "backoffMultiplier": 2,

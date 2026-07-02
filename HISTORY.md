@@ -5,6 +5,82 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.2.2 (2026-07-02)
+
+- **New webhook reporter: native Slack/Discord/Teams/ntfy notifications.** A
+  fourth reporter joins sentry/mail/shell in every `report` block: `webhook`
+  sends an HTTP request (POST by default) to a configured URL with a
+  jinja2-templated body. The default body is a `{"text": ...}` JSON payload
+  carrying the same subject-plus-body text as the default mail/sentry
+  templates, JSON-encoded with jinja2's `tojson` filter so quotes, newlines,
+  and non-ASCII job output always produce valid JSON -- point `url` at a
+  Slack, Mattermost, or Teams incoming webhook and it works with no further
+  configuration. `method`, `contentType`, `headers`, `body`, and `timeout`
+  cover everything else (Discord's `{"content": ...}` shape, ntfy's
+  plain-text body and header-driven priority, or your own endpoint). The URL
+  resolves like the sentry DSN (`value` / `fromFile` / `fromEnvVar`) and is
+  treated as a secret throughout: it is never logged, and the job-set
+  fingerprint redacts the inline URL value and all header values (which
+  commonly carry `Authorization` tokens). No new dependency -- outbound
+  delivery rides the core aiohttp. Note: because every job's effective
+  config gains the new default block, job-set ids change on upgrade;
+  replicas must be on the same version to compare ids, as before.
+
+- **Unchanged peers now answer gossip polls with a bodyless `304`.** Every
+  `/peer` response carries a strong `ETag` (a content hash of the payload),
+  and each polling node echoes the tag of the last full body a peer served
+  it back as `If-None-Match`, so a peer whose state has not changed since
+  then skips re-sending the full O(members + jobs) JSON: a converged, idle
+  cluster's steady-state round costs headers rather than bodies. This is a
+  transport optimization, not a protocol change. A `304` is still a fresh,
+  mutually-authenticated round trip, and because the tag is content-derived,
+  a match proves the peer's payload is exactly the one the poller already
+  holds, so the poller replays its cached observation and every gate (mutual
+  agreement, conflict detection, the `cluster.driftAfter` debounce) advances
+  exactly as if the identical body had been re-sent. The one live field, a
+  job's seconds-to-next-fire countdown, is hashed as the absolute next-fire
+  time instead, so the tag stays stable between fires and rolls exactly when
+  a schedule fires. Mixed fleets degrade safely during a rolling upgrade: an
+  older peer ignores `If-None-Match` and keeps serving full bodies, a
+  tagless response stops the poller from sending the header at all, an
+  unsolicited `304` is recorded as a failed poll, and an over-long or
+  non-printable tag is never stored or echoed.
+
+- **Fleet-view countdowns are aged, not frozen.** With `304` rounds
+  refreshing a peer's liveness without re-shipping its job summaries, a
+  stored snapshot can now legitimately outlive many polling rounds, so
+  `GET /fleet` re-derives each peer job's advertised `scheduled_in`
+  countdown from the snapshot's age (an elapsed duration measured on the
+  local clock alone, so peer clock offsets never leak in) instead of serving
+  the value the snapshot arrived with, clamping at zero. The fire itself
+  rolls the peer's `ETag`, so the next poll ships a full body carrying the
+  real successor value.
+
+- **`/peer` bodies that do go out are gzip-compressed** once they reach
+  1 KiB (below that, the per-request CPU spend outweighs the few bytes
+  saved). The polling side already advertised gzip support, and the existing
+  response-size cap applies to the *decompressed* payload, so compression
+  does not weaken it.
+
+- **Dashboard: the version and job-set id header chips copy their value on
+  click.** Header text is chrome and is no longer text-selectable; the two
+  values worth grabbing hand themselves out instead. Clicking the version
+  chip copies the version, and clicking the job-set chip copies the full
+  job-set id even though the header shows only a short prefix; both
+  tooltips say so. The command palette carries the same two copies, so both
+  values stay reachable from the keyboard.
+
+- **Dashboard: the quick "power-on sweep" flash between boots is gone.** The
+  full POST boot screen still replays once its cooldown elapses, but the
+  visits in between now start the app directly instead of playing a
+  full-screen power-on animation first.
+
+- Internal: the conditional exchange ships with a matching batch of cluster
+  tests (tag stability across countdown ticks and rollover on a fire, the
+  `304` replay path, unsolicited-`304` and unusable-tag rejection, countdown
+  aging, and an end-to-end mutual-TLS `304`-plus-gzip round), and the wiki's
+  Architecture and Internals page documents the exchange.
+
 ## 1.2.1 (2026-07-02)
 
 This is the largest yacron2 release since the fork. Its headline feature is

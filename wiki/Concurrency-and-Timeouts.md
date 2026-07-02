@@ -85,7 +85,7 @@ outgoing instance. This flag changes how the finished run is reaped:
 - The replaced run is **not** treated as a failure: `_handle_finished_job`
   returns early when `replaced` is set, logging
   `Job <name> was replaced by a newer instance`.
-- Because it is not a failure, it is **not reported** (no Mail/Sentry/Shell
+- Because it is not a failure, it is **not reported** (no Mail/Sentry/Shell/Webhook
   reporters fire for it) and it does **not** trigger
   [retries](Failure-Detection-and-Retries). `cancel()` itself does not set a
   return code, so whatever value the run's own `wait()` task happened to record

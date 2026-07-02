@@ -139,19 +139,8 @@
     0%,100% { opacity: 1; } 97% { opacity: 1; }
     97.5% { opacity: .82; } 98% { opacity: 1; } 98.5% { opacity: .9; }
   }
-  /* one-shot power-on sweep */
-  body.booting::after {
-    content: ""; position: fixed; inset: 0; z-index: 9500; pointer-events: none;
-    background: var(--fg); opacity: .0; animation: poweron .55s ease-out;
-  }
-  @keyframes poweron {
-    0% { opacity: .9; transform: scaleY(.004); }
-    40% { opacity: .25; transform: scaleY(.02); }
-    100% { opacity: 0; transform: scaleY(1); }
-  }
   @media (prefers-reduced-motion: reduce) {
     body.fx.flicker #crt { animation: none; }
-    body.booting::after { animation: none; }
     .dot.run, .dot.live, .blink { animation: none !important; }
     .iconbtn.spin svg { animation: none !important; }
     .toast { animation: none; }
@@ -165,17 +154,20 @@
     background: color-mix(in srgb, var(--bg) 90%, transparent);
     backdrop-filter: blur(3px);
     border-bottom: 1px solid var(--border);
+    user-select: none;
   }
   .brand { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
-  .brand .mark { color: var(--fg); font-weight: 700; cursor: default; user-select: none;
+  .brand .mark { color: var(--fg); font-weight: 700; cursor: default;
     display: inline-block; }
-  .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; user-select: none; }
-  .brand .tag { font-size: 11px; color: var(--fg-faint); }
-  .brand .ver { font-size: 10.5px; color: var(--fg-faint); }
+  .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; }
+  .brand .tag { font-size: 11px; color: var(--fg-faint); cursor: default; }
+  /* header text can't be selected, so these copy their value on click instead */
+  .brand .ver { font-size: 10.5px; color: var(--fg-faint); cursor: pointer; }
+  .brand .ver:hover { color: var(--fg-dim); text-decoration: underline dotted; }
   .spacer { flex: 1; }
 
   .clock { font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; }
-  .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; cursor: default; user-select: none; }
+  .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; cursor: default; }
 
   .summary { display: flex; gap: 7px; align-items: center; }
   .pill {
@@ -3346,6 +3338,10 @@
       { ic: "◴", lbl: "Cron sandbox", run: () => openSandbox() },
       { ic: "◱", lbl: "Toggle run ledger", run: () => setLedger(!prefs.ledger) },
       { ic: "▮", lbl: "Toggle boot self-test", run: () => setBoot(!prefs.boot) },
+      // the header chips also copy these on click, but the chips are
+      // mouse-only spans -- the palette keeps both reachable by keyboard
+      { ic: "❏", lbl: "Copy version", run: () => { const v = $("ver").textContent; if (v) copyText(v, "version"); } },
+      { ic: "❏", lbl: "Copy job set id", run: () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); } },
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
@@ -3724,6 +3720,9 @@
       markVel += 360;
       if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
     });
+    // header text is unselectable; these chips hand out their value on click
+    $("ver").addEventListener("click", () => { const v = $("ver").textContent; if (v) copyText(v, "version"); });
+    $("jobset").addEventListener("click", () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); });
     $("refreshBtn").addEventListener("click", loadJobs);
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
@@ -3910,8 +3909,13 @@
   }
 
   async function loadVersion() {
-    try { const r = await apiFetch("/version"); if (r.ok) $("ver").textContent = "v" + (await r.text()).trim(); }
-    catch (_) {}
+    try {
+      const r = await apiFetch("/version");
+      if (!r.ok) return;
+      const el = $("ver");
+      el.textContent = "v" + (await r.text()).trim();
+      el.title = "version (click to copy)";
+    } catch (_) {}
   }
 
   async function loadJobSetId() {
@@ -3920,9 +3924,10 @@
       if (!r.ok) return;
       const id = (await r.text()).trim();
       const el = $("jobset");
-      // show a short prefix in the header; full id in the tooltip
+      // show a short prefix in the header; full id in the tooltip + copied on click
       el.textContent = "#" + id.replace(/^v\d+:/, "").slice(0, 12);
-      el.title = "job set id: " + id;
+      el.title = "job set id: " + id + " (click to copy)";
+      el.dataset.full = id;
     } catch (_) {}
   }
 
@@ -4815,7 +4820,7 @@
     syncSettings();
   }
   // The full POST screen replays only after a cooldown has elapsed since it
-  // last ran; in-between visits get the quick power-on sweep instead.
+  // last ran; in-between visits start the app directly.
   const BOOT_SEEN_KEY = PREF_PREFIX + "bootShownAt";
   const BOOT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
   function bootDue() {
@@ -5016,10 +5021,6 @@
   if (prefs.boot && !reducedMotion && bootDue()) {
     runBootSequence(startApp);          // POST screen types out, then starts the app
   } else {
-    if (!reducedMotion) {               // otherwise keep the quick power-on sweep
-      document.body.classList.add("booting");
-      setTimeout(() => document.body.classList.remove("booting"), 600);
-    }
     startApp();
   }
 })();

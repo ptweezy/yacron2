@@ -123,7 +123,7 @@ the inherited environment of every job. Note that the reporting templates'
 which is only populated when the job has a non-empty `environment` or an
 `env_file`; for a job with neither, `environment` is `None` in templates and
 `{{ environment.HOSTNAME }}` renders empty. See
-[Reporting (Mail, Sentry, Shell)](Reporting).
+[Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
 
 ## env_file
 

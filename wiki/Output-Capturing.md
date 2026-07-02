@@ -197,7 +197,7 @@ jobs:
 
 ## See also
 
-- [Reporting (Mail, Sentry, Shell)](Reporting): how captured `stdout`/`stderr`
+- [Reporting (Mail, Sentry, Shell, Webhook)](Reporting): how captured `stdout`/`stderr`
   appear in report templates and shell-reporter environment variables.
 - [Failure Detection and Retries](Failure-Detection-and-Retries):
   `failsWhen.producesStdout` / `producesStderr`.

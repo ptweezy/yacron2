@@ -138,6 +138,18 @@ DEFAULT_SUBJECT_TEMPLATE = (
     "Cron job '{{name}}' {% if success %}completed{% else %}failed{% endif %}"
 )
 
+# Same text as the default sentry body (subject + body), JSON-encoded into a
+# {"text": ...} payload -- the shape Slack, Mattermost and Teams incoming
+# webhooks accept out of the box. Override `body` for other services (e.g.
+# Discord wants {"content": ...}, ntfy takes a plain-text body).
+DEFAULT_WEBHOOK_BODY_TEMPLATE = (
+    '{"text": {% filter tojson %}'
+    + DEFAULT_SUBJECT_TEMPLATE
+    + "\n"
+    + DEFAULT_BODY_TEMPLATE
+    + "{% endfilter %}}"
+)
+
 _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
@@ -163,6 +175,16 @@ _REPORT_DEFAULTS = {
     "shell": {
         "shell": platform.DEFAULT_SHELL,
         "command": None,
+    },
+    "webhook": {
+        # resolved like sentry "dsn": value / fromFile / fromEnvVar. Treated
+        # as a secret (a Slack/Discord webhook URL embeds its token).
+        "url": {"value": None, "fromFile": None, "fromEnvVar": None},
+        "method": "POST",
+        "contentType": "application/json",
+        "headers": {},
+        "body": DEFAULT_WEBHOOK_BODY_TEMPLATE,
+        "timeout": 10,
     },
 }
 
@@ -253,6 +275,22 @@ _report_schema = Map(
             {
                 Opt("shell"): Str(),
                 "command": Str() | Seq(Str()),
+            }
+        ),
+        Opt("webhook"): Map(
+            {
+                Opt("url"): Map(
+                    {
+                        Opt("value"): EmptyNone() | Str(),
+                        Opt("fromFile"): EmptyNone() | Str(),
+                        Opt("fromEnvVar"): EmptyNone() | Str(),
+                    }
+                ),
+                Opt("method"): Str(),
+                Opt("contentType"): Str(),
+                Opt("headers"): MapPattern(Str(), Str()),
+                Opt("body"): Str(),
+                Opt("timeout"): Float(),
             }
         ),
     }

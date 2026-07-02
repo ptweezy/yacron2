@@ -18,7 +18,7 @@
   - [Failure Detection and Retries](Failure-Detection-and-Retries)
   - [Clustering and Leader Election](Clustering-and-Leader-Election)
 - **Integrations**
-  - [Reporting (Mail, Sentry, Shell)](Reporting)
+  - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
   - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)

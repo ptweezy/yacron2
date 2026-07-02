@@ -98,6 +98,6 @@ This matters for `concurrencyPolicy: Replace`, where the scheduler may cancel a 
 
 - [Metrics with Prometheus](Metrics-with-Prometheus): the pull-side sibling; a scrapeable `/metrics` endpoint on the web API.
 - [Configuration Reference](Configuration-Reference): full per-job option list.
-- [Reporting (Mail, Sentry, Shell)](Reporting): the other outbound notification channels.
+- [Reporting (Mail, Sentry, Shell, Webhook)](Reporting): the other outbound notification channels.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): how `job.failed` (and thus `success:0`/`success:1`) is determined.
 - [Concurrency and Timeouts](Concurrency-and-Timeouts): `concurrencyPolicy` and `executionTimeout`, which interact with stop metrics.

@@ -22,7 +22,8 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
   (see [Classic crontab files](#classic-crontab-files))
-* Builtin sending of Sentry and Mail outputs when cron jobs fail
+* Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
+  notifications when cron jobs fail
 * Flexible configuration: you decide how to determine if a cron job fails or not
 * Designed for running in Docker, Kubernetes, or 12 factor environments:
   * Runs in the foreground
@@ -539,7 +540,8 @@ Note: if the configuration option is a directory and there are multiple configur
 ### Reporting
 
 Yacron2 has builtin support for reporting jobs failure (more on that below) by
-email, Sentry and shell command (additional reporting methods might be added in the future):
+email, Sentry, shell command, and HTTP webhook (Slack-compatible out of the
+box):
 
 ```yaml
 - name: test-01
@@ -583,6 +585,9 @@ email, Sentry and shell command (additional reporting methods might be added in 
       shell:
         shell: /bin/bash
         command: ...
+      webhook:
+        url:
+          fromEnvVar: SLACK_WEBHOOK_URL
 ```
 
 Here, the `onFailure` object indicates that what to do when a job failure
@@ -705,6 +710,28 @@ A simple example configuration:
         shell: /bin/bash
         command: echo "Error code $YACRON2_RETCODE"
 ```
+
+The webhook reporter sends an HTTP POST to a URL of your choice. The default
+body is a Slack-compatible `{"text": ...}` JSON payload, so pointing it at a
+Slack, Mattermost, or Teams incoming-webhook URL works with no further
+configuration; `method`, `contentType`, `headers`, `timeout`, and the jinja2
+`body` template are all configurable for other services (Discord, ntfy, or
+your own endpoint). Like the other secrets, the URL can come from `value`,
+`fromFile`, or `fromEnvVar`:
+
+```yaml
+- name: test-01
+  command: echo "foobar" && exit 123
+  schedule: "* * * * *"
+  onFailure:
+    report:
+      webhook:
+        url:
+          fromEnvVar: SLACK_WEBHOOK_URL
+```
+
+See [Reporting](https://github.com/ptweezy/yacron2/wiki/Reporting) in the wiki
+for all webhook options and per-service examples.
 
 It is possible to send emails formatted as html, by adding
 the `html: true` property.  For example, here the standard output of a shell
@@ -1191,7 +1218,8 @@ which gives it some useful properties:
 * `user`/`group` are fingerprinted **as configured** (e.g. `www-data`), not as
   the resolved numeric uid/gid, which can differ host to host;
 * **secret/value material is never embedded**: inline reporting secrets
-  (Sentry DSN, mail password) are redacted, and only the *names* of
+  (Sentry DSN, mail password, webhook URL and header values) are redacted,
+  and only the *names* of
   `environment` variables are hashed, not their values (env commonly holds
   secrets, and a per-host value, e.g. from `env_file`, would otherwise make
   identical configs differ across hosts). The id is safe to log and serve, and

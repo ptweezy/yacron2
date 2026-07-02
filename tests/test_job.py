@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import tempfile
 from unittest.mock import Mock, patch
@@ -572,6 +573,246 @@ jobs:
         with open(out_file_path, "r") as file:
             data = file.read()
         assert data.strip() == expected_output
+
+
+def _webhook_job_config(url_yaml: str, extra: str = "") -> str:
+    return f"""
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        webhook:
+          url:
+{url_yaml}
+{extra}
+"""
+
+
+def _webhook_job(job_config, success=False, stdout="out", stderr="err"):
+    fail_reason = None if success else "reasons"
+    return Mock(
+        config=job_config,
+        stdout=stdout,
+        stderr=stderr,
+        template_vars={
+            "name": job_config.name,
+            "success": success,
+            "fail_reason": fail_reason,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": 0 if success else 123,
+            "command": job_config.command,
+            "shell": job_config.shell,
+            "environment": None,
+        },
+    )
+
+
+class _WebhookServer:
+    """A local aiohttp server capturing every request the reporter makes."""
+
+    def __init__(self, status: int = 200) -> None:
+        from aiohttp import web
+
+        self.requests = []
+        self.status = status
+        app = web.Application()
+        app.router.add_route("*", "/hook", self._handler)
+        self._app = app
+        self._server = None
+
+    async def _handler(self, request):
+        from aiohttp import web
+
+        self.requests.append(
+            {
+                "method": request.method,
+                "headers": dict(request.headers),
+                "body": await request.text(),
+            }
+        )
+        return web.Response(status=self.status, text="a response body")
+
+    async def __aenter__(self) -> str:
+        from aiohttp.test_utils import TestServer
+
+        self._server = TestServer(self._app)
+        await self._server.start_server()
+        return str(self._server.make_url("/hook"))
+
+    async def __aexit__(self, *exc) -> None:
+        await self._server.close()
+
+
+@pytest.mark.parametrize(
+    "success, expected_subject",
+    [
+        (False, "Cron job 'test' failed"),
+        (True, "Cron job 'test' completed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_report_webhook(success, expected_subject):
+    import json
+
+    server = _WebhookServer()
+    async with server as url:
+        conf = yacron2.config.parse_config_string(
+            _webhook_job_config(
+                f"            value: {url}",
+                extra=(
+                    "          headers:\n"
+                    "            X-Custom: yes-hello"
+                ),
+            ),
+            "",
+        )
+        job_config = conf.jobs[0]
+        job = _webhook_job(job_config, success=success)
+
+        reporter = yacron2.job.WebhookReporter()
+        await reporter.report(success, job, job_config.onFailure["report"])
+
+    (request,) = server.requests
+    assert request["method"] == "POST"
+    assert request["headers"]["Content-Type"] == "application/json"
+    assert request["headers"]["X-Custom"] == "yes-hello"
+    # the default body template must render valid JSON in the {"text": ...}
+    # shape Slack-compatible webhooks accept
+    payload = json.loads(request["body"])
+    assert set(payload.keys()) == {"text"}
+    assert payload["text"].startswith(expected_subject)
+    assert "out" in payload["text"]
+    assert "err" in payload["text"]
+    if not success:
+        assert "(job failed because reasons)" in payload["text"]
+
+
+@pytest.mark.parametrize("url_source", ["fromFile", "fromEnvVar"])
+@pytest.mark.asyncio
+async def test_report_webhook_url_sources(url_source, monkeypatch, tmp_path):
+    server = _WebhookServer()
+    async with server as url:
+        if url_source == "fromFile":
+            url_file = tmp_path / "hook-url"
+            url_file.write_text(url + "\n")
+            url_yaml = f"            fromFile: {url_file}"
+        else:
+            monkeypatch.setenv("TEST_WEBHOOK_URL", url)
+            url_yaml = "            fromEnvVar: TEST_WEBHOOK_URL"
+        conf = yacron2.config.parse_config_string(
+            _webhook_job_config(url_yaml), ""
+        )
+        job_config = conf.jobs[0]
+        job = _webhook_job(job_config)
+
+        await yacron2.job.WebhookReporter().report(
+            False, job, job_config.onFailure["report"]
+        )
+
+    assert len(server.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_disabled():
+    # with no url source configured (the default), the reporter must return
+    # early without opening any HTTP session
+    conf = yacron2.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    job_config = conf.jobs[0]
+    job = _webhook_job(job_config)
+
+    def no_session(*args, **kwargs):
+        raise AssertionError("ClientSession must not be created")
+
+    with patch("aiohttp.ClientSession", no_session):
+        await yacron2.job.WebhookReporter().report(
+            False, job, job_config.onFailure["report"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_env_var_not_set(monkeypatch, caplog):
+    monkeypatch.delenv("TEST_WEBHOOK_URL", raising=False)
+    conf = yacron2.config.parse_config_string(
+        _webhook_job_config("            fromEnvVar: TEST_WEBHOOK_URL"), ""
+    )
+    job_config = conf.jobs[0]
+    job = _webhook_job(job_config)
+
+    def no_session(*args, **kwargs):
+        raise AssertionError("ClientSession must not be created")
+
+    with patch("aiohttp.ClientSession", no_session):
+        with caplog.at_level(logging.ERROR, logger="yacron2"):
+            await yacron2.job.WebhookReporter().report(
+                False, job, job_config.onFailure["report"]
+            )
+    assert any(
+        "url env var" in rec.message for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_http_error(caplog):
+    # a non-2xx response is logged at ERROR (with the response text) but must
+    # not raise out of the reporter
+    server = _WebhookServer(status=500)
+    async with server as url:
+        conf = yacron2.config.parse_config_string(
+            _webhook_job_config(f"            value: {url}"), ""
+        )
+        job_config = conf.jobs[0]
+        job = _webhook_job(job_config)
+
+        with caplog.at_level(logging.ERROR, logger="yacron2"):
+            await yacron2.job.WebhookReporter().report(
+                False, job, job_config.onFailure["report"]
+            )
+
+    assert len(server.requests) == 1
+    assert any(
+        "HTTP 500" in rec.getMessage()
+        and "a response body" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_custom_method_and_body():
+    server = _WebhookServer()
+    async with server as url:
+        conf = yacron2.config.parse_config_string(
+            _webhook_job_config(
+                f"            value: {url}",
+                extra=(
+                    "          method: PUT\n"
+                    "          contentType: text/plain\n"
+                    '          body: "job {{ name }}: rc={{ exit_code }}"'
+                ),
+            ),
+            "",
+        )
+        job_config = conf.jobs[0]
+        job = _webhook_job(job_config)
+
+        await yacron2.job.WebhookReporter().report(
+            False, job, job_config.onFailure["report"]
+        )
+
+    (request,) = server.requests
+    assert request["method"] == "PUT"
+    assert request["headers"]["Content-Type"] == "text/plain"
+    assert request["body"] == "job test: rc=123"
 
 
 @pytest.mark.parametrize(

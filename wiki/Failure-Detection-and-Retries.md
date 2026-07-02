@@ -138,7 +138,7 @@ See [Schedules and Timezones](Schedules-and-Timezones) for `@reboot` semantics.
 
 ## Report hooks
 
-Each hook has its own independent `report` block (Sentry, mail, shell), defaulted from `_REPORT_DEFAULTS` (deep-copied per hook so they do not alias). All three reporters in a block run for the relevant outcome; reporting errors are logged and do not abort the others. See [Reporting (Mail, Sentry, Shell)](Reporting) for the report block options.
+Each hook has its own independent `report` block (Sentry, mail, shell, webhook), defaulted from `_REPORT_DEFAULTS` (deep-copied per hook so they do not alias). All four reporters in a block run for the relevant outcome; reporting errors are logged and do not abort the others. See [Reporting (Mail, Sentry, Shell, Webhook)](Reporting) for the report block options.
 
 | Hook | Fires when | Frequency |
 | --- | --- | --- |

@@ -260,7 +260,7 @@ does not apply. See [Clustering and Leader Election](Clustering-and-Leader-Elect
 Apart from the differences above, yacron2 behaves the same on Windows as on
 POSIX. The YAML crontab, schedules and timezones, environment variables and env
 files, output capturing, concurrency, failure detection and retries, reporting
-(mail / Sentry / shell), statsd metrics, the Prometheus `/metrics` endpoint,
+(mail / Sentry / shell / webhook), statsd metrics, the Prometheus `/metrics` endpoint,
 the HTTP control API, and the web dashboard all work exactly as documented
 elsewhere in this wiki:
 
@@ -269,7 +269,7 @@ elsewhere in this wiki:
 - [Output Capturing](Output-Capturing)
 - [Concurrency and Timeouts](Concurrency-and-Timeouts)
 - [Failure Detection and Retries](Failure-Detection-and-Retries)
-- [Reporting (Mail, Sentry, Shell)](Reporting)
+- [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
 - [Metrics with statsd](Metrics-with-Statsd) and
   [Metrics with Prometheus](Metrics-with-Prometheus)
 - [HTTP Control API](HTTP-API) and [Web Dashboard](Web-Dashboard)

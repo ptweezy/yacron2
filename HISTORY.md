@@ -5,6 +5,80 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.2.5 (2026-07-03)
+
+A performance and footprint release. There are **no behavior or configuration
+changes**: every schedule fires exactly as before, the metrics endpoint renders
+byte-for-byte identically, and the core install stays zero-new-dependency. The
+work trims CPU on the daemon's hottest repeating paths -- the once-a-minute
+config reload, every Prometheus scrape, and each cluster poll / gossip round /
+lease renew -- lowers steady-state memory, and adds an optional faster event
+loop.
+
+- **Optional uvloop event loop (`speedups` extra).** `pip install
+  yacron2[speedups]` swaps asyncio's selector loop for uvloop's faster
+  libuv-based one, speeding every I/O path yacron2 drives: cluster gossip and
+  lease HTTP, the web dashboard, and the Prometheus scrape. It is entirely
+  opt-in and best-effort -- `__main__` selects uvloop lazily on POSIX and falls
+  back to stock asyncio, behavior unchanged, whenever it is absent or
+  unimportable -- so it stays off the core install to keep the baseline
+  architecture-portable. Windows always uses its Proactor loop (there is no
+  uvloop build there, and the Proactor loop is required for subprocess support
+  anyway). The prebuilt POSIX binaries now bundle uvloop wherever it builds: a
+  wheel where one exists, an otherwise verified source build, with a start-up
+  self-test (`verify_uvloop.py`) that uninstalls a miscompiled build (a real
+  risk under QEMU emulation) before freezing so the binary cleanly runs on
+  asyncio instead. An arch where uvloop cannot build ships the asyncio binary
+  exactly as before.
+
+- **The once-a-minute reload no longer reparses an unchanged config.** The
+  scheduler rereads and reparses the config every minute so an on-disk edit is
+  picked up promptly, but strictyaml is a slow pure-Python parser and reparsing
+  an unchanged file was pure wasted work (in a worker thread, but still real CPU
+  plus thread-pool churn). `reload_config` now compares a cheap `os.stat`
+  fingerprint -- `(path, mtime_ns, size)` per file, plus the config directory's
+  own mtime -- of exactly the files the last parse read (the top-level config,
+  every transitively `include`d file, and each job's `env_file`) and skips the
+  reparse entirely when nothing has changed, returning the already-loaded
+  config. A genuine edit, a vanished file, or a new entry dropped into a config
+  directory still reparses on the next pass.
+
+- **Cheaper Prometheus scrapes.** The job-set fingerprint (`job_set_id`, queried
+  on every scrape and every cluster poll / gossip round / lease renew) is a pure
+  function of the loaded jobs, so it is now computed once per reload and
+  memoized rather than re-deriving its per-job deepcopy / JSON / SHA-256 each
+  time. The `job_next_run_timestamp` gauge reads the scheduler's authoritative
+  next-fire index instead of re-walking every crontab and building two aware
+  datetimes per job per scrape (falling back to a direct computation only in the
+  brief start-up window before the index is seeded). The histogram `le` label
+  strings are precomputed once from the bucket bounds rather than re-rendered for
+  every bucket of every job on every scrape.
+
+- **Lower steady-state memory and faster attribute access.** `JobConfig` -- one
+  instance per configured job for the life of the process -- now declares
+  `__slots__`, trimming its per-instance `__dict__` and speeding the attribute
+  reads on the scheduling hot path. Fingerprint redaction is now copy-on-write
+  instead of `deepcopy`, so the long immutable report templates (the sentry body,
+  the webhook body) are shared by reference rather than duplicated on each
+  fingerprint. The PyInstaller binaries are now built with `optimize=2`, which
+  strips docstrings and (side-effect-free, internal-invariant) asserts from the
+  frozen bytecode -- yacron2's modules are deliberately docstring-dense, so this
+  shrinks the binary and lowers resident memory for the life of the daemon.
+
+- **The idle scheduler no longer polls once a second.** The job reaper waited on
+  its "any job running?" event with a one-second timeout, waking every second
+  even when nothing was running. It now blocks on the event outright -- the wait
+  condition can only change when a job launches or shutdown is signalled, both of
+  which set the event (shutdown now does so explicitly, so the reaper exits
+  promptly) -- so a fully idle daemon does no per-second work. A related fix reads
+  the running-jobs map with `.get()` so a concurrency check can no longer leave a
+  phantom empty entry that would spin the reaper hot at shutdown.
+
+- Internal: the reload skip cache (change detection, the failed-parse and
+  worker-thread paths), the memoized fingerprint, and the scrape reading the
+  seeded next-fire index are covered by new tests; the uvloop bundling is gated
+  behind a build-time verification step and the per-arch `--version` smoke test.
+
 ## 1.2.4 (2026-07-03)
 
 This release re-implements the scheduler core added in 1.2.3 without changing

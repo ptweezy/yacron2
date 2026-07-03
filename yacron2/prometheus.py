@@ -271,6 +271,13 @@ class PrometheusMetrics:
     def __init__(self) -> None:
         self._jobs: Dict[str, _JobMetrics] = {}
         self._buckets: Tuple[float, ...] = DEFAULT_DURATION_BUCKETS
+        # The histogram "le" label strings are a pure function of the (fixed
+        # between config changes) bucket bounds, so render them once here (and
+        # in set_duration_buckets) rather than repr()-ing every bound for every
+        # job on every scrape.
+        self._bucket_bound_strs: Tuple[str, ...] = tuple(
+            _bucket_bound(b) for b in self._buckets
+        )
         self._start_time = time.time()
         self._last_reload_ok: Optional[bool] = None
         self._last_reload_success_time: Optional[float] = None
@@ -284,6 +291,7 @@ class PrometheusMetrics:
         if new == self._buckets:
             return
         self._buckets = new
+        self._bucket_bound_strs = tuple(_bucket_bound(b) for b in new)
         # Bucket bounds changed: past observations cannot be re-binned, so
         # every job's histogram restarts from zero -- an ordinary counter
         # reset to Prometheus. The run/outcome counters are unaffected.
@@ -411,8 +419,7 @@ class PrometheusMetrics:
     def _job_families(self, cron: "Cron") -> List[MetricFamily]:
         # Local import: cron.py imports this module, so the cycle can only
         # be broken at call time (mirrors the deferred imports elsewhere).
-        # get_now (rather than datetime.now directly) keeps scrape-time
-        # values on the same clock the scheduler itself uses.
+        # get_now/datetime are only touched by the next-fire fallback below.
         import datetime
 
         from yacron2.cron import get_now, schedule_str
@@ -472,12 +479,13 @@ class PrometheusMetrics:
             permanent.add(labels, job.permanent_failures)
             start_failures.add(labels, job.start_failures)
             # bucket_counts is stored cumulatively (every bound >= the
-            # observation is incremented), so the counts render as-is.
-            for bound, count in zip(
-                self._buckets, job.bucket_counts, strict=True
+            # observation is incremented), so the counts render as-is. The "le"
+            # label strings are precomputed (self._bucket_bound_strs).
+            for le, count in zip(
+                self._bucket_bound_strs, job.bucket_counts, strict=True
             ):
                 duration.add(
-                    {"job_name": name, "le": _bucket_bound(bound)},
+                    {"job_name": name, "le": le},
                     count,
                     suffix="_bucket",
                 )
@@ -547,7 +555,22 @@ class PrometheusMetrics:
             )
             enabled.add(labels, 1 if job_config.enabled else 0)
             running.add(labels, len(cron.running_jobs.get(name) or ()))
-            if job_config.enabled and isinstance(job_config.schedule, CronTab):
+            # Reuse the scheduler's authoritative next-fire instant instead of
+            # re-walking the crontab and building two aware datetimes per job
+            # per scrape: cron._next_fire holds the aware-UTC next fire for
+            # exactly the enabled CronTab jobs, maintained incrementally by the
+            # loop (and computed the same way the fallback below does). This is
+            # the steady-state path.
+            when = cron._next_fire.get(name)
+            if when is not None:
+                next_run.add(labels, when.timestamp())
+            elif job_config.enabled and isinstance(
+                job_config.schedule, CronTab
+            ):
+                # Index not yet seeded: a scrape in the startup window before
+                # the loop's first tick, or metrics rendered on a Cron whose
+                # loop never ran. Compute the next fire directly so the gauge
+                # is still emitted (absent for disabled/@reboot jobs).
                 seconds = job_config.schedule.next(
                     now=get_now(job_config.timezone),
                     default_utc=job_config.utc,

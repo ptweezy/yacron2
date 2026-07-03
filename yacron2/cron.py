@@ -334,6 +334,13 @@ class Cron:
         self.metrics = PrometheusMetrics()
         # list of cron jobs we /want/ to run
         self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
+        # Memoized job-set fingerprint (see job_set_id). The fingerprint is a
+        # pure function of cron_jobs, but it is queried on hot, repeating paths
+        # (every /metrics scrape, every peer poll, each gossip round, several
+        # times per lease renew) while only ever changing on a reload. Computed
+        # lazily, cached here, and invalidated (set None) at every point
+        # cron_jobs is reassigned.
+        self._job_set_id_cache = None  # type: Optional[str]
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
@@ -376,6 +383,7 @@ class Cron:
             self.cron_jobs = OrderedDict(
                 (job.name, job) for job in config.jobs
             )
+            self._job_set_id_cache = None
 
         self._wait_for_running_jobs_task = None  # type: Optional[asyncio.Task]
         self._stop_event = asyncio.Event()
@@ -557,6 +565,11 @@ class Cron:
     def signal_shutdown(self) -> None:
         logger.debug("Signalling shutdown")
         self._stop_event.set()
+        # Wake the job reaper if it is parked on the idle wait below, so it
+        # re-evaluates the loop condition and exits promptly instead of after
+        # its next poll. Harmless when a job is running (the reaper clears this
+        # each busy iteration); the only other setter is a job launch.
+        self._jobs_running.set()
 
     @staticmethod
     def _empty_config() -> Yacron2Config:
@@ -692,6 +705,10 @@ class Cron:
         self.metrics.config_parse(True)
         old_jobs = self.cron_jobs
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
+        # The job set changed: drop the memoized fingerprint so the next
+        # job_set_id() recomputes it once. A failed parse raises before this
+        # point, so a bad reload never stales the cache.
+        self._job_set_id_cache = None
         # Drop metric series for jobs removed from the config, so a renamed
         # job does not leave a stale twin behind forever. A removed job with
         # an instance still running keeps its accumulator until the run
@@ -722,8 +739,18 @@ class Cron:
 
         Two yacron2 instances return the same value iff they hold the same set
         of jobs (same effective config, any order); see yacron2.fingerprint.
+
+        Memoized: the fingerprint is a pure function of the loaded job set, so
+        it is computed once per reload and cached (invalidated wherever
+        cron_jobs is reassigned), keeping the per-job deepcopy/JSON/SHA-256
+        work off the scrape / gossip / lease-renew paths that query it each
+        cycle.
         """
-        return job_set_id(self.cron_jobs.values())
+        cached = self._job_set_id_cache
+        if cached is None:
+            cached = job_set_id(self.cron_jobs.values())
+            self._job_set_id_cache = cached
+        return cached
 
     def _log_job_set_id(self) -> None:
         """Log the job-set id at startup and whenever a reload changes it."""
@@ -2334,10 +2361,12 @@ class Cron:
                         if job not in wait_tasks:
                             wait_tasks[job] = asyncio.create_task(job.wait())
                 if not wait_tasks:
-                    try:
-                        await asyncio.wait_for(self._jobs_running.wait(), 1)
-                    except asyncio.TimeoutError:
-                        pass
+                    # Nothing running: block until a job launches or shutdown
+                    # is signalled (both set _jobs_running) rather than polling
+                    # once a second. This is the scheduler's most frequent idle
+                    # wakeup, and the loop condition can only change on those
+                    # two events, so a plain wait loses no liveness.
+                    await self._jobs_running.wait()
                     continue
                 self._jobs_running.clear()
                 # wait for at least one task with timeout

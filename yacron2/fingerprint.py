@@ -40,7 +40,6 @@ and ``cmd.exe`` on Windows).  Compare instances running on the same platform,
 which HA replicas are.
 """
 
-import copy
 import hashlib
 import json
 from typing import Any, Dict, Iterable, List, Union
@@ -93,36 +92,57 @@ def _command_repr(command: Union[str, List[str]]) -> Dict[str, Any]:
 
 
 def _redact_report(report: Dict[str, Any]) -> Dict[str, Any]:
-    """Deep-copy a report block, replacing inline secret values with a marker.
+    """Copy a report block, replacing inline secret values with a marker.
 
     Only the literal ``value`` of a sentry DSN / mail password / webhook URL
     (plus webhook header values) is redacted; the ``fromFile`` /
     ``fromEnvVar`` references are paths and env-var names (not secrets) and
     are kept, since they are part of the job's identity.
+
+    Copy-on-write, not ``deepcopy``: the report carries long immutable template
+    strings (sentry body, the ~300-char webhook body) that we only ever read,
+    so we shallow-copy just the dicts on the path to each redacted leaf and
+    share every untouched subtree by reference. The input ``report`` (a live
+    JobConfig dict) is never mutated -- see test_canonical_job_is_json_safe_
+    and_pure -- and downstream (``_normalize_numbers``, ``json.dumps``) only
+    reads, so reference-sharing is safe and the output stays byte-identical.
     """
-    redacted = copy.deepcopy(report)
-    sentry = redacted.get("sentry")
+    out = dict(report)
+    sentry = out.get("sentry")
     if isinstance(sentry, dict):
         dsn = sentry.get("dsn")
         if isinstance(dsn, dict) and dsn.get("value") is not None:
-            dsn["value"] = _SECRET_PLACEHOLDER
-    mail = redacted.get("mail")
+            out["sentry"] = {
+                **sentry,
+                "dsn": {**dsn, "value": _SECRET_PLACEHOLDER},
+            }
+    mail = out.get("mail")
     if isinstance(mail, dict):
         password = mail.get("password")
         if isinstance(password, dict) and password.get("value") is not None:
-            password["value"] = _SECRET_PLACEHOLDER
-    webhook = redacted.get("webhook")
+            out["mail"] = {
+                **mail,
+                "password": {**password, "value": _SECRET_PLACEHOLDER},
+            }
+    webhook = out.get("webhook")
     if isinstance(webhook, dict):
+        new_webhook = None
         url = webhook.get("url")
         if isinstance(url, dict) and url.get("value") is not None:
-            url["value"] = _SECRET_PLACEHOLDER
+            new_webhook = dict(webhook)
+            new_webhook["url"] = {**url, "value": _SECRET_PLACEHOLDER}
         headers = webhook.get("headers")
         if isinstance(headers, dict):
             # header *values* commonly carry credentials (e.g. an
             # Authorization token); keep the names, which are identity.
-            for name in headers:
-                headers[name] = _SECRET_PLACEHOLDER
-    return redacted
+            if new_webhook is None:
+                new_webhook = dict(webhook)
+            new_webhook["headers"] = dict.fromkeys(
+                headers, _SECRET_PLACEHOLDER
+            )
+        if new_webhook is not None:
+            out["webhook"] = new_webhook
+    return out
 
 
 def _redact_action(action: Dict[str, Any]) -> Dict[str, Any]:

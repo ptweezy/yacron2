@@ -3764,16 +3764,23 @@
       markDeg = (markDeg + markVel * dt) % 360;
       markVel *= Math.pow(0.757822222, dt);
       mark.style.transform = `rotate(${markDeg}deg)`;
-      if (markVel > 3) { markRaf = requestAnimationFrame(spinMark); }
+      // magnitude, not sign: a negative velocity means it's coasting backwards
+      if (Math.abs(markVel) > 3) { markRaf = requestAnimationFrame(spinMark); }
       else { markVel = 0; markRaf = 0; }
     };
-    const bumpMark = () => {
-      markVel += 360;
+    // one nudge = one click's worth of spin; the sign picks the direction
+    const nudgeMark = (d) => {
+      markVel += d;
       if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
     };
+    const bumpMark = () => nudgeMark(360);
+    // right-click drives it the other way instead of popping the browser menu
+    const slowMark = (e) => { e.preventDefault(); nudgeMark(-360); };
     mark.addEventListener("click", bumpMark);
-    // clicking the wordmark spins the logo too
+    mark.addEventListener("contextmenu", slowMark);
+    // clicking the wordmark spins the logo too; right-click there brakes it
     $("brandName").addEventListener("click", bumpMark);
+    $("brandName").addEventListener("contextmenu", slowMark);
     // header text is unselectable; these chips hand out their value on click
     $("ver").addEventListener("click", () => { const v = $("ver").textContent; if (v) copyText(v, "version"); });
     $("jobset").addEventListener("click", () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); });

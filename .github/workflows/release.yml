@@ -227,6 +227,15 @@ jobs:
           pip install --upgrade pip
           pip install pyinstaller==6.21.0  # pin matches pyinstaller/Dockerfile
           pip install .                     # bakes the pinned version into yacron2/version.py
+          # Bundle uvloop (the `speedups` extra) so the binary runs the faster
+          # event loop. Install a wheel where one exists, else build from sdist
+          # (this is a release: ship uvloop as broadly as it compiles); a failed
+          # install falls back to asyncio. verify_uvloop.py then proves the
+          # result actually runs a loop (a source build can miscompile under
+          # emulation) and uninstalls it if not, so a broken uvloop is never
+          # frozen in -- the binary then cleanly uses asyncio.
+          pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
+          python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
           pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           mv dist/yacron2 "dist/yacron2-linux-${{ matrix.arch }}"
@@ -314,6 +323,15 @@ jobs:
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
               pip install .                     # bakes the pinned version into yacron2/version.py
+              # Bundle uvloop (the `speedups` extra): a musllinux wheel where one
+              # exists (amd64/arm64), else a source build (this is a release:
+              # ship it as broadly as it compiles -- build-base above supplies the
+              # toolchain). verify_uvloop.py proves the result runs a loop (a
+              # source build can miscompile under QEMU) and uninstalls it
+              # otherwise, so a broken uvloop is never frozen in; the binary then
+              # cleanly falls back to asyncio.
+              pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
+              python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
               pyinstaller pyinstaller/yacron2.spec
               dist/yacron2 --version            # smoke test: a musl binary on a musl host
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
@@ -388,6 +406,15 @@ jobs:
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into yacron2/version.py
+              # Bundle uvloop (the `speedups` extra): a manylinux wheel where one
+              # exists (amd64/arm64), else a source build (this is a release:
+              # ship it as broadly as it compiles -- build-essential above
+              # supplies the toolchain). verify_uvloop.py proves the result runs a
+              # loop (a source build can miscompile under QEMU) and uninstalls it
+              # otherwise, so a broken uvloop is never frozen in; the binary then
+              # cleanly falls back to asyncio.
+              pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
+              python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
               pyinstaller pyinstaller/yacron2.spec
               dist/yacron2 --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
@@ -441,6 +468,12 @@ jobs:
           pip install --upgrade pip
           pip install pyinstaller==6.21.0  # pin matches the Linux jobs
           pip install .                     # bakes the pinned version into yacron2/version.py
+          # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
+          # ships wheels for both arches. verify_uvloop.py confirms it imports and
+          # runs a loop, else uninstalls it so the binary falls back to asyncio
+          # (yacron2/__main__._new_event_loop).
+          pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
+          python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
           pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           # Assert the binary is the intended native arch: Rosetta would happily

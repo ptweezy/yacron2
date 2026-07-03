@@ -22,6 +22,10 @@ COPY . /root/yacron2
 WORKDIR /root/yacron2
 RUN git status
 RUN pip install .
+# Best-effort, wheel-only: bundle uvloop so this (x86_64 glibc) local build gets
+# the faster event loop too, mirroring the CI binary jobs. Falls back to asyncio
+# if no wheel is available (yacron2/__main__._new_event_loop).
+RUN pip install --only-binary=:all: "uvloop>=0.19" || echo "no uvloop wheel; using asyncio"
 RUN python pyinstaller/yacron2 --version
 RUN pyinstaller pyinstaller/yacron2.spec
 RUN ls -sFh dist/yacron2

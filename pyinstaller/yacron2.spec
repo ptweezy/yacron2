@@ -16,6 +16,22 @@ STRIP = sys.platform != "win32"
 # it without needing any files on disk
 datas = collect_data_files("yacron2")
 
+# uvloop is an optional runtime accelerator: yacron2/__main__._new_event_loop
+# imports it lazily on POSIX and falls back to asyncio when it is absent. A
+# frozen binary only contains what is importable in the build environment, so
+# bundle it (as a hidden import, since the lazy in-function import is easy for
+# the analysis to miss) exactly when the build env actually has it -- the POSIX
+# binary CI jobs best-effort `pip install` a uvloop wheel before freezing.
+# Absent (Windows, or a niche arch with no wheel) this stays empty and the
+# binary simply runs on stock asyncio.
+hiddenimports = []
+try:
+    import uvloop  # noqa: F401
+
+    hiddenimports = ["uvloop"]
+except ImportError:
+    pass
+
 
 # optimize=2 compiles every bundled module at -OO: it strips assert statements
 # AND docstrings from the frozen bytecode. yacron2's modules are deliberately
@@ -33,7 +49,7 @@ a = Analysis(
     pathex=["."],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
     excludes=[],

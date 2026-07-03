@@ -141,6 +141,11 @@ jobs:
           pip install --upgrade pip
           pip install pyinstaller==6.21.0  # pin matches pyinstaller/Dockerfile
           pip install .                     # bakes the pinned version into yacron2/version.py
+          # Best-effort: bundle uvloop (the `speedups` extra) so the binary runs
+          # the faster event loop. Wheel-only, so an arch with no prebuilt uvloop
+          # wheel skips it cleanly (no sdist/QEMU compile) and the binary falls
+          # back to asyncio at runtime (yacron2/__main__._new_event_loop).
+          pip install --only-binary=:all: "uvloop>=0.19" || echo "no uvloop wheel for this arch; using asyncio"
           pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           mv dist/yacron2 "dist/yacron2-linux-${{ matrix.arch }}"
@@ -230,6 +235,10 @@ jobs:
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
               pip install .                     # bakes the pinned version into yacron2/version.py
+              # Best-effort, wheel-only: bundle uvloop where a musllinux wheel
+              # exists (amd64/arm64), skip it cleanly elsewhere -- no sdist build
+              # under QEMU; the binary falls back to asyncio at runtime.
+              pip install --only-binary=:all: "uvloop>=0.19" || echo "no uvloop wheel for this arch; using asyncio"
               pyinstaller pyinstaller/yacron2.spec
               dist/yacron2 --version            # smoke test: a musl binary on a musl host
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
@@ -304,6 +313,10 @@ jobs:
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into yacron2/version.py
+              # Best-effort, wheel-only: bundle uvloop where a manylinux wheel
+              # exists (amd64/arm64), skip it cleanly elsewhere -- no sdist build
+              # under QEMU; the binary falls back to asyncio at runtime.
+              pip install --only-binary=:all: "uvloop>=0.19" || echo "no uvloop wheel for this arch; using asyncio"
               pyinstaller pyinstaller/yacron2.spec
               dist/yacron2 --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
@@ -358,6 +371,10 @@ jobs:
           pip install --upgrade pip
           pip install pyinstaller==6.21.0  # pin matches the Linux jobs
           pip install .                     # bakes the pinned version into yacron2/version.py
+          # Best-effort, wheel-only: bundle uvloop (the `speedups` extra) for the
+          # faster event loop where a macOS wheel exists; the binary falls back
+          # to asyncio at runtime otherwise (yacron2/__main__._new_event_loop).
+          pip install --only-binary=:all: "uvloop>=0.19" || echo "no uvloop wheel for this arch; using asyncio"
           pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           # Assert the binary is the intended native arch: Rosetta would happily

@@ -82,7 +82,7 @@ jobs:
       - uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           version: "0.11.26"
       - name: Compute build version
@@ -107,7 +107,7 @@ jobs:
       - uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           version: "0.11.26"
       - name: Build distributions
@@ -147,7 +147,7 @@ jobs:
       - uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           version: "0.11.26"
       - name: Build binary
@@ -396,7 +396,7 @@ jobs:
       - uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           version: "0.11.26"
       - name: Build binary
@@ -463,7 +463,7 @@ jobs:
       - uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           version: "0.11.26"
       - name: Build binary

@@ -44,6 +44,7 @@ from yacron2 import crontabs, platform
 logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
 ClusterConfig = NewType("ClusterConfig", Dict[str, Any])
+StateConfig = NewType("StateConfig", Dict[str, Any])
 JobDefaults = NewType("JobDefaults", Dict[str, Any])
 LoggingConfig = NewType("LoggingConfig", Dict[str, Any])
 
@@ -109,6 +110,30 @@ DEFAULT_ETCD: Dict[str, Any] = {
     "password": {"value": None, "fromFile": None, "fromEnvVar": None},
     # optional client TLS to the etcd endpoints
     "tls": {"ca": None, "cert": None, "key": None},
+}
+
+
+# Defaults for an (optional) state block. Only applied when a `state` section
+# is present; see _build_state_config. yacron2 is stateless by default, so the
+# whole section is absent unless the user opts in.
+DEFAULT_STATE: Dict[str, Any] = {
+    # required: the directory the durable store lives in. A local path gives
+    # single-node durability; an Amazon S3 Files / EFS mount gives durability
+    # plus fleet-wide coordination -- the same POSIX backend either way, the
+    # mount decides the reach. Enforced non-empty in _build_state_config.
+    "path": None,
+    # auto (probe the mount) | single-node | shared. Gates whether cross-node
+    # coordination may be offered; auto detects a shared network mount
+    # (NFS/EFS/S3 Files) and otherwise assumes single-node. See yacron2.state.
+    "topology": "auto",
+    # optional stable prefix so several deployments can share one store/bucket
+    # without colliding or cross-reading; None -> the "default" namespace.
+    "deploymentId": None,
+    # how many finished runs to retain durably per job (the durable analogue of
+    # the in-memory history ring); the ledger is pruned to this after each
+    # append. <= 0 disables pruning (unbounded; rely on an external lifecycle
+    # rule). Durable retention is larger than the in-memory window on purpose.
+    "maxRunsPerJob": 1000,
 }
 
 
@@ -477,6 +502,20 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         ),
                     }
                 ),
+            }
+        ),
+        # Optional state section: an opt-in durable store (a local filesystem
+        # path or an Amazon S3 Files / EFS mount -- the same POSIX backend
+        # either way) enabling restart-durable history, missed-run catch-up
+        # and, on a shared mount, HA coordination. Stateless by default: absent
+        # this section yacron2 keeps everything in memory exactly as before.
+        # See yacron2.state.
+        Opt("state"): Map(
+            {
+                "path": Str(),
+                Opt("topology"): Enum(["auto", "single-node", "shared"]),
+                Opt("deploymentId"): Str(),
+                Opt("maxRunsPerJob"): Int(),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -1057,6 +1096,21 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
     if backend == "etcd":
         return _build_etcd_cluster_config(raw)
     return _build_gossip_cluster_config(raw)
+
+
+def _build_state_config(raw: dict) -> StateConfig:
+    """Fill the state defaults over a raw (schema-validated) block, validate.
+
+    ``path`` is the one required key (the schema enforces its presence and
+    string type; this guards against an empty/whitespace value that would
+    otherwise resolve to a surprising directory).  ``topology`` is already
+    constrained to the enum by the schema, and ``deploymentId`` is free-form.
+    """
+    cfg: Dict[str, Any] = dict(DEFAULT_STATE)
+    cfg.update(raw)
+    if not cfg.get("path") or not str(cfg["path"]).strip():
+        raise ConfigError("state.path is required and must be non-empty")
+    return StateConfig(cfg)
 
 
 def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
@@ -1750,6 +1804,9 @@ class Yacron2Config:
     # Optional; None default so existing constructors (e.g. the empty config in
     # Cron.update_config) need no change.
     cluster_config: Optional[ClusterConfig] = None
+    # Optional durable state backend (yacron2.state); None keeps the classic
+    # stateless, in-memory behaviour. Defaulted for the same reason as above.
+    state_config: Optional[StateConfig] = None
 
 
 def parse_config_string(
@@ -1806,6 +1863,7 @@ def _config_from_doc(
     clusterconf = (
         _build_cluster_config(doc["cluster"]) if "cluster" in doc else None
     )
+    stateconf = _build_state_config(doc["state"]) if "state" in doc else None
     logging_conf = LoggingConfig(doc["logging"]) if "logging" in doc else None
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
@@ -1826,6 +1884,10 @@ def _config_from_doc(
             if clusterconf:
                 raise ConfigError("multiple cluster configs")
             clusterconf = inc_config.cluster_config
+        if inc_config.state_config:
+            if stateconf:
+                raise ConfigError("multiple state configs")
+            stateconf = inc_config.state_config
         if inc_config.logging_config:
             if logging_conf:
                 raise ConfigError("multiple logging configs")
@@ -1841,6 +1903,7 @@ def _config_from_doc(
         job_defaults=JobDefaults(defaults),
         logging_config=logging_conf,
         cluster_config=clusterconf,
+        state_config=stateconf,
     )
 
 
@@ -1942,6 +2005,8 @@ def _parse_config_dir(
     web_config_source_fname: Optional[str] = None
     cluster_config: Optional[ClusterConfig] = None
     cluster_config_source_fname: Optional[str] = None
+    state_config: Optional[StateConfig] = None
+    state_config_source_fname: Optional[str] = None
     logging_config: Optional[LoggingConfig] = None
     logging_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
@@ -1989,6 +2054,17 @@ def _parse_config_dir(
                         cluster_config_source_fname, direntry.path
                     )
                 )
+        if config.state_config is not None:
+            if state_config is None:
+                state_config = config.state_config
+                state_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'state' configurations found: "
+                    "first in {}, now in {}".format(
+                        state_config_source_fname, direntry.path
+                    )
+                )
         if config.logging_config is not None:
             if logging_config is None:
                 logging_config = config.logging_config
@@ -2014,4 +2090,5 @@ def _parse_config_dir(
         job_defaults=job_defaults,
         logging_config=logging_config,
         cluster_config=cluster_config,
+        state_config=state_config,
     )

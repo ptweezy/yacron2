@@ -17,11 +17,21 @@ the ``grp``/``pwd`` databases), but is likewise gated on :data:`IS_WINDOWS`.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
 import sys
-from typing import Callable, List, Union
+from typing import Callable, Iterator, List, Union
+
+# Platform-specific file-locking primitive, imported behind a ``sys.platform``
+# guard so each OS pulls in only the module it has (``fcntl`` is Unix-only,
+# ``msvcrt`` Windows-only) and mypy -- pinned to ``platform = linux`` -- checks
+# just the POSIX branch, exactly as the signal handling below is arranged.
+if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
+    import msvcrt
+else:
+    import fcntl
 
 logger = logging.getLogger("yacron2")
 
@@ -144,3 +154,48 @@ def install_shutdown_handlers(
             signal.signal(sig, prev)
 
     return restore_signal_handlers
+
+
+# --- Advisory exclusive file locking -------------------------------------
+@contextlib.contextmanager
+def exclusive_file_lock(fileno: int) -> Iterator[None]:
+    """Hold a blocking, advisory, exclusive lock on ``fileno`` for the block.
+
+    Used by :class:`yacron2.state.FilesystemStateBackend` to serialise the
+    read-modify-write of a lease file.  The reach of the lock is a property of
+    the *mount*, not this code, which is what lets one backend serve both
+    deployment shapes:
+
+    * on a **local** filesystem the lock excludes other processes on the same
+      host -- exactly right for single-node durability;
+    * on a **shared** NFSv4 mount (an Amazon S3 Files / EFS mount) the same
+      lock is honoured *across hosts*, so it excludes the fleet -- exactly
+      right for HA.
+
+    On POSIX this is ``fcntl.flock`` (whole-file, advisory: it does not block
+    I/O by non-cooperating processes, which is fine because yacron2 owns both
+    sides).  On Windows it is ``msvcrt.locking`` over the first byte; Windows
+    has no cross-host story, so it only ever serialises same-host processes
+    (single-node), which is all the Windows target needs.  Blocking: a stuck
+    holder would wait here, so callers run the whole locked section in a worker
+    thread (``asyncio.to_thread``) to keep it off the event loop, and the
+    section itself only rewrites a tiny file, so contention is brief.
+    """
+    if sys.platform == "win32":  # pragma: no cover - Windows-only path
+        # msvcrt.locking locks ``nbytes`` from the current file position; lock
+        # the first byte (the caller guarantees the lock file has one).
+        # LK_LOCK retries internally for ~10s, then raises OSError, rather than
+        # blocking forever as flock does.
+        os.lseek(fileno, 0, os.SEEK_SET)
+        msvcrt.locking(fileno, msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            os.lseek(fileno, 0, os.SEEK_SET)
+            msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fileno, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fileno, fcntl.LOCK_UN)

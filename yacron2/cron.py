@@ -20,6 +20,7 @@ from typing import (  # noqa
     FrozenSet,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -37,6 +38,7 @@ from yacron2.config import (
     JobConfig,
     JobDefaults,
     LoggingConfig,
+    StateConfig,
     WebConfig,
     Yacron2Config,
     cluster_config_warnings,
@@ -53,6 +55,7 @@ from yacron2.prometheus import (
     PrometheusMetrics,
     resolve_metrics_config,
 )
+from yacron2.state import StateBackend, make_state_backend
 
 logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
@@ -73,6 +76,11 @@ RUN_HISTORY_LIMIT = 50
 # for the dashboard's inline sparkline without shipping the full detailed
 # history on every poll. The full history is available from /jobs/{name}/runs.
 JOBS_INLINE_HISTORY = 20
+# Prefix under which a job's finished-run records live in the durable state
+# store (yacron2.state), one stream per job. Scoped by JOB NAME (stable across
+# config edits) rather than job-set id, so restart-durable history survives an
+# ordinary reload instead of being orphaned every time the config changes.
+RUN_STREAM_PREFIX = "runs/"
 # Floor (seconds) for the gate re-check interval of a deferred fail-closed
 # retry: the cluster gate can stay closed for a while, and a job configured
 # with a tiny/zero backoff delay must not hot-loop the scheduler (and spam the
@@ -173,6 +181,46 @@ def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
         "max_duration": max(durations) if durations else None,
         "last_duration": runs[-1].duration if runs else None,
     }
+
+
+def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
+    """Rebuild a :class:`JobRunInfo` from a durable ledger record.
+
+    The inverse of :meth:`JobRunInfo.to_dict`, used to warm the in-memory
+    history on restart.  The captured output stream is not persisted, so a
+    rehydrated run gets an empty, already-closed :class:`JobOutputStream`: the
+    dashboard's stats/sparkline never need it, and the log-replay endpoint
+    returns an empty (cleanly-terminating) stream for it.  A record missing or
+    with an unparseable ``finished_at`` is skipped (returns ``None``) rather
+    than crashing the rehydration.
+    """
+    finished_raw = rec.get("finished_at")
+    if not isinstance(finished_raw, str):
+        return None
+    try:
+        finished = datetime.datetime.fromisoformat(finished_raw)
+    except ValueError:
+        return None
+    started: Optional[datetime.datetime] = None
+    started_raw = rec.get("started_at")
+    if isinstance(started_raw, str):
+        try:
+            started = datetime.datetime.fromisoformat(started_raw)
+        except ValueError:
+            started = None
+    empty = JobOutputStream()
+    empty.closed = True
+    outcome = rec.get("outcome")
+    exit_code = rec.get("exit_code")
+    fail_reason = rec.get("fail_reason")
+    return JobRunInfo(
+        outcome=outcome if isinstance(outcome, str) else "success",
+        exit_code=exit_code if isinstance(exit_code, int) else None,
+        started_at=started,
+        finished_at=finished,
+        fail_reason=fail_reason if isinstance(fail_reason, str) else None,
+        output=empty,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -398,6 +446,21 @@ class Cron:
         self.web_config = None  # type: Optional[WebConfig]
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
+        # the durable state backend, when a `state` section is configured; None
+        # keeps yacron2's classic stateless, in-memory behaviour. See
+        # start_stop_state and yacron2.state.
+        self.state_backend: Optional[StateBackend] = None
+        # in-flight fire-and-forget durable run-record writes, tracked so they
+        # are not GC'd mid-flight and can be flushed on shutdown. Durability is
+        # never allowed to gate the loop, so _record_run schedules the write
+        # here rather than awaiting it.
+        self._pending_state_writes: Set[asyncio.Task] = set()
+        # whether the in-memory history has been warmed from the durable ledger
+        # yet; rehydration runs once, on the first successful backend start.
+        self._state_rehydrated = False
+        # how many finished runs to retain per job in the durable ledger; set
+        # from state.maxRunsPerJob when the backend starts. <= 0 disables.
+        self._state_max_runs = 0
         # last job-set id we logged, so reloads only log it again on change
         self._logged_job_set_id = None  # type: Optional[str]
         # whether the loaded config asks us to gate jobs on leader election;
@@ -465,6 +528,7 @@ class Cron:
                     config = await self.reload_config()
                     self._log_job_set_id()
                     await self.start_stop_cluster(config.cluster_config)
+                    await self.start_stop_state(config.state_config)
                 except ConfigError as err:
                     logger.error(
                         "Error in configuration file(s), so not updating "
@@ -557,6 +621,22 @@ class Cron:
             await self.cluster_manager.stop()
             self.cluster_manager = None
         await self._wait_for_running_jobs_task
+
+        if self.state_backend is not None:
+            # flush the in-flight durable run-record writes so the last few
+            # runs are not lost on a clean shutdown; bounded so a stuck store
+            # cannot hang the exit (its writes are simply abandoned).
+            if self._pending_state_writes:
+                logger.info(
+                    "Flushing %d pending state write(s)",
+                    len(self._pending_state_writes),
+                )
+                await asyncio.wait(
+                    set(self._pending_state_writes), timeout=5
+                )
+            logger.info("Stopping state backend")
+            await self.state_backend.stop()
+            self.state_backend = None
 
         if self.web_runner is not None:
             logger.info("Stopping http server")
@@ -1422,6 +1502,47 @@ class Cron:
                 logger.error("cluster: failed to start: %s", ex)
                 return
             self.cluster_manager = manager
+
+    async def start_stop_state(
+        self, state_config: Optional[StateConfig]
+    ) -> None:
+        """(Re)build the durable state backend to match the config.
+
+        Mirrors :meth:`start_stop_cluster` but simpler: the backend has no
+        election, TLS, or convergence to reason about.  It is rebuilt only when
+        the ``state`` section is added, removed, or changed (the backend tracks
+        the job-set id itself via ``self.job_set_id``, so an ordinary reload
+        that only edits jobs does not disturb it).  A start failure -- an
+        unwritable path, a bad mount -- is logged and swallowed, exactly like a
+        cluster start failure, so durability being misconfigured never stops
+        yacron2 from running jobs in memory.
+        """
+        backend = self.state_backend
+        if backend is not None and (
+            state_config is None or state_config != backend.config
+        ):
+            logger.info("state: configuration changed, stopping")
+            await backend.stop()
+            self.state_backend = None
+        if state_config is not None and self.state_backend is None:
+            try:
+                # Construct INSIDE the try: building the backend resolves and
+                # creates the store directories and runs a write probe, any of
+                # which can raise OSError on a bad/unwritable path or mount.
+                backend = make_state_backend(state_config, self.job_set_id)
+                await backend.start()
+            except (OSError, ConfigError) as ex:
+                # an operational misconfiguration (unwritable path, bad mount)
+                # to log and keep running through, not the run loop's generic
+                # "report a bug" path.
+                logger.error("state: failed to start: %s", ex)
+                return
+            self.state_backend = backend
+            self._state_max_runs = state_config.get("maxRunsPerJob", 0)
+            # warm the in-memory history from the ledger the first time a
+            # backend comes up, so a restart's dashboard/status is populated at
+            # once instead of blank until each job next runs.
+            await self._rehydrate_from_state()
 
     @staticmethod
     def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
@@ -2412,6 +2533,116 @@ class Cron:
         # every recorded run also feeds the Prometheus counters/histogram,
         # so /metrics and the run-history API always agree on outcomes.
         self.metrics.job_run_recorded(name, info.outcome, info.duration)
+        # and, when a durable state backend is configured, persist the run to
+        # the ledger so history/last-run survive a restart. Fire-and-forget: a
+        # slow store must never stall run handling, so the write is a tracked
+        # background task rather than an await here (this method is sync and on
+        # the finished-job path). No-op on the stateless default.
+        if self.state_backend is not None:
+            task = asyncio.create_task(self._persist_run_record(name, info))
+            self._pending_state_writes.add(task)
+            task.add_done_callback(self._pending_state_writes.discard)
+
+    @staticmethod
+    def _run_stream(name: str) -> str:
+        """The durable ledger stream name for a job's finished runs."""
+        return RUN_STREAM_PREFIX + name
+
+    async def _persist_run_record(
+        self, name: str, info: JobRunInfo
+    ) -> None:
+        """Append one finished run to the durable ledger and prune it.
+
+        Runs as a background task (see :meth:`_record_run`).  Errors are logged
+        and swallowed: a durability failure must never break job handling, and
+        an unhandled exception in a fire-and-forget task would otherwise show
+        as a noisy "task exception was never retrieved".  Pruning right after
+        the append bounds the stream where it just grew, avoiding a per-minute
+        fleet-wide scan.
+        """
+        backend = self.state_backend
+        if backend is None:  # torn down between scheduling and running
+            return
+        stream = self._run_stream(name)
+        try:
+            await backend.append_record(stream, info.to_dict())
+            if self._state_max_runs > 0:
+                await backend.prune_records(
+                    stream, keep=self._state_max_runs
+                )
+        except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
+            logger.warning(
+                "state: failed to persist run record for %s: %s", name, ex
+            )
+
+    async def _rehydrate_from_state(self) -> None:
+        """Warm the in-memory history from the durable ledger, once, on boot.
+
+        After the backend first starts, load each job's newest records back
+        into ``last_run`` and ``run_history`` so ``/status``, ``/jobs`` and the
+        dashboard (latest status, sparkline, success-rate stats) are correct
+        from the first scrape after a restart instead of blank until the job
+        next runs.  Bypasses :meth:`_record_run` deliberately: rehydration must
+        not re-emit Prometheus counters or re-persist what it just read.  A
+        poison record is skipped by :func:`_job_run_info_from_dict` (and
+        quarantined by the backend), never fatal to startup.
+        """
+        backend = self.state_backend
+        if backend is None or self._state_rehydrated:
+            return
+        self._state_rehydrated = True
+        warmed = 0
+        for name in list(self.cron_jobs):
+            # a job that already accumulated in-memory history this process
+            # (unusual at boot) is left as the live source of truth.
+            if self.run_history.get(name):
+                continue
+            try:
+                recs = await backend.list_records(
+                    self._run_stream(name),
+                    limit=RUN_HISTORY_LIMIT,
+                    newest_first=True,
+                )
+            except OSError as ex:
+                logger.warning(
+                    "state: failed to rehydrate history for %s: %s", name, ex
+                )
+                continue
+            recs.reverse()  # oldest-first, to match the append order
+            for rec in recs:
+                restored = _job_run_info_from_dict(rec)
+                if restored is not None:
+                    self.run_history[name].append(restored)
+            history = self.run_history.get(name)
+            if history:
+                self.last_run[name] = history[-1]
+                warmed += 1
+        if warmed:
+            logger.info(
+                "state: rehydrated run history for %d job(s) from the ledger",
+                warmed,
+            )
+
+    async def durable_last_run_at(
+        self, name: str
+    ) -> Optional[str]:
+        """The last finished-run timestamp for a job, from the durable ledger.
+
+        The restart-surviving "last fired" watermark, derived as the max
+        ``finished_at`` over the immutable records (order-independent, so it is
+        correct even when several nodes append to one job's stream on a shared
+        mount).  ISO-8601 UTC, so a lexicographic max is a chronological max.
+        ``None`` with no backend or no records.  The scheduling features that
+        consume it (missed-run catch-up) arrive in a later phase; it is exposed
+        and tested here because the ledger this reads is the Phase 1 artifact.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return None
+        result = await backend.derive_max(
+            self._run_stream(name), "finished_at"
+        )
+        return result if isinstance(result, str) else None
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
         jobs_list = self.running_jobs[job.config.name]

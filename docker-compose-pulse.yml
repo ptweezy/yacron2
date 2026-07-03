@@ -1,0 +1,23 @@
+# Pulse — a real-time uptime / SLA monitor showcasing second-level scheduling.
+#
+# A single yacron2 node that probes a latency-critical HTTP endpoint every few
+# SECONDS (not minutes), heartbeats every 10s, and rolls up once a minute. The
+# service under test is this node's own web API, so it runs with nothing else.
+#
+#   docker compose -f docker-compose-pulse.yml up --build      # start
+#   docker compose -f docker-compose-pulse.yml down            # stop and remove
+#
+# Then open http://localhost:8080/ and watch the probe rows count down in
+# seconds. See example/pulse-monitor/README.md for the full walkthrough
+# (including how to simulate an outage).
+
+services:
+  yacron2-pulse:
+    build:
+      context: .
+    container_name: yacron2-pulse
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./example/pulse-monitor/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro
+    restart: unless-stopped

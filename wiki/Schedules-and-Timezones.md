@@ -9,6 +9,7 @@ Every job's `schedule` determines *when* it runs; `utc` and `timezone` determine
 ```
 "schedule": Str()
 | Map({
+      Opt("second"): Str(),
       Opt("minute"): Str(),
       Opt("hour"): Str(),
       Opt("dayOfMonth"): Str(),
@@ -32,7 +33,7 @@ classic crontab files (`*.crontab`, `*.cron`, or a file named `crontab`),
 whose entries use this same field dialect plus the `@` nicknames and default
 to UTC like every other yacron2 schedule. See [Classic Crontabs](Classic-Crontabs).
 
-## Form 1: crontab string (5 fields)
+## Form 1: crontab string (5, 6 or 7 fields)
 
 A standard five-field crontab expression: `minute hour day-of-month month day-of-week`.
 
@@ -43,7 +44,34 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The string is passed verbatim to `CronTab(...)`; yacron2 does not pre-validate or rewrite it, so a malformed expression surfaces as whatever `parse-crontab` raises at config-load time. Quote the value in YAML: a bare `*/5 * * * *` is not valid YAML scalar syntax in all positions.
+The string is passed verbatim to `CronTab(...)`. A malformed expression is caught and re-raised as `ConfigError("invalid schedule '...': ...")` at config-load time (naming the offending expression), so a bad field fails the reload cleanly rather than as an anonymous traceback. Quote the value in YAML: a bare `*/5 * * * *` is not valid YAML scalar syntax in all positions.
+
+parse-crontab reads **extra columns from the ends**, so the field count selects the dialect:
+
+| Fields | Layout | Meaning |
+|--------|--------|---------|
+| 5 | `minute hour dayOfMonth month dayOfWeek` | the classic form; implicit second `0`, any year |
+| 6 | `... dayOfWeek year` | adds a trailing **year** column (still second `0`) |
+| 7 | `second minute hour dayOfMonth month dayOfWeek year` | adds a leading **second** column too |
+
+So a seven-field string schedules at **second granularity** (see [Second-level schedules](#second-level-schedules) below), while a six-field string pins a `year`. A six-field string is *not* seconds — the extra column is the year.
+
+## Second-level schedules
+
+yacron2 can run jobs at second granularity. Give the schedule a `second` (via the seven-field string above, or the `second:` object key in [Form 3](#form-3-schedule-object)); both jobs below run every 15 seconds:
+
+```yaml
+jobs:
+  - name: every-15s-string
+    command: echo tick
+    schedule: "*/15 * * * * * *"   # 7 fields; leading field is the second
+  - name: every-15s-object
+    command: echo tick
+    schedule:
+      second: "*/15"
+```
+
+The `second` field takes the same syntax as any other (`*`, `*/5`, `0,30`, `10-20`); `second: "*"` fires every second. While **any enabled job** specifies seconds, the scheduler switches from its once-a-minute cadence to once-a-second (see [How the scheduler ticks](#how-the-scheduler-ticks)); when none do, the original minute cadence and its zero overhead are retained. Minute-granular jobs are unaffected either way: they still fire exactly once in their scheduled minute. Second-level scheduling is a YAML-only feature — [classic crontab files](Classic-Crontabs) stay five-field and minute-granular.
 
 ## Form 2: `@reboot`
 
@@ -74,28 +102,41 @@ jobs:
       dayOfWeek: "mon-fri"
 ```
 
-`_parse_schedule` builds a five-field crontab string from exactly these keys and feeds it to `CronTab`:
+`schedule_object_to_crontab` (in `yacron2/config.py`) builds a crontab string from exactly these keys and `_parse_schedule` feeds it to `CronTab`:
 
 | Object key   | Crontab field | Default if omitted |
 |--------------|---------------|--------------------|
-| `minute`     | field 1       | `*`                |
-| `hour`       | field 2       | `*`                |
-| `dayOfMonth` | field 3       | `*`                |
-| `month`      | field 4       | `*`                |
-| `dayOfWeek`  | field 5       | `*`                |
+| `second`     | second        | *(omitted)*        |
+| `minute`     | minute        | `*`                |
+| `hour`       | hour          | `*`                |
+| `dayOfMonth` | day-of-month  | `*`                |
+| `month`      | month         | `*`                |
+| `dayOfWeek`  | day-of-week   | `*`                |
+| `year`       | year          | *(omitted)*        |
 
-The assembled string is `f"{minute} {hour} {day} {month} {dow}"`. All values are typed `Str()` in the schema, so write `minute: "0"`, not `minute: 0`. Although strictyaml will coerce an unquoted scalar to a string here, quoting is the documented convention and avoids surprises with values like `"7"`.
+Only the columns you actually use are emitted, matching parse-crontab's end-column rule from [Form 1](#form-1-crontab-string-5-6-or-7-fields):
 
-### Caveat: the `year` key is silently dropped
+- neither `second` nor `year` → a five-field line (`f"{minute} {hour} {day} {month} {dow}"`), exactly as before;
+- `year` only → a six-field line with the trailing year column;
+- `second` present → a full seven-field line (`year` defaults to `*` if unset).
 
-The schema declares `Opt("year"): Str()`, and `README.md` shows a schedule object that includes `year: 2017`. **`_parse_schedule` never reads `year`.** It assembles only a five-field string from `minute`/`hour`/`dayOfMonth`/`month`/`dayOfWeek`; `schedule_unparsed.get("year", ...)` is never called and `year` is not appended to the crontab string.
+So `{minute: "*/5"}` is byte-for-byte the five-field string `"*/5 * * * *"` (and the two spellings share a [job-set fingerprint](Configuration-Reference)), while `{second: "*/15"}` is the seven-field `"*/15 * * * * * *"`.
 
-Consequences:
+All values are typed `Str()` in the schema, so write `minute: "0"`, not `minute: 0`. Although strictyaml will coerce an unquoted scalar to a string here, quoting is the documented convention and avoids surprises with values like `"7"`.
 
-- A `year` key is accepted by the schema (no validation error) but has **no effect** on scheduling.
-- The README example claiming a job "only on the specific date 2017-07-19" does **not** restrict by year: it runs every July 19th, every year, that matches the other fields.
+### The `year` key
 
-This is a discrepancy between the schema/README and the implementation. Do not rely on `year`. If you need a one-shot run, use `@reboot` plus an external guard, or remove the job after it fires.
+`year` restricts the schedule to specific years (parse-crontab's optional trailing column). For example, this runs only during 2017:
+
+```yaml
+schedule:
+  minute: "*/5"
+  dayOfMonth: "19"
+  month: "7"
+  year: "2017"
+```
+
+> **Upgrade note (breaking for object-form `year`).** Earlier releases accepted `year` in the schema but silently dropped it when building the crontab string, so it had no effect — a job with an object-form `year` ran every year. It is **now honored**. If you have such a job, upgrading changes its behavior: `year: "2017"` now pins the schedule to 2017 (a past year means the job stops firing). Honoring `year` also changes that job's [job-set fingerprint](Configuration-Reference), so during a rolling upgrade of a cluster the old and new binaries compute different `job_set_id`s for the identical config and will not treat each other as agreed peers until every node is upgraded (the same transient, self-healing drift as any config rollout; leader election stays at-most-once throughout). Jobs that do **not** use object-form `year` are unaffected: their fingerprint is byte-for-byte identical to before. To keep the old "runs every year" behavior, simply remove the `year` key.
 
 ## Timezone resolution
 
@@ -140,18 +181,20 @@ jobs:
 
 ## How the scheduler ticks
 
-The scheduler does not run a per-job timer. It wakes on a fixed cadence and tests every job (`yacron2/cron.py`):
+The scheduler does not run a per-job timer. It wakes on a cadence, tests every job, and launches those that are due (`yacron2/cron.py`). The cadence **adapts to the finest resolution any enabled job needs**:
 
-- `WAKEUP_INTERVAL = datetime.timedelta(minutes=1)`.
-- `next_sleep_interval()` computes the time until the next minute boundary using **UTC**: `now.replace(second=0) + WAKEUP_INTERVAL`. The daemon therefore wakes aligned to the top of each wall-clock minute (in UTC), not at a fixed N-second period from startup.
-- On each wake, `spawn_jobs` iterates all jobs and calls `job_should_run`. For a `CronTab` job it evaluates `crontab.test(get_now(job.timezone).replace(second=0))`: the current time **truncated to the minute** in the job's resolved timezone.
+- `Cron._needs_subminute()` is `True` when any enabled job's schedule pins a `second` (its `has_seconds` flag). While that holds, `next_sleep_interval(subminute=True)` snaps to the next whole-second boundary; otherwise it snaps to the next minute boundary (`now.replace(second=0) + WAKEUP_INTERVAL`, `WAKEUP_INTERVAL = 1 minute`). Alignment is computed in **UTC** each iteration, so a slightly late wake still catches up to the boundary.
+- Each pass (`_service_slots` → `spawn_jobs`) reads the clock **once** and passes that one instant to every job, so the "is it due" test and the per-slot de-dup key can never straddle a slot boundary and double-launch a single-slot job. For a `CronTab` job it evaluates `crontab.test(schedule_slot(job, now))`, where `schedule_slot` truncates that instant (in the job's timezone) to the job's resolution: the whole **second** for a second-level job, or the top of the **minute** otherwise.
+- Because a second-level job makes the whole loop tick every second, minute-level jobs would be tested up to 60 times per minute. `spawn_jobs` therefore **de-duplicates per scheduling slot**: it records the last slot each job launched in (`_last_run_slot`) and skips a job whose current slot already fired. So a minute-level job still fires exactly once in its minute, and a second-level job exactly once per matching second — even if two ticks land in the same second.
+- **Catch-up for overrun seconds.** In sub-minute mode, if one pass runs long — many simultaneous launches, or the once-a-minute config reload — and the clock advances past one or more whole seconds before the next pass, `_service_slots` services each skipped second too (evaluating every job against that second's slot), so a second-level job due in the gap still fires instead of being dropped. The catch-up is bounded by `CATCHUP_LIMIT` (10 s): a larger gap is treated as a stall/suspend/clock-jump and skipped past with a warning, rather than replayed as a burst of backdated launches. Minute-level jobs need no catch-up — their minute-truncated slot already absorbs any sub-minute overrun.
+- **No spurious run for the period in progress at startup.** When yacron2 starts (or restarts) partway through a minute, it seeds `_last_run_slot` with the in-progress slot for every scheduled job, so a minute-level job whose minute is already under way does not fire immediately on the first tick — it first fires at the next matching boundary, exactly as in minute-only mode. (Without this, merely having a second-level job present would make every minute-level job fire ~1 s after a mid-minute restart.)
 
 Implications:
 
-- **Sub-minute schedules are meaningless.** The seconds component is zeroed before testing, and the daemon only wakes once per minute, so the finest effective resolution is one minute. A crontab expression cannot schedule anything more frequent than every minute via yacron2, regardless of what `parse-crontab` itself supports.
-- A job whose schedule matches a given minute fires at most once for that minute (one test per wake). If multiple instances would overlap, [`concurrencyPolicy`](Concurrency-and-Timeouts) governs the outcome.
-- The reload/sleep loop catches up to the boundary even if a wake is slightly late; alignment is recomputed each iteration from the current UTC time.
-- A job that is [disabled](Configuration-Reference) (`enabled: false`) returns `False` from `job_should_run` regardless of schedule and never fires, including at `@reboot`.
+- **Second-level schedules fire on time.** With a `second` field the daemon wakes every second and tests at second resolution, so `*/15 * * * * * *` really does fire at seconds 0/15/30/45.
+- **No cost when unused.** If no enabled job specifies seconds, the loop keeps its once-a-minute cadence and per-minute config reload exactly as before. (When it *is* ticking per second, configuration reload / cluster / web housekeeping is still gated to run at most once per minute — only the job-firing test runs every second, and any second that gating pushes past is caught up as described above.)
+- A job whose schedule matches a given slot fires at most once for that slot. If multiple instances would overlap, [`concurrencyPolicy`](Concurrency-and-Timeouts) governs the outcome.
+- A job that is [disabled](Configuration-Reference) (`enabled: false`) returns `False` from `job_should_run` regardless of schedule and never fires, including at `@reboot`; a disabled second-level job also does not force the per-second cadence.
 
 ## Inspecting the next run
 

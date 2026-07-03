@@ -1533,21 +1533,38 @@ jobs:
 
 
 @pytest.mark.asyncio
-async def test_run_survives_config_error(monkeypatch):
-    # If update_config() raises (e.g. the config became invalid on reload),
-    # run() must log it and keep running the previously-loaded jobs, not crash
-    # with UnboundLocalError when it later inspects `config`.
-    cron = yacron2.cron.Cron(None)
+async def test_run_survives_config_error(tmp_path, monkeypatch):
+    # If the reparse raises (e.g. the config became invalid on reload), run()
+    # must log it and keep running the previously-loaded jobs, not crash with
+    # UnboundLocalError when the housekeeping block later inspects `config`.
+    # The reparse now runs off the event loop (reload_config ->
+    # run_in_executor(parse_config)), so make parse_config itself fail after a
+    # clean load at construction.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(TWO_JOBS)
+    cron = yacron2.cron.Cron(str(cfg))
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
 
-    def failing_update_config():
-        # stop the loop after this (failing) iteration, then fail
-        cron.signal_shutdown()
+    def boom(*args, **kwargs):
         raise ConfigError("boom")
 
-    monkeypatch.setattr(cron, "update_config", failing_update_config)
+    monkeypatch.setattr("yacron2.cron.parse_config", boom)
 
-    # completes without raising (UnboundLocalError before the fix)
-    await asyncio.wait_for(cron.run(), timeout=5)
+    task = asyncio.create_task(cron.run())
+    try:
+        # the reparse fails on every housekeeping tick, but the daemon must
+        # stay up (no UnboundLocalError, no escape) and keep the jobs it had.
+        await asyncio.sleep(0.1)
+        assert not task.done()
+        assert set(cron.cron_jobs) == {"alpha", "beta"}  # unchanged
+        # the failed reload flips the standard "config broken on disk" signal
+        # (yacron2_config_last_reload_successful) even though the parse ran off
+        # the loop, in a worker thread.
+        assert cron.metrics._last_reload_ok is False
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
 
 
 def test_cluster_allows_per_policy():
@@ -3103,7 +3120,8 @@ jobs:
 async def test_run_reloads_changed_config(tmp_path, monkeypatch):
     # tiny sleep so the reload loop iterates quickly instead of waiting out the
     # real ~60s to the next minute boundary.
-    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda: 0.02)
+    # accept the subminute flag arg the loop now passes to next_sleep_interval
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.02)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_RELOAD_V1)
 
@@ -3324,3 +3342,375 @@ async def test_fleet_job_summaries_snapshot():
     alpha = cron.fleet_job_summaries()["alpha"]
     assert alpha["running"] is True
     assert alpha["scheduled_in"] is None
+
+
+# =====================================================================
+#  second-level (sub-minute) scheduling
+# =====================================================================
+
+_SECONDS_JOB = """
+jobs:
+  - name: sec
+    command: echo sec
+    schedule: "*/15 * * * * * *"
+  - name: min
+    command: echo min
+    schedule: "* * * * *"
+"""
+
+
+def _set_now(monkeypatch, holder):
+    # a controllable clock: holder["now"] is a naive datetime, localised to the
+    # requested timezone exactly as the real fixed_current_time fixture does.
+    def get_now(timezone):
+        now = holder["now"]
+        if timezone is not None:
+            now = (
+                now.replace(tzinfo=timezone)
+                if now.tzinfo is None
+                else now.astimezone(timezone)
+            )
+        return now
+
+    monkeypatch.setattr("yacron2.cron.get_now", get_now)
+
+
+def test_schedule_slot_resolution(monkeypatch):
+    holder = {"now": DT(2020, 1, 1, 0, 0, 4, 500000)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    sec = cron.cron_jobs["sec"]
+    minute = cron.cron_jobs["min"]
+    # a second-level job truncates to the whole second (microseconds zeroed)
+    assert yacron2.cron.schedule_slot(sec) == DT(
+        2020, 1, 1, 0, 0, 4, tzinfo=UTC
+    )
+    # a minute-level job truncates to the top of the minute, as always
+    assert yacron2.cron.schedule_slot(minute) == DT(
+        2020, 1, 1, 0, 0, 0, tzinfo=UTC
+    )
+
+
+def test_needs_subminute():
+    # an enabled second-level job makes the scheduler tick per-second
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    assert cron._needs_subminute() is True
+    # minute-only config does not
+    cron2 = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    assert cron2._needs_subminute() is False
+    # a DISABLED second-level job must not force per-second ticking
+    disabled = """
+jobs:
+  - name: sec
+    command: echo sec
+    schedule: "*/15 * * * * * *"
+    enabled: false
+"""
+    cron3 = yacron2.cron.Cron(None, config_yaml=disabled)
+    assert cron3._needs_subminute() is False
+
+
+@pytest.mark.parametrize(
+    "second, should_run",
+    [(0, True), (1, False), (14, False), (15, True), (45, True), (46, False)],
+)
+def test_job_should_run_at_seconds(monkeypatch, second, should_run):
+    holder = {"now": DT(2020, 1, 1, 0, 0, second)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    job = cron.cron_jobs["sec"]  # "*/15 * * * * * *"
+    assert cron.job_should_run(False, job) is should_run
+
+
+def test_next_sleep_interval_modes(monkeypatch):
+    holder = {"now": DT(2020, 1, 1, 12, 30, 30, 500000)}
+    _set_now(monkeypatch, holder)
+    # minute mode snaps to the next minute (preserving the sub-second offset,
+    # exactly as the historical behaviour did): from :30.5 that is 30.0s away.
+    assert yacron2.cron.next_sleep_interval(False) == pytest.approx(30.0)
+    # sub-minute mode snaps to the next whole-second boundary: :30.5 -> :31.0
+    assert yacron2.cron.next_sleep_interval(True) == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_spawn_jobs_subminute_dedup(monkeypatch):
+    # Ticking every second, a minute-level job must still fire exactly once per
+    # minute, and a second-level job exactly once per matching second -- even
+    # if two ticks land in one second. spawn_jobs de-dupes per scheduling slot.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+
+    launched = []
+
+    async def fake_launch(job):
+        launched.append((holder["now"].second, holder["now"].minute, job.name))
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+
+    async def tick(minute, second):
+        holder["now"] = DT(2020, 1, 1, 0, minute, second)
+        await cron.spawn_jobs(False)
+
+    await tick(0, 0)  # sec + min both due at :00
+    await tick(0, 1)  # nothing (sec off-beat; min already fired this minute)
+    await tick(0, 15)  # sec only
+    await tick(0, 15)  # duplicate tick in the same second: de-duped
+    await tick(0, 30)  # sec only
+    await tick(1, 0)  # new minute: sec + min both fire again
+
+    sec_fires = [(m, s) for (s, m, n) in launched if n == "sec"]
+    min_fires = [(m, s) for (s, m, n) in launched if n == "min"]
+    assert sec_fires == [(0, 0), (0, 15), (0, 30), (1, 0)]
+    assert min_fires == [(0, 0), (1, 0)]  # once per minute despite 6 ticks
+
+
+_EVERY_SECOND_AND_MINUTE = """
+jobs:
+  - name: tick
+    command: echo tick
+    schedule: "* * * * * * *"
+  - name: noon
+    command: echo noon
+    schedule: "0 12 * * *"
+"""
+
+
+def _drive_cron(monkeypatch, holder, config_yaml):
+    """A Cron wired to the controllable clock, recording (name, slot-second)
+    at each launch by reading the de-dup slot spawn_jobs just set."""
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=config_yaml)
+    launched = []
+
+    async def fake_launch(job):
+        launched.append((job.name, cron._last_run_slot[job.name].second))
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+    return cron, launched
+
+
+@pytest.mark.asyncio
+async def test_service_slots_catches_up_overrun_seconds(monkeypatch):
+    # A pass that overruns by a couple of seconds (the clock jumps forward
+    # between passes) must not silently drop the seconds it skipped: the next
+    # pass services each skipped whole-second slot too.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
+
+    await cron._service_slots(startup=True)  # startup at :00 seeds, fires none
+    assert launched == []
+    holder["now"] = DT(2020, 1, 1, 0, 0, 3)  # the :00 pass overran to :03
+    await cron._service_slots(startup=False)
+
+    # every skipped second :01, :02, :03 is serviced (the every-second job
+    # fires once for each), rather than only :03.
+    assert [s for (n, s) in launched if n == "tick"] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_service_slots_bounds_catchup_after_long_gap(monkeypatch):
+    # A gap larger than CATCHUP_LIMIT is a stall/suspend, not tick overhead:
+    # resume at the current second instead of replaying a burst.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
+
+    await cron._service_slots(startup=True)
+    gap = int(yacron2.cron.CATCHUP_LIMIT.total_seconds()) + 5
+    holder["now"] = DT(2020, 1, 1, 0, 0, gap)
+    await cron._service_slots(startup=False)
+
+    # only the current second fires -- no backdated storm of the skipped ones
+    assert [s for (n, s) in launched if n == "tick"] == [gap]
+
+
+@pytest.mark.asyncio
+async def test_startup_seeding_skips_in_progress_minute(monkeypatch):
+    # Restarting partway through a minute must not fire a minute-level job for
+    # the minute already under way, even though a second-level job is present
+    # (which forces per-second ticking). Regression: without startup seeding
+    # the minute job fired ~1s after a mid-minute restart.
+    holder = {"now": DT(2020, 1, 1, 0, 5, 30)}
+    cron, launched = _drive_cron(monkeypatch, holder, _SECONDS_JOB)
+
+    await cron._service_slots(startup=True)  # restart at 00:05:30
+    holder["now"] = DT(2020, 1, 1, 0, 5, 31)
+    await cron._service_slots(startup=False)
+    # the in-progress minute is skipped -- "min" must not have fired
+    assert "min" not in [n for (n, s) in launched]
+
+    holder["now"] = DT(2020, 1, 1, 0, 6, 0)  # next minute boundary
+    await cron._service_slots(startup=False)
+    assert ("min", 0) in launched  # now it fires, once, at the fresh boundary
+
+
+@pytest.mark.asyncio
+async def test_single_slot_job_fires_once_across_boundary(monkeypatch):
+    # A single-slot job (noon) serviced tick-by-tick across the minute boundary
+    # fires exactly once. Regression for the two-clock-read TOCTOU: the due
+    # test and the de-dup key are now one and the same read, so the boundary
+    # cannot double-launch it.
+    holder = {"now": DT(2020, 1, 1, 11, 59, 58)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
+
+    await cron._service_slots(startup=True)
+    for sec in (59, 0, 1, 2):
+        minute = 59 if sec == 59 else 0
+        hour = 11 if sec == 59 else 12
+        holder["now"] = DT(2020, 1, 1, hour, minute, sec)
+        await cron._service_slots(startup=False)
+
+    noon_fires = [s for (n, s) in launched if n == "noon"]
+    assert noon_fires == [0]  # exactly one launch, at second 0 of 12:00
+
+
+# =====================================================================
+#  concurrent launches + off-loop config reparse
+# =====================================================================
+
+_THREE_DUE = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+  - name: b
+    command: echo b
+    schedule: "* * * * *"
+  - name: c
+    command: echo c
+    schedule: "* * * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_spawn_jobs_launches_concurrently(monkeypatch):
+    # Jobs due in the same slot are launched concurrently, not one at a time:
+    # all three enter their (blocking) launch before any of them completes, so
+    # a slot's wall time is ~one spawn-time instead of N x spawn-time. Under
+    # the old sequential loop only the first launch would ever start (it blocks
+    # on `release`), so `started` would never fire and this would time out.
+    cron = yacron2.cron.Cron(None, config_yaml=_THREE_DUE)
+
+    order = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_launch(job):
+        order.append(job.name)
+        if len(order) == 3:
+            started.set()
+        await release.wait()
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+
+    task = asyncio.create_task(cron.spawn_jobs(False))
+    try:
+        # all three launches are in flight at once (would hang if sequential)
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert order == ["a", "b", "c"]  # scheduled in config order
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_single_due_job_still_launches(monkeypatch):
+    # The len == 1 fast path (await directly, no gather) still launches the one
+    # due job, so the optimisation does not regress the common single-job slot.
+    # Only "alpha" is due here ("beta" is a disabled @reboot one-shot).
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    launched = []
+
+    async def fake_launch(job):
+        launched.append(job.name)
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+    # alpha is "*/5 * * * *"; the frozen clock is 12:00, a multiple of 5
+    await cron.spawn_jobs(False)
+    assert launched == ["alpha"]
+
+
+@pytest.mark.asyncio
+async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
+    # The once-a-minute reparse is offloaded to a worker thread so a slow disk
+    # read + parse cannot freeze the event loop (and stall the scheduling
+    # tick). Prove every run-loop reparse executes off the event-loop thread.
+    import threading
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(TWO_JOBS)
+    # construction parses once, synchronously, on this (the loop) thread
+    cron = yacron2.cron.Cron(str(cfg))
+    main_thread = threading.get_ident()
+
+    seen = []
+    real_parse = yacron2.cron.parse_config
+
+    def recording_parse(arg):
+        seen.append(threading.get_ident())
+        return real_parse(arg)
+
+    monkeypatch.setattr("yacron2.cron.parse_config", recording_parse)
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: len(seen) >= 2)  # a couple of reload ticks
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert seen  # the loop reparsed at least once
+    assert all(t != main_thread for t in seen)  # ...always off the loop thread
+
+
+_LEADER_REBOOT_BAD_CLUSTER = """
+jobs:
+  - name: boot
+    command: echo boot
+    schedule: "@reboot"
+    clusterPolicy: Leader
+cluster:
+  listen: "127.0.0.1:18444"
+  tls:
+    ca: /nonexistent/ca.pem
+    cert: /nonexistent/cert.pem
+    key: /nonexistent/key.pem
+  peers:
+    - host: b:8443
+    - host: c:8443
+  electLeader: true
+"""
+
+
+@pytest.mark.asyncio
+async def test_startup_gates_reboot_before_servicing(tmp_path, monkeypatch):
+    # Housekeeping (which sets the cluster gate _elect_leader_configured via
+    # start_stop_cluster) must run BEFORE the first spawn_jobs, so a Leader
+    # @reboot job is deferred to the elected owner rather than run ungated on
+    # every node. This must hold even though the reparse is now offloaded to a
+    # worker thread (reload_config): it is still awaited and applied before
+    # _service_slots. Here the manager fails to start (bad certs), so the
+    # Leader one-shot must stay deferred and fail closed -- never launched.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_LEADER_REBOOT_BAD_CLUSTER)
+    cron = yacron2.cron.Cron(str(cfg))
+
+    launched = []
+
+    async def fake_launch(job):
+        launched.append(job.name)
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: cron._elect_leader_configured)
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert cron.cluster_manager is None  # bad certs -> no manager
+    assert "boot" in cron._pending_reboot_jobs  # deferred, not run ungated
+    assert launched == []  # never launched anywhere

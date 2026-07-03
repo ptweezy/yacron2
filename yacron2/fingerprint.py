@@ -45,7 +45,7 @@ import hashlib
 import json
 from typing import Any, Dict, Iterable, List, Union
 
-from yacron2.config import JobConfig
+from yacron2.config import JobConfig, schedule_object_to_crontab
 
 # Canonicalization scheme version.  Prefixes the emitted ID and is folded into
 # the hash input, so a future change to what/how we canonicalize can bump this
@@ -61,10 +61,11 @@ _SECRET_PLACEHOLDER = "<redacted>"
 def _schedule_repr(job: JobConfig) -> str:
     """Normalize a job's schedule to a canonical string.
 
-    The object form (``minute:``/``hour:``/...) collapses to the same
-    five-field crontab line as the equivalent string form, so the two spellings
-    fingerprint identically.  Bare strings (a crontab line, or ``@reboot``) are
-    used verbatim.
+    The object form (``minute:``/``hour:``/...) collapses to the same crontab
+    line as the equivalent string form, so the two spellings fingerprint
+    identically -- a plain 5-field line when neither ``second`` nor ``year`` is
+    used (unchanged from before), and the matching 7-/6-field line when they
+    are.  Bare strings (a crontab line, or ``@reboot``) are used verbatim.
     """
     unparsed = job.schedule_unparsed
     if isinstance(unparsed, str):
@@ -73,8 +74,10 @@ def _schedule_repr(job: JobConfig) -> str:
         # same. Cron syntax (and the '@reboot'/'@daily'/... sentinels) is
         # whitespace-delimited single tokens, so this is lossless.
         return " ".join(unparsed.split())
-    order = ("minute", "hour", "dayOfMonth", "month", "dayOfWeek")
-    return " ".join(str(unparsed.get(field, "*")) for field in order)
+    # Shared object->crontab builder, so the fingerprint, the parsed schedule
+    # and the web UI label can never disagree on how the object form maps to a
+    # crontab line (including the second/year columns).
+    return schedule_object_to_crontab(unparsed)
 
 
 def _command_repr(command: Union[str, List[str]]) -> Dict[str, Any]:

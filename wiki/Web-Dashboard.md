@@ -355,10 +355,11 @@ browser), so its horizon is bounded by the daemon's in-memory history.
 ## Cron sandbox
 
 *Cron sandbox* in the palette opens a scratchpad for schedule expressions: type
-any five-field cron expression or `@macro`, pick a timezone frame, and it
-validates the expression, describes it in plain English, breaks out the five
-fields, and previews the **next 12 fire times** with wall-clock and relative
-labels (impossible schedules and `@reboot` are called out). It cross-references
+any 5-, 6-, or 7-field cron expression (including [second-level](Schedules-and-Timezones#second-level-schedules)
+schedules) or `@macro`, pick a timezone frame, and it validates the expression,
+describes it in plain English, breaks out the fields, and previews the
+**next 12 fire times** with wall-clock and relative labels (impossible
+schedules and `@reboot` are called out). It cross-references
 your live jobs to show which ones use the same schedule, and keeps a
 browser-local list of recent expressions. The same engine powers the
 dashboard's schedule advisories (overlap, thundering-herd, and DST warnings).

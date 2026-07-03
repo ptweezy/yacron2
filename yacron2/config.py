@@ -354,6 +354,10 @@ _job_schema_dict.update(
         "schedule": Str()
         | Map(
             {
+                # An explicit second opts the job into second-level scheduling
+                # (see schedule_object_to_crontab / yacron2.cron). Omit it and
+                # the schedule stays minute-granular, exactly as before.
+                Opt("second"): Str(),
                 Opt("minute"): Str(),
                 Opt("hour"): Str(),
                 Opt("dayOfMonth"): Str(),
@@ -532,6 +536,75 @@ def mergedicts(dict1, dict2):
             yield (k, dict2[k])
 
 
+def schedule_object_to_crontab(spec: Dict[str, Any]) -> str:
+    """Render the object form of a ``schedule`` to a parse-crontab string.
+
+    parse-crontab's field layout is ``[second] minute hour dayOfMonth month
+    dayOfWeek [year]``: a bare 5-field line has an implicit second of 0 and any
+    year, a 6-field line adds a trailing ``year`` column, and a 7-field line
+    adds a leading ``second`` column.  We emit only the columns actually
+    specified, so a schedule that uses neither ``second`` nor ``year`` still
+    renders as the exact 5-field line it always did -- keeping its job-set
+    fingerprint stable, and equal to the equivalent crontab-string spelling.
+
+    Note this is the single source of truth for the object->crontab mapping,
+    shared by parsing (:meth:`JobConfig._parse_schedule`), the web UI's
+    schedule label (:func:`yacron2.cron.schedule_str`) and the fingerprint
+    (:func:`yacron2.fingerprint._schedule_repr`), so those cannot drift.
+    """
+    minute = spec.get("minute", "*")
+    hour = spec.get("hour", "*")
+    day = spec.get("dayOfMonth", "*")
+    month = spec.get("month", "*")
+    dow = spec.get("dayOfWeek", "*")
+    second = spec.get("second")
+    year = spec.get("year")
+    if second is not None:
+        # 7-field: an explicit seconds column. year defaults to "*" (any).
+        return "{} {} {} {} {} {} {}".format(
+            second,
+            minute,
+            hour,
+            day,
+            month,
+            dow,
+            year if year is not None else "*",
+        )
+    if year is not None:
+        # 6-field: parse-crontab reads the trailing column as the year.
+        return "{} {} {} {} {} {}".format(minute, hour, day, month, dow, year)
+    return "{} {} {} {} {}".format(minute, hour, day, month, dow)
+
+
+def schedule_has_seconds(
+    schedule_unparsed: Union[str, Dict[str, Any]],
+) -> bool:
+    """Whether a schedule pins specific seconds (fires at second granularity).
+
+    True for the object ``second:`` key and for a full 7-field crontab string;
+    such jobs make the scheduler tick once per second rather than once per
+    minute (see :meth:`yacron2.cron.Cron._needs_subminute`).  A 5- or 6-field
+    string, ``@reboot`` and the ``@daily``/``@hourly``/... nicknames never do.
+    """
+    if isinstance(schedule_unparsed, dict):
+        # Derive from the ACTUAL rendered field count, not mere key presence:
+        # a blank/whitespace ``second:`` value (e.g. a leftover ``second:``
+        # with no value) renders a leading empty column that vanishes under
+        # parse-crontab's whitespace split, leaving a minute-granular 5-/6-
+        # field line. Keying off presence alone would set has_seconds True for
+        # such a line and force the whole scheduler to tick per-second for a
+        # job that only ever fires once a minute.
+        return len(schedule_object_to_crontab(schedule_unparsed).split()) == 7
+    if isinstance(schedule_unparsed, str):
+        stripped = schedule_unparsed.strip()
+        if not stripped or stripped.startswith("@"):
+            return False
+        # parse-crontab only reads a leading seconds column at 7 fields; a 5-
+        # or 6-field line has an implicit second of 0 (6th field is the year).
+        return len(stripped.split()) == 7
+    return False
+
+
 class JobConfig:
     def __init__(self, config: dict) -> None:
         self.name = config["name"]  # type: str
@@ -540,6 +613,9 @@ class JobConfig:
         self.schedule: Union[CronTab, str] = self._parse_schedule(
             self.schedule_unparsed
         )
+        # True when the schedule pins specific seconds; the scheduler then
+        # ticks per-second for this job instead of per-minute (yacron2.cron).
+        self.has_seconds: bool = schedule_has_seconds(self.schedule_unparsed)
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
         self.clusterPolicy = config.pop("clusterPolicy")
@@ -583,17 +659,25 @@ class JobConfig:
         if isinstance(schedule_unparsed, str):
             if schedule_unparsed == "@reboot":
                 return schedule_unparsed
-            return CronTab(schedule_unparsed)
+            return self._crontab(schedule_unparsed)
         if isinstance(schedule_unparsed, dict):
-            minute = schedule_unparsed.get("minute", "*")
-            hour = schedule_unparsed.get("hour", "*")
-            day = schedule_unparsed.get("dayOfMonth", "*")
-            month = schedule_unparsed.get("month", "*")
-            dow = schedule_unparsed.get("dayOfWeek", "*")
-            tab = f"{minute} {hour} {day} {month} {dow}"
+            tab = schedule_object_to_crontab(schedule_unparsed)
             logger.debug("Converted schedule to %r", tab)
-            return CronTab(tab)
+            return self._crontab(tab)
         raise ConfigError("invalid schedule: {!r}".format(schedule_unparsed))
+
+    def _crontab(self, tab: str) -> CronTab:
+        # parse-crontab raises ValueError on a malformed field (a bad range, an
+        # out-of-range second, the wrong field count). Surface it as a
+        # ConfigError naming the offending expression, so a bad schedule fails
+        # the config load with a clear message the reload loop can log, rather
+        # than as an anonymous traceback.
+        try:
+            return CronTab(tab)
+        except ValueError as err:
+            raise ConfigError(
+                "invalid schedule {!r}: {}".format(tab, err)
+            ) from err
 
     def _resolve_timezone(
         self, timezone: Optional[str]

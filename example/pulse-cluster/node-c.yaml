@@ -1,0 +1,20 @@
+# Per-node cluster section for yacron-c (mounted as cluster.yaml on this node).
+# See node-a.yaml for the annotated version; only the identity differs.
+#
+# NOTE: yacron-c is also the default PULSE_TARGET (a follower, never the leader),
+# so "stop yacron-c" simulates an UPSTREAM OUTAGE, while "stop yacron-a"
+# simulates a LEADER failover — two independent experiments (see the README).
+cluster:
+  listen: "0.0.0.0:8443"
+  tls:
+    ca:   /certs/ca.pem
+    cert: /certs/yacron-c.pem       # SAN = yacron-c
+    key:  /certs/yacron-c.key
+  peers:
+    - host: yacron-a:8443
+    - host: yacron-b:8443
+  nodeName: yacron-c
+  electLeader: true
+  interval: 10
+  driftAfter: 2
+  # distribution: spread            # set on ALL three node files together

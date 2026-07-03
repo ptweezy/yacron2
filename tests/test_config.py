@@ -828,3 +828,92 @@ def test_web_metrics_buckets_must_be_finite():
                 {"metrics": {"durationBuckets": [1.0, float("inf")]}}
             )
         )
+
+
+# --- second-level scheduling -------------------------------------------------
+
+
+def _one_job(schedule_yaml: str):
+    conf = config.parse_config_string(
+        "jobs:\n  - name: t\n    command: echo hi\n" + schedule_yaml, ""
+    )
+    return conf.jobs[0]
+
+
+def test_schedule_object_second_builds_seven_field_crontab():
+    # An explicit second: opts into second-level scheduling; the object form
+    # renders to a full 7-field parse-crontab line (year defaults to "*").
+    job = _one_job('    schedule:\n      second: "*/15"\n      minute: "*"\n')
+    assert job.has_seconds is True
+    from crontab import CronTab
+
+    assert isinstance(job.schedule, CronTab)
+    # fires at seconds 0,15,30,45 of the minute (parse-crontab 7-field)
+    assert config.schedule_object_to_crontab(job.schedule_unparsed) == (
+        "*/15 * * * * * *"
+    )
+
+
+def test_schedule_string_seven_field_has_seconds():
+    job = _one_job('    schedule: "*/10 * * * * * *"\n')
+    assert job.has_seconds is True
+
+
+@pytest.mark.parametrize(
+    "schedule, expect_seconds",
+    [
+        ('    schedule: "*/5 * * * *"\n', False),  # 5-field minute
+        ('    schedule: "0 12 * * * 2030"\n', False),  # 6-field year, not sec
+        ('    schedule: "0 0 12 * * * *"\n', True),  # 7-field, explicit second
+        ('    schedule: "@reboot"\n', False),
+        ('    schedule: "@daily"\n', False),
+    ],
+)
+def test_has_seconds_string_forms(schedule, expect_seconds):
+    assert _one_job(schedule).has_seconds is expect_seconds
+
+
+def test_schedule_object_year_now_honored_six_field():
+    # Regression: the object-form year: used to be silently dropped. It now
+    # maps to parse-crontab's trailing year column (6-field line), no seconds.
+    job = _one_job(
+        '    schedule:\n      minute: "*/5"\n'
+        '      dayOfMonth: "19"\n      month: "7"\n      year: "2017"\n'
+    )
+    assert job.has_seconds is False
+    assert config.schedule_object_to_crontab(job.schedule_unparsed) == (
+        "*/5 * 19 7 * 2017"
+    )
+
+
+def test_schedule_object_minute_only_unchanged():
+    # No second/year -> the exact 5-field line it always produced (so existing
+    # job-set fingerprints are unperturbed).
+    job = _one_job('    schedule:\n      minute: "*/5"\n')
+    assert job.has_seconds is False
+    assert config.schedule_object_to_crontab(job.schedule_unparsed) == (
+        "*/5 * * * *"
+    )
+
+
+def test_out_of_range_second_reports_config_error():
+    with pytest.raises(ConfigError, match="invalid schedule"):
+        _one_job('    schedule: "99 * * * * * *"\n')
+
+
+def test_bad_schedule_string_reports_config_error():
+    # a malformed field is a ConfigError (was an anonymous ValueError before)
+    with pytest.raises(ConfigError, match="invalid schedule"):
+        _one_job('    schedule: "* * * notamonth *"\n')
+
+
+@pytest.mark.parametrize("blank", ['""', '" "'])
+def test_blank_second_is_not_second_granular(blank):
+    # A blank/whitespace `second:` value collapses to a minute-granular line;
+    # has_seconds must be False so it does not force the whole scheduler to
+    # tick per-second for a job that only fires once a minute. has_seconds is
+    # derived from the actual rendered field count, not mere key presence.
+    job = _one_job(
+        "    schedule:\n      second: {}\n      minute: \"5\"\n".format(blank)
+    )
+    assert job.has_seconds is False

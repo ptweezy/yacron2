@@ -1,0 +1,16 @@
+# Per-node cluster section for yacron-b (mounted as cluster.yaml on this node).
+# See node-a.yaml for the annotated version; only the identity differs.
+cluster:
+  listen: "0.0.0.0:8443"
+  tls:
+    ca:   /certs/ca.pem
+    cert: /certs/yacron-b.pem       # SAN = yacron-b
+    key:  /certs/yacron-b.key
+  peers:
+    - host: yacron-a:8443
+    - host: yacron-c:8443
+  nodeName: yacron-b
+  electLeader: true
+  interval: 10
+  driftAfter: 2
+  # distribution: spread            # set on ALL three node files together

@@ -1,0 +1,98 @@
+# Pulse (clustered) — a THREE-NODE, second-level uptime / SLA monitor with
+# mutual-TLS peer attestation and leader election.
+#
+#   docker compose -f docker-compose-pulse-cluster.yml up --build     # start
+#   docker compose -f docker-compose-pulse-cluster.yml logs -f        # watch
+#   docker compose -f docker-compose-pulse-cluster.yml down           # stop
+#   docker compose -f docker-compose-pulse-cluster.yml down -v        # stop + wipe certs
+#
+# Three nodes (yacron-a, -b, -c) run one identical pulse job set
+# (example/pulse-cluster/jobs.yaml) plus a per-node cluster section. A one-shot
+# `certgen` mints a throwaway CA + one cert per node into a shared volume first.
+#
+# Each node serves its own dashboard:
+#   - yacron-a -> http://localhost:8080/   (the leader while all three are up)
+#   - yacron-b -> http://localhost:8081/
+#   - yacron-c -> http://localhost:8082/   (also the PULSE_TARGET — a follower)
+#
+# WHAT TO WATCH
+# -------------
+# 1. Coordinated second-level probing. `liveness-probe` (EveryNode, every 5s)
+#    advances on ALL three dashboards — three independent vantage points on the
+#    upstream. `latency-slo` (Leader, every 2s) advances on yacron-a ONLY, so
+#    the upstream is sampled once, not three times. Both count down in SECONDS.
+#
+# 2. Fail the leader.   docker compose -f docker-compose-pulse-cluster.yml stop yacron-a
+#    Quorum holds (2 of 3); leadership moves to yacron-b, and `latency-slo`
+#    resumes on 8081. The upstream (yacron-c) is still up, so liveness stays
+#    green everywhere. This is a pure LEADER-FAILOVER demo.
+#
+# 3. Simulate an upstream outage.  docker compose -f docker-compose-pulse-cluster.yml stop yacron-c
+#    yacron-c is the PULSE_TARGET, so within ~5s `liveness-probe` goes RED on
+#    the remaining nodes (8080/8081) and their reports print the on-call PAGE
+#    line — the outage is caught from every surviving vantage point. Quorum is
+#    unaffected (a+b = 2 of 3), so this is a pure OUTAGE-DETECTION demo, cleanly
+#    separate from #2. Bring it back: `... start yacron-c`.
+#
+# 4. Spread the Leader work. Uncomment `distribution: spread` in ALL THREE
+#    example/pulse-cluster/node-*.yaml and recreate. Now `latency-slo` and
+#    `sla-rollup` get per-job owners (rendezvous-hashed), so they can land on
+#    different nodes instead of both on the leader.
+#
+# For the single-node version, see docker-compose-pulse.yml /
+# example/pulse-monitor. For the clustering feature tour without the monitoring
+# theme, see docker-compose-cluster.yml.
+
+x-yacron-node: &yacron-node
+  build:
+    context: .
+  image: yacron2-pulse-cluster:local   # built once, reused by all three nodes
+  restart: unless-stopped
+  depends_on:
+    certgen:
+      condition: service_completed_successfully
+
+services:
+  # One-shot: generate the cluster CA + per-node certs, then exit.
+  certgen:
+    image: alpine:3.20
+    command: ["sh", "/gen-certs.sh"]
+    volumes:
+      - pulse-certs:/certs
+      - ./example/pulse-cluster/gen-certs.sh:/gen-certs.sh:ro
+
+  yacron-a:
+    <<: *yacron-node
+    container_name: yacron-a
+    hostname: yacron-a                 # sets $HOSTNAME, used in the job output
+    ports:
+      - "8080:8080"                    # dashboard; 8443 (cluster mTLS) stays internal
+    volumes:
+      - ./example/pulse-cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
+      - ./example/pulse-cluster/node-a.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - pulse-certs:/certs:ro
+
+  yacron-b:
+    <<: *yacron-node
+    container_name: yacron-b
+    hostname: yacron-b
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./example/pulse-cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
+      - ./example/pulse-cluster/node-b.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - pulse-certs:/certs:ro
+
+  yacron-c:
+    <<: *yacron-node
+    container_name: yacron-c
+    hostname: yacron-c
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./example/pulse-cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
+      - ./example/pulse-cluster/node-c.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - pulse-certs:/certs:ro
+
+volumes:
+  pulse-certs:

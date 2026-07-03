@@ -1,6 +1,7 @@
 import asyncio
 import asyncio.subprocess
 import datetime
+import heapq
 import hmac
 import importlib.resources
 import json
@@ -11,7 +12,16 @@ import ssl
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Awaitable, Deque, Dict, List, Optional, Union  # noqa
+from typing import (  # noqa
+    Any,
+    Awaitable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 from urllib.parse import urlparse
 
 import aiohttp
@@ -45,13 +55,14 @@ from yacron2.prometheus import (
 
 logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
-# In sub-minute mode, the most whole seconds the scheduler will retroactively
-# service after a slow pass (see Cron._service_slots): a gap up to this bound
-# is tick overhead (a long config reload, many simultaneous launches) whose
-# skipped seconds we replay so a second-level job is not silently dropped; a
-# larger gap is a stall/suspend/clock jump, which we resume past WITHOUT
-# replaying -- matching cron's no-catch-up-after-an-outage behaviour, so a long
-# freeze cannot unleash a burst of backdated launches.
+# The furthest back the scheduler will retroactively service a job after a slow
+# pass or a forward clock jump (see Cron._advance): if a job's soonest missed
+# fire is no more than this behind, every missed occurrence in the window is
+# replayed so a frequently-scheduled job is not silently dropped by tick
+# overhead (a long config reload, many simultaneous launches); a larger gap is
+# a stall/suspend/clock jump, which we resume past by firing only the most
+# recent occurrence -- matching cron's no-catch-up-after-an-outage behaviour,
+# so a long freeze cannot unleash a burst of backdated launches.
 CATCHUP_LIMIT = datetime.timedelta(seconds=10)
 # How many finished runs to retain per job for the web UI's history/stats view.
 # In-memory only (like the rest of the run record), and bounded so a frequently
@@ -325,22 +336,25 @@ class Cron:
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
-        # name -> the last scheduling slot (a datetime at the job's resolution)
-        # we launched it in, so a job fires at most once per slot even when the
-        # scheduler ticks every second to service sub-minute schedules. Pruned
-        # on reload; initialised before update_config() runs below. See
-        # spawn_jobs / schedule_slot.
+        # name -> the last scheduling slot (a UTC datetime) we launched the job
+        # in, retained for status/introspection.  Pruned on reload; the
+        # forward-only next-fire index below is what actually de-duplicates
+        # launches, so this no longer gates firing. See _launch_plan.
         self._last_run_slot = {}  # type: Dict[str, datetime.datetime]
+        # The next-fire index: name -> the aware-UTC instant the job next
+        # fires, for every enabled CronTab job (a @reboot/string schedule or a
+        # disabled job is absent). _fire_heap is a min-heap of (when, name)
+        # over the same data, to find the soonest fire in O(1) and pop the due
+        # jobs in O(due log n); it may hold STALE entries (a name reseeded or
+        # removed on reload), validated against _next_fire lazily on pop. This
+        # replaces scanning every job with crontab.test each tick: the loop
+        # sleeps until the soonest fire and only touches jobs actually due.
+        self._next_fire = {}  # type: Dict[str, datetime.datetime]
+        self._fire_heap = []  # type: List[tuple[datetime.datetime, str]]
         # wall-clock minute of the last housekeeping pass (config reload,
         # cluster/web (re)start, logging). Gates that work to once per minute
-        # even while ticking per-second. See run().
+        # even while a second-level job wakes the loop far more often. run().
         self._last_housekeeping_minute: Optional[datetime.datetime] = None
-        # the last whole-second (UTC) scheduling slot serviced, and whether the
-        # last pass ran in sub-minute mode. Together they let _service_slots
-        # replay whole seconds a slow pass skipped (bounded by CATCHUP_LIMIT),
-        # so a second-level job is never silently dropped by tick overhead.
-        self._last_serviced_slot: Optional[datetime.datetime] = None
-        self._subminute_serviced: bool = False
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -480,14 +494,21 @@ class Cron:
                         # config changes, so a fixed-after-error logging
                         # section is picked up on reload without a restart.
                         applied_logging_config = config.logging_config
-            # Service the due slot(s). _service_slots re-reads the clock AFTER
-            # the (possibly slow) housekeeping above, so a whole second the
-            # reload pushed past is still serviced instead of silently dropped.
+            # Service the due job(s). _service_slots re-reads the clock AFTER
+            # the (possibly slow) housekeeping above, so a fire the reload
+            # pushed past is still serviced instead of silently dropped.
             await self._service_slots(startup)
             startup = False
-            # Recompute after servicing so a reload that just added (or
-            # removed) a second-level job switches cadence on this same tick.
-            sleep_interval = next_sleep_interval(self._needs_subminute())
+            # Sleep until the soonest job's next fire (or the next housekeeping
+            # minute, whichever is first). asyncio.wait_for schedules its
+            # timeout against loop.time() -- the event loop's MONOTONIC clock
+            # -- so the wait length is derived from the wall clock but realized
+            # monotonically: a wall-clock/NTP step during the sleep cannot
+            # stretch or collapse it, and (because firing compares the wall
+            # clock against the fixed, forward-only next-fire instants in the
+            # heap) a step is absorbed cleanly on the next wake rather than
+            # re-firing already-fired slots or unleashing a catch-up storm.
+            sleep_interval = self._sleep_interval()
             logger.debug("Will sleep for %.1f seconds", sleep_interval)
             try:
                 await asyncio.wait_for(self._stop_event.wait(), sleep_interval)
@@ -598,6 +619,7 @@ class Cron:
         this mutation of shared scheduler state stays on the loop thread.
         """
         self.metrics.config_parse(True)
+        old_jobs = self.cron_jobs
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
         # Drop metric series for jobs removed from the config, so a renamed
         # job does not leave a stale twin behind forever. A removed job with
@@ -606,7 +628,7 @@ class Cron:
         # the series from zero (a phantom counter reset); the reload after
         # the run ends prunes it for good.
         self.metrics.prune(set(self.cron_jobs) | set(self.running_jobs))
-        # Drop de-dup slots for jobs no longer in the config, so churning job
+        # Drop last-run slots for jobs no longer in the config, so churning job
         # names cannot grow this map without bound. A removed-but-still-running
         # job keeps its slot until it finishes and the next reload prunes it,
         # matching how the metrics accumulators above are pruned.
@@ -616,6 +638,12 @@ class Cron:
             for name, slot in self._last_run_slot.items()
             if name in keep
         }
+        # Bring the next-fire index in step with the new job set: drop removed
+        # / now-unscheduled jobs, reseed jobs whose schedule changed, and keep
+        # the existing next-fire for jobs whose schedule is unchanged (a reseed
+        # would recompute a STRICTLY-future fire and could skip a fire
+        # that coincides with this reload's minute boundary).
+        self._refresh_schedule(get_now(datetime.timezone.utc), old_jobs)
         return config
 
     def job_set_id(self) -> str:
@@ -1364,135 +1392,294 @@ class Cron:
             )
 
     def _needs_subminute(self) -> bool:
-        """Whether any enabled job needs the scheduler to tick every second.
+        """Whether any enabled job fires at second granularity.
 
-        Drives the loop cadence and the housekeeping gate in :meth:`run`. Only
-        enabled jobs count: a disabled second-level job never runs, so it must
-        not pay the per-second-tick cost on its behalf.
+        Gates the once-per-minute housekeeping in :meth:`run`: while a
+        second-level job wakes the loop far more often than once a minute,
+        rereading and reparsing the config on every wake would be pointless
+        IO/CPU, so housekeeping still runs at most once per wall-clock minute.
+        Only enabled jobs count: a disabled second-level job never runs.
         """
         return any(
             job.has_seconds for job in self.cron_jobs.values() if job.enabled
         )
 
-    async def _service_slots(self, startup: bool) -> None:
-        """Run :meth:`spawn_jobs` for every scheduling slot due since the last
-        pass.
+    # ---- next-fire index ------------------------------------------------
+    #
+    # Instead of testing every job against the clock on every tick, each
+    # enabled CronTab job carries its next fire instant (aware UTC) in
+    # ``_next_fire``, mirrored into the ``_fire_heap`` min-heap.  The loop
+    # sleeps until the soonest entry and only touches the jobs actually due,
+    # turning the per-wake cost from O(all jobs) into O(due jobs).  Firing
+    # compares the wall clock against these fixed, forward-only instants, which
+    # is what makes the cadence immune to clock steps (see :meth:`run`).
 
-        Normally that is the single current slot.  In sub-minute mode, if the
-        previous pass ran long -- many simultaneous launches, or the once-a-
-        minute config reload -- and pushed the clock past one or more whole-
-        second boundaries, those skipped seconds are serviced here too, so a
-        second-level job due in the gap still fires (once) rather than being
-        silently dropped.  In minute mode the minute-truncated slot already
-        absorbs any sub-minute tick overhead, so a single current slot
-        reproduces the historical behaviour exactly and nothing is ever caught
-        up.  The replay is bounded by :data:`CATCHUP_LIMIT`.
+    def _compute_next_fire(
+        self, job: JobConfig, after: datetime.datetime
+    ) -> Optional[datetime.datetime]:
+        """The aware-UTC instant ``job`` next fires strictly after ``after``.
+
+        Render ``after`` into the job's own frame (its timezone, or the
+        system-local zone when it has none) and ask parse-crontab for the delay
+        to the next match.  The frame is kept timezone-AWARE in both cases, so
+        parse-crontab computes the delay as a real duration -- correcting for
+        any utcoffset (DST) change across the interval -- and adding it back to
+        the UTC ``after`` yields the correct UTC fire instant.  A naive local
+        frame would defeat that correction: parse-crontab would return a civil
+        wall-clock delta that, added to a UTC instant, lands an hour off across
+        a spring-forward/fall-back (the same wall time the old per-tick
+        ``crontab.test`` matched correctly).  ``None`` when the schedule has no
+        further occurrence (a fixed past year), so the job drops out of the
+        index.
+        """
+        crontab = job.schedule
+        assert isinstance(crontab, CronTab)
+        if job.timezone is not None:
+            frame = after.astimezone(job.timezone)  # type: datetime.datetime
+        else:
+            # no explicit timezone -> the system-local wall clock, but kept
+            # AWARE (not .replace(tzinfo=None)) so parse-crontab applies its
+            # DST correction. default_utc is inert for an aware `now`.
+            frame = after.astimezone()
+        delay = crontab.next(now=frame, default_utc=job.utc)
+        if delay is None:
+            return None
+        return after + datetime.timedelta(seconds=delay)
+
+    def _set_next_fire(self, name: str, when: datetime.datetime) -> None:
+        """Record ``name``'s next fire and mirror it into the heap."""
+        self._next_fire[name] = when
+        heapq.heappush(self._fire_heap, (when, name))
+
+    def _ensure_seeded(self, now: datetime.datetime) -> None:
+        """Seed the index for any enabled CronTab job missing from it.
+
+        Seeds strictly-future (the next boundary after ``now``), so a job just
+        added on a reload -- or every job at start-up -- skips the in-progress
+        slot rather than firing once for the partial period already under way.
+        """
+        for name, job in self.cron_jobs.items():
+            if name in self._next_fire:
+                continue
+            if job.enabled and isinstance(job.schedule, CronTab):
+                nxt = self._compute_next_fire(job, now)
+                if nxt is not None:
+                    self._set_next_fire(name, nxt)
+
+    @staticmethod
+    def _same_schedule(a: JobConfig, b: JobConfig) -> bool:
+        """Whether two job configs fire on the same wall-clock instants.
+
+        Compares the schedule and the RESOLVED timezone (which already folds
+        in ``utc``: ``utc: true`` -> UTC, ``utc: false`` with no timezone ->
+        local, an explicit ``timezone`` -> that zone with ``utc`` inert).  The
+        timezone is compared by its canonical string so ``datetime.timezone``
+        ``.utc`` and ``ZoneInfo("UTC")`` -- distinct objects that fire
+        identically -- are treated as equal (an object-identity compare would
+        force a needless reseed that could skip a fire on the reload boundary).
+        The raw ``utc`` field is deliberately NOT compared: it is fully carried
+        by the resolved timezone and has no further effect on the fire instants
+        (:meth:`_compute_next_fire` reads an aware frame, so ``default_utc`` is
+        inert), so comparing it would only cause spurious reseeds.
+        """
+        return a.schedule == b.schedule and str(a.timezone) == str(b.timezone)
+
+    def _refresh_schedule(
+        self, now: datetime.datetime, old_jobs: Dict[str, JobConfig]
+    ) -> None:
+        """Reconcile the next-fire index with a reloaded job set.
+
+        Keeps the existing next-fire for a job whose schedule is unchanged (so
+        a reload never recomputes a strictly-future fire and skips a fire that
+        coincides with the reload's own minute boundary), drops a job that is
+        gone / disabled / no longer a CronTab schedule / has a changed
+        schedule, then reseeds anything now missing (changed schedules and
+        newly added jobs).  Stale heap entries left behind by a drop are
+        discarded lazily on pop (see :meth:`_due_names`).
+        """
+        for name in list(self._next_fire):
+            job = self.cron_jobs.get(name)
+            old = old_jobs.get(name)
+            if (
+                job is None
+                or not job.enabled
+                or not isinstance(job.schedule, CronTab)
+                or old is None
+                or not self._same_schedule(old, job)
+            ):
+                del self._next_fire[name]
+        self._ensure_seeded(now)
+
+    def _peek_soonest_fire(self) -> Optional[datetime.datetime]:
+        """The soonest valid next-fire instant, or ``None`` if nothing is
+        scheduled.  Discards stale heap entries from the top as it goes."""
+        heap = self._fire_heap
+        while heap:
+            when, name = heap[0]
+            if self._next_fire.get(name) == when:
+                return when
+            heapq.heappop(heap)  # stale: superseded or removed
+        return None
+
+    def _sleep_interval(self) -> float:
+        """Seconds to sleep until the next wake.
+
+        The soonest job's next fire, capped by the next housekeeping boundary
+        (the next wall-clock minute) so config reloads and cluster/web upkeep
+        stay ~once a minute even when no job is due for a while.  Never
+        negative; a fire already due returns 0 and is serviced next pass.  The
+        housekeeping cap goes through :func:`next_sleep_interval`, so a test
+        can still patch that one function to spin the loop fast.
+        """
+        housekeeping = next_sleep_interval(False)
+        soonest = self._peek_soonest_fire()
+        if soonest is None:
+            return housekeeping
+        now = get_now(datetime.timezone.utc)
+        delta = (soonest - now).total_seconds()
+        return max(0.0, min(housekeeping, delta))
+
+    def _due_names(self, now: datetime.datetime) -> List[str]:
+        """Names of every job whose next fire is at or before ``now``.
+
+        Pops the matching heap entries (validated against ``_next_fire``, so
+        stale ones are discarded and a name that somehow holds two live entries
+        for the same instant is returned once).  The popped names' next-fire
+        entries are left in place for :meth:`_advance` to read the fired slot
+        and push the replacement.
+        """
+        heap = self._fire_heap
+        due = []  # type: List[str]
+        seen = set()  # type: set[str]
+        while heap:
+            when, name = heap[0]
+            if when > now:
+                break
+            heapq.heappop(heap)
+            if name in seen:
+                continue
+            if self._next_fire.get(name) == when:
+                due.append(name)
+                seen.add(name)
+        return due
+
+    def _advance(
+        self,
+        job: JobConfig,
+        fire_slot: datetime.datetime,
+        now: datetime.datetime,
+    ) -> Tuple[List[datetime.datetime], Optional[datetime.datetime]]:
+        """The slots a due job launches this pass, plus its new next-fire.
+
+        When ``fire_slot`` (its current next-fire, known ``<= now``) is within
+        :data:`CATCHUP_LIMIT` of ``now``, walk forward occurrence by occurrence
+        while still ``<= now`` -- replaying each missed slot so a frequently
+        scheduled job overrun by a slow pass is not silently dropped.  This
+        walk is bounded: at most ``CATCHUP_LIMIT`` occurrences even for a
+        per-second job.
+
+        A larger gap is a stall/suspend/forward-clock-jump, NOT tick overhead,
+        and is handled WITHOUT walking the window: enumerating it would iterate
+        once per missed occurrence -- millions of times for a per-second job
+        across a multi-hour gap, unbounded for an RTC-less boot corrected
+        forward by years -- blocking the event loop and exhausting memory only
+        to discard the result.  Instead the job resumes exactly where the old
+        per-tick scheduler would, in O(1): fire the current slot only if now
+        itself matches (a per-second job fires once at the current second; a
+        sparse job -- ``*/15``, hourly, daily -- whose current slot does not
+        match fires nothing), then resync to the next occurrence after ``now``.
+        This is cron's no-catch-up-after-an-outage rule.
+        """
+        if now - fire_slot >= CATCHUP_LIMIT:
+            logger.warning(
+                "job %s: the scheduler fell behind by %.0fs (a slow pass, "
+                "stall, suspend, or clock change); resuming at the current "
+                "slot instead of replaying the interval",
+                job.name,
+                (now - fire_slot).total_seconds(),
+            )
+            # Resume at the current slot, firing only if it matches -- the same
+            # decision the old tick made via schedule_slot + crontab.test --
+            # and resync to the first occurrence after now (no enumeration).
+            crontab = job.schedule
+            assert isinstance(crontab, CronTab)
+            now_slot = schedule_slot(job, now)
+            # Record the fired slot as an aware-UTC instant, matching the
+            # normal branch below (whose fires are the aware-UTC next-fire
+            # entries), so _last_run_slot never mixes naive and aware values.
+            # schedule_slot renders now into the job's OWN frame -- naive local
+            # for a job with no timezone -- which is what crontab.test must
+            # match against; the recorded slot is then converted back to UTC.
+            # astimezone(utc) reads a naive slot as local (as schedule_slot
+            # produced it) and is a no-op for an already-UTC one.
+            fires = (
+                [now_slot.astimezone(datetime.timezone.utc)]
+                if crontab.test(now_slot)
+                else []
+            )
+            return fires, self._compute_next_fire(job, now)
+        fires = [fire_slot]
+        nxt = self._compute_next_fire(job, fire_slot)
+        while nxt is not None and nxt <= now:
+            fires.append(nxt)
+            nxt = self._compute_next_fire(job, nxt)
+        return fires, nxt
+
+    async def _service_slots(self, startup: bool) -> None:
+        """Service the jobs due on this pass.
+
+        Reads the clock once (AFTER any slow housekeeping, so a fire the reload
+        pushed past is still serviced instead of dropped) and hands that
+        instant to :meth:`spawn_jobs`.  On the start-up pass it also seeds the
+        next-fire index for every scheduled job, so their first fire is the
+        boundary strictly after start-up (the skip-the-partial-period start).
         """
         now = get_now(datetime.timezone.utc)
-        subminute = self._needs_subminute()
-        if not subminute:
-            self._last_serviced_slot = now.replace(second=0, microsecond=0)
-            self._subminute_serviced = False
-            await self.spawn_jobs(startup, now)
-            return
-        current = now.replace(microsecond=0)
-        if (
-            startup
-            or self._last_serviced_slot is None
-            or not self._subminute_serviced
-        ):
-            # First sub-minute pass (startup, or the tick that just switched
-            # into sub-minute mode): no established prior second to catch up
-            # from, so service only the current slot.
-            slots = [current]
-        else:
-            start = self._last_serviced_slot + datetime.timedelta(seconds=1)
-            if current - start >= CATCHUP_LIMIT:
-                # Gap too large to be tick overhead (a stall/suspend/clock
-                # jump): resume at the current second without replaying, so a
-                # long freeze cannot unleash a burst of backdated launches.
-                if current > start:
-                    logger.warning(
-                        "scheduler fell behind by %.0fs (a stall, suspend, "
-                        "or clock change); resuming at the current second "
-                        "without replaying the skipped interval",
-                        (current - self._last_serviced_slot).total_seconds(),
-                    )
-                slots = [current]
-            else:
-                slots = []
-                s = start
-                while s <= current:
-                    slots.append(s)
-                    s += datetime.timedelta(seconds=1)
-                # A clock that did not advance a whole second (or moved
-                # backwards) leaves slots empty; service the current slot so a
-                # pass is never a silent no-op.
-                if not slots:
-                    slots = [current]
-        self._last_serviced_slot = current
-        self._subminute_serviced = True
-        for slot in slots:
-            await self.spawn_jobs(startup, slot)
+        if startup:
+            self._ensure_seeded(now)
+        await self.spawn_jobs(startup, now)
 
     async def spawn_jobs(
         self, startup: bool, now: Optional[datetime.datetime] = None
     ) -> None:
+        """Launch the jobs due on this pass.
+
+        At start-up only ``@reboot`` jobs are due; scheduled (CronTab) jobs
+        never fire at start-up (they are seeded strictly-future in the
+        next-fire index).  On a normal pass the due jobs come from that index
+        (:meth:`_due_names`), each advanced past its fired slot with bounded
+        catch-up (:meth:`_advance`), so a job fires at most once per slot with
+        no per-tick scan or ``crontab.test`` over the whole job set.
+
+        ``now`` is the pass instant (aware UTC) from :meth:`_service_slots`; a
+        direct caller may omit it for a fresh read.
+        """
+        if now is None:
+            now = get_now(datetime.timezone.utc)
         self._log_cluster_role()
-        # Jobs cleared to run this pass, in config order. The gate/de-dup
-        # decisions below mutate shared scheduler state (_last_run_slot,
-        # _pending_reboot_jobs) and stay strictly sequential; only the actual
-        # launches -- each of which awaits a subprocess spawn -- are gathered
-        # and run concurrently afterwards. See the launch step at the end.
+        if startup:
+            await self._spawn_reboot_jobs()
+        else:
+            await self._spawn_due_jobs(now)
+        await self._process_pending_reboots()
+
+    async def _spawn_reboot_jobs(self) -> None:
+        """Launch ``@reboot`` jobs at start-up, in config order.
+
+        A ``@reboot`` Leader/PreferLeader job under election is deferred until
+        the cluster elects an owner (:meth:`_process_pending_reboots`) rather
+        than run now, when ownership is unknown: running it now would either
+        skip it forever (Leader sees no quorum) or run it on every node
+        (PreferLeader sees only itself).  ``EveryNode`` @reboot is not
+        deferred: it is meant to run on every node at boot.
+        """
         to_launch = []  # type: List[JobConfig]
         for job in self.cron_jobs.values():
-            # One clock read per job per pass: the SAME slot decides "due" and
-            # is recorded for de-dup, so the two cannot straddle a boundary and
-            # double-launch a single-slot job. `now` is the pass instant from
-            # _service_slots (None -> a fresh per-job read for direct callers).
-            slot = (
-                schedule_slot(job, now)
-                if isinstance(job.schedule, CronTab)
-                else None
-            )
-            if startup and slot is not None:
-                # Seed the de-dup map with the in-progress slot for every
-                # scheduled job, so the first post-startup tick does not fire a
-                # minute-level job for the minute already under way at startup
-                # (nor a second-level job for the in-progress second). This
-                # restores the historical "snap to the next boundary, skip the
-                # partial period" start behaviour, which per-second ticking
-                # otherwise broke: without it, merely having any second-level
-                # job made every minute-level job fire ~1s after a mid-minute
-                # restart. @reboot jobs (no CronTab slot) are unaffected and
-                # still fire once at startup below.
-                self._last_run_slot[job.name] = slot
-            if not self.job_should_run(startup, job, slot):
+            # job_should_run(startup=True) is True only for an enabled @reboot
+            # job, so everything below concerns @reboot one-shots.
+            if not self.job_should_run(True, job, None):
                 continue
-            if not startup and slot is not None:
-                # (slot is always set here: a non-CronTab job returns False
-                # from job_should_run above and was skipped.)
-                # De-duplicate within a scheduling slot. When a second-level
-                # job makes the scheduler tick every second, a minute-level job
-                # tests "due" on every one of the 60 ticks of its due minute
-                # (job_should_run truncates to the minute), and even a
-                # second-level job could see two ticks land in one second. Fire
-                # each job at most once per slot. Recorded whether or not the
-                # cluster gate below lets THIS node run it, so a leader-gated
-                # job is evaluated exactly once per slot -- once per minute as
-                # before. @reboot startup runs are exempt (they fire once by
-                # construction and carry no crontab slot).
-                if self._last_run_slot.get(job.name) == slot:
-                    continue
-                self._last_run_slot[job.name] = slot
-            if startup and self._is_deferrable_reboot(job):
-                # @reboot + Leader/PreferLeader under election: at the startup
-                # instant the cluster has not converged, so we cannot tell who
-                # owns the job yet. Defer it and run once on the elected owner
-                # (see _process_pending_reboots). Running it now would either
-                # skip it forever (Leader sees no quorum) or run it on every
-                # node (PreferLeader sees only itself). EveryNode @reboot is
-                # not deferred: it is meant to run on every node at boot.
+            if self._is_deferrable_reboot(job):
                 self._pending_reboot_jobs[job.name] = job
                 logger.info(
                     "cluster: deferring @reboot job %s until the cluster "
@@ -1502,26 +1689,76 @@ class Cron:
                 continue
             if self._cluster_allows(job):
                 to_launch.append(job)
-        # Launch every cleared job concurrently. Each launch awaits a
-        # subprocess spawn, so with N jobs due in the same slot the old
-        # one-at-a-time form cost N x spawn-time -- the dominant source of
-        # same-second scheduling overrun. Gathering collapses that to about a
-        # single spawn-time. The launches are independent: each touches only
-        # its own name's running_jobs/retry_state entry (to_launch holds
-        # distinct names, drawn once from cron_jobs), and the loop is
-        # single-threaded so the interleaved awaits cannot race. The de-dup
-        # decision was already made and recorded sequentially above, so it is
-        # unaffected; only the per-job "Starting"/"spawned" INFO lines may now
-        # interleave across jobs. gather is scheduled in config order. The
-        # single-job case (the norm) takes a direct await so its behaviour is
-        # byte-identical to before, and an empty pass skips launching entirely.
+        await self._launch_concurrently(to_launch)
+
+    async def _spawn_due_jobs(self, now: datetime.datetime) -> None:
+        """Launch the jobs whose next fire has arrived, in config order.
+
+        Due jobs come from the next-fire index; each is advanced past its fired
+        slot (with bounded catch-up) BEFORE any launch awaits, so the index is
+        already current if the launches yield.
+        """
+        due = set(self._due_names(now))
+        if not due:
+            return
+        # Build the launch plan in config order. Each due job contributes its
+        # list of fire slots (usually one; more only when a slow pass or a
+        # forward clock jump missed whole occurrences within CATCHUP_LIMIT).
+        plan = []  # type: List[Tuple[JobConfig, List[datetime.datetime]]]
+        for name, job in self.cron_jobs.items():
+            if name not in due:
+                continue
+            fires, new_next = self._advance(job, self._next_fire[name], now)
+            if new_next is not None:
+                self._set_next_fire(name, new_next)
+            else:
+                # no further occurrence (a fixed past year now behind us):
+                # drop it from the index so it is not revisited.
+                self._next_fire.pop(name, None)
+            plan.append((job, fires))
+        await self._launch_plan(plan)
+
+    async def _launch_plan(
+        self, plan: List[Tuple[JobConfig, List[datetime.datetime]]]
+    ) -> None:
+        """Launch a due-job plan.
+
+        One round per catch-up depth: within a round the due jobs launch
+        concurrently in config order (so N jobs due in the same slot cost about
+        one spawn-time, not N), while a single job's own catch-up replays run
+        in successive rounds -- i.e. sequentially -- so its concurrencyPolicy
+        still applies between them.  The common case (every job has exactly one
+        fire) is a single round.
+        """
+        rounds = max((len(fires) for _, fires in plan), default=0)
+        for r in range(rounds):
+            to_launch = []  # type: List[JobConfig]
+            for job, fires in plan:
+                if r >= len(fires):
+                    continue
+                # record the slot this fire is for (status/introspection), then
+                # gate on the cluster -- recorded whether or not this node runs
+                # it, mirroring the old per-slot bookkeeping.
+                self._last_run_slot[job.name] = fires[r]
+                if self._cluster_allows(job):
+                    to_launch.append(job)
+            await self._launch_concurrently(to_launch)
+
+    async def _launch_concurrently(self, to_launch: List[JobConfig]) -> None:
+        """Launch every job in ``to_launch`` concurrently, in config order.
+
+        Each launch awaits a subprocess spawn, so gathering collapses N due
+        jobs from N x spawn-time to about a single spawn-time.  The launches
+        are independent (each touches only its own name's running_jobs /
+        retry_state entry).  The single-job case (the norm) takes a direct
+        await so it is byte-identical to the pre-gather form; empty is a no-op.
+        """
         if len(to_launch) == 1:
             await self.launch_scheduled_job(to_launch[0])
         elif to_launch:
             await asyncio.gather(
                 *(self.launch_scheduled_job(job) for job in to_launch)
             )
-        await self._process_pending_reboots()
 
     def _is_deferrable_reboot(self, job: JobConfig) -> bool:
         """Whether ``job`` is an @reboot job whose start must wait for the

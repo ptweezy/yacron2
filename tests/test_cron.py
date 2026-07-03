@@ -3434,9 +3434,12 @@ def test_next_sleep_interval_modes(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_spawn_jobs_subminute_dedup(monkeypatch):
-    # Ticking every second, a minute-level job must still fire exactly once per
-    # minute, and a second-level job exactly once per matching second -- even
-    # if two ticks land in one second. spawn_jobs de-dupes per scheduling slot.
+    # A minute-level job fires exactly once per minute and a second-level job
+    # exactly once per matching second, even when the loop wakes more than once
+    # in a second (a duplicate tick). The forward-only next-fire index de-dupes
+    # structurally: once a slot has fired the job's next fire has already
+    # advanced past it. Start-up seeds strictly-future, so the second and
+    # minute in progress at start-up are skipped, not fired for a partial run.
     holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
     _set_now(monkeypatch, holder)
     cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
@@ -3448,21 +3451,21 @@ async def test_spawn_jobs_subminute_dedup(monkeypatch):
 
     monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
 
-    async def tick(minute, second):
+    async def tick(minute, second, *, startup=False):
         holder["now"] = DT(2020, 1, 1, 0, minute, second)
-        await cron.spawn_jobs(False)
+        await cron._service_slots(startup)
 
-    await tick(0, 0)  # sec + min both due at :00
-    await tick(0, 1)  # nothing (sec off-beat; min already fired this minute)
-    await tick(0, 15)  # sec only
+    await tick(0, 0, startup=True)  # start-up: seed strictly-future, fire none
+    await tick(0, 15)  # sec fires (min not due until :01:00)
     await tick(0, 15)  # duplicate tick in the same second: de-duped
     await tick(0, 30)  # sec only
-    await tick(1, 0)  # new minute: sec + min both fire again
+    await tick(0, 45)  # sec only
+    await tick(1, 0)  # new minute: sec + min both fire
 
     sec_fires = [(m, s) for (s, m, n) in launched if n == "sec"]
     min_fires = [(m, s) for (s, m, n) in launched if n == "min"]
-    assert sec_fires == [(0, 0), (0, 15), (0, 30), (1, 0)]
-    assert min_fires == [(0, 0), (1, 0)]  # once per minute despite 6 ticks
+    assert sec_fires == [(0, 15), (0, 30), (0, 45), (1, 0)]
+    assert min_fires == [(1, 0)]  # once, despite the ticks through the minute
 
 
 _EVERY_SECOND_AND_MINUTE = """
@@ -3488,6 +3491,17 @@ def _drive_cron(monkeypatch, holder, config_yaml):
 
     monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
     return cron, launched
+
+
+def _seed_due(cron, *names):
+    """Make the named jobs due *now* by seeding the next-fire index at the
+    current (frozen) clock, so a direct spawn_jobs(False) call services them.
+    Mirrors what a real pass does once the loop has been running -- the loop's
+    start-up seeding is strictly-future, which deliberately skips the current
+    slot."""
+    now = yacron2.cron.get_now(datetime.timezone.utc)
+    for name in names:
+        cron._set_next_fire(name, now)
 
 
 @pytest.mark.asyncio
@@ -3603,6 +3617,7 @@ async def test_spawn_jobs_launches_concurrently(monkeypatch):
 
     monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
 
+    _seed_due(cron, "a", "b", "c")  # all three due this pass
     task = asyncio.create_task(cron.spawn_jobs(False))
     try:
         # all three launches are in flight at once (would hang if sequential)
@@ -3625,7 +3640,10 @@ async def test_single_due_job_still_launches(monkeypatch):
         launched.append(job.name)
 
     monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
-    # alpha is "*/5 * * * *"; the frozen clock is 12:00, a multiple of 5
+    # alpha is "*/5 * * * *"; the frozen clock is 12:00, a multiple of 5.
+    # Seed it due so this single-pass call services it (beta is a disabled
+    # @reboot one-shot and never enters the next-fire index).
+    _seed_due(cron, "alpha")
     await cron.spawn_jobs(False)
     assert launched == ["alpha"]
 
@@ -3714,3 +3732,443 @@ async def test_startup_gates_reboot_before_servicing(tmp_path, monkeypatch):
     assert cron.cluster_manager is None  # bad certs -> no manager
     assert "boot" in cron._pending_reboot_jobs  # deferred, not run ungated
     assert launched == []  # never launched anywhere
+
+
+# =====================================================================
+#  next-fire index + monotonic-sleep behaviour, and a perf demonstration
+# =====================================================================
+
+_ONE_MINUTE_JOB = """
+jobs:
+  - name: m
+    command: echo m
+    schedule: "* * * * *"
+"""
+
+_NOON_DAILY = """
+jobs:
+  - name: noon
+    command: echo noon
+    schedule: "0 12 * * *"
+"""
+
+_TZ_JOBS = """
+jobs:
+  - name: utc
+    command: echo utc
+    schedule: "*/10 * * * *"
+  - name: local
+    command: echo local
+    schedule: "*/10 * * * *"
+    utc: false
+  - name: la
+    command: echo la
+    schedule: "*/10 * * * *"
+    timezone: America/Los_Angeles
+"""
+
+_RELOAD_BEFORE = """
+jobs:
+  - name: keep
+    command: echo keep
+    schedule: "* * * * *"
+  - name: drop
+    command: echo drop
+    schedule: "* * * * *"
+"""
+
+_RELOAD_AFTER = """
+jobs:
+  - name: keep
+    command: echo keep
+    schedule: "* * * * *"
+  - name: added
+    command: echo added
+    schedule: "*/5 * * * *"
+"""
+
+
+def test_compute_next_fire_is_now_plus_delay_utc(monkeypatch):
+    # The index instant is exactly now + parse-crontab's delay-to-next-match,
+    # the same formula the dashboard countdown and the Prometheus next-run
+    # gauge use, so all three agree.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_ONE_MINUTE_JOB)
+    now = yacron2.cron.get_now(UTC)
+    job = cron.cron_jobs["m"]
+    delay = job.schedule.next(now=now, default_utc=True)
+    assert cron._compute_next_fire(job, now) == now + datetime.timedelta(
+        seconds=delay
+    )
+    # strictly-future: the in-progress minute (:00) is skipped for :01
+    assert cron._compute_next_fire(job, now) == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+
+
+def test_compute_next_fire_lands_on_a_matching_slot(monkeypatch):
+    # Whatever the timezone, the computed next-fire instant, rendered back into
+    # the job's own frame, satisfies the cron expression -- so the heap fires
+    # the job exactly when the old test()-based tick would have matched. Uses a
+    # */10 schedule so the next fire is minutes away (no DST boundary crossed).
+    holder = {"now": DT(2020, 6, 1, 12, 34, 56)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_TZ_JOBS)
+    now = yacron2.cron.get_now(UTC)
+    for name, job in cron.cron_jobs.items():
+        fire = cron._compute_next_fire(job, now)
+        assert fire is not None and fire.tzinfo is not None
+        assert fire > now
+        if job.timezone is not None:
+            frame = fire.astimezone(job.timezone)
+        else:
+            frame = fire.astimezone().replace(tzinfo=None)
+        assert job.schedule.test(frame.replace(microsecond=0)), name
+
+
+def test_sleep_interval_uses_soonest_fire(monkeypatch):
+    # The loop sleeps until the soonest job's next fire, not a fixed tick.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)  # sec */15 + min
+    cron._ensure_seeded(yacron2.cron.get_now(UTC))
+    # soonest is the */15 job at :15 -> 15s away (the minute job is 60s away)
+    assert cron._sleep_interval() == pytest.approx(15.0, abs=0.05)
+
+
+def test_sleep_interval_capped_by_housekeeping(monkeypatch):
+    # A sparse job hours away still wakes the loop within the next wall-minute,
+    # so config reload / cluster upkeep stays ~once a minute.
+    holder = {"now": DT(2020, 1, 1, 3, 0, 15)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_NOON_DAILY)  # next fire 12:00
+    cron._ensure_seeded(yacron2.cron.get_now(UTC))
+    # capped at the next minute boundary (03:01:00), i.e. 45s
+    assert cron._sleep_interval() == pytest.approx(45.0, abs=0.05)
+
+
+def test_sleep_interval_no_jobs_uses_housekeeping(monkeypatch):
+    holder = {"now": DT(2020, 1, 1, 3, 0, 15)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None)  # nothing scheduled
+    assert cron._peek_soonest_fire() is None
+    assert cron._sleep_interval() == pytest.approx(45.0, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_backward_clock_step_does_not_refire(monkeypatch):
+    # The heart of the clock-step immunity: next-fire advances forward-only, so
+    # an NTP/clock step BACKWARD defers the next fire rather than re-firing an
+    # already-fired slot. The old tick+test scheduler re-matched the earlier
+    # second and fired it a second time.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
+    await cron._service_slots(startup=True)  # seed tick->:01, noon->12:00
+
+    holder["now"] = DT(2020, 1, 1, 0, 0, 5)
+    await cron._service_slots(startup=False)  # tick fires :01..:05
+    assert [s for (n, s) in launched if n == "tick"] == [1, 2, 3, 4, 5]
+
+    launched.clear()
+    # the wall clock jumps BACK 3 seconds
+    holder["now"] = DT(2020, 1, 1, 0, 0, 2)
+    await cron._service_slots(startup=False)
+    assert [s for (n, s) in launched if n == "tick"] == []  # no re-fire
+
+    # ...and it resumes cleanly once the clock passes the pending fire again
+    holder["now"] = DT(2020, 1, 1, 0, 0, 6)
+    await cron._service_slots(startup=False)
+    assert [s for (n, s) in launched if n == "tick"] == [6]
+
+
+_EVERY_15MIN = """
+jobs:
+  - name: j15
+    command: echo j15
+    schedule: "*/15 * * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_long_gap_sparse_job_fires_only_if_current_slot_matches(
+    monkeypatch,
+):
+    # After a gap beyond CATCHUP_LIMIT, a sparse job resumes EXACTLY where the
+    # old tick would: it fires only if NOW's own slot matches the schedule, not
+    # a stale most-recent occurrence. Regression: an earlier draft fired the
+    # most recent missed slot (00:30), backdating a launch the old scheduler
+    # never made.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_15MIN)
+    await cron._service_slots(startup=True)  # seed j15 -> 00:15:00
+
+    # froze ~37 minutes, resuming at 00:37 -- NOT a */15 slot
+    holder["now"] = DT(2020, 1, 1, 0, 37, 0)
+    await cron._service_slots(startup=False)
+    assert launched == []  # nothing backdated (00:37 is not a */15 slot)
+
+    # ...and it resyncs: the next real fire at 00:45 still happens
+    holder["now"] = DT(2020, 1, 1, 0, 45, 0)
+    await cron._service_slots(startup=False)
+    assert [n for (n, s) in launched] == ["j15"]
+
+
+@pytest.mark.asyncio
+async def test_long_gap_resumes_at_matching_current_slot(monkeypatch):
+    # The mirror of the above: when the resume instant DOES land on a matching
+    # slot, the job fires once there (the frequently-scheduled / on-boundary
+    # case), matching the old "fire the current slot" behaviour.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_15MIN)
+    await cron._service_slots(startup=True)  # seed j15 -> 00:15:00
+    holder["now"] = DT(2020, 1, 1, 0, 45, 0)  # froze to a */15 boundary
+    await cron._service_slots(startup=False)
+    assert [(n, s) for (n, s) in launched] == [("j15", 0)]  # once, at 00:45
+
+
+@pytest.mark.asyncio
+async def test_large_forward_jump_does_not_enumerate_window(monkeypatch):
+    # A large forward clock jump / long suspend must NOT walk the missed window
+    # occurrence-by-occurrence: for a per-second job an 8h gap is ~28,800
+    # occurrences (and an RTC-less 1970->now boot is billions), which would
+    # block the event loop and exhaust memory. The long-gap branch resumes at
+    # the current slot with O(1) crontab work. Regression guard for the review's
+    # high-severity finding.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
+    await cron._service_slots(startup=True)  # seed tick -> 00:00:01
+    counts = _count_crontab_calls(monkeypatch)
+
+    holder["now"] = DT(2020, 1, 1, 8, 0, 0)  # jump forward 8 hours
+    await cron._service_slots(startup=False)
+
+    # O(1), not ~28,800 (one crontab.next per second of the gap)
+    assert counts["next"] <= 3
+    # ...and the per-second job still fires once, at the current second
+    assert [s for (n, s) in launched if n == "tick"] == [0]
+
+
+_LOCAL_MINUTE_JOB = """
+jobs:
+  - name: loc
+    command: echo loc
+    schedule: "* * * * *"
+    utc: false
+"""
+
+
+@pytest.mark.asyncio
+async def test_last_run_slot_is_aware_utc_in_both_advance_branches(monkeypatch):
+    # _last_run_slot must never mix naive and aware datetimes. The normal
+    # catch-up branch records the aware-UTC next-fire instant; the long-gap
+    # branch records schedule_slot(), which is NAIVE local for a utc:false /
+    # no-timezone job, so it converts back to UTC before recording. Regression
+    # for the review finding: an earlier draft stored the naive slot, leaving
+    # _last_run_slot[name] after a long-gap resume mutually incomparable with
+    # the value the normal branch stores (a TypeError on any ordering).
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _LOCAL_MINUTE_JOB)
+    await cron._service_slots(startup=True)  # seed loc -> next minute boundary
+
+    # normal branch: a short overrun within CATCHUP_LIMIT
+    holder["now"] = DT(2020, 1, 1, 0, 1, 2)
+    await cron._service_slots(startup=False)
+    normal = cron._last_run_slot["loc"]
+    assert normal.tzinfo == UTC
+
+    # long-gap branch: a gap beyond CATCHUP_LIMIT resumes at the current slot
+    holder["now"] = DT(2020, 1, 1, 0, 30, 0)
+    await cron._service_slots(startup=False)
+    longgap = cron._last_run_slot["loc"]
+    assert longgap.tzinfo == UTC
+    # both values are now comparable (a naive one would raise TypeError here)
+    assert longgap > normal
+
+
+def test_reload_utc_to_timezone_utc_preserves_next_fire(tmp_path, monkeypatch):
+    # utc:true and an explicit `timezone: UTC` fire on identical instants, so a
+    # reconfiguration between them must NOT be treated as a schedule change (an
+    # object-identity timezone compare made datetime.timezone.utc != ZoneInfo
+    # ("UTC") and forced a reseed that could skip a boundary fire). Regression
+    # guard for the review's _same_schedule finding.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_ONE_MINUTE_JOB)  # utc:true by default
+    cron = yacron2.cron.Cron(str(cfg))
+    assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+
+    # reload AT the boundary with an explicit `timezone: UTC` added
+    holder["now"] = DT(2020, 1, 1, 0, 1, 0)
+    cfg.write_text(_ONE_MINUTE_JOB.rstrip() + "\n    timezone: UTC\n")
+    cron.update_config()
+    # kept at 00:01:00 (a spurious reseed would jump it to 00:02:00)
+    assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_minute_job_missed_minutes_fires_once(monkeypatch):
+    # A minute-level job whose scheduler froze across several minutes fires
+    # ONCE on resume (no backdated storm), matching cron's outage semantics --
+    # the per-job catch-up bound (CATCHUP_LIMIT) unifies this with sub-minute
+    # catch-up.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _ONE_MINUTE_JOB)
+    await cron._service_slots(startup=True)  # seed m -> 00:01:00
+    holder["now"] = DT(2020, 1, 1, 0, 5, 30)  # froze ~4.5 minutes
+    await cron._service_slots(startup=False)
+    assert [n for (n, s) in launched] == ["m"]  # once, not five times
+
+
+def test_reload_preserves_unchanged_next_fire(tmp_path, monkeypatch):
+    # A reload that does NOT change a job's schedule keeps its next-fire, so a
+    # reload landing on the job's own boundary minute never recomputes a
+    # strictly-future fire and skips that fire.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_ONE_MINUTE_JOB)
+    cron = yacron2.cron.Cron(str(cfg))
+    assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+
+    # reload AT the boundary minute, same schedule
+    holder["now"] = DT(2020, 1, 1, 0, 1, 0)
+    cron.update_config()
+    # kept at 00:01:00 (a reseed would have jumped it to 00:02:00, dropping the
+    # fire due this very minute)
+    assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+
+
+def test_reload_reseeds_changed_schedule(tmp_path, monkeypatch):
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_ONE_MINUTE_JOB)
+    cron = yacron2.cron.Cron(str(cfg))
+    assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+
+    cfg.write_text(_ONE_MINUTE_JOB.replace('"* * * * *"', '"*/5 * * * *"'))
+    cron.update_config()
+    # reseeded strictly-future for the NEW schedule
+    assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 5, tzinfo=UTC)
+
+
+def test_reload_refreshes_index(tmp_path, monkeypatch):
+    # One reload exercises all three reconciliations: an unchanged job keeps its
+    # fire, a removed job leaves the index, a new job is seeded strictly-future.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_BEFORE)
+    cron = yacron2.cron.Cron(str(cfg))
+    keep_before = cron._next_fire["keep"]
+    assert set(cron._next_fire) == {"keep", "drop"}
+
+    cfg.write_text(_RELOAD_AFTER)
+    cron.update_config()
+    assert set(cron._next_fire) == {"keep", "added"}  # drop gone, added in
+    assert cron._next_fire["keep"] == keep_before  # unchanged kept
+    assert cron._next_fire["added"] == DT(2020, 1, 1, 0, 5, tzinfo=UTC)
+
+
+def test_reload_drops_disabled_job(tmp_path, monkeypatch):
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_ONE_MINUTE_JOB)
+    cron = yacron2.cron.Cron(str(cfg))
+    assert "m" in cron._next_fire
+
+    cfg.write_text(_ONE_MINUTE_JOB.rstrip() + "\n    enabled: false\n")
+    cron.update_config()
+    assert "m" not in cron._next_fire  # disabled -> not scheduled
+
+
+def _count_crontab_calls(monkeypatch):
+    import crontab as crontab_mod
+
+    counts = {"test": 0, "next": 0}
+    orig_test = crontab_mod.CronTab.test
+    orig_next = crontab_mod.CronTab.next
+
+    def counting_test(self, entry):
+        counts["test"] += 1
+        return orig_test(self, entry)
+
+    def counting_next(self, *a, **k):
+        counts["next"] += 1
+        return orig_next(self, *a, **k)
+
+    monkeypatch.setattr(crontab_mod.CronTab, "test", counting_test)
+    monkeypatch.setattr(crontab_mod.CronTab, "next", counting_next)
+    return counts
+
+
+@pytest.mark.asyncio
+async def test_perf_wake_is_o_due_not_o_all(monkeypatch, capsys):
+    # PERFORMANCE DEMONSTRATION. The next-fire index turns a wake from
+    # O(all jobs) into O(due jobs): over a large fleet, a wake where nothing is
+    # due performs ZERO crontab matches (a heap peek), and a wake with a cohort
+    # due matches only that cohort -- independent of fleet size. The old
+    # tick+test loop called CronTab.test once per job per tick, i.e. O(all).
+    N = 2000
+    jobs = "\n".join(
+        "  - name: j{0}\n    command: echo {0}\n"
+        '    schedule: "{1} * * * *"'.format(i, i % 60)
+        for i in range(N)
+    )
+    holder = {"now": DT(2020, 1, 1, 0, 30, 0)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml="jobs:\n" + jobs)
+
+    async def fake_launch(job):
+        pass
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+
+    # one-time seeding (startup) is O(all); every wake AFTER it is O(due)
+    await cron._service_slots(startup=True)
+    assert len(cron._next_fire) == N
+
+    counts = _count_crontab_calls(monkeypatch)
+
+    # a wake where nothing is due: no crontab work at all
+    holder["now"] = DT(2020, 1, 1, 0, 30, 1)
+    await cron._service_slots(startup=False)
+    assert counts["test"] == 0  # the O(all) per-tick scan primitive is gone
+    assert counts["next"] == 0  # the heap said nothing is due -> no work
+
+    # a wake where the minute-31 cohort (~N/60 jobs) is due
+    holder["now"] = DT(2020, 1, 1, 0, 31, 0)
+    await cron._service_slots(startup=False)
+    due = sum(1 for i in range(N) if i % 60 == 31)
+    assert counts["test"] == 0  # still never scans-and-tests the whole fleet
+    assert counts["next"] == due  # exactly one advance per due job -> O(due)
+
+    # wall-time: an idle heap wake over N jobs vs the old O(all) test() scan
+    idle_reps = 50
+    t0 = time.perf_counter()
+    for _ in range(idle_reps):
+        await cron._service_slots(startup=False)  # nothing due now
+    new_idle = (time.perf_counter() - t0) / idle_reps
+
+    sample = next(iter(cron.cron_jobs.values()))
+    slot = yacron2.cron.schedule_slot(sample, holder["now"])
+    scan_reps = 50
+    t0 = time.perf_counter()
+    for _ in range(scan_reps):
+        for job in cron.cron_jobs.values():  # what the old tick did every wake
+            job.schedule.test(slot)
+    old_scan = (time.perf_counter() - t0) / scan_reps
+
+    with capsys.disabled():
+        print(
+            "\n[perf] fleet={0} jobs | idle heap wake {1:.1f}us "
+            "vs old O(all) test scan {2:.0f}us  (~{3:.0f}x faster)".format(
+                N,
+                new_idle * 1e6,
+                old_scan * 1e6,
+                old_scan / max(new_idle, 1e-12),
+            )
+        )
+    # the idle wake must be dramatically cheaper than scanning every job
+    assert new_idle < old_scan

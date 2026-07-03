@@ -5,6 +5,53 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.2.4 (2026-07-03)
+
+This release re-implements the scheduler core added in 1.2.3 without changing
+what it does: every schedule fires exactly when it did before, and there are no
+configuration changes. The daemon no longer wakes on a fixed cadence and tests
+every job against the clock; it keeps each job's next fire time in an index and
+**sleeps until the soonest one is due**, servicing only the jobs whose moment
+has arrived.
+
+- **Per-wake cost scales with jobs *due*, not jobs *configured*.** The previous
+  loop matched every enabled job against the clock on every tick -- and with a
+  second-level job present that tick was once a second, so the whole job set was
+  scanned every second. The scheduler now maintains a next-fire index (each
+  job's next-fire instant, mirrored in a min-heap), sleeps until the earliest
+  entry, and touches only the jobs actually due. An idle wake over a large fleet
+  is an O(1) heap peek that runs zero cron matching; a wake with a cohort due
+  matches only that cohort. A deployment running thousands of sparsely-scheduled
+  jobs pays dramatically less per wake, and adding a second-level job no longer
+  imposes a per-second scan of everything else.
+
+- **Robust across wall-clock and NTP steps.** The sleep is realized against the
+  event loop's monotonic clock, and firing compares the wall clock against
+  fixed, forward-only next-fire instants. A clock step **backward** (an NTP
+  correction or a manual set) now defers the pending fire instead of re-running
+  a slot that already fired; a large step **forward**, a resume from suspend, or
+  an RTC-less boot corrected far ahead resumes at the current slot in O(1)
+  instead of enumerating and replaying every occurrence in the skipped span. The
+  bounded catch-up for a genuinely overrun pass -- a slow config reload, a burst
+  of simultaneous launches -- is retained, still capped at the ten-second
+  `CATCHUP_LIMIT`, and now covers minute- and second-level jobs by the same
+  path.
+
+- **De-duplication is now structural.** A fired slot cannot fire twice because
+  advancing the index moves a job's next fire strictly past the slot it just
+  fired; the old per-slot "did this already run?" gate is gone (`_last_run_slot`
+  is kept only for status/introspection). All the surrounding guarantees are
+  preserved: a job fires exactly once per matching slot, a mid-period restart
+  skips the period already under way (the index is seeded strictly-future at
+  start-up), `@reboot` jobs run once at boot, a config reload landing on a job's
+  own boundary minute does not skip that fire, and housekeeping (config reload,
+  cluster and web upkeep, logging) still runs at most once a wall-clock minute.
+
+- Internal: the next-fire index, monotonic sleep, clock-step handling, reload
+  reconciliation, and a fleet-scale performance demonstration are covered by a
+  new batch of scheduler tests; the wiki's "How the scheduler ticks" section is
+  rewritten to describe the index.
+
 ## 1.2.3 (2026-07-02)
 
 This release brings **second-level (sub-minute) scheduling**: a job can now

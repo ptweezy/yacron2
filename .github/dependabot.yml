@@ -1,0 +1,59 @@
+# Dependabot keeps the CI/CD supply chain current: it opens PRs to bump the
+# pinned versions as new releases land, so the exact pins in .github/workflows
+# and the Dockerfiles don't silently rot back into known-vulnerable versions.
+#
+# Two mechanisms, one file:
+#   - VERSION updates (configured below) run on the weekly schedule and bump a
+#     dependency simply because a newer release exists.
+#   - SECURITY updates -- the ones that matter most here, where Dependabot raises
+#     a PR the moment a dependency has a published advisory, regardless of
+#     schedule -- are switched on in the repo UI, not here: Settings -> Code
+#     security -> enable "Dependabot alerts" AND "Dependabot security updates".
+#     They reuse the ecosystems declared below to know which manifests to patch,
+#     so keep this file in sync with what the pipeline actually uses.
+#
+# Updates are grouped per ecosystem so a quiet week brings at most one PR per
+# ecosystem to review, not one per dependency.
+version: 2
+updates:
+  # The GitHub Actions pinned in .github/workflows/*.yml. They are exact-pinned
+  # (e.g. actions/checkout@v7.0.0), which is precisely what lets Dependabot see
+  # each one as outdated and open a reviewable bump -- a moving major tag (@v7)
+  # would hide minor/patch drift behind a mutable ref instead.
+  - package-ecosystem: github-actions
+    directory: "/" # scans .github/workflows/ (and any composite actions)
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Python dependencies: the pyproject.toml optional-dependency groups (incl. the
+  # dev extra) and requirements_dev.txt. Catches CVEs in the aiohttp/ruamel stack
+  # and the dev toolchain (tox, ruff, mypy, pytest, uv-via-tox-uv).
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      python:
+        patterns: ["*"]
+
+  # Base images in the Dockerfiles: the published multi-distro image matrix
+  # (/Dockerfile is the default Debian image; docker/Dockerfile.* are the
+  # variants) plus the local PyInstaller build image (pyinstaller/Dockerfile,
+  # which also carries the uv COPY --from pin). Base-image bumps can change a
+  # distro's default Python, so review these rather than automerging.
+  - package-ecosystem: docker
+    directories:
+      - "/"
+      - "/docker"
+      - "/pyinstaller"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      docker:
+        patterns: ["*"]

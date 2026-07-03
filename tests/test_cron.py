@@ -3659,6 +3659,7 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
     # The once-a-minute reparse is offloaded to a worker thread so a slow disk
     # read + parse cannot freeze the event loop (and stall the scheduling
     # tick). Prove every run-loop reparse executes off the event-loop thread.
+    import itertools
     import threading
 
     cfg = tmp_path / "c.yaml"
@@ -3678,21 +3679,28 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
         "yacron2.cron.parse_config_with_sources", recording_parse
     )
     monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+    # Force every housekeeping pass to reparse by defeating the unchanged-config
+    # skip cache: an ever-incrementing signature never equals the stored one, so
+    # reload_config always treats the config as changed and offloads the parse.
+    # This test is about WHERE the reparse runs (a worker thread), not about the
+    # skip cache's change detection -- which test_run_reloads_changed_config
+    # already covers through a real on-disk edit. Driving the reparse this way
+    # keeps the test off the filesystem's timing entirely: relying on real
+    # size/mtime changes to trigger successive reparses races the parse->record
+    # window (reload_config re-stats the file when recording the parse result,
+    # so a second rapid rewrite lands inside that window and is absorbed into the
+    # record, and the next reparse never fires). That race is benign in
+    # production (reloads are ~60s apart) but is deterministic under this test's
+    # 10ms ticks on Windows / Python <= 3.12, whose coarse ~15.6ms asyncio timer
+    # lands every rewrite inside the window -- which hung this test in CI.
+    _sig_counter = itertools.count()
+    monkeypatch.setattr(
+        cron, "_config_signature", lambda files: next(_sig_counter)
+    )
 
     task = asyncio.create_task(cron.run())
     try:
-        # reload_config skips the reparse while the file is unchanged on disk
-        # (stat fingerprint: size + mtime). Force a reparse each iteration by
-        # GROWING the file so its size changes every time. mtime alone is not
-        # enough: Windows stamps file mtimes from the ~15.6ms system timer, so
-        # two rapid writes can land on the same mtime, and equal-length bodies
-        # (e.g. "# edit 0" vs "# edit 1") would then fingerprint identically --
-        # the second reparse would be skipped and this test would hang on
-        # Windows CI. A distinct size sidesteps the mtime resolution entirely.
-        for i in range(2):
-            cfg.write_text(TWO_JOBS + "\n# edit\n" * (i + 1))
-            before = len(seen)
-            await _wait_until(lambda before=before: len(seen) > before)
+        await _wait_until(lambda: len(seen) >= 2)  # a couple of reload ticks
     finally:
         cron.signal_shutdown()
         await asyncio.wait_for(task, timeout=5)

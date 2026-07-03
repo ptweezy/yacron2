@@ -1533,21 +1533,38 @@ jobs:
 
 
 @pytest.mark.asyncio
-async def test_run_survives_config_error(monkeypatch):
-    # If update_config() raises (e.g. the config became invalid on reload),
-    # run() must log it and keep running the previously-loaded jobs, not crash
-    # with UnboundLocalError when it later inspects `config`.
-    cron = yacron2.cron.Cron(None)
+async def test_run_survives_config_error(tmp_path, monkeypatch):
+    # If the reparse raises (e.g. the config became invalid on reload), run()
+    # must log it and keep running the previously-loaded jobs, not crash with
+    # UnboundLocalError when the housekeeping block later inspects `config`.
+    # The reparse now runs off the event loop (reload_config ->
+    # run_in_executor(parse_config)), so make parse_config itself fail after a
+    # clean load at construction.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(TWO_JOBS)
+    cron = yacron2.cron.Cron(str(cfg))
+    assert set(cron.cron_jobs) == {"alpha", "beta"}
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
 
-    def failing_update_config():
-        # stop the loop after this (failing) iteration, then fail
-        cron.signal_shutdown()
+    def boom(*args, **kwargs):
         raise ConfigError("boom")
 
-    monkeypatch.setattr(cron, "update_config", failing_update_config)
+    monkeypatch.setattr("yacron2.cron.parse_config", boom)
 
-    # completes without raising (UnboundLocalError before the fix)
-    await asyncio.wait_for(cron.run(), timeout=5)
+    task = asyncio.create_task(cron.run())
+    try:
+        # the reparse fails on every housekeeping tick, but the daemon must
+        # stay up (no UnboundLocalError, no escape) and keep the jobs it had.
+        await asyncio.sleep(0.1)
+        assert not task.done()
+        assert set(cron.cron_jobs) == {"alpha", "beta"}  # unchanged
+        # the failed reload flips the standard "config broken on disk" signal
+        # (yacron2_config_last_reload_successful) even though the parse ran off
+        # the loop, in a worker thread.
+        assert cron.metrics._last_reload_ok is False
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
 
 
 def test_cluster_allows_per_policy():
@@ -3545,3 +3562,155 @@ async def test_single_slot_job_fires_once_across_boundary(monkeypatch):
 
     noon_fires = [s for (n, s) in launched if n == "noon"]
     assert noon_fires == [0]  # exactly one launch, at second 0 of 12:00
+
+
+# =====================================================================
+#  concurrent launches + off-loop config reparse
+# =====================================================================
+
+_THREE_DUE = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+  - name: b
+    command: echo b
+    schedule: "* * * * *"
+  - name: c
+    command: echo c
+    schedule: "* * * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_spawn_jobs_launches_concurrently(monkeypatch):
+    # Jobs due in the same slot are launched concurrently, not one at a time:
+    # all three enter their (blocking) launch before any of them completes, so
+    # a slot's wall time is ~one spawn-time instead of N x spawn-time. Under
+    # the old sequential loop only the first launch would ever start (it blocks
+    # on `release`), so `started` would never fire and this would time out.
+    cron = yacron2.cron.Cron(None, config_yaml=_THREE_DUE)
+
+    order = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_launch(job):
+        order.append(job.name)
+        if len(order) == 3:
+            started.set()
+        await release.wait()
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+
+    task = asyncio.create_task(cron.spawn_jobs(False))
+    try:
+        # all three launches are in flight at once (would hang if sequential)
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert order == ["a", "b", "c"]  # scheduled in config order
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_single_due_job_still_launches(monkeypatch):
+    # The len == 1 fast path (await directly, no gather) still launches the one
+    # due job, so the optimisation does not regress the common single-job slot.
+    # Only "alpha" is due here ("beta" is a disabled @reboot one-shot).
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    launched = []
+
+    async def fake_launch(job):
+        launched.append(job.name)
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+    # alpha is "*/5 * * * *"; the frozen clock is 12:00, a multiple of 5
+    await cron.spawn_jobs(False)
+    assert launched == ["alpha"]
+
+
+@pytest.mark.asyncio
+async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
+    # The once-a-minute reparse is offloaded to a worker thread so a slow disk
+    # read + parse cannot freeze the event loop (and stall the scheduling
+    # tick). Prove every run-loop reparse executes off the event-loop thread.
+    import threading
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(TWO_JOBS)
+    # construction parses once, synchronously, on this (the loop) thread
+    cron = yacron2.cron.Cron(str(cfg))
+    main_thread = threading.get_ident()
+
+    seen = []
+    real_parse = yacron2.cron.parse_config
+
+    def recording_parse(arg):
+        seen.append(threading.get_ident())
+        return real_parse(arg)
+
+    monkeypatch.setattr("yacron2.cron.parse_config", recording_parse)
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: len(seen) >= 2)  # a couple of reload ticks
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert seen  # the loop reparsed at least once
+    assert all(t != main_thread for t in seen)  # ...always off the loop thread
+
+
+_LEADER_REBOOT_BAD_CLUSTER = """
+jobs:
+  - name: boot
+    command: echo boot
+    schedule: "@reboot"
+    clusterPolicy: Leader
+cluster:
+  listen: "127.0.0.1:18444"
+  tls:
+    ca: /nonexistent/ca.pem
+    cert: /nonexistent/cert.pem
+    key: /nonexistent/key.pem
+  peers:
+    - host: b:8443
+    - host: c:8443
+  electLeader: true
+"""
+
+
+@pytest.mark.asyncio
+async def test_startup_gates_reboot_before_servicing(tmp_path, monkeypatch):
+    # Housekeeping (which sets the cluster gate _elect_leader_configured via
+    # start_stop_cluster) must run BEFORE the first spawn_jobs, so a Leader
+    # @reboot job is deferred to the elected owner rather than run ungated on
+    # every node. This must hold even though the reparse is now offloaded to a
+    # worker thread (reload_config): it is still awaited and applied before
+    # _service_slots. Here the manager fails to start (bad certs), so the
+    # Leader one-shot must stay deferred and fail closed -- never launched.
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_LEADER_REBOOT_BAD_CLUSTER)
+    cron = yacron2.cron.Cron(str(cfg))
+
+    launched = []
+
+    async def fake_launch(job):
+        launched.append(job.name)
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: cron._elect_leader_configured)
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+    assert cron.cluster_manager is None  # bad certs -> no manager
+    assert "boot" in cron._pending_reboot_jobs  # deferred, not run ungated
+    assert launched == []  # never launched anywhere

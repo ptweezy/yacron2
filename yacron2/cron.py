@@ -407,10 +407,10 @@ class Cron:
             now_minute = get_now(datetime.timezone.utc).replace(
                 second=0, microsecond=0
             )
-            # None when housekeeping is skipped this tick, or until
-            # update_config succeeds; on failure we keep running the previously
-            # loaded jobs (update_config only overwrites self.cron_jobs on
-            # success) and must not dereference an unbound config below.
+            # None when housekeeping is skipped this tick, or until the reload
+            # succeeds; on failure we keep running the previously loaded jobs
+            # (reload_config only swaps self.cron_jobs on a clean parse) and
+            # must not dereference an unbound config below.
             config: Optional[Yacron2Config] = None
             if (
                 startup
@@ -419,7 +419,16 @@ class Cron:
             ):
                 self._last_housekeeping_minute = now_minute
                 try:
-                    config = self.update_config()
+                    # reload_config runs the disk read + full reparse OFF the
+                    # event loop (in a worker thread), so a slow parse no
+                    # longer freezes the whole loop -- web API, cluster gossip,
+                    # job output pumping -- for its duration once a minute. The
+                    # parsed job set is applied here, on the loop thread, and
+                    # BEFORE _service_slots below, so the cluster gate is in
+                    # place before the first spawn_jobs (a reload that enables
+                    # electLeader must gate its Leader jobs on that same tick,
+                    # not one tick late).
+                    config = await self.reload_config()
                     self._log_job_set_id()
                     await self.start_stop_cluster(config.cluster_config)
                 except ConfigError as err:
@@ -516,14 +525,32 @@ class Cron:
         logger.debug("Signalling shutdown")
         self._stop_event.set()
 
+    @staticmethod
+    def _empty_config() -> Yacron2Config:
+        """The config used when no config source is set (config_arg is None).
+
+        Empty job set, no web/cluster/logging, so applying it is a no-op that
+        leaves any test-injected cron_jobs (config_yaml) untouched. Kept as a
+        factory rather than a constant because JobDefaults({}) is mutable.
+        """
+        return Yacron2Config(
+            jobs=[],
+            web_config=None,
+            job_defaults=JobDefaults({}),
+            logging_config=None,
+        )
+
     def update_config(self) -> Yacron2Config:
+        """Reload the config from disk and apply it, synchronously.
+
+        Used at construction (where there is no running event loop to offload
+        to) and by tests. The run loop instead calls :meth:`reload_config`,
+        which does the same work but runs the disk read + reparse off the event
+        loop; both paths share the pure parse (:func:`parse_config`) and
+        :meth:`_apply_reload`.
+        """
         if self.config_arg is None:
-            return Yacron2Config(
-                jobs=[],
-                web_config=None,
-                job_defaults=JobDefaults({}),
-                logging_config=None,
-            )
+            return self._empty_config()
         try:
             config = parse_config(self.config_arg)
         except ConfigError:
@@ -531,6 +558,45 @@ class Cron:
             # "config broken on disk" alert signal.
             self.metrics.config_parse(False)
             raise
+        return self._apply_reload(config)
+
+    async def reload_config(self) -> Yacron2Config:
+        """Like :meth:`update_config`, but runs the disk read + full reparse
+        OFF the event loop, in a worker thread.
+
+        :func:`parse_config` is a synchronous file read and full reparse; run
+        inline on the scheduling tick it froze the entire event loop -- web
+        API, cluster gossip, job output pumping -- for its whole duration, once
+        a minute. Offloading just the parse keeps the loop responsive; applying
+        the result (which mutates shared scheduler state) stays on the loop
+        thread via :meth:`_apply_reload`, so there is no cross-thread access to
+        ``self``. The caller applies this BEFORE servicing due slots, so the
+        cluster gate is always current for the tick.
+        """
+        if self.config_arg is None:
+            return self._empty_config()
+        loop = asyncio.get_running_loop()
+        try:
+            config = await loop.run_in_executor(
+                None, parse_config, self.config_arg
+            )
+        except ConfigError:
+            # feeds yacron2_config_last_reload_successful, the standard
+            # "config broken on disk" alert signal. The parse ran in the worker
+            # thread (parse_config does not touch metrics), so record the
+            # failure here, back on the loop thread.
+            self.metrics.config_parse(False)
+            raise
+        return self._apply_reload(config)
+
+    def _apply_reload(self, config: Yacron2Config) -> Yacron2Config:
+        """Swap in a freshly parsed config's job set (event-loop thread only).
+
+        Records the successful reload, installs the new jobs and prunes the
+        per-job maps of jobs the reload removed. Kept separate from the parse
+        itself so the parse can run in a worker thread (see :meth:`run`) while
+        this mutation of shared scheduler state stays on the loop thread.
+        """
         self.metrics.config_parse(True)
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
         # Drop metric series for jobs removed from the config, so a renamed
@@ -1373,6 +1439,12 @@ class Cron:
         self, startup: bool, now: Optional[datetime.datetime] = None
     ) -> None:
         self._log_cluster_role()
+        # Jobs cleared to run this pass, in config order. The gate/de-dup
+        # decisions below mutate shared scheduler state (_last_run_slot,
+        # _pending_reboot_jobs) and stay strictly sequential; only the actual
+        # launches -- each of which awaits a subprocess spawn -- are gathered
+        # and run concurrently afterwards. See the launch step at the end.
+        to_launch = []  # type: List[JobConfig]
         for job in self.cron_jobs.values():
             # One clock read per job per pass: the SAME slot decides "due" and
             # is recorded for de-dup, so the two cannot straddle a boundary and
@@ -1429,7 +1501,26 @@ class Cron:
                 )
                 continue
             if self._cluster_allows(job):
-                await self.launch_scheduled_job(job)
+                to_launch.append(job)
+        # Launch every cleared job concurrently. Each launch awaits a
+        # subprocess spawn, so with N jobs due in the same slot the old
+        # one-at-a-time form cost N x spawn-time -- the dominant source of
+        # same-second scheduling overrun. Gathering collapses that to about a
+        # single spawn-time. The launches are independent: each touches only
+        # its own name's running_jobs/retry_state entry (to_launch holds
+        # distinct names, drawn once from cron_jobs), and the loop is
+        # single-threaded so the interleaved awaits cannot race. The de-dup
+        # decision was already made and recorded sequentially above, so it is
+        # unaffected; only the per-job "Starting"/"spawned" INFO lines may now
+        # interleave across jobs. gather is scheduled in config order. The
+        # single-job case (the norm) takes a direct await so its behaviour is
+        # byte-identical to before, and an empty pass skips launching entirely.
+        if len(to_launch) == 1:
+            await self.launch_scheduled_job(to_launch[0])
+        elif to_launch:
+            await asyncio.gather(
+                *(self.launch_scheduled_job(job) for job in to_launch)
+            )
         await self._process_pending_reboots()
 
     def _is_deferrable_reboot(self, job: JobConfig) -> bool:

@@ -5,6 +5,202 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.2.3 (2026-07-02)
+
+This release brings **second-level (sub-minute) scheduling**: a job can now
+fire at second granularity, either through a new `second` field on the schedule
+object or a full seven-field crontab string. The scheduler keeps its historical
+once-a-minute cadence -- and its zero overhead -- until some enabled job
+actually asks for seconds, at which point it ticks once a second, firing
+second-level jobs on time while every minute-level job still fires exactly once
+in its minute. The release also starts honoring the schedule object's `year`
+key (previously accepted but silently dropped, a behavior change for the few
+configs that set it), surfaces a malformed schedule as a named `ConfigError` at
+reload instead of an anonymous traceback, teaches the web dashboard to parse,
+describe, and preview five-, six-, and seven-field expressions, and ships two
+runnable examples (`pulse-monitor` and its clustered sibling `pulse-cluster`)
+built around second-level probing. Sub-minute scheduling is entirely opt-in;
+see the upgrade notes below for the one behavior change that can affect an
+existing deployment.
+
+### Second-level (sub-minute) scheduling
+
+- **New `second` field and seven-field crontab strings.** parse-crontab reads
+  extra columns from the *ends* of a crontab line, so the field count selects
+  the dialect: a five-field line has an implicit second of `0` and any year, a
+  six-field line adds a trailing **year** column, and a seven-field line adds a
+  leading **second** column too (`second minute hour dayOfMonth month dayOfWeek
+  year`). So the object `second: "*/15"` and the seven-field string
+  `"*/15 * * * * * *"` both fire every 15 seconds, while a six-field string pins
+  a year and stays minute-granular. The `second` field takes the same syntax as
+  any other (`*`, `*/5`, `0,30`, `10-20`); `second: "*"` fires every second.
+  Second-level scheduling is a YAML feature: classic crontab files stay
+  five-field and minute-granular.
+
+- **Adaptive cadence, zero cost when unused.** The scheduler ticks once a second
+  only while some *enabled* job pins a second (`Cron._needs_subminute()`);
+  otherwise it keeps the historical once-a-minute cadence, aligned to the top of
+  each UTC minute, byte-for-byte as before. A disabled second-level job never
+  forces the per-second cadence. The cadence is re-evaluated every tick, so a
+  reload that adds or removes a second-level job switches modes on that same
+  tick.
+
+- **Exactly once per slot; mixed cadences.** Each pass reads the clock once and
+  tests every job against a single scheduling "slot" truncated to that job's own
+  resolution -- the whole second for a second-level job, the top of the minute
+  otherwise. Launches are de-duplicated per slot (`_last_run_slot`), so a
+  minute-level job now tested up to 60 times in its due minute still fires
+  exactly once, and a second-level job fires once per matching second even if two
+  ticks land in the same second. A leader-gated job is evaluated once per slot
+  regardless of which node runs it. Sub-minute and per-minute jobs mix freely in
+  one config; `concurrencyPolicy` still governs overlap as before.
+
+- **Catch-up for overrun seconds, bounded.** In sub-minute mode, if a pass runs
+  long -- many simultaneous launches, or the once-a-minute config reload -- and
+  the clock crosses one or more whole seconds before the next pass, the skipped
+  seconds are serviced after the fact, so a second-level job due in the gap still
+  fires (once) rather than being silently dropped. The replay is bounded by a
+  ten-second `CATCHUP_LIMIT`: a larger gap is treated as a stall, suspend, or
+  clock jump and resumed past with a warning, never replayed as a burst of
+  backdated launches (matching cron's no-catch-up-after-an-outage behavior).
+  Minute-level jobs need no catch-up: their minute-truncated slot already
+  absorbs any sub-minute overrun.
+
+- **No spurious run at a mid-period restart.** On startup the de-dup map is
+  seeded with the in-progress slot for every scheduled job, so a job whose
+  minute (or second) is already under way does not fire immediately on the first
+  tick; it first fires at the next matching boundary, exactly as in minute-only
+  mode. Without this, merely having any second-level job present would have made
+  every minute-level job fire about a second after a mid-minute restart.
+  `@reboot` jobs are unaffected and still fire once at startup.
+
+- **Concurrent launches within a slot.** When several jobs are due in the same
+  slot, `spawn_jobs` now launches them concurrently instead of one at a time.
+  With N jobs sharing a slot the old serial form cost N times a subprocess spawn
+  -- the dominant source of same-second overrun -- which now collapses to about
+  a single spawn. The single-job case (the norm) still takes a direct await and
+  is byte-identical to before, and the de-dup and cluster-gate decisions are
+  still made sequentially, so only the per-job "Starting"/"spawned" log lines may
+  now interleave.
+
+- **Config reload moved off the event loop.** The once-a-minute reload now runs
+  its disk read and full reparse in a worker thread (`reload_config`), so a slow
+  parse no longer freezes the event loop -- web API, cluster gossip, job-output
+  pumping -- for its whole duration. The parsed job set is still applied on the
+  loop thread and *before* jobs are serviced, so the cluster leader-gate is
+  always current for the tick. Housekeeping (config reload, cluster and web
+  (re)start, logging config) is gated to run at most once per wall-clock minute
+  even while the loop ticks per second; in pure minute-tick mode it runs every
+  iteration, exactly as before.
+
+### The `year` schedule key is now honored
+
+- **`year` restricts the schedule to specific years.** Earlier releases accepted
+  a `year` key on the schedule object but built only a five-field crontab string
+  from it, silently dropping `year` so it had no effect -- a job with an
+  object-form `year` ran every year. It is now emitted as parse-crontab's
+  trailing year column and honored, so `year: "2017"` really does pin the
+  schedule to 2017. (String schedules were always passed to parse-crontab
+  verbatim, so a six-field string already honored its year; only the object form
+  changes.) This is a behavior change -- see the upgrade notes below.
+
+- Honoring `year` changes that job's job-set fingerprint, so during a rolling
+  upgrade of a cluster the old and new binaries compute different `job_set_id`s
+  for the identical config and will not treat each other as agreed peers until
+  every node is upgraded -- the same transient, self-healing drift as any config
+  rollout, and leader election stays at-most-once throughout. Jobs that do *not*
+  use object-form `year` are unaffected: their fingerprint is byte-for-byte
+  identical to before.
+
+### Schedule parsing, errors, and fingerprints
+
+- **A malformed schedule now fails the reload with a named error.**
+  parse-crontab's `ValueError` on a bad field (an out-of-range value, the wrong
+  field count) is caught and re-raised as `ConfigError("invalid schedule
+  '...': ...")`, naming the offending expression, so a bad schedule fails config
+  load or reload cleanly with a message the reload loop can log, rather than
+  surfacing as an anonymous traceback.
+
+- **One object-to-crontab builder, shared everywhere.** A single
+  `schedule_object_to_crontab` helper now renders the object form to a crontab
+  line -- five fields normally, six or seven when `year`/`second` are used -- and
+  is shared by parsing, the fingerprint, and the dashboard's schedule label, so
+  those three can never disagree on the mapping. The object form still collapses
+  to the exact five-field line as before when neither `second` nor `year` is set,
+  so its fingerprint is unchanged. Whether a schedule counts as second-level is
+  derived from the *actual rendered field count* (seven), not mere key presence,
+  so a blank `second:` value that renders an empty column does not force the
+  whole scheduler onto the per-second cadence.
+
+### Web dashboard
+
+- **Cron parsing, description, and preview understand five-, six-, and
+  seven-field expressions.** The client-side cron engine normalizes any of the
+  three widths (implicit second `0` and any year for five fields, a trailing year
+  for six, a leading second for seven), computes next-fire times at second
+  resolution with year restriction (and parse-crontab's 2099 year ceiling), and
+  renders wall-clock times with a seconds component where the schedule has one.
+  Plain-English descriptions gain "Every second", "Every N seconds", "At
+  second(s) ...", and an "in {year}" clause -- and deliberately do *not* lead
+  with a per-second cadence phrase when a coarser field is restricted, so a
+  schedule like `* 30 * * * * *` is not described as firing every second.
+
+- **Cron sandbox covers the new widths.** The palette's schedule sandbox
+  validates 5-, 6-, and 7-field expressions (its error copy and field-breakout
+  labels updated to match, labelling the leading second and trailing year
+  columns correctly), and its next-fire preview shows seconds.
+
+- **Clicking the wordmark spins the logo.** The "yacron2" wordmark now triggers
+  the same mark-spin animation as clicking the mark glyph.
+
+### Examples and documentation
+
+- **`example/pulse-monitor`** -- a small, runnable real-time uptime / SLA monitor
+  built entirely on second-level scheduling: it probes a latency-critical service
+  every few seconds, heartbeats every ten, and rolls up a summary once a minute
+  (which still fires exactly once per minute alongside the per-second probes). It
+  watches yacron2's own `/status` endpoint, so `docker compose -f
+  docker-compose-pulse.yml up` needs nothing else running.
+
+- **`example/pulse-cluster`** -- the clustered sibling: a three-node,
+  mutual-TLS, leader-electing cluster that splits the monitoring work the way a
+  real fleet should -- `liveness-probe` runs on every node (independent vantage
+  points catch a partition outage), while `latency-slo` and the summary run on
+  the leader only. A one-shot service mints throwaway certs, and an optional
+  `distribution: spread` fans the leader jobs across nodes by rendezvous hashing.
+  `docker compose -f docker-compose-pulse-cluster.yml up`.
+
+- The wiki and README are updated throughout: a new "Second-level schedules"
+  reference and field-count table in Schedules and Timezones, the `year` key
+  documented as honored (with an upgrade note), a Troubleshooting entry on the
+  common "six fields is a year, not seconds" mistake, the Configuration Reference
+  `schedule` row, and the Web Dashboard sandbox notes.
+
+- Internal: second-level scheduling ships with a matching batch of tests
+  (`test_cron.py`, `test_config.py`, `test_fingerprint.py`) covering the object
+  and string spellings, the adaptive cadence and its zero-overhead minute path,
+  per-slot de-duplication, bounded catch-up, the mid-period-restart seeding, the
+  `year` fingerprint change, and the malformed-schedule error path.
+
+### Upgrade notes
+
+- **Object-form `year` is now honored (breaking).** A schedule object that sets
+  `year` previously had no effect and now restricts the job to that year, so a
+  past year stops the job firing. This is the only change that can affect an
+  existing deployment, and only one that uses object-form `year`; to keep the old
+  "runs every year" behavior, remove the `year` key. During a rolling cluster
+  upgrade such a job's fingerprint changes, so mixed-version nodes will not agree
+  on its `job_set_id` until all are upgraded (transient and self-healing; leader
+  election stays at-most-once). All other schedules -- crontab strings, and
+  object schedules without `year`/`second` -- behave and fingerprint exactly as
+  before.
+
+- **Seven-field crontab strings now fire at second granularity.** A seven-field
+  string earlier fired at most once a minute, because the scheduler zeroed the
+  seconds column and only woke per minute; such schedules were effectively
+  meaningless. They now fire on the seconds they specify. This is unlikely to
+  surprise, but audit any seven-field strings already in your configs.
+
 ## 1.2.2 (2026-07-02)
 
 - **New webhook reporter: native Slack/Discord/Teams/ntfy notifications.** A

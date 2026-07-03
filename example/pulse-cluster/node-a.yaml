@@ -1,0 +1,23 @@
+# Per-node cluster section for yacron-a (mounted as cluster.yaml on this node).
+#
+# Only the node identity differs between node-a/-b/-c: nodeName, the peer list
+# (every OTHER member), and this node's TLS cert/key. None of this affects the
+# job-set id, so the three nodes still agree. See node-a in example/cluster for
+# the annotated original; this is the same shape, driving the pulse job set.
+cluster:
+  listen: "0.0.0.0:8443"            # the mutual-TLS /peer listener (internal only)
+  tls:
+    ca:   /certs/ca.pem             # shared cluster CA (trust anchor)
+    cert: /certs/yacron-a.pem       # this node's cert (SAN = yacron-a)
+    key:  /certs/yacron-a.key
+  peers:                            # every OTHER member -> cluster size = 3
+    - host: yacron-b:8443
+    - host: yacron-c:8443
+  nodeName: yacron-a                # lowest name -> the leader when all agree
+  electLeader: true                 # Leader jobs (latency-slo, rollup) run on the leader only
+  interval: 10                      # poll every 10s so the demo reacts quickly
+  driftAfter: 2                     # report drift after 2 mismatched rounds
+  # distribution: spread            # OPT-IN: per-job ownership instead of one
+                                    # leader (set on ALL three node files). With
+                                    # only two Leader jobs here, spread lets a
+                                    # DIFFERENT node own latency-slo vs rollup.

@@ -1,0 +1,133 @@
+# Shared job set for the docker-compose-pulse-cluster.yml demo — a CLUSTERED,
+# second-level uptime / SLA monitor.
+#
+# This is the clustered sibling of example/pulse-monitor. Three nodes probe a
+# critical upstream every few SECONDS, but they coordinate over mutual TLS so
+# the RIGHT work runs in the RIGHT place — which for a monitor is a genuinely
+# interesting mix, not just "run everything once":
+#
+#   * liveness  -> EveryNode   Each node probes the upstream from its OWN vantage
+#                              point. That is the whole value of a distributed
+#                              monitor: a node with a bad network path reports
+#                              DOWN while the others report UP, catching a
+#                              partial / partition outage a single prober misses.
+#   * latency   -> Leader      Measuring latency from all three nodes 30x/min
+#                              would just triple the load on the upstream for no
+#                              extra signal, so ONE elected node samples it.
+#   * heartbeat -> EveryNode   Each node emits its own liveness pulse.
+#   * rollup    -> Leader      One authoritative per-minute summary, not three.
+#
+# This file is mounted IDENTICALLY into all three nodes (that is what lets their
+# job-set ids match so a quorum/leader can form). The per-node bits (nodeName,
+# peers, TLS identity) live in node-a.yaml / node-b.yaml / node-c.yaml, which do
+# NOT change the job-set id. Node identity in the output comes from $HOSTNAME.
+#
+# See example/pulse-cluster/README.md for the full walkthrough.
+
+defaults:
+  captureStdout: true
+  captureStderr: true
+  environment:
+    - key: PYTHONIOENCODING
+      value: utf-8
+    # The upstream under test. It defaults to node yacron-c's dashboard so the
+    # demo is self-contained AND the target is a FOLLOWER (never the leader):
+    # that keeps the "fail the leader" and "outage" experiments independent
+    # (see the README). Point it at your real service in production.
+    - key: PULSE_TARGET
+      value: http://yacron-c:8080/status
+    - key: PULSE_BUDGET_MS
+      value: "250"
+
+web:
+  # 0.0.0.0 so each node's dashboard is reachable through its published port.
+  listen:
+    - http://0.0.0.0:8080
+
+jobs:
+  # -- @reboot: every node announces itself (EveryNode) ----------------------
+  - name: welcome
+    command: echo "🩺 $HOSTNAME joined the pulse cluster at $(date -u +%H:%M:%S)Z — watching $PULSE_TARGET"
+    schedule: "@reboot"
+    clusterPolicy: EveryNode
+
+  # -- liveness probe: EveryNode, every 5 seconds ----------------------------
+  # Runs on ALL three nodes so the upstream is watched from three independent
+  # vantage points. Fails closed (and pages) if it is unreachable or non-200.
+  - name: liveness-probe
+    schedule:
+      second: "*/5"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Forbid
+    executionTimeout: 4
+    command:
+      - python3
+      - -c
+      - |
+        import os, sys, time, urllib.request
+        url = os.environ["PULSE_TARGET"]
+        node = os.environ.get("HOSTNAME", "?")
+        t0 = time.perf_counter()
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                resp.read()
+                code = resp.status
+        except Exception as exc:
+            print(f"DOWN   [{node}] {url}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        rtt = (time.perf_counter() - t0) * 1000
+        print(f"UP     [{node}] {url}  HTTP {code}  {rtt:6.1f} ms")
+        sys.exit(0 if code == 200 else 1)
+    onFailure:
+      report:
+        shell:
+          # stand-in pager — swap for a webhook/mail reporter in production
+          command: echo "🚨 PAGE on-call — $YACRON2_JOB_NAME on $HOSTNAME failed ($YACRON2_FAIL_REASON)"
+
+  # -- latency SLO probe: Leader only, every 2 seconds -----------------------
+  # Only the elected leader samples latency, so the upstream is not hammered by
+  # three nodes at once and there is a single authoritative number. A response
+  # slower than the budget writes to stderr -> failed run (failsWhen).
+  - name: latency-slo
+    schedule: "*/2 * * * * * *"
+    clusterPolicy: Leader
+    executionTimeout: 4
+    failsWhen:
+      producesStdout: false
+      producesStderr: true
+      nonzeroReturn: true
+    command:
+      - python3
+      - -c
+      - |
+        import os, sys, time, urllib.request
+        url = os.environ["PULSE_TARGET"]
+        node = os.environ.get("HOSTNAME", "?")
+        budget = float(os.environ["PULSE_BUDGET_MS"])
+        t0 = time.perf_counter()
+        try:
+            urllib.request.urlopen(url, timeout=3).read()
+        except Exception as exc:
+            print(f"[{node}] unreachable: {exc}", file=sys.stderr)
+            sys.exit(1)
+        rtt = (time.perf_counter() - t0) * 1000
+        if rtt > budget:
+            print(f"[{node}] SLO BREACH: {rtt:.1f} ms > {budget:.0f} ms budget", file=sys.stderr)
+        else:
+            print(f"[{node}] within SLO: {rtt:6.1f} ms  (budget {budget:.0f} ms)")
+
+  # -- heartbeat: EveryNode, every 10 seconds --------------------------------
+  # Each node proves ITSELF alive from its own clock.
+  - name: heartbeat
+    schedule:
+      second: "*/10"
+    clusterPolicy: EveryNode
+    command: echo "♥ $HOSTNAME pulse $(date -u +%H:%M:%S)Z"
+
+  # -- rollup: Leader only, once a minute ------------------------------------
+  # One authoritative per-minute summary. Note it fires exactly ONCE per minute
+  # even though the scheduler ticks every second for the probes above.
+  - name: sla-rollup
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+    command: echo "▣ $(date -u +%H:%M)Z rollup from leader $HOSTNAME — liveness ran on every node, latency on the leader"

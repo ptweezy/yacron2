@@ -209,6 +209,64 @@ jobs:
     assert _id(as_string) == _id(as_object)
 
 
+def test_schedule_seconds_string_and_object_forms_match():
+    # the object second: form fingerprints identically to the equivalent
+    # 7-field crontab string (same equivalence property, extended to seconds)
+    as_string = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "*/15 * * * * * *"
+"""
+    as_object = """
+jobs:
+  - name: a
+    command: echo a
+    schedule:
+      second: "*/15"
+      minute: "*"
+"""
+    assert _id(as_string) == _id(as_object)
+
+
+def test_schedule_seconds_change_id():
+    # a schedule that pins seconds is a different job set from the minute-only
+    # one (the second column is part of the identity)
+    minute_only = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "*/15 * * * *"
+"""
+    with_seconds = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "*/15 * * * * * *"
+"""
+    assert _id(minute_only) != _id(with_seconds)
+
+
+def test_schedule_year_string_and_object_forms_match():
+    # the object year: form (now honored, 6-field) matches the crontab string
+    as_string = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "0 12 * * * 2030"
+"""
+    as_object = """
+jobs:
+  - name: a
+    command: echo a
+    schedule:
+      minute: "0"
+      hour: "12"
+      year: "2030"
+"""
+    assert _id(as_string) == _id(as_object)
+
+
 def test_environment_order_independent():
     one = """
 jobs:

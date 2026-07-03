@@ -1,4 +1,4 @@
-# yacron2 (Yet Another Cron ...2)
+# yacron2
 
 [![PyPI version](https://img.shields.io/pypi/v/yacron2.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/yacron2/)
 [![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/yacron2/)
@@ -439,6 +439,50 @@ jobs:
       year: 2017
       dayOfWeek: "*"
 ```
+
+#### Second-level schedules
+
+Schedules are minute-granular by default, but yacron2 can also run jobs at
+**second granularity**. There are two equivalent spellings:
+
+* a full **seven-field** crontab string, where the first field is the second
+  (`second minute hour dayOfMonth month dayOfWeek year`); or
+* the object form with a `second:` property.
+
+Both of the jobs below run every 15 seconds (at seconds 0, 15, 30 and 45 of
+every minute):
+
+```yaml
+jobs:
+  - name: every-15s-string
+    command: echo "tick"
+    schedule: "*/15 * * * * * *"   # 7 fields: the leading field is seconds
+  - name: every-15s-object
+    command: echo "tick"
+    schedule:
+      second: "*/15"
+```
+
+The second field accepts the same syntax as the others (`*`, `*/5`, `0,30`,
+`10-20`, ...). `second: "*"` (or `* * * * * * *`) fires every second.
+
+While any enabled job specifies seconds, the scheduler wakes once per second
+instead of once per minute; minute-granular jobs are unaffected and still fire
+exactly once in their scheduled minute. If no job uses seconds, yacron2 keeps
+its original once-a-minute cadence, so there is no overhead for the common case.
+
+Second-level scheduling is a YAML feature: [classic crontab files](#classic-crontab-files)
+keep their standard five-field, minute-granular format. (A **six-field** string
+is read as the classic five fields plus a trailing `year` column, *not* as
+seconds; seconds require the full seven fields.)
+
+For a runnable end-to-end example, see
+[`example/pulse-monitor`](example/pulse-monitor) — a small real-time uptime / SLA
+monitor that probes a service every few seconds
+(`docker compose -f docker-compose-pulse.yml up`) — and its clustered sibling
+[`example/pulse-cluster`](example/pulse-cluster), which fans the probes across a
+three-node leader-electing cluster
+(`docker compose -f docker-compose-pulse-cluster.yml up`).
 
 Important: by default all time is interpreted to be in UTC, but you can
 request to use local time instead.  For instance, the cron job below runs

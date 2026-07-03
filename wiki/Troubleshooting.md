@@ -225,26 +225,24 @@ are treated "as if they aren't there" apart from config validation:
 
 **Fix.** Set `enabled: true` (or remove the field) to run the job.
 
-### Schedule object `year` appears ignored
+### A `second` schedule does not fire more than once a minute
 
-**Symptom.** A schedule object that pins `year` still runs in other years.
+**Symptom.** A schedule with a `second` field (or a seven-field crontab string) only
+seems to run once a minute.
 
-**Cause (confirmed behavior).** `_parse_schedule` builds a five-field crontab string
-from `minute`, `hour`, `dayOfMonth`, `month`, and `dayOfWeek` only; it never reads
-the `year` key:
+**Cause.** Second-level scheduling requires a **seven-field** crontab string
+(`second minute hour dayOfMonth month dayOfWeek year`) or the object `second:` key.
+A common mistake is writing a **six-field** string like `"*/15 * * * * *"` expecting
+"every 15 seconds". A six-field line has no seconds column: its *leading* field is
+still the **minute**, and the extra *trailing* sixth field is the **year** (`*` =
+any year). So `"*/15 * * * * *"` actually runs every 15 **minutes** (at second 0),
+not every 15 seconds. Add the seventh field (`"*/15 * * * * * *"`, whose leading
+field is the second), or use the object form (`second: "*/15"`).
 
-```text
-tab = f"{minute} {hour} {day} {month} {dow}"
-```
-
-The strictyaml schema accepts a `year` key (and the README example at "Configuration
-basics" sets `year: 2017`), but the parser drops it, so `year` has **no effect** on
-scheduling. This is a discrepancy between the schema/README and the code; document and
-rely on the five honored fields only.
-
-**Fix.** Do not depend on `year`. To restrict a job to a single date, combine
-`dayOfMonth` and `month` and gate the job by other means (for example, disable it
-after the date). Unspecified schedule-object fields default to `*`.
+**Fix.** Use the object `second:` key, or a full seven-field string. See
+[Second-level schedules](Schedules-and-Timezones#second-level-schedules). Note that
+second-level scheduling is a YAML feature; [classic crontab files](Classic-Crontabs)
+stay five-field and minute-granular.
 
 ### Unknown timezone
 

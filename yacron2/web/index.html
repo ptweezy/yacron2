@@ -849,7 +849,7 @@
 <header>
   <div class="brand">
     <span class="mark glow" id="mark">▚</span>
-    <h1 class="glow">yacron2</h1>
+    <h1 class="glow" id="brandName">yacron2</h1>
     <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
     <span class="ver" id="jobset" title=""></span>
@@ -1437,15 +1437,24 @@
     if (low === "@reboot") return { type: "reboot", raw: expr };
     const expanded = MACROS[low] || expr;
     const f = expanded.split(/\s+/);
-    if (f.length !== 5) return { type: "unknown", raw: expr };
+    // parse-crontab field layout: [second] minute hour dom month dow [year].
+    // 5 fields -> implicit second 0 and any year; 6 -> a trailing year column;
+    // 7 -> a leading second column as well. Normalise to the 7-field shape.
+    let sec = "0", yr = "*", core;
+    if (f.length === 5) core = f;
+    else if (f.length === 6) { core = f.slice(0, 5); yr = f[5]; }
+    else if (f.length === 7) { sec = f[0]; core = f.slice(1, 6); yr = f[6]; }
+    else return { type: "unknown", raw: expr };
     try {
       return {
-        type: "fields", raw: expr,
-        minute: parseField(f[0], 0, 59, null, false),
-        hour:   parseField(f[1], 0, 23, null, false),
-        dom:    parseField(f[2], 1, 31, null, false),
-        month:  parseField(f[3], 1, 12, MON_NAMES, false),
-        dow:    parseField(f[4], 0, 7, DOW_NAMES, true),
+        type: "fields", raw: expr, hasSeconds: f.length === 7,
+        second: parseField(sec, 0, 59, null, false),
+        minute: parseField(core[0], 0, 59, null, false),
+        hour:   parseField(core[1], 0, 23, null, false),
+        dom:    parseField(core[2], 1, 31, null, false),
+        month:  parseField(core[3], 1, 12, MON_NAMES, false),
+        dow:    parseField(core[4], 0, 7, DOW_NAMES, true),
+        year:   parseField(yr, 1970, 2099, null, false),
       };
     } catch (_) { return { type: "unknown", raw: expr }; }
   }
@@ -1467,7 +1476,7 @@
       _dtfCache[frame] = new Intl.DateTimeFormat("en-US", {
         timeZone: frame, hourCycle: "h23",
         year: "numeric", month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit", weekday: "short",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", weekday: "short",
       });
     }
     return _dtfCache[frame];
@@ -1475,18 +1484,19 @@
   function wallParts(date, frame) {
     if (frame === "LOCAL") {
       return { Y: date.getFullYear(), Mo: date.getMonth() + 1, D: date.getDate(),
-               h: date.getHours(), mi: date.getMinutes(), dow: date.getDay() };
+               h: date.getHours(), mi: date.getMinutes(), se: date.getSeconds(), dow: date.getDay() };
     }
     const parts = dtf(frame).formatToParts(date);
     const m = {};
     for (const p of parts) m[p.type] = p.value;
     let h = parseInt(m.hour, 10); if (h === 24) h = 0;
-    return { Y: +m.year, Mo: +m.month, D: +m.day, h, mi: +m.minute, dow: WEEKDAY_IDX[m.weekday] };
+    return { Y: +m.year, Mo: +m.month, D: +m.day, h, mi: +m.minute, se: +m.second, dow: WEEKDAY_IDX[m.weekday] };
   }
   // convert wall-clock components in a frame back to an absolute instant (ms)
   function instantOf(c, frame) {
-    if (frame === "LOCAL") return new Date(c.Y, c.Mo - 1, c.D, c.h, c.mi, 0).getTime();
-    const guess = Date.UTC(c.Y, c.Mo - 1, c.D, c.h, c.mi, 0);
+    const se = c.se || 0;
+    if (frame === "LOCAL") return new Date(c.Y, c.Mo - 1, c.D, c.h, c.mi, se).getTime();
+    const guess = Date.UTC(c.Y, c.Mo - 1, c.D, c.h, c.mi, se);
     const off1 = tzOffset(frame, guess);
     let t = guess - off1;
     const off2 = tzOffset(frame, t);
@@ -1495,7 +1505,7 @@
   }
   function tzOffset(frame, t) {
     const w = wallParts(new Date(t), frame);
-    return Date.UTC(w.Y, w.Mo - 1, w.D, w.h, w.mi, 0) - t;
+    return Date.UTC(w.Y, w.Mo - 1, w.D, w.h, w.mi, w.se) - t;
   }
   function frameOf(job) {
     if (job.timezone) return job.timezone;       // IANA name (incl. "UTC")
@@ -1505,31 +1515,40 @@
   function nextRuns(parsed, n, frame, fromMs) {
     if (parsed.type !== "fields") return [];
     const start = wallParts(new Date(fromMs), frame);
-    let c = { Y: start.Y, Mo: start.Mo, D: start.D, h: start.h, mi: start.mi, dow: start.dow };
-    // step to strictly-after the current minute
-    const incMin = () => {
-      c.mi++;
-      if (c.mi > 59) { c.mi = 0; c.h++; if (c.h > 23) { c.h = 0; advDay(); } }
-    };
+    let c = { Y: start.Y, Mo: start.Mo, D: start.D, h: start.h, mi: start.mi, se: start.se, dow: start.dow };
+    // Higher-magnitude resets zero everything below them (a new day starts at
+    // 00:00:00), so any coarse skip lands on a clean boundary the second-level
+    // matching below can accept without a long inner scan.
     const advDay = () => {
       c.D++;
       if (c.D > daysInMonth(c.Y, c.Mo)) { c.D = 1; c.Mo++; if (c.Mo > 12) { c.Mo = 1; c.Y++; } }
-      c.dow = dowOf(c.Y, c.Mo, c.D);
+      c.h = 0; c.mi = 0; c.se = 0; c.dow = dowOf(c.Y, c.Mo, c.D);
     };
     const advMonth = () => {
       c.Mo++; if (c.Mo > 12) { c.Mo = 1; c.Y++; }
-      c.D = 1; c.h = 0; c.mi = 0; c.dow = dowOf(c.Y, c.Mo, c.D);
+      c.D = 1; c.h = 0; c.mi = 0; c.se = 0; c.dow = dowOf(c.Y, c.Mo, c.D);
     };
-    incMin();
+    const advYear = () => {
+      c.Y++; c.Mo = 1; c.D = 1; c.h = 0; c.mi = 0; c.se = 0; c.dow = dowOf(c.Y, c.Mo, c.D);
+    };
+    // step to strictly-after the current second (cascading up on overflow)
+    const incSec = () => {
+      c.se++;
+      if (c.se > 59) { c.se = 0; c.mi++; if (c.mi > 59) { c.mi = 0; c.h++; if (c.h > 23) { c.h = 0; advDay(); } } }
+    };
+    incSec();
     const out = [];
     let guard = 0;
-    while (out.length < n && guard++ < 200000) {
+    while (out.length < n && guard++ < 500000) {
+      if (c.Y > 2099) break;   // parse-crontab's year ceiling; nothing matches beyond it
+      if (parsed.year.restricted && !parsed.year.has(c.Y)) { advYear(); continue; }
       if (!parsed.month.has(c.Mo)) { advMonth(); continue; }
-      if (!dayMatches(parsed, c)) { advDay(); c.h = 0; c.mi = 0; continue; }
-      if (!parsed.hour.has(c.h)) { c.h++; c.mi = 0; if (c.h > 23) { c.h = 0; advDay(); } continue; }
-      if (!parsed.minute.has(c.mi)) { incMin(); continue; }
+      if (!dayMatches(parsed, c)) { advDay(); continue; }
+      if (!parsed.hour.has(c.h)) { c.h++; c.mi = 0; c.se = 0; if (c.h > 23) { c.h = 0; advDay(); } continue; }
+      if (!parsed.minute.has(c.mi)) { c.mi++; c.se = 0; if (c.mi > 59) { c.mi = 0; c.h++; if (c.h > 23) { c.h = 0; advDay(); } } continue; }
+      if (!parsed.second.has(c.se)) { incSec(); continue; }
       out.push({ c: Object.assign({}, c), t: instantOf(c, frame) });
-      incMin();
+      incSec();
     }
     return out;
   }
@@ -1549,7 +1568,13 @@
     const p = parseCron(expr);
     if (p.type !== "fields") return "Custom schedule: " + expr;
     const f = (MACROS[low] || expr).split(/\s+/);
-    const [mi, h, dom, mon, dow] = f;
+    // normalise to [second, minute, hour, dom, month, dow, year] tokens, so the
+    // 5-/6-/7-field forms all describe consistently (see _parseCron).
+    let sec = "0", yr = "*", core;
+    if (f.length === 6) { core = f.slice(0, 5); yr = f[5]; }
+    else if (f.length === 7) { sec = f[0]; core = f.slice(1, 6); yr = f[6]; }
+    else core = f;
+    const [mi, h, dom, mon, dow] = core;
     const everyMin = mi === "*", everyHr = h === "*", everyDom = dom === "*", everyMon = mon === "*", everyDow = dow === "*";
     const stepM = mi.match(/^\*\/(\d+)$/), stepH = h.match(/^\*\/(\d+)$/);
     // "*/n" only reads as a true fixed interval when n divides the field's span
@@ -1582,7 +1607,34 @@
     else if (dayClauses.length === 1) clauses.push(dayClauses[0]);
     if (!everyMon) clauses.push("in " + listJoin(p.month.values.map((m) => MONTHS[m])));
     else if (everyDom && everyDow) clauses.push("every day");
-    return [timePart, ...clauses].join(", ");
+    // restrict to specific year(s) when a year column is present (6-/7-field)
+    if (yr !== "*") clauses.push("in " + listJoin(p.year.values.map(String)));
+    let base = [timePart, ...clauses].join(", ");
+    // A leading second column (7-field) with a non-default seconds value.
+    if (p.hasSeconds && sec !== "0") {
+      const stepS = sec.match(/^\*\/(\d+)$/), everySec = sec === "*";
+      const stepSok = stepS && (60 % +stepS[1] === 0);
+      // A standalone cadence phrase ("Every second" / "Every N seconds") is
+      // only TRUE when nothing above the seconds column is restricted -- the
+      // job really does fire every (Nth) second of every minute. When a
+      // minute/hour/day IS restricted the seconds only sub-select within those
+      // matched minutes, so leading with "Every second" would overstate the
+      // frequency (e.g. "* 30 * * * * *" fires 60x during :30, not 3600x/hr).
+      const topFree = everyMin && everyHr && everyDom && everyMon && everyDow && yr === "*";
+      if (topFree) {
+        if (everySec) return "Every second";
+        if (stepSok) return "Every " + stepS[1] + " seconds";
+        return "At second" + (p.second.values.length > 1 ? "s " : " ") + p.second.values.map((x) => pad2(x)).join(", ");
+      }
+      // Restricted above seconds: append the seconds as a qualifying clause,
+      // enumerated (consistent with the restricted minute/hour phrasing) so the
+      // cadence is not overstated.
+      const secClause = everySec
+        ? "every second"
+        : "at second" + (p.second.values.length > 1 ? "s " : " ") + p.second.values.map((x) => pad2(x)).join(", ");
+      return base + ", " + secClause;
+    }
+    return base;
   }
   function listJoin(arr) {
     if (arr.length <= 1) return arr.join("");
@@ -2006,7 +2058,7 @@
     if (sec >= 3600) { const m0 = Math.round(sec / 60), h = Math.floor(m0 / 60), m = m0 % 60; return h + "h" + pad2(m) + "m"; }
     return pad2(Math.floor(sec / 60)) + ":" + pad2(sec % 60);
   }
-  function fmtWall(c) { return c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi); }
+  function fmtWall(c, withSeconds) { return c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi) + (withSeconds ? ":" + pad2(c.se || 0) : ""); }
   // Recompute each enabled job's next fire instant. Cheap (parseCron is cached,
   // nextRuns(n=1) is bounded), but only called when the panel is open or the
   // soonest fire has already elapsed.
@@ -2049,7 +2101,7 @@
       $("radarFeed").innerHTML = feed.length
         ? feed.map((x) => {
             const j = state.byName[x.name];
-            const title = fmtWall(x.c) + (j ? " · " + describeCron(j.schedule) : "");
+            const title = fmtWall(x.c, j && parseCron(j.schedule).hasSeconds) + (j ? " · " + describeCron(j.schedule) : "");
             return '<li data-job="' + escAttr(x.name) + '" title="' + escAttr(title) + '">' +
               '<span class="cd">' + fmtCountdown((x.t - now) / 1000) + "</span>" +
               '<span class="nm">' + esc(x.name) + "</span></li>";
@@ -2792,8 +2844,7 @@
       else {
         html += '<div class="card-label" style="padding-left:0;border:0">next runs</div><ul class="nextruns">';
         for (const r of runs) {
-          const c = r.c;
-          const when = c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi);
+          const when = fmtWall(r.c, parsed.hasSeconds);
           const rel = fmtIn((r.t - Date.now()) / 1000);
           html += "<li><span class='when'>" + esc(when) + "</span><span class='rel'>" + esc(rel) + "</span></li>";
         }
@@ -3716,10 +3767,13 @@
       if (markVel > 3) { markRaf = requestAnimationFrame(spinMark); }
       else { markVel = 0; markRaf = 0; }
     };
-    mark.addEventListener("click", () => {
+    const bumpMark = () => {
       markVel += 360;
       if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
-    });
+    };
+    mark.addEventListener("click", bumpMark);
+    // clicking the wordmark spins the logo too
+    $("brandName").addEventListener("click", bumpMark);
     // header text is unselectable; these chips hand out their value on click
     $("ver").addEventListener("click", () => { const v = $("ver").textContent; if (v) copyText(v, "version"); });
     $("jobset").addEventListener("click", () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); });
@@ -4592,21 +4646,28 @@
     if (parsed.type === "reboot") {
       html += '<p class="sbx-desc">Runs once, when yacron2 starts (@reboot).</p>';
     } else if (parsed.type !== "fields") {
-      html += '<p class="sbx-desc sbx-bad">Not a valid 5-field cron expression or known @macro.</p>';
+      html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';
     } else {
       const runs = nextRuns(parsed, 12, frame, Date.now());
       const impossible = !runs.length;
       html += '<p class="sbx-desc' + (impossible ? " sbx-bad" : "") + '">' + esc(impossible ? "This schedule can never occur (impossible date)." : describeCron(expr)) + "</p>";
       const low = expr.toLowerCase();
       const f = (MACROS[low] || expr).split(/\s+/);
-      const labels = ["min", "hour", "day-of-month", "month", "day-of-week"];
+      // Label each present column by parse-crontab's end-column rule: 5 fields
+      // are minute..dow, a 6th adds a trailing year, a 7th adds a leading
+      // second. Mislabelling these (or dropping the second/year columns) would
+      // contradict the plain-English description above.
+      let cols;
+      if (f.length === 6) cols = [["min", f[0]], ["hour", f[1]], ["day-of-month", f[2]], ["month", f[3]], ["day-of-week", f[4]], ["year", f[5]]];
+      else if (f.length === 7) cols = [["second", f[0]], ["min", f[1]], ["hour", f[2]], ["day-of-month", f[3]], ["month", f[4]], ["day-of-week", f[5]], ["year", f[6]]];
+      else cols = [["min", f[0]], ["hour", f[1]], ["day-of-month", f[2]], ["month", f[3]], ["day-of-week", f[4]]];
       html += '<div class="sbx-flds">';
-      for (let i = 0; i < 5; i++) html += '<div class="sbx-fld"><div class="fk">' + labels[i] + '</div><div class="fv">' + esc(f[i] || "*") + "</div></div>";
+      for (const [k, v] of cols) html += '<div class="sbx-fld"><div class="fk">' + k + '</div><div class="fv">' + esc(v || "*") + "</div></div>";
       html += "</div>";
       if (runs.length) {
         html += '<div class="card-label" style="padding-left:0;border:0">next ' + runs.length + " fires · " + esc(frame === "LOCAL" ? "local" : frame) + '</div><ul class="nextruns">';
         for (const r of runs)
-          html += "<li><span class='when'>" + esc(fmtWall(r.c)) + "</span><span class='rel'>" + esc(fmtIn((r.t - Date.now()) / 1000)) + "</span></li>";
+          html += "<li><span class='when'>" + esc(fmtWall(r.c, parsed.hasSeconds)) + "</span><span class='rel'>" + esc(fmtIn((r.t - Date.now()) / 1000)) + "</span></li>";
         html += "</ul>";
       }
       const users = state.jobs.filter((j) => sameSchedule(j.schedule, expr));

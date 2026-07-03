@@ -17,6 +17,7 @@ from typing import (  # noqa
     Awaitable,
     Deque,
     Dict,
+    FrozenSet,
     List,
     Optional,
     Tuple,
@@ -39,8 +40,8 @@ from yacron2.config import (
     WebConfig,
     Yacron2Config,
     cluster_config_warnings,
-    parse_config,
     parse_config_string,
+    parse_config_with_sources,
     schedule_object_to_crontab,
 )
 from yacron2.fingerprint import job_set_id
@@ -355,6 +356,17 @@ class Cron:
         # cluster/web (re)start, logging). Gates that work to once per minute
         # even while a second-level job wakes the loop far more often. run().
         self._last_housekeeping_minute: Optional[datetime.datetime] = None
+        # Config-reload skip cache. strictyaml is a slow pure-Python parser,
+        # so rereading and reparsing the whole config on every once-a-minute
+        # housekeeping pass when nothing changed on disk is pure wasted CPU (in
+        # a worker thread, but still real work + thread-pool churn). We
+        # remember the set of files the last successful parse read, a cheap
+        # stat fingerprint of them, and the config it produced; reload_config
+        # skips the reparse whenever the fingerprint is unchanged. See
+        # _config_signature / reload_config.
+        self._config_sources: FrozenSet[str] = frozenset()
+        self._config_sig: Optional[tuple] = None
+        self._last_config: Optional[Yacron2Config] = None
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -561,54 +573,113 @@ class Cron:
             logging_config=None,
         )
 
+    def _config_signature(self, files: FrozenSet[str]) -> tuple:
+        """A cheap stat fingerprint of the files a parse read.
+
+        ``(abspath, st_mtime_ns, st_size)`` per file, sorted for determinism; a
+        file that has vanished collapses to a sentinel so a deletion still
+        registers as a change. When the config source is a DIRECTORY its own
+        mtime is folded in as well, so a brand-new entry dropped into the dir
+        (which touches none of the already-tracked files) is still noticed. All
+        of this is a handful of ``os.stat`` calls -- microseconds -- versus a
+        full strictyaml reparse, which is the whole point.
+        """
+        parts: List[tuple] = []
+        for f in sorted(files):
+            try:
+                st = os.stat(f)
+                parts.append((f, st.st_mtime_ns, st.st_size))
+            except OSError:
+                parts.append((f, None, None))
+        if self.config_arg is not None and os.path.isdir(self.config_arg):
+            try:
+                parts.append(("\0dir", os.stat(self.config_arg).st_mtime_ns))
+            except OSError:
+                parts.append(("\0dir", None))
+        return tuple(parts)
+
+    def _record_config(
+        self, config: Yacron2Config, sources: FrozenSet[str]
+    ) -> None:
+        """Cache a successful parse for the unchanged-config skip.
+
+        Fingerprints ``sources`` immediately after the parse, so the next
+        housekeeping pass compares against the on-disk state we actually
+        parsed. (A file edited in the microseconds between the parse's read and
+        this stat would be recorded as already-current and picked up only on a
+        later change -- an acceptable, vanishingly narrow window for a
+        once-a-minute reload.)
+        """
+        self._config_sources = sources
+        self._config_sig = self._config_signature(sources)
+        self._last_config = config
+
     def update_config(self) -> Yacron2Config:
         """Reload the config from disk and apply it, synchronously.
 
         Used at construction (where there is no running event loop to offload
         to) and by tests. The run loop instead calls :meth:`reload_config`,
         which does the same work but runs the disk read + reparse off the event
-        loop; both paths share the pure parse (:func:`parse_config`) and
-        :meth:`_apply_reload`.
+        loop; both paths share the pure parse
+        (:func:`parse_config_with_sources`) and :meth:`_apply_reload`. Always
+        parses (no unchanged-config skip): it runs once at construction to
+        establish the baseline the skip later compares against.
         """
         if self.config_arg is None:
             return self._empty_config()
         try:
-            config = parse_config(self.config_arg)
+            config, sources = parse_config_with_sources(self.config_arg)
         except ConfigError:
             # feeds yacron2_config_last_reload_successful, the standard
             # "config broken on disk" alert signal.
             self.metrics.config_parse(False)
             raise
-        return self._apply_reload(config)
+        result = self._apply_reload(config)
+        self._record_config(config, sources)
+        return result
 
     async def reload_config(self) -> Yacron2Config:
         """Like :meth:`update_config`, but runs the disk read + full reparse
-        OFF the event loop, in a worker thread.
+        OFF the event loop, in a worker thread -- and skips it entirely when
+        nothing the last parse read has changed on disk.
 
-        :func:`parse_config` is a synchronous file read and full reparse; run
-        inline on the scheduling tick it froze the entire event loop -- web
+        The reparse is a synchronous file read plus a full strictyaml parse;
+        run inline on the scheduling tick it froze the entire event loop -- web
         API, cluster gossip, job output pumping -- for its whole duration, once
-        a minute. Offloading just the parse keeps the loop responsive; applying
-        the result (which mutates shared scheduler state) stays on the loop
-        thread via :meth:`_apply_reload`, so there is no cross-thread access to
-        ``self``. The caller applies this BEFORE servicing due slots, so the
-        cluster gate is always current for the tick.
+        a minute. First we compare a cheap stat fingerprint
+        (:meth:`_config_signature`) of the files the last successful parse read
+        against the stored one; if they match, the config on disk is unchanged
+        and we return the already-loaded config without touching strictyaml or
+        the thread pool. The downstream cluster/web/logging (re)starts in
+        :meth:`run` are idempotent, so handing them the same config object is a
+        no-op. Only a real change offloads the parse to a worker thread;
+        applying the result (which mutates shared scheduler state) stays on the
+        loop thread via :meth:`_apply_reload`, so there is no cross-thread
+        access to ``self``. The caller applies this BEFORE servicing due slots,
+        so the cluster gate is always current for the tick.
         """
         if self.config_arg is None:
             return self._empty_config()
+        if self._last_config is not None and (
+            self._config_signature(self._config_sources) == self._config_sig
+        ):
+            logger.debug("config unchanged on disk; skipping reparse")
+            return self._last_config
         loop = asyncio.get_running_loop()
         try:
-            config = await loop.run_in_executor(
-                None, parse_config, self.config_arg
+            config, sources = await loop.run_in_executor(
+                None, parse_config_with_sources, self.config_arg
             )
         except ConfigError:
             # feeds yacron2_config_last_reload_successful, the standard
             # "config broken on disk" alert signal. The parse ran in the worker
-            # thread (parse_config does not touch metrics), so record the
-            # failure here, back on the loop thread.
+            # thread (parse_config_with_sources does not touch metrics), so
+            # record the failure here, back on the loop thread.
             self.metrics.config_parse(False)
             raise
-        return self._apply_reload(config)
+        result = self._apply_reload(config)
+        self._record_config(config, sources)
+        return result
 
     def _apply_reload(self, config: Yacron2Config) -> Yacron2Config:
         """Swap in a freshly parsed config's job set (event-loop thread only).

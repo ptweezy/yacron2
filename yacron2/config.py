@@ -11,9 +11,11 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Dict,
+    FrozenSet,
     List,
     NewType,
     Optional,
+    Tuple,
     Union,  # noqa
 )
 from urllib.parse import urlparse
@@ -606,6 +608,48 @@ def schedule_has_seconds(
 
 
 class JobConfig:
+    # One JobConfig exists per configured job for the life of the process (and
+    # is rebuilt on every reload), so trimming its per-instance __dict__ with
+    # __slots__ cuts steady-state memory and speeds attribute access on the
+    # scheduler's hot path.  Every attribute the class ever sets -- including
+    # the host-resolved uid/gid/username and the configured user/group kept for
+    # the fingerprint -- must be listed here, or assigning it raises
+    # AttributeError.  Nothing outside this class assigns attributes to a
+    # JobConfig instance (the prometheus per-job accumulators live on their own
+    # slotted _JobMetrics), so the set is closed.
+    __slots__ = (
+        "name",
+        "command",
+        "schedule_unparsed",
+        "schedule",
+        "has_seconds",
+        "shell",
+        "concurrencyPolicy",
+        "clusterPolicy",
+        "captureStderr",
+        "captureStdout",
+        "streamPrefix",
+        "saveLimit",
+        "maxLineLength",
+        "utc",
+        "enabled",
+        "timezone",
+        "failsWhen",
+        "onFailure",
+        "onPermanentFailure",
+        "onSuccess",
+        "env_file",
+        "environment",
+        "executionTimeout",
+        "killTimeout",
+        "statsd",
+        "user",
+        "group",
+        "uid",
+        "gid",
+        "username",
+    )
+
     def __init__(self, config: dict) -> None:
         self.name = config["name"]  # type: str
         self.command = config["command"]  # type: Union[str, List[str]]
@@ -1709,13 +1753,16 @@ class Yacron2Config:
 
 
 def parse_config_string(
-    data: str, path: str, _seen: Optional[set] = None
+    data: str,
+    path: str,
+    _seen: Optional[set] = None,
+    _sources: Optional[set] = None,
 ) -> Yacron2Config:
     try:
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
     except YAMLError as ex:
         raise ConfigError(str(ex)) from ex
-    return _config_from_doc(doc, path, _seen)
+    return _config_from_doc(doc, path, _seen, _sources)
 
 
 def parse_crontab_string(data: str, path: str) -> Yacron2Config:
@@ -1737,7 +1784,10 @@ def parse_crontab_string(data: str, path: str) -> Yacron2Config:
 
 
 def _config_from_doc(
-    doc: dict, path: str, _seen: Optional[set]
+    doc: dict,
+    path: str,
+    _seen: Optional[set],
+    _sources: Optional[set] = None,
 ) -> Yacron2Config:
     """Build a Yacron2Config from an already-validated plain config doc.
 
@@ -1763,7 +1813,7 @@ def _config_from_doc(
         # their own file's defaults; a top-level ``defaults`` block does NOT
         # retro-apply to them. Only the included files' defaults are merged
         # here, and they affect this file's inline jobs.
-        inc_config = parse_config_file(inc_path, _seen)
+        inc_config = parse_config_file(inc_path, _seen, _sources)
         inc_defaults_merged = dict(
             mergedicts(inc_defaults_merged, inc_config.job_defaults)
         )
@@ -1818,12 +1868,23 @@ def _is_crontab_config(path: str, data: str) -> bool:
     return crontabs.looks_like_crontab(data)
 
 
-def parse_config_file(path: str, _seen: Optional[set] = None) -> Yacron2Config:
+def parse_config_file(
+    path: str,
+    _seen: Optional[set] = None,
+    _sources: Optional[set] = None,
+) -> Yacron2Config:
     # Guard against include cycles (a file that includes itself directly or
     # transitively) so a misconfiguration raises a clear ConfigError instead
     # of recursing until RecursionError. _seen is scoped per top-level parse,
     # so two independent files including a common file is not flagged.
     abspath = os.path.abspath(path)
+    # _sources, when supplied, accumulates every on-disk file the parse reads
+    # (this file plus any it includes, transitively) so a caller can stat them
+    # and skip an unchanged reparse; it is deliberately NOT _seen (which is
+    # per-file cycle scope) so two dir files including a common file are still
+    # both recorded without being mistaken for a cycle.
+    if _sources is not None:
+        _sources.add(abspath)
     if _seen is None:
         _seen = set()
     if abspath in _seen:
@@ -1833,21 +1894,48 @@ def parse_config_file(path: str, _seen: Optional[set] = None) -> Yacron2Config:
         data = stream.read()
     if _is_crontab_config(path, data):
         return parse_crontab_string(data, path)
-    return parse_config_string(data, path, _seen)
+    return parse_config_string(data, path, _seen, _sources)
 
 
-def parse_config(config_arg: str) -> Yacron2Config:
+def parse_config(
+    config_arg: str, _sources: Optional[set] = None
+) -> Yacron2Config:
     if os.path.isdir(config_arg):
-        return _parse_config_dir(config_arg)
+        return _parse_config_dir(config_arg, _sources)
     try:
-        return parse_config_file(config_arg)
+        return parse_config_file(config_arg, _sources=_sources)
     except OSError as ex:
         # surface a clean ConfigError (e.g. file not found) rather than a bare
         # OSError, so callers (__main__) handle it uniformly.
         raise ConfigError(str(ex)) from ex
 
 
-def _parse_config_dir(config_arg: str) -> Yacron2Config:
+def parse_config_with_sources(
+    config_arg: str,
+) -> Tuple[Yacron2Config, FrozenSet[str]]:
+    """Parse ``config_arg`` and report the on-disk files the parse read.
+
+    Returns ``(config, sources)`` where ``sources`` is the absolute path of
+    every YAML/crontab file consulted (the top-level file or directory entries,
+    plus anything they ``include`` transitively) and every job's ``env_file``.
+    The scheduler stats this exact set to detect that nothing changed on disk
+    and skip the (strictyaml-heavy) reparse on an unchanged config; because it
+    covers includes and env_files, an edit to any file that actually feeds the
+    config is still noticed.  ``env_file`` is abspath'd the same way
+    :func:`parse_environment_file` opens it (relative to the process CWD), so
+    the recorded path matches what was read.
+    """
+    sources: set = set()
+    config = parse_config(config_arg, sources)
+    for job in config.jobs:
+        if job.env_file is not None:
+            sources.add(os.path.abspath(job.env_file))
+    return config, frozenset(sources)
+
+
+def _parse_config_dir(
+    config_arg: str, _sources: Optional[set] = None
+) -> Yacron2Config:
     jobs: List[JobConfig] = []
     config_errors: Dict[str, str] = {}
     web_config: Optional[WebConfig] = None
@@ -1871,7 +1959,7 @@ def _parse_config_dir(config_arg: str) -> Yacron2Config:
         ):
             continue
         try:
-            config = parse_config_file(direntry.path)
+            config = parse_config_file(direntry.path, _sources=_sources)
         except ConfigError as err:
             config_errors[direntry.path] = str(err)
             continue

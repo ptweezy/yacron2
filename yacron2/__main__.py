@@ -80,11 +80,37 @@ def main_loop(loop):
         remove_shutdown_handlers()
 
 
+def _new_event_loop():  # pragma: no cover
+    """The event loop to run on: uvloop's faster libuv loop when available,
+    otherwise stock asyncio.
+
+    uvloop is a drop-in, libuv-based replacement for asyncio's selector loop
+    that runs yacron2's I/O paths -- cluster gossip/lease HTTP, the web
+    dashboard, the Prometheus scrape -- markedly faster. It is strictly
+    optional (install the ``speedups`` extra to pull it in): it has no Windows
+    build (where yacron2 also needs the Proactor loop for subprocess support)
+    and ships no wheels for some of the leaner architectures we target, so a
+    missing or unimportable uvloop silently falls back to stock asyncio with
+    identical behavior. Selecting the loop directly (rather than via
+    ``asyncio.set_event_loop_policy``) sidesteps the event-loop-policy API that
+    Python 3.14 deprecates.
+
+    ``asyncio.new_event_loop()`` yields the right stock loop per platform: a
+    subprocess-capable Proactor loop on Windows (the default since 3.8) and a
+    selector loop on POSIX.
+    """
+    if sys.platform != "win32":
+        try:
+            import uvloop
+        except ImportError:
+            pass
+        else:
+            return uvloop.new_event_loop()
+    return asyncio.new_event_loop()
+
+
 def main():  # pragma: no cover
-    # asyncio.new_event_loop() yields the right loop on each platform: a
-    # subprocess-capable Proactor loop on Windows (the default since 3.8) and a
-    # selector loop on POSIX.
-    _loop = asyncio.new_event_loop()
+    _loop = _new_event_loop()
     try:
         main_loop(_loop)
     finally:

@@ -17,6 +17,17 @@ STRIP = sys.platform != "win32"
 datas = collect_data_files("yacron2")
 
 
+# optimize=2 compiles every bundled module at -OO: it strips assert statements
+# AND docstrings from the frozen bytecode. yacron2's modules are deliberately
+# docstring-dense (the rationale lives next to the code), and those strings
+# otherwise ship in the archive and sit in resident memory for the life of the
+# daemon; dropping them shrinks the binary and lowers RSS. Every assert in the
+# tree is a type-narrowing / internal-invariant check (`x is not None`,
+# `isinstance`, `not in`) with no side effects and no untrusted-input
+# validation, so removing them does not change behavior on the correct path.
+# The source-run test suite does not exercise the frozen -OO build; CI's
+# per-arch `--version` smoke test is the backstop for a dependency that might
+# misbehave without its docstrings/asserts.
 a = Analysis(
     ["yacron2"],
     pathex=["."],
@@ -30,6 +41,7 @@ a = Analysis(
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
+    optimize=2,
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(

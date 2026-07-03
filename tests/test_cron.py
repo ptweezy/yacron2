@@ -1549,7 +1549,13 @@ async def test_run_survives_config_error(tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         raise ConfigError("boom")
 
-    monkeypatch.setattr("yacron2.cron.parse_config", boom)
+    # reload_config now skips the reparse when the file is unchanged on disk,
+    # so touch it (a real "config edited to something invalid on reload"
+    # scenario bumps mtime) to defeat the skip; the failed parse never records
+    # a new fingerprint, so every subsequent tick still sees the change and
+    # retries.
+    cfg.write_text(TWO_JOBS + "\n# edited\n")
+    monkeypatch.setattr("yacron2.cron.parse_config_with_sources", boom)
 
     task = asyncio.create_task(cron.run())
     try:
@@ -3662,23 +3668,32 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
     main_thread = threading.get_ident()
 
     seen = []
-    real_parse = yacron2.cron.parse_config
+    real_parse = yacron2.cron.parse_config_with_sources
 
     def recording_parse(arg):
         seen.append(threading.get_ident())
         return real_parse(arg)
 
-    monkeypatch.setattr("yacron2.cron.parse_config", recording_parse)
+    monkeypatch.setattr(
+        "yacron2.cron.parse_config_with_sources", recording_parse
+    )
     monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
 
     task = asyncio.create_task(cron.run())
     try:
-        await _wait_until(lambda: len(seen) >= 2)  # a couple of reload ticks
+        # reload_config now skips the reparse while the file is unchanged on
+        # disk, so edit it (a distinct body each time bumps size/mtime past
+        # the recorded fingerprint) to force each reparse and prove a couple
+        # of them run off the loop thread.
+        for i in range(2):
+            cfg.write_text(TWO_JOBS + f"\n# edit {i}\n")
+            before = len(seen)
+            await _wait_until(lambda before=before: len(seen) > before)
     finally:
         cron.signal_shutdown()
         await asyncio.wait_for(task, timeout=5)
 
-    assert seen  # the loop reparsed at least once
+    assert len(seen) >= 2  # the loop reparsed on each on-disk change
     assert all(t != main_thread for t in seen)  # ...always off the loop thread
 
 

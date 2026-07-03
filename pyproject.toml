@@ -90,6 +90,13 @@ yacron2 = "yacron2.__main__:main"
 # core install stays zero-new-dep and architecture-portable. The etcd backend
 # needs no extra: it always uses etcd's v3 gRPC-gateway JSON/HTTP API directly.
 kubernetes = ["kubernetes>=27"]
+# Optional: swap asyncio's event loop for uvloop's faster libuv-based one
+# (cluster HTTP, web dashboard, Prometheus scrape). Best-effort at runtime --
+# yacron2 falls back to stock asyncio when it is absent -- so it stays off the
+# core install to keep the zero-new-dep, architecture-portable baseline intact.
+# Gated off Windows, which has no uvloop build (and needs the Proactor loop for
+# subprocesses anyway); pip skips it there rather than failing to resolve.
+speedups = ["uvloop>=0.19; sys_platform != 'win32'"]
 dev = [
     # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.

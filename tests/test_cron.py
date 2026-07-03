@@ -413,6 +413,17 @@ RETRYING_JOB_THAT_FAILS2 = (
 
 @pytest.mark.asyncio
 async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noqa: C901
+    # This test runs against the REAL wall clock (get_now maps perf_counter
+    # 1:1 onto simulated time from START_TIME), spawning two real subprocesses:
+    # the @reboot job fails, then its single retry fires initialDelay (0.4s)
+    # later. numjobs must reach 2 before the wait_and_quit loop stops at
+    # STOP_TIME. Keep this window WIDE (2s): the retry's launch is anchored to
+    # when the FIRST job's subprocess finishes failing, and Windows/CI process
+    # spawn latency is both large and variable (100-300ms). A tight window
+    # (the retry delay nearly filling it) leaves only tens of ms of slack, so a
+    # slow spawn pushes the retry's launch past STOP_TIME and the second job is
+    # never counted -- a load-sensitive flake seen on the windows-latest CI
+    # runners (assert 1 == 2). Do not shrink it back.
     START_TIME = datetime.datetime(
         year=1999,
         month=12,
@@ -428,8 +439,8 @@ async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noq
         day=31,
         hour=12,
         minute=1,
-        second=00,
-        microsecond=250000,
+        second=1,
+        microsecond=750000,
     )
 
     t0 = time.perf_counter()

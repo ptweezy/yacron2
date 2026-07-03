@@ -5,8 +5,8 @@
 # no package manager, no busybox — which minimizes the attack surface and pairs
 # naturally with yacron2's hardened, read-only, non-root deployment model.
 #
-# The base provides Python 3.11 (Debian 12 lineage); the venv is built in a
-# matching debian:12 builder so its interpreter path stays valid after the copy.
+# The base provides Python 3.13 (Debian 13 lineage); the venv is built in a
+# matching debian:13 builder so its interpreter path stays valid after the copy.
 #
 # Build locally:
 #   docker build -f docker/Dockerfile.distroless -t yacron2:distroless .
@@ -14,7 +14,7 @@
 # reads it from .git (kept in the context by .dockerignore).
 
 # ---- build stage --------------------------------------------------------
-FROM debian:12-slim AS builder
+FROM debian:13-slim AS builder
 
 ARG VERSION=""
 ENV DEBIAN_FRONTEND=noninteractive
@@ -22,8 +22,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /src
 COPY . .
 
-# Debian 12's python3 is 3.11, matching the distroless runtime below. Build the
-# venv with the versioned interpreter (/usr/bin/python3.11) so its symlinks
+# Debian 13's python3 is 3.13, matching the distroless runtime below. Build the
+# venv with the versioned interpreter (/usr/bin/python3.13) so its symlinks
 # resolve to a path that also exists in the distroless image. The toolchain lets
 # pip source-compile any dep lacking a wheel for the target arch and stays in
 # this builder stage. git is pulled in only for a plain local build (empty
@@ -38,12 +38,12 @@ RUN set -eux; \
     retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends $pkgs; \
     rm -rf /var/lib/apt/lists/*; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
-    python3.11 -m venv /opt/venv; \
+    python3.13 -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
 # ---- runtime stage ------------------------------------------------------
-FROM gcr.io/distroless/python3-debian12
+FROM gcr.io/distroless/python3-debian13
 
 LABEL org.opencontainers.image.title="yacron2" \
       org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (distroless)." \
@@ -54,7 +54,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
-# The distroless base supplies /usr/bin/python3.11 (the interpreter the venv's
+# The distroless base supplies /usr/bin/python3.13 (the interpreter the venv's
 # symlinks point at) plus ca-certificates and tzdata. We add only the venv.
 COPY --from=builder /opt/venv /opt/venv
 

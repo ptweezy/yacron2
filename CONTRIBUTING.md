@@ -9,9 +9,20 @@ yacron2 targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13 and 3.14 are tested)
 and runs on **Linux, macOS and Windows** (the test suite runs on all three in
 CI, including Windows ARM64).
 
+yacron2 uses [uv](https://docs.astral.sh/uv/) for a fast dev loop (`tox` also
+runs through uv via `tox-uv`, and uv can fetch the 3.10–3.14 interpreters the
+test matrix needs). With uv installed:
+
 ```sh
 git clone https://github.com/ptweezy/yacron2
 cd yacron2
+uv venv                                         # create .venv (uv picks a suitable Python)
+uv pip install -e ".[dev]"                      # editable install with the dev extra
+```
+
+Prefer stock tooling? The classic path still works unchanged:
+
+```sh
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
 ```
@@ -35,10 +46,15 @@ tox -e mypy    # mypy
 tox -e py      # pytest on the current interpreter
 ```
 
+`tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and
+installs dependencies with uv automatically (much faster; behavior-identical).
+Force the legacy virtualenv+pip path with `tox --runner virtualenv` if you ever
+need to.
+
 `pre-commit` runs ruff and bandit on staged changes:
 
 ```sh
-pip install pre-commit
+uv tool install pre-commit   # or: pip install pre-commit
 pre-commit install
 ```
 

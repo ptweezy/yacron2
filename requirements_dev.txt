@@ -10,3 +10,5 @@ pytest-asyncio
 pytest-cov
 ruff
 tox
+# tox-uv makes tox provision envs and install deps with uv (see tox.ini).
+tox-uv

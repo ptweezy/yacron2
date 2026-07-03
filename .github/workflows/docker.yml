@@ -11,12 +11,12 @@ name: docker
 #     ------        ----                          ----------   --------------
 #     debian        python:3.14-slim              (none)       3.14   <- latest
 #     alpine        python:3.14-alpine            -alpine      3.14
-#     ubuntu        ubuntu:24.04                  -ubuntu      3.12
-#     rhel          ubi9 (Red Hat UBI)            -rhel        3.12
-#     fedora        fedora:41                     -fedora      3.13
-#     opensuse      opensuse/leap:15.6            -opensuse    3.11
+#     ubuntu        ubuntu:26.04                  -ubuntu      3.14
+#     rhel          ubi10 (Red Hat UBI)           -rhel        3.12
+#     fedora        fedora:44                     -fedora      3.14
+#     opensuse      opensuse/leap:16.0            -opensuse    3.13
 #     amazonlinux   amazonlinux:2023              -amazonlinux 3.11
-#     distroless    gcr.io/distroless/python3     -distroless  3.11
+#     distroless    gcr.io/distroless/python3     -distroless  3.13
 #
 # The Debian image is the default: it gets the bare `latest`/`<version>` tags
 # (no suffix). The variants get `latest-<distro>` and `<version>-<distro>`.
@@ -174,7 +174,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "::notice::distro=$DISTRO event=$EVENT version=${version:-<git>} push=$push platforms=$platforms"
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           ref: ${{ steps.target.outputs.ref }}
           fetch-depth: 0 # full history so setuptools_scm can resolve a version
@@ -207,7 +207,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@v6.2.0
         with:
           images: ${{ steps.registries.outputs.images }}
           # The distro suffix (e.g. `-alpine`) is appended to every tag; it is
@@ -226,7 +226,7 @@ jobs:
 
       - name: Log in to GHCR
         if: steps.target.outputs.push == 'true'
-        uses: docker/login-action@v4
+        uses: docker/login-action@v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -234,16 +234,16 @@ jobs:
 
       - name: Log in to Docker Hub
         if: steps.target.outputs.push == 'true' && steps.registries.outputs.dockerhub == 'true'
-        uses: docker/login-action@v4
+        uses: docker/login-action@v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-qemu-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.2.0
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}

@@ -108,6 +108,8 @@ dev = [
     "pytest-cov",
     "ruff",
     "tox",
+    # tox-uv routes tox's env creation + installs through uv (see tox.ini).
+    "tox-uv",
 ]
 
 [tool.setuptools]

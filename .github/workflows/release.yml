@@ -61,6 +61,17 @@ concurrency:
 permissions:
   contents: read
 
+# Network + interpreter hardening for the runner-native jobs that install with
+# uv (gate/tox, native binaries, macOS, Windows, and the wheel+sdist build):
+# UV_HTTP_TIMEOUT raises uv's per-request socket timeout (uv retries internally)
+# and UV_PYTHON_DOWNLOADS=never keeps uv on the setup-python interpreter rather
+# than fetching a managed one. The emulated foreign-arch binary jobs stay on pip
+# inside their `docker run` containers -- uv's official image is amd64/arm64
+# only and its musl ppc64le/s390x wheels don't exist -- mirroring build.yml.
+env:
+  UV_HTTP_TIMEOUT: "60"
+  UV_PYTHON_DOWNLOADS: "never"
+
 jobs:
   # Decide whether to release and at what level. Kept separate (and strict) so
   # the trigger logic lives in a real script, never a fuzzy `contains()` match.
@@ -70,7 +81,7 @@ jobs:
       release: ${{ steps.d.outputs.release }}
       bump: ${{ steps.d.outputs.bump }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
       - id: d
@@ -130,7 +141,7 @@ jobs:
     outputs:
       new: ${{ steps.ver.outputs.new }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0  # full history + tags so we can find the latest X.Y.Z
       - name: Compute next version
@@ -180,10 +191,10 @@ jobs:
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0  # full history + tags so setuptools_scm resolves a version
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/setup-python@v6.3.0
         with:
           python-version: |
             3.10
@@ -191,7 +202,8 @@ jobs:
             3.12
             3.13
             3.14
-      - run: pip install --upgrade pip tox
+      # tox-uv pulls in uv and makes tox provision envs + install deps with it.
+      - run: pip install --upgrade pip tox tox-uv
       - run: tox  # runs py310, py311, py312, py313, py314, lint, mypy (see tox.ini)
 
   # Build the self-contained glibc PyInstaller binaries, one per architecture on
@@ -213,20 +225,25 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/setup-python@v6.3.0
         with:
           python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.26"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          pip install --upgrade pip
-          pip install pyinstaller==6.21.0  # pin matches pyinstaller/Dockerfile
-          pip install .                     # bakes the pinned version into yacron2/version.py
+          # Runner-native, all-wheels arch: install into a throwaway uv venv and
+          # freeze from it with `uv run` (uv discovers the setup-python 3.14).
+          uv venv --python 3.14
+          uv pip install pyinstaller==6.21.0  # pin matches pyinstaller/Dockerfile
+          uv pip install .                     # bakes the pinned version into yacron2/version.py
           # Bundle uvloop (the `speedups` extra) so the binary runs the faster
           # event loop. Install a wheel where one exists, else build it from
           # sdist (ship uvloop as broadly as it compiles); a failed install
@@ -234,12 +251,12 @@ jobs:
           # actually runs a loop (a source build can miscompile under emulation)
           # and uninstalls it if not, so a broken uvloop is never frozen in and
           # the binary cleanly uses asyncio.
-          pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-          python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
-          pyinstaller pyinstaller/yacron2.spec
+          uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
+          uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
+          uv run pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           mv dist/yacron2 "dist/yacron2-linux-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: yacron2-linux-${{ matrix.arch }}
           path: dist/yacron2-linux-${{ matrix.arch }}
@@ -298,14 +315,14 @@ jobs:
             qemu: true            # no native armv6 on the runners -> emulate
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
       # container (armv7, armv6, ppc64le, s390x, riscv64). amd64/arm64/i686 run
       # natively and skip this.
       - if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@v4.2.0
       - name: Build binary (Alpine/musl)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -336,7 +353,7 @@ jobs:
               dist/yacron2 --version            # smoke test: a musl binary on a musl host
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
             '
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: yacron2-linux-${{ matrix.arch }}-musl
           path: dist/yacron2-linux-${{ matrix.arch }}-musl
@@ -382,11 +399,11 @@ jobs:
             qemu: true
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@v4.2.0
       - name: Build binary (Debian/glibc container)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -419,7 +436,7 @@ jobs:
               dist/yacron2 --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
             '
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: yacron2-linux-${{ matrix.arch }}
           path: dist/yacron2-linux-${{ matrix.arch }}
@@ -454,27 +471,32 @@ jobs:
             runner: macos-15-intel    # Intel
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/setup-python@v6.3.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.26"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          pip install --upgrade pip
-          pip install pyinstaller==6.21.0  # pin matches the Linux jobs
-          pip install .                     # bakes the pinned version into yacron2/version.py
+          # Runner-native, all-wheels arch: install into a throwaway uv venv and
+          # freeze from it with `uv run` (uv discovers the setup-python 3.14).
+          uv venv --python 3.14
+          uv pip install pyinstaller==6.21.0  # pin matches the Linux jobs
+          uv pip install .                     # bakes the pinned version into yacron2/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
           # ships wheels for both arches. verify_uvloop.py confirms it imports and
           # runs a loop, else uninstalls it so the binary falls back to asyncio
           # (yacron2/__main__._new_event_loop).
-          pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-          python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
-          pyinstaller pyinstaller/yacron2.spec
+          uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
+          uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
+          uv run pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           # Assert the binary is the intended native arch: Rosetta would happily
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
@@ -538,7 +560,7 @@ jobs:
             --wait
       - name: Rename binary
         run: mv dist/yacron2 "dist/yacron2-macos-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: yacron2-macos-${{ matrix.arch }}
           path: dist/yacron2-macos-${{ matrix.arch }}
@@ -571,24 +593,29 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/setup-python@v6.3.0
         with:
           python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.26"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          pip install --upgrade pip
-          pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
-          pip install .                     # bakes the pinned version into yacron2/version.py
-          pyinstaller pyinstaller/yacron2.spec
+          # Runner-native (uv ships a win_arm64 build too); install into a
+          # throwaway uv venv and freeze from it with `uv run`.
+          uv venv --python 3.14
+          uv pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
+          uv pip install .                     # bakes the pinned version into yacron2/version.py
+          uv run pyinstaller pyinstaller/yacron2.spec
           ./dist/yacron2.exe --version      # smoke test: fails the job if the bundle is broken
           mv dist/yacron2.exe "dist/yacron2-windows-${{ matrix.arch }}.exe"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: yacron2-windows-${{ matrix.arch }}
           path: dist/yacron2-windows-${{ matrix.arch }}.exe
@@ -602,25 +629,28 @@ jobs:
       contents: write   # push the tag and create the GitHub Release
       id-token: write   # PyPI Trusted Publishing (OIDC)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/setup-python@v6.3.0
         with:
           python-version: '3.14'
+
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.11.26"
 
       - name: Build distributions
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          pip install --upgrade pip build twine
-          python -m build
-          twine check dist/*.whl dist/*.tar.gz
+          uv build                                      # wheel + sdist into dist/
+          uvx twine check dist/*.whl dist/*.tar.gz       # twine, run ephemerally
 
       - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@v1.14.0
 
       # Everything below runs only after PyPI has accepted the upload.
       - name: Tag the release
@@ -639,7 +669,7 @@ jobs:
       # `yacron2-linux-*`) does NOT error on the artifacts it misses, it just
       # silently drops them from the release.
       - name: Download release binaries
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v8.0.1
         with:
           path: binaries
           pattern: yacron2-*
@@ -677,7 +707,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v3.0.1
         with:
           tag_name: ${{ needs.version.outputs.new }}
           name: ${{ needs.version.outputs.new }}
@@ -740,7 +770,7 @@ jobs:
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7    # for the formula template + render script
+      - uses: actions/checkout@v7.0.0    # for the formula template + render script
 
       - name: Update Homebrew tap formula
         env:

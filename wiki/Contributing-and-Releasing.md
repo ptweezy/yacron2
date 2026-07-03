@@ -10,18 +10,27 @@ yacron2 runs **natively on Windows, Linux, and macOS** (WSL is not required). Al
 
 Linting and type checking do not import the package and run on any platform. mypy is pinned to the `linux` platform (`pyproject.toml` `[tool.mypy]` `platform = "linux"`), so type-checking is identical on every OS: it type-checks the POSIX API surface, and the Windows branches are runtime-guarded.
 
-Clone and install the editable package with the `dev` extra:
+Clone and install the editable package with the `dev` extra. yacron2 uses
+[uv](https://docs.astral.sh/uv/) for a fast dev loop (`tox` also runs through uv
+via `tox-uv`, and uv can fetch the 3.10–3.14 interpreters the matrix needs):
 
 ```sh
 git clone https://github.com/ptweezy/yacron2
 cd yacron2
+uv venv                                         # create .venv (uv picks a suitable Python)
+uv pip install -e ".[dev]"                      # editable install with the dev extra
+```
+
+The classic virtualenv+pip path still works unchanged:
+
+```sh
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                         # or: pip install -r requirements_dev.txt
 ```
 
 The editable dev install (`pip install -e ".[dev]"`) and the checks (`pytest`, `ruff`, `mypy`) all run natively on Windows too. Use `.venv\Scripts\activate` to enter the venv as shown above.
 
-The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: `mypy`, `mypy-extensions`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, and `tox`. The console entry point `yacron2 = yacron2.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
+The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: `mypy`, `mypy-extensions`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `tox`, and `tox-uv` (the plugin that makes `tox` provision and install with uv). The console entry point `yacron2 = yacron2.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
 
 ## Running the checks
 
@@ -39,6 +48,8 @@ tox -e py      # pytest on the current interpreter
 | `py313`, `py314` | yes (`-rrequirements_dev.txt`, `PYTHONPATH={toxinidir}`) | `pytest --color=yes -vv` |
 | `lint` | no (`skip_install = true`) | `ruff check yacron2` then `ruff format --check yacron2` |
 | `mypy` | no (`skip_install = true`, `basepython=python3`) | `mypy -p yacron2 --ignore-missing-imports` |
+
+`tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and installs dependencies with uv automatically (much faster; behavior-identical). Force the legacy virtualenv+pip path with `tox --runner virtualenv` if ever needed.
 
 The `lint` and `mypy` envs deliberately skip installing the package: ruff and mypy analyze the source tree directly, so they avoid imposing the project's `requires-python` on the lint/type-check interpreter.
 
@@ -108,14 +119,14 @@ The `release.yml` jobs run in dependency order. Top-level `permissions` default 
 1. **`decide`**: determines `release` (true/false) and `bump`. Trigger logic lives in a real shell script rather than a fuzzy `contains()` expression. All downstream jobs are gated on `needs.decide.outputs.release == 'true'`.
 2. **`version`**: computes the next version once, so every builder and the publish job build at the same number. Finds the latest tag matching `^[0-9]+\.[0-9]+\.[0-9]+$` (via `git tag -l | … | sort -V | tail -n1`, defaulting to `0.0.0`), applies the bump, and **refuses with an error if the computed tag already exists** (`refs/tags/$new`).
 3. **`gate`**: checks out full history and runs `tox` across Python 3.10–3.14 (`tox` with no `-e` runs `py310, py311, py312, py313, py314, lint, mypy`). A red build means no release.
-4. **Native binary builds** (run before publishing, so a broken build fails the run instead of producing a half-finished release). Each job pins `pyinstaller==6.21.0`, runs `pip install .` to bake `SETUPTOOLS_SCM_PRETEND_VERSION` (the computed version) into `yacron2/version.py`, runs `pyinstaller pyinstaller/yacron2.spec`, and smoke-tests the bundle with `dist/yacron2 --version`:
+4. **Native binary builds** (run before publishing, so a broken build fails the run instead of producing a half-finished release). Each job pins `pyinstaller==6.21.0`, installs the project to bake `SETUPTOOLS_SCM_PRETEND_VERSION` (the computed version) into `yacron2/version.py`, runs `pyinstaller pyinstaller/yacron2.spec`, and smoke-tests the bundle with `dist/yacron2 --version`. The **runner-native** jobs (`binaries`, `binaries-macos`, `binaries-windows`) install with **uv** (`uv venv` + `uv pip install` + `uv run pyinstaller`, via `astral-sh/setup-uv`); the **emulated foreign-arch** jobs (`binaries-glibc-extra`, `binaries-musl`) stay on **pip** inside their `docker run` containers, since uv's official image is amd64/arm64 only and it publishes no musl `ppc64le`/`s390x` wheels — pip is the arch-portable choice there:
    - **`binaries`**: Linux **glibc, 64-bit**, `amd64` on `ubuntu-24.04` and `arm64` on `ubuntu-24.04-arm` (native runners, no QEMU). Built on Python 3.14. Artifacts `yacron2-linux-amd64`, `yacron2-linux-arm64`.
    - **`binaries-glibc-extra`**: Linux **glibc** for the arches with no native GitHub runner (`i686`, `armv7`, `ppc64le`, `s390x`, `riscv64`), built **inside a `python:3.14-slim` (Debian) container via `docker run --platform`** (the native `binaries` job covers only `amd64`/`arm64` and PyInstaller is not a cross-compiler, so these need a foreign-arch container). `i686` (`linux/386`) runs natively on the `ubuntu-24.04` runner; `armv7` (`linux/arm/v7`), `ppc64le` (`linux/ppc64le`), `s390x` (`linux/s390x`) and `riscv64` (`linux/riscv64`) run under QEMU (`docker/setup-qemu-action`). Installs `build-essential libffi-dev zlib1g-dev` (the spec sets `strip=True`; `ppc64le`/`s390x` have full manylinux wheels, while the i686 aiohttp stack, propcache-on-`armv7`, and multidict/frozenlist/ruamel.yaml.clib on `riscv64` compile from sdist). Artifacts `yacron2-linux-{i686,armv7,ppc64le,s390x,riscv64}` (no `-musl` suffix; they sit beside the 64-bit glibc binaries).
    - **`binaries-musl`**: Linux **musl/Alpine**, `amd64`, `arm64`, `i686`, `armv7`, `ppc64le`, `s390x`, `riscv64` and `armv6`, built **inside a `python:3.14-alpine` container via `docker run`** (so checkout/upload stay on the glibc host). `amd64`/`arm64` use their native runners; `i686` (`linux/386`) runs natively on the `ubuntu-24.04` runner and `armv7`/`ppc64le`/`s390x`/`riscv64`/`armv6` under QEMU. `armv6` is **musl-only** (the Debian/glibc image ships no arm32v6, so it has no `binaries-glibc-extra` counterpart). Installs `build-base libffi-dev zlib-dev` (the spec sets `strip=True`, and headers cover any dep that compiles from sdist, notably the i686 aiohttp stack, which ships no `musllinux_i686` wheels, and the whole C-ext stack on `armv6`). Artifacts `yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64,armv6}-musl`.
    - **`binaries-macos`**: macOS, `arm64` on `macos-15` (Apple Silicon) and `amd64` on `macos-15-intel`. Built on Python 3.14. After the smoke test it asserts the native arch with `file` (so Rosetta cannot let a mislabelled x86_64 build pass on the arm64 runner). Artifacts `yacron2-macos-arm64`, `yacron2-macos-amd64`.
    - **`binaries-windows`**: Windows, `amd64` on `windows-latest` and `arm64` on the `windows-11-arm` runner (both native; PyInstaller is not a cross-compiler). Built on Python 3.14 with the same `pyinstaller==6.21.0` pin and `dist/yacron2.exe --version` smoke test as the other jobs; any C-extension dep lacking a `win_arm64` wheel compiles from sdist via the runner's Visual Studio ARM64 toolchain. There is **no Windows code-signing step** (the binaries ship unsigned, like the Linux binaries). Artifacts `yacron2-windows-amd64.exe`, `yacron2-windows-arm64.exe`. See [Running on Windows](Running-on-Windows).
 5. **`release`**: runs only after all builders succeed, with `permissions: contents: write` and `id-token: write`. In order:
-   - Builds the wheel + sdist with `python -m build` (at `SETUPTOOLS_SCM_PRETEND_VERSION`) and validates with `twine check`.
+   - Builds the wheel + sdist with `uv build` (at `SETUPTOOLS_SCM_PRETEND_VERSION`) and validates with `twine check` (run ephemerally via `uvx`).
    - **Publishes the wheel + sdist to PyPI** via Trusted Publishing / OIDC (`pypa/gh-action-pypi-publish@release/v1`), no API token.
    - **Only after a successful publish**: creates an annotated tag `X.Y.Z` and pushes it; downloads every per-arch binary artifact (pattern `yacron2-*`, `merge-multiple: true`); extracts the release notes; and creates the GitHub Release.
 6. **`docker`**: after `release`, calls `docker.yml` via `workflow_call` with the new version to build and push the multi-arch image (see below).
@@ -164,7 +175,7 @@ The version is baked in by installing the package under `SETUPTOOLS_SCM_PRETEND_
 
 ### Building a binary locally
 
-`pyinstaller/Dockerfile` builds a glibc binary reproducibly on `ubuntu:24.04`: it installs build deps and `upx-ucl`, uses `pyenv` to install CPython `3.13.14` with `--enable-shared`, creates a venv, `pip install pyinstaller==6.21.0`, installs the package, runs the entry script (`python pyinstaller/yacron2 --version`), runs `pyinstaller pyinstaller/yacron2.spec`, and smoke-tests `dist/yacron2 --version`.
+`pyinstaller/Dockerfile` builds a glibc binary reproducibly on `ubuntu:24.04`: it installs build deps and `upx-ucl`, uses `pyenv` to install CPython `3.13.14` with `--enable-shared`, creates a venv, installs `pyinstaller==6.21.0` and the package with **uv** (copied in via `COPY --from=ghcr.io/astral-sh/uv` — an amd64-only local build, so the clean image-copy pattern is arch-safe here, unlike the multi-arch release `Dockerfile`), runs the entry script (`python pyinstaller/yacron2 --version`), runs `pyinstaller pyinstaller/yacron2.spec`, and smoke-tests `dist/yacron2 --version`.
 
 `pyinstaller/Makefile` wraps that: `make` (target `all`) builds the image, copies `dist/yacron2` out of the container, and runs `dist/yacron2 --version`.
 

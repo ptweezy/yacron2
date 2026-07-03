@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
-# yacron2 — Ubuntu variant, built on Ubuntu 24.04 LTS using its native Python
-# 3.12. For users who standardize on an Ubuntu base (familiar userland, apt,
+# yacron2 — Ubuntu variant, built on Ubuntu 26.04 LTS using its native Python
+# 3.14. For users who standardize on an Ubuntu base (familiar userland, apt,
 # matching host images).
 #
 # Build locally:
@@ -9,7 +9,7 @@
 # CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
 # reads it from .git (kept in the context by .dockerignore).
 
-ARG UBUNTU_VERSION=24.04
+ARG UBUNTU_VERSION=26.04
 
 # ---- build stage --------------------------------------------------------
 FROM ubuntu:${UBUNTU_VERSION} AS builder
@@ -21,7 +21,7 @@ WORKDIR /src
 COPY . .
 
 # Ubuntu ships no official "python" image, so install its packaged interpreter
-# (3.12 on 24.04) plus a toolchain, letting pip source-compile any dep that has
+# (3.14 on 26.04) plus a toolchain, letting pip source-compile any dep that has
 # no wheel for the target arch (e.g. propcache on 32-bit ARM). The toolchain
 # stays in this builder stage. git is pulled in only for a plain local build
 # (empty VERSION), where setuptools_scm reads the version from .git.

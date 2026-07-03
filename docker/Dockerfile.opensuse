@@ -1,15 +1,15 @@
 # syntax=docker/dockerfile:1
 #
-# yacron2 — openSUSE variant, built on openSUSE Leap 15.6. Covers the SUSE /
-# SLES family; Leap shares its package base with SUSE Linux Enterprise. Leap's
-# default python3 is old, so this installs the parallel-installable python311.
+# yacron2 — openSUSE variant, built on openSUSE Leap 16.0. Covers the SUSE /
+# SLES family; Leap shares its package base with SUSE Linux Enterprise. This
+# installs the parallel-installable python313 (Python 3.13).
 #
 # Build locally:
 #   docker build -f docker/Dockerfile.opensuse -t yacron2:opensuse .
 # CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
 # reads it from .git (kept in the context by .dockerignore).
 
-ARG LEAP_VERSION=15.6
+ARG LEAP_VERSION=16.0
 
 # ---- build stage --------------------------------------------------------
 FROM opensuse/leap:${LEAP_VERSION} AS builder
@@ -19,23 +19,25 @@ ARG VERSION=""
 WORKDIR /src
 COPY . .
 
-# python311 is Leap's modern, parallel-installable interpreter (the default
-# python3 is much older). Add a toolchain so pip can source-compile any dep
-# without a wheel for the target arch; it stays in this builder stage. git is
-# pulled in only for a plain local build (empty VERSION), where setuptools_scm
-# reads the version from .git.
+# python313 is Leap 16's modern, parallel-installable interpreter (Python 3.13).
+# Unlike Leap 15 (which split pip into a python311-pip package), Leap 16 bundles
+# ensurepip in python313, so `python3.13 -m venv` bootstraps pip into the venv
+# with no separate -pip package to install. Add a toolchain so pip can
+# source-compile any dep without a wheel for the target arch; it stays in this
+# builder stage. git is pulled in only for a plain local build (empty VERSION),
+# where setuptools_scm reads the version from .git.
 # retry() re-runs a network step (package refresh/install, pip download) a few
 # times with backoff. zypper exit 106 means a repo mirror was unreachable, so
 # the refresh is retried explicitly before install.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    pkgs="python311 python311-pip python311-devel gcc"; \
+    pkgs="python313 python313-devel gcc"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
     retry zypper --non-interactive refresh; \
     retry zypper --non-interactive install $pkgs; \
     zypper clean --all; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
-    python3.11 -m venv /opt/venv; \
+    python3.13 -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
@@ -51,12 +53,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
-# The venv references /usr/bin/python3.11, so the runtime needs python311
+# The venv references /usr/bin/python3.13, so the runtime needs python313
 # installed. Both stages are opensuse/leap:${LEAP_VERSION}, so it matches.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     retry zypper --non-interactive refresh; \
-    retry zypper --non-interactive install python311; \
+    retry zypper --non-interactive install python313; \
     zypper clean --all
 
 COPY --from=builder /opt/venv /opt/venv

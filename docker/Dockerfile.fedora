@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # yacron2 — Fedora variant. Tracks a recent Fedora release and its
-# leading-edge Python (3.13 on Fedora 41). For users who run Fedora hosts or
+# leading-edge Python (3.14 on Fedora 44). For users who run Fedora hosts or
 # want a more current RPM userland than the enterprise UBI base.
 #
 # Build locally:
@@ -9,7 +9,7 @@
 # CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
 # reads it from .git (kept in the context by .dockerignore).
 
-ARG FEDORA_VERSION=41
+ARG FEDORA_VERSION=44
 
 # ---- build stage --------------------------------------------------------
 FROM fedora:${FEDORA_VERSION} AS builder

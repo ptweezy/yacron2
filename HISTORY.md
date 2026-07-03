@@ -5,6 +5,54 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.2.6 (2026-07-03)
+
+A toolchain and packaging release. There are **no behavior, API, or
+configuration changes** and **no change to the core dependency footprint**: the
+published wheel/sdist and the release binaries are built from the same sources
+as before and install exactly the same runtime dependencies. The work adopts
+[uv](https://docs.astral.sh/uv/) across the paths where it pays off -- CI, the
+build/release pipeline, and the local dev loop -- refreshes the container base
+images, and pins the CI action versions.
+
+- **uv on the runner-native CI, build, and dev paths.** The dist build
+  (`uv build`), the runner-native PyInstaller binaries (macOS, Windows, and the
+  all-wheels Linux arches, each installed into a throwaway `uv venv` and frozen
+  with `uv run`), the version probe (`uv run --no-project --with
+  setuptools-scm`), and `twine check` (`uvx twine`) all run through uv now:
+  parallel downloads and a shared global wheel cache make them markedly faster,
+  and the results are behavior-identical. `UV_PYTHON_DOWNLOADS=never` keeps uv on
+  the exact interpreter `setup-python` pinned rather than fetching a managed one,
+  and `UV_HTTP_TIMEOUT` carries the same transient-network hardening the pip
+  paths had.
+
+- **The emulated foreign-arch binary legs stay on pip, on purpose.** The
+  musl and glibc-extra binary jobs (armv7/armv6, ppc64le, s390x, riscv64, i686)
+  build inside `docker run` containers under QEMU, where uv is not a fit: its
+  official image is amd64/arm64 only and it has no musl ppc64le/s390x wheels, so
+  pip remains the arch-portable choice there and keeps `PIP_RETRIES`/`PIP_TIMEOUT`
+  hardening. The uvloop bundling and per-arch `--version` smoke test are
+  unchanged on every leg.
+
+- **uv in the local dev loop.** `tox.ini` now declares `requires = tox-uv`, so a
+  plain `tox` auto-provisions its environments and installs dependencies with uv
+  (much faster, behavior-identical); `tox-uv` is added to the `dev` extra and
+  `requirements_dev.txt`. `CONTRIBUTING.md` documents the uv quickstart
+  (`uv venv`, `uv pip install -e ".[dev]"`) alongside the unchanged stock
+  `venv`+`pip` path, and notes the `tox --runner virtualenv` escape hatch for
+  anyone who wants the legacy runner.
+
+- **Refreshed container base images.** The Docker variant matrix moves to
+  current bases: `ubuntu` 24.04 -> 26.04 (Python 3.12 -> 3.14), `rhel` UBI9 ->
+  UBI10, `fedora` 41 -> 44 (3.13 -> 3.14), `opensuse` Leap 15.6 -> 16.0 (3.11 ->
+  3.13), and `distroless` to Python 3.13. The Debian/Alpine images and every
+  image tag stay as they were.
+
+- Internal: every CI-consumed action is pinned to an exact version
+  (`checkout@v7.0.0`, `setup-python@v6.3.0`, `setup-uv@v8.2.0`, the docker/*
+  actions, etc.), and a `dependabot.yml` is added to keep those pins and the
+  Python dev dependencies current.
+
 ## 1.2.5 (2026-07-03)
 
 A performance and footprint release. There are **no behavior or configuration

@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import pytest
 from aiohttp import web
@@ -103,3 +104,35 @@ def test_install_shutdown_handlers_roundtrip():
         cleanup()
     finally:
         loop.close()
+
+
+def test_nonblocking_lock_raises_on_contention(tmp_path):
+    # blocking=False must surface contention as an immediate OSError (the
+    # lock-fidelity probe DEPENDS on the second attempt failing; a store
+    # where it succeeds has no-op locks). Two descriptors of one file
+    # contend on both platforms: POSIX flock is per-open-file-description,
+    # Windows byte-range locks are per-handle.
+    path = tmp_path / "lockfile"
+    path.write_bytes(b"\0")
+    fd1 = os.open(str(path), os.O_RDWR)
+    fd2 = os.open(str(path), os.O_RDWR)
+    try:
+        with platform.exclusive_file_lock(fd1, blocking=False):
+            with pytest.raises(OSError):
+                with platform.exclusive_file_lock(fd2, blocking=False):
+                    pass
+        # released: the second descriptor may now take it
+        with platform.exclusive_file_lock(fd2, blocking=False):
+            pass
+    finally:
+        os.close(fd1)
+        os.close(fd2)
+
+
+def test_pid_alive_own_and_bogus_pid():
+    # our own process exists; a hugely out-of-range pid does not. None is
+    # reserved for "cannot tell" (treated as dead by reconciliation, which
+    # the per-process token already vouches for).
+    assert platform.pid_alive(os.getpid()) is True
+    assert platform.pid_alive(2**22 + 12345) in (False, None)
+    assert platform.pid_alive(0) is None

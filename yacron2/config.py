@@ -55,9 +55,12 @@ DEFAULT_CLUSTER = {
     #   "gossip" (default) - the embedded mTLS, no-shared-state, best-effort
     #                        quorum election (listen/tls/peers below);
     #   "kubernetes"       - a coordination.k8s.io/v1 Lease (fenced);
-    #   "etcd"             - a lease-backed etcd key/election (fenced).
-    # The two lease backends talk to their store over plain HTTP (the core
-    # aiohttp dependency), so neither adds a runtime dependency.
+    #   "etcd"             - a lease-backed etcd key/election (fenced);
+    #   "filesystem"       - a flock-guarded TTL lease on a shared POSIX
+    #                        mount (fenced under NTP-bounded clock skew).
+    # The kubernetes/etcd backends talk to their store over plain HTTP (the
+    # core aiohttp dependency) and the filesystem backend needs only a
+    # mount, so none of them adds a runtime dependency.
     "backend": "gossip",
     "interval": 30,  # seconds between peer-attestation rounds
     "driftAfter": 3,  # reachable-but-mismatched rounds before "drifted"
@@ -112,6 +115,26 @@ DEFAULT_ETCD: Dict[str, Any] = {
     "tls": {"ca": None, "cert": None, "key": None},
 }
 
+# Defaults merged over a `cluster.filesystem` block (backend: filesystem):
+# leader election over a shared POSIX mount (Amazon S3 Files / EFS / NFS),
+# using the same flock-guarded TTL lease the durable state store uses -- no
+# coordination service at all. See yacron2.backends.filesystem.
+DEFAULT_FILESYSTEM: Dict[str, Any] = {
+    # required: the directory the election lease lives in. Point it at the
+    # same mount (and deploymentId) as the `state` section to keep one
+    # coordination surface per deployment.
+    "path": None,
+    "electionName": "cluster/leader",
+    "ttl": 15,  # lease time-to-live, seconds (floor 3, like etcd)
+    # namespace prefix inside the store; None -> "default". Use the SAME
+    # value as state.deploymentId when sharing a mount with the state store.
+    "deploymentId": None,
+    # auto (probe the mount) | single-node | shared -- same semantics as
+    # state.topology. Windows/macOS cannot probe; assert `shared` explicitly
+    # there.
+    "topology": "auto",
+}
+
 
 # Defaults for an (optional) state block. Only applied when a `state` section
 # is present; see _build_state_config. yacron2 is stateless by default, so the
@@ -152,8 +175,16 @@ DEFAULT_STATE: Dict[str, Any] = {
     "gcGraceSeconds": 604800,
     # upper bound on store operations per second (a token bucket over every
     # backend call), for request-rate/cost control on mounts that bill per
-    # request. 0 disables (no throttling).
+    # request. 0 disables (no throttling). Lease operations (coordination)
+    # bypass the bucket: a renew queued behind bulk writes could overshoot
+    # its TTL and double-run the job the lease fences.
     "maxOpsPerSecond": 0,
+    # TTL (seconds) of the per-job concurrency slot lease taken for
+    # concurrencyScope: cluster jobs. Renewed at a third of this while the
+    # job runs; on a crash the slot frees itself after at most this long.
+    # Floor 5 (enforced): a tiny TTL leaves no room for renew latency on a
+    # network mount and would expire live holders.
+    "slotTtlSeconds": 30,
 }
 
 
@@ -239,6 +270,13 @@ _REPORT_DEFAULTS = {
 DEFAULT_CONFIG: Dict[str, Any] = {
     "shell": platform.DEFAULT_SHELL,
     "concurrencyPolicy": "Allow",
+    # how far concurrencyPolicy reaches: "node" (default, classic behaviour:
+    # only this process's running instances are considered) or "cluster"
+    # (Forbid/Replace also exclude instances on OTHER nodes sharing the
+    # `state` store, via a TTL slot lease on the shared mount). Requires a
+    # `state` section; Allow+cluster is refused as inert. See
+    # yacron2.cron.maybe_launch_job.
+    "concurrencyScope": "node",
     # where this job runs under cluster leader election (inert unless
     # cluster.electLeader is set); see yacron2.cron._cluster_allows.
     "clusterPolicy": "Leader",
@@ -373,6 +411,7 @@ _report_schema = Map(
 _job_defaults_common = {
     Opt("shell"): Str(),
     Opt("concurrencyPolicy"): Enum(["Allow", "Forbid", "Replace"]),
+    Opt("concurrencyScope"): Enum(["node", "cluster"]),
     Opt("clusterPolicy"): Enum(["Leader", "PreferLeader", "EveryNode"]),
     Opt("onMissed"): Enum(["skip", "run-once", "run-all"]),
     Opt("startingDeadlineSeconds"): EmptyNone() | Int(),
@@ -493,8 +532,10 @@ CONFIG_SCHEMA = EmptyDict() | Map(
         # carry them.
         Opt("cluster"): Map(
             {
-                # gossip (default) | kubernetes | etcd
-                Opt("backend"): Enum(["gossip", "kubernetes", "etcd"]),
+                # gossip (default) | kubernetes | etcd | filesystem
+                Opt("backend"): Enum(
+                    ["gossip", "kubernetes", "etcd", "filesystem"]
+                ),
                 # --- gossip transport (required for backend: gossip) ---
                 # host:port the mTLS cluster listener binds to
                 Opt("listen"): Str(),
@@ -555,6 +596,18 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         ),
                     }
                 ),
+                # --- shared-mount election backend (backend: filesystem) ---
+                Opt("filesystem"): Map(
+                    {
+                        Opt("path"): Str(),
+                        Opt("electionName"): Str(),
+                        Opt("ttl"): Int() | Float(),
+                        Opt("deploymentId"): EmptyNone() | Str(),
+                        Opt("topology"): Enum(
+                            ["auto", "single-node", "shared"]
+                        ),
+                    }
+                ),
             }
         ),
         # Optional state section: an opt-in durable store (a local filesystem
@@ -572,6 +625,7 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("onStoreUnavailable"): Enum(["degrade", "fail-closed"]),
                 Opt("gcGraceSeconds"): Int(),
                 Opt("maxOpsPerSecond"): Int() | Float(),
+                Opt("slotTtlSeconds"): Int() | Float(),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -720,6 +774,7 @@ class JobConfig:
         "has_seconds",
         "shell",
         "concurrencyPolicy",
+        "concurrencyScope",
         "clusterPolicy",
         "onMissed",
         "startingDeadlineSeconds",
@@ -763,6 +818,10 @@ class JobConfig:
         self.has_seconds: bool = schedule_has_seconds(self.schedule_unparsed)
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
+        # cluster scope reaches across nodes, so it IS fingerprinted (like
+        # clusterPolicy) -- but only when set, so pre-existing configs keep
+        # their digests (see yacron2.fingerprint.canonical_job).
+        self.concurrencyScope = config.pop("concurrencyScope")
         self.clusterPolicy = config.pop("clusterPolicy")
         # Catch-up config is deliberately NOT part of the job-set fingerprint
         # (yacron2.fingerprint): it is a restart-time, node-local behaviour
@@ -949,6 +1008,19 @@ class JobConfig:
         require(self.saveLimit >= 0, "saveLimit must be >= 0")
         require(self.maxLineLength > 0, "maxLineLength must be > 0")
         require(self.killTimeout >= 0, "killTimeout must be >= 0")
+        # Allow places no bound on concurrent instances, so widening its
+        # scope to the cluster gates nothing -- a safety option that
+        # silently does nothing is worse than an error the operator sees
+        # once at load time.
+        require(
+            not (
+                self.concurrencyScope == "cluster"
+                and self.concurrencyPolicy == "Allow"
+            ),
+            "concurrencyScope: cluster has no effect with "
+            "concurrencyPolicy: Allow (the default); set Forbid or "
+            "Replace, or drop concurrencyScope",
+        )
         require(
             self.catchupJitterSeconds >= 0,
             "catchupJitterSeconds must be >= 0",
@@ -1180,6 +1252,8 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
         return _build_kubernetes_cluster_config(raw)
     if backend == "etcd":
         return _build_etcd_cluster_config(raw)
+    if backend == "filesystem":
+        return _build_filesystem_cluster_config(raw)
     return _build_gossip_cluster_config(raw)
 
 
@@ -1205,6 +1279,11 @@ def _build_state_config(raw: dict) -> StateConfig:
         raise ConfigError(
             "state.gcGraceSeconds must be <= 0 (GC disabled) or >= 86400"
         )
+    if float(cfg.get("slotTtlSeconds") or 0) < 5:
+        # the slot lease is renewed at ttl/3 by a live holder; below ~5s
+        # one slow renew on a network mount expires a healthy holder's
+        # slot and invites the cross-node double-run the lease fences.
+        raise ConfigError("state.slotTtlSeconds must be >= 5")
     return StateConfig(cfg)
 
 
@@ -1327,7 +1406,7 @@ def _reject_lease_spread(cfg: dict, backend: str) -> None:
 # Lease store sub-blocks. Each lease builder reads ONLY its own; a block under
 # the wrong backend is rejected so the operator's intended endpoints/TLS/creds
 # are never silently discarded (see _reject_foreign_store_blocks).
-_LEASE_STORE_KEYS = ("etcd", "kubernetes")
+_LEASE_STORE_KEYS = ("etcd", "kubernetes", "filesystem")
 
 # Kubernetes object-name charsets, used to keep leaseName/leaseNamespace clear
 # of URL path metacharacters ('/', '?', '#', whitespace) that could retarget
@@ -1767,6 +1846,45 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     return ClusterConfig(cfg)
 
 
+def _build_filesystem_cluster_config(raw: dict) -> ClusterConfig:
+    """Build the cluster config for the shared-mount (filesystem) backend.
+
+    The store is a directory, so validation is far smaller than etcd's: a
+    non-empty path, a ttl floor (same rationale as etcd's -- below 3s the
+    leader window collapses under the renew cadence and the clock-skew
+    margin), and the shared lease-backend rules (no spread, no foreign store
+    blocks, electLeader implied).
+    """
+    cfg = _cluster_base(raw)
+    _reject_lease_spread(cfg, "filesystem")
+    _reject_foreign_store_blocks(cfg, "filesystem")
+    raw_fs = cfg.get("filesystem") or {}
+    fsb = dict(DEFAULT_FILESYSTEM)
+    fsb.update(raw_fs)
+    cfg["filesystem"] = fsb
+    if not fsb.get("path") or not str(fsb["path"]).strip():
+        raise ConfigError(
+            "cluster.filesystem.path is required and must be non-empty "
+            "(the directory -- normally a shared mount -- the election "
+            "lease lives in)"
+        )
+    if not str(fsb.get("electionName") or "").strip():
+        raise ConfigError("cluster.filesystem.electionName must be non-empty")
+    if fsb["ttl"] < 3:
+        raise ConfigError(
+            "cluster.filesystem.ttl must be >= 3 seconds (the leader "
+            "holds the lease only until ttl minus a clock-skew margin and "
+            "renews every max(1s, ttl/3); a smaller ttl makes a node that "
+            "wins the election immediately treat its own lease as "
+            "expired, so no Leader job ever runs); got {}".format(fsb["ttl"])
+        )
+    cfg["electLeader"] = True
+    advisories = _lease_advisories(raw, "filesystem")
+    if advisories:
+        cfg["_advisories"] = advisories
+    return ClusterConfig(cfg)
+
+
 def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
     """Non-fatal advisories for a cluster config, returned as messages.
 
@@ -2055,17 +2173,44 @@ def parse_config_file(
     return parse_config_string(data, path, _seen, _sources)
 
 
+def _validate_cross_sections(config: Yacron2Config) -> None:
+    """Validate constraints spanning jobs and the optional sections.
+
+    Runs only at the top-level parse entry point (:func:`parse_config`),
+    on the fully-assembled config -- never inside :func:`_config_from_doc`,
+    where an included or config-dir sibling file is parsed standalone and
+    the section a job depends on may legitimately live in another file.
+    """
+    if config.state_config is None:
+        offenders = sorted(
+            job.name
+            for job in config.jobs
+            if job.concurrencyScope == "cluster"
+        )
+        if offenders:
+            raise ConfigError(
+                "concurrencyScope: cluster requires a `state` section "
+                "(the shared store is what coordinates the nodes), but "
+                "none is configured; offending job(s): {}".format(
+                    ", ".join(offenders)
+                )
+            )
+
+
 def parse_config(
     config_arg: str, _sources: Optional[set] = None
 ) -> Yacron2Config:
     if os.path.isdir(config_arg):
-        return _parse_config_dir(config_arg, _sources)
-    try:
-        return parse_config_file(config_arg, _sources=_sources)
-    except OSError as ex:
-        # surface a clean ConfigError (e.g. file not found) rather than a bare
-        # OSError, so callers (__main__) handle it uniformly.
-        raise ConfigError(str(ex)) from ex
+        config = _parse_config_dir(config_arg, _sources)
+    else:
+        try:
+            config = parse_config_file(config_arg, _sources=_sources)
+        except OSError as ex:
+            # surface a clean ConfigError (e.g. file not found) rather than a
+            # bare OSError, so callers (__main__) handle it uniformly.
+            raise ConfigError(str(ex)) from ex
+    _validate_cross_sections(config)
+    return config
 
 
 def parse_config_with_sources(

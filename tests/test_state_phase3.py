@@ -229,7 +229,9 @@ async def test_abandon_retry_settles_owner_moved(tmp_path):
         state = JobRetryState(1, 2, 60)
         state.next_delay()
         cron.retry_state["j"] = state
-        cron._abandon_retry("j", 1)
+        # a single-node store: cross-node resume is inactive, so the
+        # abandonment settles the ladder dead (the legacy behaviour).
+        cron._abandon_retry(cron.cron_jobs["j"], 1)
         await _drain_state_writes(cron)
         rec = await _newest(cron, "retries/j")
         assert rec is not None

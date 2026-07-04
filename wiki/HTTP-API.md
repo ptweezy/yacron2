@@ -167,7 +167,7 @@ Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
 When no `cluster` section is configured, it returns
 `{"enabled": false, "peers": []}`. When a cluster section is present it returns
 `enabled: true` plus a `backend` field naming the active leadership backend
-(`gossip`, `kubernetes`, or `etcd`) and the node's view: its
+(`gossip`, `kubernetes`, `etcd`, or `filesystem`) and the node's view: its
 `node_name` and `job_set_id`, the computed `cluster_size` and `quorum`, whether
 `elect_leader` is on, the `distribution` mode (`single-leader` or `spread`),
 whether any conflict is pausing `Leader` jobs (`conflict`, the umbrella flag),
@@ -186,23 +186,28 @@ and a quorate peer advertising a different `distribution` or `elect_leader`
 setting, a coordination-policy conflict surfaced as `policy_conflict: true` with
 the differing descriptors in `conflicting_policies`.
 
-The **lease backends** (`kubernetes` / `etcd`) have no static peer set, so their
-view is lease-shaped: `backend` names the backend, `peers` is empty,
-`cluster_size`/`quorum` are `1`, `elect_leader` is `true`, `distribution` is
+The **lease backends** (`kubernetes` / `etcd` / `filesystem`) have no static
+peer set, so their view is lease-shaped: `backend` names the backend, `peers`
+is empty, `cluster_size`/`quorum` are `1`, `elect_leader` is `true`,
+`distribution` is
 `single-leader`, all three conflict flags (`conflict`, `size_conflict`,
 `policy_conflict`) are always `false`, and an extra `lease` block carries the
 backend-specific detail. This is an endpoint-reference view; the field
 semantics (what `quorate` means for a lease backend, the `lease` block contents,
 and the `expiry` rules below) are documented once in
 [Clustering and Leader Election](Clustering-and-Leader-Election#observing-the-cluster).
-For `kubernetes` the block is `{name, namespace, identity, holder, expiry}` and
-for `etcd` `{electionName, identity, holder, leaseId, expiry}`. The `expiry` is
-populated only while **this** node holds the lease: a follower reports
-`expiry: null`. (For `kubernetes` it is the local lease deadline while this node
-leads; for `etcd` it is the current lease deadline, or `null` when this node is
-not the holder.) `quorate` is whether the node has a fresh successful read of the
-lease store (stale → `Leader` fails closed; the never-skip `PreferLeader` default
-then runs the job anyway).
+For `kubernetes` the block is `{name, namespace, identity, holder, expiry}`,
+for `etcd` `{electionName, identity, holder, leaseId, expiry}`, and for
+`filesystem` `{path, electionName, identity, holder, fence, expiry}`. `fence`
+is the store's monotonic takeover counter: it bumps every time the lease
+changes hands (a renew by the same holder keeps it). For `kubernetes` and
+`etcd` the `expiry` is populated only while **this** node holds the lease: a
+follower reports `expiry: null` (for `kubernetes` it is the local lease
+deadline while this node leads; for `etcd` the current lease deadline). For
+`filesystem` it is the written expiry of the last lease this node observed,
+follower included. `quorate` is whether the node has a fresh successful read
+of the lease store (stale → `Leader` fails closed; the never-skip
+`PreferLeader` default then runs the job anyway).
 
 ```shell
 $ http get http://127.0.0.1:8080/cluster Accept:application/json
@@ -280,8 +285,9 @@ peer traffic. Any node can therefore serve the whole fleet's picture, at most
 one gossip `interval` stale per peer.
 
 When no `cluster` section is configured, or the backend is a lease backend
-(`kubernetes` / `etcd`, which carry only a lease and know nothing about what
-other nodes run), it returns `{"enabled": false, "nodes": []}`.
+(`kubernetes` / `etcd` / `filesystem`, which carry only a lease and know
+nothing about what other nodes run), it returns
+`{"enabled": false, "nodes": []}`.
 
 For the gossip backend it returns `enabled: true`, the serving node's
 `node_name`, the `distribution` and `elect_leader` policy, the gossip
@@ -440,7 +446,12 @@ aggregate statistics. Returns `404 Not Found` for an unknown job.
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
-`fail_reason`). `stats` summarizes them:
+`fail_reason`). Besides `success`, `failure`, and `cancelled`, `outcome` can
+be `unknown`: a crash-reconciled run, recorded when the daemon exited or lost
+the [state store](Durable-State) mid-run so no completion was ever written.
+It is a non-verdict: excluded from `success_rate`, counted only in `total`,
+with no `started_at` or `duration` (`fail_reason` explains the interruption).
+`stats` summarizes them:
 
 | `stats` field | Meaning |
 | --- | --- |

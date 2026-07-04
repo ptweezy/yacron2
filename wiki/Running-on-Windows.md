@@ -3,8 +3,9 @@
 yacron2 runs natively on Windows, alongside Linux and macOS. This page is the
 canonical reference for the handful of behaviors that differ on Windows: how
 to install it, where it looks for configuration, how a string `command` is fed
-to a shell, how to stop the daemon, how a job is terminated, and the two
-POSIX-only features that are reported (never silently dropped) on Windows.
+to a shell, how to stop the daemon, how a job is terminated, the two
+POSIX-only features that are reported (never silently dropped) on Windows, and
+what file-lock coordination over a shared mount can and cannot verify.
 Everything not listed here behaves exactly as it does on POSIX, so the rest of
 this wiki applies unchanged.
 
@@ -254,6 +255,55 @@ Note that this limitation is specific to `unix://` **web** listeners. Gossip
 clustering (the mTLS peer listener) does work on Windows: `cluster.listen` binds
 a TCP `host:port`, not a unix socket, so the Proactor unix-socket restriction
 does not apply. See [Clustering and Leader Election](Clustering-and-Leader-Election).
+
+## Shared-mount coordination
+
+The [durable state store](Durable-State) and the `filesystem` leadership
+backend ([Clustering and Leader Election](Clustering-and-Leader-Election))
+coordinate through advisory file locks. On Windows the lock primitive is an
+`msvcrt.locking` byte-range lock rather than the POSIX `fcntl.flock`; between
+processes on the *same* Windows host it excludes exactly as on POSIX, so
+leases, leader election, and `concurrencyScope: cluster` slots all work fully
+when the coordinating processes share one machine. What Windows cannot do is
+*verify* cross-host reach: there is no `/proc/mounts` to probe, so
+`topology: auto` resolves to `single-node`, and the lock-fidelity probe
+(which runs on one host) cannot detect a mount whose locks are real locally
+but never reach the file server.
+
+Left at `topology: auto`, the state store logs an info line telling you to
+set `state.topology: shared`, and the filesystem election backend warns at
+startup that its locks only exclude local processes, verbatim (`<path>`
+filled in):
+
+```text
+cluster: the filesystem election store at <path> resolved topology 'single-node', so its locks only exclude processes on THIS host (Windows/macOS cannot probe the mount); if the directory really is a shared network mount, set cluster.filesystem.topology: shared
+```
+
+Coordinating *across* Windows hosts over a shared mount therefore requires
+both an explicit assertion (`state.topology: shared` and/or
+`cluster.filesystem.topology: shared`) **and** a mount that truly honours
+byte-range locks across hosts. yacron2 cannot check the second half on
+Windows, so with `topology: shared` asserted the election still logs a loud
+startup advisory, verbatim, and the residual risk rests on your assertion:
+
+```text
+cluster: filesystem election on a Windows shared mount: cross-host lock fidelity cannot be verified on this platform (no /proc/mounts); the election is safe only if the mount honours byte-range locks across hosts
+```
+
+The same limit applies to `concurrencyScope: cluster`: over a mount that does
+not propagate locks between hosts, a "cluster-wide" claim only guards
+processes on the same host. Asserting `shared` over a mount that fakes its
+locks is how you get two leaders or overlapping `Forbid` runs, so verify the
+mount's lock semantics before trusting it. See [Durable State](Durable-State)
+and [Clustering and Leader Election](Clustering-and-Leader-Election) for the
+full coordination semantics and guarantees.
+
+One neighbouring durable-state mechanism needs no caveat: crash
+reconciliation's same-host pid-liveness check (an in-flight run left open by
+a previous daemon is not declared dead while its recorded pid still exists,
+because a daemon crash does not kill the job processes it spawned) works
+fully on Windows, via `OpenProcess` in place of the POSIX `kill(pid, 0)`
+probe.
 
 ## Everything else behaves identically
 

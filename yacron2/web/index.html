@@ -22,6 +22,7 @@
     --pending: #ffbf47;
     --disabled: #7d8590;
     --cancelled: #c98bff;
+    --unknown: #9aa5b1;   /* crash-reconciled runs: neutral, never green */
 
     --radius: 3px;
     --shadow-lg: 0 10px 40px rgba(0, 0, 0, .7);
@@ -184,6 +185,7 @@
   .dot.pending { background: var(--pending); }
   .dot.disabled { background: var(--disabled); }
   .dot.cancelled { background: var(--cancelled); }
+  .dot.unknown { background: var(--unknown); }
   .dot.live { background: #5cff97; filter: drop-shadow(0 0 4px rgba(92, 255, 151, .9)); }
   .dot.dead { background: var(--fail); }
   .dot.run, .dot.live { box-shadow: 0 0 0 0 currentColor; animation: pulse 1.8s infinite; color: var(--run); }
@@ -282,6 +284,7 @@
   .st.pending .glyph, .st.pending .label { color: var(--pending); }
   .st.disabled .glyph, .st.disabled .label { color: var(--disabled); }
   .st.cancelled .glyph, .st.cancelled .label { color: var(--cancelled); }
+  .st.unknown .glyph, .st.unknown .label { color: var(--unknown); }
 
   .jobname { font-weight: 700; color: var(--fg); }
   .jobcmd { color: var(--fg-faint); margin-top: 1px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -335,6 +338,7 @@
   .spark i.ok { background: var(--ok); }
   .spark i.fail { background: var(--fail); }
   .spark i.cancelled { background: var(--cancelled); }
+  .spark i.unknown { background: var(--unknown); }
   .spark.empty { color: var(--fg-faint); font-size: 11px; }
 
   .actions { display: flex; gap: 5px; justify-content: flex-end; }
@@ -418,7 +422,7 @@
 
   .barchart { display: flex; align-items: flex-end; gap: 2px; height: 60px; padding: 6px 0 0; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
   .barchart i { flex: 1; min-width: 2px; background: var(--fg-faint); border-radius: 1px 1px 0 0; min-height: 2px; }
-  .barchart i.ok { background: var(--ok); } .barchart i.fail { background: var(--fail); } .barchart i.cancelled { background: var(--cancelled); }
+  .barchart i.ok { background: var(--ok); } .barchart i.fail { background: var(--fail); } .barchart i.cancelled { background: var(--cancelled); } .barchart i.unknown { background: var(--unknown); }
 
   .runtable { width: 100%; border-collapse: collapse; font-size: 11.5px; }
   .runtable th { text-align: left; color: var(--fg-faint); font-weight: 600; padding: 5px 8px; border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 10px; letter-spacing: .5px; }
@@ -618,6 +622,7 @@
   .heat-cell.ok { background: var(--ok); }
   .heat-cell.fail { background: var(--fail); }
   .heat-cell.cancelled { background: var(--cancelled); }
+  .heat-cell.unknown { background: var(--unknown); }
   .heat-cell.act { cursor: pointer; }
 
   /* ---------- cluster peer swimlane ---------- */
@@ -652,6 +657,7 @@
   #fleetPanel .cell.ok { color: var(--ok); }
   #fleetPanel .cell.fail { color: var(--fail); font-weight: 700; }
   #fleetPanel .cell.cancelled { color: var(--fg-dim); }
+  #fleetPanel .cell.unknown { color: var(--unknown); }
   #fleetPanel .cell.run { color: var(--accent); }
   #fleetPanel .cell.none { color: var(--fg-faint); }
   #fleetPanel td.owner { box-shadow: inset 2px 0 0 var(--accent); }
@@ -724,7 +730,7 @@
   .tlrow:hover { background: var(--hover); border-left-color: var(--accent); }
   .tlrow .tlt { color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .tlrow .tlg { text-align: center; }
-  .tlrow.ok .tlg { color: var(--ok); } .tlrow.fail .tlg { color: var(--fail); } .tlrow.cancelled .tlg { color: var(--cancelled); }
+  .tlrow.ok .tlg { color: var(--ok); } .tlrow.fail .tlg { color: var(--fail); } .tlrow.cancelled .tlg { color: var(--cancelled); } .tlrow.unknown .tlg { color: var(--unknown); }
   .tlrow .tlnm { font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tlrow .tlre { color: var(--fg-faint); font-size: 11px; }
   .tlrow .tlmeta { color: var(--fg-dim); font-size: 11px; white-space: nowrap; }
@@ -741,7 +747,7 @@
   .mitlist { overflow: auto; max-height: 30vh; padding: 8px 16px; border-bottom: 1px solid var(--border); }
   .mitlist .mj { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; }
   .mitlist .mj .g { width: 1.2ch; text-align: center; }
-  .mitlist .mj.ok .g { color: var(--ok); } .mitlist .mj.fail .g { color: var(--fail); } .mitlist .mj.cancelled .g { color: var(--cancelled); } .mitlist .mj.run .g { color: var(--run); }
+  .mitlist .mj.ok .g { color: var(--ok); } .mitlist .mj.fail .g { color: var(--fail); } .mitlist .mj.cancelled .g { color: var(--cancelled); } .mitlist .mj.run .g { color: var(--run); } .mitlist .mj.unknown .g { color: var(--unknown); }
   .mitlist .mj .mn { flex: 1; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mitlist .mj .ms { color: var(--fg-faint); font-size: 10.5px; }
   .mitlog { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); padding: 8px 16px; max-height: 16vh; overflow: auto; white-space: pre-wrap; }
@@ -1222,9 +1228,9 @@
   const PREF_PREFIX = "yacron2.";             // localStorage prefs
   const MAX_LOG_LINES = 5000;                 // bound the in-memory log view
   const RE_SCAN_CAP = 5000;                   // cap chars scanned per line (ReDoS guard)
-  const GLYPH = { ok: "●", fail: "✗", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘" };
+  const GLYPH = { ok: "●", fail: "✗", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍" };
   // one place that maps a run outcome -> its CSS state class
-  const outcomeCls = (o) => o === "failure" ? "fail" : o === "cancelled" ? "cancelled" : "ok";
+  const outcomeCls = (o) => o === "failure" ? "fail" : o === "cancelled" ? "cancelled" : o === "unknown" ? "unknown" : "ok";
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e; };
@@ -1372,11 +1378,12 @@
     if (job.last_run) {
       if (job.last_run.outcome === "failure") return { key: "fail", label: "Failed" };
       if (job.last_run.outcome === "cancelled") return { key: "cancelled", label: "Cancelled" };
+      if (job.last_run.outcome === "unknown") return { key: "unknown", label: "Unknown" };
       return { key: "ok", label: "OK" };
     }
     return { key: "pending", label: "Pending" };
   }
-  const STATUS_ORDER = { run: 0, fail: 1, pending: 2, cancelled: 3, ok: 4, disabled: 5 };
+  const STATUS_ORDER = { run: 0, fail: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, disabled: 6 };
 
   // ===================================================================
   //  cron schedule intelligence  (client-side)
@@ -2288,10 +2295,11 @@
         if (isNaN(tt) || tt < start || tt > now) continue;
         let bi = Math.floor((tt - start) / bucketMs);
         if (bi < 0) bi = 0; else if (bi >= HEAT_COLS) bi = HEAT_COLS - 1;
-        const b = buckets[bi] || (buckets[bi] = { ok: 0, fail: 0, cancelled: 0, total: 0 });
+        const b = buckets[bi] || (buckets[bi] = { ok: 0, fail: 0, cancelled: 0, unknown: 0, total: 0 });
         b.total++;
         if (run.o === "failure") b.fail++;
         else if (run.o === "cancelled") b.cancelled++;
+        else if (run.o === "unknown") b.unknown++;
         else b.ok++;
       }
       const maxTotal = buckets.reduce((m, b) => (b && b.total > m ? b.total : m), 1);
@@ -2300,7 +2308,7 @@
         const b = buckets[i];
         const win = bucketLabel(start + i * bucketMs, bucketMs);
         if (!b) { cells += '<span class="heat-cell" title="' + escAttr(win + " · no runs") + '"></span>'; continue; }
-        const worst = b.fail ? "fail" : b.cancelled ? "cancelled" : "ok";
+        const worst = b.fail ? "fail" : b.cancelled ? "cancelled" : b.unknown ? "unknown" : "ok";
         const op = (0.35 + 0.65 * (b.total / maxTotal)).toFixed(2);
         const tip = job.name + " · " + win + " · " + b.ok + " ok / " + b.fail + " fail" + (b.cancelled ? " / " + b.cancelled + " cancelled" : "");
         cells += '<span class="heat-cell act ' + worst + '" data-job="' + escAttr(job.name) + '" style="opacity:' + op + '" title="' + escAttr(tip) + '"></span>';
@@ -2529,7 +2537,7 @@
         else if (s.running) { cls = "cell run"; body = GLYPH.run + " running"; tip = "running now"; }
         else if (s.last) {
           const k = outcomeCls(s.last.outcome);
-          const g = s.last.outcome === "failure" ? GLYPH.fail : s.last.outcome === "cancelled" ? GLYPH.cancelled : GLYPH.ok;
+          const g = s.last.outcome === "failure" ? GLYPH.fail : s.last.outcome === "cancelled" ? GLYPH.cancelled : s.last.outcome === "unknown" ? GLYPH.unknown : GLYPH.ok;
           cls = "cell " + k;
           body = g + " " + esc(s.last.outcome === "success" ? "ok" : s.last.outcome) +
             '<span class="age">' + esc(agoShort(s.last.finished_at)) + "</span>";

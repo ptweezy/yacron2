@@ -6,7 +6,7 @@ through a handful of methods on whatever object ``cluster.backend`` selected.
 This module defines that seam as :class:`LeadershipBackend` and the
 :func:`make_backend` factory that builds the chosen one.
 
-Three backends share the seam, each a different point on the CAP trade-off:
+Four backends share the seam, each a different point on the CAP trade-off:
 
 * **gossip** (default) -- the original mTLS, no-shared-state, best-effort
   quorum election in :mod:`yacron2.cluster`.  Zero new dependencies; can only
@@ -16,12 +16,16 @@ Three backends share the seam, each a different point on the CAP trade-off:
   store is reachable.
 * **etcd** -- a lease-backed key/election (see :mod:`yacron2.backends.etcd`).
   Same fenced guarantee, against an etcd cluster.
+* **filesystem** -- a flock-guarded TTL lease on a shared POSIX mount (see
+  :mod:`yacron2.backends.filesystem`).  Fenced under NTP-bounded clock skew;
+  no coordination service at all -- the mount is the store.
 
-The two lease backends talk to their store over plain HTTP via the core
+The kubernetes/etcd backends talk to their store over plain HTTP via the core
 ``aiohttp`` dependency (the Kubernetes apiserver's REST API, etcd's v3
-gRPC-gateway JSON API) -- *not* the heavyweight official client libraries.
-That keeps the core install zero-new-dep and, by avoiding grpc/protobuf wheels,
-keeps yacron2's wide architecture coverage intact.
+gRPC-gateway JSON API) -- *not* the heavyweight official client libraries --
+and the filesystem backend needs only the standard library.  That keeps the
+core install zero-new-dep and, by avoiding grpc/protobuf wheels, keeps
+yacron2's wide architecture coverage intact.
 
 The surface is split three ways so a new lease backend stays tiny:
 
@@ -357,7 +361,8 @@ class LeadershipBackend(abc.ABC):
 
 
 class LeaseBackend(LeadershipBackend):
-    """Shared base for the single-holder lease backends (kubernetes, etcd).
+    """Shared base for the single-holder lease backends (kubernetes, etcd,
+    filesystem).
 
     It pins ``distribution`` to ``"single-leader"`` (lease backends reject
     ``spread``) and provides the common lease-shaped :meth:`view_dict`; the
@@ -550,7 +555,7 @@ def make_backend(
 
     Imports are deferred so the lease backends (and any future heavyweight
     dependency) never enter the import graph for the common gossip case.  The
-    schema only ever admits the three known names, so the final ``raise`` is a
+    schema only ever admits the four known names, so the final ``raise`` is a
     defensive backstop, not a user-facing path.
     """
     backend = cluster_config.get("backend", "gossip")
@@ -566,6 +571,10 @@ def make_backend(
         from yacron2.backends.etcd import EtcdBackend
 
         return EtcdBackend(cluster_config, get_job_set_id)
+    if backend == "filesystem":
+        from yacron2.backends.filesystem import FilesystemBackend
+
+        return FilesystemBackend(cluster_config, get_job_set_id)
     raise ConfigError(  # pragma: no cover - unreachable; schema-validated
         "unknown cluster.backend {!r}".format(backend)
     )

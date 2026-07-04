@@ -34,6 +34,7 @@ names its loaded config defines, the anchor for garbage collection.
 [The store model](#the-store-model) ·
 [The durable run ledger](#the-durable-run-ledger) ·
 [Missed-run catch-up](#missed-run-catch-up) ·
+[In-flight runs and crash reconciliation](#in-flight-runs-and-crash-reconciliation) ·
 [Depends-on-past](#depends-on-past-onlyiflastsucceeded) ·
 [Output archival](#output-archival-and-secret-redaction) ·
 [Restart-surviving retries](#restart-surviving-retries) ·
@@ -60,6 +61,9 @@ With just that, and no per-job changes, yacron2 gains:
 
 * a **[durable run ledger](#the-durable-run-ledger)** per job, rehydrated into
   the dashboard's history after a restart;
+* **[in-flight run records](#in-flight-runs-and-crash-reconciliation)** for
+  every job: a run interrupted by a daemon crash surfaces as an `unknown`
+  ledger row instead of silently vanishing;
 * **[restart-surviving retries](#restart-surviving-retries)** for every job
   with `onFailure.retry`: a pending retry re-arms across a daemon restart at
   its absolute deadline;
@@ -88,6 +92,7 @@ state:
   onStoreUnavailable: degrade  # optional; degrade | fail-closed
   gcGraceSeconds: 604800       # optional; GC grace (7 days); <= 0 disables GC
   maxOpsPerSecond: 0           # optional; token-bucket op cap; 0 = unlimited
+  slotTtlSeconds: 30           # optional; cluster concurrency-slot lease TTL
 ```
 
 | Key | Default | Meaning |
@@ -99,6 +104,7 @@ state:
 | `onStoreUnavailable` | `degrade` | What the durable-truth gates do when the store cannot answer. See [When the store is unavailable](#when-the-store-is-unavailable-onstoreunavailable). |
 | `gcGraceSeconds` | `604800` | How long a job's streams must be unreferenced *and* idle before [garbage collection](#garbage-collection-and-manifests) deletes them. `<= 0` disables automatic GC. |
 | `maxOpsPerSecond` | `0` | Token-bucket cap on store operations, for request-billed mounts. `0` = unlimited. See [Rate limiting](#rate-limiting-maxopspersecond). |
+| `slotTtlSeconds` | `30` | TTL of the per-job slot lease behind [`concurrencyScope: cluster`](Clustering-and-Leader-Election), renewed at a third of the TTL while the job runs here -- a crashed holder's slot frees after at most this long. Must be `>= 5`: a tiny TTL leaves no room for renew latency on a network mount and would expire live holders. |
 
 ### Per-job stateful options
 
@@ -150,6 +156,14 @@ Several distinct deployments can point at one shared mount: give each its own
 Several *nodes of the same deployment* share one `deploymentId`, which is
 exactly what makes the fleet-wide features work.
 
+The same shared mount can also elect the cluster's *leader*: the
+[`cluster.backend: filesystem`](Clustering-and-Leader-Election) leadership
+backend runs its election over a private, embedded instance of this store.
+Sharing a directory (same `path` *and* `deploymentId`) with the `state`
+section is legal and recommended when both are used -- the stream namespaces
+are disjoint, and the election's instance runs none of this page's chores (no
+manifests, no [GC](#garbage-collection-and-manifests), no counters).
+
 ## The store model
 
 The store's design goal is that **no half-written or hostile file can ever
@@ -171,9 +185,18 @@ with no native rename:
   several nodes append to one stream.
 * **Advisory-`flock` TTL leases.** Coordination uses a lease with a monotonic
   fence, guarded by a `flock` over a dedicated lock file under `leases/` --
-  never over a data file, which the atomic rename swaps out. Lease files are
-  never deleted. Locked read-modify-writes run in a worker thread so a
-  blocking lock can never freeze the event loop.
+  never over a data file, which the atomic rename swaps out. The scheduler
+  takes two lease families here: the per-job concurrency slot
+  (`slots/<job>`, behind
+  [`concurrencyScope: cluster`](Clustering-and-Leader-Election)) and the
+  cross-node retry claim (`retry-claim/<job>`; see
+  [Restart-surviving retries](#restart-surviving-retries)). Lease files are
+  never deleted, deliberately: a lease file is its fence counter's only
+  home, and removing it would hand the next taker a reset fence a stale
+  holder could not be told apart from. The price is that a renamed or
+  removed job leaks one tiny lease file, which GC leaves alone. Locked
+  read-modify-writes run in a worker thread so a blocking lock can never
+  freeze the event loop.
 * **Writes never stall scheduling.** Durable writes are fire-and-forget
   background tasks; a failed write is dropped with a warning and counted
   (`yacron2_state_dropped_writes_total`). The few *reads* on scheduling paths
@@ -191,6 +214,8 @@ The layout under `<path>/<deploymentId>/`:
 │   ├── catchup%2F<job>/  #   catch-up open/close checkpoints
 │   ├── retries%2F<job>/  #   pending/settled retry records
 │   ├── reboot%2F<job>/   #   @reboot boot markers
+│   ├── inflight%2F<job>/ #   in-flight run records (open/closed)
+│   ├── slots%2F<job>/    #   cluster concurrency-slot cancel requests
 │   ├── counters%2F<host>/#   Prometheus counter snapshots
 │   ├── manifests/        #   per-node job manifests (the GC anchor)
 │   └── meta/             #   the store's version stamp
@@ -201,9 +226,10 @@ The layout under `<path>/<deploymentId>/`:
 
 Stream and job names are percent-encoded into filenames injectively (safe on
 case-insensitive filesystems and around Windows reserved device names), so two
-distinct job names can never collide on one path. Run/log/retry/catch-up
-streams are scoped by **job name**, not job-set id, so a job's durable history
-survives ordinary config reloads instead of being orphaned by every edit.
+distinct job names can never collide on one path. The per-job streams (runs,
+logs, retries, catch-up, in-flight, slots) are scoped by **job name**, not
+job-set id, so a job's durable history survives ordinary config reloads
+instead of being orphaned by every edit.
 
 A **version stamp** (the `meta` stream) is written once at first start. A
 store stamped by a *newer* record scheme than this build understands logs a
@@ -296,6 +322,56 @@ the durable watermark. It is unrelated to the scheduler's small intra-process
 catch-up window for slow passes, and a *running* daemon that crosses a
 forward clock jump still follows cron's no-catch-up-after-an-outage rule
 until the next restart evaluates the watermark.
+
+## In-flight runs and crash reconciliation
+
+The run ledger records *finished* runs, so a run the daemon crashed under
+used to leave no trace at all: not failed, not cancelled, just absent. With a
+store configured, every job also gets an **in-flight record**, and two
+reconciliation passes turn an interrupted run into a visible ledger row
+instead of a silent gap:
+
+* **Open and closed records.** When a job goes from zero to one live
+  instances on a node, an `open` record (host, a per-process token, pid,
+  start instant, job digest) lands in the job's `inflight/<job>` stream; when
+  the last instance finishes, a `closed` record follows. This is on for every
+  job whenever `state` is configured, with no per-job option -- on a
+  request-billed mount the cost is about two extra fire-and-forget writes
+  (plus a prune) per run.
+* **Same-host reconciliation at rehydration.** Once per backend start (after
+  the ledger warm, before the retry re-arm), an `open` record from *this
+  host* whose writing process is gone is closed (reason `reconciled-crash`)
+  and a synthetic ledger row appended. Three guards keep live runs safe: a
+  record written by this very process is skipped (a `state`-section reload
+  rebuilds the backend under live runs); live local instances outrank the
+  ledger; and a recorded pid that still exists is left alone with a warning
+  -- a daemon crash does not kill the job processes it spawned.
+* **Cross-host reconciliation on a slot takeover.** For a
+  [`concurrencyScope: cluster`](Clustering-and-Leader-Election) job, the node
+  that wins the job's slot lease fresh also closes a foreign holder's
+  orphaned `open` record (reason `reconciled-takeover`). The honest caveat:
+  an expired slot proves the previous holder made **no successful renewal**
+  for a full TTL -- it does *not* prove the process died (it may still be
+  running if it lost store access; that overlap is the slot's documented
+  at-least-once trade). The synthetic row's `fail_reason` therefore says
+  "daemon crash, or the node lost access to the state store mid-run", never
+  asserting a crash.
+* **The synthetic row is a non-verdict.** The reconciled run lands in the
+  ledger with outcome `unknown`:
+  [`onlyIfLastSucceeded`](#depends-on-past-onlyiflastsucceeded) ignores it,
+  the [trends](#sla-trends-over-the-ledger) success rate excludes it, and it
+  carries no `started_at`, so duration statistics are untouched. Its
+  `fail_reason` names the original start instant and host, and the
+  [Web Dashboard](Web-Dashboard) renders `unknown` neutrally (gray, never
+  success-green).
+* **The catch-up watermark is `onMissed`-aware.** Under the default
+  [`onMissed: skip`](#missed-run-catch-up) the row carries `finished_at` (the
+  interrupted run's *start* instant), so the durable watermark advances over
+  exactly the interrupted slot: it counts as attempted, and later missed
+  occurrences are unaffected. Under `run-once` / `run-all` the instant is
+  stored as `interruptedAt` *instead of* `finished_at`, leaving the watermark
+  untouched -- the interrupted occurrence is still owed to catch-up, because
+  crash recovery must not silently downgrade those jobs to at-most-once.
 
 ## Depends-on-past: `onlyIfLastSucceeded`
 
@@ -414,6 +490,62 @@ ladder died with the old process). With a store, when the
 during *this* OS boot, the pending retry is re-armed instead of superseded --
 the supervised process keeps getting restarted across yacron2's own restarts.
 
+**Cross-node retry resume.** On a shared store the ladder can also survive
+the *node*, not just the process. Resume is active only when all three hold:
+the store's resolved topology is `shared`, leader election is configured
+(`electLeader`), and the cluster manager is running. It applies to `Leader` /
+`PreferLeader` ladders that are not `@reboot`: `EveryNode` ladders stay
+strictly per-node (every node runs its own copy, so a foreign pending on the
+shared stream is another node's live ladder), and `@reboot` ladders are
+anchored to a host's boot, so an abandoned `@reboot` keep-alive still ends
+cluster-wide, exactly as above. While resume is active:
+
+* **An ownership move hands the ladder off.** When the cluster moves a job's
+  ownership off-node mid-ladder, the old owner writes a `handoff` record
+  (attempt, job digest, a now-due deadline, `fromHost`) instead of settling
+  the ladder dead, and writes *no* `cancelled` run-history record: the
+  attempt is moving, not dying. On a single-node store the legacy behaviour
+  is unchanged (settled `owner-moved`, plus the cancelled row).
+* **A crashed owner's `pending` simply stays newest.** The new owner's claim
+  scan (spawned from the housekeeping pass about once a minute) claims a
+  `handoff` immediately -- the owner positively relinquished -- but a
+  *foreign* `pending` only once it is stale 30 seconds past due. That grace
+  covers a live owner whose fire is slightly late; it deliberately cannot
+  cover an owner deferring on a closed cluster gate, whose re-check cadence
+  is its own ladder delay -- that is what the consume-time re-check below is
+  for.
+* **Claims are leased and re-checked.** A claim validates the record (digest
+  match, job enabled, retry budget, `startingDeadlineSeconds`, no
+  locally-known newer run), acquires the job's `retry-claim/<job>` lease
+  (TTL 30 seconds), **re-reads** the newest record under the lease (it must
+  be unchanged), and checks superseded-by-run against the **durable** ledger
+  -- the run that resolved the ladder most likely happened on another host,
+  which this node's in-memory history knows nothing about; a newer durable
+  run settles the record `superseded-by-run` instead of claiming it. Only
+  then does the claimer append its own `pending` (with its host and
+  `claimedFrom`), wait for that write to land before releasing the lease,
+  and re-arm the local ladder exactly like rehydration: absolute deadline,
+  only the remaining delay slept.
+* **The consume-time re-check is load-bearing.** While resume is active, a
+  due retry's launch decision serializes on the *same* claim lease and
+  re-checks that the newest ladder record still belongs to this host. A
+  foreign newest record (a claimer's `pending`, or its settled `launched`
+  after it already fired) aborts the local ladder silently -- no settle is
+  written, so the claimer's record stays newest. This, not the staleness
+  grace, is what protects a gate-deferred owner. Read or acquire failures
+  follow
+  [`onStoreUnavailable`](#when-the-store-is-unavailable-onstoreunavailable):
+  `degrade` proceeds unserialized, `fail-closed` defers.
+* **Honest contract: at-least-once, not exactly-once.** The lease, the
+  re-read and the re-check close every race a healthy store lets them close,
+  but a store outage at the wrong instant can still let a claimed attempt
+  and its original owner both fire -- the same trade as every other
+  cross-node guarantee on this page.
+* **Mixed-version fleets are safe.** Older builds treat the unknown
+  `handoff` record kind as not-pending and skip it: a partially upgraded
+  fleet may lose a handoff (the ladder is not resumed there), but it never
+  double-runs one.
+
 ## `@reboot` once per OS boot
 
 Without a store, `@reboot` means "once per daemon start" -- restart yacron2
@@ -509,6 +641,8 @@ gated on the store under either policy**:
 | Failed durable writes | dropped with a warning, counted in `yacron2_state_dropped_writes_total` | same (writes are never blocking) |
 | `onlyIfLastSucceeded` gate | decides from the in-memory history (fail open) | **blocks** the fire |
 | A due durable retry | proceeds on the in-memory ladder | **defers** and re-checks, like a closed cluster gate |
+| The cluster concurrency slot claim ([`concurrencyScope: cluster`](Clustering-and-Leader-Election)) | launches with **node-local** enforcement only for that run (a warning names the reason) | **skips** the launch, like a closed cluster gate |
+| Serializing a due retry with [cross-node claims](#restart-surviving-retries) | proceeds unserialized (at-least-once) | **defers** and re-checks |
 | `@reboot` boot marker unreadable/unwritable | runs the job (at-least-once) | **skips** the boot run |
 | Scheduled fires | never gated | never gated |
 
@@ -529,7 +663,8 @@ forever. The store cleans up after itself, conservatively, anchored on
   every 6 hours.
 * A **GC pass** (every 24 hours per process, plus on demand via
   [`yacron2 state gc`](#administering-the-store)) deletes the streams (runs,
-  logs, catch-up, retries, reboot markers) of jobs that **no recent manifest**
+  logs, catch-up, retries, reboot markers, in-flight records, slot cancel
+  records) of jobs that **no recent manifest**
   -- from *any* node, *any* job set, same `deploymentId` -- references, *and*
   whose newest record is older than `gcGraceSeconds` (default 7 days).
   Counter streams of hosts no recent manifest names are collected likewise.
@@ -558,13 +693,20 @@ their state to the collector.
 
 On a request-billed shared mount, an enthusiastic store (many jobs, tight
 schedules, archived output) has a literal price. `state.maxOpsPerSecond`
-puts a token bucket over **every** backend operation (burst = one second's
-tokens): operations past the rate queue rather than fail, the delay is
-invisible to scheduling (writes are already background tasks; bounded reads
-still honour their timeout), and the throttling is observable as
-`yacron2_state_throttled_ops_total` / `yacron2_state_throttle_wait_seconds_total`.
+puts a token bucket over **every backend operation except lease operations**
+(burst = one second's tokens): operations past the rate queue rather than
+fail, the delay is invisible to scheduling (writes are already background
+tasks; bounded reads still honour their timeout), and the throttling is
+observable as `yacron2_state_throttled_ops_total` /
+`yacron2_state_throttle_wait_seconds_total`.
 `0` (the default) disables the limiter -- the right choice for a local
 directory.
+
+Lease operations bypass the bucket deliberately: a lease renew queued behind
+a burst of bulk writes could overshoot its TTL, expiring a live holder's
+lease and double-running the very job the lease exists to fence. The
+coordination traffic is a handful of small operations per running slot-gated
+job, so exempting it costs little.
 
 ## Administering the store
 
@@ -602,11 +744,14 @@ families (see [Metrics with Prometheus](Metrics-with-Prometheus)):
 * `yacron2_state_throttled_ops_total` /
   `yacron2_state_throttle_wait_seconds_total` -- the
   [`maxOpsPerSecond`](#rate-limiting-maxopspersecond) limiter (emitted once
-  nonzero);
+  nonzero; lease operations never show up here, because they
+  [bypass the bucket](#rate-limiting-maxopspersecond) -- a queued renew
+  could overshoot its TTL and double-run the job the lease fences);
 * `yacron2_state_dropped_writes_total{kind}` -- durable writes that failed
   and were dropped (`kind`: `run-record`, `checkpoint`, `retry`,
-  `reboot-marker`, `counters`, `manifest`). **This is the one to alert on**:
-  a rising rate means the durable features are silently degrading.
+  `reboot-marker`, `inflight`, `counters`, `manifest`). **This is the one to
+  alert on**: a rising rate means the durable features are silently
+  degrading.
 
 A backend read error at scrape time omits the state families from that scrape
 (the job and daemon families still serve) rather than failing it with a 500.

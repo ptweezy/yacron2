@@ -333,7 +333,7 @@ async def test_handle_finished_job_skips_replaced(monkeypatch):
     monkeypatch.setattr(cron, "handle_job_success", fake_success)
 
     job = SimpleNamespace(
-        config=SimpleNamespace(name="test"),
+        config=SimpleNamespace(name="test", concurrencyScope="node"),
         replaced=True,
         cancelled=False,
         fail_reason="failsWhen=nonzeroReturn and retcode=-15",
@@ -369,7 +369,7 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     monkeypatch.setattr(cron, "handle_job_success", fake_success)
 
     job = SimpleNamespace(
-        config=SimpleNamespace(name="test"),
+        config=SimpleNamespace(name="test", concurrencyScope="node"),
         replaced=False,
         cancelled=False,
         start_failed=False,
@@ -1210,7 +1210,7 @@ async def test_handle_finished_job_records_cancelled(monkeypatch):
     monkeypatch.setattr(cron, "handle_job_success", fake_success)
 
     job = SimpleNamespace(
-        config=SimpleNamespace(name="test"),
+        config=SimpleNamespace(name="test", concurrencyScope="node"),
         replaced=False,
         cancelled=True,
         fail_reason=None,

@@ -75,15 +75,19 @@ can run from one config without double-running jobs. `cluster.backend` chooses
 how: the default **`gossip`** backend attests, over mutual TLS, that a static
 list of peers is running the same job set and runs a best-effort quorum
 election; the **`kubernetes`** and **`etcd`** backends use a coordination store
-(a `Lease` / a lease-bound key) for a fenced, exactly-once election. There must
-be exactly one `cluster` block across the whole configuration; a duplicate in an
-included file or a second config-directory file raises a `ConfigError`. Defaults
-come from `DEFAULT_CLUSTER` (plus `DEFAULT_K8S` / `DEFAULT_ETCD` for the lease
-backends) and are applied only when a `cluster` section is present.
+(a `Lease` / a lease-bound key) for a fenced, exactly-once election; the
+**`filesystem`** backend elects through a fenced TTL lease on a shared POSIX
+mount, with no coordination service at all (its safety additionally rests on
+synchronized clocks; see its table below). There must be exactly one `cluster`
+block across the whole configuration; a duplicate in an included file or a
+second config-directory file raises a `ConfigError`. Defaults come from
+`DEFAULT_CLUSTER` (plus `DEFAULT_K8S` / `DEFAULT_ETCD` / `DEFAULT_FILESYSTEM`
+for the lease backends) and are applied only when a `cluster` section is
+present.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `backend` | `Enum(["gossip", "kubernetes", "etcd"])` | `gossip` | Which leadership backend gates jobs. `gossip` (default) is the embedded mTLS best-effort election; `kubernetes`/`etcd` are fenced lease backends. The lease backends talk to their store over plain HTTP via the core `aiohttp` dependency, so they add no runtime dependency. |
+| `backend` | `Enum(["gossip", "kubernetes", "etcd", "filesystem"])` | `gossip` | Which leadership backend gates jobs. `gossip` (default) is the embedded mTLS best-effort election; `kubernetes`/`etcd`/`filesystem` are fenced lease backends. `kubernetes`/`etcd` talk to their store over plain HTTP via the core `aiohttp` dependency, and `filesystem` needs only a shared POSIX mount, so none of them adds a runtime dependency. |
 
 **Gossip backend** (`backend: gossip`). `listen`, `tls`, and `peers` are
 required **only for this backend**:
@@ -100,7 +104,7 @@ required **only for this backend**:
 | `driftAfter` | `Int` | `3` | Consecutive reachable-but-mismatched rounds before a peer is reported `drifted` (debounce). Must be `>= 1`. |
 | `connectTimeout` | `Int` | `10` | Seconds per request (also the HTTP timeout for the lease backends). Must be `> 0`. |
 | `electLeader` | `Bool` | `false` | When true, only the quorum-gated elected leader runs *scheduled* jobs (manual API triggers and retries are unaffected). Off by default, so a gossip `cluster` section is observe-only until opted in. The lease backends imply `electLeader: true` (configuring one is opting into leadership). |
-| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). With `backend: kubernetes`/`etcd` a non-default `distribution` is a **hard `ConfigError` at load** (a single lease holder cannot be a per-job owner), not a silent fallback. See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
+| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). With a lease backend (`kubernetes`/`etcd`/`filesystem`) a non-default `distribution` is a **hard `ConfigError` at load** (a single lease holder cannot be a per-job owner), not a silent fallback. See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
 
 Gossip load-time validation (in addition to the numeric ranges above): with
 `electLeader: true`, a **2-node** cluster (one peer) is rejected outright with a
@@ -143,11 +147,49 @@ traffic sent in cleartext, a `ConfigError`). Likewise a `username` or resolved
 bearer token are never POSTed in cleartext; a `username` without a resolvable
 `password` is also rejected.
 
+**Filesystem backend** (`backend: filesystem`), under `cluster.filesystem`. The
+flock-guarded, fence-counted TTL lease of the durable state store's filesystem
+backend is the fence, taken over a shared POSIX mount (Amazon EFS (NFSv4) / S3
+Files) -- no coordination service; the mount is the store. Defaults from
+`DEFAULT_FILESYSTEM`:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | `Str` | required | Directory the election lease lives in -- normally a shared mount. Must be present and non-empty: a missing, blank, or whitespace-only value is a `ConfigError` at load (`cluster.filesystem.path is required and must be non-empty`). Sharing the [`state`](#state) store's directory (same mount, same `deploymentId`) is legal and recommended when both are configured: the namespaces are disjoint, and one mount stays the whole coordination surface. |
+| `electionName` | `Str` | `cluster/leader` | Name of the lease the replicas contend for. Must be non-empty: a blank or whitespace-only value is a `ConfigError` at load (`cluster.filesystem.electionName must be non-empty`). |
+| `ttl` | `Int` or `Float` | `15` | Lease time-to-live, seconds. Must be `>= 3`, for the same reason as etcd's floor: the leader holds the lease only until `ttl` minus a clock-skew margin and renews every `max(1s, ttl/3)`, so a smaller `ttl` would make a node that wins the election immediately treat its own lease as expired (no `Leader` job would ever run). |
+| `deploymentId` | `Str` or null | null → namespace `default` | Stable namespace prefix inside the store, same semantics as `state.deploymentId`. Use the **same** value as `state.deploymentId` when sharing a mount with the state store. |
+| `topology` | `Enum(["auto", "single-node", "shared"])` | `auto` | Whether the mount's locks may be trusted across hosts; same semantics and probe as `state.topology`. `auto` probes `/proc/mounts` for a shared network mount; Windows and macOS cannot probe, so there `auto` resolves to `single-node` (the election then only excludes processes on this host, with a startup warning) unless overridden with an explicit `shared`. |
+
+The lease-backend family rules apply exactly as for `kubernetes`/`etcd`:
+`electLeader` is forced on (configuring the backend is opting into
+leadership), `distribution: spread` is a hard `ConfigError`, a store block
+belonging to a different backend (say an `etcd:` block under
+`backend: filesystem`) is a `ConfigError` rather than silently ignored, and
+gossip-only keys (`listen`, `tls`, `peers`, `interval`, `driftAfter`) draw an
+emit-once startup advisory.
+
+One filesystem-backend guard is deferred to startup, because it needs the
+live mount: `start()` probes lock fidelity (two descriptors of one file must
+actually contend on a non-blocking exclusive lock; on Linux an NFS mount
+carrying `nolock` or `local_lock=flock`/`local_lock=all` is additionally
+refused, since those honour locks host-locally) and **hard-refuses** a store
+whose locks are no-ops, verbatim
+`cluster.backend filesystem: refusing to elect over <path>: <reason>`. A
+refused start leaves the cluster manager unbuilt, so `Leader` jobs fail
+closed -- the safe direction. Both checks run on one host, so on platforms
+without `/proc/mounts` (Windows, macOS) the residual risk rests on the
+operator's `topology: shared` assertion. Unlike the `kubernetes`/`etcd`
+fences, election safety here also rests on wall clocks (two leaders need
+inter-host clock skew above roughly 2 seconds): run NTP on every node, the
+same requirement [Durable State](Durable-State) documents for shared mounts.
+
 Because the cluster schema has many load-time rejections (the ordering rules,
-the RFC1123 and https guards, the credential-over-plaintext refusals above),
-check a cluster config before deploying with `yacron2 --validate-config`, which
-runs the full load path and prints the first `ConfigError` without starting the
-scheduler. See [Command-Line Reference](CLI-Reference).
+the RFC1123 and https guards, the credential-over-plaintext refusals, and the
+lease-family rules above), check a cluster config before deploying with
+`yacron2 --validate-config`, which runs the full load path and prints the
+first `ConfigError` without starting the scheduler. See
+[Command-Line Reference](CLI-Reference).
 
 Full behavior, the trust model, quorum math, the lease backends' guarantees,
 and per-job `clusterPolicy` are documented in
@@ -178,7 +220,8 @@ separate, client-local feature, unrelated to this store.)
 | `maxRunsPerJob` | `Int` | `1000` | Durable finished-run retention per job (the durable analogue of the in-memory history ring); the ledger is pruned to this after each append. `<= 0` disables pruning (unbounded; rely on an external lifecycle rule). Durable retention is larger than the in-memory window on purpose. |
 | `onStoreUnavailable` | `Enum(["degrade", "fail-closed"])` | `degrade` | What the stateful features do while the store is configured but unavailable (down, unreadable, hung). `degrade`: durable-truth gates fail open to the in-memory state and failed writes are dropped with a warning (counted in `yacron2_state_dropped_writes_total`). `fail-closed`: prefer not running over possibly running wrong -- the `onlyIfLastSucceeded` gate blocks, a due durable retry defers until the store answers, and an unverifiable `@reboot` boot marker skips the boot run. Plain scheduled fires are **never** gated on the store under either policy. |
 | `gcGraceSeconds` | `Int` | `604800` (7 days) | Age past which durable state belonging to a job that no recent manifest references (no node's loaded config under this `deploymentId` has mentioned it for this long) is garbage collected. `<= 0` disables automatic GC. Values between `1` and `86399` are a `ConfigError` at load: a grace below the manifest cadence would make live peers' manifests look stale and collect their state. |
-| `maxOpsPerSecond` | `Int` or `Float` | `0` | Token-bucket cap on store operations per second (burst of one second's tokens), for request-rate/cost control on mounts that bill per request; throttled ops queue and are counted. `0` disables throttling. Must be `>= 0` (a negative value is a `ConfigError` at load). |
+| `maxOpsPerSecond` | `Int` or `Float` | `0` | Token-bucket cap on store operations per second (burst of one second's tokens), for request-rate/cost control on mounts that bill per request; throttled ops queue and are counted. `0` disables throttling. Must be `>= 0` (a negative value is a `ConfigError` at load). Lease (coordination) operations bypass the bucket: a lease renew queued behind bulk writes could overshoot its TTL and double-run the very job the lease exists to fence. |
+| `slotTtlSeconds` | `Int` or `Float` | `30` | TTL, in seconds, of the per-job concurrency slot lease taken for `concurrencyScope: cluster` jobs; the running holder renews it at a third of this, and a crashed holder's slot frees itself after at most this long. Must be `>= 5` (a `ConfigError` at load, `state.slotTtlSeconds must be >= 5`): the renew cadence needs headroom, and below ~5s one slow renew on a network mount expires a healthy holder's slot and invites the cross-node double-run the lease exists to fence. |
 
 `path` is the only required key. Full behavior -- the store layout and
 durability model, restart-surviving retries, missed-run catch-up, `@reboot`
@@ -241,6 +284,7 @@ See [Schedules and Timezones](Schedules-and-Timezones).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `concurrencyPolicy` | `Enum(["Allow", "Forbid", "Replace"])` | `Allow` | Behavior when a scheduled run overlaps a still-running instance. `Allow`: run concurrently. `Forbid`: skip the new run. `Replace`: cancel the running instance and start the new one. |
+| `concurrencyScope` | `Enum(["node", "cluster"])` | `node` | How far `concurrencyPolicy` reaches. `node` (default): an overlap is another instance in this yacron2 process, exactly as before. `cluster`: `Forbid`/`Replace` also exclude instances of the job on other nodes sharing the [`state`](#state) store, via a per-job TTL slot lease (`slots/<job name>`) in the state store -- it works with or without a `cluster` section. Requires a `state` section somewhere in the assembled config: without one, load fails with a `ConfigError` naming the offending job(s). `cluster` with `concurrencyPolicy: Allow` is likewise a `ConfigError` at load (Allow places no bound on concurrent instances, so widening its scope gates nothing). Enforcement is best-effort at-least-once, not exactly-once; `state.slotTtlSeconds` and `state.onStoreUnavailable` govern the edges. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation) **only when set to `cluster`** (existing configs keep their digests; replicas disagreeing on it show as drift). See [Concurrency and Timeouts](Concurrency-and-Timeouts#cluster-wide-concurrency-concurrencyscope). |
 | `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
 | `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). |
 | `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals, so both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). |
@@ -420,15 +464,17 @@ configured per job: the `GET /metrics` endpoint is global, tuned under
 ## Load-time numeric validation
 
 strictyaml enforces only the type (`Int`/`Float`). After type validation,
-`JobConfig._validate_numeric_ranges` enforces value ranges and raises a
-`ConfigError` (prefixed `Job <name>:`) on violation. These checks run at load
-time, not at run time. New in the yacron2 fork.
+`JobConfig._validate_numeric_ranges` enforces value ranges (plus one
+cross-field rule) and raises a `ConfigError` (prefixed `Job <name>:`) on
+violation. These checks run at load time, not at run time. New in the yacron2
+fork.
 
 | Rule | Condition |
 | --- | --- |
 | `saveLimit >= 0` | always |
 | `maxLineLength > 0` | always |
 | `killTimeout >= 0` | always |
+| `concurrencyPolicy` is `Forbid` or `Replace` | only when `concurrencyScope: cluster` (widening `Allow` gates nothing, so it is rejected rather than ignored) |
 | `executionTimeout > 0` | only when `executionTimeout` is set |
 | `catchupJitterSeconds >= 0` | always |
 | `startingDeadlineSeconds > 0` | only when `startingDeadlineSeconds` is set |

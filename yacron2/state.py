@@ -272,13 +272,16 @@ def _unescape_mount(field: str) -> str:
     return "".join(out)
 
 
-def _mount_fstype(path: str) -> Optional[str]:
-    """The filesystem type of the mount ``path`` lives on, or ``None``.
+def _mount_entry(path: str) -> Optional[Tuple[str, str]]:
+    """The ``(fstype, options)`` of the mount ``path`` lives on, or ``None``.
 
     Parses ``/proc/mounts`` and picks the longest mountpoint that is a prefix
     of the resolved path.  Linux-only (no portable ``statfs`` f_type in the
     stdlib); returns ``None`` where ``/proc`` is absent (macOS/Windows),
-    which the caller treats as "cannot tell -> single-node".
+    which the caller treats as "cannot tell -> single-node".  The options
+    column feeds the lock-fidelity check: an NFS mount carrying ``nolock``
+    (or ``local_lock=flock``/``all``) honours flock only host-locally, which
+    the fstype alone cannot reveal.
     """
     try:
         with open("/proc/mounts", encoding="utf-8") as fobj:
@@ -287,20 +290,57 @@ def _mount_fstype(path: str) -> Optional[str]:
         return None
     real = os.path.realpath(path)
     best_mount = ""
-    best_type: Optional[str] = None
+    best: Optional[Tuple[str, str]] = None
     for line in lines:
         parts = line.split(" ")
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
         mountpoint = _unescape_mount(parts[1])
         fstype = parts[2]
+        options = parts[3]
         prefix = mountpoint.rstrip("/") + "/"
         if real == mountpoint or real.startswith(prefix) or mountpoint == "/":
             # longest matching mountpoint wins (>= so "/" is a fallback only)
             if len(mountpoint) >= len(best_mount):
                 best_mount = mountpoint
-                best_type = fstype
-    return best_type
+                best = (fstype, options)
+    return best
+
+
+def _mount_fstype(path: str) -> Optional[str]:
+    """The filesystem type of the mount ``path`` lives on, or ``None``."""
+    entry = _mount_entry(path)
+    return entry[0] if entry is not None else None
+
+
+def _local_lock_reason(path: str) -> Optional[str]:
+    """A human reason the mount's locks are host-local, or ``None`` (fine).
+
+    Inspects the mount options of NFS-family mounts: ``nolock`` and
+    ``local_lock=flock``/``local_lock=all`` make the kernel satisfy flock
+    requests locally without ever consulting the server, so two hosts each
+    "hold" the same exclusive lock -- exactly the silent double-run a
+    coordination consumer must refuse.  Linux-only (like the topology
+    probe); an undecidable mount returns ``None``, leaving the functional
+    probe and the operator's ``topology`` assertion as the remaining
+    guards.
+    """
+    entry = _mount_entry(path)
+    if entry is None:
+        return None
+    fstype, options = entry
+    if not fstype.startswith("nfs"):
+        return None
+    opts = options.split(",")
+    if "nolock" in opts:
+        return "the NFS mount is mounted with 'nolock'"
+    for opt in opts:
+        if opt.startswith("local_lock=") and opt.split("=", 1)[1] in (
+            "flock",
+            "all",
+        ):
+            return "the NFS mount is mounted with '{}'".format(opt)
+    return None
 
 
 def detect_topology(path: str) -> Optional[str]:
@@ -517,6 +557,12 @@ class StateBackend(abc.ABC):
         """Whether a lease here excludes across hosts (HA-capable)."""
         return self.topology == "shared"
 
+    async def verify_locking(self) -> Optional[str]:
+        """Why the store's locks must not be trusted for coordination, or
+        ``None`` (they behave, or the backend has no way to tell).  See the
+        filesystem backend for the real probe."""
+        return None
+
     def stats(self) -> Dict[str, Any]:
         """Self-observability counters (op counts/errors/latency, lock
         contention, throttling); ``{}`` for a backend with none."""
@@ -635,9 +681,15 @@ class FilesystemStateBackend(StateBackend):
         accumulated per label and surfaced via :meth:`stats`.
         """
         loop = asyncio.get_running_loop()
-        if self._rate_limit is not None:
+        if self._rate_limit is not None and not op.startswith("lease-"):
             # take the rate token BEFORE a worker slot, so a throttled op
             # queues as a cheap pending coroutine, not a held thread slot.
+            # Lease operations BYPASS the bucket: they are tiny, and a
+            # coordination renew queued behind a burst of bulk record writes
+            # could overshoot its TTL -- expiring a live holder's lease and
+            # double-running the very job the lease exists to fence.  The
+            # billing cost this exempts is a few small requests per renew
+            # period, not the bulk traffic the bucket is for.
             waited = await self._rate_limit.throttle()
             if waited > 0.0:
                 with self._stats_lock:
@@ -1278,6 +1330,76 @@ class FilesystemStateBackend(StateBackend):
             # a released lease: observers see "nobody holds it".
             return None
         return lease
+
+    # --- lock-fidelity probe -------------------------------------------------
+
+    async def verify_locking(self) -> Optional[str]:
+        """Probe whether the store's advisory locks actually exclude.
+
+        Returns ``None`` when the locks behave, else a human-readable reason
+        they must not be trusted for coordination.  Two checks:
+
+        * a **functional** probe: lock a scratch file through one file
+          descriptor, then attempt a non-blocking exclusive lock through a
+          second descriptor of the same file.  On every real lock
+          implementation the second attempt fails with contention (POSIX
+          ``flock`` is per-open-file-description, Windows byte-range locks
+          are per-handle); a mount whose locks are silent no-ops (some FUSE
+          filesystems) grants it -- positive proof the TTL lease's mutual
+          exclusion is fiction;
+        * a **mount-option** sniff (Linux): an NFS mount carrying ``nolock``
+          or ``local_lock=flock``/``all`` satisfies flock host-locally, so
+          the functional probe passes on every node while no lock ever
+          reaches the server -- the silent cross-host double-run.
+
+        Honest limits: both checks run on one host, so a mount whose locks
+        are real locally but not propagated across hosts (the ``local_lock``
+        case on a platform without ``/proc/mounts`` -- Windows, macOS) is
+        undetectable here; that residual rests on the operator's
+        ``topology`` assertion and is documented.  A probe that cannot run
+        (I/O error) is inconclusive and reports ``None`` rather than
+        refusing a healthy store on a blip.
+        """
+        return await self._call("lock-probe", self._verify_locking_sync)
+
+    def _verify_locking_sync(self) -> Optional[str]:
+        reason = _local_lock_reason(self.root)
+        if reason is not None:
+            return (
+                "{}, so file locks are host-local and cannot fence "
+                "other nodes".format(reason)
+            )
+        probe = os.path.join(
+            self.base, TMP_DIR, "lock-probe-{}".format(self._instance)
+        )
+        fd1 = fd2 = -1
+        try:
+            fd1 = os.open(probe, os.O_RDWR | os.O_CREAT, 0o600)
+            # msvcrt.locking needs a byte present to lock; guarantee one.
+            if os.fstat(fd1).st_size == 0:
+                os.write(fd1, b"\0")
+            fd2 = os.open(probe, os.O_RDWR)
+            with exclusive_file_lock(fd1, blocking=False):
+                try:
+                    with exclusive_file_lock(fd2, blocking=False):
+                        return (
+                            "the mount at {} grants two exclusive locks on "
+                            "one file (its locks are no-ops)".format(self.root)
+                        )
+                except OSError:
+                    # contention: the second descriptor was refused while
+                    # the first held the lock -- locks genuinely exclude.
+                    return None
+        except OSError as ex:
+            logger.debug("state: lock-fidelity probe inconclusive: %s", ex)
+            return None
+        finally:
+            for fdesc in (fd1, fd2):
+                if fdesc != -1:
+                    with contextlib.suppress(OSError):
+                        os.close(fdesc)
+            with contextlib.suppress(OSError):
+                os.unlink(probe)
 
     # --- maintenance -------------------------------------------------------
 

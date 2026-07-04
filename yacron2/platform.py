@@ -207,10 +207,63 @@ def os_boot_time() -> Optional[float]:
     return time.time() - uptime
 
 
+# --- Process liveness -------------------------------------------------------
+def pid_alive(pid: int) -> Optional[bool]:
+    """Whether a process with ``pid`` currently exists, or ``None``.
+
+    Used by in-flight run reconciliation (:mod:`yacron2.cron`) as a
+    same-host safety check before declaring a previous daemon's run dead: a
+    daemon crash does NOT kill the job processes it spawned, so an ``open``
+    in-flight record whose recorded pid is still running must be left alone.
+    PID reuse can make this report ``True`` for an unrelated process; that
+    errs toward *not* reconciling, the safe direction.  ``None`` means the
+    platform could not answer (treated by callers the same as dead, since
+    the per-process token in the record already proved a different daemon
+    wrote it).
+    """
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":  # pragma: no cover - Windows-only path
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if handle:
+                # the pid may name a zombie whose handles are still open;
+                # check the exit code: STILL_ACTIVE (259) means running.
+                STILL_ACTIVE = 259
+                code = ctypes.c_ulong()
+                alive = None  # type: Optional[bool]
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    alive = code.value == STILL_ACTIVE
+                kernel32.CloseHandle(handle)
+                return alive
+            return False
+        except Exception:  # noqa: BLE001 - any ctypes failure -> cannot tell
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # exists, owned by someone else (should not happen for our own
+        # spawned jobs, but existence is what was asked).
+        return True
+    except OSError:
+        return None
+    return True
+
+
 # --- Advisory exclusive file locking -------------------------------------
 @contextlib.contextmanager
-def exclusive_file_lock(fileno: int) -> Iterator[None]:
-    """Hold a blocking, advisory, exclusive lock on ``fileno`` for the block.
+def exclusive_file_lock(
+    fileno: int, *, blocking: bool = True
+) -> Iterator[None]:
+    """Hold an advisory, exclusive lock on ``fileno`` for the block.
 
     Used by :class:`yacron2.state.FilesystemStateBackend` to serialise the
     read-modify-write of a lease file.  The reach of the lock is a property of
@@ -227,10 +280,18 @@ def exclusive_file_lock(fileno: int) -> Iterator[None]:
     I/O by non-cooperating processes, which is fine because yacron2 owns both
     sides).  On Windows it is ``msvcrt.locking`` over the first byte; Windows
     has no cross-host story, so it only ever serialises same-host processes
-    (single-node), which is all the Windows target needs.  Blocking: a stuck
-    holder would wait here, so callers run the whole locked section in a worker
-    thread (``asyncio.to_thread``) to keep it off the event loop, and the
-    section itself only rewrites a tiny file, so contention is brief.
+    (single-node), which is all the Windows target needs.  Blocking (the
+    default): a stuck holder would wait here, so callers run the whole locked
+    section in a worker thread (``asyncio.to_thread``) to keep it off the
+    event loop, and the section itself only rewrites a tiny file, so
+    contention is brief.
+
+    With ``blocking=False`` a contended lock raises ``OSError`` immediately
+    instead of waiting (``EWOULDBLOCK``/``EAGAIN`` on POSIX, ``EACCES`` on
+    Windows).  Used by the lock-fidelity probe
+    (:meth:`yacron2.state.FilesystemStateBackend.verify_locking`), whose whole
+    point is observing that a second lock attempt on an already-locked file
+    *fails*: a mount whose locks are silent no-ops would grant it.
     """
     if sys.platform == "win32":  # pragma: no cover - Windows-only path
         # msvcrt.locking locks ``nbytes`` from the current file position; lock
@@ -252,6 +313,8 @@ def exclusive_file_lock(fileno: int) -> Iterator[None]:
                 # say -- must surface, not become an infinite spin.
                 if ex.errno not in (errno.EACCES, errno.EDEADLOCK):
                     raise
+                if not blocking:
+                    raise
                 time.sleep(0.05)
         try:
             yield
@@ -259,7 +322,8 @@ def exclusive_file_lock(fileno: int) -> Iterator[None]:
             os.lseek(fileno, 0, os.SEEK_SET)
             msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
     else:
-        fcntl.flock(fileno, fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(fileno, flags)
         try:
             yield
         finally:

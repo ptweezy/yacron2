@@ -59,7 +59,7 @@ from yacron2.prometheus import (
     resolve_metrics_config,
 )
 from yacron2.redact import redact_lines
-from yacron2.state import StateBackend, make_state_backend
+from yacron2.state import Lease, StateBackend, make_state_backend
 
 logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
@@ -181,6 +181,30 @@ COUNTER_STREAM_KEEP = 4
 # the per-run persist task, so without a floor a per-second job would double
 # every durable write for a low-value gain; the tail is flushed at shutdown.
 COUNTER_SNAPSHOT_INTERVAL = 15.0
+# Prefix for a job's in-flight run stream (newest-wins, like retries/): an
+# "open" record lands when a job's FIRST live instance starts and a "closed"
+# record when its LAST one finishes, so a crash leaves "open" on top and the
+# next rehydration (same host) or slot takeover (another node) can make the
+# interrupted run visible instead of it silently vanishing from the ledger.
+# Written only when a state backend is configured.
+INFLIGHT_STREAM_PREFIX = "inflight/"
+INFLIGHT_STREAM_KEEP = 8
+# Prefix for a job's concurrency-slot signalling stream (cancel requests for
+# cluster-scoped Replace); the slot LEASE shares the same "slots/<name>"
+# name in the lease namespace. See maybe_launch_job/_claim_cluster_slot.
+SLOT_STREAM_PREFIX = "slots/"
+SLOT_STREAM_KEEP = 8
+# Lease-name prefix serializing cross-node retry claims (and the claiming
+# side of the consume path) for one job; TTL bounds a crashed claimer.
+RETRY_CLAIM_PREFIX = "retry-claim/"
+RETRY_CLAIM_TTL = 30.0
+# How stale (seconds past due) a foreign host's pending retry must be before
+# the claim scan may take it over. This only covers a live owner whose fire
+# is slightly late (slow loop, small clock skew); it CANNOT cover an owner
+# deferring on a closed cluster gate, whose re-check cadence is its own
+# ladder delay -- the consume-time newest-record re-check under the claim
+# lease is what prevents a double-fire there, and is load-bearing.
+RETRY_CLAIM_GRACE = 30.0
 # Aggregation windows served by GET /jobs/{name}/trends over the durable
 # ledger (label, seconds). Bounded by state.maxRunsPerJob retention.
 TREND_WINDOWS: Tuple[Tuple[str, float], ...] = (
@@ -327,6 +351,12 @@ def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
     # mixing naive and aware datetimes would raise TypeError from the
     # `duration` property on every dashboard request.
     finished = _parse_iso_utc(rec.get("finished_at"))
+    if finished is None:
+        # a crash-reconciled record deliberately omits finished_at so the
+        # catch-up watermark stays put (the interrupted slot is still owed
+        # under onMissed run-once/run-all); its interruption instant
+        # stands in for display ordering only.
+        finished = _parse_iso_utc(rec.get("interruptedAt"))
     if finished is None:
         return None
     started = _parse_iso_utc(rec.get("started_at"))
@@ -675,6 +705,41 @@ class Cron:
         # the cluster had not yet elected an owner; run once on convergence.
         # name -> JobConfig; see _process_pending_reboots.
         self._pending_reboot_jobs = {}  # type: Dict[str, JobConfig]
+        # A per-PROCESS token stamped into in-flight run records (with the
+        # host and pid), so reconciliation can tell "a previous daemon on
+        # this host wrote this" from "this very process wrote it" -- the
+        # state backend's own instance id will not do, because a state-
+        # section reload rebuilds the backend (new id) while runs from this
+        # process are still live.
+        self._proc_token = os.urandom(6).hex()
+        # cluster-wide concurrency slots (concurrencyScope: cluster): the
+        # TTL lease each slot-gated job holds while it runs here, the renew
+        # task keeping it alive, a per-job asyncio.Lock serializing
+        # claim/release (an unserialized release racing the next claim
+        # could revoke the fresh claim's lease -- same-holder re-acquire
+        # keeps the fence, so a stale release still matches), and the
+        # single-flight Replace pursuit tasks waiting out a foreign holder.
+        self._slot_leases: Dict[str, Lease] = {}
+        self._slot_renewers: Dict[str, asyncio.Task] = {}
+        self._slot_locks: Dict[str, asyncio.Lock] = {}
+        self._slot_pursuits: Dict[str, asyncio.Task] = {}
+        # count of live users of each job's slot: every successful claim
+        # (one per launched instance) increments, every finished instance
+        # of a cluster-scoped job decrements; the lease is released only at
+        # zero. A plain running_jobs emptiness check would race the window
+        # between a claim succeeding and its RunningJob being registered
+        # (the subprocess spawn awaits in between).
+        self._slot_refs: Dict[str, int] = {}
+        # effective state.slotTtlSeconds while a state section is configured
+        self._slot_ttl = 30.0
+        # lock-fidelity latch for the slot gate: None until probed, then
+        # either "" (locks behave) or the human reason they cannot be
+        # trusted (treated per onStoreUnavailable at each claim). Reset
+        # whenever the backend is rebuilt.
+        self._slot_fidelity: Optional[str] = None
+        # the in-flight cross-node retry claim scan, if any (single-flight,
+        # spawned from the housekeeping pass; see _retry_claim_scan).
+        self._retry_claim_task: Optional[asyncio.Task] = None
 
     async def run(self) -> None:
         self._wait_for_running_jobs_task = asyncio.create_task(
@@ -806,6 +871,10 @@ class Cron:
                 for name in self.retry_state
             ]
             await asyncio.gather(*cancel_all)
+        # Stop the launch-adjacent background work before the drain: a
+        # Replace pursuit could otherwise LAUNCH a job mid-shutdown, and
+        # the retry claim scan could arm a ladder nobody will run.
+        self._cancel_coordination_tasks()
         # Release leadership BEFORE waiting out the running-job drain: the
         # drain is unbounded (it waits for every running job, no deadline),
         # and keeping the gossip listener / lease renew loop alive through it
@@ -822,6 +891,11 @@ class Cron:
             await self.cluster_manager.stop()
             self.cluster_manager = None
         await self._wait_for_running_jobs_task
+        # the drain released every slot (each finish cancels its renewer);
+        # belt-and-braces for renewers whose release write raced teardown.
+        for task in list(self._slot_renewers.values()):
+            task.cancel()
+        self._slot_renewers.clear()
 
         # cancel any pending catch-up backfills (they also self-abort on the
         # stop event, set above, but cancelling is prompt and tidy at exit).
@@ -849,6 +923,15 @@ class Cron:
         if self.web_runner is not None:
             logger.info("Stopping http server")
             await self.web_runner.cleanup()
+
+    def _cancel_coordination_tasks(self) -> None:
+        """Cancel the Replace pursuits and the retry claim scan, if any."""
+        for task in list(self._slot_pursuits.values()):
+            task.cancel()
+        self._slot_pursuits.clear()
+        if self._retry_claim_task is not None:
+            self._retry_claim_task.cancel()
+            self._retry_claim_task = None
 
     def signal_shutdown(self) -> None:
         logger.debug("Signalling shutdown")
@@ -1803,9 +1886,11 @@ class Cron:
             self._state_gc_grace = float(
                 state_config.get("gcGraceSeconds") or 0
             )
+            self._slot_ttl = float(state_config.get("slotTtlSeconds") or 30)
         else:
             self._state_on_unavailable = "degrade"
             self._state_gc_grace = 0.0
+            self._slot_ttl = 30.0
         backend = self.state_backend
         if backend is not None and (
             state_config is None or state_config != backend.config
@@ -1818,6 +1903,22 @@ class Cron:
             # that have none in memory yet, instead of serving the old
             # store's history forever.
             self._state_rehydrated = False
+            # the concurrency slots live in the OLD store: drop the held
+            # leases (they lapse there by TTL) and stop their renewers and
+            # any Replace pursuits -- re-claiming in the new store is the
+            # next launch's business. The lock-fidelity verdict is also
+            # per-store.
+            for task in list(self._slot_renewers.values()):
+                task.cancel()
+            self._slot_renewers.clear()
+            self._slot_leases.clear()
+            for task in list(self._slot_pursuits.values()):
+                task.cancel()
+            self._slot_pursuits.clear()
+            self._slot_fidelity = None
+            if self._retry_claim_task is not None:
+                self._retry_claim_task.cancel()
+                self._retry_claim_task = None
         if state_config is not None and self.state_backend is None:
             try:
                 # Construct INSIDE the try: building the backend resolves and
@@ -1892,6 +1993,14 @@ class Cron:
             self._gc_next = now + STATE_GC_INTERVAL
             self._gc_task = self._track_state_write(
                 self._collect_state_garbage()
+            )
+        if self._retry_resume_active() and (
+            self._retry_claim_task is None or self._retry_claim_task.done()
+        ):
+            # cross-node retry resume: scan for claimable foreign ladders
+            # about once a minute (the housekeeping cadence).
+            self._retry_claim_task = self._track_state_write(
+                self._retry_claim_scan()
             )
 
     async def _persist_manifest(self) -> None:
@@ -1990,6 +2099,8 @@ class Cron:
             RETRY_STREAM_PREFIX: names,
             REBOOT_STREAM_PREFIX: names,
             COUNTER_STREAM_PREFIX: hosts,
+            INFLIGHT_STREAM_PREFIX: names,
+            SLOT_STREAM_PREFIX: names,
         }
         try:
             # bounded: a worker thread wedged in a dead-mount syscall must
@@ -3614,15 +3725,736 @@ class Cron:
                     await running_job.cancel()
             else:
                 raise AssertionError  # pragma: no cover
+        if job.concurrencyScope == "cluster":
+            # the cluster-wide half of Forbid/Replace: a TTL slot lease on
+            # the shared state store excludes instances on OTHER nodes.
+            # Bounded (each store op capped at STATE_OP_TIMEOUT); a foreign
+            # Replace holder is pursued by a background task, never waited
+            # out here on the scheduler path.
+            if not await self._claim_cluster_slot(job):
+                return False
         logger.info("Starting job %s", job.name)
         running_job = RunningJob(
             job, self.retry_state.get(job.name) if with_retries else None
         )
-        await running_job.start()
+        try:
+            await running_job.start()
+        except BaseException:
+            # start() handles the expected spawn failures itself (the
+            # instance still registers, start_failed, and the reaper pairs
+            # the finish); anything escaping here never registers, so the
+            # slot claim above must be handed back or its refcount -- and
+            # the lease's renew task -- would outlive the launch forever.
+            if job.concurrencyScope == "cluster":
+                await self._release_cluster_slot(job)
+            raise
+        first_instance = not self.running_jobs.get(job.name)
         self.running_jobs[job.name].append(running_job)
+        if self.state_backend is not None and first_instance:
+            # record the run as in-flight (0 -> 1 instances) so a crash
+            # leaves an "open" record for reconciliation; closed again when
+            # the LAST instance finishes (see _handle_finished_job).
+            self._track_state_write(
+                self._persist_inflight_open(job, running_job)
+            )
         logger.info("Job %s spawned", job.name)
         self._jobs_running.set()
         return True
+
+    # --- cluster-wide concurrency slots (concurrencyScope: cluster) -------
+
+    def _slot_holder(self) -> str:
+        """The slot lease holder string: host plus a per-process token.
+
+        Process-unique so a restarted daemon (or a second daemon on this
+        host) can never adopt the other's slot; the host prefix is display
+        only and never compared for gating.
+        """
+        return "{}#{}".format(self._state_host, self._proc_token)
+
+    @staticmethod
+    def _slot_name(name: str) -> str:
+        """Both the slot LEASE name and the cancel-record stream name."""
+        return SLOT_STREAM_PREFIX + name
+
+    def _slot_mutex(self, name: str) -> asyncio.Lock:
+        return self._slot_locks.setdefault(name, asyncio.Lock())
+
+    async def _slot_fidelity_reason(self) -> Optional[str]:
+        """The reason the store's locks cannot fence, or ``None`` (they can).
+
+        Probed once per backend generation (see
+        :meth:`yacron2.state.FilesystemStateBackend.verify_locking`) and
+        latched; a probe that cannot run right now latches nothing and is
+        retried on the next claim.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return None
+        if self._slot_fidelity is None:
+            try:
+                reason = await asyncio.wait_for(
+                    backend.verify_locking(), timeout=STATE_OP_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - inconclusive; retry later
+                return None
+            self._slot_fidelity = reason or ""
+            if reason:
+                logger.error(
+                    "state: the store's file locks cannot be trusted for "
+                    "cluster-wide concurrency (%s); concurrencyScope: "
+                    "cluster claims degrade per onStoreUnavailable",
+                    reason,
+                )
+        return self._slot_fidelity or None
+
+    async def _claim_cluster_slot(self, job: JobConfig) -> bool:
+        """Claim the cluster-wide concurrency slot for one launch of ``job``.
+
+        ``True`` means launch (holding the slot lease, or having degraded
+        to node-local enforcement per ``onStoreUnavailable``); ``False``
+        means this launch is skipped (Forbid: a foreign holder; Replace:
+        a background pursuit will re-attempt once the holder yields;
+        fail-closed: the store did not answer).
+
+        The whole claim runs under a per-job asyncio lock, serializing it
+        against the release on the finish path: without it, a release
+        landing between a fresh claim and its instance registration could
+        revoke the new claim's lease (same-holder re-acquire keeps the
+        fence, so the stale release still matches it).
+
+        Honesty contract: at-least-once, not exactly-once.  A holder that
+        loses its lease to a store outage keeps running (never kill work
+        on a store blip), so a Forbid peer that then wins the slot overlaps
+        it; ``degrade`` explicitly trades the cluster gate for availability
+        when the store cannot answer.
+        """
+        backend = self.state_backend
+        if not self._state_configured:
+            # unreachable via the parse-time cross-check; test configs that
+            # bypass it just fall back to node-local enforcement.
+            return True
+        fail_closed = self._state_on_unavailable == "fail-closed"
+        name = job.name
+
+        def _unavailable(why: str) -> bool:
+            if fail_closed:
+                logger.warning(
+                    "Job %s skipped: cannot claim its cluster concurrency "
+                    "slot (%s) and onStoreUnavailable is fail-closed",
+                    name,
+                    why,
+                )
+                return False
+            logger.warning(
+                "Job %s: cannot claim its cluster concurrency slot (%s); "
+                "enforcing concurrencyPolicy on this node only for this "
+                "run (onStoreUnavailable: degrade)",
+                name,
+                why,
+            )
+            self._slot_refs[name] = self._slot_refs.get(name, 0) + 1
+            return True
+
+        if backend is None:
+            return _unavailable("the state store is unavailable")
+        fidelity = await self._slot_fidelity_reason()
+        if fidelity is not None:
+            return _unavailable(fidelity)
+        async with self._slot_mutex(name):
+            held = self._slot_leases.get(name)
+            renewer = self._slot_renewers.get(name)
+            if held is not None and renewer is not None and not renewer.done():
+                # already holding (a Replace re-launch, or Allow-scoped
+                # overlap after a reload): adopt the live lease.
+                self._slot_refs[name] = self._slot_refs.get(name, 0) + 1
+                return True
+            lease_name = self._slot_name(name)
+            got: Optional[Lease] = None
+            try:
+                got = await asyncio.wait_for(
+                    backend.acquire_lease(
+                        lease_name, self._slot_holder(), self._slot_ttl
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                got = None
+            if got is None:
+                # denied, sick, or timed out -- a bounded read tells a live
+                # foreign holder apart from a store that cannot answer (the
+                # lease API fails closed, so None alone proves nothing).
+                observed: Optional[Lease] = None
+                answered = False
+                try:
+                    observed = await asyncio.wait_for(
+                        backend.read_lease(lease_name),
+                        timeout=STATE_OP_TIMEOUT,
+                    )
+                    answered = observed is not None
+                except asyncio.TimeoutError:
+                    pass
+                if observed is not None:
+                    if observed.holder == self._slot_holder():
+                        # our own acquire landed after its timeout was
+                        # abandoned (the documented UNKNOWN case): adopt it.
+                        got = observed
+                    elif (
+                        get_now(datetime.timezone.utc).timestamp()
+                        > observed.expires_at
+                    ):
+                        # expired but unreclaimed: treat as unanswered and
+                        # let the policy decide (the next attempt acquires).
+                        answered = False
+                        observed = None
+                    elif job.concurrencyPolicy == "Forbid":
+                        logger.warning(
+                            "Job %s skipped: its cluster concurrency slot "
+                            "is held by %s (concurrencyPolicy: Forbid, "
+                            "concurrencyScope: cluster)",
+                            name,
+                            observed.holder.rsplit("#", 1)[0],
+                        )
+                        return False
+                    else:  # Replace
+                        self._spawn_slot_pursuit(job, observed)
+                        return False
+                if got is None and not answered:
+                    return _unavailable("the store did not answer")
+            if got is None:  # pragma: no cover - defensive; handled above
+                return _unavailable("the store did not answer")
+            self._slot_leases[name] = got
+            self._slot_refs[name] = self._slot_refs.get(name, 0) + 1
+            if renewer is not None and not renewer.done():
+                renewer.cancel()
+            self._slot_renewers[name] = asyncio.create_task(
+                self._slot_renewer(name)
+            )
+            # a fresh slot win is the one moment a foreign orphaned run is
+            # provably unrenewed: reconcile its in-flight record (does not
+            # prove the process died -- see _reconcile_open_record).
+            await self._reconcile_takeover_inflight(job)
+            return True
+
+    def _spawn_slot_pursuit(self, job: JobConfig, observed: Lease) -> None:
+        """Start (or keep) the background Replace pursuit for ``job``.
+
+        The pursuit -- asking the foreign holder to yield, waiting it out,
+        then re-attempting the launch -- takes up to ~2 slot TTLs, so it
+        must never run inline on the scheduler pass (one held slot would
+        stall every other due job); single-flight per job.
+        """
+        name = job.name
+        existing = self._slot_pursuits.get(name)
+        if existing is not None and not existing.done():
+            return
+        logger.info(
+            "Job %s: cluster Replace: asking the current slot holder (%s) "
+            "to yield; the launch is re-attempted when the slot frees",
+            name,
+            observed.holder.rsplit("#", 1)[0],
+        )
+        task = asyncio.create_task(self._pursue_replace_slot(job, observed))
+        self._slot_pursuits[name] = task
+
+        def _clear(done: asyncio.Task) -> None:
+            if self._slot_pursuits.get(name) is done:
+                del self._slot_pursuits[name]
+
+        task.add_done_callback(_clear)
+
+    async def _pursue_replace_slot(
+        self, job: JobConfig, observed: Lease
+    ) -> None:
+        """Ask a foreign slot holder to yield, wait, then re-attempt.
+
+        The cancel request is an immutable record aimed at the holder's
+        exact FENCE, so a request left over from a previous incarnation is
+        inert (a takeover always bumps the fence).  The holder's renew task
+        observes it within one renew period and cancels its instances
+        (marked replaced); when the slot frees -- release or TTL expiry --
+        the launch goes back through every normal gate.  Bounded: a holder
+        that never yields (still running, or its node is gone but the
+        record write failed) forfeits this launch with a warning -- no-run
+        over double-run.
+        """
+        backend = self.state_backend
+        name = job.name
+        if backend is None:
+            return
+        cancel = {
+            "kind": "cancel",
+            "fence": observed.fence,
+            "by": self._state_host,
+            "at": get_now(datetime.timezone.utc).isoformat(),
+        }
+        stream = self._slot_name(name)
+        try:
+            await asyncio.wait_for(
+                backend.append_record(stream, cancel),
+                timeout=STATE_OP_TIMEOUT,
+            )
+            await asyncio.wait_for(
+                backend.prune_records(stream, keep=SLOT_STREAM_KEEP),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - give up, log, no launch
+            logger.warning(
+                "Job %s: could not record the cluster Replace cancel "
+                "request: %s",
+                name,
+                ex,
+            )
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2 * self._slot_ttl
+        poll = max(1.0, self._slot_ttl / 6)
+        while True:
+            if self._stop_event.is_set():
+                return
+            await asyncio.sleep(poll)
+            current: Optional[Lease] = observed
+            try:
+                current = await asyncio.wait_for(
+                    backend.read_lease(self._slot_name(name)),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep waiting
+                pass
+            now = get_now(datetime.timezone.utc).timestamp()
+            if (
+                current is None
+                or now > current.expires_at
+                or current.holder == self._slot_holder()
+            ):
+                break
+            if loop.time() >= deadline:
+                logger.warning(
+                    "Job %s: the foreign holder (%s) did not yield its "
+                    "cluster concurrency slot within %.0fs; skipping this "
+                    "launch (no-run over double-run)",
+                    name,
+                    current.holder.rsplit("#", 1)[0],
+                    2 * self._slot_ttl,
+                )
+                return
+        if await self.maybe_launch_job(job):
+            logger.info(
+                "Job %s: launched after the previous cluster slot holder "
+                "yielded (concurrencyPolicy: Replace)",
+                name,
+            )
+
+    async def _slot_renewer(self, name: str) -> None:
+        """Keep a held slot lease alive while the job runs here.
+
+        Renews at a third of the TTL, and doubles as the Replace listener:
+        each cycle reads the newest cancel record and, when one targets our
+        exact fence, cancels the local instances (marked replaced -- not a
+        failure) so the requesting node can take the slot.  A renew that is
+        positively refused because another node took the lease over logs
+        and stops renewing but NEVER cancels the running work (a store blip
+        must not kill a healthy job); an ambiguous refusal keeps retrying
+        -- the store deliberately allows a same-fence renew slightly past
+        expiry, so a single unreadable blip self-heals.
+        """
+        period = max(1.0, self._slot_ttl / 3)
+        while True:
+            await asyncio.sleep(period)
+            backend = self.state_backend
+            lease = self._slot_leases.get(name)
+            if backend is None or lease is None:
+                return
+            try:
+                recs = await asyncio.wait_for(
+                    backend.list_records(
+                        self._slot_name(name), limit=1, newest_first=True
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the listener is best-effort
+                recs = []
+            rec = recs[0] if recs else None
+            if (
+                rec is not None
+                and rec.get("kind") == "cancel"
+                and rec.get("fence") == lease.fence
+                and self.running_jobs.get(name)
+            ):
+                logger.info(
+                    "Job %s: node %s requested this instance be replaced "
+                    "(concurrencyPolicy: Replace, concurrencyScope: "
+                    "cluster); cancelling",
+                    name,
+                    rec.get("by"),
+                )
+                for running_job in list(self.running_jobs.get(name) or []):
+                    running_job.replaced = True
+                    await running_job.cancel()
+                # the finish path releases the slot; keep renewing till then
+            try:
+                renewed = await asyncio.wait_for(
+                    backend.renew_lease(lease, self._slot_ttl),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                continue  # unknown; retry next period
+            except asyncio.CancelledError:
+                raise
+            if renewed is not None:
+                self._slot_leases[name] = renewed
+                continue
+            observed: Optional[Lease] = None
+            try:
+                observed = await asyncio.wait_for(
+                    backend.read_lease(self._slot_name(name)),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - ambiguous; retry
+                continue
+            if observed is not None and (
+                observed.holder != lease.holder
+                or observed.fence != lease.fence
+            ):
+                logger.warning(
+                    "Job %s: its cluster concurrency slot was taken over "
+                    "by %s while it is still running here (a store outage "
+                    "outlasted the slot TTL?); the run continues -- the "
+                    "overlap is the documented at-least-once trade",
+                    name,
+                    observed.holder.rsplit("#", 1)[0],
+                )
+                self._slot_leases.pop(name, None)
+                return
+            # our lease on disk (blip) or unreadable: keep trying.
+
+    async def _release_cluster_slot(self, job: JobConfig) -> None:
+        """Hand back the slot when a cluster-scoped job's last user is done.
+
+        Refcounted (see ``_slot_refs``): every claim increments, every
+        finished instance decrements, and the lease is released only at
+        zero AND with no registered instances -- so a Replace overlap or a
+        claim whose instance is still being spawned cannot lose its lease
+        to a stale release.  The release itself is fire-and-forget; when
+        no lease was recorded (a degraded launch, or an acquire whose
+        timeout abandoned a worker that later landed the write) a phantom
+        check read is made and any lease held by THIS process released, so
+        a phantom cannot block other nodes for a whole TTL.
+        """
+        name = job.name
+        async with self._slot_mutex(name):
+            refs = self._slot_refs.get(name, 0) - 1
+            if refs > 0:
+                self._slot_refs[name] = refs
+                return
+            self._slot_refs.pop(name, None)
+            if self.running_jobs.get(name):
+                return
+            renewer = self._slot_renewers.pop(name, None)
+            if renewer is not None and not renewer.done():
+                renewer.cancel()
+            lease = self._slot_leases.pop(name, None)
+            if lease is not None:
+                self._track_state_write(self._release_slot_lease(name, lease))
+            else:
+                self._track_state_write(self._release_phantom_slot(name))
+
+    async def _release_slot_lease(self, name: str, lease: Lease) -> None:
+        backend = self.state_backend
+        if backend is None:
+            return
+        try:
+            await asyncio.wait_for(
+                backend.release_lease(lease), timeout=STATE_OP_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - TTL expiry is the fallback
+            logger.warning(
+                "state: failed to release the concurrency slot for %s "
+                "(%s); it frees by TTL",
+                name,
+                ex,
+            )
+
+    async def _release_phantom_slot(self, name: str) -> None:
+        backend = self.state_backend
+        if backend is None:
+            return
+        try:
+            observed = await asyncio.wait_for(
+                backend.read_lease(self._slot_name(name)),
+                timeout=STATE_OP_TIMEOUT,
+            )
+            if observed is not None and observed.holder == self._slot_holder():
+                await asyncio.wait_for(
+                    backend.release_lease(observed),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+    # --- in-flight run records and crash reconciliation -------------------
+
+    @staticmethod
+    def _inflight_stream(name: str) -> str:
+        return INFLIGHT_STREAM_PREFIX + name
+
+    async def _persist_inflight_open(
+        self, job: JobConfig, running_job: RunningJob
+    ) -> None:
+        """Record that ``job`` went 0 -> 1 live instances on this node."""
+        backend = self.state_backend
+        if backend is None:
+            return
+        proc = getattr(running_job, "proc", None)
+        pid = proc.pid if proc is not None else None
+        record = {
+            "kind": "open",
+            "host": self._state_host,
+            "proc": self._proc_token,
+            "pid": pid,
+            "startedAt": get_now(datetime.timezone.utc).isoformat(),
+            "jobDigest": job_digest(job),
+        }
+        stream = self._inflight_stream(job.name)
+        try:
+            await backend.append_record(stream, record)
+            await backend.prune_records(stream, keep=INFLIGHT_STREAM_KEEP)
+        except Exception as ex:  # noqa: BLE001 - fire-and-forget
+            self.metrics.state_write_dropped("inflight")
+            logger.warning(
+                "state: failed to record the in-flight run of %s: %s",
+                job.name,
+                ex,
+            )
+
+    async def _persist_inflight_closed(
+        self, name: str, reason: str = "finished"
+    ) -> None:
+        """Record that ``name`` went 1 -> 0 live instances on this node."""
+        backend = self.state_backend
+        if backend is None:
+            return
+        record = {
+            "kind": "closed",
+            "host": self._state_host,
+            "proc": self._proc_token,
+            "reason": reason,
+            "at": get_now(datetime.timezone.utc).isoformat(),
+        }
+        try:
+            await backend.append_record(self._inflight_stream(name), record)
+        except Exception as ex:  # noqa: BLE001 - fire-and-forget
+            self.metrics.state_write_dropped("inflight")
+            logger.warning(
+                "state: failed to close the in-flight record of %s: %s",
+                name,
+                ex,
+            )
+
+    async def _reconcile_inflight(self) -> None:
+        """Close runs the PREVIOUS daemon on this host left in flight.
+
+        Runs once per rehydration (after the ledger warm, before the retry
+        re-arm).  An ``open`` record from this host whose writing process
+        is gone means the run died with (or after) that daemon: it is made
+        visible as an ``unknown``-outcome ledger row instead of silently
+        vanishing.  Three guards keep live runs safe: a record written by
+        THIS process (a state-section reload rebuilt the backend under a
+        live run) is skipped; live local instances outrank the ledger; and
+        a recorded pid that still exists is left alone -- a daemon crash
+        does not kill the job processes it spawned.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return
+        for name, job in list(self.cron_jobs.items()):
+            if self.running_jobs.get(name):
+                continue
+            try:
+                recs = await asyncio.wait_for(
+                    backend.list_records(
+                        self._inflight_stream(name),
+                        limit=1,
+                        newest_first=True,
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "state: in-flight reconciliation timed out reading %s; "
+                    "skipping the rest (store unhealthy?)",
+                    name,
+                )
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - degrade, never crash
+                logger.warning(
+                    "state: cannot read the in-flight record of %s: %s",
+                    name,
+                    ex,
+                )
+                continue
+            rec = recs[0] if recs else None
+            if rec is None or rec.get("kind") != "open":
+                continue
+            if rec.get("host") != self._state_host:
+                continue  # another node's business (see the slot takeover)
+            if rec.get("proc") == self._proc_token:
+                continue  # our own live run; the backend was just rebuilt
+            pid = rec.get("pid")
+            if (
+                isinstance(pid, int)
+                and not isinstance(pid, bool)
+                and platform.pid_alive(pid)
+            ):
+                logger.warning(
+                    "Job %s: the previous daemon's run (pid %d) still "
+                    "appears to be running; leaving its in-flight record "
+                    "open",
+                    name,
+                    pid,
+                )
+                continue
+            self._reconcile_open_record(name, job, rec, "reconciled-crash")
+
+    async def _reconcile_takeover_inflight(self, job: JobConfig) -> None:
+        """On a fresh slot win, close a foreign holder's orphaned run.
+
+        A just-acquired slot proves the previous holder made NO successful
+        renewal for a full TTL -- not that its process died (it may still
+        be running if it lost store access; that overlap is the documented
+        at-least-once trade).  The fence supersession is what makes closing
+        the record safe: any late write the old incarnation makes is
+        detectable against the bumped fence.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(
+                    self._inflight_stream(job.name),
+                    limit=1,
+                    newest_first=True,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - reconciliation is best-effort
+            return
+        rec = recs[0] if recs else None
+        if rec is None or rec.get("kind") != "open":
+            return
+        if (
+            rec.get("host") == self._state_host
+            and rec.get("proc") == self._proc_token
+        ):
+            return
+        self._reconcile_open_record(job.name, job, rec, "reconciled-takeover")
+
+    def _reconcile_open_record(
+        self,
+        name: str,
+        job: Optional[JobConfig],
+        rec: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Close an orphaned ``open`` record and make the run visible.
+
+        Appends a ``closed`` record (so the orphan is not re-reconciled)
+        and a synthetic ``unknown``-outcome ledger row.  ``unknown`` is a
+        non-verdict everywhere (onlyIfLastSucceeded, success-rate,
+        superseded-by-run all ignore it) and the row carries no
+        ``started_at`` so it cannot skew duration statistics.
+
+        The catch-up watermark is policy-aware: for the default
+        ``onMissed: skip`` the row carries ``finished_at`` (the run's start
+        instant, so the watermark advances over exactly the interrupted
+        slot); under ``run-once``/``run-all`` it carries the instant as
+        ``interruptedAt`` instead, leaving the durable watermark untouched
+        so the interrupted occurrence is still owed to catch-up -- crash
+        recovery must not silently downgrade those jobs to at-most-once.
+        """
+        started_iso = rec.get("startedAt")
+        if not isinstance(started_iso, str):
+            started_iso = get_now(datetime.timezone.utc).isoformat()
+        fail_reason = (
+            "run interrupted: no completion was recorded for the run "
+            "started at {} on {} (daemon crash, or the node lost access "
+            "to the state store mid-run)".format(started_iso, rec.get("host"))
+        )
+        data: Dict[str, Any] = {
+            "outcome": "unknown",
+            "exit_code": None,
+            "started_at": None,
+            "duration": None,
+            "fail_reason": fail_reason,
+        }
+        if job is None or job.onMissed == "skip":
+            data["finished_at"] = started_iso
+        else:
+            data["interruptedAt"] = started_iso
+        self._track_state_write(self._persist_inflight_closed(name, reason))
+        self._track_state_write(self._persist_reconciled_record(name, data))
+        # make it visible on this node's dashboard immediately (bypassing
+        # _record_run: no metric emission, no double-persist).
+        finished = _parse_iso_utc(started_iso) or get_now(
+            datetime.timezone.utc
+        )
+        output = JobOutputStream()
+        output.close()
+        info = JobRunInfo(
+            outcome="unknown",
+            exit_code=None,
+            started_at=None,
+            finished_at=finished,
+            fail_reason=fail_reason,
+            output=output,
+        )
+        self.run_history[name].append(info)
+        self.last_run[name] = info
+        logger.warning(
+            "Job %s: reconciled an interrupted run (%s): %s",
+            name,
+            reason,
+            fail_reason,
+        )
+
+    async def _persist_reconciled_record(
+        self, name: str, data: Dict[str, Any]
+    ) -> None:
+        backend = self.state_backend
+        if backend is None:
+            return
+        stream = self._run_stream(name)
+        try:
+            await backend.append_record(stream, data)
+            if self._state_max_runs > 0:
+                await backend.prune_records(stream, keep=self._state_max_runs)
+        except Exception as ex:  # noqa: BLE001 - fire-and-forget
+            self.metrics.state_write_dropped("run-record")
+            logger.warning(
+                "state: failed to persist the reconciled run record for "
+                "%s: %s",
+                name,
+                ex,
+            )
 
     # continually watches for the running jobs, clean them up when they exit
     async def _wait_for_running_jobs(self) -> None:
@@ -3890,6 +4722,9 @@ class Cron:
                 "state: rehydrated run history for %d job(s) from the ledger",
                 warmed,
             )
+        # BEFORE the retry re-arm: a reconciled interrupted run updates
+        # last_run, and the superseded-by-run guard must see it.
+        await self._reconcile_inflight()
         await self._rehydrate_counters()
         await self._rehydrate_retries()
 
@@ -4242,8 +5077,23 @@ class Cron:
     async def _handle_finished_job(self, job: RunningJob) -> None:
         jobs_list = self.running_jobs[job.config.name]
         jobs_list.remove(job)
+        last_instance = not jobs_list
         if not jobs_list:
             del self.running_jobs[job.config.name]
+        if last_instance and self.state_backend is not None:
+            # the job went 1 -> 0 live instances here: close the in-flight
+            # record. Fire-and-forget; runs before the replaced/cancelled
+            # early-returns below on purpose -- a replaced instance ending
+            # the job's last local instance must still close the record.
+            self._track_state_write(
+                self._persist_inflight_closed(job.config.name)
+            )
+        if job.config.concurrencyScope == "cluster":
+            # every claimed launch pairs with exactly one finish here; the
+            # slot lease is released when the refcount drains (see
+            # _release_cluster_slot). Before the early-returns below for
+            # the same reason as the in-flight close.
+            await self._release_cluster_slot(job.config)
 
         if job.replaced:
             # deliberately cancelled to make way for a newer instance
@@ -4403,17 +5253,37 @@ class Cron:
                 # settled, not re-arm the attempt that already ran. Under
                 # onStoreUnavailable: fail-closed an unsettleable record
                 # defers the launch like a closed gate; under degrade it
-                # launches anyway (at-least-once, bounded replay).
-                if await self._retry_consume_ok(
-                    job_name, retry_num, quiet=deferrals > 0
-                ):
+                # launches anyway (at-least-once, bounded replay). When
+                # cross-node retry resume is active the decision also
+                # serializes on the per-job claim lease and re-checks that
+                # the newest ladder record is still OUR OWN pending -- a
+                # peer that claimed this ladder while we slept or deferred
+                # ends it here ("abort") without settling, so the
+                # claimer's record stays newest.
+                decision = await self._retry_consume_decision(
+                    job, retry_num, quiet=deferrals > 0
+                )
+                if decision == "launch":
                     break
+                if decision == "abort":
+                    state = self.retry_state.get(job_name)
+                    if state is not None:
+                        state.cancelled = True
+                    self.retry_state.pop(job_name, None)
+                    logger.warning(
+                        "Cron job %s retry (#%i) dropped: another node "
+                        "claimed this retry ladder (cross-node retry "
+                        "resume); it fires there",
+                        job_name,
+                        retry_num,
+                    )
+                    return
             elif self._cluster_owner_moved(job):
                 # ownership genuinely moved: end this node's retry sequence
-                # (the new owner picks up the job's future scheduled firings,
-                # not this failed attempt; see _abandon_retry for the
-                # @reboot-one-shot caveat).
-                self._abandon_retry(job_name, retry_num)
+                # (on a shared store the ladder is handed off for the new
+                # owner to resume; otherwise the new owner picks up only
+                # the job's future scheduled firings -- see _abandon_retry).
+                self._abandon_retry(job, retry_num)
                 return
             # A transient fail-closed denial (lost quorum, a nodeName/size/
             # policy conflict, a backend read error, no manager): this node
@@ -4661,6 +5531,393 @@ class Cron:
             pass
         return True
 
+    # --- cross-node retry resume -------------------------------------------
+
+    def _retry_resume_active(self) -> bool:
+        """Whether cross-node retry resume applies right now.
+
+        Needs a SHARED store (other nodes can see the ladder records at
+        all), leader election (ownership is what moves), and a live
+        manager (the claim scan gates on ``_cluster_allows``).
+        """
+        backend = self.state_backend
+        return (
+            backend is not None
+            and backend.supports_shared_locking()
+            and self._elect_leader_configured
+            and self.cluster_manager is not None
+        )
+
+    def _retry_cross_node_eligible(self, job: JobConfig) -> bool:
+        """Whether ``job``'s retry ladder may move between nodes.
+
+        ``EveryNode`` ladders are strictly per-node (every node runs its
+        own copy; a foreign pending on the shared stream is another node's
+        live ladder, exactly as in rehydration).  ``@reboot`` ladders are
+        anchored to a HOST's boot (the re-arm validity is judged against
+        this host's boot marker), so they never move either -- an
+        abandoned @reboot keep-alive still ends cluster-wide, as
+        documented.
+        """
+        return (
+            self._retry_resume_active()
+            and job.clusterPolicy != "EveryNode"
+            and not (
+                isinstance(job.schedule, str) and job.schedule == "@reboot"
+            )
+        )
+
+    @staticmethod
+    def _retry_claim_lease(name: str) -> str:
+        return RETRY_CLAIM_PREFIX + name
+
+    async def _retry_consume_decision(
+        self, job: JobConfig, retry_num: int, *, quiet: bool
+    ) -> str:
+        """Decide a due retry's fate: ``launch`` | ``defer`` | ``abort``.
+
+        Without cross-node resume this is exactly the classic
+        :meth:`_retry_consume_ok` (launch/defer).  With it, two additions
+        close the claim/consume race:
+
+        * the consume serializes on the SAME per-job claim lease the scan
+          uses, so a claimer's re-read-then-append and our re-check-then-
+          settle cannot interleave;
+        * the newest ladder record must still be a record THIS host wrote
+          -- a foreign newest record (a claimer's pending, or its
+          settled/"launched" after it already fired) means the ladder
+          positively moved, and the only safe move is to end it locally
+          without settling (``abort``): our settle landing on top would
+          bury the claimer's pending and could resurrect the attempt on
+          the next boot.
+
+        The staleness grace (:data:`RETRY_CLAIM_GRACE`) cannot protect a
+        gate-deferred owner -- its re-check cadence is its own ladder
+        delay, arbitrarily longer than any constant -- so this re-check is
+        load-bearing for at-most-once, not defensive hardening.  Read/
+        acquire failures follow ``onStoreUnavailable``: degrade proceeds
+        (unserialized, at-least-once), fail-closed defers.
+        """
+        if not self._retry_cross_node_eligible(job):
+            ok = await self._retry_consume_ok(job.name, retry_num, quiet=quiet)
+            return "launch" if ok else "defer"
+        backend = self.state_backend
+        if backend is None:
+            ok = await self._retry_consume_ok(job.name, retry_num, quiet=quiet)
+            return "launch" if ok else "defer"
+        fail_closed = self._state_on_unavailable == "fail-closed"
+        lease: Optional[Lease] = None
+        try:
+            lease = await asyncio.wait_for(
+                backend.acquire_lease(
+                    self._retry_claim_lease(job.name),
+                    self._slot_holder(),
+                    RETRY_CLAIM_TTL,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            lease = None
+        if lease is None:
+            observed: Optional[Lease] = None
+            try:
+                observed = await asyncio.wait_for(
+                    backend.read_lease(self._retry_claim_lease(job.name)),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                pass
+            if observed is not None and observed.holder != self._slot_holder():
+                # a live claimer is working this very ladder: defer and
+                # re-check; if it claimed, the next pass aborts.
+                return "defer"
+            if observed is None and fail_closed:
+                if not quiet:
+                    logger.warning(
+                        "Cron job %s retry (#%i) deferred: cannot "
+                        "serialize with cross-node claims (store "
+                        "unavailable) and onStoreUnavailable is "
+                        "fail-closed",
+                        job.name,
+                        retry_num,
+                    )
+                return "defer"
+            if observed is not None:
+                lease = observed  # our own late-landing acquire: adopt it
+        try:
+            try:
+                recs = await asyncio.wait_for(
+                    backend.list_records(
+                        self._retry_stream(job.name),
+                        limit=1,
+                        newest_first=True,
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - policy fork below
+                if fail_closed:
+                    return "defer"
+                recs = []
+            rec = recs[0] if recs else None
+            if (
+                rec is not None
+                and isinstance(rec.get("host"), str)
+                and rec.get("host") != self._state_host
+            ):
+                return "abort"
+            ok = await self._retry_consume_ok(job.name, retry_num, quiet=quiet)
+            return "launch" if ok else "defer"
+        finally:
+            if lease is not None:
+                try:
+                    await asyncio.wait_for(
+                        backend.release_lease(lease),
+                        timeout=STATE_OP_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - TTL is the fallback
+                    pass
+
+    async def _retry_claim_scan(self) -> None:
+        """Scan for foreign retry ladders this node should resume.
+
+        The cross-node half of restart-surviving retries: a pending record
+        whose owner crashed (stale past its deadline plus
+        :data:`RETRY_CLAIM_GRACE`) or a ``handoff`` record from an owner
+        that positively relinquished is claimed -- under a per-job TTL
+        lease, with a re-read inside it -- and re-armed locally exactly
+        like rehydration re-arms this host's own pendings.  Spawned from
+        the housekeeping pass about once a minute; every failure degrades
+        to "not this pass".
+        """
+        if not self._retry_resume_active():
+            return
+        for name, job in list(self.cron_jobs.items()):
+            try:
+                await self._maybe_claim_retry(name, job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one job must not end the scan
+                logger.exception(
+                    "state: error scanning job %s for a claimable retry",
+                    name,
+                )
+
+    async def _maybe_claim_retry(self, name: str, job: JobConfig) -> None:
+        backend = self.state_backend
+        if backend is None or not self._retry_cross_node_eligible(job):
+            return
+        if not job.enabled or not job.onFailure["retry"]["maximumRetries"]:
+            return
+        if self.running_jobs.get(name):
+            return
+        state = self.retry_state.get(name)
+        if state is not None and (state.task is not None or state.count > 0):
+            # a live local ladder outranks; a count-0, taskless leftover
+            # (a slot-denied scheduled fire armed it and never launched)
+            # does not block a claim.
+            return
+        if not self._cluster_allows(job):
+            return
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(
+                    self._retry_stream(name), limit=1, newest_first=True
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - not this pass
+            return
+        rec = recs[0] if recs else None
+        if rec is None:
+            return
+        claimable = self._retry_record_claimable(name, job, rec)
+        if claimable is None:
+            return
+        attempt, not_before = claimable
+        lease: Optional[Lease] = None
+        try:
+            lease = await asyncio.wait_for(
+                backend.acquire_lease(
+                    self._retry_claim_lease(name),
+                    self._slot_holder(),
+                    RETRY_CLAIM_TTL,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            lease = None
+        if lease is None:
+            return  # a rival claimer or a sick store: next scan retries
+        try:
+            claimed = await self._claim_retry_under_lease(
+                name, job, rec, attempt, not_before
+            )
+        finally:
+            try:
+                await asyncio.wait_for(
+                    backend.release_lease(lease), timeout=STATE_OP_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - TTL is the fallback
+                pass
+        if not claimed:
+            return
+        retry = job.onFailure["retry"]
+        state = JobRetryState(
+            retry["initialDelay"],
+            retry["backoffMultiplier"],
+            retry["maximumDelay"],
+        )
+        for _ in range(attempt):
+            state.next_delay()
+        now = get_now(datetime.timezone.utc)
+        remaining = max(0.0, (not_before - now).total_seconds())
+        self.retry_state[name] = state
+        state.task = asyncio.create_task(
+            self.schedule_retry_job(name, remaining, attempt)
+        )
+        logger.info(
+            "Job %s: claimed pending retry #%d from host %s (cross-node "
+            "retry resume); due in %.1f seconds",
+            name,
+            attempt,
+            rec.get("host") or rec.get("fromHost"),
+            remaining,
+        )
+
+    async def _claim_retry_under_lease(
+        self,
+        name: str,
+        job: JobConfig,
+        rec: Dict[str, Any],
+        attempt: int,
+        not_before: datetime.datetime,
+    ) -> bool:
+        """The claim's critical section: re-check, validate, append.
+
+        Runs while holding the per-job claim lease.  ``True`` means the
+        claim record landed and the caller may arm the local ladder.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return False
+        # re-read under the lease: the record must not have moved.
+        try:
+            recheck = await asyncio.wait_for(
+                backend.list_records(
+                    self._retry_stream(name), limit=1, newest_first=True
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - not this pass
+            return False
+        if not recheck or recheck[0] != rec:
+            return False
+        # superseded-by-run against the DURABLE ledger: the run that
+        # resolved this ladder most likely happened on ANOTHER host,
+        # which this node's in-memory history knows nothing about.
+        armed_at = rec.get("at") or rec.get("notBefore")
+        try:
+            last_durable = await asyncio.wait_for(
+                self.durable_last_run_at(name),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - ambiguity settles: no claim
+            return False
+        if (
+            isinstance(last_durable, str)
+            and isinstance(armed_at, str)
+            and last_durable > armed_at
+        ):
+            # a run finished after the ladder was armed: it resolved (its
+            # settle may have been dropped). Settle it here so the scan
+            # stops revisiting it; no-run beats double-run.
+            self._persist_retry_settled(name, "superseded-by-run", attempt)
+            return False
+        claim = {
+            "kind": "pending",
+            "attempt": attempt,
+            "notBefore": not_before.isoformat(),
+            "jobDigest": job_digest(job),
+            "host": self._state_host,
+            "at": get_now(datetime.timezone.utc).isoformat(),
+            "claimedFrom": rec.get("host") or rec.get("fromHost"),
+        }
+        write = self._queue_retry_write(name, claim)
+        try:
+            # the claim record must LAND before the lease is released, or
+            # a rival's post-release re-read could still see the old
+            # record and claim it too.
+            await asyncio.wait_for(
+                asyncio.shield(write), timeout=STATE_OP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    def _retry_record_claimable(
+        self, name: str, job: JobConfig, rec: Dict[str, Any]
+    ) -> Optional[Tuple[int, datetime.datetime]]:
+        """Judge whether a ladder record is another node's claimable retry.
+
+        Mirrors :meth:`_validate_pending_retry`'s checks (shape, digest,
+        budget, deadline) with the cross-node rules on top: only a FOREIGN
+        ``pending`` stale past :data:`RETRY_CLAIM_GRACE` (a crashed owner
+        -- a live one fires within moments of its deadline) or a
+        ``handoff`` (an owner that positively relinquished; no grace)
+        qualifies.  Every validation failure here just declines the claim
+        -- settling another host's record on local suspicion alone would
+        race its live owner; the durable superseded-by-run check (which
+        has store-wide evidence) happens under the claim lease instead.
+        """
+        kind = rec.get("kind")
+        if kind not in ("pending", "handoff"):
+            return None
+        attempt = rec.get("attempt")
+        not_before = _parse_iso_utc(rec.get("notBefore"))
+        if (
+            isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or attempt < 1
+            or not_before is None
+        ):
+            return None
+        if rec.get("jobDigest") != job_digest(job):
+            return None
+        retry = job.onFailure["retry"]
+        maximum = retry["maximumRetries"]
+        if maximum != -1 and attempt > maximum:
+            return None
+        now = get_now(datetime.timezone.utc)
+        deadline = job.startingDeadlineSeconds
+        if deadline and (now - not_before).total_seconds() > deadline:
+            return None
+        last = self.last_run.get(name)
+        armed_at = _parse_iso_utc(rec.get("at")) or not_before
+        if last is not None and last.finished_at > armed_at:
+            return None  # locally-known newer run; the ladder resolved
+        if kind == "handoff":
+            return attempt, max(not_before, now)
+        host = rec.get("host")
+        if not isinstance(host, str) or host == self._state_host:
+            # our own pending is rehydration's business, never the scan's
+            return None
+        due_anchor = max(not_before, armed_at)
+        if (now - due_anchor).total_seconds() <= RETRY_CLAIM_GRACE:
+            return None
+        return attempt, not_before
+
     def _cluster_owner_moved(self, job: JobConfig) -> bool:
         """Whether another node is *positively* identified as ``job``'s owner.
 
@@ -4711,7 +5968,7 @@ class Cron:
             )
             return False
 
-    def _abandon_retry(self, job_name: str, retry_num: int) -> None:
+    def _abandon_retry(self, job: JobConfig, retry_num: int) -> None:
         """End a pending retry sequence whose job's ownership moved off-node.
 
         Marks the state cancelled BEFORE dropping it: a RunningJob launched
@@ -4721,11 +5978,42 @@ class Cron:
         ``retry_state`` -- which ``cancel_job_retries`` could never find or
         cancel, so the orphan would relaunch the job even after a later
         successful run.
+
+        When cross-node retry resume is active (a shared store plus leader
+        election) the ladder is HANDED OFF instead of settled dead: a
+        ``handoff`` record carrying the attempt, the job digest and a
+        now-due deadline lands on the stream, and the new owner's claim
+        scan picks it up (no staleness grace -- the old owner has
+        positively relinquished).  No ``cancelled`` run-history record is
+        written on that path: the attempt is not ending, it is moving.
         """
+        job_name = job.name
         state = self.retry_state.get(job_name)
         if state is not None:
             state.cancelled = True
         self.retry_state.pop(job_name, None)
+        if self._retry_cross_node_eligible(job):
+            now = get_now(datetime.timezone.utc)
+            self._queue_retry_write(
+                job_name,
+                {
+                    "kind": "handoff",
+                    "attempt": retry_num,
+                    "notBefore": now.isoformat(),
+                    "jobDigest": job_digest(job),
+                    "fromHost": self._state_host,
+                    "at": now.isoformat(),
+                },
+            )
+            logger.warning(
+                "Cron job %s retry (#%i) handed off: the cluster moved "
+                "ownership of it to another node; the new owner resumes "
+                "the ladder from its durable record (cross-node retry "
+                "resume)",
+                job_name,
+                retry_num,
+            )
+            return
         # settle the durable ladder: the new owner runs the job's future
         # firings, so re-arming this attempt on OUR next boot would be the
         # exact cross-node double-run the abandonment avoids.

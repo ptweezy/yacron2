@@ -9,6 +9,7 @@ import pytest
 
 from yacron2.config import (
     DEFAULT_ETCD,
+    DEFAULT_FILESYSTEM,
     DEFAULT_K8S,
     ConfigError,
     _redact_userinfo,
@@ -714,3 +715,73 @@ def test_k8s_apiserver_credentialed_error_redacts_password():
         _cluster(yaml)
     assert "apiServer must be an https" in str(ei.value)
     assert "s3cret" not in str(ei.value)
+
+
+# --- filesystem (shared-mount) backend --------------------------------------
+
+_FS = (
+    "cluster:\n"
+    "  backend: filesystem\n"
+    "  nodeName: node-a\n"
+    "  filesystem:\n"
+    "    path: /mnt/shared/yacron2\n"
+)
+
+
+def test_filesystem_defaults_filled():
+    cfg = _cluster(_FS)
+    fsb = cfg["filesystem"]
+    assert fsb["path"] == "/mnt/shared/yacron2"
+    assert fsb["electionName"] == DEFAULT_FILESYSTEM["electionName"]
+    assert fsb["ttl"] == DEFAULT_FILESYSTEM["ttl"]
+    assert fsb["deploymentId"] is None
+    assert fsb["topology"] == "auto"
+    assert cfg["electLeader"] is True  # lease backend implies leadership
+
+
+def test_filesystem_requires_path():
+    with pytest.raises(ConfigError, match="filesystem.path"):
+        _cluster("cluster:\n  backend: filesystem\n")
+    with pytest.raises(ConfigError, match="filesystem.path"):
+        _cluster(
+            "cluster:\n  backend: filesystem\n"
+            "  filesystem:\n    path: '  '\n"
+        )
+
+
+def test_filesystem_ttl_floor():
+    # same rationale as etcd's: below 3s the leader window collapses under
+    # the renew cadence plus the clock-skew margin.
+    with pytest.raises(ConfigError, match="ttl must be >= 3"):
+        _cluster(_FS + "    ttl: 2\n")
+
+
+def test_filesystem_election_name_nonempty():
+    with pytest.raises(ConfigError, match="electionName"):
+        _cluster(_FS + "    electionName: ' '\n")
+
+
+def test_filesystem_rejects_spread():
+    with pytest.raises(ConfigError, match="spread"):
+        _cluster(_FS + "  distribution: spread\n")
+
+
+def test_filesystem_block_rejected_under_other_backends():
+    # a filesystem: block under another backend would be silently ignored,
+    # arbitrating leadership against an unintended store -- refused loudly.
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  filesystem:\n"
+        "    path: /mnt/shared\n"
+    )
+    with pytest.raises(ConfigError, match="cluster.filesystem"):
+        _cluster(yaml)
+
+
+def test_filesystem_gossip_only_keys_are_advisories():
+    cfg = _cluster(_FS + "  interval: 5\n  electLeader: false\n")
+    warnings = cluster_config_warnings(cfg)
+    assert any("interval" in w for w in warnings)
+    assert any("electLeader" in w for w in warnings)
+    assert cfg["electLeader"] is True  # the override stands

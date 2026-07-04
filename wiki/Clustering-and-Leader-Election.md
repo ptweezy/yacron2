@@ -20,7 +20,10 @@ elected leader firing scheduled jobs. It builds directly on the
 > narrow windows where a firing may be skipped or (under some policies)
 > double-run. If you need a hard exactly-once guarantee **and** already run a
 > coordination store, set `cluster.backend: kubernetes` or `etcd` (below) to
-> elect through a `Lease` / a lease-bound key instead. See
+> elect through a `Lease` / a lease-bound key instead; if the nodes already
+> share a POSIX mount, `cluster.backend: filesystem` elects through a fenced
+> lease file on the mount itself (fenced under NTP-bounded clock skew), with
+> no extra service at all. See
 > [Choosing a backend](#choosing-a-backend) and
 > [Guarantees and trade-offs](#guarantees-and-trade-offs).
 
@@ -98,7 +101,9 @@ Most clusters want the **default single leader**: enable
 one leader cannot carry all the scheduled work.
 
 **On Kubernetes**, skip the certs and peer list entirely and set
-`cluster.backend: kubernetes` so a `Lease` fences leadership instead (see
+`cluster.backend: kubernetes` so a `Lease` fences leadership instead; nodes
+that already share a POSIX mount can likewise skip them with
+`cluster.backend: filesystem` and elect through a lease file on the mount (see
 [Choosing a backend](#choosing-a-backend)).
 
 ## From one node to a cluster
@@ -112,7 +117,8 @@ attestation first, verify it is healthy, then turn on election:
 2. **Provision the coordination material.** For `gossip`, issue per-node
    certs from a dedicated cluster CA (see
    [Cluster peer attestation](#cluster-peer-attestation)); for a lease backend,
-   set up the `Lease` RBAC or etcd credentials
+   set up the `Lease` RBAC or etcd credentials, or point
+   `cluster.filesystem.path` at the shared mount
    ([Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd)).
 3. **Add the `cluster` block with `electLeader: false` first** (attestation
    only). Every replica still runs every job, so nothing changes operationally,
@@ -140,20 +146,23 @@ over at once.
 on the default `gossip` when you want zero-dependency replicas and can tolerate
 an occasional skip or double-run in narrow windows; pick `kubernetes` (already on
 Kubernetes) or `etcd` (already run etcd) when you need a **fenced, exactly-once**
-guarantee and already run that store. All three present the same **per-job** seam
+guarantee and already run that store; pick `filesystem` when the nodes already
+share a POSIX mount (Amazon S3 Files / EFS / NFS) and you want fenced
+leadership with zero extra services. All four present the same **per-job** seam
 (`clusterPolicy`) to the scheduler, so switching backends does not change how
 jobs are written; only the *coordination* underneath, and therefore how the
 cluster is **observed**, differs.
 
-| | `gossip` *(default)* | `kubernetes` | `etcd` |
-| --- | --- | --- | --- |
-| Coordination | embedded mTLS gossip, no shared state | a `coordination.k8s.io/v1` `Lease` | a lease-bound etcd key |
-| Guarantee | best-effort (may skip or double-run in narrow windows) | **fenced, exactly-once** while the apiserver is reachable | **fenced, exactly-once** while etcd is reachable |
-| Extra dependency | none | none (optional `yacron2[kubernetes]`) | none |
-| Needs | per-node mTLS certs + a static peer list | in-cluster (or kubeconfig) apiserver access + a Lease RBAC | reachable etcd endpoint(s) |
-| Best when | zero-dependency replicas, occasional skip/dup tolerable | already on Kubernetes and want a hard guarantee | already run etcd |
+| | `gossip` *(default)* | `kubernetes` | `etcd` | `filesystem` |
+| --- | --- | --- | --- | --- |
+| Coordination | embedded mTLS gossip, no shared state | a `coordination.k8s.io/v1` `Lease` | a lease-bound etcd key | a flock-guarded TTL lease file on a shared POSIX mount |
+| Guarantee | best-effort (may skip or double-run in narrow windows) | **fenced, exactly-once** while the apiserver is reachable | **fenced, exactly-once** while etcd is reachable | **fenced** under NTP-bounded clock skew (~2 s budget) while the mount is reachable |
+| Extra dependency | none | none (optional `yacron2[kubernetes]`) | none | none |
+| Needs | per-node mTLS certs + a static peer list | in-cluster (or kubeconfig) apiserver access + a Lease RBAC | reachable etcd endpoint(s) | a shared POSIX mount (S3 Files / EFS / NFSv4) with real cross-host locks, NTP on every node |
+| Best when | zero-dependency replicas, occasional skip/dup tolerable | already on Kubernetes and want a hard guarantee | already run etcd | you already have a shared mount and want fenced leadership with zero extra services |
 
-The per-backend config keys (`cluster.kubernetes.*`, `cluster.etcd.*`) are in the
+The per-backend config keys (`cluster.kubernetes.*`, `cluster.etcd.*`,
+`cluster.filesystem.*`) are in the
 [Configuration Reference](Configuration-Reference#cluster); deployment, RBAC,
 auth/TLS, failure modes, and monitoring are in
 [Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd).
@@ -170,9 +179,9 @@ semantics in [Per-job policy](#per-job-policy), however, apply to every backend.
 | | Single instance (default) | `cluster` only | `cluster` + `electLeader` |
 | --- | --- | --- | --- |
 | Replicas | 1 | many (each runs everything) | many (leader runs scheduled jobs) |
-| Coordination | none | observe-only attestation | quorum-gated election |
-| mTLS identity required | no | yes | yes |
-| Endpoint | none | `GET /cluster`, `GET /peer` | `GET /cluster`, `GET /peer` |
+| Coordination | none | observe-only attestation | quorum-gated election (`gossip`) or a fenced lease (`kubernetes` / `etcd` / `filesystem`) |
+| mTLS identity required | no | yes | yes on `gossip` (a lease backend needs none) |
+| Endpoint | none | `GET /cluster`, `GET /peer` | `GET /cluster` (plus `GET /peer` on `gossip`) |
 | Double-running | n/a | yes (by design) | no for `Leader` jobs in a converged, fully-connected quorum (best-effort: a thin bridge, a same-`N` membership change, or the ~one-`interval` window after a partition can still let two nodes both lead; see [Guarantees and trade-offs](#guarantees-and-trade-offs)) |
 
 ## The job-set id foundation
@@ -312,9 +321,16 @@ deliberately *not* gated, so you can still trigger a job on any node. Automatic
 *retries* re-check the gate before every relaunch: a transient fail-closed
 denial (lost quorum, a detected conflict, a rebuilt manager's still-converging
 view) merely defers the retry and re-checks it, while a *positively observed*
-ownership move abandons the pending retry (a WARNING plus a `cancelled`
-run-history record) so it cannot double-run against the new owner. The full
-defer-vs-abandon lifecycle is documented in
+ownership move ends the local ladder so it cannot double-run against the new
+owner. What happens to the pending attempt then depends on the state store: on
+a **shared** [durable state](Durable-State#restart-surviving-retries) store
+with leader election, the ladder is **handed off** rather than dropped -- the
+old owner writes a durable `handoff` record instead of settling the ladder
+dead (no `cancelled` run-history record: the attempt moves, it does not die)
+and the new owner resumes the remaining attempts from it. Without a shared
+store the retry is **abandoned** (a WARNING plus a `cancelled` run-history
+record). `EveryNode` and `@reboot` ladders never move between nodes. The full
+defer-vs-abandon-vs-handoff lifecycle is documented in
 [Failure Detection and Retries](Failure-Detection-and-Retries#retry-lifecycle).
 
 ### Cluster size and quorum
@@ -599,7 +615,8 @@ unreachable), a `PreferLeader` `@reboot` runs on **this** node when the store is
 unreachable (a possible boot-time double-run), and `EveryNode` is not deferred.
 The cross-node "already ran" record that gossip advertises peer-to-peer is
 **persisted in the lease store** instead (a Kubernetes Lease annotation, an etcd
-sibling key), scoped to the current [job-set id](#the-job-set-id-foundation), so
+sibling key, append-only records in the filesystem store's `cluster/reboot-ran`
+stream), scoped to the current [job-set id](#the-job-set-id-foundation), so
 a failover holder does not re-run the one-shot. Because the store outlives the
 processes, this shifts the semantics: a `Leader` `@reboot` runs **once per job
 configuration**, not once per boot. Restarting the whole fleet with an unchanged
@@ -745,7 +762,9 @@ view instead: `backend` names the backend, `peers` is `[]`,
 are always `false`,
 and an extra `lease` block carries the holder and expiry: for `kubernetes`
 `{name, namespace, identity, holder, expiry}`, for `etcd`
-`{electionName, identity, holder, leaseId, expiry}`. There `quorate` means the
+`{electionName, identity, holder, leaseId, expiry}`, for `filesystem`
+`{path, electionName, identity, holder, fence, expiry}` (`fence` is the
+store's monotonic takeover counter). There `quorate` means the
 node has a *fresh read of the lease store* (see
 [Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd)
 and the [`GET /cluster`](HTTP-API#get-cluster) reference).
@@ -828,8 +847,9 @@ done | grep -c '^true$'     # > 1 means a transient double-leader
 Under `distribution: spread` there is no single leader, so instead compare the
 `clusterOwner` each replica reports per job (`GET /jobs`) and alert if any job
 has more than one distinct owner across the fleet. A non-idempotent job that
-must *never* double-run belongs on a fenced backend (`kubernetes` / `etcd`) or a
-single replica, not the gossip backend.
+must *never* double-run belongs on a fenced backend (`kubernetes` / `etcd`, or
+`filesystem` given NTP-bounded clocks) or a single replica, not the gossip
+backend.
 
 ## Guarantees and trade-offs
 
@@ -838,16 +858,24 @@ matrix below is the one-word summary (fuller wording follows); "fenced" is the
 hard, single-holder guarantee, "best-effort" admits the narrow gossip windows,
 and "may skip" / "may dup" name the side each policy gives up:
 
-| `clusterPolicy` | `gossip` | `kubernetes` | `etcd` |
-| --- | --- | --- | --- |
-| `Leader` | best-effort (may skip; rare dup) | fenced (may skip) | fenced (may skip) |
-| `PreferLeader` | never-skip (may dup) | never-skip (may dup) | never-skip (may dup) |
-| `EveryNode` | every-node | every-node | every-node |
+| `clusterPolicy` | `gossip` | `kubernetes` | `etcd` | `filesystem` |
+| --- | --- | --- | --- | --- |
+| `Leader` | best-effort (may skip; rare dup) | fenced (may skip) | fenced (may skip) | fenced under NTP-bounded skew (may skip) |
+| `PreferLeader` | never-skip (may dup) | never-skip (may dup) | never-skip (may dup) | never-skip (may dup) |
+| `EveryNode` | every-node | every-node | every-node | every-node |
 
 On the lease backends "fenced" holds while the store is reachable; a store
 outage is the one window a `Leader` job skips and a `PreferLeader` job may
-double-run (see [Failure modes](#failure-modes)). `EveryNode` is never gated on
-any backend.
+double-run (see [Failure modes](#failure-modes)). On `filesystem` the fence
+additionally assumes **NTP-bounded clock skew**: the lease expiry is compared
+across host wall clocks with two 1 s margins (the holder stops calling itself
+leader 1 s before its lease really expires; a challenger refuses to take over
+until the observed expiry is 1 s in the past by *its* clock), so two leaders
+need inter-host skew above the sum, ~2 s. Run NTP on every node that mounts
+the store -- the same requirement [Durable State](Durable-State#operational-notes)
+documents under "Clocks on shared mounts". The `kubernetes`/`etcd` takeover is
+judged on a single clock (the challenger's own, or etcd's server), so those
+two carry no such budget. `EveryNode` is never gated on any backend.
 
 This gossip design intentionally keeps **no shared state**, which is what makes
 it easy to run, but it means the guarantee is *best-effort*, not fenced
@@ -886,8 +914,9 @@ exactly-once. Because each node acts on a view only as fresh as its last poll
 * A `PreferLeader` job **may double-run** across a partition (that is the point
   of the policy: it never skips).
 
-If you need a hard exactly-once guarantee, you need a lease/consensus store
-(etcd, a Kubernetes `Lease`), which this design deliberately avoids. If a job
+If you need a hard exactly-once guarantee, you need a shared store (etcd, a
+Kubernetes `Lease`, or -- given NTP-bounded clocks -- a shared mount via the
+`filesystem` backend), which this design deliberately avoids. If a job
 must *never* be skipped or doubled, run a single replica (`replicas: 1`) or use
 an external coordinator. Tuning the `interval` shorter narrows the degraded
 windows at the cost of more polling traffic.
@@ -910,17 +939,20 @@ trust overlap, and recovering from an `untrusted` cascade), see
 
 ## Operating the lease backends (Kubernetes and etcd)
 
-The `kubernetes` and `etcd` backends replace the gossip protocol with a real
-coordination store, giving a **fenced, exactly-once** election while the store
-is reachable. They share one code path (`yacron2.leadership.LeaseBackend`) and
+The `kubernetes`, `etcd`, and `filesystem` backends replace the gossip protocol
+with a shared store, giving a **fenced** election while the store is reachable
+(exactly-once on `kubernetes`/`etcd`; on `filesystem`, fenced under NTP-bounded
+clock skew). They share one code path (`yacron2.leadership.LeaseBackend`) and
 differ only in which store they talk to. This section covers how they elect, how
 to deploy each, their failure modes, and how to monitor them; the config keys
 are in the [Configuration Reference](Configuration-Reference#cluster).
 
-How the lease backends talk to their store: **over plain HTTP using the core
-`aiohttp` dependency**, namely the Kubernetes apiserver's REST API and etcd's v3
-gRPC-gateway JSON API. So the **core install gains no new dependency**, and by
-avoiding grpc/protobuf wheels both backends run on the full set of architectures
+How the lease backends talk to their store: `kubernetes` and `etcd` speak
+**plain HTTP over the core `aiohttp` dependency**, namely the Kubernetes
+apiserver's REST API and etcd's v3 gRPC-gateway JSON API, while `filesystem`
+talks to no service at all (its store is a directory, driven with the standard
+library). So the **core install gains no new dependency**, and by avoiding
+grpc/protobuf wheels every lease backend runs on the full set of architectures
 yacron2 ships for. The Kubernetes backend can optionally use the **official
 `kubernetes` client** when it is installed
 (`pip install yacron2[kubernetes]`): `cluster.kubernetes.clientLibrary: auto`
@@ -942,9 +974,10 @@ uses its own v3 JSON gateway, so it has no optional client.
 * **The lease is the fence, not a name.** Leadership is decided by the
   *lease*, so a duplicate node identity cannot make two nodes both lead the way
   it can on a naive lease holder: etcd fences on the **bound lease id** (only
-  the node whose own lease backs the election key leads), and Kubernetes writes
-  a **per-process `holderIdentity` token** so two nodes sharing a `nodeName`
-  still write distinct holders. You should still give each node a stable, unique
+  the node whose own lease backs the election key leads), and Kubernetes and
+  filesystem write a **per-process token** into the holder they record
+  (`<identity>#<token>`) so two nodes sharing a `nodeName` still write
+  distinct holders. You should still give each node a stable, unique
   name for clear observability (see
   [Node identity](#node-identity-for-the-lease-backends)).
 * **Local-expiry safety.** A holder only calls itself leader until a
@@ -965,8 +998,8 @@ uses its own v3 JSON gateway, so it has no optional client.
 
 ### How a lease backend elects
 
-Both reduce leadership to "hold a short-lived lease on a shared object and keep
-renewing it":
+All three reduce leadership to "hold a short-lived lease on a shared object and
+keep renewing it":
 
 * **Kubernetes** drives a single `coordination.k8s.io/v1` `Lease`. The holder
   writes its identity into `spec.holderIdentity` and refreshes `spec.renewTime`
@@ -981,11 +1014,20 @@ renewing it":
   keeps alive. At most one node's transaction wins; if the holder dies the lease
   expires, etcd deletes the key, and another node's transaction wins. etcd's
   server enforces the TTL.
+* **Filesystem** takes the same flock-guarded, fence-counted TTL lease the
+  [durable state store](Durable-State) provides, on a lease file in the shared
+  directory. The holder renews it under the lock every `max(1s, ttl / 3)`; if
+  it stops, the written expiry passes and a challenger takes the lease over,
+  bumping the **fence counter**. The takeover compares the challenger's wall
+  clock against the expiry the holder *wrote* -- a cross-host clock
+  comparison, so unlike the two backends above it carries a ~2 s clock-skew
+  budget (see [Filesystem](#filesystem-backend-filesystem) below).
 
-Both gate `is_leader()` on a **locally-computed** lease deadline (renew/keepalive
+All three gate `is_leader()` on a **locally-computed** lease deadline (renew/keepalive
 time + duration − a 1 s clock-skew margin), so a node whose renew loop stalls
 **self-demotes with no network call**: that local expiry, not the store, is what
-guarantees two holders never act at once. Separately, `is_quorate()` reflects
+guarantees two holders never act at once (on `filesystem`, together with the
+challenger-side margin and NTP-bounded clocks). Separately, `is_quorate()` reflects
 whether the node has a *fresh successful read* of the store (within one lease
 duration / TTL); when it goes stale, `Leader` jobs fail closed and the never-skip
 `PreferLeader` default runs the job anyway.
@@ -1013,6 +1055,11 @@ Leadership is fenced on the **lease**, but each node still carries an identity:
   dashboard and `GET /cluster` strip the token back to the readable name (so
   `kubectl get lease … -o jsonpath='{.spec.holderIdentity}'` shows the suffixed
   form, while the dashboard shows the clean name).
+* **filesystem**: the holder written into the lease file is always
+  `<nodeName>#<12-hex per-process token>`, so two nodes sharing a `nodeName`
+  (or a restarted daemon) can never adopt or renew each other's lease; as on
+  Kubernetes, the dashboard and `GET /cluster` strip the token back to the
+  readable name, and no run/skip decision ever string-compares it.
 
 A duplicate identity therefore no longer silently breaks the fence, but give
 each node a **stable, unique name** anyway so the holder shown in the dashboard,
@@ -1127,9 +1174,110 @@ cluster:
   honours: a smaller server-granted TTL narrows the effective leader window
   accordingly.
 
+### Filesystem (`backend: filesystem`)
+
+Point the backend at a directory on a mount every node shares (an Amazon S3
+Files / EFS / NFSv4 mount). The mount *is* the store, so there is no service
+to deploy and nothing beyond the standard library at work:
+
+```yaml
+cluster:
+  backend: filesystem
+  filesystem:
+    path: /mnt/shared/yacron2       # the directory the election lease lives in (required)
+    # electionName: cluster/leader  # the lease's name inside the store
+    # ttl: 15                        # lease time-to-live, seconds (>= 3; renewed every ~ttl/3)
+    # deploymentId: null             # namespace inside the store; null -> "default"
+    # topology: auto                 # auto | single-node | shared (assert shared on Windows/macOS)
+  nodeName: yacron-a
+```
+
+The full key table is in the
+[Configuration Reference](Configuration-Reference#cluster); `deploymentId` and
+`topology` carry the same semantics as their [`state:`](Durable-State)
+counterparts. `ttl` must be **>= 3** (a smaller value is rejected at config
+load: the holder keeps the lease only until `ttl` minus the clock-skew margin
+and renews every `max(1s, ttl / 3)`, so a smaller `ttl` would make a node
+treat its own freshly-won lease as expired).
+
+* **How it elects.** Leadership is the [durable state store](Durable-State)'s
+  flock-guarded, fence-counted TTL lease: one small file under the store's
+  `leases/` directory, taken and renewed under an advisory lock, with a
+  monotonic **fence counter** that bumps on every takeover. The holder string
+  written into the lease is `<nodeName>#<12-hex per-process token>` (see
+  [Node identity](#node-identity-for-the-lease-backends)). The holder renews
+  every `max(1s, ttl / 3)` and calls itself leader only until a local
+  `time.monotonic` deadline anchored *before* the renewing write, minus a 1 s
+  clock-skew margin, so a stalled renew loop **self-demotes with no I/O**; a
+  challenger refuses to take over until the observed expiry is a further 1 s
+  in the past *by its own clock*.
+* **Clocks: run NTP on every node.** Those two 1 s margins are the whole skew
+  budget: the takeover compares wall clocks *across hosts*, so two
+  simultaneous leaders need inter-host skew above their sum, **~2 s**. NTP
+  keeps real fleets orders of magnitude below that; it is the same
+  requirement [Durable State](Durable-State#operational-notes) documents
+  under "Clocks on shared mounts". This backend does **not** inherit the
+  `kubernetes`/`etcd` skew immunity (those judge takeover on a single clock).
+* **The lock-fidelity probe (a hard refusal).** `start()` refuses a store
+  whose locks are demonstrably fiction, raising a `ConfigError` of the form
+  `cluster.backend filesystem: refusing to elect over <path>: …` instead of
+  silently electing two leaders. Two same-host checks: a **functional probe**
+  (two descriptors of one file must contend on a non-blocking exclusive lock;
+  a mount that grants both has no-op locks, e.g. `… grants two exclusive
+  locks on one file (its locks are no-ops)`), and on Linux a **mount-option
+  sniff** (an NFS mount carrying `nolock` or `local_lock=flock`/`local_lock=all`
+  satisfies flock host-locally, so its locks `are host-local and cannot fence
+  other nodes`). A refused start leaves the manager unbuilt, so `Leader` jobs
+  fail closed -- the safe direction (see
+  [Failure handling](#failure-handling)).
+* **The Windows/macOS residual.** Both probe checks run on one host, so a
+  mount whose locks are real locally but not propagated across hosts is
+  **not detectable** on platforms without `/proc/mounts` (Windows, macOS).
+  There `topology: auto` cannot probe and resolves `single-node` -- the store
+  then warns that "its locks only exclude processes on THIS host" and asks
+  you to `set cluster.filesystem.topology: shared` if the directory really is
+  a shared mount -- and on a Windows shared mount `start()` logs a loud
+  advisory: "cross-host lock fidelity cannot be verified on this platform (no
+  /proc/mounts); the election is safe only if the mount honours byte-range
+  locks across hosts". The residual safety rests on that operator assertion.
+* **What `quorate` means here.** A fresh **positive** observation of the
+  lease store within one `ttl`: only an operation that returned an actual
+  lease (a renew, an acquire, or a read that parsed a live holder) counts. A
+  `None` from the lease API is deliberately *not* contact -- the store fails
+  closed, conflating "denied" with "unreadable" -- so a sick store lapses
+  quorum: `Leader` jobs fail closed and never-skip `PreferLeader` jobs run
+  anyway (they may double-run across the outage), the same posture as the
+  other lease backends' store outage. Each failed round logs
+  `cluster: filesystem election round failed: …` at WARNING.
+* **Sharing a directory with `state:`.** Legal, and recommended when both are
+  used (same `path` *and* `deploymentId`): the election's embedded store runs
+  none of the scheduler's durable-state chores (no manifests, no GC, no
+  counters), the stream namespaces are disjoint, and lease files are never
+  garbage-collected.
+* **`@reboot` one-shots.** Same semantics as the other lease backends: once
+  per job **configuration**, not once per boot. The "already ran" set is
+  persisted as **append-only records** (one per newly-ran job, tagged with
+  the job-set id) in the store's `cluster/reboot-ran` stream; readers union
+  the records matching the *live* job-set id, and the stream is pruned to the
+  newest **512** records (a documented bound). The set is re-read every 60 s
+  and immediately on gaining leadership, so a failover leader never re-runs a
+  one-shot the old leader marked moments before.
+* **Failover timing.** A dead holder is replaced within ~`ttl` (plus the 1 s
+  challenger margin). On a *graceful* stop the holder releases the lease
+  best-effort so a survivor takes over at once; TTL expiry is the fallback.
+* **Monitoring.** `GET /cluster` returns the lease-shaped view with
+  `backend: "filesystem"` and a `lease` block
+  `{path, electionName, identity, holder, fence, expiry}`; `fence` is the
+  store's monotonic takeover counter, so a bump marks each real leadership
+  change. No new Prometheus families; see
+  [Monitoring the lease backends](#monitoring-the-lease-backends). A healthy
+  start logs `cluster: filesystem election ready at <path> (election=…,
+  identity=…, ttl=…)`.
+
 ### Failure modes
 
-* **Store unreachable** (apiserver / etcd down, or partitioned from this node).
+* **Store unreachable** (apiserver / etcd down, a hung or unmounted shared
+  mount, or partitioned from this node).
   Within one duration / TTL the node's `is_quorate()` goes stale, so its
   `Leader` jobs **fail closed** (skip) and its `PreferLeader` jobs **run anyway**
   (the never-skip rule: they may double-run across the outage). When the store
@@ -1139,7 +1287,11 @@ cluster:
 * **A fenced backend never shows two simultaneous leaders.** Unlike gossip there
   is no thin-bridge / convergence double-run window for `Leader` jobs, so
   scraping every replica for `is_leader: true` (the gossip double-run check)
-  will never find two while the store is healthy.
+  will never find two while the store is healthy. On `filesystem` this holds
+  while inter-host clock skew also stays inside the ~2 s budget (see
+  [Filesystem](#filesystem-backend-filesystem)); a store with fake locks never
+  gets this far -- it is refused at start with a `ConfigError` ("refusing to
+  elect over …") and `Leader` jobs fail closed.
 * **Kubernetes optimistic concurrency.** Writes carry the observed
   `resourceVersion`; a node that loses the race gets an HTTP `409`, stands down
   for that round, and retries. The graceful release is best-effort: if it races
@@ -1156,21 +1308,26 @@ cluster:
 ### Monitoring the lease backends
 
 **`quorate` is the field to alert on for every backend**; on a lease backend it
-means this node has a fresh read of the store, not that it sees a majority. The
+means this node has a fresh read of the store (on `filesystem`, a fresh
+*positive* read: an operation that actually returned a lease), not that it
+sees a majority. The
 gossip alerts on the [Monitoring](#monitoring-and-alerting) table (per-peer
 status, agreed-peers-vs-quorum, `untrusted` certs, the multi-leader scrape) **do
 not apply**: a lease view has `peers: []`, `quorum: 1`, and `conflict` is always
-`false`, and a fenced backend never reports two leaders. So the signal that
+`false`, and a fenced backend never reports two leaders (on `filesystem`,
+within its ~2 s skew budget). So the signal that
 matters is **`quorate`**:
 
 | Alert when | Field(s) | Means |
 | --- | --- | --- |
 | `quorate` is `false` on a replica for more than a few rounds | `quorate` | that replica **cannot reach the lease store** (not "no majority"): its `Leader` jobs are standing down and its `PreferLeader` jobs may double-run |
-| the holder is unexpected or flapping | `lease.holder`, `lease.expiry` | leadership is moving more than it should (renew loop starved, duration too short) |
+| the holder is unexpected or flapping | `lease.holder`, `lease.expiry`, and on `filesystem` `lease.fence` (it bumps on every real takeover) | leadership is moving more than it should (renew loop starved, duration too short) |
 
 Probe `GET /cluster` on each replica, or watch the store directly
 (`kubectl get lease <name> -o jsonpath='{.spec.holderIdentity}'`,
-`etcdctl get <electionName>`). The same leadership transitions are logged.
+`etcdctl get <electionName>`; the filesystem election lease is a small JSON
+file under the store's `leases/` directory on the mount). The same leadership
+transitions are logged.
 
 The lease-backend `@reboot` behaviour is covered inline in the main
 [`@reboot` section](#reboot-jobs-under-leader-election).

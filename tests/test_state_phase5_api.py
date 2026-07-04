@@ -12,6 +12,10 @@ Style: bare ``async def`` tests, real temp store via ``_backend``, no frozen
 clock (lock TTLs are kept at the floor and never waited on for a renewal).
 """
 
+import asyncio
+import os
+import sys
+
 import aiohttp
 
 from tests.test_state import _backend, _state_cfg
@@ -519,6 +523,46 @@ async def test_cron_jobapi_disabled(tmp_path):
         assert token is None
         assert env == {}
     finally:
+        if cron.state_backend is not None:
+            await cron.state_backend.stop()
+
+
+async def test_end_to_end_real_subprocess(tmp_path):
+    # The full chain in one process: the daemon injects the env, a REAL child
+    # process runs the CLI, the CLI reaches the loopback endpoint over TCP, and
+    # the write lands in the backend. This is the one seam the other tests
+    # split across the server, the CLI parser, and env injection.
+    cron = Cron(None, config_yaml=_ONE_JOB.format(path=tmp_path))
+    await cron.start_stop_state(_state_cfg(_ONE_JOB.format(path=tmp_path)))
+    try:
+        job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
+        token, env = cron._prepare_job_api_run(job, None)
+        child_env = {**os.environ, **env}
+        # run via create_subprocess_exec (not blocking subprocess.run) so the
+        # daemon's event loop stays free to serve the child's loopback request.
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "yacron2",
+            "state",
+            "set",
+            "greeting",
+            "hi",
+            env=child_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await proc.communicate()
+        assert proc.returncode == 0, err.decode(errors="replace")
+        # it landed in the job's own default scope (the job name), through the
+        # endpoint the child reached over the injected YACRON2_STATE_URL.
+        from yacron2 import jobstate
+
+        body = await jobstate.kv_get(cron.state_backend, "j", "greeting")
+        assert body is not None and body["value"] == "hi"
+        await cron._job_api.finish_run(token)
+    finally:
+        await cron._stop_job_api()
         if cron.state_backend is not None:
             await cron.state_backend.stop()
 

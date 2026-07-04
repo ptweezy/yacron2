@@ -18,10 +18,12 @@ the ``grp``/``pwd`` databases), but is likewise gated on :data:`IS_WINDOWS`.
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import signal
 import sys
+import time
 from typing import Callable, Iterator, List, Union
 
 # Platform-specific file-locking primitive, imported behind a ``sys.platform``
@@ -184,10 +186,24 @@ def exclusive_file_lock(fileno: int) -> Iterator[None]:
     if sys.platform == "win32":  # pragma: no cover - Windows-only path
         # msvcrt.locking locks ``nbytes`` from the current file position; lock
         # the first byte (the caller guarantees the lock file has one).
-        # LK_LOCK retries internally for ~10s, then raises OSError, rather than
-        # blocking forever as flock does.
+        # msvcrt has no true blocking mode: LK_LOCK retries internally about
+        # once a second for ~10 attempts and then raises OSError -- which
+        # would surface as a spurious lease failure whenever another process
+        # held the lock a little long.  Emulate flock's indefinite block with
+        # a non-blocking attempt loop instead; callers already run this on a
+        # worker thread, so the sleep never touches the event loop.
         os.lseek(fileno, 0, os.SEEK_SET)
-        msvcrt.locking(fileno, msvcrt.LK_LOCK, 1)
+        while True:
+            try:
+                msvcrt.locking(fileno, msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as ex:
+                # retry only CONTENTION (EACCES from LK_NBLCK, EDEADLOCK
+                # from the CRT); any other error -- a closed/invalid fd,
+                # say -- must surface, not become an infinite spin.
+                if ex.errno not in (errno.EACCES, errno.EDEADLOCK):
+                    raise
+                time.sleep(0.05)
         try:
             yield
         finally:

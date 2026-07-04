@@ -508,11 +508,17 @@ jobs:
     captureStdout: true
 """
 
+# Regenerated when onlyIfLastSucceeded entered the identity (it gates every
+# scheduled fire, like `enabled`, so replicas disagreeing on it must show as
+# drift). The v1 scheme had not shipped in any release at that point, so no
+# operator-stored ids existed to invalidate and SCHEME_VERSION stays v1; a
+# post-release change of this kind WOULD require the bump the comment above
+# demands.
 GOLDEN_JOB_SET_ID = (
-    "v1:491b050853db073090309a09312073ad422fc42dbd4b383158f24cb643ac4243"
+    "v1:d9b739b4e1b0a55bfa9929c00ab439b5b45ece1dec79e103f6346f8e5719bccf"
 )
 GOLDEN_ALPHA_DIGEST = (
-    "b65d5808540f239ebc702c2a15f46595d52c7c6617ffda2835b49d45f4f52aa8"
+    "c499a588afc43ad866589ff7194e09e571946290cd96a57d2065dc4c02c40c40"
 )
 
 
@@ -542,6 +548,9 @@ EXPECTED_CANONICAL_FIELDS = frozenset(
         "maxLineLength",
         "timezone",
         "enabled",
+        # gates every scheduled fire (like `enabled`): replicas disagreeing
+        # on it must show as drift, so it is part of the identity.
+        "onlyIfLastSucceeded",
         "failsWhen",
         "onFailure",
         "onPermanentFailure",

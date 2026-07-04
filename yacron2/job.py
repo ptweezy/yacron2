@@ -71,9 +71,15 @@ class JobOutputStream:
         self.lines: Deque[Tuple[str, str]] = deque(maxlen=limit)
         self._subscribers: List["asyncio.Queue"] = []
         self.closed = False
+        # total lines ever published: `published - len(lines)` is how many
+        # the ring evicted, so a consumer archiving the buffer (see
+        # Cron._archive_output) can record the truncation instead of
+        # presenting the tail as the whole output.
+        self.published = 0
 
     def publish(self, stream_name: str, line: str) -> None:
         item = (stream_name, line)
+        self.published += 1
         self.lines.append(item)
         for queue in self._subscribers:
             queue.put_nowait(item)

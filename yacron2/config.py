@@ -745,7 +745,10 @@ class JobConfig:
         # (yacron2.fingerprint): it is a restart-time, node-local behaviour
         # depends on a durable state backend, not a property of "which jobs run
         # on which schedule", so it does not gate leader-election drift and
-        # needs no SCHEME_VERSION bump.
+        # needs no SCHEME_VERSION bump.  The same goes for the archival pair
+        # (observability, not behaviour).  onlyIfLastSucceeded is different:
+        # it gates EVERY scheduled fire, so it IS fingerprinted, like
+        # `enabled` -- replicas disagreeing on it must show as drift.
         self.onMissed = config.pop("onMissed")
         self.startingDeadlineSeconds = config.pop("startingDeadlineSeconds")
         self.catchupJitterSeconds = config.pop("catchupJitterSeconds")

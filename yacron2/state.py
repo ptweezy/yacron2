@@ -49,15 +49,29 @@ standard library, so it costs the common, stateless install nothing.
 import abc
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 from yacron2.config import ConfigError, StateConfig
 from yacron2.platform import IS_WINDOWS, exclusive_file_lock
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger("yacron2.state")
 
@@ -102,10 +116,28 @@ _SHARED_FSTYPES = frozenset(
 
 # Characters kept as-is in a filename; everything else in a stream/namespace/
 # lease name is percent-encoded (see _fs_safe), which is injective, so two
-# distinct job names can never collide on one on-disk path.
-_FS_SAFE = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+# distinct job names can never collide on one on-disk path.  Deliberately
+# lowercase-only (uppercase is encoded) so the mapping stays injective on
+# case-INsensitive filesystems (NTFS, APFS), and dot-free (``.`` is encoded)
+# so no name can produce ``.``/``..`` path components or the trailing-dot
+# aliases Windows strips.
+_FS_SAFE = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
+
+# Windows device names, reserved in every directory (case-insensitively).  A
+# lowercase job name could otherwise pass through _fs_safe verbatim and make
+# every open/mkdir under it fail (or hit the console device) on Windows.
+_WINDOWS_RESERVED = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {"com{}".format(i) for i in range(1, 10)}
+    | {"lpt{}".format(i) for i in range(1, 10)}
 )
+
+# Longest _fs_safe token emitted, comfortably under NAME_MAX (255 bytes) once
+# the surrounding prefixes/suffixes ("runs%2F", ".json", ".lease") are added.
+# Longer encodings are truncated and made unique again with a digest; without
+# this a long (or non-ASCII, at 3 encoded chars per UTF-8 byte) job name makes
+# every append/list for its stream fail with ENAMETOOLONG forever.
+_FS_SAFE_MAX = 130
 
 
 def _now() -> float:
@@ -123,7 +155,20 @@ def _fs_safe(name: str) -> str:
 
     Any byte outside :data:`_FS_SAFE` is percent-encoded from its UTF-8
     encoding, so arbitrary job names (which may contain ``/``, spaces, unicode)
-    map to distinct, portable filenames without collisions.
+    map to distinct, portable filenames without collisions.  Injectivity holds
+    even case-insensitively: the safe set has no uppercase, and the uppercase
+    hex the escapes emit is fixed-case, so two tokens that differ only by case
+    cannot both be produced.  Three escape hatches keep the token usable as a
+    path component everywhere:
+
+    * a token that IS a reserved Windows device name (``con``, ``nul``, ...)
+      gets its first character force-encoded -- unambiguous, since the natural
+      encoding never escapes a safe character;
+    * a token longer than :data:`_FS_SAFE_MAX` (ENAMETOOLONG territory) is
+      truncated and re-uniqued with a SHA-256 digest of the original name,
+      joined by ``%.`` -- a marker the natural encoding (``%`` + 2 uppercase
+      hex) can never emit;
+    * an empty name maps to ``_``.
     """
     out: List[str] = []
     for byte in name.encode("utf-8"):
@@ -132,7 +177,13 @@ def _fs_safe(name: str) -> str:
             out.append(char)
         else:
             out.append("%{:02X}".format(byte))
-    return "".join(out) or "_"
+    token = "".join(out) or "_"
+    if token in _WINDOWS_RESERVED:
+        token = "%{:02X}".format(ord(token[0])) + token[1:]
+    if len(token) > _FS_SAFE_MAX:
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+        token = token[: _FS_SAFE_MAX - 34] + "%." + digest
+    return token
 
 
 def _unescape_mount(field: str) -> str:
@@ -208,14 +259,30 @@ def detect_topology(path: str) -> Optional[str]:
     return "shared" if fstype in _SHARED_FSTYPES else "single-node"
 
 
+class _LeaseUnreadable(Exception):
+    """A lease file exists (or may exist) but cannot be trusted right now.
+
+    Raised (internally) when the lease file is unreadable for any reason other
+    than plain absence: a transient I/O error on a shared mount (ESTALE/EIO),
+    a permissions problem, or corrupt content.  The lease operations treat it
+    as *fail closed*: an acquire/renew is denied rather than treating the
+    unreadable state as "no lease" and stealing a possibly-valid, unexpired
+    lease from its live holder (with a reset fence).
+    """
+
+
 @dataclass
 class Lease:
     """A held (or observed) TTL lease.
 
-    ``fence`` increases every time the lease is *taken over* from an expired
-    holder (fixed across a same-holder renew), so a stale holder can be
-    detected and its late writes fenced off; ``expires_at`` is wall-clock epoch
-    seconds; the lease is free to take over once ``_now() > expires_at``.
+    ``fence`` increases every time the lease is *taken over* (fixed only
+    across a same-holder renew of a still-valid lease), so a stale holder can
+    be detected and its late writes fenced off.  It is monotonic for the life
+    of the store: release marks the lease expired *in place* (never deletes
+    the file), so the counter survives release/re-acquire cycles instead of
+    resetting to 1 and re-issuing fence values already handed out.
+    ``expires_at`` is wall-clock epoch seconds; the lease is free to take over
+    once ``_now() > expires_at``.
     """
 
     name: str
@@ -300,7 +367,13 @@ class StateBackend(abc.ABC):
     async def acquire_lease(
         self, name: str, holder: str, ttl: float
     ) -> Optional[Lease]:
-        """Take (or renew) lease ``name`` for ``ttl``s, else ``None``."""
+        """Take (or renew) lease ``name`` for ``ttl``s, else ``None``.
+
+        A caller that bounds this with a timeout must treat a timeout as
+        UNKNOWN, not as denied: the abandoned worker may still complete the
+        acquisition on disk, leaving the lease held (by this holder) until
+        its TTL lapses.
+        """
 
     @abc.abstractmethod
     async def renew_lease(self, lease: Lease, ttl: float) -> Optional[Lease]:
@@ -345,7 +418,9 @@ class FilesystemStateBackend(StateBackend):
     ) -> None:
         self.config = config
         self.get_job_set_id = get_job_set_id
-        self.root = os.path.abspath(config["path"])
+        # expanduser first: `path: ~/state` must mean the home directory, not
+        # a literal "~" directory under whatever CWD the daemon started in.
+        self.root = os.path.abspath(os.path.expanduser(config["path"]))
         # a stable prefix so several deployments can share one store without
         # colliding; job-set scoping (like the lease backends' @reboot set) is
         # layered on top by callers via the stream name, in later phases.
@@ -356,7 +431,20 @@ class FilesystemStateBackend(StateBackend):
         # temp files from different nodes/processes onto one shared mount never
         # collide on a name.  os.urandom is fine (uniqueness, not secrecy).
         self._instance = os.urandom(6).hex()
+        # The sync halves below run on (daemon) worker threads, several of
+        # which may be in flight at once -- two jobs finishing together each
+        # schedule an append.  An unlocked `self._seq += 1` is a read-modify-
+        # write two threads can interleave, and a duplicated seq (plus the
+        # coarse Windows clock) means a duplicated record id: one record
+        # silently clobbering another via the atomic rename.
         self._seq = 0
+        self._seq_lock = threading.Lock()
+        # Bounds concurrent worker threads (see _call).  Daemon threads make
+        # a hung store abandonable, but without a cap a wedged mount plus a
+        # busy scheduler would pile up one stuck thread per finished run;
+        # excess calls queue on the semaphore (cheap pending tasks) instead.
+        # Created lazily so construction needs no running event loop.
+        self._call_slots: Optional[asyncio.Semaphore] = None
 
     # --- paths -----------------------------------------------------------
 
@@ -376,13 +464,76 @@ class FilesystemStateBackend(StateBackend):
             os.path.join(leases, safe + ".lease"),
         )
 
+    def _next_seq(self) -> int:
+        with self._seq_lock:
+            self._seq += 1
+            return self._seq
+
     def _tmp_path(self) -> str:
-        self._seq += 1
         return os.path.join(
             self.base,
             TMP_DIR,
-            "w-{}-{:012d}.tmp".format(self._instance, self._seq),
+            "w-{}-{:012d}.tmp".format(self._instance, self._next_seq()),
         )
+
+    # --- worker threads ----------------------------------------------------
+
+    async def _call(self, fn: Callable[..., _T], *args: Any) -> _T:
+        """Run blocking ``fn(*args)`` on a *daemon* thread and await it.
+
+        Not ``asyncio.to_thread``: the default executor's threads are
+        non-daemonic and joined at interpreter exit, so one worker wedged in
+        an uninterruptible NFS syscall (the classic dead-server hard mount)
+        would hang process shutdown forever -- exactly what the bounded
+        shutdown flush promises cannot happen.  A daemon thread per call keeps
+        a hung store abandonable: callers can time out (``asyncio.wait_for``)
+        and exit; the OS reclaims the stuck thread.  State ops are low-rate
+        (a handful per finished run), so thread-per-call is cheap.
+        """
+        loop = asyncio.get_running_loop()
+        if self._call_slots is None:
+            self._call_slots = asyncio.Semaphore(16)
+        slots = self._call_slots
+        # The slot is held for the THREAD's lifetime, released from its
+        # completion callback -- not scoped to this await, which a wait_for
+        # timeout can cancel while the thread is still stuck in a syscall.
+        # Scoping it here would un-bound the thread count in exactly the
+        # hung-store case the cap exists for.
+        await slots.acquire()
+        future: asyncio.Future = loop.create_future()
+
+        def _resolve(result: Any, exc: Optional[BaseException]) -> None:
+            slots.release()
+            if future.cancelled():
+                return  # the awaiter timed out / went away: nobody to tell
+            if exc is not None:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        def _runner() -> None:
+            result: Any = None
+            exc: Optional[BaseException] = None
+            try:
+                result = fn(*args)
+            except BaseException as ex:  # noqa: BLE001 - relayed to awaiter
+                exc = ex
+            try:
+                loop.call_soon_threadsafe(_resolve, result, exc)
+            except RuntimeError:
+                # the loop already closed (late finish during teardown):
+                # nothing is waiting; drop the result (the slot stays taken,
+                # which is moot -- the loop is gone).
+                pass
+
+        try:
+            threading.Thread(
+                target=_runner, daemon=True, name="yacron2-state"
+            ).start()
+        except BaseException:
+            slots.release()  # the thread never ran; nobody else will free it
+            raise
+        return cast(_T, await future)
 
     # --- lifecycle -------------------------------------------------------
 
@@ -391,7 +542,7 @@ class FilesystemStateBackend(StateBackend):
         return self._topology
 
     async def start(self) -> None:
-        await asyncio.to_thread(self._start_sync)
+        await self._call(self._start_sync)
         logger.info(
             "state: filesystem backend ready at %s "
             "(namespace=%s, topology=%s, shared_locking=%s)",
@@ -402,8 +553,15 @@ class FilesystemStateBackend(StateBackend):
         )
 
     def _start_sync(self) -> None:
+        # 0o700 (further narrowed by the umask): records and archived output
+        # can carry job output -- secrets, even post-redaction -- so nothing
+        # here should be world-readable on a multi-user host.  Only applied to
+        # directories this process creates; an operator who pre-created the
+        # tree with wider modes has made that choice deliberately.
         for sub in (RECORDS_DIR, LEASES_DIR, QUARANTINE_DIR, TMP_DIR):
-            os.makedirs(os.path.join(self.base, sub), exist_ok=True)
+            os.makedirs(
+                os.path.join(self.base, sub), mode=0o700, exist_ok=True
+            )
         self._topology = self._resolve_topology()
         # Fail start() loudly if the store is not actually writable (a bad
         # mount, wrong permissions) rather than silently swallowing every later
@@ -412,11 +570,17 @@ class FilesystemStateBackend(StateBackend):
         probe = os.path.join(
             self.base, TMP_DIR, "startup-{}.probe".format(self._instance)
         )
-        with open(probe, "wb") as fobj:
-            fobj.write(b"ok")
-            fobj.flush()
-            os.fsync(fobj.fileno())
-        os.unlink(probe)
+        try:
+            with open(probe, "wb") as fobj:
+                fobj.write(b"ok")
+                fobj.flush()
+                os.fsync(fobj.fileno())
+        finally:
+            # remove the probe even when the write/fsync raised (a probe
+            # that failed midway would otherwise leak into TMP_DIR on every
+            # failed start retry).
+            with contextlib.suppress(OSError):
+                os.unlink(probe)
 
     def _resolve_topology(self) -> str:
         configured = self._configured_topology
@@ -453,6 +617,28 @@ class FilesystemStateBackend(StateBackend):
 
     # --- record store ----------------------------------------------------
 
+    @staticmethod
+    def _replace(src: str, dest: str) -> None:
+        """``os.replace`` that rides out Windows sharing violations.
+
+        On Windows, replacing a file another handle has open (the deliberately
+        unlocked ``read_lease``, an antivirus/backup scan) raises
+        ``PermissionError`` because CPython opens files without
+        FILE_SHARE_DELETE.  Such holds are transient by nature, so retry
+        briefly before giving up; on POSIX this is a single plain replace.
+        """
+        if not IS_WINDOWS:
+            os.replace(src, dest)
+            return
+        for attempt in range(5):
+            try:
+                os.replace(src, dest)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+
     def _atomic_write(self, dest: str, payload: bytes) -> None:
         """Write ``payload`` to ``dest`` via a temp file + atomic rename.
 
@@ -460,27 +646,48 @@ class FilesystemStateBackend(StateBackend):
         and -- crucially -- on an Amazon S3 Files mount, where *file* rename is
         atomic even though the underlying object store has no native rename.  A
         reader therefore never observes a half-written ``dest``.
+
+        Data files are created 0o600 (narrowed further by the umask): records
+        and archived output can carry job output, which is exactly where
+        secrets live.  After the rename the parent directory is fsync'd (POSIX
+        only; a directory cannot be opened on Windows), because without it the
+        rename itself is not crash-durable -- a power loss could silently
+        drop an acknowledged record, regress the derived watermark, and
+        double-run jobs on the next boot.
         """
         tmp = self._tmp_path()
-        with open(tmp, "wb") as fobj:
-            fobj.write(payload)
-            fobj.flush()
-            os.fsync(fobj.fileno())
-        os.replace(tmp, dest)
+        try:
+            fdesc = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fdesc, "wb") as fobj:
+                fobj.write(payload)
+                fobj.flush()
+                os.fsync(fobj.fileno())
+            self._replace(tmp, dest)
+        except BaseException:
+            # never leave the temp file behind on a failed write/rename
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        if not IS_WINDOWS:
+            with contextlib.suppress(OSError):
+                dfd = os.open(os.path.dirname(dest), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
 
     async def append_record(self, stream: str, data: Dict[str, Any]) -> str:
-        return await asyncio.to_thread(self._append_sync, stream, data)
+        return await self._call(self._append_sync, stream, data)
 
     def _append_sync(self, stream: str, data: Dict[str, Any]) -> str:
         stream_dir = self._stream_dir(stream)
-        os.makedirs(stream_dir, exist_ok=True)
+        os.makedirs(stream_dir, mode=0o700, exist_ok=True)
         # Filename sort key is the write-time epoch (zero-padded so it sorts
         # lexicographically == chronologically), then instance+seq for
         # uniqueness.  The record's own logical timestamp lives in ``data`` and
         # is what derive_max reads; the filename only orders listing.
-        self._seq += 1
         rec_id = "{:020.6f}-{}-{:012d}".format(
-            _now(), self._instance, self._seq
+            _now(), self._instance, self._next_seq()
         )
         payload = json.dumps(
             {"schemaVersion": SCHEME_VERSION, "data": data},
@@ -497,7 +704,7 @@ class FilesystemStateBackend(StateBackend):
             "{}.{}.bad".format(name, self._instance),
         )
         try:
-            os.replace(path, dest)
+            self._replace(path, dest)
             logger.warning(
                 "state: quarantined corrupt record %s (%s)", name, reason
             )
@@ -516,7 +723,35 @@ class FilesystemStateBackend(StateBackend):
         except FileNotFoundError:
             # raced away (pruned/quarantined) between listdir and open: skip.
             return None
-        except (OSError, ValueError):
+        except OSError as ex:
+            # An I/O error is the ENVIRONMENT failing (an NFS blip, an AV
+            # scanner's transient hold), not the record: skip it for this
+            # read but leave it in place.  Quarantining here would eject
+            # perfectly valid history -- and regress the derived watermark --
+            # on every store hiccup.
+            hint = ""
+            if isinstance(ex, PermissionError):
+                # data files are deliberately 0o600 (they carry job output):
+                # a persistent EACCES here usually means two nodes run as
+                # DIFFERENT users against one shared store, which silently
+                # hides half the history -- worth a pointed hint.
+                hint = (
+                    " (records are created 0o600: every node sharing this "
+                    "store must run as the same user)"
+                )
+            logger.warning(
+                "state: cannot read record %s (%s); leaving it in place%s",
+                name,
+                ex,
+                hint,
+            )
+            return None
+        except Exception:  # noqa: BLE001 - any content-driven parse failure
+            # The CONTENT is bad: invalid/truncated JSON (ValueError), or a
+            # hostile shape like >1000-deep nesting (RecursionError).  This
+            # must catch everything content-dependent -- a poison record that
+            # raised out of here would escape quarantine and crash whichever
+            # caller is reading the stream ("never fatal" is the invariant).
             self._quarantine(path, name, "unreadable-or-invalid-json")
             return None
         if (
@@ -536,9 +771,7 @@ class FilesystemStateBackend(StateBackend):
         limit: Optional[int] = None,
         newest_first: bool = False,
     ) -> List[Dict[str, Any]]:
-        return await asyncio.to_thread(
-            self._list_sync, stream, limit, newest_first
-        )
+        return await self._call(self._list_sync, stream, limit, newest_first)
 
     def _list_sync(
         self, stream: str, limit: Optional[int], newest_first: bool
@@ -562,7 +795,7 @@ class FilesystemStateBackend(StateBackend):
         return out
 
     async def derive_max(self, stream: str, field: str) -> Optional[Any]:
-        return await asyncio.to_thread(self._derive_max_sync, stream, field)
+        return await self._call(self._derive_max_sync, stream, field)
 
     def _derive_max_sync(self, stream: str, field: str) -> Optional[Any]:
         best: Optional[Any] = None
@@ -583,7 +816,7 @@ class FilesystemStateBackend(StateBackend):
         return best
 
     async def prune_records(self, stream: str, *, keep: int) -> int:
-        return await asyncio.to_thread(self._prune_sync, stream, keep)
+        return await self._call(self._prune_sync, stream, keep)
 
     def _prune_sync(self, stream: str, keep: int) -> int:
         stream_dir = self._stream_dir(stream)
@@ -617,7 +850,7 @@ class FilesystemStateBackend(StateBackend):
         out from under a lock taken on it; locking a stable side-file avoids
         that entirely.
         """
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
         fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             # msvcrt.locking needs a byte present to lock; guarantee one.
@@ -628,24 +861,41 @@ class FilesystemStateBackend(StateBackend):
         finally:
             os.close(fdesc)
 
-    def _read_lease_file(self, lease_path: str) -> Optional[Lease]:
+    def _read_lease_file(
+        self, lease_path: str, *, strict: bool = False
+    ) -> Optional[Lease]:
+        """Read a lease file; ``None`` means *positively absent*.
+
+        With ``strict`` (the locked read-modify-write paths), anything short
+        of plain absence -- a transient I/O error, corrupt content -- raises
+        :class:`_LeaseUnreadable` instead of returning ``None``.  Conflating
+        "unreadable right now" with "no lease" would let one NFS blip steal a
+        valid, unexpired lease from its live holder and re-issue a stale
+        fence.  The unlocked observer (:meth:`read_lease`) stays best-effort.
+        """
         try:
             with open(lease_path, "rb") as fobj:
                 obj = json.loads(fobj.read())
         except FileNotFoundError:
             return None
-        except (OSError, ValueError):
-            return None
-        if not isinstance(obj, dict):
+        except Exception as ex:  # noqa: BLE001 - classified below
+            if strict:
+                raise _LeaseUnreadable(str(ex)) from ex
             return None
         try:
+            if not isinstance(obj, dict):
+                raise TypeError("lease file is not a JSON object")
             return Lease(
                 name=str(obj["name"]),
                 holder=str(obj["holder"]),
                 fence=int(obj["fence"]),
                 expires_at=float(obj["expiresAt"]),
             )
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError) as ex:
+            # corrupt content: _write_lease_file is atomic so this should not
+            # happen; failing closed (deny) beats guessing at a fence.
+            if strict:
+                raise _LeaseUnreadable(str(ex)) from ex
             return None
 
     def _write_lease_file(self, lease_path: str, lease: Lease) -> None:
@@ -657,14 +907,23 @@ class FilesystemStateBackend(StateBackend):
     async def acquire_lease(
         self, name: str, holder: str, ttl: float
     ) -> Optional[Lease]:
-        return await asyncio.to_thread(self._acquire_sync, name, holder, ttl)
+        return await self._call(self._acquire_sync, name, holder, ttl)
 
     def _acquire_sync(
         self, name: str, holder: str, ttl: float
     ) -> Optional[Lease]:
         lock_path, lease_path = self._lease_paths(name)
         with self._locked(lock_path):
-            current = self._read_lease_file(lease_path)
+            try:
+                current = self._read_lease_file(lease_path, strict=True)
+            except _LeaseUnreadable as ex:
+                # fail CLOSED: an unreadable lease is not a free lease.
+                logger.warning(
+                    "state: lease %s unreadable (%s); denying acquire",
+                    name,
+                    ex,
+                )
+                return None
             now = _now()
             if (
                 current is not None
@@ -675,12 +934,14 @@ class FilesystemStateBackend(StateBackend):
                 return None
             if current is None:
                 fence = 1
-            elif current.holder == holder:
-                # a renew by the same holder keeps the fence.
+            elif current.holder == holder and current.expires_at > now:
+                # a renew of our own still-valid lease keeps the fence.
                 fence = current.fence
             else:
-                # taking over an expired lease: bump the fence so the old
-                # holder's late writes can be fenced off.
+                # taking over an EXPIRED (or released) lease -- even our own:
+                # bump the fence so any late writes issued under the previous
+                # incarnation can be fenced off.  Monotonic because release
+                # marks the lease expired in place instead of deleting it.
                 fence = current.fence + 1
             lease = Lease(
                 name=name,
@@ -688,23 +949,50 @@ class FilesystemStateBackend(StateBackend):
                 fence=fence,
                 expires_at=now + ttl,
             )
-            self._write_lease_file(lease_path, lease)
+            try:
+                self._write_lease_file(lease_path, lease)
+            except OSError as ex:
+                # a write that cannot land (Windows sharing violation past
+                # the retries, a read-only blip) means we did NOT acquire:
+                # deny, never raise out of the lease API.
+                logger.warning(
+                    "state: lease %s write failed (%s); denying acquire",
+                    name,
+                    ex,
+                )
+                return None
             return lease
 
     async def renew_lease(self, lease: Lease, ttl: float) -> Optional[Lease]:
-        return await asyncio.to_thread(self._renew_sync, lease, ttl)
+        return await self._call(self._renew_sync, lease, ttl)
 
     def _renew_sync(self, lease: Lease, ttl: float) -> Optional[Lease]:
         lock_path, lease_path = self._lease_paths(lease.name)
         with self._locked(lock_path):
-            current = self._read_lease_file(lease_path)
+            try:
+                current = self._read_lease_file(lease_path, strict=True)
+            except _LeaseUnreadable as ex:
+                # fail closed: without a trustworthy read we cannot prove we
+                # still hold it.  Losing a renew is safe; renewing a lease
+                # someone else took over is not.
+                logger.warning(
+                    "state: lease %s unreadable (%s); denying renew",
+                    lease.name,
+                    ex,
+                )
+                return None
             # Renew only if we still hold it: same holder AND same fence (a
             # takeover would have bumped the fence).  Allowed even a hair past
-            # expiry, as long as nobody else took over in the meantime.
+            # expiry, as long as nobody else took over in the meantime -- but
+            # NOT past a release: a released lease is marked expired in place
+            # with the same holder+fence, and a renew landing after our own
+            # release (an in-flight renew loop racing shutdown) must not
+            # silently resurrect it.
             if (
                 current is None
                 or current.holder != lease.holder
                 or current.fence != lease.fence
+                or current.expires_at <= 0.0
             ):
                 return None
             renewed = Lease(
@@ -713,27 +1001,57 @@ class FilesystemStateBackend(StateBackend):
                 fence=lease.fence,
                 expires_at=_now() + ttl,
             )
-            self._write_lease_file(lease_path, renewed)
+            try:
+                self._write_lease_file(lease_path, renewed)
+            except OSError as ex:
+                # cannot persist the extension: the holder must treat the
+                # renew as failed (fail closed), not crash on it.
+                logger.warning(
+                    "state: lease %s write failed (%s); denying renew",
+                    lease.name,
+                    ex,
+                )
+                return None
             return renewed
 
     async def release_lease(self, lease: Lease) -> None:
-        await asyncio.to_thread(self._release_sync, lease)
+        await self._call(self._release_sync, lease)
 
     def _release_sync(self, lease: Lease) -> None:
         lock_path, lease_path = self._lease_paths(lease.name)
         with self._locked(lock_path):
-            current = self._read_lease_file(lease_path)
+            try:
+                current = self._read_lease_file(lease_path, strict=True)
+            except _LeaseUnreadable:
+                # cannot prove ownership: leave it to expire by TTL.
+                return
             if (
                 current is not None
                 and current.holder == lease.holder
                 and current.fence == lease.fence
             ):
+                # Mark expired IN PLACE rather than unlinking: the lease file
+                # is the fence counter's only home, and deleting it would
+                # reset the next acquire to fence=1 -- re-issuing fence values
+                # already handed out and defeating stale-writer detection.
                 with contextlib.suppress(OSError):
-                    os.unlink(lease_path)
+                    self._write_lease_file(
+                        lease_path,
+                        Lease(
+                            name=lease.name,
+                            holder=lease.holder,
+                            fence=lease.fence,
+                            expires_at=0.0,
+                        ),
+                    )
 
     async def read_lease(self, name: str) -> Optional[Lease]:
         _lock_path, lease_path = self._lease_paths(name)
-        return await asyncio.to_thread(self._read_lease_file, lease_path)
+        lease = await self._call(self._read_lease_file, lease_path)
+        if lease is not None and lease.expires_at <= 0.0:
+            # a released lease: observers see "nobody holds it".
+            return None
+        return lease
 
     # --- introspection ---------------------------------------------------
 

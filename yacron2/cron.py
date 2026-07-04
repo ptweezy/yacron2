@@ -56,7 +56,7 @@ from yacron2.prometheus import (
     PrometheusMetrics,
     resolve_metrics_config,
 )
-from yacron2.redact import redact_secrets
+from yacron2.redact import redact_lines
 from yacron2.state import StateBackend, make_state_backend
 
 logger = logging.getLogger("yacron2")
@@ -92,6 +92,32 @@ RUN_STREAM_PREFIX = "runs/"
 # Prefix for a job's archived captured output (opt-in archiveOutput), one
 # stream per job, pruned to the same maxRunsPerJob bound as the run ledger.
 LOG_STREAM_PREFIX = "logs/"
+# Prefix for a job's catch-up checkpoint stream: an "open" intent is recorded
+# before a backfill is scheduled and a "close" after it completes, so a
+# restart mid-backfill (or mid-jitter) resumes from the intent's watermark
+# instead of silently forfeiting the owed runs -- the run ledger's derived
+# watermark alone cannot tell a backfilled slot from an ordinary run that
+# advanced it past the still-missing slots.  At-least-once: a crash between
+# the last launch and the close record replays; that is the documented trade.
+CATCHUP_STREAM_PREFIX = "catchup/"
+# How many checkpoint records to retain per job (each cycle writes two).
+CATCHUP_STREAM_KEEP = 8
+# Upper bound on any single awaited state-store READ issued from scheduling
+# paths (the depends-on-past gate, the catch-up watermark, rehydration).  A
+# hung mount (dead NFS server) must degrade the stateful features, never
+# stall job scheduling: past the timeout the read is abandoned (its daemon
+# worker thread is left to the OS) and the caller falls back.
+STATE_OP_TIMEOUT = 10.0
+# How long to wait before re-evaluating catch-up when it could not resolve on
+# a pass -- the state backend had not (re)started yet, or the cluster had not
+# converged on an owner.  Keeps the retry off the per-second hot path.
+CATCHUP_RECHECK_INTERVAL = 30.0
+# Longest a backfill launch waits for a non-Forbid job to go idle between
+# its serialized launches.  For Allow/Replace the wait is anti-stampede
+# pacing, not correctness, so it must not starve forever when the job's
+# scheduled instances always overlap; Forbid waits unbounded (launching
+# would be swallowed).
+CATCHUP_IDLE_WAIT_LIMIT = 30.0
 # Floor (seconds) for the gate re-check interval of a deferred fail-closed
 # retry: the cluster gate can stay closed for a while, and a job configured
 # with a tiny/zero backoff delay must not hot-loop the scheduler (and spam the
@@ -194,6 +220,28 @@ def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
     }
 
 
+def _parse_iso_utc(value: Any) -> Optional[datetime.datetime]:
+    """Parse an ISO-8601 string to an AWARE datetime, or ``None``.
+
+    Ledger records written by yacron2 are always aware UTC, but the parsers
+    must survive foreign/hand-written records: a naive timestamp is pinned to
+    UTC rather than returned naive, because a naive datetime escaping into
+    schedule arithmetic (``_compute_next_fire``) or a ``duration`` subtraction
+    raises TypeError against the aware datetimes everything else uses -- and
+    on the catch-up path that would crash the scheduler at every boot until
+    the record is deleted.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
 def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
     """Rebuild a :class:`JobRunInfo` from a durable ledger record.
 
@@ -205,27 +253,23 @@ def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
     with an unparseable ``finished_at`` is skipped (returns ``None``) rather
     than crashing the rehydration.
     """
-    finished_raw = rec.get("finished_at")
-    if not isinstance(finished_raw, str):
+    # _parse_iso_utc pins naive timestamps to UTC: a rehydrated JobRunInfo
+    # mixing naive and aware datetimes would raise TypeError from the
+    # `duration` property on every dashboard request.
+    finished = _parse_iso_utc(rec.get("finished_at"))
+    if finished is None:
         return None
-    try:
-        finished = datetime.datetime.fromisoformat(finished_raw)
-    except ValueError:
-        return None
-    started: Optional[datetime.datetime] = None
-    started_raw = rec.get("started_at")
-    if isinstance(started_raw, str):
-        try:
-            started = datetime.datetime.fromisoformat(started_raw)
-        except ValueError:
-            started = None
+    started = _parse_iso_utc(rec.get("started_at"))
     empty = JobOutputStream()
     empty.closed = True
     outcome = rec.get("outcome")
     exit_code = rec.get("exit_code")
     fail_reason = rec.get("fail_reason")
     return JobRunInfo(
-        outcome=outcome if isinstance(outcome, str) else "success",
+        # an absent/corrupt outcome must NOT rehydrate as a fabricated
+        # "success" (it would skew stats and could open the depends-on-past
+        # gate); "unknown" is skipped by every outcome-sensitive consumer.
+        outcome=outcome if isinstance(outcome, str) else "unknown",
         exit_code=exit_code if isinstance(exit_code, int) else None,
         started_at=started,
         finished_at=finished,
@@ -472,9 +516,34 @@ class Cron:
         # how many finished runs to retain per job in the durable ledger; set
         # from state.maxRunsPerJob when the backend starts. <= 0 disables.
         self._state_max_runs = 0
-        # whether missed-run catch-up has run; it runs once, on the first
-        # start-up pass, reading the durable last-run watermark. See _catch_up.
+        # whether missed-run catch-up has fully resolved; evaluation starts on
+        # the first start-up pass but is NOT latched while it cannot actually
+        # run yet (the state backend failed to start and is being retried, or
+        # the cluster has no positive owner) -- latching there would forfeit
+        # the owed backfill forever. See _catch_up.
         self._caught_up = False
+        # job names whose catch-up decision is final (backfill scheduled,
+        # nothing owed, or positively delegated to another node's owner), so
+        # an unresolved job elsewhere does not re-process them next pass.
+        self._catchup_done: Set[str] = set()
+        # loop-clock gate for re-evaluating unresolved catch-up (see
+        # CATCHUP_RECHECK_INTERVAL); 0.0 means "evaluate on the next pass".
+        self._catchup_next_retry = 0.0
+        # the instant of the FIRST catch-up evaluation: deferred retries
+        # (backend down at boot) must count missed slots against this, not a
+        # later "now" -- the live scheduler ran (statelessly) in between, so
+        # a later window would replay runs that actually happened.
+        self._catchup_reference: Optional[datetime.datetime] = None
+        # the in-flight catch-up evaluation, when one is running.  The
+        # evaluation awaits bounded store reads (up to STATE_OP_TIMEOUT
+        # each), so it runs as a background task rather than inline on the
+        # scheduler pass: a slow-but-alive mount must degrade catch-up, not
+        # delay job launches.
+        self._catchup_eval_task: Optional[asyncio.Task] = None
+        # whether the loaded config HAS a state section, tracked separately
+        # from state_backend so catch-up can tell "no durability configured"
+        # (latch and warn) from "configured but not started yet" (retry).
+        self._state_configured = False
         # in-flight catch-up launch tasks (each may sleep its per-job jitter
         # before launching), tracked so they are not GC'd and can be cancelled
         # on shutdown.
@@ -1538,6 +1607,7 @@ class Cron:
         cluster start failure, so durability being misconfigured never stops
         yacron2 from running jobs in memory.
         """
+        self._state_configured = state_config is not None
         backend = self.state_backend
         if backend is not None and (
             state_config is None or state_config != backend.config
@@ -1545,18 +1615,34 @@ class Cron:
             logger.info("state: configuration changed, stopping")
             await backend.stop()
             self.state_backend = None
+            # a replacement backend (different path/namespace) serves a
+            # different store: let it warm the dashboard history for jobs
+            # that have none in memory yet, instead of serving the old
+            # store's history forever.
+            self._state_rehydrated = False
         if state_config is not None and self.state_backend is None:
             try:
                 # Construct INSIDE the try: building the backend resolves and
                 # creates the store directories and runs a write probe, any of
                 # which can raise OSError on a bad/unwritable path or mount.
+                # BOUNDED: on a hard-hung mount (dead NFS server) the probe's
+                # syscalls block uninterruptibly on the worker thread, and an
+                # unbounded await here would stall run() before it ever
+                # schedules a job.  Timing out degrades to the in-memory path
+                # and retries on the next housekeeping pass, exactly like the
+                # OSError branch.
                 backend = make_state_backend(state_config, self.job_set_id)
-                await backend.start()
-            except (OSError, ConfigError) as ex:
+                await asyncio.wait_for(
+                    backend.start(), timeout=STATE_OP_TIMEOUT
+                )
+            except (OSError, ConfigError, asyncio.TimeoutError) as ex:
                 # an operational misconfiguration (unwritable path, bad mount)
                 # to log and keep running through, not the run loop's generic
                 # "report a bug" path.
-                logger.error("state: failed to start: %s", ex)
+                logger.error(
+                    "state: failed to start: %s",
+                    str(ex) or type(ex).__name__,
+                )
                 return
             self.state_backend = backend
             self._state_max_runs = state_config.get("maxRunsPerJob", 0)
@@ -1876,27 +1962,105 @@ class Cron:
             return 0.0
         return (zlib.crc32(name.encode("utf-8")) % (jitter * 1000)) / 1000.0
 
+    @staticmethod
+    def _catchup_stream(name: str) -> str:
+        """The durable checkpoint stream for a job's catch-up cycles."""
+        return CATCHUP_STREAM_PREFIX + name
+
+    async def _pending_catchup_watermark(self, name: str) -> Optional[str]:
+        """The watermark of an unfinished backfill cycle, if one is open.
+
+        Reads the newest checkpoint record: an ``open`` without a following
+        ``close`` means a previous backfill (here or on a crashed node) never
+        completed, and catch-up should resume from ITS watermark rather than
+        the run ledger's -- ordinary runs finishing after that boot advanced
+        the derived watermark past the still-unreplayed slots.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return None
+        recs = await asyncio.wait_for(
+            backend.list_records(
+                self._catchup_stream(name), limit=1, newest_first=True
+            ),
+            timeout=STATE_OP_TIMEOUT,
+        )
+        if recs and recs[0].get("kind") == "open":
+            watermark = recs[0].get("watermark")
+            if isinstance(watermark, str):
+                return watermark
+        return None
+
+    async def _checkpoint_catchup(
+        self, name: str, kind: str, watermark: Optional[str]
+    ) -> None:
+        """Append an ``open``/``close`` catch-up checkpoint (best-effort).
+
+        A failure to checkpoint must never block the backfill itself: it only
+        costs crash-resume fidelity, which is logged.  At-least-once by
+        design in one more way: a checkpoint write abandoned by its timeout
+        is still applied later by its daemon worker thread, so a stalled
+        ``open`` can land on disk AFTER the cycle's ``close`` and sort newer
+        (record order is the writer's clock at the actual write).  The next
+        restart then resumes an already-completed cycle -- a bounded replay,
+        never a loss.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return
+        record = {
+            "kind": kind,
+            "watermark": watermark or "",
+            "at": get_now(datetime.timezone.utc).isoformat(),
+        }
+        stream = self._catchup_stream(name)
+        try:
+            await asyncio.wait_for(
+                backend.append_record(stream, record),
+                timeout=STATE_OP_TIMEOUT,
+            )
+            await asyncio.wait_for(
+                backend.prune_records(stream, keep=CATCHUP_STREAM_KEEP),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except Exception as ex:  # noqa: BLE001 - checkpoint is best-effort
+            logger.warning(
+                "catch-up: could not checkpoint %r for %s (%s); a restart "
+                "mid-backfill may not resume it",
+                kind,
+                name,
+                ex,
+            )
+
     async def _missed_occurrences(
         self, job: JobConfig, now: datetime.datetime
-    ) -> int:
-        """How many catch-up launches ``job`` is owed for downtime.
+    ) -> Tuple[int, Optional[str]]:
+        """How many catch-up launches ``job`` is owed, and from where.
 
-        Reads the durable last-run watermark and steps the schedule forward
-        from it (DST-safe, via :meth:`_compute_next_fire`), bounded by
+        Reads the durable last-run watermark -- hoisted back to an open
+        checkpoint's (older) watermark when a previous backfill never closed
+        (see :meth:`_pending_catchup_watermark`) -- and steps the schedule
+        forward from it (DST-safe, via :meth:`_compute_next_fire`), bounded by
         ``startingDeadlineSeconds`` and :data:`MAX_CATCHUP_OCCURRENCES`.
-        Returns ``0`` when nothing was missed or the job never ran under this
-        store (no reference point, so -- like anacron/systemd -- a first-ever
-        run just schedules forward); ``1`` for ``run-once`` when at least one
-        slot was missed (every missed slot coalesced into a single launch); or
-        the bounded count of missed slots for ``run-all``.
+        Returns ``(0, ...)`` when nothing was missed or the job never ran
+        under this store (no reference point, so -- like anacron/systemd -- a
+        first-ever run just schedules forward); ``(1, ...)`` for ``run-once``
+        when at least one slot was missed (every missed slot coalesced into a
+        single launch); or the bounded count of missed slots for ``run-all``.
+        The second element is the reference watermark (ISO string) for the
+        cycle's checkpoint.  Store errors and timeouts propagate: the callers
+        treat them as "cannot evaluate yet", never as "nothing owed".
         """
-        watermark = await self.durable_last_run_at(job.name)
-        if watermark is None:
-            return 0
-        try:
-            after = datetime.datetime.fromisoformat(watermark)
-        except ValueError:  # pragma: no cover - ledger writes valid ISO
-            return 0
+        watermark = await asyncio.wait_for(
+            self.durable_last_run_at(job.name), timeout=STATE_OP_TIMEOUT
+        )
+        after = _parse_iso_utc(watermark)
+        pending = await self._pending_catchup_watermark(job.name)
+        pending_dt = _parse_iso_utc(pending)
+        if pending_dt is not None and (after is None or pending_dt < after):
+            after, watermark = pending_dt, pending
+        if after is None:
+            return 0, None
         deadline = job.startingDeadlineSeconds
         if deadline:
             cutoff = now - datetime.timedelta(seconds=deadline)
@@ -1904,9 +2068,9 @@ class Cron:
                 after = cutoff  # only the recent window (bounds run-all)
         nxt = self._compute_next_fire(job, after)
         if nxt is None or nxt > now:
-            return 0
+            return 0, watermark
         if job.onMissed == "run-once":
-            return 1
+            return 1, watermark
         # run-all: count each missed occurrence, hard-capped.
         count = 1
         nxt = self._compute_next_fire(job, nxt)
@@ -1923,67 +2087,186 @@ class Cron:
                 )
                 break
             nxt = self._compute_next_fire(job, nxt)
-        return count
+        return count, watermark
 
     async def _catch_up(self, now: datetime.datetime) -> None:
-        """Replay (or coalesce) runs missed while down, once, on start-up.
+        """Replay (or coalesce) runs missed while down, on start-up.
 
-        Runs on the first start-up pass, after the state backend and the
-        cluster gate are up.  For each enabled ``onMissed`` job it counts the
-        missed occurrences and, when this node is the job's cluster owner,
-        schedules the catch-up launches spread over ``catchupJitterSeconds`` so
-        a fleet does not all fire at once.  A no-op without a state backend
-        (there is no durable watermark to compare against) -- catch-up is a
-        stateful-only feature.
+        Evaluation begins on the first start-up pass, after the state backend
+        and the cluster gate are up.  For each enabled ``onMissed`` job it
+        counts the missed occurrences and, when this node is the job's cluster
+        owner, schedules the catch-up launches spread over
+        ``catchupJitterSeconds`` so a fleet does not all fire at once.  A
+        no-op without a ``state`` section (there is no durable watermark to
+        compare against) -- catch-up is a stateful-only feature.
+
+        Resolution is NOT latched while it cannot actually happen yet: with a
+        configured-but-unstarted backend (start_stop_state retries it every
+        housekeeping pass) or a cluster that has no positive owner for a job
+        yet (still electing at boot), the affected jobs stay pending and are
+        re-evaluated every :data:`CATCHUP_RECHECK_INTERVAL`.  Latching there
+        (the old behaviour) forfeited the owed backfill forever.  Per-job
+        decisions that ARE final -- backfill scheduled, nothing owed, another
+        node positively owns it -- are remembered in ``_catchup_done`` so they
+        are not re-processed while a sibling job stays pending.  All store
+        I/O here is guarded and bounded: a store error defers (never forfeits,
+        never crashes the caller).
+
+        Every evaluation (including a deferred retry) is anchored to the
+        FIRST attempt's instant, not the current pass's: while the backend
+        was down the live scheduler kept firing jobs statelessly (nothing
+        recorded), so counting missed slots up to a later "now" would replay
+        runs that actually ran.  The owed window is the pre-boot downtime,
+        full stop.
         """
         if self._caught_up:
             return
-        self._caught_up = True
-        wants = [j for j in self.cron_jobs.values() if j.onMissed != "skip"]
-        if self.state_backend is None:
+        if asyncio.get_running_loop().time() < self._catchup_next_retry:
+            return
+        if self._catchup_reference is None:
+            self._catchup_reference = now
+        now = self._catchup_reference
+        if not self._state_configured:
+            wants = [
+                j for j in self.cron_jobs.values() if j.onMissed != "skip"
+            ]
             if wants:
                 logger.warning(
                     "onMissed catch-up is set on %d job(s) but needs a "
                     "`state` backend for the last-run watermark; skipping",
                     len(wants),
                 )
+            inert = [j for j in self.cron_jobs.values() if j.archiveOutput]
+            if inert:
+                logger.warning(
+                    "archiveOutput is set on %d job(s) but archives nothing "
+                    "without a `state` backend",
+                    len(inert),
+                )
+            gated = [
+                j for j in self.cron_jobs.values() if j.onlyIfLastSucceeded
+            ]
+            if gated:
+                logger.info(
+                    "onlyIfLastSucceeded is set on %d job(s) with no `state` "
+                    "backend: the gate works from in-memory history only and "
+                    "resets on restart",
+                    len(gated),
+                )
+            self._caught_up = True
             return
-        for name, job in self.cron_jobs.items():
+        unresolved = False
+        if self.state_backend is None:
+            # configured but not (yet) running -- a bad mount at boot that
+            # start_stop_state keeps retrying: keep the whole evaluation
+            # pending rather than forfeiting the backfill.
+            unresolved = True
+        else:
+            try:
+                unresolved = await self._evaluate_catch_up(now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - defer, never surface: this
+                # runs as a detached task, so an escaped exception would be
+                # an unretrieved-task warning and a silently dead catch-up.
+                logger.exception(
+                    "catch-up: unexpected error evaluating; will retry"
+                )
+                unresolved = True
+        if unresolved:
+            self._catchup_next_retry = (
+                asyncio.get_running_loop().time() + CATCHUP_RECHECK_INTERVAL
+            )
+        else:
+            self._caught_up = True
+            self._catchup_done.clear()
+
+    async def _evaluate_catch_up(self, now: datetime.datetime) -> bool:
+        """One catch-up evaluation pass; returns whether jobs stay pending."""
+        unresolved = False
+        for name, job in list(self.cron_jobs.items()):
+            if name in self._catchup_done:
+                continue
             if (
                 job.onMissed == "skip"
                 or not job.enabled
                 or not isinstance(job.schedule, CronTab)
             ):
+                self._catchup_done.add(name)
                 continue
-            count = await self._missed_occurrences(job, now)
-            if count <= 0:
-                continue
+            # Gate before the durable read: no store I/O for a job this
+            # node may not run.
             if not self._cluster_allows(job):
-                logger.info(
-                    "catch-up: %s missed %d run(s) but this node is not its "
-                    "owner; leaving the backfill to the owner",
-                    name,
-                    count,
-                )
+                if self._cluster_owner_moved(job):
+                    # positive confirmation another node owns it: its
+                    # owner sees the same ledger and does the backfill.
+                    logger.info(
+                        "catch-up: %s is owned by another node; leaving "
+                        "any backfill to its owner",
+                        name,
+                    )
+                    self._catchup_done.add(name)
+                else:
+                    # transient denial (no owner elected yet, no quorum,
+                    # conflict): nobody would backfill if we latched now.
+                    unresolved = True
                 continue
+            try:
+                count, watermark = await self._missed_occurrences(job, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - defer, never crash
+                logger.warning(
+                    "catch-up: cannot read the %s watermark (%s); will retry",
+                    name,
+                    ex,
+                )
+                unresolved = True
+                continue
+            if count <= 0:
+                self._catchup_done.add(name)
+                continue
+            # Checkpoint the intent BEFORE scheduling: a crash/restart
+            # mid-jitter or mid-backfill then resumes from `watermark`
+            # instead of losing the owed slots to the advancing ledger.
+            await self._checkpoint_catchup(name, "open", watermark)
             offset = self._catchup_offset(name, job.catchupJitterSeconds)
-            task = asyncio.create_task(self._run_catch_up(job, count, offset))
+            task = asyncio.create_task(
+                self._run_catch_up(job, count, offset, now)
+            )
             self._catchup_tasks.add(task)
             task.add_done_callback(self._catchup_tasks.discard)
+            self._catchup_done.add(name)
+        return unresolved
 
     async def _run_catch_up(
-        self, job: JobConfig, count: int, offset: float
+        self,
+        job: JobConfig,
+        count: int,
+        offset: float,
+        now: datetime.datetime,
     ) -> None:
         """Launch a job's catch-up runs, after its jitter offset.
 
         Sleeps out the per-job jitter (interruptibly, so shutdown wakes it at
-        once) then launches ``count`` times through the concurrency-gated path.
-        Uses :meth:`maybe_launch_job`, not :meth:`launch_scheduled_job`: a
-        backfill is best-effort and does not arm retries (whose single per-job
-        slot ``run-all``'s repeated launches would otherwise tangle).  Failure
+        once), then REVALIDATES everything the sleep may have invalidated --
+        the job may have been removed/disabled/edited by a reload (the live
+        definition is launched, never the boot-time capture), cluster
+        ownership may have moved (the new owner resumes from the open
+        checkpoint; launching here too would double-run the backfill), and
+        the owed count may have changed (another node backfilled).  Then
+        launches ``count`` times through the concurrency-gated path,
+        SERIALIZED: each launch waits for the job's previous instance(s) to
+        drain, so ``concurrencyPolicy: Forbid`` cannot swallow the rest of the
+        owed runs and ``run-all`` cannot stampede N concurrent instances.
+        Uses :meth:`maybe_launch_job` with ``with_retries=False``, not
+        :meth:`launch_scheduled_job`: a backfill is best-effort and must not
+        arm retries -- nor capture a LIVE retry ladder armed by a concurrent
+        scheduled fire, whose budget its failures would burn.  Failure
         reporting still applies (the reaper reports every finished run), and
-        each finished run is recorded to the ledger, advancing the watermark so
-        a later restart does not re-backfill the same slots.
+        each finished run is recorded to the ledger, advancing the watermark
+        so a later restart does not re-backfill the same slots; the cycle's
+        checkpoint is closed once the backfill completes.
         """
         try:
             if offset > 0:
@@ -1995,19 +2278,132 @@ class Cron:
                     pass  # normal: the jitter elapsed without a shutdown
             if self._stop_event.is_set():
                 return
+            current = self.cron_jobs.get(job.name)
+            if (
+                current is None
+                or current.onMissed == "skip"
+                or not current.enabled
+                or not isinstance(current.schedule, CronTab)
+            ):
+                logger.info(
+                    "catch-up: %s was removed or disabled during its jitter "
+                    "window; dropping the backfill",
+                    job.name,
+                )
+                return
+            job = current  # the live definition, not the boot-time capture
+            if not self._cluster_allows(job):
+                logger.info(
+                    "catch-up: ownership of %s moved during its jitter "
+                    "window; leaving the backfill to the new owner",
+                    job.name,
+                )
+                return
+            # Recompute against the ORIGINAL pass instant, not a fresh clock
+            # read: the open checkpoint anchors the window's start at the
+            # boot-time watermark, so a fresh `now` would stretch the window
+            # over slots the live scheduler already fired during the jitter
+            # and replay them.  Slots that became due during the jitter are
+            # the scheduler's, not the backfill's.
+            try:
+                count, watermark = await self._missed_occurrences(job, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - drop, resume on restart
+                logger.warning(
+                    "catch-up: cannot re-read the %s watermark after its "
+                    "jitter (%s); dropping the backfill (the open checkpoint "
+                    "resumes it on the next restart)",
+                    job.name,
+                    ex,
+                )
+                return
+            if count <= 0:
+                # someone else (another node, or ordinary runs) already
+                # covered it: close the cycle so restarts stop resuming it.
+                await self._checkpoint_catchup(job.name, "close", watermark)
+                return
             logger.info(
                 "catch-up: replaying %d missed run(s) for %s", count, job.name
             )
+            # Only Forbid must wait for TOTAL idleness (launching would be
+            # swallowed).  For Allow/Replace the wait is mere anti-stampede
+            # pacing, so it is bounded: a job whose scheduled instances
+            # always overlap (runtime > interval) would otherwise starve the
+            # backfill forever and leave its checkpoint open.
+            max_wait: Optional[float] = (
+                None
+                if job.concurrencyPolicy == "Forbid"
+                else CATCHUP_IDLE_WAIT_LIMIT
+            )
             for _ in range(count):
-                if self._stop_event.is_set():
-                    break
-                await self.maybe_launch_job(job)
+                if not await self._wait_job_idle(job.name, max_wait=max_wait):
+                    return  # shutdown while draining
+                # Revalidate EVERY iteration, not just after the jitter: a
+                # serialized run-all backfill spans count x run-duration,
+                # plenty of time for a reload to remove/disable the job or
+                # for ownership to move -- launching on after either would
+                # run a dead definition or double-run against the new owner
+                # (which resumes from the still-open checkpoint).
+                live = self.cron_jobs.get(job.name)
+                if (
+                    live is None
+                    or live.onMissed == "skip"
+                    or not live.enabled
+                    or not isinstance(live.schedule, CronTab)
+                ):
+                    logger.info(
+                        "catch-up: %s was removed or disabled mid-backfill; "
+                        "dropping the remaining runs",
+                        job.name,
+                    )
+                    return
+                job = live
+                if not self._cluster_allows(job):
+                    logger.info(
+                        "catch-up: ownership of %s moved mid-backfill; "
+                        "leaving the remainder to the new owner",
+                        job.name,
+                    )
+                    return
+                await self.maybe_launch_job(job, with_retries=False)
+            # drain the final launch so its run record lands before the
+            # checkpoint closes (a crash in between merely replays: the
+            # checkpoint is at-least-once by design).
+            if not await self._wait_job_idle(job.name, max_wait=max_wait):
+                return
+            await self._checkpoint_catchup(job.name, "close", watermark)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a backfill must never kill the loop
             logger.exception(
                 "catch-up: unexpected error backfilling %s", job.name
             )
+
+    async def _wait_job_idle(
+        self, name: str, *, max_wait: Optional[float] = None
+    ) -> bool:
+        """Wait until no instance of ``name`` is running (backfill pacing).
+
+        Returns ``False`` when shutdown was signalled while waiting; ``True``
+        means "go ahead" -- either the job went idle or ``max_wait`` seconds
+        elapsed first (used by the non-Forbid policies, where the wait is
+        pacing rather than correctness and must not starve forever).  Polling
+        (rather than plumbing a completion event out of the reaper) keeps the
+        backfill decoupled from the reaper's bookkeeping; the half-second
+        cadence is plenty for runs that just finished.
+        """
+        waited = 0.0
+        while self.running_jobs.get(name):
+            if max_wait is not None and waited >= max_wait:
+                return not self._stop_event.is_set()
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                waited += 0.5
+                continue
+            return False
+        return not self._stop_event.is_set()
 
     async def _service_slots(self, startup: bool) -> None:
         """Service the jobs due on this pass.
@@ -2023,8 +2419,21 @@ class Cron:
         if startup:
             self._ensure_seeded(now)
         await self.spawn_jobs(startup, now)
-        if startup:
-            await self._catch_up(now)
+        # Every pass, not just start-up: _catch_up latches itself once fully
+        # resolved (one boolean check per pass thereafter) but must be able
+        # to retry when the backend or the cluster was not ready at boot --
+        # latching on the first pass forfeited the owed backfill forever.
+        # Spawned, not awaited: the evaluation performs bounded store reads
+        # (up to STATE_OP_TIMEOUT each), and a slow-but-alive mount must not
+        # stall this pass -- job launches outrank catch-up bookkeeping.
+        # Tracked in _catchup_tasks so shutdown cancels a straggler.
+        if not self._caught_up and (
+            self._catchup_eval_task is None or self._catchup_eval_task.done()
+        ):
+            task = asyncio.create_task(self._catch_up(now))
+            self._catchup_eval_task = task
+            self._catchup_tasks.add(task)
+            task.add_done_callback(self._catchup_tasks.discard)
 
     async def spawn_jobs(
         self, startup: bool, now: Optional[datetime.datetime] = None
@@ -2613,12 +3022,20 @@ class Cron:
 
         await self.maybe_launch_job(job)
 
-    async def maybe_launch_job(self, job: JobConfig) -> bool:
+    async def maybe_launch_job(
+        self, job: JobConfig, *, with_retries: bool = True
+    ) -> bool:
         """Launch ``job`` unless concurrencyPolicy forbids it.
 
         Returns whether a new instance was actually launched (False only
         for the ``Forbid`` skip), so a caller accounting for launches --
         the retry metric -- does not count a swallowed one.
+
+        ``with_retries=False`` (catch-up backfills) launches WITHOUT the
+        job's retry state: a backfill must not attach itself to a live retry
+        ladder armed by a concurrent scheduled fire -- its failures would
+        cancel the legitimate pending retry and burn the shared budget toward
+        a premature onPermanentFailure.
         """
         # .get(), not self.running_jobs[job.name]: a bare subscript on this
         # defaultdict would INSERT an empty-list entry for a not-yet-running
@@ -2647,7 +3064,9 @@ class Cron:
             else:
                 raise AssertionError  # pragma: no cover
         logger.info("Starting job %s", job.name)
-        running_job = RunningJob(job, self.retry_state.get(job.name))
+        running_job = RunningJob(
+            job, self.retry_state.get(job.name) if with_retries else None
+        )
         await running_job.start()
         self.running_jobs[job.name].append(running_job)
         logger.info("Job %s spawned", job.name)
@@ -2758,30 +3177,41 @@ class Cron:
     async def _archive_output(self, job: JobConfig, info: JobRunInfo) -> None:
         """Write a finished run's captured output to the durable log store.
 
-        Opt-in per job (``archiveOutput``).  The output is already bounded by
-        the job's ``saveLimit`` / ``maxLineLength``; each line is scrubbed of
-        recognisable secrets (:func:`yacron2.redact.redact_secrets`) unless the
-        job set ``redactArchivedSecrets: false``, then written as one immutable
-        record linked to the run by its ``finished_at``.  Encryption-at-rest is
-        the mount's job (an encrypted volume, EFS/S3 server-side encryption);
+        Opt-in per job (``archiveOutput``).  What is archived is the run's
+        live-tail ring buffer -- the newest :data:`yacron2.job.LIVE_LOG_LIMIT`
+        lines (each already bounded by ``maxLineLength``); older lines were
+        evicted from the ring before archiving and are accounted for in the
+        record's ``dropped_lines`` rather than silently lost.  A job with
+        ``saveLimit: 0`` (the operator's explicit "retain no output") archives
+        nothing.  The lines are scrubbed of recognisable secrets
+        (:func:`yacron2.redact.redact_lines`, which also tracks multi-line
+        PEM private-key blocks) unless the job set
+        ``redactArchivedSecrets: false``, then written as one immutable record
+        linked to the run by its ``finished_at``.  Encryption-at-rest is the
+        mount's job (an encrypted volume, EFS/S3 server-side encryption);
         this only redacts.  Pruned to the same per-job bound as the ledger.
         """
         backend = self.state_backend
         if backend is None:
             return
+        if job.saveLimit == 0:
+            return
         redact = job.redactArchivedSecrets
+        raw = list(info.output.lines)
+        if redact:
+            texts = redact_lines([line for _stream, line in raw])
+        else:
+            texts = [line for _stream, line in raw]
         lines = [
-            {
-                "stream": stream_name,
-                "line": redact_secrets(line) if redact else line,
-            }
-            for stream_name, line in info.output.lines
+            {"stream": stream_name, "line": text}
+            for (stream_name, _), text in zip(raw, texts, strict=True)
         ]
         record = {
             "finished_at": info.finished_at.isoformat(),
             "outcome": info.outcome,
             "exit_code": info.exit_code,
             "redacted": redact,
+            "dropped_lines": max(0, info.output.published - len(raw)),
             "lines": lines,
         }
         stream = self._log_stream(job.name)
@@ -2812,15 +3242,35 @@ class Cron:
             if self.run_history.get(name):
                 continue
             try:
-                recs = await backend.list_records(
-                    self._run_stream(name),
-                    limit=RUN_HISTORY_LIMIT,
-                    newest_first=True,
+                recs = await asyncio.wait_for(
+                    backend.list_records(
+                        self._run_stream(name),
+                        limit=RUN_HISTORY_LIMIT,
+                        newest_first=True,
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
                 )
+            except asyncio.TimeoutError:
+                # a store that cannot serve one read in STATE_OP_TIMEOUT is
+                # unhealthy (hung mount): abandon the whole warm-up rather
+                # than stalling boot for jobs x timeout. The dashboard fills
+                # in as jobs run, exactly as with no rehydration.
+                logger.warning(
+                    "state: rehydration timed out reading %s; skipping the "
+                    "rest of the warm-up (store unhealthy?)",
+                    name,
+                )
+                break
             except OSError as ex:
                 logger.warning(
                     "state: failed to rehydrate history for %s: %s", name, ex
                 )
+                continue
+            if self.run_history.get(name):
+                # a run finished while we awaited the read (the await above
+                # yields): the live run is fresher than anything in the
+                # ledger snapshot; appending the old records after it would
+                # regress last_run and scramble the history's order.
                 continue
             recs.reverse()  # oldest-first, to match the append order
             for rec in recs:
@@ -2860,28 +3310,93 @@ class Cron:
         """Whether ``job``'s depends-on-past gate permits a scheduled fire.
 
         ``True`` (allow) unless ``onlyIfLastSucceeded`` is set AND the job's
-        most recent durable *run* outcome was a failure.  Consults the ledger,
-        skipping non-run outcomes (``cancelled``/``skipped``) to find the last
-        real ``success``/``failure`` -- so a skipped tick does not itself clear
-        the gate, and only a genuine success re-opens it.  No state backend or
-        no prior run on record -> allow (there is nothing to depend on, and a
-        first-ever run must not be blocked).  Applies to scheduled and @reboot
-        fires (:meth:`launch_scheduled_job`); retries, catch-up backfills, and
+        most recent *run* outcome was a failure -- or its previous instance is
+        STILL RUNNING (an unfinished run has not "succeeded", and letting the
+        answer depend on whether it happens to finish first would make the
+        gate a race).  The last real outcome is the NEWEST of two sources,
+        by ``finished_at``:
+
+        * the in-memory history (``run_history``), which the finished-run
+          path updates synchronously -- the durable write behind it is
+          fire-and-forget, so the ledger alone can be a beat stale and would
+          re-run a job whose failure record is still in flight;
+        * the durable ledger, which sees runs from OTHER nodes on a shared
+          mount (guarded and bounded: a store error/timeout degrades to the
+          in-memory view with a warning -- fail open, like "no backend" --
+          rather than stalling or crashing the launch path, which runs
+          outside run()'s try/except).
+
+        Non-run outcomes (``cancelled``/``skipped``) are skipped in both, so
+        a skipped tick does not itself clear the gate and only a genuine
+        success re-opens it -- within each source's bounded window
+        (:data:`RUN_HISTORY_LIMIT` newest entries), which a pathological pile
+        of consecutive non-run records could in principle exhaust.  No prior
+        run in either source -> allow (there is nothing to depend on, and a
+        first-ever run must not be blocked).  Without a state backend the
+        gate still works from the in-memory history -- it simply is not
+        restart-surviving (history resets with the process).
+
+        The still-running block is SKIPPED for ``concurrencyPolicy:
+        Replace``: that policy's contract is that a new fire supersedes the
+        running instance (its reaping happens in :meth:`maybe_launch_job`),
+        so blocking here would let one hung run freeze the job forever; the
+        gate then judges the last *finished* outcome, as it always did.
+        Applies to scheduled and @reboot fires
+        (:meth:`launch_scheduled_job`); retries, catch-up backfills, and
         manual API triggers deliberately bypass it.
         """
         if not job.onlyIfLastSucceeded:
             return True
+        if job.concurrencyPolicy != "Replace" and self.running_jobs.get(
+            job.name
+        ):
+            return False
+        latest: Optional[Tuple[datetime.datetime, str]] = None
+        for info in reversed(self.run_history.get(job.name) or ()):
+            if info.outcome in ("success", "failure"):
+                latest = (info.finished_at, info.outcome)
+                break
         backend = self.state_backend
-        if backend is None:
+        if backend is not None:
+            try:
+                recs = await asyncio.wait_for(
+                    backend.list_records(
+                        self._run_stream(job.name),
+                        limit=RUN_HISTORY_LIMIT,
+                        newest_first=True,
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - degrade, never crash
+                logger.warning(
+                    "state: cannot read the run ledger for the "
+                    "onlyIfLastSucceeded gate on %s (%s); deciding from the "
+                    "in-memory history",
+                    job.name,
+                    ex,
+                )
+                recs = []
+            for rec in recs:
+                outcome = rec.get("outcome")
+                if outcome not in ("success", "failure"):
+                    continue
+                finished = _parse_iso_utc(rec.get("finished_at"))
+                if latest is None or (
+                    finished is not None and finished > latest[0]
+                ):
+                    latest = (
+                        finished
+                        or datetime.datetime.min.replace(
+                            tzinfo=datetime.timezone.utc
+                        ),
+                        str(outcome),
+                    )
+                break  # newest real run in the ledger; older ones are moot
+        if latest is None:
             return True
-        recs = await backend.list_records(
-            self._run_stream(job.name), limit=20, newest_first=True
-        )
-        for rec in recs:
-            outcome = rec.get("outcome")
-            if outcome in ("success", "failure"):
-                return bool(outcome == "success")
-        return True
+        return latest[1] == "success"
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
         jobs_list = self.running_jobs[job.config.name]

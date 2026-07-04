@@ -186,6 +186,12 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
         # timezone).
         "timezone": (str(job.timezone) if job.timezone is not None else None),
         "enabled": job.enabled,
+        # gates every scheduled fire (like `enabled`), so replicas that
+        # disagree on it must show as drift.  The catch-up trio
+        # (onMissed/startingDeadlineSeconds/catchupJitterSeconds) and the
+        # archival pair stay excluded: restart-time / observability-only,
+        # node-local behaviour (see yacron2.config.JobConfig.__init__).
+        "onlyIfLastSucceeded": job.onlyIfLastSucceeded,
         "failsWhen": job.failsWhen,
         "onFailure": _redact_action(job.onFailure),
         "onPermanentFailure": _redact_action(job.onPermanentFailure),

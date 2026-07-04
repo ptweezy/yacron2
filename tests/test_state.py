@@ -475,11 +475,46 @@ def test_mount_fstype_no_proc(monkeypatch):
 
 
 def test_fs_safe_is_injective_and_portable():
-    assert _fs_safe("plain-name.1") == "plain-name.1"
+    assert _fs_safe("plain-name_1") == "plain-name_1"
     # path separators / spaces / unicode are percent-encoded, not dropped.
     assert "/" not in _fs_safe("a/b c")
     assert _fs_safe("a/b") != _fs_safe("a-b")  # no collision
     assert _fs_safe("") == "_"
+
+
+def test_fs_safe_case_insensitive_injectivity():
+    # NTFS/APFS resolve names case-insensitively: two jobs differing only by
+    # case must not share one on-disk stream (merged ledgers -> wrong
+    # watermark/gate decisions), so uppercase is encoded, not passed through.
+    assert _fs_safe("Backup").lower() != _fs_safe("backup").lower()
+    assert _fs_safe("JOB").lower() != _fs_safe("job").lower()
+
+
+def test_fs_safe_neutralizes_traversal_and_windows_hazards():
+    # "." is encoded, so no name can yield a "." / ".." path component (a
+    # deploymentId of ".." would otherwise escape the state root) or the
+    # trailing-dot aliases Windows strips.
+    assert _fs_safe("..") != ".."
+    assert "." not in _fs_safe("..")
+    assert not _fs_safe("job.").endswith(".")
+    # reserved Windows device names are re-encoded to something openable.
+    for name in ("con", "nul", "com1", "lpt9"):
+        assert _fs_safe(name) not in {name, name.upper()}
+    # ...without breaking injectivity against a literal "%63on"-style name.
+    assert _fs_safe("con") != _fs_safe("%63on")
+
+
+def test_fs_safe_caps_component_length():
+    # percent-encoding expands 3x per non-safe byte (9x per CJK char):
+    # without a cap a long job name exceeds NAME_MAX=255 and every append
+    # for its stream fails with ENAMETOOLONG forever. Long names truncate to
+    # a digest-uniqued token that still tells inputs apart.
+    long_a = "測試" * 60
+    long_b = "測試" * 60 + "x"
+    token_a, token_b = _fs_safe(long_a), _fs_safe(long_b)
+    assert len(token_a.encode()) <= 150
+    assert len(token_b.encode()) <= 150
+    assert token_a != token_b
 
 
 def test_unescape_mount():
@@ -796,7 +831,7 @@ async def _cron_with_watermark(tmp_path, watermark_iso, **jobkw):
 def _count_launcher():
     calls = []
 
-    async def fake(job):
+    async def fake(job, *, with_retries=True):
         calls.append(job.name)
         return True
 
@@ -857,21 +892,32 @@ def test_catchup_offset_deterministic_and_in_range():
 
 async def test_missed_zero_when_never_ran(tmp_path):
     cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
-    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 0
+    count, watermark = await cron._missed_occurrences(
+        cron.cron_jobs["j"], _NOW
+    )
+    assert (count, watermark) == (0, None)
 
 
 async def test_missed_zero_when_current(tmp_path):
     cron = await _cron_with_watermark(
         tmp_path, "2026-07-01T10:10:00+00:00", onmissed="run-all"
     )
-    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 0
+    count, watermark = await cron._missed_occurrences(
+        cron.cron_jobs["j"], _NOW
+    )
+    assert count == 0
+    assert watermark == "2026-07-01T10:10:00+00:00"
 
 
 async def test_missed_run_once_coalesces_to_one(tmp_path):
     cron = await _cron_with_watermark(
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
     )
-    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 1
+    count, watermark = await cron._missed_occurrences(
+        cron.cron_jobs["j"], _NOW
+    )
+    assert count == 1
+    assert watermark == "2026-07-01T10:00:00+00:00"
 
 
 async def test_missed_run_all_counts_each(tmp_path):
@@ -879,7 +925,8 @@ async def test_missed_run_all_counts_each(tmp_path):
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
     )
     # per-minute job, 10:01..10:10 missed by 10:10:30 -> 10 occurrences.
-    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 10
+    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
+    assert count == 10
 
 
 async def test_missed_deadline_bounds_window(tmp_path):
@@ -887,7 +934,8 @@ async def test_missed_deadline_bounds_window(tmp_path):
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all", deadline=180
     )
     # only the last 180s (10:08, 10:09, 10:10) count.
-    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 3
+    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
+    assert count == 3
 
 
 async def test_missed_hard_capped(tmp_path, caplog):
@@ -895,9 +943,20 @@ async def test_missed_hard_capped(tmp_path, caplog):
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
     )
     far = datetime.datetime(2026, 7, 1, 12, 30, 0, tzinfo=_UTC)  # 150 min
-    count = await cron._missed_occurrences(cron.cron_jobs["j"], far)
+    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], far)
     assert count == 100
     assert any("dropping the rest" in r.getMessage() for r in caplog.records)
+
+
+async def test_missed_naive_watermark_is_pinned_to_utc(tmp_path):
+    # a foreign/hand-written record with a NAIVE finished_at must not raise
+    # TypeError out of the schedule arithmetic (which would crash the
+    # scheduler at every boot): it is pinned to UTC instead.
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00", onmissed="run-once"
+    )
+    count, _ = await cron._missed_occurrences(cron.cron_jobs["j"], _NOW)
+    assert count == 1
 
 
 # --- _catch_up orchestration ---
@@ -971,7 +1030,7 @@ async def test_run_catch_up_bails_when_stopping(tmp_path):
     )
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
     cron._stop_event.set()
-    await cron._run_catch_up(cron.cron_jobs["j"], 5, 0.0)
+    await cron._run_catch_up(cron.cron_jobs["j"], 5, 0.0, _NOW)
     assert calls == []
 
 
@@ -982,8 +1041,30 @@ async def test_run_catch_up_waits_out_jitter(tmp_path):
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
     # a small non-zero offset exercises the interruptible jitter sleep before
     # the launch (the cross-job stagger path).
-    await cron._run_catch_up(cron.cron_jobs["j"], 1, 0.02)
+    await cron._run_catch_up(cron.cron_jobs["j"], 1, 0.02, _NOW)
     assert calls == ["j"]
+
+
+async def test_run_catch_up_revalidates_after_jitter(tmp_path):
+    # ownership moving (or the job being disabled/removed) during the jitter
+    # sleep must abort the backfill: launching anyway would double-run it
+    # alongside the new owner's own catch-up.
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+    cron._cluster_allows = lambda job: False  # type: ignore[method-assign]
+    await cron._run_catch_up(cron.cron_jobs["j"], 1, 0.0, _NOW)
+    assert calls == []
+    del cron.cron_jobs["j"]  # removed by a reload during the jitter
+    cron._cluster_allows = lambda job: True  # type: ignore[method-assign]
+    await cron._run_catch_up(
+        parse_config_string(_catchup_yaml(onmissed="run-once"), "").jobs[0],
+        1,
+        0.0,
+        _NOW,
+    )
+    assert calls == []
 
 
 # --- Phase 3: depends_on_past (onlyIfLastSucceeded) -----------------------

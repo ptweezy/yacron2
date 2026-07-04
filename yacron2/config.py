@@ -185,6 +185,39 @@ DEFAULT_STATE: Dict[str, Any] = {
     # Floor 5 (enforced): a tiny TTL leaves no room for renew latency on a
     # network mount and would expire live holders.
     "slotTtlSeconds": 30,
+    # the job-facing state API (Phase 5): the loopback HTTP endpoint + the
+    # `yacron2 state|cursor|lock|artifact|idempotent|secret` job commands.
+    # Merged (not replaced) over DEFAULT_JOB_API in _build_state_config, so a
+    # partial `jobApi:` block keeps the untouched defaults. See the defaults.
+    "jobApi": None,
+}
+
+# Defaults for the state.jobApi sub-section. Present only when a `state`
+# section is (the loopback endpoint has no store to talk to otherwise). See
+# yacron2.jobapi / yacron2.jobstate.
+DEFAULT_JOB_API: Dict[str, Any] = {
+    # run the loopback endpoint and inject its address/token into every job's
+    # environment. On by default when `state` is configured; set false to keep
+    # the durable store's scheduler features but expose nothing to jobs.
+    "enabled": True,
+    # override the loopback bind, as an `http://host:port` URL. None (default)
+    # binds an OS-assigned ephemeral port on 127.0.0.1 -- reachable only from
+    # this host's job processes, which is what the per-run token then scopes.
+    # A unix:// path is not accepted here: the job CLI reaches the endpoint
+    # over stdlib urllib, which speaks TCP only.
+    "listen": None,
+    # upper bound (bytes) on a single KV / cursor value; a larger set is
+    # refused (HTTP 413). Keeps a runaway job from filling the store one
+    # oversized document at a time.
+    "maxValueBytes": 1024 * 1024,
+    # upper bound (bytes) on a single artifact payload; a larger put is
+    # refused (HTTP 413).
+    "maxArtifactBytes": 64 * 1024 * 1024,
+    # TTL (seconds) of a job mutex/semaphore lease. The daemon holds the lease
+    # on the run's behalf and renews it at a third of this; if the job (or the
+    # daemon) dies the lock frees itself after at most this long. Floor 5, like
+    # slotTtlSeconds, for the same renew-latency reason.
+    "lockTtlSeconds": 30,
 }
 
 
@@ -333,6 +366,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "onPermanentFailure": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
     "onSuccess": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
     "environment": [],
+    # run-scoped secrets staged for the job over the loopback endpoint; each is
+    # {name, value|fromFile|fromEnvVar}. Resolved fresh per run, never durably
+    # stored. Inert without a `state` section with jobApi enabled.
+    "secrets": [],
     "env_file": None,
     "executionTimeout": None,
     "killTimeout": 30,
@@ -449,6 +486,21 @@ _job_defaults_common = {
     Opt("onPermanentFailure"): Map({Opt("report"): _report_schema}),
     Opt("onSuccess"): Map({Opt("report"): _report_schema}),
     Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
+    # run-scoped secrets (Phase 5): each is resolved fresh per run and served
+    # to the job over the loopback endpoint (`yacron2 secret get NAME`) rather
+    # than placed in the environment, so it never shows in /proc/<pid>/environ
+    # or a `ps -E`. The same value/fromFile/fromEnvVar source triple every
+    # other secret uses. Needs a `state` section with jobApi enabled.
+    Opt("secrets"): Seq(
+        Map(
+            {
+                "name": Str(),
+                Opt("value"): EmptyNone() | Str(),
+                Opt("fromFile"): EmptyNone() | Str(),
+                Opt("fromEnvVar"): EmptyNone() | Str(),
+            }
+        )
+    ),
     Opt("env_file"): Str(),
     Opt("executionTimeout"): Float(),
     Opt("killTimeout"): Float(),
@@ -626,6 +678,18 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("gcGraceSeconds"): Int(),
                 Opt("maxOpsPerSecond"): Int() | Float(),
                 Opt("slotTtlSeconds"): Int() | Float(),
+                # the job-facing state API (Phase 5): the loopback endpoint
+                # and the `yacron2 state|cursor|lock|artifact|...` commands.
+                # See yacron2.jobapi. Defaults filled from DEFAULT_JOB_API.
+                Opt("jobApi"): Map(
+                    {
+                        Opt("enabled"): Bool(),
+                        Opt("listen"): Str(),
+                        Opt("maxValueBytes"): Int(),
+                        Opt("maxArtifactBytes"): Int(),
+                        Opt("lockTtlSeconds"): Int() | Float(),
+                    }
+                ),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -670,6 +734,14 @@ def mergedicts(dict1, dict2):
                             for kk, vv in merged.items()
                         ],
                     )
+                elif k == "secrets":
+                    # secrets is a list of {name, ...}; merge by name so a
+                    # job's secret overrides a same-named default rather than
+                    # staging two secrets under one name (mirrors environment).
+                    merged_secrets = {e["name"]: e for e in v1}
+                    for e in v2:
+                        merged_secrets[e["name"]] = e
+                    yield (k, list(merged_secrets.values()))
                 elif k == "fingerprint":
                     # sentry "fingerprint" is a replace-not-append setting: a
                     # job (or a defaults block) that supplies its own
@@ -796,6 +868,7 @@ class JobConfig:
         "onSuccess",
         "env_file",
         "environment",
+        "secrets",
         "executionTimeout",
         "killTimeout",
         "statsd",
@@ -856,6 +929,8 @@ class JobConfig:
 
         self.env_file = config.pop("env_file")
         self.environment = config.pop("environment")
+        self.secrets = config.pop("secrets")
+        self._validate_secrets()
         if self.env_file is not None:
             self._merge_env_file()
 
@@ -910,6 +985,28 @@ class JobConfig:
         if self.utc:
             return datetime.timezone.utc
         return None
+
+    def _validate_secrets(self) -> None:
+        """Reject secret blocks that name no source.
+
+        A secret with no source (value/fromFile/fromEnvVar) could only ever
+        stage empty, which is a config mistake worth catching at load rather
+        than at run time.  (The ``name`` is schema-required, and same-named
+        secrets merge to last-wins exactly as ``environment`` variables do.)
+        Whether a *configured* source resolves non-empty is checked when the
+        run stages it (yacron2.jobapi), the same fail-closed contract every
+        other secret uses.
+        """
+        for entry in self.secrets:
+            if not (
+                entry.get("value")
+                or entry.get("fromFile")
+                or entry.get("fromEnvVar")
+            ):
+                raise ConfigError(
+                    "job {!r}: secret {!r} needs a value, fromFile or "
+                    "fromEnvVar source".format(self.name, entry.get("name"))
+                )
 
     def _merge_env_file(self) -> None:
         try:
@@ -1284,6 +1381,28 @@ def _build_state_config(raw: dict) -> StateConfig:
         # one slow renew on a network mount expires a healthy holder's
         # slot and invites the cross-node double-run the lease fences.
         raise ConfigError("state.slotTtlSeconds must be >= 5")
+    # jobApi is a nested block: merge its raw keys over the defaults explicitly
+    # (cfg.update above is a shallow merge that would drop the untouched
+    # DEFAULT_JOB_API keys of a partially-specified `jobApi:` block).
+    job_api = dict(DEFAULT_JOB_API)
+    job_api.update(cfg.get("jobApi") or {})
+    cfg["jobApi"] = job_api
+    if float(job_api.get("lockTtlSeconds") or 0) < 5:
+        raise ConfigError("state.jobApi.lockTtlSeconds must be >= 5")
+    if int(job_api.get("maxValueBytes") or 0) < 0:
+        raise ConfigError("state.jobApi.maxValueBytes must be >= 0")
+    if int(job_api.get("maxArtifactBytes") or 0) < 0:
+        raise ConfigError("state.jobApi.maxArtifactBytes must be >= 0")
+    listen = job_api.get("listen")
+    if (
+        listen is not None
+        and "://" in str(listen)
+        and not str(listen).startswith("http://")
+    ):
+        raise ConfigError(
+            "state.jobApi.listen must be an http:// URL or a bare host:port "
+            "(the job CLI reaches the loopback endpoint over TCP only)"
+        )
     return StateConfig(cfg)
 
 
@@ -2195,6 +2314,27 @@ def _validate_cross_sections(config: Yacron2Config) -> None:
                     ", ".join(offenders)
                 )
             )
+        secret_offenders = sorted(
+            job.name for job in config.jobs if job.secrets
+        )
+        if secret_offenders:
+            raise ConfigError(
+                "job `secrets` are staged over the state loopback endpoint, "
+                "which requires a `state` section; none is configured, "
+                "offending job(s): {}".format(", ".join(secret_offenders))
+            )
+    elif config.jobs:
+        job_api = config.state_config.get("jobApi") or {}
+        if not job_api.get("enabled", True):
+            secret_offenders = sorted(
+                job.name for job in config.jobs if job.secrets
+            )
+            if secret_offenders:
+                raise ConfigError(
+                    "job `secrets` need the state loopback endpoint, but "
+                    "state.jobApi.enabled is false; offending job(s): "
+                    "{}".format(", ".join(secret_offenders))
+                )
 
 
 def parse_config(

@@ -1,20 +1,28 @@
 # Command-Line Reference
 
 This page documents the `yacron2` command and every argument it accepts, the
-`yacron2 state` administration subcommands, the runtime model (foreground
-execution, signal handling, exit codes), and common invocations. Behavior is
-taken from `yacron2/__main__.py` and `yacron2/state_admin.py`.
+`yacron2 state` administration subcommands, the job-facing state commands a
+running job uses (`state get|set|delete|keys`, `cursor`, `lock`, `artifact`,
+`idempotent`, `secret`), the runtime model (foreground execution, signal
+handling, exit codes), and common invocations. Behavior is taken from
+`yacron2/__main__.py`, `yacron2/state_admin.py`, and `yacron2/jobcli.py`.
 
 ## Synopsis
 
 ```
 yacron2 [-c FILE-OR-DIR] [-l LOG_LEVEL] [-v] [--job-set-id] [--version]
 yacron2 state ACTION [options] [-c FILE-OR-DIR]
+yacron2 state get|set|delete|keys ...  [--scope NAME | --global]
+yacron2 cursor|lock|artifact|idempotent|secret ...  [--scope NAME | --global]
 ```
 
 Without a subcommand, `yacron2` is the scheduler daemon described below. With
 the `state` subcommand it is an offline administration tool for the durable
-state store; see [The `state` subcommand](#the-state-subcommand).
+state store; see [The `state` subcommand](#the-state-subcommand). The
+`state get|set|delete|keys`, `cursor`, `lock`, `artifact`, `idempotent`, and
+`secret` commands are a different surface: a *running job* uses them to reach the
+daemon's store through its loopback endpoint; see
+[Job-facing state commands](#job-facing-state-commands).
 
 `yacron2` runs as a single foreground process. It does not daemonize, does not
 fork, and does not write a PID file. Diagnostics go to stdout/stderr via the
@@ -259,6 +267,179 @@ with `gcGraceSeconds` disabled). Errors print `yacron2 state error: <detail>`.
 `yacron2 state` with no action prints a pointer to `yacron2 state --help` and
 exits `2`, the same code argparse itself uses for usage errors (an unknown
 option, or a missing required one such as `backup` without `-o`).
+
+## Job-facing state commands
+
+Alongside the offline `state` admin actions above, yacron2 ships a family of
+**job-facing** state commands -- `state get|set|delete|keys`, `cursor`, `lock`,
+`artifact`, `idempotent`, and `secret` -- that a *running job's* command line
+uses to reach the daemon's durable store. They are thin clients of the
+[loopback state endpoint](HTTP-API#job-facing-state-endpoints-loopback) the
+daemon injects into every job's environment: each reads the injected
+`YACRON2_STATE_URL` / `YACRON2_STATE_TOKEN` and speaks HTTP over the standard
+library (no aiohttp, no event loop), so it starts instantly and needs no config
+file. Behavior is taken from `yacron2/jobcli.py`.
+
+These are meant to run **inside a job**, not from an operator shell: outside a
+job the injected environment is absent and every command exits `1` with `not
+running inside a yacron2 job: YACRON2_STATE_URL is not set`. They require a
+`state:` section with `jobApi.enabled` (the default); see the
+[endpoint reference](HTTP-API#job-facing-state-endpoints-loopback) and
+[Durable State](Durable-State).
+
+> The `state get|set|delete|keys` job actions **coexist** with the offline
+> `state backup|restore|migrate|gc|check|migrate-schema`
+> [admin actions](#the-state-subcommand) under the one `yacron2 state` command;
+> the action name selects which handler runs. The admin actions operate offline
+> from `-c`; these job actions act through the running daemon and take no `-c`.
+
+### Scope and exit codes
+
+Every KV, cursor, artifact, lock, and idempotency command acts in a *scope*: a
+namespace that defaults to the calling job's own name, so one job cannot read
+another's state by accident. Two mutually exclusive flags override it:
+
+| Flag | Meaning |
+| --- | --- |
+| `--scope NAME` | Act in the named scope. |
+| `--global` | Act in the shared `global` scope (deliberate cross-job coordination). |
+
+(`secret` takes neither flag: a run's secrets are always its own.)
+
+The commands share one exit-code convention, made for shell branching:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success (or, for `idempotent`, the claim was fresh). |
+| `1` | An error (or, for `idempotent`, the key was already claimed -- a duplicate). |
+| `2` | Usage error (argparse; e.g. a command invoked with no action). |
+| `3` | A `lock acquire` / `lock run` did not get the lock. |
+| `4` | The looked-up key, cursor, artifact, or secret does not exist. |
+
+### `state get|set|delete|keys` (durable key/value)
+
+```
+yacron2 state get KEY [--scope NAME | --global]
+yacron2 state set KEY VALUE [--json] [--scope NAME | --global]
+yacron2 state delete KEY [--scope NAME | --global]
+yacron2 state keys [--scope NAME | --global]
+```
+
+Durable, restart-surviving key/value storage. `get` prints the value (exit `4`
+if the key is absent); `set` stores it (as a string by default, or as a parsed
+JSON document with `--json`); `delete` removes it (exit `4` if it did not exist);
+`keys` prints one key per line for the scope.
+
+### `cursor get|advance` (ETL watermark)
+
+```
+yacron2 cursor get NAME [--scope NAME | --global]
+yacron2 cursor advance NAME VALUE [--force] [--scope NAME | --global]
+```
+
+A monotonic marker an incremental job advances and never sees regress. `advance`
+moves the cursor to `VALUE` only when it is greater than the stored value (a
+numeric `VALUE` compares numerically, otherwise it compares as a string), so a
+replayed or out-of-order batch cannot walk it backwards; `--force` sets it
+unconditionally (a deliberate rewind). `get` prints the current value (exit `4`
+if the cursor is unset). Both print the resulting value.
+
+### `lock acquire|release|run` (distributed mutex/semaphore)
+
+```
+yacron2 lock acquire NAME [--permits N] [--wait --timeout S] [--ttl S] [--scope NAME | --global]
+yacron2 lock run NAME [--permits N] [--wait --timeout S] [--ttl S] [--scope NAME | --global] -- COMMAND...
+yacron2 lock release TOKEN
+```
+
+A fleet-wide mutex (or a semaphore, with `--permits N`) held as a daemon-renewed
+lease. `acquire` takes the lock and prints its hold token (exit `3` if it could
+not, unless `--wait` blocks up to `--timeout` seconds for a free permit);
+`release TOKEN` frees a lock by the token `acquire` printed (it takes no scope
+flags). `run` is the safe form: it holds the lock while running `COMMAND...`
+(everything after `--`), exits with the command's own exit code, and always
+releases the lock afterward -- even if the command fails or is signalled.
+`--ttl` overrides the lease TTL (default `state.jobApi.lockTtlSeconds`). The
+daemon also releases any lock a run still holds when the run ends, so a crash
+never leaks one.
+
+### `artifact put|get|list` (named blob store)
+
+```
+yacron2 artifact put NAME [FILE] [--scope NAME | --global]
+yacron2 artifact get NAME [-o FILE] [--scope NAME | --global]
+yacron2 artifact list [--scope NAME | --global]
+```
+
+Small named blobs published by one run and read back by a later run or a peer
+node. `put` publishes from `FILE` (or from stdin when `FILE` is omitted or `-`)
+and prints the payload's `sha256`; `get` writes the newest blob for `NAME` to
+`-o FILE` (or stdout when omitted or `-`, and exits `4` if the name was never
+published); `list` prints one artifact name per line.
+
+### `idempotent` (run-once guard)
+
+```
+yacron2 idempotent KEY [--ttl S] [--release] [--scope NAME | --global]
+```
+
+A fleet-wide create-if-absent claim: the first caller to claim `KEY` exits `0`
+(fresh -- do the work), every later caller exits `1` (a duplicate -- skip it),
+made for a shell guard around an at-most-once side effect. `--ttl S` expires the
+claim after `S` seconds (`0`, the default, is a permanent claim); `--release`
+drops the claim instead of making it, so `KEY` can be claimed fresh again.
+
+### `secret get|list` (run-scoped secrets)
+
+```
+yacron2 secret get NAME
+yacron2 secret list
+```
+
+Read a secret the daemon staged in memory for this run (resolved fresh per run,
+never written to the store, dropped when the run ends). `get` prints the value
+(exit `4` if no secret of that name is staged); `list` prints one staged name
+per line. There are no scope flags: a run sees only its own secrets.
+
+### Job command examples
+
+These run inside a job, where the daemon has injected `YACRON2_STATE_URL` and
+`YACRON2_STATE_TOKEN`.
+
+Advance an ETL watermark from the highest id this run processed, so the next run
+resumes from where it stopped:
+
+```shell
+last=$(yacron2 cursor get rows 2>/dev/null || echo 0)
+process-rows --since "$last" --emit-max-id > max_id
+yacron2 cursor advance rows "$(cat max_id)"
+```
+
+Hold a fleet-wide mutex while a critical section runs, releasing it
+automatically when the command finishes (or crashes):
+
+```shell
+yacron2 lock run db-migrate --wait --timeout 300 -- ./apply-migrations.sh
+```
+
+Guard an at-most-once side effect so a retried or duplicated run sends today's
+invoices only once, fleet-wide:
+
+```shell
+if yacron2 idempotent "invoice-$(date +%F)"; then
+    send-invoices
+else
+    echo "invoices already sent for today; skipping"
+fi
+```
+
+Hand a build artifact from one job to a shared scope another job reads:
+
+```shell
+yacron2 artifact put report.pdf ./out/report.pdf --global
+# ...then, in a later job:
+yacron2 artifact get report.pdf -o ./report.pdf --global
+```
 
 ## Runtime model
 

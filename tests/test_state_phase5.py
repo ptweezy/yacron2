@@ -1,0 +1,579 @@
+"""Phase 5 -- state as a first-class job primitive.
+
+Two layers are exercised here:
+
+* the backend primitives the whole phase rests on -- the mutable *document*
+  store (one file per key, atomic-rename rewrite under an advisory flock) and
+  the content-addressed *blob* store -- driven straight against a real temp
+  directory through :func:`tests.test_state._backend`;
+* the pure logic layer in :mod:`yacron2.jobstate` (KV, monotonic cursor,
+  create-if-absent idempotency, named artifacts) over that backend.
+
+Style matches the other state test files: no frozen clock, bare ``async def``
+tests (``asyncio_mode = auto``), module seams monkeypatched rather than time
+asserted.  Server/CLI wiring lives in test_state_phase5_api.py.
+"""
+
+import os
+
+import pytest
+
+from tests.test_state import _backend
+from yacron2 import jobstate, state
+from yacron2.config import ConfigError, parse_config, parse_config_string
+from yacron2.jobstate import JobStateError
+from yacron2.state import DOC_DELETE, DOC_KEEP
+
+
+def _cfg(yaml):
+    return parse_config_string(yaml, "")
+
+
+# --------------------------------------------------------------------------
+# Config: state.jobApi + per-job secrets
+# --------------------------------------------------------------------------
+
+
+def test_jobapi_defaults_filled():
+    cfg = _cfg("state:\n  path: /x\n").state_config
+    api = cfg["jobApi"]
+    assert api["enabled"] is True
+    assert api["listen"] is None
+    assert api["maxValueBytes"] == 1024 * 1024
+    assert api["lockTtlSeconds"] == 30
+
+
+def test_jobapi_partial_override_keeps_other_defaults():
+    cfg = _cfg(
+        "state:\n  path: /x\n  jobApi:\n    enabled: false\n"
+    ).state_config
+    api = cfg["jobApi"]
+    assert api["enabled"] is False
+    # the untouched keys survive the partial block.
+    assert api["maxValueBytes"] == 1024 * 1024
+    assert api["lockTtlSeconds"] == 30
+
+
+def test_jobapi_lock_ttl_floor():
+    with pytest.raises(ConfigError, match="lockTtlSeconds must be >= 5"):
+        _cfg("state:\n  path: /x\n  jobApi:\n    lockTtlSeconds: 2\n")
+
+
+def test_jobapi_listen_rejects_unix():
+    with pytest.raises(ConfigError, match="must be an http:// URL"):
+        _cfg(
+            "state:\n  path: /x\n  jobApi:\n"
+            "    listen: unix:///run/y.sock\n"
+        )
+
+
+def test_secrets_parsed():
+    cfg = _cfg(
+        "state:\n  path: /x\n"
+        "jobs:\n  - name: j\n    command: 'true'\n"
+        "    schedule: '* * * * *'\n"
+        "    secrets:\n"
+        "      - name: TOKEN\n        value: hunter2\n"
+    )
+    (job,) = cfg.jobs
+    assert job.secrets == [{"name": "TOKEN", "value": "hunter2"}]
+
+
+def test_secret_missing_source_rejected():
+    with pytest.raises(ConfigError, match="needs a value, fromFile"):
+        _cfg(
+            "state:\n  path: /x\n"
+            "jobs:\n  - name: j\n    command: 'true'\n"
+            "    schedule: '* * * * *'\n"
+            "    secrets:\n      - name: TOKEN\n"
+        )
+
+
+def test_secret_duplicate_name_last_wins():
+    # like environment variables, a same-named secret merges to last-wins
+    # rather than staging two secrets under one name.
+    cfg = _cfg(
+        "state:\n  path: /x\n"
+        "jobs:\n  - name: j\n    command: 'true'\n"
+        "    schedule: '* * * * *'\n"
+        "    secrets:\n"
+        "      - name: T\n        value: a\n"
+        "      - name: T\n        value: b\n"
+    )
+    (job,) = cfg.jobs
+    assert job.secrets == [{"name": "T", "value": "b"}]
+
+
+def test_secrets_require_state_section(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "jobs:\n  - name: j\n    command: 'true'\n"
+        "    schedule: '* * * * *'\n"
+        "    secrets:\n      - name: T\n        value: a\n"
+    )
+    with pytest.raises(ConfigError, match="requires a `state` section"):
+        parse_config(str(path))
+
+
+def test_secrets_require_jobapi_enabled(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "state:\n  path: " + str(tmp_path) + "\n"
+        "  jobApi:\n    enabled: false\n"
+        "jobs:\n  - name: j\n    command: 'true'\n"
+        "    schedule: '* * * * *'\n"
+        "    secrets:\n      - name: T\n        value: a\n"
+    )
+    with pytest.raises(ConfigError, match="jobApi.enabled is false"):
+        parse_config(str(path))
+
+
+def test_secrets_merge_from_defaults():
+    cfg = _cfg(
+        "defaults:\n"
+        "  secrets:\n      - name: SHARED\n        value: base\n"
+        "state:\n  path: /x\n"
+        "jobs:\n  - name: j\n    command: 'true'\n"
+        "    schedule: '* * * * *'\n"
+        "    secrets:\n      - name: OWN\n        value: mine\n"
+    )
+    (job,) = cfg.jobs
+    names = sorted(s["name"] for s in job.secrets)
+    assert names == ["OWN", "SHARED"]
+
+
+# --------------------------------------------------------------------------
+# Backend: mutable document store
+# --------------------------------------------------------------------------
+
+
+async def test_document_absent_reads_none(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    assert await backend.read_document("ns", "missing") is None
+    assert await backend.list_documents("ns") == []
+    await backend.stop()
+
+
+async def test_document_write_read_roundtrip(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+
+    def _put(current):
+        return {"key": "k", "value": {"a": 1}}, "created"
+
+    stored, result = await backend.mutate_document("ns", "k", _put)
+    assert result == "created"
+    assert stored == {"key": "k", "value": {"a": 1}}
+    assert await backend.read_document("ns", "k") == {
+        "key": "k",
+        "value": {"a": 1},
+    }
+    await backend.stop()
+
+
+async def test_document_keep_leaves_value(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "k", lambda c: ({"value": 1}, None))
+    stored, res = await backend.mutate_document(
+        "ns", "k", lambda c: (DOC_KEEP, "unchanged")
+    )
+    assert res == "unchanged"
+    assert stored == {"value": 1}
+    assert await backend.read_document("ns", "k") == {"value": 1}
+    await backend.stop()
+
+
+async def test_document_delete(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "k", lambda c: ({"value": 1}, None))
+    assert await backend.delete_document("ns", "k") is True
+    assert await backend.read_document("ns", "k") is None
+    # deleting an absent document reports it did not exist.
+    assert await backend.delete_document("ns", "k") is False
+    await backend.stop()
+
+
+async def test_document_delete_via_sentinel(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "k", lambda c: ({"value": 1}, None))
+    stored, res = await backend.mutate_document(
+        "ns", "k", lambda c: (DOC_DELETE, "gone")
+    )
+    assert stored is None
+    assert res == "gone"
+    assert await backend.read_document("ns", "k") is None
+    await backend.stop()
+
+
+async def test_document_transform_sees_current(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document(
+        "ns", "counter", lambda c: ({"value": 0}, None)
+    )
+
+    def _incr(current):
+        n = current["value"] if current else 0
+        return {"value": n + 1}, n + 1
+
+    for expected in (1, 2, 3):
+        _stored, res = await backend.mutate_document("ns", "counter", _incr)
+        assert res == expected
+    assert (await backend.read_document("ns", "counter"))["value"] == 3
+    await backend.stop()
+
+
+async def test_document_list_returns_bodies(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    for key in ("a", "b", "c"):
+        await backend.mutate_document(
+            "ns", key, lambda c, k=key: ({"key": k, "value": k}, None)
+        )
+    bodies = await backend.list_documents("ns")
+    assert sorted(b["key"] for b in bodies) == ["a", "b", "c"]
+    await backend.stop()
+
+
+async def test_document_namespaces_isolated(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns1", "k", lambda c: ({"value": 1}, None))
+    await backend.mutate_document("ns2", "k", lambda c: ({"value": 2}, None))
+    assert (await backend.read_document("ns1", "k"))["value"] == 1
+    assert (await backend.read_document("ns2", "k"))["value"] == 2
+    assert len(await backend.list_documents("ns1")) == 1
+    await backend.stop()
+
+
+async def test_document_survives_restart(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document(
+        "ns", "k", lambda c: ({"value": "durable"}, None)
+    )
+    await backend.stop()
+
+    backend2 = _backend(tmp_path)
+    await backend2.start()
+    assert (await backend2.read_document("ns", "k"))["value"] == "durable"
+    await backend2.stop()
+
+
+async def test_document_weird_key_is_filename_safe(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    # slashes, spaces, unicode, path traversal attempts: all injective-safe.
+    for key in ("a/b/c", "../escape", "with space", "uniçode", "CON"):
+        await backend.mutate_document(
+            "ns", key, lambda c, k=key: ({"key": k, "value": 1}, None)
+        )
+        assert await backend.read_document("ns", key) is not None
+    # nothing escaped the docs namespace directory.
+    ns_dir = os.path.join(backend.base, "docs")
+    assert os.path.isdir(ns_dir)
+    await backend.stop()
+
+
+async def test_document_corrupt_reads_none_but_mutate_fails(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "k", lambda c: ({"value": 1}, None))
+    _lock, doc_path = backend._doc_paths("ns", "k")
+    with open(doc_path, "wb") as fobj:
+        fobj.write(b"{ this is not valid json")
+    # best-effort read swallows the corruption...
+    assert await backend.read_document("ns", "k") is None
+    # ...but a read-modify-write fails closed rather than clobbering it.
+    with pytest.raises(state._DocumentUnreadable):
+        await backend.mutate_document(
+            "ns", "k", lambda c: ({"value": 2}, None)
+        )
+    await backend.stop()
+
+
+# --------------------------------------------------------------------------
+# Backend: content-addressed blob store
+# --------------------------------------------------------------------------
+
+
+async def test_blob_put_get_roundtrip(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    digest = await backend.put_blob(b"hello world")
+    assert len(digest) == 64  # sha-256 hex
+    assert await backend.get_blob(digest) == b"hello world"
+    await backend.stop()
+
+
+async def test_blob_is_content_addressed_and_deduped(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    d1 = await backend.put_blob(b"same")
+    d2 = await backend.put_blob(b"same")
+    assert d1 == d2
+    # only one file on disk for identical content.
+    shard = os.path.join(backend.base, "blobs", d1[:2])
+    assert os.listdir(shard) == [d1 + ".blob"]
+    await backend.stop()
+
+
+async def test_blob_missing_returns_none(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    assert await backend.get_blob("0" * 64) is None
+    await backend.stop()
+
+
+async def test_blob_survives_restart(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    digest = await backend.put_blob(b"persisted bytes")
+    await backend.stop()
+
+    backend2 = _backend(tmp_path)
+    await backend2.start()
+    assert await backend2.get_blob(digest) == b"persisted bytes"
+    await backend2.stop()
+
+
+# --------------------------------------------------------------------------
+# Logic layer: durable key/value
+# --------------------------------------------------------------------------
+
+
+async def test_kv_set_get_delete(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    assert await jobstate.kv_get(backend, "job-a", "greeting") is None
+    await jobstate.kv_set(backend, "job-a", "greeting", "hello")
+    body = await jobstate.kv_get(backend, "job-a", "greeting")
+    assert body["value"] == "hello"
+    assert await jobstate.kv_delete(backend, "job-a", "greeting") is True
+    assert await jobstate.kv_get(backend, "job-a", "greeting") is None
+    await backend.stop()
+
+
+async def test_kv_null_value_distinct_from_absent(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.kv_set(backend, "job-a", "k", None)
+    body = await jobstate.kv_get(backend, "job-a", "k")
+    assert body is not None and body["value"] is None
+    await backend.stop()
+
+
+async def test_kv_scopes_isolated(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.kv_set(backend, "job-a", "k", "a")
+    await jobstate.kv_set(backend, "job-b", "k", "b")
+    assert (await jobstate.kv_get(backend, "job-a", "k"))["value"] == "a"
+    assert (await jobstate.kv_get(backend, "job-b", "k"))["value"] == "b"
+    keys_a = [b["key"] for b in await jobstate.kv_list(backend, "job-a")]
+    assert keys_a == ["k"]
+    await backend.stop()
+
+
+async def test_kv_size_limit(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    with pytest.raises(JobStateError) as ei:
+        await jobstate.kv_set(backend, "job-a", "k", "x" * 100, max_bytes=10)
+    assert ei.value.status == 413
+    await backend.stop()
+
+
+async def test_kv_list_sorted(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    for key in ("charlie", "alpha", "bravo"):
+        await jobstate.kv_set(backend, "s", key, key)
+    keys = [b["key"] for b in await jobstate.kv_list(backend, "s")]
+    assert keys == ["alpha", "bravo", "charlie"]
+    await backend.stop()
+
+
+# --------------------------------------------------------------------------
+# Logic layer: incremental cursor / watermark
+# --------------------------------------------------------------------------
+
+
+async def test_cursor_monotonic_advance(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    r1 = await jobstate.cursor_advance(backend, "etl", "wm", 100)
+    assert r1 == {"value": 100, "advanced": True}
+    r2 = await jobstate.cursor_advance(backend, "etl", "wm", 200)
+    assert r2 == {"value": 200, "advanced": True}
+    # a lower value never regresses the watermark.
+    r3 = await jobstate.cursor_advance(backend, "etl", "wm", 150)
+    assert r3 == {"value": 200, "advanced": False}
+    assert (await jobstate.cursor_get(backend, "etl", "wm"))["value"] == 200
+    await backend.stop()
+
+
+async def test_cursor_iso_string_watermark(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.cursor_advance(backend, "etl", "ts", "2026-07-01T00:00:00")
+    r = await jobstate.cursor_advance(
+        backend, "etl", "ts", "2026-06-01T00:00:00"
+    )
+    # ISO-8601 sorts lexicographically == chronologically, so the older
+    # timestamp does not advance the cursor.
+    assert r["advanced"] is False
+    assert (
+        await jobstate.cursor_get(backend, "etl", "ts")
+    )["value"] == "2026-07-01T00:00:00"
+    await backend.stop()
+
+
+async def test_cursor_force_rewind(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.cursor_advance(backend, "etl", "wm", 500)
+    r = await jobstate.cursor_advance(backend, "etl", "wm", 10, force=True)
+    assert r == {"value": 10, "advanced": True}
+    await backend.stop()
+
+
+async def test_cursor_type_clash_rejected(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.cursor_advance(backend, "etl", "wm", 100)
+    with pytest.raises(JobStateError) as ei:
+        await jobstate.cursor_advance(backend, "etl", "wm", "not-a-number")
+    assert ei.value.status == 409
+    await backend.stop()
+
+
+# --------------------------------------------------------------------------
+# Logic layer: idempotency keys
+# --------------------------------------------------------------------------
+
+
+async def test_idempotency_first_claim_fresh(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    assert (await jobstate.idempotency_claim(backend, "s", "order-1"))["fresh"]
+    # a second claim of the same key is not fresh.
+    assert not (
+        await jobstate.idempotency_claim(backend, "s", "order-1")
+    )["fresh"]
+    await backend.stop()
+
+
+async def test_idempotency_ttl_reclaim(tmp_path, monkeypatch):
+    backend = _backend(tmp_path)
+    await backend.start()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(jobstate, "_now", lambda: clock["t"])
+    assert (
+        await jobstate.idempotency_claim(backend, "s", "k", ttl=30)
+    )["fresh"]
+    # still within the window: not fresh.
+    clock["t"] = 1020.0
+    assert not (
+        await jobstate.idempotency_claim(backend, "s", "k", ttl=30)
+    )["fresh"]
+    # past the window: re-winnable.
+    clock["t"] = 1040.0
+    assert (
+        await jobstate.idempotency_claim(backend, "s", "k", ttl=30)
+    )["fresh"]
+    await backend.stop()
+
+
+async def test_idempotency_release(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.idempotency_claim(backend, "s", "k")
+    assert await jobstate.idempotency_release(backend, "s", "k") is True
+    assert (await jobstate.idempotency_claim(backend, "s", "k"))["fresh"]
+    await backend.stop()
+
+
+# --------------------------------------------------------------------------
+# Logic layer: named artifact store
+# --------------------------------------------------------------------------
+
+
+async def test_artifact_put_get(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    rec = await jobstate.artifact_put(backend, "s", "report.csv", b"a,b,c\n")
+    assert rec["size"] == 6
+    got = await jobstate.artifact_get(backend, "s", "report.csv")
+    assert got is not None
+    record, data = got
+    assert data == b"a,b,c\n"
+    assert record["sha256"] == rec["sha256"]
+    await backend.stop()
+
+
+async def test_artifact_newest_version_wins(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.artifact_put(backend, "s", "x", b"v1")
+    await jobstate.artifact_put(backend, "s", "x", b"v2")
+    _rec, data = await jobstate.artifact_get(backend, "s", "x")
+    assert data == b"v2"
+    await backend.stop()
+
+
+async def test_artifact_list_newest_per_name(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.artifact_put(backend, "s", "a", b"1")
+    await jobstate.artifact_put(backend, "s", "b", b"2")
+    await jobstate.artifact_put(backend, "s", "a", b"3")
+    listing = await jobstate.artifact_list(backend, "s")
+    assert [r["name"] for r in listing] == ["a", "b"]
+    await backend.stop()
+
+
+async def test_artifact_missing_returns_none(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    assert await jobstate.artifact_get(backend, "s", "nope") is None
+    await backend.stop()
+
+
+async def test_artifact_size_limit(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    with pytest.raises(JobStateError) as ei:
+        await jobstate.artifact_put(backend, "s", "big", b"x" * 100,
+                                    max_bytes=10)
+    assert ei.value.status == 413
+    await backend.stop()
+
+
+async def test_artifact_orphan_blob_swept_after_reference_gone(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    digest = (await jobstate.artifact_put(backend, "s", "x", b"payload"))[
+        "sha256"
+    ]
+    # referenced by a surviving record: not swept even at grace 0.
+    assert await backend.sweep_orphan_blobs({digest}, 0.0) == 0
+    assert await backend.get_blob(digest) is not None
+    # unreferenced (its scope was collected) and old enough: swept.
+    assert await backend.sweep_orphan_blobs(set(), 0.0) == 1
+    assert await backend.get_blob(digest) is None
+    await backend.stop()
+
+
+async def test_referenced_blob_digests(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    d1 = (await jobstate.artifact_put(backend, "s1", "a", b"one"))["sha256"]
+    d2 = (await jobstate.artifact_put(backend, "s2", "b", b"two"))["sha256"]
+    refs = await jobstate.referenced_blob_digests(backend, ["s1", "s2"])
+    assert refs == {d1, d2}
+    await backend.stop()

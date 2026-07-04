@@ -14,7 +14,7 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A modern, optionally-distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
+A modern, container-friendly, optionally-distributed, fault-tolerant, highly available, leader-electing, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
@@ -37,7 +37,11 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * **Opt-in durable state**: point a single `state:` config block at a local
   directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
   gain durability across restarts -- missed-run catch-up after downtime and
-  retries that survive a daemon restart (see the
+  retries that survive a daemon restart. The same store is handed to the jobs
+  themselves over a loopback endpoint, so a job command can reach for durable
+  key/value, an ETL cursor/watermark, a fleet-wide mutex or semaphore,
+  idempotency keys, a shared artifact store and run-scoped secrets with
+  `yacron2 state|cursor|lock|artifact|idempotent|secret` (see the
   [Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State) wiki
   page); without it, yacron2 stays stateless as before
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and

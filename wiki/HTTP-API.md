@@ -771,6 +771,138 @@ the web app starts under its own error handling, after the cluster manager, so a
 web misconfiguration cannot skip the cluster gate (which would otherwise fail
 open and run every `Leader` job on every node).
 
+## Job-facing state endpoints (loopback)
+
+Separate from the `web` control API above, yacron2 can run a second,
+**loopback-only** HTTP server that hands its [durable state store](Durable-State)
+to the *jobs it runs*. It binds `127.0.0.1` on an OS-assigned ephemeral port (or
+the address in `state.jobApi.listen`), and the daemon injects its base URL and a
+per-run bearer token into every job's environment, so a job's command line can
+read and write durable state, coordinate through a fleet-wide lock, or fetch a
+run-scoped secret. The `yacron2 state|cursor|lock|artifact|idempotent|secret`
+[CLI commands](CLI-Reference#job-facing-state-commands) are thin clients of this
+endpoint; the same primitives are also reachable offline against the store
+directly, so this server is a front-end, not a second source of truth. The
+surface is served by `yacron2/jobapi.py`; the primitives themselves live in
+`yacron2/jobstate.py`.
+
+### Enabling the endpoint
+
+The endpoint is stood up only when the configuration has a `state:` section with
+`jobApi.enabled` (default `true`). A stateless install, or one with a `state:`
+section but `jobApi.enabled: false`, never starts it and injects nothing.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Serve the loopback endpoint and inject the `YACRON2_*` environment into every job. |
+| `listen` | string | (ephemeral) | Address to bind, as `host:port` or `http://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; keep it on loopback. |
+| `maxValueBytes` | int | (unlimited) | Reject a KV or cursor value larger than this many bytes (JSON-encoded) with `413`. `0` or absent means no limit. |
+| `maxArtifactBytes` | int | (unlimited) | Reject an artifact payload larger than this many bytes with `413`. `0` or absent means no limit. |
+| `lockTtlSeconds` | float | `30` | Default lease TTL for a job lock (floored at `5`); the daemon renews it at a third of the TTL while the job holds it. |
+
+### Injected environment
+
+On launch the daemon injects these variables into every job's process. All are
+strings; an unknown scheduled time is the empty string rather than absent, so a
+job can test the variable instead of guessing whether it was set.
+
+| Variable | Meaning |
+| --- | --- |
+| `YACRON2_STATE_URL` | The loopback base URL, e.g. `http://127.0.0.1:54321`. |
+| `YACRON2_STATE_TOKEN` | A per-run bearer token, revoked the instant the run ends. |
+| `YACRON2_RUN_ID` | A unique id for this run. |
+| `YACRON2_JOB_NAME` | The job's name (also its default scope). |
+| `YACRON2_ATTEMPT` | The retry attempt number (`0` on the first fire). |
+| `YACRON2_SCHEDULED_AT` | The scheduled fire time (ISO-8601), or empty. |
+| `YACRON2_HOST` | The host name. |
+
+### Authentication and errors
+
+Every request must carry `Authorization: Bearer $YACRON2_STATE_TOKEN`. The token
+is matched in constant time against the live run set, so a missing, malformed,
+forged, or stale token returns `401 Unauthorized` before any state is touched.
+Other outcomes:
+
+| Status | When | Body |
+| --- | --- | --- |
+| `400` | A caller error: a missing required field, or a body that is not a JSON object. | `{"error": "..."}` |
+| `409` | A cursor advanced with a value not comparable to its stored one (a type clash). | `{"error": "..."}` |
+| `410` | An artifact record survives but its payload blob was garbage collected. | `{"error": "..."}` |
+| `413` | A value or artifact larger than the configured `maxValueBytes` / `maxArtifactBytes`. | `{"error": "..."}` |
+| `404` | A `get` for a key, cursor, artifact, or secret that is not set. | (empty) |
+| `503` | The state store is unavailable or a backend call timed out. | `{"error": "..."}` |
+
+### Scopes
+
+Every KV, cursor, idempotency, and artifact call acts in a *scope*: a namespace
+that defaults to the calling job's own name (`defaultScope` in `GET /v1/run`), so
+one job cannot read another's state by accident. Omit `scope` for that private
+namespace, or pass `scope=global` (any shared name works) for deliberate
+cross-job coordination.
+
+### Routes
+
+All routes are under `/v1/` and registered in `JobStateAPI._routes`:
+
+| Method | Path | Body / query | Success response |
+| --- | --- | --- | --- |
+| `GET` | `/v1/run` | -- | `{runId, job, attempt, scheduledAt, host, defaultScope}` |
+| `GET` | `/v1/kv/get` | `?scope=&key=` | `{value, updatedAt}`, or `404` |
+| `POST` | `/v1/kv/set` | `{scope?, key, value}` | `{ok, updatedAt}` |
+| `POST` | `/v1/kv/delete` | `{scope?, key}` | `{existed}` |
+| `GET` | `/v1/kv/list` | `?scope=` | `{scope, keys: [{key, value, updatedAt}]}` |
+| `GET` | `/v1/cursor/get` | `?scope=&name=` | `{value, updatedAt}`, or `404` |
+| `POST` | `/v1/cursor/advance` | `{scope?, name, value, force?}` | `{value, advanced}` |
+| `POST` | `/v1/idempotency/claim` | `{scope?, key, ttl?}` | `{fresh, claimedAt}` |
+| `POST` | `/v1/idempotency/release` | `{scope?, key}` | `{released}` |
+| `POST` | `/v1/artifact/put` | `?scope=&name=`, raw body | `{sha256, size}` |
+| `GET` | `/v1/artifact/get` | `?scope=&name=` | raw bytes plus `X-Yacron2-Sha256` / `X-Yacron2-Size`, or `404` |
+| `GET` | `/v1/artifact/list` | `?scope=` | `{scope, artifacts: [{name, sha256, size, at}]}` |
+| `POST` | `/v1/lock/acquire` | `{scope?, name, permits?, ttl?, wait?, blockSeconds?}` | `{acquired, token?, slot?, fence?, ttl?}` |
+| `POST` | `/v1/lock/release` | `{token}` | `{released}` |
+| `GET` | `/v1/secret/get` | `?name=` | `{value}`, or `404` |
+| `GET` | `/v1/secret/list` | -- | `{names: [...]}` |
+
+`cursor/advance` is monotonic by default: the stored value only ever moves to
+`max(current, value)`, so a replayed or out-of-order batch cannot walk a
+watermark backwards, and two nodes racing to advance the same cursor converge on
+the larger value. `advanced` is `false` when the given value was not greater than
+the current one (a no-op that is not even a write), and `force: true` sets the
+value unconditionally (a deliberate rewind). `idempotency/claim` is a fleet-wide
+create-if-absent: the first caller gets `fresh: true`, every later caller
+`fresh: false`, so a retried run can tell "already did this" from "first time"; a
+positive `ttl` bounds the dedupe window (`0` is a permanent claim).
+
+The lock is a fleet-wide mutex (or a semaphore, with `permits > 1`) held as a TTL
+lease that the daemon renews for as long as the job holds it and releases the
+instant the job releases it or the run ends -- so a job that crashes or forgets
+to unlock never leaks a lock. `wait: true` retries for up to `blockSeconds`
+before giving up; without it the call makes a single pass over the permits and
+returns `{acquired: false}` when they are all taken. Like every yacron2
+coordination primitive the lock is at-least-once, not exactly-once (the `fence`
+token in the reply is there for a job that needs true fencing). Run-scoped
+**secrets** are staged in memory by the daemon per run and vanish when the run
+ends; they never touch the store, so only the daemon holds them, and there is no
+scope on the secret routes -- a run sees only its own.
+
+```shell
+# Inside a job, using the injected env directly.
+$ curl -s -H "Authorization: Bearer $YACRON2_STATE_TOKEN" \
+    "$YACRON2_STATE_URL/v1/run"
+{"runId": "…", "job": "nightly-etl", "attempt": 0, "scheduledAt": "2026-07-04T02:00:00+00:00", "host": "node-a", "defaultScope": "nightly-etl"}
+
+# Advance the job's private ETL cursor to the last row processed.
+$ curl -s -H "Authorization: Bearer $YACRON2_STATE_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"name": "rows", "value": 20482}' \
+    "$YACRON2_STATE_URL/v1/cursor/advance"
+{"value": 20482, "advanced": true}
+```
+
+In practice a job reaches for the
+[job-facing CLI](CLI-Reference#job-facing-state-commands) rather than raw `curl`;
+those commands read the injected environment for you.
+
 ## See also
 
 - [Web Dashboard](Web-Dashboard): the built-in browser UI served by this interface.
@@ -778,6 +910,7 @@ open and run every `Leader` job on every node).
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the `GET /cluster` view and the separate mTLS `/peer` endpoint.
 - [Running on Windows](Running-on-Windows): `unix://` listeners and `socketMode`
   behave differently on Windows.
+- [Durable State](Durable-State): the store the [job-facing state endpoints](#job-facing-state-endpoints-loopback) expose to the jobs the daemon runs.
 - [Configuration Reference](Configuration-Reference)
 - [CLI Reference](CLI-Reference)
 - [Concurrency and Timeouts](Concurrency-and-Timeouts)

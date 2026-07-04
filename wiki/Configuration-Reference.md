@@ -222,6 +222,17 @@ separate, client-local feature, unrelated to this store.)
 | `gcGraceSeconds` | `Int` | `604800` (7 days) | Age past which durable state belonging to a job that no recent manifest references (no node's loaded config under this `deploymentId` has mentioned it for this long) is garbage collected. `<= 0` disables automatic GC. Values between `1` and `86399` are a `ConfigError` at load: a grace below the manifest cadence would make live peers' manifests look stale and collect their state. |
 | `maxOpsPerSecond` | `Int` or `Float` | `0` | Token-bucket cap on store operations per second (burst of one second's tokens), for request-rate/cost control on mounts that bill per request; throttled ops queue and are counted. `0` disables throttling. Must be `>= 0` (a negative value is a `ConfigError` at load). Lease (coordination) operations bypass the bucket: a lease renew queued behind bulk writes could overshoot its TTL and double-run the very job the lease exists to fence. |
 | `slotTtlSeconds` | `Int` or `Float` | `30` | TTL, in seconds, of the per-job concurrency slot lease taken for `concurrencyScope: cluster` jobs; the running holder renews it at a third of this, and a crashed holder's slot frees itself after at most this long. Must be `>= 5` (a `ConfigError` at load, `state.slotTtlSeconds must be >= 5`): the renew cadence needs headroom, and below ~5s one slow renew on a network mount expires a healthy holder's slot and invites the cross-node double-run the lease exists to fence. |
+| `jobApi` | `Map` | *(see below)* | The [job-facing state endpoint](Durable-State#job-facing-state): a loopback HTTP server the daemon injects into every job's environment, backing the `yacron2 state\|cursor\|lock\|artifact\|idempotent\|secret` commands. A nested block (merged over its defaults, so a partial block keeps the rest). |
+
+The `state.jobApi` sub-keys:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | `Bool` | `true` | Run the loopback endpoint and inject its address/token into every job. `false` keeps the durable scheduler features but exposes nothing to jobs. |
+| `listen` | `Str` | *(ephemeral)* | Override the bind, as an `http://host:port` URL (a `unix://` URL is a `ConfigError`: the job CLI speaks TCP only). Unset binds an OS-assigned ephemeral port on `127.0.0.1`. |
+| `maxValueBytes` | `Int` | `1048576` | Cap (bytes) on one KV / cursor value; a larger set is refused (HTTP 413). Must be `>= 0`. |
+| `maxArtifactBytes` | `Int` | `67108864` | Cap (bytes) on one artifact payload; a larger put is refused (HTTP 413). Must be `>= 0`. |
+| `lockTtlSeconds` | `Int` or `Float` | `30` | TTL of a job mutex/semaphore lease, renewed by the daemon at a third of this. Must be `>= 5` (a `ConfigError`, `state.jobApi.lockTtlSeconds must be >= 5`), for the same reason as `slotTtlSeconds`. |
 
 `path` is the only required key. Full behavior -- the store layout and
 durability model, restart-surviving retries, missed-run catch-up, `@reboot`
@@ -421,6 +432,7 @@ in-memory history alone (the gate then resets on restart). See
 | --- | --- | --- | --- |
 | `environment` | `Seq(Map({"key": Str, "value": Str}))` | `[]` | Environment variables set for the process. Both `key` and `value` are required per entry. Merged by key with `defaults` and with `env_file` (config values win). |
 | `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
+| `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and exactly one source (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). The job reads one with `yacron2 secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
 
 ```yaml
 jobs:

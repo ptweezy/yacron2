@@ -99,6 +99,17 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
         "--dry-run", default=False, action="store_true"
     )
 
+    # Phase 5: the job-facing state commands. The KV actions (get/set/delete/
+    # keys) hang off the SAME `state` subparser as the admin actions above and
+    # coexist with them (the action name routes); the other verbs (cursor/
+    # lock/artifact/idempotent/secret) are their own top-level commands. Both
+    # are thin clients of the daemon's loopback endpoint. Imported here (not at
+    # module load) so the import cost is paid only when the CLI is built.
+    from yacron2 import jobcli
+
+    jobcli.add_state_job_actions(actions)
+    jobcli.add_job_commands(sub)
+
 
 def main_loop(loop):
     parser = argparse.ArgumentParser(prog="yacron2")
@@ -133,12 +144,25 @@ def main_loop(loop):
         print(yacron2.version.version)
         sys.exit(0)
 
-    if getattr(args, "command", None) == "state":
+    command = getattr(args, "command", None)
+    if command == "state":
+        # `state get/set/delete/keys` are job-facing (they reach the running
+        # daemon's loopback endpoint); everything else under `state` is offline
+        # store administration. Route by action name so the two coexist.
+        from yacron2 import jobcli
+
+        if getattr(args, "state_command", None) in jobcli.STATE_JOB_ACTIONS:
+            sys.exit(jobcli.dispatch(args))
         # lazy import: the admin module (tarfile etc.) costs the daemon and
         # the stateless install nothing.
         from yacron2 import state_admin
 
         sys.exit(state_admin.dispatch(args))
+
+    if command in ("cursor", "lock", "artifact", "idempotent", "secret"):
+        from yacron2 import jobcli
+
+        sys.exit(jobcli.dispatch(args))
 
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(

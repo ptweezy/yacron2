@@ -366,7 +366,7 @@ async def test_backfill_does_not_capture_live_retry_ladder(monkeypatch):
     captured = []
 
     class FakeRunningJob:
-        def __init__(self, config, retry_state):
+        def __init__(self, config, retry_state, **kwargs):
             captured.append(retry_state)
             self.config = config
 

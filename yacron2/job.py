@@ -522,9 +522,26 @@ class RunningJob:
     ]  # type: List[Reporter]
 
     def __init__(
-        self, config: JobConfig, retry_state: Optional[JobRetryState]
+        self,
+        config: JobConfig,
+        retry_state: Optional[JobRetryState],
+        *,
+        extra_env: Optional[Dict[str, str]] = None,
+        state_token: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> None:
         self.config = config
+        # Phase 5: environment the daemon injects on top of the job's own
+        # (the loopback state-API URL + a per-run bearer token + run context).
+        # Applied unconditionally in start(), after config.environment, so the
+        # control-channel vars are present on every job and win over a same-
+        # named user override. state_token is the loopback token the daemon
+        # revokes when this run finishes (see Cron._handle_finished_job); it is
+        # also carried in extra_env, but kept here for a direct, unambiguous
+        # cleanup handle. run_id identifies this run in the durable ledger.
+        self.extra_env = extra_env or {}
+        self.state_token = state_token
+        self.run_id = run_id
         self.proc = None  # type: Optional[asyncio.subprocess.Process]
         self.retcode = None  # type: Optional[int]
         # wall-clock instant this run started, for the web UI's run history;
@@ -614,11 +631,15 @@ class RunningJob:
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [self.config.command]
-        if self.config.environment:
+        if self.config.environment or self.extra_env:
             env = dict(os.environ)
             fixup_pyinstaller_env(env)
             for envvar in self.config.environment:
                 env[envvar["key"]] = envvar["value"]
+            # The daemon-injected control-channel vars go last, so a job's own
+            # environment cannot shadow the loopback URL/token it needs to
+            # reach the state API (YACRON2_* is reserved for yacron2's use).
+            env.update(self.extra_env)
             self.env = env
             kwargs["env"] = env
         if self.config.uid is not None or self.config.gid is not None:

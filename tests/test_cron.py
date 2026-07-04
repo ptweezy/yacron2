@@ -50,8 +50,8 @@ def tracing_running_job(monkeypatch):
 class TracingRunningJob(RunningJob):
     _TRACE = asyncio.Queue()
 
-    def __init__(self, config: JobConfig, retry_state) -> None:
-        super().__init__(config, retry_state)
+    def __init__(self, config: JobConfig, retry_state, **kwargs) -> None:
+        super().__init__(config, retry_state, **kwargs)
         self._TRACE.put_nowait((time.perf_counter(), "create", self))
 
     async def start(self) -> None:

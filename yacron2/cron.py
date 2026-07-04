@@ -15,6 +15,7 @@ from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import (  # noqa
+    TYPE_CHECKING,
     Any,
     Awaitable,
     Coroutine,
@@ -28,6 +29,9 @@ from typing import (  # noqa
     Union,
 )
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
+    from yacron2.jobapi import JobStateAPI
 
 import aiohttp
 from aiohttp import web
@@ -749,6 +753,12 @@ class Cron:
         # the in-flight cross-node retry claim scan, if any (single-flight,
         # spawned from the housekeeping pass; see _retry_claim_scan).
         self._retry_claim_task: Optional[asyncio.Task] = None
+        # Phase 5: the loopback job-state API (yacron2.jobapi.JobStateAPI),
+        # built when a `state` section with jobApi enabled starts and torn
+        # down when the backend is (its per-run tokens and staged secrets go
+        # with it). None keeps the classic behaviour: no endpoint, no injected
+        # YACRON2_STATE_* env, jobs unaware of the store.
+        self._job_api: Optional["JobStateAPI"] = None
 
     async def run(self) -> None:
         self._wait_for_running_jobs_task = asyncio.create_task(
@@ -925,6 +935,10 @@ class Cron:
                     len(self._pending_state_writes),
                 )
                 await asyncio.wait(set(self._pending_state_writes), timeout=5)
+            # stop the loopback job API while the backend is still alive, so it
+            # can release every held job lock (rather than leaving the fleet's
+            # locks pinned for a whole TTL after a clean shutdown).
+            await self._stop_job_api()
             logger.info("Stopping state backend")
             await self.state_backend.stop()
             self.state_backend = None
@@ -1907,6 +1921,11 @@ class Cron:
             logger.info("state: configuration changed, stopping")
             await backend.stop()
             self.state_backend = None
+            # the loopback job-state API belongs to this backend generation
+            # (its per-run tokens and staged secrets are meaningless against a
+            # different store): stop it here, and a replacement is started
+            # below if the new config still wants one.
+            await self._stop_job_api()
             # a replacement backend (different path/namespace) serves a
             # different store: let it warm the dashboard history for jobs
             # that have none in memory yet, instead of serving the old
@@ -1964,6 +1983,47 @@ class Cron:
             # backend comes up, so a restart's dashboard/status is populated at
             # once instead of blank until each job next runs.
             await self._rehydrate_from_state()
+            # Phase 5: expose this backend to job commands over a loopback
+            # endpoint (opt-out via state.jobApi.enabled). A start failure is
+            # logged and swallowed -- the scheduler's own durable features do
+            # not depend on it.
+            await self._start_job_api(state_config)
+
+    async def _start_job_api(self, state_config: StateConfig) -> None:
+        """Stand up the loopback job-state API for this backend, if enabled."""
+        job_api_cfg = dict(state_config.get("jobApi") or {})
+        if not job_api_cfg.get("enabled", True):
+            return
+        # lazy import (like state_admin and the lease backends): the module
+        # never enters the graph unless a job API is actually configured.
+        from yacron2.jobapi import JobStateAPI
+
+        api = JobStateAPI(
+            lambda: self.state_backend,
+            host=self._state_host,
+            base_holder=self._slot_holder(),
+            config=job_api_cfg,
+        )
+        try:
+            await asyncio.wait_for(api.start(), timeout=STATE_OP_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as ex:
+            logger.error(
+                "state: job API failed to start (jobs will run without the "
+                "loopback state endpoint): %s",
+                str(ex) or type(ex).__name__,
+            )
+            return
+        self._job_api = api
+
+    async def _stop_job_api(self) -> None:
+        api = self._job_api
+        if api is None:
+            return
+        self._job_api = None
+        try:
+            await asyncio.wait_for(api.stop(), timeout=STATE_OP_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as ex:
+            logger.warning("state: job API did not stop cleanly: %s", ex)
 
     def _track_state_write(
         self, coro: Coroutine[Any, Any, None]
@@ -3743,8 +3803,18 @@ class Cron:
             if not await self._claim_cluster_slot(job):
                 return False
         logger.info("Starting job %s", job.name)
+        retry_state = self.retry_state.get(job.name) if with_retries else None
+        # Phase 5: register this run with the loopback state API (minting its
+        # id + token and staging its secrets) BEFORE the child launches, so the
+        # child's first callback is already authorised. extra_env carries the
+        # endpoint URL/token/run-context the job needs to reach it.
+        run_token, extra_env = self._prepare_job_api_run(job, retry_state)
         running_job = RunningJob(
-            job, self.retry_state.get(job.name) if with_retries else None
+            job,
+            retry_state,
+            extra_env=extra_env,
+            state_token=run_token,
+            run_id=extra_env.get("YACRON2_RUN_ID"),
         )
         try:
             await running_job.start()
@@ -3756,6 +3826,11 @@ class Cron:
             # the lease's renew task -- would outlive the launch forever.
             if job.concurrencyScope == "cluster":
                 await self._release_cluster_slot(job)
+            # likewise the job-API run registration: a launch that never
+            # registers is never reaped, so drop its token/secrets here or
+            # they would linger until shutdown.
+            if run_token is not None and self._job_api is not None:
+                await self._job_api.finish_run(run_token)
             raise
         first_instance = not self.running_jobs.get(job.name)
         self.running_jobs[job.name].append(running_job)
@@ -3781,6 +3856,60 @@ class Cron:
         only and never compared for gating.
         """
         return "{}#{}".format(self._state_host, self._proc_token)
+
+    def _prepare_job_api_run(
+        self, job: JobConfig, retry_state: Optional[JobRetryState]
+    ) -> Tuple[Optional[str], Dict[str, str]]:
+        """Register this run with the loopback state API; return its env.
+
+        Mints the run id + bearer token, resolves and stages the job's
+        run-scoped ``secrets`` (fresh, in memory), registers the whole
+        :class:`~yacron2.jobapi.RunContext`, and returns
+        ``(token, injected_env)`` so the launcher can hand the env to the child
+        and the reaper can revoke the token by it.  Returns ``(None, {})`` when
+        no job API is running (no ``state`` section, or jobApi disabled), so
+        the classic no-endpoint path is byte-identical.
+        """
+        api = self._job_api
+        if api is None or api.base_url is None:
+            return None, {}
+        from yacron2.config import _resolve_secret
+        from yacron2.jobapi import RunContext, run_environment
+
+        secrets: Dict[str, str] = {}
+        for spec in job.secrets:
+            name = spec.get("name")
+            try:
+                value = _resolve_secret(
+                    spec, "job {} secret {}".format(job.name, name)
+                )
+            except ConfigError as ex:
+                # a secret that cannot be resolved right now (an unreadable
+                # fromFile, an unset fromEnvVar) is skipped, not fatal: the
+                # job sees a 404 for it and fails as it sees fit, rather than
+                # the whole launch dying over one secret.
+                logger.warning(
+                    "job %s: could not stage secret %r: %s",
+                    job.name,
+                    name,
+                    ex,
+                )
+                continue
+            if name and value is not None:
+                secrets[name] = value
+        slot = self._last_run_slot.get(job.name)
+        ctx = RunContext(
+            token=os.urandom(32).hex(),
+            run_id=os.urandom(16).hex(),
+            job_name=job.name,
+            attempt=retry_state.count if retry_state is not None else 0,
+            scheduled_at=slot.isoformat() if slot is not None else None,
+            host=self._state_host,
+            default_scope=job.name,
+            secrets=secrets,
+        )
+        api.register_run(ctx)
+        return ctx.token, run_environment(ctx, api.base_url)
 
     @staticmethod
     def _slot_name(name: str) -> str:
@@ -5175,6 +5304,13 @@ class Cron:
             # _release_cluster_slot). Before the early-returns below for
             # the same reason as the in-flight close.
             await self._release_cluster_slot(job.config)
+
+        if self._job_api is not None and job.state_token is not None:
+            # Phase 5: revoke this run's loopback token and staged secrets and
+            # release any mutex/semaphore it still holds. Before the early
+            # returns below (a replaced or cancelled run must clean up too),
+            # and paired one-to-one with the _prepare_job_api_run at launch.
+            await self._job_api.finish_run(job.state_token)
 
         if job.replaced:
             # deliberately cancelled to make way for a newer instance

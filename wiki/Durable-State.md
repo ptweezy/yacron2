@@ -44,6 +44,7 @@ names its loaded config defines, the anchor for garbage collection.
 [When the store is unavailable](#when-the-store-is-unavailable-onstoreunavailable) ·
 [Garbage collection and manifests](#garbage-collection-and-manifests) ·
 [Rate limiting](#rate-limiting-maxopspersecond) ·
+[Job-facing state](#job-facing-state) ·
 [Administering the store](#administering-the-store) ·
 [Observing the store](#observing-the-store) ·
 [Operational notes](#operational-notes)
@@ -105,6 +106,18 @@ state:
 | `gcGraceSeconds` | `604800` | How long a job's streams must be unreferenced *and* idle before [garbage collection](#garbage-collection-and-manifests) deletes them. `<= 0` disables automatic GC. |
 | `maxOpsPerSecond` | `0` | Token-bucket cap on store operations, for request-billed mounts. `0` = unlimited. See [Rate limiting](#rate-limiting-maxopspersecond). |
 | `slotTtlSeconds` | `30` | TTL of the per-job slot lease behind [`concurrencyScope: cluster`](Clustering-and-Leader-Election), renewed at a third of the TTL while the job runs here -- a crashed holder's slot frees after at most this long. Must be `>= 5`: a tiny TTL leaves no room for renew latency on a network mount and would expire live holders. |
+| `jobApi` | *(see below)* | The job-facing state endpoint (a nested block). See [Job-facing state](#job-facing-state). |
+
+The `jobApi` block (present only when `state` is, since it has no store to
+serve otherwise) takes these sub-keys:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Run the loopback endpoint and inject its address into every job. Set `false` to keep the durable scheduler features but expose nothing to job commands. |
+| `listen` | *(ephemeral)* | Override the bind, as an `http://host:port` URL. Unset binds an OS-assigned ephemeral port on `127.0.0.1`, reachable only from this host's jobs. A `unix://` path is not accepted (the job CLI speaks TCP only). |
+| `maxValueBytes` | `1048576` | Cap on one KV / cursor value in bytes; a larger set is refused. |
+| `maxArtifactBytes` | `67108864` | Cap on one artifact payload in bytes; a larger put is refused. |
+| `lockTtlSeconds` | `30` | TTL of a [job mutex/semaphore](#mutex-and-semaphore) lease, renewed by the daemon at a third of the TTL. Must be `>= 5`, for the same reason as `slotTtlSeconds`. |
 
 ### Per-job stateful options
 
@@ -123,6 +136,7 @@ history -- its memory then just resets on restart (see
 | `onlyIfLastSucceeded` | `false` | Depends-on-past gate: skip scheduled fires while the job's most recent real outcome is a failure. See [Depends-on-past](#depends-on-past-onlyiflastsucceeded). |
 | `archiveOutput` | `false` | Persist the job's captured output to the store, one archived record per finished run. See [Output archival](#output-archival-and-secret-redaction). |
 | `redactArchivedSecrets` | `true` | Scrub recognisable secrets from output before archiving it (only applies with `archiveOutput`). |
+| `secrets` | *(none)* | Run-scoped secrets staged for the job over the loopback endpoint (each `{name, value\|fromFile\|fromEnvVar}`). Needs `jobApi` enabled. See [Run-scoped secrets](#run-scoped-secrets). |
 
 The full option schema is in the
 [Configuration Reference](Configuration-Reference).
@@ -708,6 +722,182 @@ lease and double-running the very job the lease exists to fence. The
 coordination traffic is a handful of small operations per running slot-gated
 job, so exempting it costs little.
 
+## Job-facing state
+
+Everything above hands the durable store to the *scheduler*. `state.jobApi`
+(on by default whenever `state` is configured) hands it to the *jobs* too: the
+daemon runs a small HTTP endpoint bound to loopback and injects its address
+plus a per-run bearer token into every job's environment, so a job command can
+reach the store through six ergonomic commands. The commands are thin clients
+of that endpoint -- there is no coordination service to run, no client library
+to install, just the daemon that is already running the job.
+
+Route it through the daemon (rather than let each job open the store itself)
+because three of the six primitives *need* the live daemon: a mutex must be
+renewed while the job holds it and released the instant the run ends; a
+run-scoped secret is staged in memory and dropped when the run ends; and every
+call is scoped and authorised by *which run is calling*, which the injected
+token establishes without the job proving anything.
+
+### The injected environment
+
+When `jobApi` is enabled, every job launched sees these variables (all are
+strings; an unknown scheduled time is the empty string):
+
+| Variable | Meaning |
+| --- | --- |
+| `YACRON2_STATE_URL` | Base URL of the loopback endpoint, e.g. `http://127.0.0.1:54321`. |
+| `YACRON2_STATE_TOKEN` | The per-run bearer token, revoked when the run ends. |
+| `YACRON2_RUN_ID` | A unique id for this run. |
+| `YACRON2_JOB_NAME` | The job name (the default *scope*, below). |
+| `YACRON2_ATTEMPT` | The retry attempt number (`0` on the first fire). |
+| `YACRON2_SCHEDULED_AT` | The scheduled fire time (ISO-8601), or empty. |
+| `YACRON2_HOST` | The host name. |
+
+The commands read these; you rarely touch them directly. Set
+`state.jobApi.enabled: false` to keep the durable scheduler features while
+injecting nothing and running no endpoint.
+
+### Scopes
+
+Every KV / cursor / artifact / lock call lands in a **scope** -- a namespace
+that defaults to the calling **job's own name**, so one job cannot read
+another's keys by accident. Pass `--global` (or `--scope NAME`) to act in a
+shared namespace for deliberate cross-job coordination. Secrets are always
+scoped to the single run they were staged for.
+
+### Durable key/value
+
+`yacron2 state get|set|delete|keys` is a restart-surviving map, scoped per job
+by default. It coexists with the `yacron2 state` [admin
+subcommands](#administering-the-store) (backup / gc / ...) -- the action name
+tells them apart.
+
+```shell
+yacron2 state set last-cursor 12345
+value=$(yacron2 state get last-cursor)      # -> 12345
+yacron2 state set config '{"n": 3}' --json  # store parsed JSON, not a string
+yacron2 state keys                          # one key per line
+yacron2 state delete last-cursor
+```
+
+`get` on a missing key prints nothing and exits `4`, so a script can branch on
+absence. `set` refuses a value larger than `maxValueBytes`.
+
+### Cursor / watermark
+
+`yacron2 cursor advance NAME VALUE` moves a monotonic watermark: the stored
+value only ever goes to `max(current, VALUE)`, so an out-of-order or replayed
+batch never walks it backwards, and on a shared store several nodes converge
+on the furthest point. A numeric value compares numerically (`9 < 10`); an
+ISO-8601 timestamp compares as the string it is (`2026-06 < 2026-07`). This is
+the ETL "process only what is new" pattern:
+
+```shell
+since=$(yacron2 cursor get watermark 2>/dev/null || echo 0)
+# ... export rows with id > $since, tracking the new maximum ...
+yacron2 cursor advance watermark "$new_max"
+```
+
+Pass `--force` to set the value even if it moves the cursor backwards (a
+deliberate rewind).
+
+### Idempotency keys
+
+`yacron2 idempotent KEY` claims a key once, fleet-wide: the first caller wins
+(exit `0`, do the work), every later caller loses (exit `1`, skip). It is the
+"run this side effect at most once" guard for a retried or duplicated run:
+
+```shell
+if yacron2 idempotent "charge-$(date -u +%F)"; then
+  charge-the-invoices          # runs at most once per day across the fleet
+fi
+```
+
+`--ttl SECONDS` makes the claim expire (a bounded dedupe window; the default
+`0` is a permanent claim); `--release` drops a claim so the key can be won
+again. Like every yacron2 coordination primitive this is at-least-once, not
+exactly-once -- a caller that wins the claim then crashes before finishing has
+"claimed but not done" work, which is why the claim guards an *idempotent*
+side effect.
+
+### Mutex and semaphore
+
+`yacron2 lock` is a fleet-wide lock backed by the same TTL lease the cluster
+concurrency slots use. The daemon holds the lease on the run's behalf, renews
+it while the job holds the lock, and releases it the instant the job releases
+*or the run ends* -- so a job that crashes or forgets to unlock never leaks a
+lock (the lease also self-frees by its TTL as the backstop). `lock run` is the
+convenient form, holding the lock for the duration of a wrapped command:
+
+```shell
+# only one holder of "db-maintenance" runs across the whole fleet at a time:
+yacron2 lock run db-maintenance --scope global --wait --timeout 60 \
+  -- /usr/local/bin/compact-db.sh
+```
+
+`--permits N` makes it a **semaphore** of `N` concurrent holders instead of a
+mutex (`N = 1`). `--wait --timeout S` blocks up to `S` seconds for a free
+permit; without `--wait`, a taken lock returns immediately (exit `3`). For
+manual control, `yacron2 lock acquire NAME` prints a hold token and
+`yacron2 lock release TOKEN` frees it. The acquire reply also carries the
+lease's monotonic **fence** token, for a job that needs true fencing on top of
+the lock (the honest limit: like every distributed lock this is at-least-once
+-- a holder that loses its lease to a store outage keeps running, and the
+fence is how a careful job fences its own writes).
+
+### Artifact store
+
+`yacron2 artifact put NAME [FILE]` publishes a small blob (from `FILE` or
+stdin) under a name that a later run, or a peer node, reads back with
+`yacron2 artifact get NAME`. Payloads are content-addressed (identical bytes
+store once) and read newest-wins:
+
+```shell
+build-report > report.csv
+yacron2 artifact put latest-report report.csv     # prints the sha256
+# ... a later run, possibly on another node ...
+yacron2 artifact get latest-report -o report.csv
+yacron2 artifact list                             # one name per line
+```
+
+`put` refuses a payload larger than `maxArtifactBytes`. Artifacts are durable
+and accumulate until their scope is [garbage
+collected](#garbage-collection-and-manifests) with the rest of a removed job's
+state; blobs deduplicate across scopes.
+
+### Run-scoped secrets
+
+A job's `secrets:` block stages secrets for the run over the endpoint, rather
+than placing them in the environment where they would show in
+`/proc/<pid>/environ` or a `ps -E`. Each secret is resolved fresh per run,
+served only to that run, and dropped when the run ends -- it never touches the
+durable store. The same `value` / `fromFile` / `fromEnvVar` source triple
+every other yacron2 secret uses:
+
+```yaml
+jobs:
+  - name: build-report
+    command: |
+      token=$(yacron2 secret get API_TOKEN)
+      build-report --token "$token"
+    schedule: "0 6 * * *"
+    secrets:
+      - name: API_TOKEN
+        fromEnvVar: REPORT_API_TOKEN     # or value:, or fromFile:
+```
+
+`yacron2 secret get NAME` prints the value (exit `4` if it was not staged);
+`yacron2 secret list` prints the staged names (not their values). Declaring
+`secrets` needs a `state` section with `jobApi` enabled, else the config is
+rejected.
+
+A full worked config is in
+[`example/job-state/yacron2tab.yaml`](https://github.com/ptweezy/yacron2/tree/develop/example/job-state).
+The wire protocol (the `/v1/` endpoints) is in the
+[HTTP Control API](HTTP-API) reference, and every command's flags and exit
+codes are in the [Command-Line Reference](CLI-Reference).
+
 ## Administering the store
 
 The `yacron2 state` subcommands administer the store of the `state:` section
@@ -786,6 +976,6 @@ A backend read error at scrape time omits the state families from that scrape
 - [Failure Detection and Retries](Failure-Detection-and-Retries): the retry ladder these records make durable.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the owner gate catch-up and retries re-check.
 - [Output Capturing](Output-Capturing): what `archiveOutput` persists.
-- [HTTP Control API](HTTP-API): `GET /jobs/{name}/trends` and the run endpoints.
+- [HTTP Control API](HTTP-API): `GET /jobs/{name}/trends`, the run endpoints, and the job-facing `/v1/` loopback endpoints.
 - [Web Dashboard](Web-Dashboard): the rehydrated history views, and the separate browser-side run ledger.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the `yacron2_state_*` families and the restart-durable job counters.

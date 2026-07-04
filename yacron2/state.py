@@ -107,13 +107,28 @@ TMP_MAX_AGE = 86400.0
 # Subdirectories under a namespace root.  Records live under RECORDS_DIR in a
 # per-stream directory; leases under LEASES_DIR; corrupt records are moved into
 # QUARANTINE_DIR; TMP_DIR holds the write-temp files atomically renamed into
-# place.  Directories are only ever *created*, never renamed (a directory
-# rename is the one costly operation on an S3 Files mount), so this layout is
-# safe there.
+# place.  DOCS_DIR holds the mutable job-facing documents (KV / cursor /
+# idempotency), one file per key rewritten via atomic rename under an advisory
+# flock -- the same lease-file discipline generalised to arbitrary values, so
+# it is equally safe on an S3 Files mount (file rename is atomic there even
+# though object rename is not).  BLOBS_DIR holds the content-addressed artifact
+# payloads, each an immutable file named by its SHA-256.  Directories are only
+# ever *created*, never renamed (a directory rename is the one costly operation
+# on an S3 Files mount), so this layout is safe there.
 RECORDS_DIR = "records"
 LEASES_DIR = "leases"
 QUARANTINE_DIR = "quarantine"
 TMP_DIR = "tmp"
+DOCS_DIR = "docs"
+BLOBS_DIR = "blobs"
+
+# Sentinels a :meth:`StateBackend.mutate_document` transform returns *in place
+# of* a new document body: leave the document exactly as it was (KEEP), or
+# delete it (DELETE).  Anything else the transform returns is the new document
+# body to persist.  Distinct ``object()`` identities so no real JSON value a
+# caller might store can be mistaken for one.
+DOC_KEEP: Any = object()
+DOC_DELETE: Any = object()
 
 # Network/shared filesystem types (as they appear in /proc/mounts) that a lock
 # is honoured across hosts on, so the backend may offer fleet-wide
@@ -372,6 +387,20 @@ class _LeaseUnreadable(Exception):
     """
 
 
+class _DocumentUnreadable(Exception):
+    """A document file exists (or may exist) but cannot be trusted right now.
+
+    The document analogue of :class:`_LeaseUnreadable`: raised (internally)
+    from the strict read inside :meth:`FilesystemStateBackend.mutate_document`
+    when the document file is unreadable for any reason other than plain
+    absence -- a transient I/O error on a shared mount, or corrupt content.
+    A read-modify-write cannot proceed safely without a trustworthy current
+    value (it would silently clobber a live document, or advance a monotonic
+    cursor backwards), so the mutation *fails* rather than guessing.  It
+    surfaces to the job-facing caller as an error, never as a wrong value.
+    """
+
+
 @dataclass
 class Lease:
     """A held (or observed) TTL lease.
@@ -502,6 +531,58 @@ class StateBackend(abc.ABC):
         the leader-gated variant is a later phase.
         """
 
+    # --- mutable documents (job-facing KV / cursor / idempotency) --------
+
+    @abc.abstractmethod
+    async def read_document(
+        self, namespace: str, key: str
+    ) -> Optional[Dict[str, Any]]:
+        """The current body of document ``key`` in ``namespace``, or ``None``.
+
+        An unlocked, best-effort read: a document that is absent, unreadable
+        right now, or corrupt all read back as ``None`` (the strict read used
+        for the read-modify-write lives inside :meth:`mutate_document`).
+        """
+
+    @abc.abstractmethod
+    async def mutate_document(
+        self,
+        namespace: str,
+        key: str,
+        transform: "Callable[[Optional[Dict[str, Any]]], Tuple[Any, _T]]",
+    ) -> "Tuple[Optional[Dict[str, Any]], _T]":
+        """Atomically read-modify-write document ``key``.
+
+        Runs ``transform(current_body)`` under an advisory ``flock`` over the
+        document's dedicated lock file, so on a shared mount the whole RMW is
+        serialised fleet-wide -- the property a monotonic cursor and a
+        create-if-absent idempotency claim both depend on.  ``transform``
+        returns ``(new_body, result)``: ``new_body`` is the JSON body to
+        persist, or :data:`DOC_KEEP` to leave the document untouched, or
+        :data:`DOC_DELETE` to remove it.  Returns ``(stored_body, result)``
+        where ``stored_body`` is the body now on disk (``None`` after a
+        delete).  ``transform`` must be a pure, side-effect-free callable: it
+        runs on a worker thread and may be retried on a torn read.
+        """
+
+    @abc.abstractmethod
+    async def delete_document(self, namespace: str, key: str) -> bool:
+        """Delete document ``key``; return whether it existed."""
+
+    @abc.abstractmethod
+    async def list_documents(self, namespace: str) -> List[Dict[str, Any]]:
+        """Every readable document body in ``namespace``, order-independent."""
+
+    # --- content-addressed blobs (job-facing artifact payloads) ----------
+
+    @abc.abstractmethod
+    async def put_blob(self, data: bytes) -> str:
+        """Store ``data`` (deduplicated by content); return its SHA-256 hex."""
+
+    @abc.abstractmethod
+    async def get_blob(self, digest: str) -> Optional[bytes]:
+        """Read the blob with SHA-256 ``digest``, or ``None`` if absent."""
+
     # --- advisory-lock TTL lease -----------------------------------------
 
     @abc.abstractmethod
@@ -545,6 +626,17 @@ class StateBackend(abc.ABC):
         """Rewrite records of older known schemes to the current one (see
         :data:`RECORD_MIGRATIONS`); the base backend has nothing to walk."""
         return {}
+
+    async def sweep_orphan_blobs(
+        self,
+        referenced: "Set[str]",
+        grace: float,
+        *,
+        dry_run: bool = False,
+    ) -> int:
+        """Delete artifact blobs no surviving record references (see the
+        filesystem backend); the base backend stores no blobs."""
+        return 0
 
     # --- introspection ---------------------------------------------------
 
@@ -648,6 +740,32 @@ class FilesystemStateBackend(StateBackend):
             os.path.join(leases, safe + ".lock"),
             os.path.join(leases, safe + ".lease"),
         )
+
+    def _doc_dir(self, namespace: str) -> str:
+        return os.path.join(self.base, DOCS_DIR, _fs_safe(namespace))
+
+    def _doc_paths(self, namespace: str, key: str) -> Tuple[str, str]:
+        """The ``(lock file, doc file)`` for one document.
+
+        Like a lease, the flock rides a stable side-file (``.lock``) while the
+        value file (``.doc``) is swapped out by the atomic rename -- locking
+        the value file directly would lock an inode about to be replaced.
+        """
+        ns_dir = self._doc_dir(namespace)
+        safe = _fs_safe(key)
+        return (
+            os.path.join(ns_dir, safe + ".lock"),
+            os.path.join(ns_dir, safe + ".doc"),
+        )
+
+    def _blob_path(self, digest: str) -> str:
+        """The on-disk path of a content-addressed blob.
+
+        Sharded by the first two hex characters so one namespace's blob
+        directory never grows to a single flat directory of millions of
+        entries (which some filesystems handle poorly).
+        """
+        return os.path.join(self.base, BLOBS_DIR, digest[:2], digest + ".blob")
 
     def _next_seq(self) -> int:
         with self._seq_lock:
@@ -773,7 +891,14 @@ class FilesystemStateBackend(StateBackend):
         # here should be world-readable on a multi-user host.  Only applied to
         # directories this process creates; an operator who pre-created the
         # tree with wider modes has made that choice deliberately.
-        for sub in (RECORDS_DIR, LEASES_DIR, QUARANTINE_DIR, TMP_DIR):
+        for sub in (
+            RECORDS_DIR,
+            LEASES_DIR,
+            QUARANTINE_DIR,
+            TMP_DIR,
+            DOCS_DIR,
+            BLOBS_DIR,
+        ):
             os.makedirs(
                 os.path.join(self.base, sub), mode=0o700, exist_ok=True
             )
@@ -1331,6 +1456,154 @@ class FilesystemStateBackend(StateBackend):
             return None
         return lease
 
+    # --- mutable documents -----------------------------------------------
+
+    def _read_doc_file(
+        self, doc_path: str, *, strict: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Read a document body; ``None`` means *positively absent*.
+
+        Mirrors :meth:`_read_lease_file`.  With ``strict`` (the locked RMW
+        inside :meth:`mutate_document`), anything short of plain absence -- a
+        transient I/O error, corrupt content, an unknown schema version --
+        raises :class:`_DocumentUnreadable` so the mutation fails closed
+        rather than clobbering a live value or reading a torn one.  Without
+        ``strict`` (the best-effort :meth:`read_document` / list) it returns
+        ``None`` for every one of those, so a single hiccup never crashes a
+        read.
+        """
+        try:
+            with open(doc_path, "rb") as fobj:
+                obj = json.loads(fobj.read())
+        except FileNotFoundError:
+            return None
+        except Exception as ex:  # noqa: BLE001 - classified below
+            if strict:
+                raise _DocumentUnreadable(str(ex)) from ex
+            return None
+        if (
+            not isinstance(obj, dict)
+            or obj.get("schemaVersion") != SCHEME_VERSION
+            or not isinstance(obj.get("data"), dict)
+        ):
+            if strict:
+                raise _DocumentUnreadable("unknown-schema-or-not-a-document")
+            return None
+        return cast(Dict[str, Any], obj["data"])
+
+    async def read_document(
+        self, namespace: str, key: str
+    ) -> Optional[Dict[str, Any]]:
+        return await self._call(
+            "doc-read", self._read_document_sync, namespace, key
+        )
+
+    def _read_document_sync(
+        self, namespace: str, key: str
+    ) -> Optional[Dict[str, Any]]:
+        _lock_path, doc_path = self._doc_paths(namespace, key)
+        return self._read_doc_file(doc_path)
+
+    async def mutate_document(
+        self,
+        namespace: str,
+        key: str,
+        transform: Callable[[Optional[Dict[str, Any]]], Tuple[Any, _T]],
+    ) -> Tuple[Optional[Dict[str, Any]], _T]:
+        return await self._call(
+            "doc-mutate", self._mutate_document_sync, namespace, key, transform
+        )
+
+    def _mutate_document_sync(
+        self,
+        namespace: str,
+        key: str,
+        transform: Callable[[Optional[Dict[str, Any]]], Tuple[Any, _T]],
+    ) -> Tuple[Optional[Dict[str, Any]], _T]:
+        lock_path, doc_path = self._doc_paths(namespace, key)
+        # the lock file's directory is the namespace dir, created here so the
+        # very first write to a fresh namespace has somewhere to land.
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+        with self._locked(lock_path):
+            current = self._read_doc_file(doc_path, strict=True)
+            new_body, result = transform(current)
+            if new_body is DOC_KEEP:
+                return current, result
+            if new_body is DOC_DELETE:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(doc_path)
+                return None, result
+            if not isinstance(new_body, dict):
+                raise TypeError(
+                    "mutate_document transform must return a dict body, "
+                    "DOC_KEEP or DOC_DELETE"
+                )
+            payload = json.dumps(
+                {"schemaVersion": SCHEME_VERSION, "data": new_body},
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            self._atomic_write(doc_path, payload)
+            return new_body, result
+
+    async def delete_document(self, namespace: str, key: str) -> bool:
+        def _delete(current: Optional[Dict[str, Any]]) -> Tuple[Any, bool]:
+            return DOC_DELETE, current is not None
+
+        _stored, existed = await self.mutate_document(namespace, key, _delete)
+        return existed
+
+    async def list_documents(self, namespace: str) -> List[Dict[str, Any]]:
+        return await self._call(
+            "doc-list", self._list_documents_sync, namespace
+        )
+
+    def _list_documents_sync(self, namespace: str) -> List[Dict[str, Any]]:
+        ns_dir = self._doc_dir(namespace)
+        try:
+            names = sorted(n for n in os.listdir(ns_dir) if n.endswith(".doc"))
+        except FileNotFoundError:
+            return []
+        out: List[Dict[str, Any]] = []
+        for name in names:
+            data = self._read_doc_file(os.path.join(ns_dir, name))
+            if data is not None:
+                out.append(data)
+        return out
+
+    # --- content-addressed blobs -----------------------------------------
+
+    async def put_blob(self, data: bytes) -> str:
+        return await self._call("blob-put", self._put_blob_sync, data)
+
+    def _put_blob_sync(self, data: bytes) -> str:
+        digest = hashlib.sha256(data).hexdigest()
+        path = self._blob_path(digest)
+        # content-addressed: an existing blob with this digest already holds
+        # exactly this payload, so skip the rewrite (and its fsync cost).
+        if os.path.exists(path):
+            return digest
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        # _atomic_write renames over any existing file; a concurrent writer of
+        # the same content is therefore harmless (identical bytes either way).
+        self._atomic_write(path, data)
+        return digest
+
+    async def get_blob(self, digest: str) -> Optional[bytes]:
+        return await self._call("blob-get", self._get_blob_sync, digest)
+
+    def _get_blob_sync(self, digest: str) -> Optional[bytes]:
+        try:
+            with open(self._blob_path(digest), "rb") as fobj:
+                return fobj.read()
+        except FileNotFoundError:
+            return None
+        except OSError as ex:
+            # a transient read error is the environment, not a missing blob:
+            # surface it (the awaiter can retry) rather than reporting absence.
+            logger.warning("state: cannot read blob %s (%s)", digest, ex)
+            raise
+
     # --- lock-fidelity probe -------------------------------------------------
 
     async def verify_locking(self) -> Optional[str]:
@@ -1607,6 +1880,72 @@ class FilesystemStateBackend(StateBackend):
             "unreadable": unreadable,
             "failed": failed,
         }
+
+    async def sweep_orphan_blobs(
+        self,
+        referenced: Set[str],
+        grace: float,
+        *,
+        dry_run: bool = False,
+    ) -> int:
+        """Delete artifact blobs no surviving record references.
+
+        Content-addressed blobs outlive the artifact records that point at
+        them only as debris: when a scope's ``artifacts/`` stream is garbage
+        collected, its blobs become unreferenced.  ``referenced`` is the set
+        of SHA-256 digests every surviving artifact record still names (the
+        caller derives it from the store's live records); a blob is removed
+        only when its digest is absent from that set AND it is older than
+        ``grace`` seconds -- the age guard keeps a blob a writer has *just*
+        landed but not yet recorded (the put-blob-then-append-record window)
+        from being swept out from under the pending record.
+        """
+        return await self._call(
+            "blob-sweep",
+            self._sweep_orphan_blobs_sync,
+            referenced,
+            grace,
+            dry_run,
+        )
+
+    def _sweep_orphan_blobs_sync(
+        self, referenced: Set[str], grace: float, dry_run: bool
+    ) -> int:
+        cutoff = _now() - max(0.0, grace)
+        removed = 0
+        blobs_root = os.path.join(self.base, BLOBS_DIR)
+        try:
+            shards = os.listdir(blobs_root)
+        except OSError:
+            return 0
+        for shard in shards:
+            shard_dir = os.path.join(blobs_root, shard)
+            try:
+                names = os.listdir(shard_dir)
+            except OSError:
+                continue
+            for name in names:
+                if not name.endswith(".blob"):
+                    continue
+                digest = name[: -len(".blob")]
+                if digest in referenced:
+                    continue
+                full = os.path.join(shard_dir, name)
+                try:
+                    if os.stat(full).st_mtime >= cutoff:
+                        # too young: an in-flight put not yet recorded
+                        continue
+                    if not dry_run:
+                        os.unlink(full)
+                    removed += 1
+                except OSError:
+                    continue
+            # a now-empty shard directory is harmless debris; drop it best
+            # effort so the blob tree does not accumulate empty shards.
+            if not dry_run:
+                with contextlib.suppress(OSError):
+                    os.rmdir(shard_dir)
+        return removed
 
     # --- introspection ---------------------------------------------------
 

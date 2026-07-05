@@ -15,7 +15,7 @@ default and can be turned off per job with ``redactArchivedSecrets: false``.
 """
 
 import re
-from typing import Callable, Iterable, List, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 #: What a redacted span is replaced with.
 REDACTED = "***REDACTED***"
@@ -103,6 +103,36 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     (re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*"), REDACTED),
 ]
 
+# Cheap prefilter, parallel to _PATTERNS (same order). Each entry is a literal
+# that MUST be present in a line for the corresponding pattern to have any
+# chance of matching, or None for the always-run patterns (the case-insensitive
+# ones, and the key=value pattern, which have no single required literal).
+# redact_secrets skips any pattern whose literal is absent: since that sub()
+# could only be a no-op, the elision keeps the output byte-identical while
+# dropping a typical no-secret line from 12 regex passes to the 3 always-on
+# ones. "***REDACTED***" contains none of these literals, so an earlier
+# redaction can never spuriously trip a later gate. Kept in lockstep with
+# _PATTERNS by the check below -- a plain `if`, deliberately not an `assert`,
+# because the release binary runs under -OO, which strips asserts.
+_PATTERN_GATES: Tuple[Optional[str], ...] = (
+    None,           # 1. key = value / key: value (case-insensitive keywords)
+    "://",          # 2. scheme://user:PASSWORD@host
+    None,           # 3. Bearer <token> (case-insensitive)
+    None,           # 4. Authorization: Basic <base64> (case-insensitive)
+    "AKIA",         # 5. AWS access key id
+    "xox",          # 6. Slack tokens
+    "gh",           # 7. GitHub ghp_/gho_/ghs_/ghu_/ghr_ tokens
+    "github_pat_",  # 8. GitHub fine-grained PAT
+    "sk-",          # 9. OpenAI/Anthropic-style keys
+    "k_",           # 10. Stripe [sr]k_live_/_test_ keys
+    "eyJ",          # 11. JWT (base64url of the opening '{"')
+    "-----",        # 12. PEM -----BEGIN ... PRIVATE KEY----- header
+)
+if len(_PATTERN_GATES) != len(_PATTERNS):  # pragma: no cover - dev invariant
+    raise RuntimeError(
+        "redact: _PATTERN_GATES is out of step with _PATTERNS"
+    )
+
 _PEM_BEGIN = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"(?i)-----END [A-Z0-9 ]*PRIVATE KEY-----")
 
@@ -115,7 +145,14 @@ def redact_secrets(text: str) -> str:
     *sequence* of lines that may contain a multi-line PEM block, use
     :func:`redact_lines`, which redacts the block's body, not just its header.
     """
-    for pattern, repl in _PATTERNS:
+    for (pattern, repl), required in zip(
+        _PATTERNS, _PATTERN_GATES, strict=True
+    ):
+        # Skip a pattern whose mandatory literal is absent from the line: its
+        # sub() would be a guaranteed no-op, so eliding it leaves the output
+        # byte-identical while sparing most lines all but the always-on passes.
+        if required is not None and required not in text:
+            continue
         text = pattern.sub(repl, text)
     return text
 

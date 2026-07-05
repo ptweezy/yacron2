@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from yacron2 import dag, platform
+from yacron2 import _json, dag, platform
 from yacron2.dag import DagSpec
 from yacron2.job import RunningJob
 from yacron2.state import DOC_KEEP, Lease, StateBackend
@@ -679,7 +679,7 @@ class DagScheduler:
             return []
         _record, data = got
         try:
-            parsed = json.loads(data.decode("utf-8"))
+            parsed = _json.loads(data.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             logger.warning(
                 "dag %s: xcom %r from %r is not valid JSON; mapping it to an "

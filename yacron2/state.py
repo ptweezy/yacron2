@@ -50,7 +50,6 @@ import abc
 import asyncio
 import contextlib
 import hashlib
-import json
 import logging
 import math
 import os
@@ -70,6 +69,7 @@ from typing import (
     cast,
 )
 
+from yacron2 import _json
 from yacron2.config import ConfigError, StateConfig
 from yacron2.platform import IS_WINDOWS, exclusive_file_lock
 
@@ -963,7 +963,7 @@ class FilesystemStateBackend(StateBackend):
         for name in reversed(names):
             try:
                 with open(os.path.join(stream_dir, name), "rb") as fobj:
-                    obj = json.loads(fobj.read())
+                    obj = _json.loads(fobj.read())
             except Exception:  # noqa: BLE001 - unreadable stamp: keep looking
                 continue
             if isinstance(obj, dict) and "schemaVersion" in obj:
@@ -1089,11 +1089,9 @@ class FilesystemStateBackend(StateBackend):
         rec_id = "{:020.6f}-{}-{:012d}".format(
             _now(), self._instance, self._next_seq()
         )
-        payload = json.dumps(
-            {"schemaVersion": SCHEME_VERSION, "data": data},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+        payload = _json.dumps_bytes(
+            {"schemaVersion": SCHEME_VERSION, "data": data}, sort_keys=True
+        )
         self._atomic_write(os.path.join(stream_dir, rec_id + ".json"), payload)
         return rec_id
 
@@ -1125,7 +1123,7 @@ class FilesystemStateBackend(StateBackend):
         path = os.path.join(stream_dir, name)
         try:
             with open(path, "rb") as fobj:
-                obj = json.loads(fobj.read())
+                obj = _json.loads(fobj.read())
         except FileNotFoundError:
             # raced away (pruned/quarantined) between listdir and open: skip.
             return None
@@ -1292,7 +1290,7 @@ class FilesystemStateBackend(StateBackend):
         """
         try:
             with open(lease_path, "rb") as fobj:
-                obj = json.loads(fobj.read())
+                obj = _json.loads(fobj.read())
         except FileNotFoundError:
             return None
         except Exception as ex:  # noqa: BLE001 - classified below
@@ -1316,9 +1314,7 @@ class FilesystemStateBackend(StateBackend):
             return None
 
     def _write_lease_file(self, lease_path: str, lease: Lease) -> None:
-        payload = json.dumps(
-            lease.to_dict(), separators=(",", ":"), sort_keys=True
-        ).encode("utf-8")
+        payload = _json.dumps_bytes(lease.to_dict(), sort_keys=True)
         self._atomic_write(lease_path, payload)
 
     async def acquire_lease(
@@ -1492,7 +1488,7 @@ class FilesystemStateBackend(StateBackend):
         """
         try:
             with open(doc_path, "rb") as fobj:
-                obj = json.loads(fobj.read())
+                obj = _json.loads(fobj.read())
         except FileNotFoundError:
             return None
         except Exception as ex:  # noqa: BLE001 - classified below
@@ -1556,11 +1552,10 @@ class FilesystemStateBackend(StateBackend):
                     "mutate_document transform must return a dict body, "
                     "DOC_KEEP or DOC_DELETE"
                 )
-            payload = json.dumps(
+            payload = _json.dumps_bytes(
                 {"schemaVersion": SCHEME_VERSION, "data": new_body},
-                separators=(",", ":"),
                 sort_keys=True,
-            ).encode("utf-8")
+            )
             self._atomic_write(doc_path, payload)
             return new_body, result
 
@@ -1854,7 +1849,7 @@ class FilesystemStateBackend(StateBackend):
                 path = os.path.join(stream_dir, name)
                 try:
                     with open(path, "rb") as fobj:
-                        obj = json.loads(fobj.read())
+                        obj = _json.loads(fobj.read())
                 except Exception:  # noqa: BLE001 - quarantined on next read
                     unreadable += 1
                     continue
@@ -1880,11 +1875,10 @@ class FilesystemStateBackend(StateBackend):
                 converted += 1
                 if dry_run:
                     continue
-                payload = json.dumps(
+                payload = _json.dumps_bytes(
                     {"schemaVersion": SCHEME_VERSION, "data": new_data},
-                    separators=(",", ":"),
                     sort_keys=True,
-                ).encode("utf-8")
+                )
                 try:
                     self._atomic_write(path, payload)
                 except OSError:

@@ -96,7 +96,17 @@ kubernetes = ["kubernetes>=27"]
 # core install to keep the zero-new-dep, architecture-portable baseline intact.
 # Gated off Windows, which has no uvloop build (and needs the Proactor loop for
 # subprocesses anyway); pip skips it there rather than failing to resolve.
-speedups = ["uvloop>=0.19; sys_platform != 'win32'"]
+speedups = [
+    "uvloop>=0.19; sys_platform != 'win32'",
+    # orjson accelerates the durable-state persistence and cluster-gossip JSON
+    # paths (see yacron2._json, which falls back to the stdlib json when it is
+    # absent). Like uvloop it is best-effort: it ships no wheels for some of
+    # the leaner architectures we target (riscv64, armv6, musl ppc64le/s390x),
+    # so it stays optional and the zero-new-dep, architecture-portable core
+    # install runs on stock json without it. It does have Windows wheels, so
+    # (unlike uvloop) it needs no platform marker.
+    "orjson>=3.9",
+]
 dev = [
     # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.
@@ -165,6 +175,13 @@ no_implicit_optional = true
 warn_no_return = true
 warn_return_any = true
 strict_optional = true
+
+[[tool.mypy.overrides]]
+# The optional `speedups` deps are imported behind try/except with a stdlib
+# fallback (orjson in yacron2._json, uvloop in yacron2.__main__), so a checkout
+# without the extra installed must still type-check cleanly.
+module = ["orjson", "uvloop"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

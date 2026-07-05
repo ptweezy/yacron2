@@ -183,6 +183,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 import aiohttp
 from aiohttp import web
 
+from yacron2 import _json
 from yacron2.config import ClusterConfig
 from yacron2.fingerprint import SCHEME_VERSION
 from yacron2.leadership import LeadershipBackend
@@ -1384,7 +1385,7 @@ class ClusterManager(LeadershipBackend):
         if too_large:
             return web.Response(status=413)
         try:
-            data = json.loads(raw)
+            data = _json.loads(raw)
         except (ValueError, RecursionError):
             # unparseable (ValueError) or too deeply nested for the JSON
             # scanner (RecursionError, not a ValueError); either is a malformed
@@ -1836,7 +1837,7 @@ class ClusterManager(LeadershipBackend):
             )
             return
         try:
-            data = json.loads(raw)
+            data = _json.loads(raw)
         except (ValueError, RecursionError):
             # invalid/truncated JSON (JSONDecodeError and UnicodeDecodeError
             # both subclass ValueError), or a deeply-nested document the JSON

@@ -3643,7 +3643,10 @@ async def test_poll_peer_rejects_deeply_nested_json(no_tls, monkeypatch):
     # frozen, by the malformed round.
     _seed_agree(mgr, "b:1", "node-b")
     assert mgr.view.peers["b:1"].status == STATUS_AGREED
-    monkeypatch.setattr(cluster_mod.json, "loads", _raise_recursion)
+    # Patch the _json shim (orjson when installed, else stdlib json): that is
+    # what _poll_peer now calls. Injecting RecursionError keeps this test
+    # independent of the active parser's real overflow depth.
+    monkeypatch.setattr(cluster_mod._json, "loads", _raise_recursion)
     session = _FakeSession(_FakeGet(resp=_FakeResp(body=b"[[[]]]")))
     await mgr._poll_peer(session, "b:1", "v1:mine")
     peer = mgr.view.peers["b:1"]
@@ -4093,7 +4096,9 @@ async def test_handle_reboot_ran_rejects_deeply_nested_json(
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
     )
-    monkeypatch.setattr(cluster_mod.json, "loads", _raise_recursion)
+    # Patch the _json shim (orjson when installed, else stdlib json): that is
+    # what the handler now calls.
+    monkeypatch.setattr(cluster_mod._json, "loads", _raise_recursion)
 
     class _NestedReq:
         content = _FakeContent(b"[[[]]]")

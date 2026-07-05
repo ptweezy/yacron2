@@ -11,25 +11,44 @@ from email.message import EmailMessage
 from email.utils import format_datetime
 from functools import lru_cache
 from socket import gethostname
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 import aiohttp
-import aiosmtplib
-import jinja2
-import sentry_sdk
-import sentry_sdk.utils
 
 from yacron2 import platform
 from yacron2.config import JobConfig
 from yacron2.statsd import StatsdJobMetricWriter
 
+if TYPE_CHECKING:
+    # jinja2/sentry_sdk/aiosmtplib are imported lazily inside the reporters
+    # that use them (_compiled_template / SentryReporter / MailReporter): they
+    # cost ~40-170ms to import and pull a lot into RSS, and a job that never
+    # reports through those channels should pay for none of it. This block
+    # runs only under the type checker (to resolve the jinja2.Template
+    # annotation); at runtime TYPE_CHECKING is False and it is skipped.
+    import jinja2
+
 logger = logging.getLogger("yacron2")
 
 
 @lru_cache(maxsize=None)
-def _compiled_template(source: str) -> jinja2.Template:
+def _compiled_template(source: str) -> "jinja2.Template":
     # Template source strings come from config and are constant for the life
-    # of the process; compile each distinct one once and reuse it.
+    # of the process; compile each distinct one once and reuse it. jinja2 is
+    # imported here (not at module top) so a daemon whose jobs never render a
+    # report template never pays its import cost; the lru_cache means the
+    # import statement is only reached on the first distinct template anyway.
+    import jinja2
+
     return jinja2.Template(source)
 
 
@@ -236,6 +255,12 @@ class SentryReporter(Reporter):
         else:
             return  # sentry disabled: early return
 
+        # Imported here, past the disabled/no-DSN early returns, so the ~130ms
+        # sentry_sdk import (and its RSS) is paid only when a job actually
+        # reports to Sentry, not by every daemon at startup.
+        import sentry_sdk
+        import sentry_sdk.utils
+
         template = _compiled_template(config["body"])
         body = template.render(job.template_vars)
 
@@ -333,6 +358,10 @@ class MailReporter(Reporter):
             message.set_content(body, subtype="html")
         else:
             message.set_content(body)
+        # Imported here, past the reporting-disabled early returns, so a daemon
+        # that never sends a mail report never pays the aiosmtplib import cost.
+        import aiosmtplib
+
         smtp = aiosmtplib.SMTP(
             hostname=smtp_host,
             port=smtp_port,

@@ -49,9 +49,11 @@
 #                   (onMissed run-once AND run-all + startingDeadlineSeconds +
 #                   catchupJitterSeconds), onlyIfLastSucceeded, archiveOutput +
 #                   redactArchivedSecrets, deploymentId namespacing
-#   Orchestration   a scheduled fan-out DAG (XCom, expand/map, retries, fan-in,
-#                   catch-up + backfill) and a manual, human-gated release DAG
-#                   (approval gate + sensor + XCom + triggerRule)
+#   Orchestration   FIVE DAGs, one per pattern: a dynamic fan-out ETL (XCom,
+#                   expand/map, retries, fan-in, catch-up + backfill), a linear
+#                   pipeline (timezone), a static diamond (parallel fan-out/
+#                   fan-in + triggerRule all_success), and two human-gated
+#                   releases (approval + sensor; onReject skip vs fail cascade)
 #   Metrics/API     statsd push metrics, native Prometheus /metrics (map form:
 #                   public scrape + custom buckets), custom web.headers, the
 #                   HTTP control API + dashboard, opt-in bearer authToken
@@ -1001,3 +1003,86 @@ dags:
         command: |
           tag=$(yacron2 xcom pull --task build --key tag)
           echo "published $tag on $(hostname)"
+
+  # [feature: DAG linear pipeline + timezone] the simplest DAG shape: a straight
+  # A -> B -> C chain, scheduled nightly in a named timezone. No fan-out, no
+  # XCom — just ordered, dependency-gated steps, one after the next.
+  - name: nightly-close
+    schedule: "0 1 * * *"
+    timezone: America/New_York
+    clusterPolicy: Leader
+    retainRuns: 10
+    tasks:
+      - id: freeze-ledgers
+        command: echo "froze the day's ledgers on $(hostname)"
+      - id: post-journals
+        dependsOn:
+          - freeze-ledgers
+        command: echo "posted journal entries on $(hostname)"
+      - id: close-books
+        dependsOn:
+          - post-journals
+        command: echo "closed the books on $(hostname)"
+
+  # [feature: DAG static diamond + explicit parallel fan-out/fan-in +
+  # triggerRule all_success] a STATIC diamond: `snapshot` fans out to three
+  # named checks that run in PARALLEL (contrast orders-etl's DYNAMIC expand),
+  # then `certify` fans them back in. `certify` uses the DEFAULT triggerRule
+  # all_success, so if ANY check fails, certify is skipped (upstream_failed).
+  # check-volume fails on odd UTC hours, so the cascade self-drives: certify runs
+  # green on even hours and is skipped on odd hours.
+  - name: data-quality-gate
+    schedule: "*/15 * * * *"
+    clusterPolicy: Leader
+    retainRuns: 20
+    tasks:
+      - id: snapshot
+        command: echo "snapshotted the warehouse on $(hostname)"
+      - id: check-nulls
+        dependsOn:
+          - snapshot
+        command: echo "null check passed"
+      - id: check-freshness
+        dependsOn:
+          - snapshot
+        command: echo "freshness check passed"
+      - id: check-volume
+        dependsOn:
+          - snapshot
+        command: |
+          if [ $(( $(date -u +%-H) % 2 )) -eq 1 ]; then
+            echo "row volume below threshold on odd hour" >&2
+            exit 1
+          fi
+          echo "volume check passed"
+      - id: certify
+        dependsOn:
+          - check-nulls
+          - check-freshness
+          - check-volume
+        command: echo "certified the dataset on $(hostname)"
+
+  # [feature: DAG approval onReject: fail (failure cascade)] a manual hotfix
+  # pipeline. Unlike release-train (onReject: skip, which SKIPS downstream), this
+  # gate uses the DEFAULT onReject: fail: rejecting it FAILS the gate, and
+  # `deploy` (default triggerRule all_success) becomes upstream_failed — the
+  # failure propagates instead of skipping. No schedule, so trigger it by hand:
+  #
+  #   curl -X POST http://localhost:8080/dags/hotfix-release/trigger
+  #   # then REJECT the gate to watch the failure cascade (or approve to deploy):
+  #   curl -X POST \
+  #     http://localhost:8080/dags/hotfix-release/runs/<runKey>/tasks/approve/decision \
+  #     -H 'Content-Type: application/json' -d '{"decision":"reject","by":"you"}'
+  - name: hotfix-release
+    tasks:
+      - id: build-hotfix
+        command: echo "built the hotfix on $(hostname)"
+      - id: approve
+        type: approval
+        dependsOn:
+          - build-hotfix
+        onReject: fail
+      - id: deploy
+        dependsOn:
+          - approve
+        command: echo "deployed the hotfix on $(hostname)"

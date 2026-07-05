@@ -11,8 +11,8 @@ fleet it runs, all together:
   monitoring and housekeeping),
 - **durable-state** jobs (ETL cursors, exactly-once billing, a fleet mutex and a
   fleet semaphore, artifacts, run-scoped secrets, durable counters),
-- two **orchestration DAGs** (a scheduled fan-out ETL and a manual, human-gated
-  release),
+- five **orchestration DAGs**, one per pattern (dynamic fan-out ETL, linear
+  pipeline, static diamond, and two human-gated releases),
 - **second-level SLA probes**, and
 - **all four failure reporters** wired to live sinks (Mailpit for mail, an echo
   server for webhooks, a statsd exporter for metrics, stdout for shell pages),
@@ -106,8 +106,11 @@ or task that demonstrates it. The big ones:
 | | catch-up **run-once** vs **run-all** + `startingDeadlineSeconds` + `catchupJitterSeconds` | `daily-reconcile` / `hourly-invoice-emit` |
 | | `onlyIfLastSucceeded`, `archiveOutput` + `redactArchivedSecrets` | `daily-reconcile`, `build-daily-report` |
 | | `deploymentId` namespacing, `onStoreUnavailable`, `gcGraceSeconds` | `state:` block |
-| **Orchestration** | DAG **XCom** + **fan-out (`expand`)** + retries + fan-in + catch-up | `orders-etl` |
-| | DAG **approval gate** + **sensor** + `triggerRule` + manual trigger | `release-train` |
+| **Orchestration** | DAG **dynamic fan-out (`expand`)** + XCom + retries + fan-in + catch-up | `orders-etl` |
+| | DAG **linear pipeline** + timezone | `nightly-close` |
+| | DAG **static diamond** (explicit parallel) + `triggerRule: all_success` | `data-quality-gate` |
+| | DAG **approval gate** (`onReject: skip`) + **sensor** + manual trigger | `release-train` |
+| | DAG approval **`onReject: fail`** (failure cascade) | `hotfix-release` |
 | **Metrics/API** | **statsd** push, native **Prometheus** `/metrics` (map form: public + custom buckets), `web.headers` | `etl-build-facts`, `queue-depth-probe`; every node |
 | | opt-in bearer **`authToken`** | `web.authToken` (see *Things to try*) |
 | **Config** | **`include:`**, custom **`logging:`**, a **classic crontab** | `_defaults.yaml`, `legacy.crontab` |
@@ -132,6 +135,7 @@ their own:
 | every **:00** | four `hourly-*` reports collide | Schedule tab thundering-herd warning |
 | continuous | `warehouse-sync` (node `Forbid`), `inventory-sync` (**cluster** `Forbid`), `search-reindex` (`Replace` → Cancelled), `render-thumbnails` (2-permit **semaphore**) | concurrency policies |
 | every 3 min | the `orders-etl` DAG runs end to end | XCom + fan-out + fan-in |
+| every 15 min | the `data-quality-gate` diamond certifies (even UTC hours) or skips `certify` (odd hours, a check fails) | `triggerRule: all_success` cascade |
 | every few s | the `pulse-*` probes tick the next-run countdown **in seconds** | second-level scheduling |
 
 ## Things to try
@@ -179,7 +183,9 @@ their own:
    ```
 
    The `canary` **sensor** then polls the platform's own `/status` until it is
-   healthy, and `publish` ships the tagged build.
+   healthy, and `publish` ships the tagged build. Trigger `hotfix-release` the
+   same way and **reject** its gate to watch the opposite policy — `onReject:
+   fail` cascades the failure to `deploy` instead of skipping it.
 7. **Backfill a DAG.** Deliberately replay `orders-etl` over a past window; each
    scheduled instant in the range gets a run (idempotent — re-running the same
    window is a no-op):

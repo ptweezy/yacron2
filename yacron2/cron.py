@@ -1683,9 +1683,7 @@ class Cron:
         }
         return web.json_response(inv, headers=headers)
 
-    async def _web_state_documents(
-        self, request: web.Request
-    ) -> web.Response:
+    async def _web_state_documents(self, request: web.Request) -> web.Response:
         """The documents of one KV/cursor/idempotency namespace, redacted.
 
         KV values are stripped to a ``valueSize``/``valueType`` summary

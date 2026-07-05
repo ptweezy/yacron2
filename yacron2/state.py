@@ -2063,9 +2063,7 @@ class FilesystemStateBackend(StateBackend):
             if not fname.endswith(".lease") or len(leases) >= cap:
                 continue
             try:
-                lease = self._read_lease_file(
-                    os.path.join(lease_root, fname)
-                )
+                lease = self._read_lease_file(os.path.join(lease_root, fname))
             except Exception:  # noqa: BLE001 - best-effort observe
                 lease = None
             if lease is None or lease.expires_at <= 0.0:

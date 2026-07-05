@@ -555,6 +555,56 @@ event: end
 data: {}
 ```
 
+### DAG endpoints
+
+The orchestration DAGs (the [`dags:`](Orchestration-and-DAGs) section) are
+introspected and controlled here. All are token-gated like the job endpoints.
+
+#### `GET /dags`
+
+The configured DAGs and their tasks:
+
+```json
+[{"name": "nightly-etl", "enabled": true, "scheduled": true,
+  "tasks": [{"id": "extract", "type": "task", "dependsOn": []},
+            {"id": "load", "type": "task", "dependsOn": ["extract"]}]}]
+```
+
+#### `GET /dags/{name}/runs`
+
+Recent dag_runs (newest first), each with its state and a per-state task count:
+
+```json
+{"dag": "nightly-etl", "runs": [
+  {"runKey": "2026-07-04T02:00:00_00:00", "runId": "…", "state": "success",
+   "kind": "scheduled", "logicalDate": "2026-07-04T02:00:00+00:00",
+   "taskStates": {"success": 3}}]}
+```
+
+`404` if the DAG is not configured.
+
+#### `GET /dags/{name}/runs/{run_key}`
+
+One run's full durable document -- every task's state, attempt, timing, XCom
+expansion (`mapped`), and approval decisions. `404` if the run is unknown.
+
+#### `POST /dags/{name}/trigger`
+
+Create and start a manual run now; returns `{"dag": …, "runKey": …}`. `404`
+if the DAG is not configured.
+
+#### `POST /dags/{name}/backfill`
+
+Replay a scheduled DAG across a historical range. Body:
+`{"from": "<ISO>", "to": "<ISO>"}`. Idempotent (create-if-absent per date) and
+bounded. Returns `{"ok": true, "created": <N>}`; `400` on a bad range.
+
+#### `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision`
+
+Approve or reject an [approval gate](Orchestration-and-DAGs#approval-gates).
+Body: `{"decision": "approve"|"reject", "by": "<who>"}`. `200` on success,
+`400` on a bad decision value, `409` if the task is not awaiting a decision.
+
 ### `GET /job-set-id`
 
 Returns this instance's job-set id: the order-independent fingerprint of every

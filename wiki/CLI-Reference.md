@@ -401,6 +401,25 @@ never written to the store, dropped when the run ends). `get` prints the value
 (exit `4` if no secret of that name is staged); `list` prints one staged name
 per line. There are no scope flags: a run sees only its own secrets.
 
+### `xcom push|pull|list` (DAG cross-task data)
+
+```
+yacron2 xcom push --key KEY [FILE]
+yacron2 xcom pull --task TASK --key KEY [--map-index I] [-o FILE]
+yacron2 xcom list
+```
+
+Pass data between the tasks of a [DAG run](Orchestration-and-DAGs#xcom-passing-data-between-tasks).
+Only meaningful inside a task the DAG scheduler launched (the daemon injects the
+run's XCom scope and this task's id); outside one, the commands print a clean
+error and exit non-zero.
+
+- `push` publishes this task's output under `KEY` (from `FILE`, or stdin).
+- `pull` reads an upstream task's output; `--map-index` selects one instance of
+  a [mapped](Orchestration-and-DAGs#fan-out-dynamic-mapping) upstream. Writes to
+  `-o FILE` or stdout; exit `4` if that key was never published.
+- `list` prints the XCom keys published in this run.
+
 ### Job command examples
 
 These run inside a job, where the daemon has injected `YACRON2_STATE_URL` and

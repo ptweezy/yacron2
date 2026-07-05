@@ -1,0 +1,1062 @@
+"""Phase 6 -- the durable DAG state machine (pure logic in yacron2.dag).
+
+These tests drive :mod:`yacron2.dag` directly: the transforms are pure
+``transform(body) -> (new_body, result)`` callables, so a tiny in-test executor
+stands in for the cron driver (apply the claim transform, "launch" each intent,
+mark it finished with a scripted outcome, repeat).  No backend, no clock, no
+subprocess -- the whole graph engine is exercised against plain dicts.
+
+Style matches the other state test files: bare ``def`` tests, module seams
+driven with explicit values, no frozen wall clock (``now`` is an explicit
+argument everywhere).  Backend + cron wiring lives in test_state_phase6_run.py.
+"""
+
+import asyncio
+import json
+import sys
+
+import pytest
+
+import yacron2.__main__
+from yacron2 import dag, jobcli
+from yacron2.config import (
+    ConfigError,
+    _validate_cross_sections,
+    parse_config_string,
+)
+from yacron2.dag import DagSpec, ExpandSpec, TaskSpec
+
+_STATE = "state:\n  path: /tmp/x\n"
+
+
+def _dagcfg(dags_yaml, state=_STATE):
+    return parse_config_string(state + dags_yaml, "")
+
+
+def _xsect(dags_yaml, state=_STATE):
+    _validate_cross_sections(_dagcfg(dags_yaml, state))
+
+
+def _spec(*tasks):
+    return DagSpec.build("d", list(tasks))
+
+
+def _body(spec, now=0.0):
+    return dag.new_run_body(
+        dag="d",
+        run_key="rk",
+        run_id="rid",
+        logical_date=None,
+        kind="scheduled",
+        now=now,
+        spec=spec,
+    )
+
+
+def _apply(transform, body):
+    new, result = transform(body)
+    if dag.is_keep(new):
+        return body, result
+    return new, result
+
+
+class _Executor:
+    """Drives a spec+body to a fixed point like the real advance loop.
+
+    ``outcomes`` maps a task id (or ``id#i``) to ``True`` (success) / ``False``
+    (failure); ``xcom`` maps a task id to the list it "published" so a mapped
+    downstream can expand.  Approval gates and un-scripted tasks are left
+    parked (the run stops making progress), which the test then inspects.
+    """
+
+    def __init__(self, spec, outcomes=None, xcom=None):
+        self.spec = spec
+        self.outcomes = outcomes or {}
+        self.xcom = xcom or {}
+        self.now = 100.0
+        self.launched = []
+
+    def _expansions(self, body):
+        out = {}
+        for tid, from_task, _key in dag.tasks_awaiting_expansion(
+            self.spec, body
+        ):
+            out[tid] = self.xcom.get(from_task)
+        return out
+
+    def step(self, body):
+        self.now += 1.0
+        transform = dag.plan_and_claim(
+            self.spec, self.now, "proc-A", "host-A", self._expansions(body)
+        )
+        body, result = _apply(transform, body)
+        for intent in result.launches:
+            self.launched.append(intent.taskkey)
+            body = self._finish(body, intent)
+        return body, result
+
+    def _finish(self, body, intent):
+        # simulate set_task_pid then completion
+        body, _ = _apply(
+            dag.set_task_pid(intent.taskkey, "proc-A", 4321, self.now), body
+        )
+        key = intent.taskkey
+        success = self.outcomes.get(key, self.outcomes.get(intent.task_id))
+        if success is None:
+            return body  # unscripted: leave running (e.g. approval/sensor)
+        task = self.spec.by_id[intent.task_id]
+        body, _ = _apply(
+            dag.mark_task_finished(
+                key,
+                success=bool(success),
+                exit_code=0 if success else 1,
+                fail_reason=None if success else "boom",
+                now=self.now,
+                task=task,
+            ),
+            body,
+        )
+        return body
+
+    def run(self, body, max_steps=50):
+        for _ in range(max_steps):
+            body, result = self.step(body)
+            if dag.is_terminal_run(body):
+                return body
+            if not result.changed and not result.launches:
+                return body  # fixed point (parked on approval/sensor)
+        raise AssertionError("did not converge")
+
+
+def _state(body, key):
+    return body["tasks"][key]["state"]
+
+
+# --------------------------------------------------------------------------
+# Graph validation
+# --------------------------------------------------------------------------
+
+
+def test_validate_ok_linear():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec("b", depends_on=("a",)),
+        TaskSpec("c", depends_on=("b",)),
+    )
+    dag.validate_graph(spec)  # no raise
+
+
+def test_validate_unknown_dep():
+    spec = _spec(TaskSpec("a", depends_on=("nope",)))
+    with pytest.raises(dag.DagValidationError, match="unknown task 'nope'"):
+        dag.validate_graph(spec)
+
+
+def test_validate_cycle():
+    spec = _spec(
+        TaskSpec("a", depends_on=("c",)),
+        TaskSpec("b", depends_on=("a",)),
+        TaskSpec("c", depends_on=("b",)),
+    )
+    with pytest.raises(dag.DagValidationError, match="cycle"):
+        dag.validate_graph(spec)
+
+
+def test_validate_duplicate_id():
+    spec = _spec(TaskSpec("a"), TaskSpec("a"))
+    with pytest.raises(dag.DagValidationError, match="duplicate"):
+        dag.validate_graph(spec)
+
+
+def test_validate_expand_needs_direct_dep():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec("b", depends_on=("a",)),
+        TaskSpec(
+            "c",
+            depends_on=("b",),
+            expand=ExpandSpec(from_task="a", key="items"),
+        ),
+    )
+    with pytest.raises(dag.DagValidationError, match="direct dependsOn"):
+        dag.validate_graph(spec)
+
+
+def test_validate_expand_of_sensor_rejected():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec(
+            "s",
+            type=dag.SENSOR,
+            depends_on=("a",),
+            expand=ExpandSpec(from_task="a", key="k"),
+        ),
+    )
+    with pytest.raises(dag.DagValidationError, match="only a plain task"):
+        dag.validate_graph(spec)
+
+
+def test_validate_chained_mapping_rejected():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec(
+            "b", depends_on=("a",),
+            expand=ExpandSpec(from_task="a", key="k"),
+        ),
+        TaskSpec(
+            "c", depends_on=("b",),
+            expand=ExpandSpec(from_task="b", key="k"),
+        ),
+    )
+    with pytest.raises(dag.DagValidationError, match="itself mapped"):
+        dag.validate_graph(spec)
+
+
+# --------------------------------------------------------------------------
+# Linear progression + terminal run
+# --------------------------------------------------------------------------
+
+
+def test_linear_all_success():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec("b", depends_on=("a",)),
+        TaskSpec("c", depends_on=("b",)),
+    )
+    ex = _Executor(spec, outcomes={"a": True, "b": True, "c": True})
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.SUCCESS
+    assert ex.launched == ["a", "b", "c"]  # strict dependency order
+
+
+def test_upstream_failure_propagates():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec("b", depends_on=("a",)),
+        TaskSpec("c", depends_on=("b",)),
+    )
+    ex = _Executor(spec, outcomes={"a": False})
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.FAILED
+    assert _state(body, "a") == dag.FAILED
+    assert _state(body, "b") == dag.UPSTREAM_FAILED
+    assert _state(body, "c") == dag.UPSTREAM_FAILED
+    assert "b" not in ex.launched  # never launched a doomed downstream
+
+
+def test_all_done_runs_despite_failure():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec("b", depends_on=("a",), trigger_rule=dag.ALL_DONE),
+    )
+    ex = _Executor(spec, outcomes={"a": False, "b": True})
+    body = ex.run(_body(spec))
+    assert _state(body, "a") == dag.FAILED
+    assert _state(body, "b") == dag.SUCCESS
+    # run is FAILED because a task failed, even though b ran and succeeded
+    assert body["state"] == dag.FAILED
+
+
+def test_diamond_fan_in():
+    spec = _spec(
+        TaskSpec("root"),
+        TaskSpec("left", depends_on=("root",)),
+        TaskSpec("right", depends_on=("root",)),
+        TaskSpec("join", depends_on=("left", "right")),
+    )
+    ex = _Executor(
+        spec,
+        outcomes={k: True for k in ("root", "left", "right", "join")},
+    )
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.SUCCESS
+    assert ex.launched[0] == "root"
+    assert ex.launched[-1] == "join"
+    assert set(ex.launched[1:3]) == {"left", "right"}
+
+
+# --------------------------------------------------------------------------
+# Retry
+# --------------------------------------------------------------------------
+
+
+def test_task_retries_then_succeeds():
+    spec = _spec(TaskSpec("a", max_attempts=3, retry_delay=0.0))
+    body = _body(spec)
+    now = 10.0
+    # first claim + fail -> up_for_retry
+    body, res = _apply(
+        dag.plan_and_claim(spec, now, "p", "h", {}), body
+    )
+    assert res.launches[0].task_id == "a"
+    task = spec.by_id["a"]
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=False, exit_code=1, fail_reason="x",
+            now=now, task=task,
+        ),
+        body,
+    )
+    assert _state(body, "a") == dag.UP_FOR_RETRY
+    assert body["tasks"]["a"]["attempt"] == 1
+    # next advance re-claims (retry delay elapsed)
+    body, res = _apply(
+        dag.plan_and_claim(spec, now + 1, "p", "h", {}), body
+    )
+    assert [i.task_id for i in res.launches] == ["a"]
+    assert _state(body, "a") == dag.RUNNING
+    # succeed the retry
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=True, exit_code=0, fail_reason=None,
+            now=now + 2, task=task,
+        ),
+        body,
+    )
+    assert _state(body, "a") == dag.SUCCESS
+
+
+def test_task_exhausts_retries():
+    spec = _spec(TaskSpec("a", max_attempts=2))
+    ex = _Executor(spec, outcomes={"a": False})
+    body = ex.run(_body(spec))
+    assert _state(body, "a") == dag.FAILED
+    assert body["tasks"]["a"]["attempt"] == 2
+    assert ex.launched.count("a") == 2  # initial + one retry
+
+
+def test_retry_delay_defers_reclaim():
+    spec = _spec(TaskSpec("a", max_attempts=2, retry_delay=100.0))
+    body = _body(spec)
+    task = spec.by_id["a"]
+    body, _ = _apply(dag.plan_and_claim(spec, 10.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=False, exit_code=1, fail_reason="x",
+            now=10.0, task=task,
+        ),
+        body,
+    )
+    # before the delay elapses: no re-claim
+    body, res = _apply(dag.plan_and_claim(spec, 50.0, "p", "h", {}), body)
+    assert res.launches == []
+    assert _state(body, "a") == dag.UP_FOR_RETRY
+    # after: re-claim
+    body, res = _apply(dag.plan_and_claim(spec, 200.0, "p", "h", {}), body)
+    assert [i.task_id for i in res.launches] == ["a"]
+
+
+# --------------------------------------------------------------------------
+# Fan-out / dynamic mapping
+# --------------------------------------------------------------------------
+
+
+def test_fan_out_expands_and_joins():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    ex = _Executor(
+        spec,
+        outcomes={
+            "gen": True, "collect": True,
+            "work#0": True, "work#1": True, "work#2": True,
+        },
+        xcom={"gen": ["x", "y", "z"]},
+    )
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.SUCCESS
+    assert body["mapped"]["work"]["items"] == ["x", "y", "z"]
+    assert {"work#0", "work#1", "work#2"}.issubset(set(ex.launched))
+    # each instance carried its own item
+    assert body["tasks"]["work#1"]["mapItem"] == "y"
+    assert ex.launched[-1] == "collect"
+
+
+def test_fan_out_empty_list_resolves_success():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work", depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    ex = _Executor(
+        spec,
+        outcomes={"gen": True, "collect": True},
+        xcom={"gen": []},
+    )
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.SUCCESS
+    assert body["mapped"]["work"]["items"] == []
+    # collect still ran (empty map counts as success upstream)
+    assert "collect" in ex.launched
+
+
+def test_fan_out_one_instance_fails_fails_join():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work", depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    ex = _Executor(
+        spec,
+        outcomes={"gen": True, "work#0": True, "work#1": False},
+        xcom={"gen": ["a", "b"]},
+    )
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.FAILED
+    assert dag.effective_state(spec, body, "work") == dag.UPSTREAM_FAILED
+    assert _state(body, "collect") == dag.UPSTREAM_FAILED
+
+
+def test_mapped_all_done_source_fails_terminalises():
+    # regression: a mapped task with trigger_rule=all_done whose expand source
+    # FAILS must terminalise (it can never fan out), not hang the run forever.
+    spec = _spec(
+        TaskSpec("u"),
+        TaskSpec(
+            "m",
+            depends_on=("u",),
+            trigger_rule=dag.ALL_DONE,
+            expand=ExpandSpec(from_task="u", key="items"),
+        ),
+    )
+    ex = _Executor(spec, outcomes={"u": False})
+    body = ex.run(_body(spec))
+    assert dag.is_terminal_run(body)
+    assert body["state"] == dag.FAILED
+    assert dag.effective_state(spec, body, "m") == dag.UPSTREAM_FAILED
+
+
+def test_mapped_group_waits_for_all_instances():
+    # regression: the fan-in barrier must hold -- the group is not terminal
+    # (so a downstream cannot launch) until EVERY instance is terminal, even
+    # if one has already failed.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "w", depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["mapped"]["w"] = {"items": ["a", "b"], "expandedAt": 1.0}
+    body["tasks"]["w#0"] = {"id": "w", "state": dag.FAILED}
+    body["tasks"]["w#1"] = {"id": "w", "state": dag.RUNNING}
+    assert dag._mapped_group_state(body, "w") == dag.RUNNING  # barrier
+    body["tasks"]["w#1"]["state"] = dag.SUCCESS
+    assert dag._mapped_group_state(body, "w") == dag.UPSTREAM_FAILED
+
+
+def test_reconcile_protects_own_proc_without_pid():
+    # regression: a task claimed by THIS process whose pid was never recorded
+    # (set_pid failed / timed out) must NOT be reconciled by the same process
+    # -- the proc token, set at claim time, protects the live task.
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "me", "h", {}), body)
+    assert body["tasks"]["a"]["proc"] == "me"
+    assert body["tasks"]["a"]["pid"] is None
+    body, n = _apply(
+        dag.reconcile_crashed(spec, 2.0, "me", "h", lambda pid: False), body
+    )
+    assert n == 0
+    assert _state(body, "a") == dag.RUNNING
+
+
+def test_added_task_does_not_block_terminalise():
+    # regression: a reload that adds a task must not wedge an in-flight run
+    # created under the older spec (the added task has no entry in this run).
+    spec1 = _spec(TaskSpec("a"))
+    body = _body(spec1)
+    body, _ = _apply(dag.plan_and_claim(spec1, 1.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=True, exit_code=0, fail_reason=None,
+            now=1.0, task=spec1.by_id["a"],
+        ),
+        body,
+    )
+    spec2 = _spec(TaskSpec("a"), TaskSpec("b", depends_on=("a",)))
+    body, _ = _apply(dag.plan_and_claim(spec2, 2.0, "p", "h", {}), body)
+    assert dag.is_terminal_run(body)
+    assert body["state"] == dag.SUCCESS
+    assert "b" not in body["tasks"]  # never materialised into this run
+
+
+def test_fan_out_deterministic_on_replan():
+    # the mapped item set is recorded once and never recomputed, even if the
+    # upstream xcom "changes" underneath a later pass.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work", depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "gen", success=True, exit_code=0, fail_reason=None,
+            now=1.0, task=spec.by_id["gen"],
+        ),
+        body,
+    )
+    body, _ = _apply(
+        dag.plan_and_claim(spec, 2.0, "p", "h", {"work": ["a", "b"]}), body
+    )
+    assert body["mapped"]["work"]["items"] == ["a", "b"]
+    # a later pass offering a different list must NOT re-expand
+    body, _ = _apply(
+        dag.plan_and_claim(spec, 3.0, "p", "h", {"work": ["a", "b", "c"]}),
+        body,
+    )
+    assert body["mapped"]["work"]["items"] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------
+# Sensors
+# --------------------------------------------------------------------------
+
+
+def test_sensor_pokes_until_success():
+    spec = _spec(
+        TaskSpec("s", type=dag.SENSOR, poke_interval=10.0, poke_timeout=1e9),
+    )
+    body = _body(spec)
+    task = spec.by_id["s"]
+    # first poke
+    body, res = _apply(dag.plan_and_claim(spec, 100.0, "p", "h", {}), body)
+    assert [i.is_sensor for i in res.launches] == [True]
+    # poke returns "not yet" (nonzero) -> reschedule
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason=None,
+            now=100.0, task=task,
+        ),
+        body,
+    )
+    assert _state(body, "s") == dag.RUNNING
+    assert body["tasks"]["s"]["nextPokeAt"] == 110.0
+    # not due yet
+    body, res = _apply(dag.plan_and_claim(spec, 105.0, "p", "h", {}), body)
+    assert res.launches == []
+    # due: re-poke
+    body, res = _apply(dag.plan_and_claim(spec, 111.0, "p", "h", {}), body)
+    assert len(res.launches) == 1
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=True, exit_code=0, fail_reason=None,
+            now=111.0, task=task,
+        ),
+        body,
+    )
+    assert _state(body, "s") == dag.SUCCESS
+
+
+def test_sensor_times_out():
+    spec = _spec(
+        TaskSpec("s", type=dag.SENSOR, poke_interval=10.0, poke_timeout=25.0),
+    )
+    body = _body(spec)
+    task = spec.by_id["s"]
+    body, _ = _apply(dag.plan_and_claim(spec, 100.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason=None,
+            now=100.0, task=task,
+        ),
+        body,
+    )
+    # far past the timeout window (firstPokeAt=100, timeout=25 -> 125)
+    body, res = _apply(dag.plan_and_claim(spec, 200.0, "p", "h", {}), body)
+    assert _state(body, "s") == dag.FAILED
+    assert res.launches == []
+
+
+# --------------------------------------------------------------------------
+# Approval gates
+# --------------------------------------------------------------------------
+
+
+def test_approval_blocks_then_approves():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec("gate", type=dag.APPROVAL, depends_on=("a",)),
+        TaskSpec("b", depends_on=("gate",)),
+    )
+    ex = _Executor(spec, outcomes={"a": True, "b": True})
+    body = ex.run(_body(spec))
+    # parked awaiting approval; b not launched
+    assert _state(body, "gate") == dag.RUNNING
+    assert body["tasks"]["gate"]["awaitingApproval"] is True
+    assert "b" not in ex.launched
+    # approve
+    body, result = _apply(
+        dag.apply_approval(
+            "gate", approved=True, by="alice", now=500.0,
+            on_reject=dag.FAILED,
+        ),
+        body,
+    )
+    assert result["ok"] is True
+    assert _state(body, "gate") == dag.SUCCESS
+    # resume: b now runs to completion
+    body = ex.run(body)
+    assert body["state"] == dag.SUCCESS
+    assert "b" in ex.launched
+
+
+def test_approval_reject_skip_cascades():
+    spec = _spec(
+        TaskSpec("gate", type=dag.APPROVAL, on_reject=dag.SKIPPED),
+        TaskSpec("b", depends_on=("gate",)),
+    )
+    body = _body(spec)
+    # claim the gate (awaiting)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    assert body["tasks"]["gate"]["awaitingApproval"] is True
+    body, result = _apply(
+        dag.apply_approval(
+            "gate", approved=False, by="bob", now=2.0, on_reject=dag.SKIPPED,
+        ),
+        body,
+    )
+    assert _state(body, "gate") == dag.SKIPPED
+    # downstream cascades to skipped under all_success
+    body, _ = _apply(dag.plan_and_claim(spec, 3.0, "p", "h", {}), body)
+    assert _state(body, "b") == dag.SKIPPED
+    assert dag.is_terminal_run(body)
+    assert body["state"] == dag.SUCCESS  # skipped is not a failure
+
+
+def test_double_approval_is_noop():
+    spec = _spec(TaskSpec("gate", type=dag.APPROVAL))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    body, r1 = _apply(
+        dag.apply_approval(
+            "gate", approved=True, by="a", now=2.0, on_reject=dag.FAILED
+        ),
+        body,
+    )
+    assert r1["ok"] is True
+    body, r2 = _apply(
+        dag.apply_approval(
+            "gate", approved=False, by="b", now=3.0, on_reject=dag.FAILED
+        ),
+        body,
+    )
+    assert r2["ok"] is False  # already decided
+    assert _state(body, "gate") == dag.SUCCESS
+
+
+# --------------------------------------------------------------------------
+# Crash reconciliation
+# --------------------------------------------------------------------------
+
+
+def test_reconcile_dead_task_retries():
+    spec = _spec(TaskSpec("a", max_attempts=2))
+    body = _body(spec)
+    # claim + record a pid from a now-dead prior process
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "old-proc", "h", {}), body)
+    body, _ = _apply(dag.set_task_pid("a", "old-proc", 999, 1.0), body)
+    assert _state(body, "a") == dag.RUNNING
+    # a new process reconciles: pid 999 is dead
+    body, n = _apply(
+        dag.reconcile_crashed(
+            spec, 10.0, "new-proc", "h", lambda pid: False
+        ),
+        body,
+    )
+    assert n == 1
+    assert _state(body, "a") == dag.UP_FOR_RETRY
+    assert body["tasks"]["a"]["attempt"] == 1
+
+
+def test_reconcile_leaves_live_child():
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "old-proc", "h", {}), body)
+    body, _ = _apply(dag.set_task_pid("a", "old-proc", 999, 1.0), body)
+    # same host, pid still alive -> the child outlived the daemon; leave it
+    body, n = _apply(
+        dag.reconcile_crashed(spec, 10.0, "new-proc", "h", lambda pid: True),
+        body,
+    )
+    assert n == 0
+    assert _state(body, "a") == dag.RUNNING
+
+
+def test_reconcile_leaves_own_process():
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "proc-A", "h", {}), body)
+    body, _ = _apply(dag.set_task_pid("a", "proc-A", 5, 1.0), body)
+    # our own token: never reconcile (even if pid_alive says dead)
+    body, n = _apply(
+        dag.reconcile_crashed(spec, 2.0, "proc-A", "h", lambda pid: False),
+        body,
+    )
+    assert n == 0
+    assert _state(body, "a") == dag.RUNNING
+
+
+def test_reconcile_claimed_but_never_launched():
+    spec = _spec(TaskSpec("a", max_attempts=1))
+    body = _body(spec)
+    # a prior process claimed `a` (its proc token persisted at claim time) but
+    # crashed before recording the pid; a fresh process must recover it.
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "old-proc", "h", {}), body)
+    assert body["tasks"]["a"]["proc"] == "old-proc"
+    assert body["tasks"]["a"]["pid"] is None
+    body, n = _apply(
+        dag.reconcile_crashed(spec, 5.0, "new-proc", "h", lambda pid: True),
+        body,
+    )
+    assert n == 1
+    assert _state(body, "a") == dag.FAILED  # no attempts left -> terminal
+
+
+def test_reconcile_leaves_sensor_between_pokes(monkeypatch):
+    # a sensor idling between pokes has proc cleared; reconciliation (which runs
+    # at the top of every advance) must NOT touch it, or it would re-poke every
+    # pass and defeat the poke schedule.
+    spec = _spec(
+        TaskSpec("s", type=dag.SENSOR, poke_interval=30.0, poke_timeout=1e9),
+    )
+    body = _body(spec)
+    task = spec.by_id["s"]
+    body, _ = _apply(dag.plan_and_claim(spec, 100.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason=None,
+            now=100.0, task=task,
+        ),
+        body,
+    )
+    assert body["tasks"]["s"]["proc"] is None
+    assert body["tasks"]["s"]["nextPokeAt"] == 130.0
+    # reconcile with a fresh proc: the idle sensor is left exactly as-is.
+    body, n = _apply(
+        dag.reconcile_crashed(spec, 105.0, "q", "h", lambda pid: False),
+        body,
+    )
+    assert n == 0
+    assert body["tasks"]["s"]["nextPokeAt"] == 130.0  # schedule preserved
+
+
+def test_reconcile_recovers_crashed_sensor_poke():
+    # a sensor whose poke crashed mid-flight (proc set, pid dead) IS recovered.
+    spec = _spec(TaskSpec("s", type=dag.SENSOR, poke_timeout=1e9))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "old", "h", {}), body)
+    body, _ = _apply(dag.set_task_pid("s", "old", 999, 1.0), body)
+    body, n = _apply(
+        dag.reconcile_crashed(spec, 9.0, "new", "h", lambda pid: False),
+        body,
+    )
+    assert n == 1
+    assert _state(body, "s") == dag.RUNNING  # re-poke, not fail
+    assert body["tasks"]["s"]["proc"] is None
+    assert body["tasks"]["s"]["nextPokeAt"] == 9.0
+
+
+def test_reconcile_skips_approval_gate():
+    spec = _spec(TaskSpec("gate", type=dag.APPROVAL))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "old-proc", "h", {}), body)
+    assert body["tasks"]["gate"]["awaitingApproval"] is True
+    body, n = _apply(
+        dag.reconcile_crashed(spec, 5.0, "new-proc", "h", lambda pid: False),
+        body,
+    )
+    assert n == 0  # a gate awaiting a human is not a crash victim
+    assert body["tasks"]["gate"]["awaitingApproval"] is True
+
+
+# --------------------------------------------------------------------------
+# Key helpers
+# --------------------------------------------------------------------------
+
+
+def test_xcom_scheme():
+    assert dag.xcom_scope("etl", "rid1") == "dagxcom/etl/rid1"
+    assert dag.xcom_name("work#2", "out") == "work#2/out"
+    assert dag.task_display_key("t", None) == "t"
+    assert dag.task_display_key("t", 3) == "t#3"
+
+
+def test_run_key_sanitised():
+    key = dag.run_key_for_logical("2026-07-04T02:00:00+00:00")
+    assert "/" not in key and " " not in key
+    # deterministic
+    assert key == dag.run_key_for_logical("2026-07-04T02:00:00+00:00")
+
+
+# --------------------------------------------------------------------------
+# `yacron2 xcom` CLI (the HTTP seam monkeypatched, like the phase-5 CLI tests)
+# --------------------------------------------------------------------------
+
+
+class _ExitError(Exception):
+    pass
+
+
+class _FakeHTTP:
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+        self.calls = []
+
+    def __call__(self, method, path, *, query=None, json_body=None, data=None):
+        self.calls.append(
+            {"method": method, "path": path, "query": query, "data": data}
+        )
+        status, body = self.responses.get(path, (200, {}))
+        payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+        return status, {}, payload
+
+
+def _xcom_cli(monkeypatch, argv, http=None, stdin=b""):
+    monkeypatch.setenv("YACRON2_STATE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("YACRON2_STATE_TOKEN", "tok")
+    monkeypatch.setenv("YACRON2_DAG_XCOM_SCOPE", "dagxcom/d/rid")
+    monkeypatch.setenv("YACRON2_DAG_TASKKEY", "gen")
+    if http is not None:
+        monkeypatch.setattr(jobcli, "_http", http)
+
+    class _Buf:
+        def __init__(self):
+            self.buffer = self
+
+        def read(self):
+            return stdin
+
+    monkeypatch.setattr(sys, "stdin", _Buf())
+    loop = asyncio.new_event_loop()
+    try:
+        monkeypatch.setattr(sys, "argv", ["yacron2"] + argv)
+        monkeypatch.setattr(
+            sys, "exit", lambda code=0: (_ for _ in ()).throw(_ExitError(code))
+        )
+        with pytest.raises(_ExitError) as ex:
+            yacron2.__main__.main_loop(loop)
+        return ex.value.args[0]
+    finally:
+        loop.close()
+
+
+def test_xcom_push_targets_own_taskkey(monkeypatch):
+    http = _FakeHTTP({"/v1/artifact/put": (200, {"sha256": "ab", "size": 2})})
+    code = _xcom_cli(
+        monkeypatch, ["xcom", "push", "--key", "out"], http=http, stdin=b"hi"
+    )
+    assert code == 0
+    call = http.calls[0]
+    assert call["path"] == "/v1/artifact/put"
+    assert call["query"] == {"scope": "dagxcom/d/rid", "name": "gen/out"}
+    assert call["data"] == b"hi"
+
+
+def test_xcom_pull_reads_upstream(monkeypatch, capsysbinary):
+    http = _FakeHTTP({"/v1/artifact/get": (200, b"payload")})
+    code = _xcom_cli(
+        monkeypatch,
+        ["xcom", "pull", "--task", "up", "--key", "out"],
+        http=http,
+    )
+    assert code == 0
+    assert http.calls[0]["query"]["name"] == "up/out"
+    assert capsysbinary.readouterr().out == b"payload"
+
+
+def test_xcom_pull_map_index(monkeypatch):
+    http = _FakeHTTP({"/v1/artifact/get": (200, b"x")})
+    _xcom_cli(
+        monkeypatch,
+        ["xcom", "pull", "--task", "up", "--key", "out", "--map-index", "2"],
+        http=http,
+    )
+    assert http.calls[0]["query"]["name"] == "up#2/out"
+
+
+def test_xcom_pull_missing_is_exit_4(monkeypatch):
+    http = _FakeHTTP({"/v1/artifact/get": (404, {})})
+    code = _xcom_cli(
+        monkeypatch,
+        ["xcom", "pull", "--task", "up", "--key", "gone"],
+        http=http,
+    )
+    assert code == jobcli.EXIT_NOT_FOUND
+
+
+def test_xcom_outside_dag_errors(monkeypatch):
+    # no YACRON2_DAG_XCOM_SCOPE -> a clean error, not a traceback
+    monkeypatch.delenv("YACRON2_DAG_XCOM_SCOPE", raising=False)
+    monkeypatch.setenv("YACRON2_STATE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("YACRON2_STATE_TOKEN", "tok")
+    monkeypatch.setattr(sys, "argv", ["yacron2", "xcom", "list"])
+    monkeypatch.setattr(
+        sys, "exit", lambda code=0: (_ for _ in ()).throw(_ExitError(code))
+    )
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(_ExitError) as ex:
+            yacron2.__main__.main_loop(loop)
+        assert ex.value.args[0] == jobcli.EXIT_ERROR
+    finally:
+        loop.close()
+
+
+# --------------------------------------------------------------------------
+# Config parsing + cross-section validation
+# --------------------------------------------------------------------------
+
+
+_ETL = """
+dags:
+  - name: etl
+    schedule: '0 2 * * *'
+    onMissed: run-all
+    retainRuns: 7
+    tasks:
+      - id: extract
+        command: 'echo x'
+      - id: load
+        command: 'echo y'
+        dependsOn:
+          - extract
+        retries: 3
+        retryDelaySeconds: 5
+"""
+
+
+def test_dag_parsed():
+    cfg = _dagcfg(_ETL)
+    (d,) = cfg.dags
+    assert d.name == "etl"
+    assert d.retain_runs == 7
+    assert d.schedule_job is not None
+    assert d.schedule_job.onMissed == "run-all"
+    load = d.task_templates["load"]
+    assert load.command == "echo y"
+    spec = {t.id: t.spec for t in d.tasks}
+    assert spec["load"].max_attempts == 4  # retries: 3 -> 4 attempts
+    assert spec["load"].retry_delay == 5.0
+    assert spec["load"].depends_on == ("extract",)
+
+
+def test_dag_manual_only_no_schedule():
+    cfg = _dagcfg(
+        "dags:\n  - name: m\n    tasks:\n"
+        "      - id: t\n        command: 'echo'\n"
+    )
+    assert cfg.dags[0].schedule_job is None
+
+
+def test_dag_requires_state():
+    with pytest.raises(ConfigError, match="dags require a `state` section"):
+        _validate_cross_sections(
+            parse_config_string(
+                "dags:\n  - name: d\n    tasks:\n"
+                "      - id: t\n        command: 'echo'\n",
+                "",
+            )
+        )
+
+
+def test_dag_requires_jobapi_enabled():
+    with pytest.raises(ConfigError, match="loopback endpoint"):
+        _xsect(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: t\n        command: 'echo'\n",
+            state="state:\n  path: /x\n  jobApi:\n    enabled: false\n",
+        )
+
+
+def test_dag_duplicate_name_rejected():
+    with pytest.raises(ConfigError, match="duplicate dag name"):
+        _xsect(
+            "dags:\n"
+            "  - name: d\n    tasks:\n      - id: a\n        command: 'e'\n"
+            "  - name: d\n    tasks:\n      - id: b\n        command: 'e'\n"
+        )
+
+
+def test_dag_cycle_is_config_error():
+    with pytest.raises(ConfigError, match="cycle"):
+        _dagcfg(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n        dependsOn:\n"
+            "          - b\n"
+            "      - id: b\n        command: 'e'\n        dependsOn:\n"
+            "          - a\n"
+        )
+
+
+def test_dag_unknown_dep_is_config_error():
+    with pytest.raises(ConfigError, match="unknown task"):
+        _dagcfg(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n        dependsOn:\n"
+            "          - ghost\n"
+        )
+
+
+def test_dag_task_needs_command():
+    with pytest.raises(ConfigError, match="needs a command"):
+        _dagcfg(
+            "dags:\n  - name: d\n    tasks:\n      - id: a\n"
+        )
+
+
+def test_dag_approval_needs_no_command():
+    cfg = _dagcfg(
+        "dags:\n  - name: d\n    tasks:\n"
+        "      - id: gate\n        type: approval\n"
+    )
+    assert cfg.dags[0].tasks[0].type == "approval"
+
+
+def test_dag_expand_must_be_direct_dep():
+    with pytest.raises(ConfigError, match="direct dependsOn"):
+        _dagcfg(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n"
+            "      - id: b\n        command: 'e'\n        dependsOn:\n"
+            "          - a\n"
+            "      - id: c\n        command: 'e'\n        dependsOn:\n"
+            "          - b\n        expand:\n"
+            "          fromTask: a\n          key: items\n"
+        )
+
+
+def test_dag_retain_runs_floor():
+    with pytest.raises(ConfigError, match="retainRuns must be >= 1"):
+        _dagcfg(
+            "dags:\n  - name: d\n    retainRuns: 0\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n"
+        )
+
+
+def test_dag_task_id_charset_rejected():
+    # '#' / '/' would alias a mapped instance key or an XCom name
+    with pytest.raises(ConfigError, match="may not contain"):
+        _dagcfg(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: 'a/b'\n        command: 'e'\n"
+        )
+    with pytest.raises(dag.DagValidationError, match="may not contain"):
+        dag.validate_graph(DagSpec.build("d", [TaskSpec("a#0")]))

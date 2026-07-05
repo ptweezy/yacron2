@@ -44,6 +44,14 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
   `yacron2 state|cursor|lock|artifact|idempotent|secret` (see the
   [Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State) wiki
   page); without it, yacron2 stays stateless as before
+* **Opt-in orchestration DAGs**: a `dags:` block turns the scheduler into a
+  small, durable workflow engine -- tasks with `dependsOn` edges, cross-task
+  data hand-off (XCom), dynamic fan-out/mapping, sensors, human approval gates,
+  whole-DAG backfill, and crash-resume of a partial graph, all on the same
+  state store and coordinated across a fleet under a single lease so a task
+  never double-launches (see the
+  [Orchestration and DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs)
+  wiki page)
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
 * Native **Prometheus metrics** at `/metrics` (plus per-job statsd push

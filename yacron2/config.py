@@ -7,7 +7,7 @@ import os
 import re
 import socket
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Dict,
@@ -39,7 +39,7 @@ from strictyaml import (
 from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
-from yacron2 import crontabs, platform
+from yacron2 import crontabs, dag, platform
 
 logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
@@ -540,10 +540,93 @@ _job_schema_dict.update(
     }
 )
 
+# Phase 6 orchestration: a task is a job invocation, so it reuses the shared
+# launch fields (shell/environment/capture/timeouts/user/secrets/...) and adds
+# the DAG-node fields (id, dependsOn edges, node type, per-task retries,
+# dynamic mapping, sensor poke schedule, approval reject policy).  ``command``
+# is optional only for an approval gate (which runs no subprocess).
+_dag_task_launch_fields = {
+    Opt("shell"): Str(),
+    Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
+    Opt("captureStderr"): Bool(),
+    Opt("captureStdout"): Bool(),
+    Opt("saveLimit"): Int(),
+    Opt("maxLineLength"): Int(),
+    Opt("streamPrefix"): Str(),
+    Opt("failsWhen"): Map(
+        {
+            "producesStdout": Bool(),
+            Opt("producesStderr"): Bool(),
+            Opt("nonzeroReturn"): Bool(),
+            Opt("always"): Bool(),
+        }
+    ),
+    Opt("executionTimeout"): Float(),
+    Opt("killTimeout"): Float(),
+    Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
+    Opt("user"): Int() | Str(),
+    Opt("group"): Int() | Str(),
+    Opt("env_file"): Str(),
+    Opt("secrets"): Seq(
+        Map(
+            {
+                "name": Str(),
+                Opt("value"): EmptyNone() | Str(),
+                Opt("fromFile"): EmptyNone() | Str(),
+                Opt("fromEnvVar"): EmptyNone() | Str(),
+            }
+        )
+    ),
+}
+
+_dag_task_schema_dict = dict(_dag_task_launch_fields)
+_dag_task_schema_dict.update(
+    {
+        "id": Str(),
+        Opt("command"): Str() | Seq(Str()),
+        Opt("type"): Enum(["task", "sensor", "approval"]),
+        Opt("dependsOn"): Seq(Str()),
+        Opt("triggerRule"): Enum(["all_success", "all_done"]),
+        Opt("retries"): Int(),
+        Opt("retryDelaySeconds"): Int() | Float(),
+        Opt("expand"): Map({"fromTask": Str(), "key": Str()}),
+        Opt("pokeIntervalSeconds"): Int() | Float(),
+        Opt("pokeTimeoutSeconds"): Int() | Float(),
+        Opt("pokeJitterSeconds"): Int() | Float(),
+        Opt("onReject"): Enum(["fail", "skip"]),
+    }
+)
+
+_dag_schema_dict = {
+    "name": Str(),
+    Opt("schedule"): Str()
+    | Map(
+        {
+            Opt("second"): Str(),
+            Opt("minute"): Str(),
+            Opt("hour"): Str(),
+            Opt("dayOfMonth"): Str(),
+            Opt("month"): Str(),
+            Opt("year"): Str(),
+            Opt("dayOfWeek"): Str(),
+        }
+    ),
+    Opt("timezone"): Str(),
+    Opt("utc"): Bool(),
+    Opt("onMissed"): Enum(["skip", "run-once", "run-all"]),
+    Opt("startingDeadlineSeconds"): EmptyNone() | Int(),
+    Opt("catchupJitterSeconds"): Int(),
+    Opt("clusterPolicy"): Enum(["Leader", "PreferLeader", "EveryNode"]),
+    Opt("enabled"): Bool(),
+    Opt("retainRuns"): Int(),
+    "tasks": Seq(Map(_dag_task_schema_dict)),
+}
+
 CONFIG_SCHEMA = EmptyDict() | Map(
     {
         Opt("defaults"): Map(_job_defaults_common),
         Opt("jobs"): Seq(Map(_job_schema_dict)),
+        Opt("dags"): Seq(Map(_dag_schema_dict)),
         Opt("web"): Map(
             {
                 "listen": Seq(Str()),
@@ -1151,6 +1234,179 @@ class JobConfig:
                 retry["backoffMultiplier"] > 0,
                 "onFailure.retry.backoffMultiplier must be > 0",
             )
+
+
+# Defaults for the DAG-node fields strictyaml leaves absent (unlike jobs, a
+# task dict is not pre-merged over a full defaults dict, so absent optionals
+# stay absent).  The launch fields are filled from DEFAULT_CONFIG when the
+# per-task JobConfig template is built.
+_DAG_TASK_DEFAULTS: Dict[str, Any] = {
+    "type": "task",
+    "dependsOn": [],
+    "triggerRule": "all_success",
+    "retries": 0,
+    "retryDelaySeconds": 0.0,
+    "pokeIntervalSeconds": 30.0,
+    "pokeTimeoutSeconds": 3600.0,
+    "pokeJitterSeconds": 0.0,
+    "onReject": "fail",
+}
+
+# the DAG-node keys consumed here; everything else in a task dict is a launch
+# field forwarded to the per-task JobConfig template.
+_DAG_TASK_NODE_KEYS = frozenset(
+    {
+        "id",
+        "type",
+        "dependsOn",
+        "triggerRule",
+        "retries",
+        "retryDelaySeconds",
+        "expand",
+        "pokeIntervalSeconds",
+        "pokeTimeoutSeconds",
+        "pokeJitterSeconds",
+        "onReject",
+    }
+)
+
+
+class DagTaskConfig:
+    """One DAG node: its state-machine :class:`yacron2.dag.TaskSpec` plus the
+    :class:`JobConfig` launch template the scheduler runs it from.
+
+    A task *is* a job invocation (the mandate), so the launch fields reuse the
+    exact job machinery -- the template carries the command, shell, env,
+    capture, timeouts and run-scoped secrets, and the daemon launches it
+    through the same :class:`~yacron2.job.RunningJob` path a scheduled job
+    uses.  The DAG-node fields (deps, type, retries, mapping) drive the pure
+    state machine.
+    """
+
+    __slots__ = ("id", "type", "job_template", "spec")
+
+    def __init__(self, dag_name: str, raw_task: dict) -> None:
+        merged = dict(mergedicts(_DAG_TASK_DEFAULTS, raw_task))
+        self.id: str = merged["id"]
+        self.type: str = merged["type"]
+        node = {
+            k: merged.pop(k) for k in list(merged) if k in _DAG_TASK_NODE_KEYS
+        }
+        expand = node.get("expand")
+        command = merged.get("command")
+        if self.type == "approval":
+            # an approval gate runs no subprocess; a harmless placeholder keeps
+            # the JobConfig template valid without demanding a command.
+            merged["command"] = command or "true"
+        elif not command:
+            raise ConfigError(
+                "dag {!r}: task {!r} needs a command".format(dag_name, self.id)
+            )
+        job_dict = dict(mergedicts(DEFAULT_CONFIG, merged))
+        job_dict["name"] = "{}.{}".format(dag_name, self.id)
+        # never auto-fires: task templates are not in the scheduler's job set,
+        # so this placeholder schedule is only there to satisfy JobConfig.
+        job_dict["schedule"] = "@reboot"
+        try:
+            self.job_template = JobConfig(job_dict)
+        except ConfigError as ex:
+            raise ConfigError(
+                "dag {!r}: task {!r}: {}".format(dag_name, self.id, ex)
+            ) from ex
+        self.spec = dag.TaskSpec(
+            id=self.id,
+            type=self.type,
+            depends_on=tuple(node["dependsOn"]),
+            trigger_rule=node["triggerRule"],
+            max_attempts=int(node["retries"]) + 1,
+            retry_delay=float(node["retryDelaySeconds"]),
+            expand=(
+                dag.ExpandSpec(from_task=expand["fromTask"], key=expand["key"])
+                if expand
+                else None
+            ),
+            poke_interval=float(node["pokeIntervalSeconds"]),
+            poke_timeout=float(node["pokeTimeoutSeconds"]),
+            poke_jitter=float(node["pokeJitterSeconds"]),
+            on_reject=dag.SKIPPED
+            if node["onReject"] == "skip"
+            else dag.FAILED,
+        )
+
+
+class DagConfig:
+    """A whole DAG: its scheduling frame, its tasks, and the validated graph.
+
+    ``schedule_job`` is a synthetic :class:`JobConfig` carrying only the DAG's
+    schedule/timezone/onMissed frame, so the scheduler reuses
+    ``_compute_next_fire`` / the catch-up discipline verbatim; it is ``None``
+    for a manual-only DAG (triggered by API or backfill).  The graph is
+    validated at construction, so a cycle or dangling dependency is a
+    :class:`ConfigError` at load.
+    """
+
+    __slots__ = (
+        "name",
+        "enabled",
+        "retain_runs",
+        "schedule_job",
+        "tasks",
+        "spec",
+        "task_templates",
+    )
+
+    def __init__(self, raw_dag: dict) -> None:
+        raw = dict(raw_dag)
+        self.name: str = raw.pop("name")
+        self.enabled: bool = bool(raw.pop("enabled", True))
+        self.retain_runs: int = int(raw.pop("retainRuns", 50))
+        if self.retain_runs < 1:
+            raise ConfigError(
+                "dag {!r}: retainRuns must be >= 1".format(self.name)
+            )
+        tasks_raw = raw.pop("tasks")
+        if not tasks_raw:
+            raise ConfigError(
+                "dag {!r}: needs at least one task".format(self.name)
+            )
+        self.tasks = [DagTaskConfig(self.name, t) for t in tasks_raw]
+        self.task_templates: Dict[str, JobConfig] = {
+            t.id: t.job_template for t in self.tasks
+        }
+        self.spec = dag.DagSpec.build(self.name, [t.spec for t in self.tasks])
+        try:
+            dag.validate_graph(self.spec)
+        except dag.DagValidationError as ex:
+            raise ConfigError("dag {!r}: {}".format(self.name, ex)) from ex
+        schedule = raw.pop("schedule", None)
+        self.schedule_job: Optional[JobConfig] = (
+            self._build_schedule_job(raw, schedule)
+            if schedule is not None
+            else None
+        )
+
+    def _build_schedule_job(self, raw: dict, schedule: Any) -> JobConfig:
+        overrides: Dict[str, Any] = {
+            "name": "dag:" + self.name,
+            "command": "true",
+            "schedule": schedule,
+            "enabled": self.enabled,
+        }
+        for key in (
+            "onMissed",
+            "startingDeadlineSeconds",
+            "catchupJitterSeconds",
+            "timezone",
+            "utc",
+            "clusterPolicy",
+        ):
+            if key in raw:
+                overrides[key] = raw[key]
+        job_dict = dict(mergedicts(DEFAULT_CONFIG, overrides))
+        try:
+            return JobConfig(job_dict)
+        except ConfigError as ex:
+            raise ConfigError("dag {!r}: {}".format(self.name, ex)) from ex
 
 
 def parse_environment_file(path: str) -> Dict[str, str]:
@@ -2139,6 +2395,9 @@ class Yacron2Config:
     # Optional durable state backend (yacron2.state); None keeps the classic
     # stateless, in-memory behaviour. Defaulted for the same reason as above.
     state_config: Optional[StateConfig] = None
+    # Phase 6 orchestration DAGs; empty keeps the classic no-DAG behaviour.
+    # A mutable default needs field(default_factory), never a shared [].
+    dags: List["DagConfig"] = field(default_factory=list)
 
 
 def parse_config_string(
@@ -2187,6 +2446,7 @@ def _config_from_doc(
     """
     inc_defaults_merged: dict = {}
     jobs = []
+    dags: List[DagConfig] = []
     webconf = WebConfig(doc["web"]) if "web" in doc else None
     if webconf is not None:
         # (an included file's web section was already validated when that
@@ -2208,6 +2468,7 @@ def _config_from_doc(
             mergedicts(inc_defaults_merged, inc_config.job_defaults)
         )
         jobs.extend(inc_config.jobs)
+        dags.extend(inc_config.dags)
         if inc_config.web_config:
             if webconf:
                 raise ConfigError("multiple web configs")
@@ -2229,6 +2490,11 @@ def _config_from_doc(
     for config_job in doc.get("jobs", []):
         job_dict = dict(mergedicts(defaults, config_job))
         jobs.append(JobConfig(job_dict))
+    # DAGs are self-contained (tasks carry their own launch fields), so a
+    # top-level `defaults:` block is not applied to them; each DAG builds its
+    # per-task templates over DEFAULT_CONFIG in DagConfig.
+    for config_dag in doc.get("dags", []):
+        dags.append(DagConfig(config_dag))
     return Yacron2Config(
         jobs=jobs,
         web_config=webconf,
@@ -2236,6 +2502,7 @@ def _config_from_doc(
         logging_config=logging_conf,
         cluster_config=clusterconf,
         state_config=stateconf,
+        dags=dags,
     )
 
 
@@ -2335,6 +2602,38 @@ def _validate_cross_sections(config: Yacron2Config) -> None:
                     "state.jobApi.enabled is false; offending job(s): "
                     "{}".format(", ".join(secret_offenders))
                 )
+    _validate_dags(config)
+
+
+def _validate_dags(config: Yacron2Config) -> None:
+    """Cross-section invariants for the orchestration DAGs.
+
+    DAGs live entirely on the durable store (each ``dag_run`` is a document,
+    per-task state and XCom ride the Phase 5 primitives), and their tasks reach
+    the store through the loopback endpoint, so a DAG needs a ``state`` section
+    with ``jobApi`` enabled.  DAG names must be unique across the whole config.
+    The per-DAG graph (acyclic, resolvable deps, valid expand targets) is
+    already validated when each :class:`DagConfig` is built.
+    """
+    if not config.dags:
+        return
+    names = [d.name for d in config.dags]
+    dups = sorted({n for n in names if names.count(n) > 1})
+    if dups:
+        raise ConfigError("duplicate dag name(s): {}".format(", ".join(dups)))
+    if config.state_config is None:
+        raise ConfigError(
+            "dags require a `state` section (each dag_run and its per-task "
+            "state live on the durable store); none is configured, "
+            "offending dag(s): {}".format(", ".join(sorted(names)))
+        )
+    job_api = config.state_config.get("jobApi") or {}
+    if not job_api.get("enabled", True):
+        raise ConfigError(
+            "dags need the state loopback endpoint for XCom and task state, "
+            "but state.jobApi.enabled is false; offending dag(s): "
+            "{}".format(", ".join(sorted(names)))
+        )
 
 
 def parse_config(
@@ -2380,6 +2679,7 @@ def _parse_config_dir(
     config_arg: str, _sources: Optional[set] = None
 ) -> Yacron2Config:
     jobs: List[JobConfig] = []
+    dags: List[DagConfig] = []
     config_errors: Dict[str, str] = {}
     web_config: Optional[WebConfig] = None
     web_config_source_fname: Optional[str] = None
@@ -2412,6 +2712,7 @@ def _parse_config_dir(
             config_errors[config_arg] = str(ex)
             continue
         jobs.extend(config.jobs)
+        dags.extend(config.dags)
         if config.web_config is not None:
             if web_config is None:
                 web_config = config.web_config
@@ -2471,4 +2772,5 @@ def _parse_config_dir(
         logging_config=logging_config,
         cluster_config=cluster_config,
         state_config=state_config,
+        dags=dags,
     )

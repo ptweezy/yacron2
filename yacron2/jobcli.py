@@ -36,6 +36,13 @@ from typing import Any, Dict, Optional, Tuple
 ENV_URL = "YACRON2_STATE_URL"
 ENV_TOKEN = "YACRON2_STATE_TOKEN"
 
+# Phase 6: injected into every DAG task so `yacron2 xcom` knows this task's own
+# key and the run's shared XCom scope (an artifact scope; XCom is a thin,
+# task-keyed convention over the Phase 5 artifact store).  Hardcoded for the
+# same reason as above -- a stable wire contract (see yacron2.dag).
+ENV_DAG_XCOM_SCOPE = "YACRON2_DAG_XCOM_SCOPE"
+ENV_DAG_TASKKEY = "YACRON2_DAG_TASKKEY"
+
 # Exit codes: 0 success, 1 a real error, 2 usage, 3 lock not acquired, 4 the
 # looked-up thing does not exist (so a script can branch on "missing").
 EXIT_ERROR = 1
@@ -350,6 +357,86 @@ def _cmd_artifact(args: argparse.Namespace) -> int:
     )
 
 
+def _xcom_scope() -> str:
+    scope = os.environ.get(ENV_DAG_XCOM_SCOPE)
+    if not scope:
+        raise _CliError(
+            "not running inside a yacron2 DAG task: {} is not set (xcom "
+            "publishes/reads task outputs within a dag_run; it only works "
+            "for a task the DAG scheduler launched)".format(ENV_DAG_XCOM_SCOPE)
+        )
+    return scope
+
+
+def _cmd_xcom(args: argparse.Namespace) -> int:
+    scope = _xcom_scope()
+    if args.xcom_command == "push":
+        my = os.environ.get(ENV_DAG_TASKKEY)
+        if not my:
+            raise _CliError(
+                "cannot determine this task's id ({} unset)".format(
+                    ENV_DAG_TASKKEY
+                )
+            )
+        payload = _read_input(args.file)
+        status, _headers, body = _http(
+            "POST",
+            "/v1/artifact/put",
+            query={"scope": scope, "name": my + "/" + args.key},
+            data=payload,
+        )
+        _ok(status, json.loads(body) if body else {})
+        return 0
+    if args.xcom_command == "pull":
+        upstream = args.task
+        if args.map_index is not None:
+            upstream = "{}#{}".format(upstream, args.map_index)
+        status, _headers, body = _http(
+            "GET",
+            "/v1/artifact/get",
+            query={"scope": scope, "name": upstream + "/" + args.key},
+        )
+        if status == 404:
+            print(
+                "no xcom {!r} from task {!r}".format(args.key, upstream),
+                file=sys.stderr,
+            )
+            return EXIT_NOT_FOUND
+        if status >= 400:
+            _ok(status, json.loads(body) if body else {})
+        _write_output(args.output, body)
+        return 0
+    if args.xcom_command == "list":
+        status, data = _json(
+            "GET", "/v1/artifact/list", query={"scope": scope}
+        )
+        for entry in _ok(status, data).get("artifacts", []):
+            sys.stdout.write(str(entry.get("name")) + "\n")
+        return 0
+    raise _CliError("unknown xcom action {!r}".format(args.xcom_command))
+
+
+def _read_input(path: Optional[str]) -> bytes:
+    if not path or path == "-":
+        return sys.stdin.buffer.read()
+    try:
+        with open(path, "rb") as fobj:
+            return fobj.read()
+    except OSError as ex:
+        raise _CliError("cannot read {}: {}".format(path, ex)) from ex
+
+
+def _write_output(path: Optional[str], data: bytes) -> None:
+    if not path or path == "-":
+        sys.stdout.buffer.write(data)
+        return
+    try:
+        with open(path, "wb") as fobj:
+            fobj.write(data)
+    except OSError as ex:
+        raise _CliError("cannot write {}: {}".format(path, ex)) from ex
+
+
 def _lock_acquire(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
     scope = _scope_of(args)
     status, data = _json(
@@ -586,6 +673,34 @@ def add_job_commands(sub: Any) -> None:
     )
     _add_scope_flags(idem)
 
+    # xcom (Phase 6): cross-task data hand-off within a dag_run
+    xcom = sub.add_parser(
+        "xcom",
+        help="publish or read a DAG task output (XCom) within a dag_run",
+    )
+    xcom_actions = xcom.add_subparsers(dest="xcom_command", metavar="ACTION")
+    xpush = xcom_actions.add_parser(
+        "push", help="publish this task's output under a key (FILE or stdin)"
+    )
+    xpush.add_argument("--key", required=True, help="the XCom key to publish")
+    xpush.add_argument("file", nargs="?", default=None)
+    xpull = xcom_actions.add_parser(
+        "pull", help="read an upstream task's output by key"
+    )
+    xpull.add_argument(
+        "--task", required=True, metavar="TASK", help="the upstream task id"
+    )
+    xpull.add_argument("--key", required=True, help="the XCom key to read")
+    xpull.add_argument(
+        "--map-index",
+        type=int,
+        default=None,
+        metavar="I",
+        help="read a specific mapped instance of the upstream task",
+    )
+    xpull.add_argument("-o", "--output", default=None, metavar="FILE")
+    xcom_actions.add_parser("list", help="list XCom keys in this run")
+
     # secret
     secret = sub.add_parser(
         "secret", help="read a run-scoped secret staged for this run"
@@ -605,6 +720,7 @@ _DISPATCH = {
     "artifact": _cmd_artifact,
     "idempotent": _cmd_idempotent,
     "secret": _cmd_secret,
+    "xcom": _cmd_xcom,
 }
 
 
@@ -620,6 +736,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "lock": "lock_command",
         "artifact": "artifact_command",
         "secret": "secret_command",
+        "xcom": "xcom_command",
     }.get(args.command)
     if action_attr is not None and getattr(args, action_attr, None) is None:
         print(

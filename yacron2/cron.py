@@ -42,6 +42,7 @@ from yacron2 import platform
 from yacron2.config import (
     ClusterConfig,
     ConfigError,
+    DagConfig,
     JobConfig,
     JobDefaults,
     LoggingConfig,
@@ -53,6 +54,7 @@ from yacron2.config import (
     parse_config_with_sources,
     schedule_object_to_crontab,
 )
+from yacron2.dagrun import DagScheduler
 from yacron2.fingerprint import job_digest, job_set_id
 from yacron2.job import JobOutputStream, JobRetryState, RunningJob
 from yacron2.leadership import LeadershipBackend, make_backend
@@ -541,6 +543,10 @@ class Cron:
         self.metrics = PrometheusMetrics()
         # list of cron jobs we /want/ to run
         self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
+        # Phase 6: the orchestration DAGs (name -> DagConfig), maintained
+        # alongside cron_jobs across reloads; empty keeps the classic no-DAG
+        # behaviour.
+        self.cron_dags: Dict[str, DagConfig] = OrderedDict()
         # Memoized job-set fingerprint (see job_set_id). The fingerprint is a
         # pure function of cron_jobs, but it is queried on hot, repeating paths
         # (every /metrics scrape, every peer poll, each gossip round, several
@@ -590,6 +596,7 @@ class Cron:
             self.cron_jobs = OrderedDict(
                 (job.name, job) for job in config.jobs
             )
+            self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
             self._job_set_id_cache = None
 
         self._wait_for_running_jobs_task = None  # type: Optional[asyncio.Task]
@@ -759,6 +766,11 @@ class Cron:
         # with it). None keeps the classic behaviour: no endpoint, no injected
         # YACRON2_STATE_* env, jobs unaware of the store.
         self._job_api: Optional["JobStateAPI"] = None
+        # Phase 6: the durable DAG orchestrator (yacron2.dagrun.DagScheduler);
+        # inert until a `dags:` section and a state backend are configured. It
+        # holds a back-reference to this Cron and reuses its state/lease/launch
+        # seams. Constructed here (cheaply) so every code path has it.
+        self._dag = DagScheduler(self)
 
     async def run(self) -> None:
         self._wait_for_running_jobs_task = asyncio.create_task(
@@ -935,6 +947,11 @@ class Cron:
                     len(self._pending_state_writes),
                 )
                 await asyncio.wait(set(self._pending_state_writes), timeout=5)
+            # Phase 6: release every held DAG advance lease (and stop its
+            # renewers) while the backend is still up, so a peer can adopt the
+            # runs at once rather than waiting out a whole lease TTL. The runs'
+            # tasks drained above; their completions flushed here.
+            await self._dag.shutdown()
             # stop the loopback job API while the backend is still alive, so it
             # can release every held job lock (rather than leaving the fleet's
             # locks pinned for a whole TTL after a clean shutdown).
@@ -1099,6 +1116,11 @@ class Cron:
         self.metrics.config_parse(True)
         old_jobs = self.cron_jobs
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
+        # Phase 6: swap in the reloaded DAG set (the DagScheduler reads this
+        # live each pass, so a reload that adds/removes/edits a DAG is picked
+        # up on the next service tick; in-flight runs of a removed DAG finish
+        # and are GC'd).
+        self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
         # The job set changed: drop the memoized fingerprint so the next
         # job_set_id() recomputes it once. A failed parse raises before this
         # point, so a bad reload never stales the cache.
@@ -1507,6 +1529,89 @@ class Cron:
             out, headers=self.web_config.get("headers", None)
         )
 
+    # --- Phase 6: DAG introspection + control -----------------------------
+
+    def _web_headers(self) -> Any:
+        assert self.web_config is not None
+        return self.web_config.get("headers", None)
+
+    async def _web_list_dags(self, request: web.Request) -> web.Response:
+        return web.json_response(
+            self._dag.list_dags(), headers=self._web_headers()
+        )
+
+    async def _web_dag_runs(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        runs = await self._dag.list_runs(name)
+        if runs is None:
+            raise web.HTTPNotFound()
+        return web.json_response(
+            {"dag": name, "runs": runs}, headers=self._web_headers()
+        )
+
+    async def _web_dag_run(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        run_key = request.match_info["run_key"]
+        body = await self._dag.get_run(name, run_key)
+        if body is None:
+            raise web.HTTPNotFound()
+        return web.json_response(body, headers=self._web_headers())
+
+    async def _web_dag_trigger(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        run_key = await self._dag.trigger_run(name)
+        if run_key is None:
+            raise web.HTTPNotFound()
+        return web.json_response(
+            {"dag": name, "runKey": run_key}, headers=self._web_headers()
+        )
+
+    async def _web_dag_backfill(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        payload = await self._web_json_body(request)
+        start = payload.get("from")
+        end = payload.get("to")
+        if not isinstance(start, str) or not isinstance(end, str):
+            raise web.HTTPBadRequest(
+                text="backfill needs string `from` and `to` ISO dates"
+            )
+        result = await self._dag.backfill(name, start, end)
+        if not result.get("ok"):
+            raise web.HTTPBadRequest(text=str(result.get("reason")))
+        return web.json_response(result, headers=self._web_headers())
+
+    async def _web_dag_decision(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        run_key = request.match_info["run_key"]
+        taskkey = request.match_info["taskkey"]
+        payload = await self._web_json_body(request)
+        decision = payload.get("decision")
+        if decision not in ("approve", "reject"):
+            raise web.HTTPBadRequest(
+                text="decision must be 'approve' or 'reject'"
+            )
+        by = str(payload.get("by") or "api")
+        result = await self._dag.approve(
+            name, run_key, taskkey, approved=(decision == "approve"), by=by
+        )
+        if not result.get("ok"):
+            raise web.HTTPConflict(text=str(result.get("reason")))
+        return web.json_response(result, headers=self._web_headers())
+
+    @staticmethod
+    async def _web_json_body(request: web.Request) -> Dict[str, Any]:
+        if not request.can_read_body:
+            return {}
+        try:
+            body = await request.json()
+        except Exception as ex:  # noqa: BLE001 - a malformed body is a 400
+            raise web.HTTPBadRequest(
+                text="request body is not valid JSON"
+            ) from ex
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="request body must be a JSON object")
+        return body
+
     async def _web_job_runs(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         name = request.match_info["name"]
@@ -1693,6 +1798,16 @@ class Cron:
                 web.post("/jobs/{name}/start", self._web_start_job),
                 web.post("/jobs/{name}/cancel", self._web_cancel_job),
                 web.get("/jobs/{name}/logs", self._web_job_logs),
+                # Phase 6: DAG introspection + control
+                web.get("/dags", self._web_list_dags),
+                web.get("/dags/{name}/runs", self._web_dag_runs),
+                web.get("/dags/{name}/runs/{run_key}", self._web_dag_run),
+                web.post("/dags/{name}/trigger", self._web_dag_trigger),
+                web.post("/dags/{name}/backfill", self._web_dag_backfill),
+                web.post(
+                    "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
+                    self._web_dag_decision,
+                ),
             ]
             if metrics_config is not None:
                 # buckets apply from here on; a changed bucket set restarts
@@ -1947,6 +2062,11 @@ class Cron:
             if self._retry_claim_task is not None:
                 self._retry_claim_task.cancel()
                 self._retry_claim_task = None
+            # Phase 6: the DAG advance leases and next-fire index also belong
+            # to the old store; drop them (renewers cancelled, leases lapse by
+            # TTL) so the new store's active runs are re-adopted from scratch
+            # by reconcile_on_boot (re-run because _state_rehydrated cleared).
+            self._dag.forget()
         if state_config is not None and self.state_backend is None:
             try:
                 # Construct INSIDE the try: building the backend resolves and
@@ -2401,6 +2521,12 @@ class Cron:
         can still patch that one function to spin the loop fast.
         """
         housekeeping = next_sleep_interval(False)
+        # Phase 6: wake sooner when a DAG sensor poke, task retry, or scheduled
+        # run is due, so sub-minute poke/retry schedules are honoured instead
+        # of waiting for the once-a-minute housekeeping boundary.
+        dag_wake = self._dag.next_wake_delay()
+        if dag_wake is not None:
+            housekeeping = min(housekeeping, max(0.0, dag_wake))
         soonest = self._peek_soonest_fire()
         if soonest is None:
             return housekeeping
@@ -2978,6 +3104,11 @@ class Cron:
             self._catchup_eval_task = task
             self._catchup_tasks.add(task)
             task.add_done_callback(self._catchup_tasks.discard)
+        # Phase 6: let the DAG scheduler create due runs and advance active
+        # ones. Single-flight and self-gated (only spawns work when a run's
+        # wake, a scheduled fire, or an adoption/GC interval is due), so a pass
+        # with no DAG work due is a couple of cheap in-memory checks.
+        self._dag.service()
 
     async def spawn_jobs(
         self, startup: bool, now: Optional[datetime.datetime] = None
@@ -4934,6 +5065,11 @@ class Cron:
         await self._reconcile_inflight()
         await self._rehydrate_counters()
         await self._rehydrate_retries()
+        # Phase 6: adopt and reconcile this node's active DAG runs from durable
+        # state (the DAG analogue of _reconcile_inflight): a run whose per-task
+        # state shows a task interrupted by the crash is resumed from that
+        # state, never from memory.
+        await self._dag.reconcile_on_boot()
 
     async def _rehydrate_counters(self) -> None:
         """Seed the Prometheus accumulators from the newest durable snapshot.
@@ -5282,6 +5418,14 @@ class Cron:
         return latest[1] == "success"
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
+        if getattr(job, "dag_ref", None) is not None:
+            # Phase 6: a DAG task instance, not a scheduled job. Route its
+            # completion to the DAG scheduler (which records the durable
+            # per-task transition and advances the graph) and skip the whole
+            # job record/retry/inflight/cluster-slot path -- a task's lifecycle
+            # lives in its dag_run document, not the job streams.
+            await self._handle_finished_dag_task(job)
+            return
         jobs_list = self.running_jobs[job.config.name]
         jobs_list.remove(job)
         last_instance = not jobs_list
@@ -5373,6 +5517,30 @@ class Cron:
             await self.handle_job_failure(job)
         else:
             await self.handle_job_success(job)
+
+    async def _handle_finished_dag_task(self, job: RunningJob) -> None:
+        """Reap one finished DAG task instance (see ``_handle_finished_job``).
+
+        Removes it from the running set, drops its Phase 5 loopback token (and
+        any lock it still holds), then hands the outcome to the DAG scheduler,
+        which records the durable per-task transition and advances the graph.
+        Writes no ``runs/`` / ``retries/`` / ``inflight/`` records: a DAG
+        task's whole lifecycle lives in its ``dag_run`` document.
+        """
+        jobs_list = self.running_jobs.get(job.config.name)
+        if jobs_list is not None:
+            try:
+                jobs_list.remove(job)
+            except ValueError:  # pragma: no cover - defensive
+                pass
+            if not jobs_list:
+                del self.running_jobs[job.config.name]
+        if self._job_api is not None and job.state_token is not None:
+            await self._job_api.finish_run(job.state_token)
+        try:
+            await self._dag.on_task_finished(job)
+        except Exception:  # noqa: BLE001 - never kill the reaper
+            logger.exception("dag: failed to record a task completion")
 
     async def handle_job_failure(self, job: RunningJob) -> None:
         if self._stop_event.is_set():

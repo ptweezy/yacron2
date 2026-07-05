@@ -1,0 +1,664 @@
+"""Phase 6 -- the DAG runtime driven against a real backend + loopback API.
+
+Where test_state_phase6.py exercises the pure state machine, this file drives
+:class:`yacron2.dagrun.DagScheduler` end to end: a real
+:class:`~yacron2.state.FilesystemStateBackend` in a temp dir, the real loopback
+job-state API bound to an ephemeral port, and real task subprocesses (launched
+through the same :class:`~yacron2.job.RunningJob` path a job uses).  A small
+in-test pump stands in for ``Cron.run``'s reaper: it awaits each launched task,
+routes its completion through ``cron._handle_finished_job`` (which the DAG
+scheduler picks up), then flushes the spawned advances, looping until the run is
+terminal.
+
+Style: bare ``async def`` tests, ``asyncio_mode = auto``, no frozen clock and no
+duration asserts (the drive loop is progress-driven, not time-driven).  Task
+commands are ``[sys.executable, ...]`` argv lists (no shell), so they are
+cross-platform; the fan-out / XCom test uses the real ``yacron2 xcom`` CLI over
+the loopback endpoint.
+"""
+
+import asyncio
+import datetime
+import json
+import sys
+
+from yacron2 import dag, dagrun
+from yacron2.cron import Cron
+
+_PY = sys.executable
+_UTC = datetime.timezone.utc
+
+
+def _utcnow():
+    return datetime.datetime.now(_UTC)
+
+
+def _state_cfg(yaml):
+    from yacron2.config import parse_config_string
+
+    return parse_config_string(yaml, "").state_config
+
+
+async def _drain_pending(cron):
+    # run every spawned state-write (advances launch the next tasks); advances
+    # spawn further advances, so loop until the set is quiet.
+    for _ in range(50):
+        pend = [t for t in list(cron._pending_state_writes) if not t.done()]
+        if not pend:
+            return
+        await asyncio.gather(*pend, return_exceptions=True)
+
+
+async def _reap_running(cron):
+    """Await every currently-running task and route its completion."""
+    rjs = [rj for jobs in list(cron.running_jobs.values()) for rj in list(jobs)]
+    for rj in rjs:
+        await rj.wait()
+        await cron._handle_finished_job(rj)
+    return bool(rjs)
+
+
+async def _drive(cron, dag_name, run_key, *, max_rounds=60):
+    """Pump the run to a terminal state (or until it parks/blocks)."""
+    for _ in range(max_rounds):
+        reaped = await _reap_running(cron)
+        await _drain_pending(cron)
+        body = await cron._dag.get_run(dag_name, run_key)
+        if body and body.get("state") in (dag.SUCCESS, dag.FAILED):
+            return body
+        if not reaped and not any(cron.running_jobs.values()):
+            # nothing running and not terminal: force one more advance (a due
+            # retry / a just-recorded completion) then re-check.
+            await cron._dag.advance_one((dag_name, run_key))
+            await _drain_pending(cron)
+            body = await cron._dag.get_run(dag_name, run_key)
+            if body and body.get("state") in (dag.SUCCESS, dag.FAILED):
+                return body
+            if not any(cron.running_jobs.values()):
+                return body  # blocked (e.g. an approval gate): stop here
+    return await cron._dag.get_run(dag_name, run_key)
+
+
+async def _make_cron(tmp_path, yaml):
+    state = "state:\n  path: {}\n".format(tmp_path)
+    cron = Cron(None, config_yaml=state + yaml)
+    await cron.start_stop_state(_state_cfg(state + yaml))
+    return cron
+
+
+async def _teardown(cron):
+    await cron._dag.shutdown()
+    await cron._stop_job_api()
+    if cron.state_backend is not None:
+        await cron.state_backend.stop()
+
+
+def _set_cmd(cron, dag_name, task_id, argv, env=None):
+    """Override a task template's command/env with a real argv (no shell)."""
+    tmpl = cron.cron_dags[dag_name].task_templates[task_id]
+    tmpl.command = argv
+    if env is not None:
+        tmpl.environment = [{"key": k, "value": v} for k, v in env.items()]
+
+
+def _states(body):
+    return {k: v["state"] for k, v in body["tasks"].items()}
+
+
+# --------------------------------------------------------------------------
+# Linear + failure propagation
+# --------------------------------------------------------------------------
+
+_LINEAR = """
+dags:
+  - name: lin
+    tasks:
+      - id: a
+        command: 'x'
+      - id: b
+        command: 'x'
+        dependsOn:
+          - a
+"""
+
+
+async def test_linear_dag_runs_to_success(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("lin")
+        body = await _drive(cron, "lin", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert _states(body) == {"a": dag.SUCCESS, "b": dag.SUCCESS}
+    finally:
+        await _teardown(cron)
+
+
+async def test_failure_propagates_downstream(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "import sys; sys.exit(3)"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("lin")
+        body = await _drive(cron, "lin", run_key)
+        assert body["state"] == dag.FAILED
+        assert body["tasks"]["a"]["state"] == dag.FAILED
+        assert body["tasks"]["b"]["state"] == dag.UPSTREAM_FAILED
+    finally:
+        await _teardown(cron)
+
+
+async def test_task_retry_then_success(tmp_path):
+    # a: fails on its first attempt (no flag file), succeeds on the retry
+    # (flag now exists). retries: 1 -> two attempts.
+    flag = tmp_path / "flag"
+    script = (
+        "import os,sys; f=r'{}';"
+        "sys.exit(0) if os.path.exists(f) else "
+        "(open(f,'w').close() or sys.exit(1))".format(flag)
+    )
+    yaml = (
+        "dags:\n  - name: r\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n        retries: 1\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "r", "a", [_PY, "-c", script])
+        run_key = await cron._dag.trigger_run("r")
+        body = await _drive(cron, "r", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert body["tasks"]["a"]["attempt"] == 1  # one retry consumed
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# Fan-out + XCom, end to end through the real CLI
+# --------------------------------------------------------------------------
+
+_FANOUT = """
+dags:
+  - name: fan
+    tasks:
+      - id: gen
+        command: 'x'
+      - id: work
+        command: 'x'
+        dependsOn:
+          - gen
+        expand:
+          fromTask: gen
+          key: items
+      - id: collect
+        command: 'x'
+        dependsOn:
+          - work
+      - id: producer
+        command: 'x'
+      - id: consumer
+        command: 'x'
+        dependsOn:
+          - producer
+"""
+
+
+async def test_e2e_fanout_and_xcom(tmp_path):
+    cron = await _make_cron(tmp_path, _FANOUT)
+    try:
+        items_file = tmp_path / "items.json"
+        items_file.write_text('["alpha", "beta", "gamma"]')
+        msg_file = tmp_path / "msg.txt"
+        msg_file.write_text("hello-downstream")
+        consumed = tmp_path / "consumed.txt"
+        outdir = tmp_path / "work"
+        outdir.mkdir()
+
+        # gen publishes the fan-out list through the real `yacron2 xcom` CLI.
+        _set_cmd(
+            cron, "fan", "gen",
+            [_PY, "-m", "yacron2", "xcom", "push", "--key", "items",
+             str(items_file)],
+        )
+        # each mapped worker writes its injected item to work/<index>.
+        worker = (
+            "import os;"
+            "open(os.path.join(r'{}', os.environ['YACRON2_DAG_MAP_INDEX']),"
+            "'w').write(os.environ['YACRON2_DAG_MAP_ITEM'])".format(outdir)
+        )
+        _set_cmd(cron, "fan", "work", [_PY, "-c", worker])
+        _set_cmd(cron, "fan", "collect", [_PY, "-c", "pass"])
+        _set_cmd(
+            cron, "fan", "producer",
+            [_PY, "-m", "yacron2", "xcom", "push", "--key", "msg",
+             str(msg_file)],
+        )
+        _set_cmd(
+            cron, "fan", "consumer",
+            [_PY, "-m", "yacron2", "xcom", "pull", "--task", "producer",
+             "--key", "msg", "-o", str(consumed)],
+        )
+
+        run_key = await cron._dag.trigger_run("fan")
+        body = await _drive(cron, "fan", run_key, max_rounds=80)
+
+        assert body["state"] == dag.SUCCESS, _states(body)
+        # fan-out expanded deterministically to the published list
+        assert body["mapped"]["work"]["items"] == ["alpha", "beta", "gamma"]
+        assert body["tasks"]["work#1"]["mapItem"] == "beta"
+        # each worker received and wrote its own item (JSON-encoded string)
+        assert json.loads((outdir / "0").read_text()) == "alpha"
+        assert json.loads((outdir / "2").read_text()) == "gamma"
+        # the XCom hand-off round-tripped through the real pull CLI
+        assert consumed.read_text() == "hello-downstream"
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# Crash-resume: a task left running by a dead process is resumed from state
+# --------------------------------------------------------------------------
+
+
+async def test_mapped_upstream_publishes_nothing_expands_empty(tmp_path):
+    # a mapped task whose upstream SUCCEEDS but never publishes its list must
+    # not wedge the run: it fans out to zero instances and its downstream runs.
+    yaml = (
+        "dags:\n  - name: em\n    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: work\n        command: 'x'\n        dependsOn:\n"
+        "          - gen\n        expand:\n"
+        "          fromTask: gen\n          key: items\n"
+        "      - id: after\n        command: 'x'\n        dependsOn:\n"
+        "          - work\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "em", "gen", [_PY, "-c", "pass"])  # publishes nothing
+        _set_cmd(cron, "em", "work", [_PY, "-c", "pass"])
+        _set_cmd(cron, "em", "after", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("em")
+        body = await _drive(cron, "em", run_key)
+        assert body["state"] == dag.SUCCESS, _states(body)
+        assert body["mapped"]["work"]["items"] == []
+        assert body["tasks"]["after"]["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_e2e_crash_resume(tmp_path):
+    yaml = (
+        "dags:\n  - name: cr\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n        retries: 2\n"
+        "      - id: b\n        command: 'x'\n        dependsOn:\n"
+        "          - a\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "cr", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "cr", "b", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("cr")
+        ns = dag.DAG_RUN_NS_PREFIX + "cr"
+
+        # Simulate a crash mid-run: a PRIOR daemon claimed+launched task `a`
+        # then died. Rewrite the durable doc so `a` is running under a foreign
+        # proc token with a dead pid, and drop this scheduler's ownership (as a
+        # restart would). No live subprocess exists for it.
+        await _reap_running(cron)  # reap whatever the initial advance launched
+        await _drain_pending(cron)
+
+        def _crash(body):
+            entry = body["tasks"]["a"]
+            entry["state"] = dag.RUNNING
+            entry["proc"] = "dead-daemon#deadbeef"
+            entry["pid"] = 2147480000  # a pid that is not alive
+            entry["host"] = cron._state_host
+            entry["finishedAt"] = None
+            return body, None
+
+        await cron.state_backend.mutate_document(ns, run_key, _crash)
+        cron._dag.forget()  # as if this process is a fresh restart
+
+        # Boot reconciliation adopts the run and recovers `a` from durable
+        # state (dead pid -> retryable), then the drive resumes it to success.
+        await cron._dag.reconcile_on_boot()
+        body = await _drive(cron, "cr", run_key)
+        assert body["state"] == dag.SUCCESS, _states(body)
+        assert body["tasks"]["a"]["state"] == dag.SUCCESS
+        assert body["tasks"]["b"]["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# Approval gate over the (in-process) control surface
+# --------------------------------------------------------------------------
+
+
+async def test_approval_gate_blocks_then_resumes(tmp_path):
+    yaml = (
+        "dags:\n  - name: ap\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "      - id: gate\n        type: approval\n        dependsOn:\n"
+        "          - a\n"
+        "      - id: b\n        command: 'x'\n        dependsOn:\n"
+        "          - gate\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "ap", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "ap", "b", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("ap")
+        body = await _drive(cron, "ap", run_key)
+        # blocked at the gate: not terminal, b not started
+        assert body["state"] == dag.RUNNING
+        assert body["tasks"]["gate"]["awaitingApproval"] is True
+        assert body["tasks"]["b"]["state"] == dag.PENDING
+        # a wrong task key is rejected cleanly
+        bad = await cron._dag.approve(
+            "ap", run_key, "nope", approved=True, by="me"
+        )
+        assert bad["ok"] is False
+        # approve and resume to completion
+        ok = await cron._dag.approve(
+            "ap", run_key, "gate", approved=True, by="alice"
+        )
+        assert ok["ok"] is True
+        body = await _drive(cron, "ap", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert body["tasks"]["gate"]["approval"]["by"] == "alice"
+    finally:
+        await _teardown(cron)
+
+
+async def test_approval_reject_skip_cascades(tmp_path):
+    yaml = (
+        "dags:\n  - name: rj\n    tasks:\n"
+        "      - id: gate\n        type: approval\n        onReject: skip\n"
+        "      - id: b\n        command: 'x'\n        dependsOn:\n"
+        "          - gate\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "rj", "b", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("rj")
+        await _drive(cron, "rj", run_key)
+        res = await cron._dag.approve(
+            "rj", run_key, "gate", approved=False, by="bob"
+        )
+        assert res["ok"] is True
+        body = await _drive(cron, "rj", run_key)
+        assert body["state"] == dag.SUCCESS  # skip is not a failure
+        assert body["tasks"]["gate"]["state"] == dag.SKIPPED
+        assert body["tasks"]["b"]["state"] == dag.SKIPPED
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# Manual trigger, introspection, backfill
+# --------------------------------------------------------------------------
+
+
+async def test_trigger_and_introspection(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        dags = cron._dag.list_dags()
+        assert dags[0]["name"] == "lin"
+        assert {t["id"] for t in dags[0]["tasks"]} == {"a", "b"}
+        run_key = await cron._dag.trigger_run("lin")
+        await _drive(cron, "lin", run_key)
+        runs = await cron._dag.list_runs("lin")
+        assert len(runs) == 1
+        assert runs[0]["state"] == dag.SUCCESS
+        assert runs[0]["kind"] == "manual"
+        one = await cron._dag.get_run("lin", run_key)
+        assert one["runKey"] == run_key
+        assert await cron._dag.get_run("lin", "nope") is None
+        assert await cron._dag.trigger_run("ghost") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_backfill_creates_runs(tmp_path):
+    yaml = (
+        "dags:\n  - name: bf\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "bf", "a", [_PY, "-c", "pass"])
+        # three hourly instants in the window
+        res = await cron._dag.backfill(
+            "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T02:30:00+00:00"
+        )
+        assert res["ok"] is True
+        assert res["created"] == 3
+        # idempotent: re-running the same backfill creates no duplicates
+        res2 = await cron._dag.backfill(
+            "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T02:30:00+00:00"
+        )
+        assert res2["created"] == 3  # stepped again, but create-if-absent
+        runs = await cron._dag.list_runs("bf")
+        keys = {r["runKey"] for r in runs}
+        assert len(keys) == 3  # exactly three distinct runs
+        bad = await cron._dag.backfill("bf", "bad", "worse")
+        assert bad["ok"] is False
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# Scheduling: prompt firing (no busy-spin), reload reseed (no flood)
+# --------------------------------------------------------------------------
+
+_SCHED = (
+    "dags:\n  - name: sch\n    schedule: '* * * * *'\n    tasks:\n"
+    "      - id: a\n        command: 'x'\n"
+)
+
+
+async def test_scheduled_fire_is_prompt_and_advances(tmp_path):
+    # regression: a scheduled fire must be a first-class wake source (no
+    # busy-spin) and must advance its index when fired (no re-fire).
+    # Deterministic: the index is driven with explicit instants rather than a
+    # wall-clock boundary, so there is no timing flake.
+    cron = await _make_cron(tmp_path, _SCHED)
+    try:
+        _set_cmd(cron, "sch", "a", [_PY, "-c", "pass"])
+        # simulate a completed seed pass
+        cron._dag._seeded["sch"] = cron._dag._sched_sig(cron.cron_dags["sch"])
+        cron._dag._next_sched_check = dagrun._now() + 20.0
+        # a FUTURE fire is advertised as a wake candidate -> the loop sleeps a
+        # positive interval instead of busy-spinning at 0
+        cron._dag._next_logical["sch"] = _utcnow() + datetime.timedelta(
+            minutes=30
+        )
+        delay = cron._dag.next_wake_delay()
+        assert delay is not None and delay > 0
+        # a DUE fire is created directly (not waiting for the seed cadence) and
+        # the index advances strictly PAST the fired instant -> it will not
+        # re-fire the same instant / busy-spin.
+        fired_at = _utcnow() - datetime.timedelta(seconds=70)
+        cron._dag._next_logical["sch"] = fired_at
+        await cron._dag._fire_scheduled(dagrun._now())
+        runs = await cron._dag.list_runs("sch")
+        assert len(runs) >= 1
+        assert runs[0]["kind"] == "scheduled"
+        assert cron._dag._next_logical["sch"] > fired_at
+        for r in runs:
+            await _drive(cron, "sch", r["runKey"])
+    finally:
+        await _teardown(cron)
+
+
+async def test_reload_disable_reenable_reseeds_future(tmp_path):
+    # regression: disabling then re-enabling a DAG must re-seed strictly-future
+    # rather than backfilling every slot of the disabled window.
+    yaml = (
+        "dags:\n  - name: h\n    schedule: '0 * * * *'\n"
+        "    onMissed: run-all\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        now = dagrun._now()
+        await cron._dag._seed_dags(now)
+        assert "h" in cron._dag._seeded
+        # simulate a long disabled window by freezing the index in the past
+        cron._dag._next_logical["h"] = _utcnow() - datetime.timedelta(hours=6)
+        cron.cron_dags["h"].enabled = False
+        await cron._dag._seed_dags(now)
+        assert "h" not in cron._dag._next_logical
+        assert "h" not in cron._dag._seeded
+        cron.cron_dags["h"].enabled = True
+        await cron._dag._seed_dags(now)
+        assert cron._dag._next_logical["h"] > _utcnow() - datetime.timedelta(
+            seconds=1
+        )
+        # crucially, no run was created for the 6h disabled gap
+        assert await cron._dag.list_runs("h") == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_bounded_schedule_exhausts_without_crash(tmp_path):
+    # regression: a fixed-year schedule that runs out of occurrences must DROP
+    # its index (not store None), or the loop's .timestamp() sleep/due
+    # candidates would crash the whole scheduler on the final occurrence.
+    yaml = (
+        "dags:\n  - name: once\n    schedule:\n"
+        "      minute: '0'\n      hour: '0'\n      dayOfMonth: '1'\n"
+        "      month: '1'\n      year: '2020'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "once", "a", [_PY, "-c", "pass"])
+        # force the last (only) occurrence to be due, then fire it
+        cron._dag._seeded["once"] = cron._dag._sched_sig(cron.cron_dags["once"])
+        cron._dag._next_logical["once"] = datetime.datetime(
+            2020, 1, 1, tzinfo=_UTC
+        )
+        await cron._dag._fire_scheduled(dagrun._now())
+        # the exhausted index was dropped, not poisoned with None ...
+        assert "once" not in cron._dag._next_logical
+        # ... so neither of the loop's consumers raises
+        assert cron._dag.next_wake_delay() is not None
+        cron._dag.service()  # must not raise
+        runs = await cron._dag.list_runs("once")
+        assert len(runs) == 1
+        await _drive(cron, "once", runs[0]["runKey"])
+    finally:
+        await _teardown(cron)
+
+
+async def test_finish_removed_task_is_noop(tmp_path):
+    # regression: a completion routed for a task the reload removed must not
+    # crash (its spec is gone).
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("lin")
+        await cron._dag._finish_task(
+            cron.cron_dags["lin"], ("lin", run_key), "ghost", "ghost",
+            success=True, exit_code=0, fail_reason=None,
+        )  # no exception
+        await _drive(cron, "lin", run_key)
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# HTTP control API (real server)
+# --------------------------------------------------------------------------
+
+
+async def _start_web(cron):
+    await cron.start_stop_web_app(
+        {"listen": ["http://127.0.0.1:0"], "ui": False}
+    )
+    port = cron.web_runner.addresses[0][1]
+    return "http://127.0.0.1:{}".format(port)
+
+
+async def test_http_dag_introspection_and_trigger(tmp_path):
+    import aiohttp
+
+    cron = await _make_cron(tmp_path, _LINEAR)
+    base = await _start_web(cron)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        async with aiohttp.ClientSession() as s:
+            async with s.get(base + "/dags") as r:
+                assert r.status == 200
+                assert (await r.json())[0]["name"] == "lin"
+            async with s.post(base + "/dags/lin/trigger") as r:
+                assert r.status == 200
+                run_key = (await r.json())["runKey"]
+            await _drive(cron, "lin", run_key)
+            async with s.get(base + "/dags/lin/runs") as r:
+                assert r.status == 200
+                runs = (await r.json())["runs"]
+                assert runs[0]["state"] == dag.SUCCESS
+            url = base + "/dags/lin/runs/" + run_key
+            async with s.get(url) as r:
+                assert r.status == 200
+                assert (await r.json())["runKey"] == run_key
+            async with s.get(base + "/dags/ghost/runs") as r:
+                assert r.status == 404
+            async with s.post(base + "/dags/ghost/trigger") as r:
+                assert r.status == 404
+    finally:
+        await cron.start_stop_web_app(None)
+        await _teardown(cron)
+
+
+async def test_http_approval_decision_and_backfill(tmp_path):
+    import aiohttp
+
+    yaml = (
+        "dags:\n  - name: g\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: gate\n        type: approval\n"
+        "      - id: b\n        command: 'x'\n        dependsOn:\n"
+        "          - gate\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    base = await _start_web(cron)
+    try:
+        _set_cmd(cron, "g", "b", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("g")
+        await _drive(cron, "g", run_key)
+        async with aiohttp.ClientSession() as s:
+            dec = base + "/dags/g/runs/{}/tasks/gate/decision".format(run_key)
+            # not-awaiting task key -> 409
+            bad = base + "/dags/g/runs/{}/tasks/none/decision".format(run_key)
+            async with s.post(bad, json={"decision": "approve"}) as r:
+                assert r.status == 409
+            # bad decision value -> 400
+            async with s.post(dec, json={"decision": "maybe"}) as r:
+                assert r.status == 400
+            # approve -> 200, then the run completes
+            async with s.post(
+                dec, json={"decision": "approve", "by": "carol"}
+            ) as r:
+                assert r.status == 200
+            body = await _drive(cron, "g", run_key)
+            assert body["state"] == dag.SUCCESS
+            assert body["tasks"]["gate"]["approval"]["by"] == "carol"
+            # backfill over the API
+            async with s.post(
+                base + "/dags/g/backfill",
+                json={
+                    "from": "2026-03-01T00:00:00+00:00",
+                    "to": "2026-03-01T01:30:00+00:00",
+                },
+            ) as r:
+                assert r.status == 200
+                assert (await r.json())["created"] == 2
+    finally:
+        await cron.start_stop_web_app(None)
+        await _teardown(cron)

@@ -159,7 +159,14 @@ def main_loop(loop):
 
         sys.exit(state_admin.dispatch(args))
 
-    if command in ("cursor", "lock", "artifact", "idempotent", "secret"):
+    if command in (
+        "cursor",
+        "lock",
+        "artifact",
+        "idempotent",
+        "secret",
+        "xcom",
+    ):
         from yacron2 import jobcli
 
         sys.exit(jobcli.dispatch(args))

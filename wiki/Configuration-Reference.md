@@ -38,6 +38,9 @@ jobs:               # optional: list of job definitions
   - name: ...
     command: ...
     schedule: ...
+dags:               # optional: durable orchestration DAGs (needs state)
+  - name: ...
+    tasks: [ ... ]
 include: [ ... ]    # optional: list of other config files to merge
 web: { ... }        # optional: HTTP control API
 cluster: { ... }    # optional: mTLS peer attestation / leader election
@@ -49,6 +52,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | --- | --- | --- | --- |
 | `defaults` | `Map` of the per-job common options | No | Default values inherited by every job in the same file. May contain any per-job option except `name`, `command`, and `schedule`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `jobs` | `Seq(Map)` of job definitions | No | The list of cron jobs. Each entry is validated against the per-job schema below. |
+| `dags` | `Seq(Map)` of DAG definitions | No | Durable orchestration workflows: each DAG is a graph of tasks with `dependsOn` edges, run on a schedule. Requires a `state` section with `jobApi` enabled. See [Orchestration and DAGs](Orchestration-and-DAGs). |
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
 | `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
@@ -242,6 +246,52 @@ migrate-schema) --
 is documented in [Durable State](Durable-State). The per-job knobs that build
 on this store are under [Durable state and catch-up](#durable-state-and-catch-up)
 below.
+
+### `dags`
+
+A list of durable orchestration DAGs. Requires a `state` section with
+`jobApi.enabled` (the default). Full guide: [Orchestration and DAGs](Orchestration-and-DAGs).
+
+Per-DAG keys:
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `Str` | required | Unique DAG name. |
+| `tasks` | `Seq(Map)` | required | The task nodes (at least one). |
+| `schedule` | `Str` or `Map` | none | Same grammar as a job's `schedule`. Omit for a manual-only DAG. |
+| `timezone` / `utc` | `Str` / `Bool` | as jobs | Schedule time base, as jobs. |
+| `onMissed` | `skip` / `run-once` / `run-all` | `skip` | Missed-run catch-up on restart, as jobs. |
+| `startingDeadlineSeconds` | `Int` | none | Bound how old a missed run may be to replay. |
+| `catchupJitterSeconds` | `Int` | `0` | Spread boot-time catch-up. |
+| `clusterPolicy` | `Leader` / `PreferLeader` / `EveryNode` | `Leader` | Which node schedules the DAG under leader election. |
+| `enabled` | `Bool` | `true` | Disable without deleting. |
+| `retainRuns` | `Int` | `50` | Keep the newest N terminal runs (must be ≥ 1). |
+
+Per-task keys:
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `id` | `Str` | required | Unique task id within the DAG. |
+| `command` | `Str` or `Seq(Str)` | required (not for `approval`) | The command to run. |
+| `type` | `task` / `sensor` / `approval` | `task` | Node kind. |
+| `dependsOn` | `Seq(Str)` | `[]` | Upstream task ids. |
+| `triggerRule` | `all_success` / `all_done` | `all_success` | When the task becomes ready. |
+| `retries` | `Int` | `0` | Per-task retry attempts (DAG-owned). |
+| `retryDelaySeconds` | `Int`/`Float` | `0` | Delay between attempts. |
+| `expand` | `Map{fromTask, key}` | none | Dynamic mapping: fan out over an upstream's XCom list (a direct, non-mapped dependency). |
+| `pokeIntervalSeconds` | `Int`/`Float` | `30` | Sensor: seconds between pokes. |
+| `pokeTimeoutSeconds` | `Int`/`Float` | `3600` | Sensor: give up after this long. |
+| `pokeJitterSeconds` | `Int`/`Float` | `0` | Sensor: jitter added to each poke. |
+| `onReject` | `fail` / `skip` | `fail` | Approval gate: what a rejection does. |
+
+Plus the shared launch fields a job takes: `shell`, `environment`,
+`captureStdout` / `captureStderr`, `saveLimit`, `maxLineLength`, `streamPrefix`,
+`failsWhen`, `executionTimeout`, `killTimeout`, `user` / `group`, `env_file`,
+`secrets`.
+
+The graph is validated at load: unknown/duplicate ids, a cycle, a self-edge, or
+an `expand.fromTask` that is not a direct non-mapped dependency are config
+errors.
 
 ### `logging`
 

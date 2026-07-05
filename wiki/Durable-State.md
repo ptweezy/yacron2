@@ -971,6 +971,7 @@ A backend read error at scrape time omits the state families from that scrape
 
 ## See also
 
+- [Orchestration and DAGs](Orchestration-and-DAGs): the durable workflow tier built entirely on this store (dag_run documents, XCom over the artifact store, per-run advance leases).
 - [Configuration Reference](Configuration-Reference): the `state` section and per-job option schema.
 - [Command-Line Reference](CLI-Reference): the `yacron2 state` administration subcommands.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): the retry ladder these records make durable.

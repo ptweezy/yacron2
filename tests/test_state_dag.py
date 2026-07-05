@@ -325,6 +325,76 @@ def test_task_exhausts_retries():
     assert ex.launched.count("a") == 2  # initial + one retry
 
 
+def test_completion_is_fenced_to_the_claiming_proc_and_attempt():
+    # H3/H4: a superseded attempt's late completion (a partitioned/evicted
+    # former owner whose subprocess outlived its lease) must NOT terminalise
+    # the instance another node has since reconciled and re-claimed.
+    spec = _spec(TaskSpec("a", max_attempts=3, retry_delay=0.0))
+    body = _body(spec)
+    # node A claims attempt 0 under proc token "proc-A" and records its pid.
+    body, res = _apply(
+        dag.plan_and_claim(spec, 10.0, "proc-A", "host-A", {}), body
+    )
+    assert res.launches[0].task_id == "a"
+    body, _ = _apply(dag.set_task_pid("a", "proc-A", 111, 10.0), body)
+    # node A partitions; node B reconciles the crashed attempt (its proc is
+    # foreign and its pid is not alive here) -> up_for_retry, attempt 1.
+    body, _ = _apply(
+        dag.reconcile_crashed(
+            spec, 40.0, "proc-B", "host-B", lambda pid: False
+        ),
+        body,
+    )
+    assert _state(body, "a") == dag.UP_FOR_RETRY
+    assert body["tasks"]["a"]["attempt"] == 1
+    # node B re-claims attempt 1 under proc token "proc-B" and launches it.
+    body, _ = _apply(
+        dag.plan_and_claim(spec, 41.0, "proc-B", "host-B", {}), body
+    )
+    assert _state(body, "a") == dag.RUNNING
+    assert body["tasks"]["a"]["proc"] == "proc-B"
+    task = spec.by_id["a"]
+    # node A's OLD attempt-0 subprocess now finishes; its completion carries
+    # the stale (proc-A, attempt 0) identity -> it must be a NO-OP.
+    body, changed = _apply(
+        dag.mark_task_finished(
+            "a", success=True, exit_code=0, fail_reason=None, now=45.0,
+            task=task, expected_proc="proc-A", expected_attempt=0,
+        ),
+        body,
+    )
+    assert changed is False
+    assert _state(body, "a") == dag.RUNNING  # live attempt-1 untouched
+    assert body["tasks"]["a"]["proc"] == "proc-B"
+    # node B's real completion (matching fence) DOES apply.
+    body, changed = _apply(
+        dag.mark_task_finished(
+            "a", success=True, exit_code=0, fail_reason=None, now=46.0,
+            task=task, expected_proc="proc-B", expected_attempt=1,
+        ),
+        body,
+    )
+    assert changed is True
+    assert _state(body, "a") == dag.SUCCESS
+
+
+def test_completion_without_fence_still_applies_backward_compat():
+    # expected_proc/expected_attempt default to None -> no fence, so existing
+    # callers/tests that omit them keep working.
+    spec = _spec(TaskSpec("a", max_attempts=1))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    body, changed = _apply(
+        dag.mark_task_finished(
+            "a", success=True, exit_code=0, fail_reason=None,
+            now=2.0, task=spec.by_id["a"],
+        ),
+        body,
+    )
+    assert changed is True
+    assert _state(body, "a") == dag.SUCCESS
+
+
 def test_retry_delay_defers_reclaim():
     spec = _spec(TaskSpec("a", max_attempts=2, retry_delay=100.0))
     body = _body(spec)

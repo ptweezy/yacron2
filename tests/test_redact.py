@@ -178,3 +178,59 @@ def test_unquoted_json_values_do_not_swallow_trailing_structure():
 def test_private_key_kv_redacted():
     out = redact_secrets("PRIVATE_KEY=abc123def456")
     assert "abc123def456" not in out
+
+
+def test_url_credentials_with_empty_username_redacted():
+    # scheme://:PASSWORD@host -- how redis/mongodb/amqp connection strings
+    # carry a password with no user.  Requiring a username here (the old
+    # ``+``) leaked these verbatim while the archive was stamped redacted.
+    for uri in (
+        "redis://:SuperSecret123@cache:6379",
+        "mongodb://:p4ssw0rd@db",
+        "amqp://:hunter2@rabbit/vhost",
+    ):
+        out = redact_secrets(uri)
+        assert REDACTED in out
+    assert "SuperSecret123" not in redact_secrets(
+        "redis://:SuperSecret123@cache:6379"
+    )
+    # a normal user:pass URL still redacts...
+    assert "s3cret" not in redact_secrets("redis://user:s3cret@host")
+    # ...and a plain host:port URL (no userinfo, no ``@``) is left untouched.
+    assert redact_secrets("redis://cache:6379/0") == "redis://cache:6379/0"
+
+
+def test_redact_lines_seeds_pem_when_begin_line_truncated():
+    # the bounded live-log ring evicted the ``BEGIN`` header before archiving,
+    # so the archived tail OPENS with the key's base64 body + END.  The body
+    # must be redacted, not passed through, even with no BEGIN present.
+    lines = [
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDktruncated",
+        "AnotherBase64BodyLineWithKeyMaterialXYZ==",
+        "-----END RSA PRIVATE KEY-----",
+        "deploy finished ok",
+    ]
+    out = redact_lines(lines)
+    assert out[0] == REDACTED
+    assert out[1] == REDACTED
+    assert out[2] == REDACTED
+    assert "MIIEvQIBAD" not in "".join(out)
+    # normal output AFTER the orphaned END passes through unredacted.
+    assert out[3] == "deploy finished ok"
+
+
+def test_redact_lines_complete_pem_block_unaffected_by_seed():
+    # a self-contained block: BEGIN precedes END, so the mid-PEM seed is
+    # False and the walk is byte-identical to before the fix.
+    lines = [
+        "starting",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "MIIEvQIBADANBgkqhkiG9w0BAQEF",
+        "-----END RSA PRIVATE KEY-----",
+        "done",
+    ]
+    out = redact_lines(lines)
+    assert out[0] == "starting"
+    assert all(line == REDACTED for line in out[1:4])
+    assert out[4] == "done"
+    assert "MIIEvQIBAD" not in "".join(out)

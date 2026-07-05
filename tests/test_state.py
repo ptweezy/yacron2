@@ -254,6 +254,44 @@ async def test_derive_max_ignores_incomparable(tmp_path):
     assert await backend.derive_max("s", "v") == "abc"
 
 
+async def test_derive_max_fails_closed_on_read_error(tmp_path):
+    # H1: an ENVIRONMENTAL read error (NFS blip, AV hold, cross-user EACCES)
+    # on one record must fail the whole derive (raise), never silently return
+    # the max over the SURVIVORS -- a value below the true max, which regresses
+    # the "last fired" watermark and makes catch-up replay an already-run slot.
+    backend = _backend(tmp_path)
+    await backend.start()
+    for ts in (1, 2, 3):
+        await backend.append_record("s", {"ts": ts})
+    stream_dir = backend._stream_dir("s")
+    names = sorted(n for n in os.listdir(stream_dir) if n.endswith(".json"))
+    # make the NEWEST record raise OSError on open: swap the file for a
+    # directory of the same name (open() on a dir raises OSError everywhere).
+    victim = os.path.join(stream_dir, names[-1])
+    os.remove(victim)
+    os.mkdir(victim)
+    with pytest.raises(OSError):
+        await backend.derive_max("s", "ts")
+    # list_records stays BEST-EFFORT (non-strict): it still swallows the
+    # unreadable record and returns the survivors, so the fix is localized to
+    # the watermark path.
+    survived = await backend.list_records("s")
+    assert {r["ts"] for r in survived} == {1, 2}
+
+
+async def test_derive_max_still_skips_poison_record(tmp_path):
+    # the strict path fails closed only for ENVIRONMENTAL errors; a genuinely
+    # corrupt (content-bad) record is unrecoverable and is still quarantined
+    # and skipped, so one poison object can never wedge the watermark forever.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("s", {"ts": 5})
+    stream_dir = backend._stream_dir("s")
+    with open(os.path.join(stream_dir, "00000-bad.json"), "w") as fobj:
+        fobj.write("{not json")
+    assert await backend.derive_max("s", "ts") == 5
+
+
 # --- corrupt-record quarantine -------------------------------------------
 
 

@@ -1,0 +1,140 @@
+# =====================================================================
+#  Meridian — the yacron2 GRAND TOUR.  Every feature, at once, coordinated.
+#
+#  A THREE-node mutual-TLS, leader-electing cluster (distribution: spread) that
+#  shares ONE durable state store, running the entire scheduled back-office of
+#  a fictional commerce platform: classic jobs + durable-state jobs + two
+#  orchestration DAGs + second-level SLA probes, with all four failure
+#  reporters wired to live sinks. See example/grand-tour/README.md for the full
+#  tour and example/grand-tour/platform.yaml for the annotated job set.
+#
+#    docker compose -f docker-compose-grand-tour.yml up --build     # start
+#    docker compose -f docker-compose-grand-tour.yml logs -f        # watch output
+#    docker compose -f docker-compose-grand-tour.yml down -v        # stop + wipe
+#
+#  Open:
+#    Node dashboards   http://localhost:8080/  (meridian-a; b,c on 8081,8082)
+#    Prometheus /metrics  http://localhost:8080/metrics  (per node)
+#    On-call inbox     http://localhost:8025/  (Mailpit)
+#    Job metrics       http://localhost:9102/metrics  (statsd exporter)
+#    Webhook sink      docker compose -f docker-compose-grand-tour.yml logs -f webhook-sink
+#
+#  HOW COORDINATION WORKS (no extra service beyond the state volume):
+#    * cluster.backend defaults to gossip: each node serves a mutual-TLS
+#      /peer endpoint, attests the shared job-set id, and the quorum elects a
+#      leader. distribution: spread hands each Leader/PreferLeader job (and
+#      DAG) its own owner node via rendezvous hashing.
+#    * state is a SHARED volume (topology: shared): cursors/locks/idempotency
+#      and every dag_run coordinate fleet-wide over it, so a task launches
+#      exactly once even though all three nodes run the identical config.
+#
+#  Each node's cluster section is generated at start by node-entrypoint.sh from
+#  env, so the compose file needs no per-node peer lists: every node shares one
+#  CLUSTER_HOSTS list and drops itself by NODE_NAME.
+#
+#  Compare a single leader with the per-job spread:
+#    DISTRIBUTION=single-leader docker compose -f docker-compose-grand-tour.yml up -d
+#
+#  NOTE ON SIZE: 3 is the smallest quorum cluster (quorum 2, tolerates 1 node
+#  down). Stop 2 of 3 nodes and the cluster loses quorum: Leader jobs stand
+#  down while PreferLeader jobs keep running.
+# =====================================================================
+
+x-cluster-hosts: &cluster_hosts "meridian-a:8443,meridian-b:8443,meridian-c:8443"
+
+x-node-env: &node-env
+  CLUSTER_HOSTS: *cluster_hosts
+  DISTRIBUTION: ${DISTRIBUTION:-spread}
+  ELECT_LEADER: "true"
+  INTERVAL: "10"
+  DRIFT_AFTER: "2"
+  # Run-scoped secret served to build-daily-report over the loopback endpoint
+  # (yacron2 secret get REPORT_TOKEN). Demo value; never written to the store.
+  REPORT_API_TOKEN: "rpt-demo-9f83a1c0-token"
+  # Leave empty to keep the sentry reporter a no-op; set a real DSN to light up
+  # fraud-model-refresh's Sentry report.
+  SENTRY_DSN: ""
+
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: yacron2-grand-tour:local        # built once, reused by all three nodes
+  entrypoint: ["sh", "/node-entrypoint.sh"]
+  restart: unless-stopped
+  depends_on:
+    certgen:
+      condition: service_completed_successfully
+    init-state:
+      condition: service_completed_successfully
+    mailpit:
+      condition: service_started
+    statsd:
+      condition: service_started
+    webhook-sink:
+      condition: service_started
+  volumes:
+    - ./example/grand-tour/platform.yaml:/config/platform.yaml:ro
+    - ./example/grand-tour/_defaults.yaml:/config/_defaults.yaml:ro
+    - ./example/grand-tour/legacy.crontab:/config/legacy.crontab:ro
+    - ./example/grand-tour/platform.env:/config/platform.env:ro
+    - ./example/grand-tour/secrets:/config/secrets:ro
+    - ./example/grand-tour/node-entrypoint.sh:/node-entrypoint.sh:ro
+    - gt-certs:/certs:ro
+    - gt-state:/var/lib/yacron2/state       # the shared, durable state store
+
+services:
+  # Mints a throwaway cluster CA + one leaf cert per node into the shared certs
+  # volume before the nodes start. Demo-only: see gen-certs.sh for the caveats.
+  certgen:
+    image: alpine:3.20
+    command: ["sh", "/gen-certs.sh"]
+    volumes:
+      - gt-certs:/certs
+      - ./example/grand-tour/gen-certs.sh:/gen-certs.sh:ro
+
+  # A Docker named volume is created root-owned, but the yacron2 image runs as
+  # an unprivileged user (uid 65534). This one-shot makes the shared state store
+  # writable by that user before the nodes start; the nodes wait for it.
+  init-state:
+    image: busybox
+    command: ["sh", "-c", "chown -R 65534:65534 /state"]
+    volumes:
+      - gt-state:/state
+
+  # SMTP sink for the onFailure / onPermanentFailure MAIL reports. The mails
+  # cert-expiry-check, webhook-dispatch and fraud-model-refresh send land here.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "8025:8025"     # web inbox
+      # 1025 (SMTP) stays internal; the nodes reach it as mailpit:1025
+
+  # statsd sink for the jobs that declare a `statsd:` block (etl-build-facts,
+  # queue-depth-probe). Also re-exports the metrics in Prometheus format.
+  statsd:
+    image: prom/statsd-exporter:latest
+    restart: unless-stopped
+    ports:
+      - "9102:9102"     # prometheus metrics
+      # 9125/udp (statsd) stays internal; the nodes reach it as statsd:9125
+
+  # HTTP sink for the WEBHOOK report (db-health-orders posts a Slack-shaped
+  # payload here during the :15-:19 incident). It echoes every request it
+  # receives to its stdout, so `logs -f webhook-sink` shows the incident POSTs.
+  webhook-sink:
+    image: mendhak/http-https-echo:latest
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+    ports:
+      - "8090:8080"     # browse/curl it too; the nodes reach it as webhook-sink:8080
+
+  meridian-a: { <<: *node, hostname: meridian-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: meridian-a } }
+  meridian-b: { <<: *node, hostname: meridian-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: meridian-b } }
+  meridian-c: { <<: *node, hostname: meridian-c, ports: ["8082:8080"], environment: { <<: *node-env, NODE_NAME: meridian-c } }
+
+volumes:
+  gt-certs:
+  gt-state:

@@ -1,0 +1,20 @@
+# Meridian grand tour — a CLASSIC Vixie crontab, run as-is.  [feature: classic crontab]
+#
+# yacron2 loads a *.crontab / *.cron / "crontab" file in the same config
+# directory next to the YAML, in the classic five-field format. Each entry
+# below becomes an ordinary yacron2 job named "legacy:<line>", with yacron2's
+# standard defaults (UTC; failure = non-zero exit or stderr). NAME=value lines,
+# the @daily nickname, and \% escapes all work as in `man 5 crontab`.
+#
+# This proves the migration story: point yacron2 at your existing crontab and
+# it runs unchanged; move an entry to YAML only when it needs retries,
+# reporting, timeouts, or the other per-job options above.
+
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+CRON_TZ=UTC
+
+# m h dom mon dow  command
+*/7 * * * *   echo "[legacy] incremental backup tick at $(date -u +\%H:\%M) (\% is escaped)"
+30 4 * * mon-fri  echo "[legacy] weekday 04:30 report generated"
+@daily        echo "[legacy] @daily rotate-logs ran"

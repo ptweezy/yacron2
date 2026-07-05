@@ -3,7 +3,7 @@
 #
 #  A NINE-node mutual-TLS, leader-electing cluster (distribution: spread) that
 #  shares ONE durable state store, running the entire scheduled back-office of
-#  a fictional commerce platform: classic jobs + durable-state jobs + two
+#  a fictional commerce platform: classic jobs + durable-state jobs + five
 #  orchestration DAGs + second-level SLA probes, with all four failure
 #  reporters wired to live sinks. See example/grand-tour/README.md for the full
 #  tour and example/grand-tour/platform.yaml for the annotated job set.

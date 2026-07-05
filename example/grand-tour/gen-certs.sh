@@ -2,7 +2,7 @@
 # Generate a throwaway cluster CA and one leaf cert per node for the Meridian
 # grand-tour cluster (docker-compose-grand-tour.yml). Run by the `certgen`
 # service into the shared volume before the nodes start. Same shape as the
-# other cluster demos' gen-certs.sh, with the three Meridian node names.
+# other cluster demos' gen-certs.sh, with the nine Meridian node names.
 #
 # FOR LOCAL EXPERIMENTATION ONLY. Real deployments provision per-node certs from
 # their own PKI; yacron2 only consumes them.

@@ -692,10 +692,10 @@ jobs:
             <h3>Certificate expiring</h3>
             <pre>{{ stderr }}</pre>
 
-  # [feature: failsWhen always] an alerting SELF-TEST: it always exits 0 and
-  # prints nothing, yet failsWhen.always forces every run to count as FAILED, so
-  # it exercises the alert path end-to-end on a fixed cadence (proving the
-  # webhook route is live). Runs a couple of times an hour to keep the noise low.
+  # [feature: failsWhen always] an alerting SELF-TEST: it exits 0 and its stdout
+  # is ignored (producesStdout:false), yet failsWhen.always forces every run to
+  # count as FAILED, so it exercises the alert path end-to-end on a fixed cadence
+  # (proving the webhook route is live). Runs twice an hour to keep the noise low.
   - name: alert-selftest
     command: echo "alert self-test firing from $HOSTNAME"
     schedule: "20,40 * * * *"

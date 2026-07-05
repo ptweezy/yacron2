@@ -393,7 +393,7 @@ Three built-in themes (amber and green phosphor CRT, or a flat **modern** look),
 
 Run history and live logs are kept **in memory only** (unless you opt into the durable state store), and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
 
-**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live.
+**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 3-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f docker-compose-grand-tour.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)).
 
 ## Usage
 

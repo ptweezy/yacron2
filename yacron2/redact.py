@@ -115,23 +115,21 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
 # _PATTERNS by the check below -- a plain `if`, deliberately not an `assert`,
 # because the release binary runs under -OO, which strips asserts.
 _PATTERN_GATES: Tuple[Optional[str], ...] = (
-    None,           # 1. key = value / key: value (case-insensitive keywords)
-    "://",          # 2. scheme://user:PASSWORD@host
-    None,           # 3. Bearer <token> (case-insensitive)
-    None,           # 4. Authorization: Basic <base64> (case-insensitive)
-    "AKIA",         # 5. AWS access key id
-    "xox",          # 6. Slack tokens
-    "gh",           # 7. GitHub ghp_/gho_/ghs_/ghu_/ghr_ tokens
+    None,  # 1. key = value / key: value (case-insensitive keywords)
+    "://",  # 2. scheme://user:PASSWORD@host
+    None,  # 3. Bearer <token> (case-insensitive)
+    None,  # 4. Authorization: Basic <base64> (case-insensitive)
+    "AKIA",  # 5. AWS access key id
+    "xox",  # 6. Slack tokens
+    "gh",  # 7. GitHub ghp_/gho_/ghs_/ghu_/ghr_ tokens
     "github_pat_",  # 8. GitHub fine-grained PAT
-    "sk-",          # 9. OpenAI/Anthropic-style keys
-    "k_",           # 10. Stripe [sr]k_live_/_test_ keys
-    "eyJ",          # 11. JWT (base64url of the opening '{"')
-    "-----",        # 12. PEM -----BEGIN ... PRIVATE KEY----- header
+    "sk-",  # 9. OpenAI/Anthropic-style keys
+    "k_",  # 10. Stripe [sr]k_live_/_test_ keys
+    "eyJ",  # 11. JWT (base64url of the opening '{"')
+    "-----",  # 12. PEM -----BEGIN ... PRIVATE KEY----- header
 )
 if len(_PATTERN_GATES) != len(_PATTERNS):  # pragma: no cover - dev invariant
-    raise RuntimeError(
-        "redact: _PATTERN_GATES is out of step with _PATTERNS"
-    )
+    raise RuntimeError("redact: _PATTERN_GATES is out of step with _PATTERNS")
 
 _PEM_BEGIN = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"(?i)-----END [A-Z0-9 ]*PRIVATE KEY-----")

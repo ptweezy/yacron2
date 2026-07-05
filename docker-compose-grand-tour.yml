@@ -1,7 +1,7 @@
 # =====================================================================
 #  Meridian — the yacron2 GRAND TOUR.  Every feature, at once, coordinated.
 #
-#  A THREE-node mutual-TLS, leader-electing cluster (distribution: spread) that
+#  A NINE-node mutual-TLS, leader-electing cluster (distribution: spread) that
 #  shares ONE durable state store, running the entire scheduled back-office of
 #  a fictional commerce platform: classic jobs + durable-state jobs + two
 #  orchestration DAGs + second-level SLA probes, with all four failure
@@ -13,7 +13,7 @@
 #    docker compose -f docker-compose-grand-tour.yml down -v        # stop + wipe
 #
 #  Open:
-#    Node dashboards   http://localhost:8080/  (meridian-a; b,c on 8081,8082)
+#    Node dashboards   http://localhost:8080/  (meridian-a; b..i on 8081..8088)
 #    Prometheus /metrics  http://localhost:8080/metrics  (per node)
 #    On-call inbox     http://localhost:8025/  (Mailpit)
 #    Job metrics       http://localhost:9102/metrics  (statsd exporter)
@@ -26,31 +26,49 @@
 #      DAG) its own owner node via rendezvous hashing.
 #    * state is a SHARED volume (topology: shared): cursors/locks/idempotency
 #      and every dag_run coordinate fleet-wide over it, so a task launches
-#      exactly once even though all three nodes run the identical config.
+#      exactly once even though all nine nodes run the identical config.
 #
 #  Each node's cluster section is generated at start by node-entrypoint.sh from
 #  env, so the compose file needs no per-node peer lists: every node shares one
 #  CLUSTER_HOSTS list and drops itself by NODE_NAME.
 #
-#  Compare a single leader with the per-job spread:
-#    DISTRIBUTION=single-leader docker compose -f docker-compose-grand-tour.yml up -d
+#  THREE env knobs (all optional, all default to the simplest thing):
+#    * Compare a single leader with the per-job spread:
+#        DISTRIBUTION=single-leader docker compose -f docker-compose-grand-tour.yml up -d
+#    * Swap the gossip mesh for a lease over the shared mount (NO certs, NO
+#      /peer endpoint — election is a single file on the state volume; note a
+#      lease backend is single-leader only, so `spread` does not apply):
+#        BACKEND=filesystem docker compose -f docker-compose-grand-tour.yml up
+#    * Turn on bearer-token auth for the dashboard + REST API (uncomment
+#      web.authToken in platform.yaml first; /metrics stays public):
+#        WEB_TOKEN=some-secret docker compose -f docker-compose-grand-tour.yml up
 #
-#  NOTE ON SIZE: 3 is the smallest quorum cluster (quorum 2, tolerates 1 node
-#  down). Stop 2 of 3 nodes and the cluster loses quorum: Leader jobs stand
-#  down while PreferLeader jobs keep running.
+#  NOTE ON SIZE: 9 is an odd cluster size (quorum 5, tolerates 4 node failures).
+#  Stop 5+ nodes and the cluster loses quorum: Leader jobs stand down while
+#  PreferLeader jobs keep running. Nine full nodes plus the sinks is a real load
+#  on a laptop (the second-level probes tick every 2s on every node); trim nodes
+#  or probes if it runs hot.
 # =====================================================================
 
-x-cluster-hosts: &cluster_hosts "meridian-a:8443,meridian-b:8443,meridian-c:8443"
+x-cluster-hosts: &cluster_hosts "meridian-a:8443,meridian-b:8443,meridian-c:8443,meridian-d:8443,meridian-e:8443,meridian-f:8443,meridian-g:8443,meridian-h:8443,meridian-i:8443"
 
 x-node-env: &node-env
   CLUSTER_HOSTS: *cluster_hosts
   DISTRIBUTION: ${DISTRIBUTION:-spread}
+  BACKEND: ${BACKEND:-gossip}       # gossip (mTLS mesh) | filesystem (shared-mount lease)
   ELECT_LEADER: "true"
   INTERVAL: "10"
   DRIFT_AFTER: "2"
   # Run-scoped secret served to build-daily-report over the loopback endpoint
   # (yacron2 secret get REPORT_TOKEN). Demo value; never written to the store.
   REPORT_API_TOKEN: "rpt-demo-9f83a1c0-token"
+  # Password for cert-expiry-check's authenticated SMTP mail report (Mailpit
+  # below accepts any credentials). Demo value.
+  SMTP_PASSWORD: "mailpit-demo-pass"
+  # Bearer token for the web API; empty by default (web.authToken stays off).
+  # Set WEB_TOKEN and uncomment web.authToken in platform.yaml to turn auth on;
+  # the pulse-* probes and the release DAG canary read this same variable.
+  YACRON2_WEB_TOKEN: ${WEB_TOKEN:-}
   # Leave empty to keep the sentry reporter a no-op; set a real DSN to light up
   # fraud-model-refresh's Sentry report.
   SENTRY_DSN: ""
@@ -59,7 +77,7 @@ x-node: &node
   build:
     context: .
     dockerfile: Dockerfile
-  image: yacron2-grand-tour:local        # built once, reused by all three nodes
+  image: yacron2-grand-tour:local        # built once, reused by all nine nodes
   entrypoint: ["sh", "/node-entrypoint.sh"]
   restart: unless-stopped
   depends_on:
@@ -86,6 +104,7 @@ x-node: &node
 services:
   # Mints a throwaway cluster CA + one leaf cert per node into the shared certs
   # volume before the nodes start. Demo-only: see gen-certs.sh for the caveats.
+  # (Only the gossip backend uses these; BACKEND=filesystem ignores them.)
   certgen:
     image: alpine:3.20
     command: ["sh", "/gen-certs.sh"]
@@ -102,11 +121,17 @@ services:
     volumes:
       - gt-state:/state
 
-  # SMTP sink for the onFailure / onPermanentFailure MAIL reports. The mails
-  # cert-expiry-check, webhook-dispatch and fraud-model-refresh send land here.
+  # SMTP sink for the onFailure / onPermanentFailure / onSuccess MAIL reports.
+  # The mails cert-expiry-check, webhook-dispatch, fraud-model-refresh and
+  # ops-heartbeat-report send land here. AUTH is accepted (any credentials, over
+  # plaintext) so cert-expiry-check's authenticated mail report works too;
+  # unauthenticated mail is still accepted, so the plain senders keep working.
   mailpit:
     image: axllent/mailpit:latest
     restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
     ports:
       - "8025:8025"     # web inbox
       # 1025 (SMTP) stays internal; the nodes reach it as mailpit:1025
@@ -120,9 +145,10 @@ services:
       - "9102:9102"     # prometheus metrics
       # 9125/udp (statsd) stays internal; the nodes reach it as statsd:9125
 
-  # HTTP sink for the WEBHOOK report (db-health-orders posts a Slack-shaped
-  # payload here during the :15-:19 incident). It echoes every request it
-  # receives to its stdout, so `logs -f webhook-sink` shows the incident POSTs.
+  # HTTP sink for the WEBHOOK reports (db-health-orders incident POSTs, the
+  # alert-selftest, and ops-heartbeat-report success pings all land here). It
+  # echoes every request it receives to its stdout, so `logs -f webhook-sink`
+  # shows the POSTs (bodies, custom method and headers).
   webhook-sink:
     image: mendhak/http-https-echo:latest
     restart: unless-stopped
@@ -134,6 +160,12 @@ services:
   meridian-a: { <<: *node, hostname: meridian-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: meridian-a } }
   meridian-b: { <<: *node, hostname: meridian-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: meridian-b } }
   meridian-c: { <<: *node, hostname: meridian-c, ports: ["8082:8080"], environment: { <<: *node-env, NODE_NAME: meridian-c } }
+  meridian-d: { <<: *node, hostname: meridian-d, ports: ["8083:8080"], environment: { <<: *node-env, NODE_NAME: meridian-d } }
+  meridian-e: { <<: *node, hostname: meridian-e, ports: ["8084:8080"], environment: { <<: *node-env, NODE_NAME: meridian-e } }
+  meridian-f: { <<: *node, hostname: meridian-f, ports: ["8085:8080"], environment: { <<: *node-env, NODE_NAME: meridian-f } }
+  meridian-g: { <<: *node, hostname: meridian-g, ports: ["8086:8080"], environment: { <<: *node-env, NODE_NAME: meridian-g } }
+  meridian-h: { <<: *node, hostname: meridian-h, ports: ["8087:8080"], environment: { <<: *node-env, NODE_NAME: meridian-h } }
+  meridian-i: { <<: *node, hostname: meridian-i, ports: ["8088:8080"], environment: { <<: *node-env, NODE_NAME: meridian-i } }
 
 volumes:
   gt-certs:

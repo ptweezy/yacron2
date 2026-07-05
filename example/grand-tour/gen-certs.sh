@@ -9,7 +9,7 @@
 set -eu
 
 CERTS=/certs
-NODES="meridian-a meridian-b meridian-c"
+NODES="meridian-a meridian-b meridian-c meridian-d meridian-e meridian-f meridian-g meridian-h meridian-i"
 
 if [ -f "$CERTS/ca.pem" ]; then
   echo "certs already present in $CERTS — leaving them in place."

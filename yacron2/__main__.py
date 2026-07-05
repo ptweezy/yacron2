@@ -6,7 +6,6 @@ import sys
 
 import yacron2.version
 from yacron2 import platform
-from yacron2.cron import ConfigError, Cron
 
 # Where -c looks when not given: /etc/yacron2.d on POSIX, %APPDATA%\yacron2 on
 # Windows (see yacron2.platform).
@@ -179,6 +178,16 @@ def main_loop(loop):
         )
         parser.print_help(sys.stderr)
         sys.exit(1)
+
+    # Imported here, not at module top: this pulls in aiohttp, strictyaml,
+    # sentry_sdk and the rest of the daemon graph (~300ms of import). The
+    # branches that exit before this point -- --version and the state / xcom
+    # / lock / cursor / artifact / idempotent / secret subcommands (thin
+    # urllib clients of the running daemon, routinely spawned from inside
+    # jobs) -- never touch Cron, so a job-facing CLI call no longer pays that
+    # cost. Everything from here down (the daemon, --job-set-id,
+    # --validate-config) needs it.
+    from yacron2.cron import ConfigError, Cron
 
     try:
         cron = Cron(args.config)

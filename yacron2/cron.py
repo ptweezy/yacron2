@@ -543,7 +543,7 @@ class Cron:
         self.metrics = PrometheusMetrics()
         # list of cron jobs we /want/ to run
         self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
-        # Phase 6: the orchestration DAGs (name -> DagConfig), maintained
+        # the orchestration DAGs (name -> DagConfig), maintained
         # alongside cron_jobs across reloads; empty keeps the classic no-DAG
         # behaviour.
         self.cron_dags: Dict[str, DagConfig] = OrderedDict()
@@ -760,13 +760,13 @@ class Cron:
         # the in-flight cross-node retry claim scan, if any (single-flight,
         # spawned from the housekeeping pass; see _retry_claim_scan).
         self._retry_claim_task: Optional[asyncio.Task] = None
-        # Phase 5: the loopback job-state API (yacron2.jobapi.JobStateAPI),
+        # the loopback job-state API (yacron2.jobapi.JobStateAPI),
         # built when a `state` section with jobApi enabled starts and torn
         # down when the backend is (its per-run tokens and staged secrets go
         # with it). None keeps the classic behaviour: no endpoint, no injected
         # YACRON2_STATE_* env, jobs unaware of the store.
         self._job_api: Optional["JobStateAPI"] = None
-        # Phase 6: the durable DAG orchestrator (yacron2.dagrun.DagScheduler);
+        # the durable DAG orchestrator (yacron2.dagrun.DagScheduler);
         # inert until a `dags:` section and a state backend are configured. It
         # holds a back-reference to this Cron and reuses its state/lease/launch
         # seams. Constructed here (cheaply) so every code path has it.
@@ -947,7 +947,7 @@ class Cron:
                     len(self._pending_state_writes),
                 )
                 await asyncio.wait(set(self._pending_state_writes), timeout=5)
-            # Phase 6: release every held DAG advance lease (and stop its
+            # release every held DAG advance lease (and stop its
             # renewers) while the backend is still up, so a peer can adopt the
             # runs at once rather than waiting out a whole lease TTL. The runs'
             # tasks drained above; their completions flushed here.
@@ -1116,7 +1116,7 @@ class Cron:
         self.metrics.config_parse(True)
         old_jobs = self.cron_jobs
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
-        # Phase 6: swap in the reloaded DAG set (the DagScheduler reads this
+        # swap in the reloaded DAG set (the DagScheduler reads this
         # live each pass, so a reload that adds/removes/edits a DAG is picked
         # up on the next service tick; in-flight runs of a removed DAG finish
         # and are GC'd).
@@ -1529,7 +1529,7 @@ class Cron:
             out, headers=self.web_config.get("headers", None)
         )
 
-    # --- Phase 6: DAG introspection + control -----------------------------
+    # --- DAG introspection + control --------------------------------------
 
     def _web_headers(self) -> Any:
         assert self.web_config is not None
@@ -1798,7 +1798,7 @@ class Cron:
                 web.post("/jobs/{name}/start", self._web_start_job),
                 web.post("/jobs/{name}/cancel", self._web_cancel_job),
                 web.get("/jobs/{name}/logs", self._web_job_logs),
-                # Phase 6: DAG introspection + control
+                # DAG introspection + control
                 web.get("/dags", self._web_list_dags),
                 web.get("/dags/{name}/runs", self._web_dag_runs),
                 web.get("/dags/{name}/runs/{run_key}", self._web_dag_run),
@@ -2062,7 +2062,7 @@ class Cron:
             if self._retry_claim_task is not None:
                 self._retry_claim_task.cancel()
                 self._retry_claim_task = None
-            # Phase 6: the DAG advance leases and next-fire index also belong
+            # the DAG advance leases and next-fire index also belong
             # to the old store; drop them (renewers cancelled, leases lapse by
             # TTL) so the new store's active runs are re-adopted from scratch
             # by reconcile_on_boot (re-run because _state_rehydrated cleared).
@@ -2103,7 +2103,7 @@ class Cron:
             # backend comes up, so a restart's dashboard/status is populated at
             # once instead of blank until each job next runs.
             await self._rehydrate_from_state()
-            # Phase 5: expose this backend to job commands over a loopback
+            # expose this backend to job commands over a loopback
             # endpoint (opt-out via state.jobApi.enabled). A start failure is
             # logged and swallowed -- the scheduler's own durable features do
             # not depend on it.
@@ -2521,7 +2521,7 @@ class Cron:
         can still patch that one function to spin the loop fast.
         """
         housekeeping = next_sleep_interval(False)
-        # Phase 6: wake sooner when a DAG sensor poke, task retry, or scheduled
+        # wake sooner when a DAG sensor poke, task retry, or scheduled
         # run is due, so sub-minute poke/retry schedules are honoured instead
         # of waiting for the once-a-minute housekeeping boundary.
         dag_wake = self._dag.next_wake_delay()
@@ -3104,7 +3104,7 @@ class Cron:
             self._catchup_eval_task = task
             self._catchup_tasks.add(task)
             task.add_done_callback(self._catchup_tasks.discard)
-        # Phase 6: let the DAG scheduler create due runs and advance active
+        # let the DAG scheduler create due runs and advance active
         # ones. Single-flight and self-gated (only spawns work when a run's
         # wake, a scheduled fire, or an adoption/GC interval is due), so a pass
         # with no DAG work due is a couple of cheap in-memory checks.
@@ -3935,7 +3935,7 @@ class Cron:
                 return False
         logger.info("Starting job %s", job.name)
         retry_state = self.retry_state.get(job.name) if with_retries else None
-        # Phase 5: register this run with the loopback state API (minting its
+        # register this run with the loopback state API (minting its
         # id + token and staging its secrets) BEFORE the child launches, so the
         # child's first callback is already authorised. extra_env carries the
         # endpoint URL/token/run-context the job needs to reach it.
@@ -5065,7 +5065,7 @@ class Cron:
         await self._reconcile_inflight()
         await self._rehydrate_counters()
         await self._rehydrate_retries()
-        # Phase 6: adopt and reconcile this node's active DAG runs from durable
+        # adopt and reconcile this node's active DAG runs from durable
         # state (the DAG analogue of _reconcile_inflight): a run whose per-task
         # state shows a task interrupted by the crash is resumed from that
         # state, never from memory.
@@ -5289,9 +5289,8 @@ class Cron:
         ``finished_at`` over the immutable records (order-independent, so it is
         correct even when several nodes append to one job's stream on a shared
         mount).  ISO-8601 UTC, so a lexicographic max is a chronological max.
-        ``None`` with no backend or no records.  The scheduling features that
-        consume it (missed-run catch-up) arrive in a later phase; it is exposed
-        and tested here because the ledger this reads is the Phase 1 artifact.
+        ``None`` with no backend or no records.  Consumed by the missed-run
+        catch-up; the ledger it reads is the durable run-record stream.
         """
         backend = self.state_backend
         if backend is None:
@@ -5419,7 +5418,7 @@ class Cron:
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
         if getattr(job, "dag_ref", None) is not None:
-            # Phase 6: a DAG task instance, not a scheduled job. Route its
+            # a DAG task instance, not a scheduled job. Route its
             # completion to the DAG scheduler (which records the durable
             # per-task transition and advances the graph) and skip the whole
             # job record/retry/inflight/cluster-slot path -- a task's lifecycle
@@ -5450,7 +5449,7 @@ class Cron:
             await self._release_cluster_slot(job.config)
 
         if self._job_api is not None and job.state_token is not None:
-            # Phase 5: revoke this run's loopback token and staged secrets and
+            # revoke this run's loopback token and staged secrets and
             # release any mutex/semaphore it still holds. Before the early
             # returns below (a replaced or cancelled run must clean up too),
             # and paired one-to-one with the _prepare_job_api_run at launch.
@@ -5521,7 +5520,7 @@ class Cron:
     async def _handle_finished_dag_task(self, job: RunningJob) -> None:
         """Reap one finished DAG task instance (see ``_handle_finished_job``).
 
-        Removes it from the running set, drops its Phase 5 loopback token (and
+        Removes it from the running set, drops its loopback token (and
         any lock it still holds), then hands the outcome to the DAG scheduler,
         which records the durable per-task transition and advances the graph.
         Writes no ``runs/`` / ``retries/`` / ``inflight/`` records: a DAG

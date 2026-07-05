@@ -1,4 +1,4 @@
-"""Phase 6 -- the durable DAG state machine (pure logic in yacron2.dag).
+"""The durable DAG state machine (pure logic in yacron2.dag).
 
 These tests drive :mod:`yacron2.dag` directly: the transforms are pure
 ``transform(body) -> (new_body, result)`` callables, so a tiny in-test executor
@@ -8,7 +8,7 @@ subprocess -- the whole graph engine is exercised against plain dicts.
 
 Style matches the other state test files: bare ``def`` tests, module seams
 driven with explicit values, no frozen wall clock (``now`` is an explicit
-argument everywhere).  Backend + cron wiring lives in test_state_phase6_run.py.
+argument everywhere).  Backend + cron wiring lives in test_state_dag_run.py.
 """
 
 import asyncio

@@ -36,9 +36,9 @@ from typing import Any, Dict, Optional, Tuple
 ENV_URL = "YACRON2_STATE_URL"
 ENV_TOKEN = "YACRON2_STATE_TOKEN"
 
-# Phase 6: injected into every DAG task so `yacron2 xcom` knows this task's own
+# Injected into every DAG task so `yacron2 xcom` knows this task's own
 # key and the run's shared XCom scope (an artifact scope; XCom is a thin,
-# task-keyed convention over the Phase 5 artifact store).  Hardcoded for the
+# task-keyed convention over the durable artifact store).  Hardcoded for the
 # same reason as above -- a stable wire contract (see yacron2.dag).
 ENV_DAG_XCOM_SCOPE = "YACRON2_DAG_XCOM_SCOPE"
 ENV_DAG_TASKKEY = "YACRON2_DAG_TASKKEY"
@@ -673,7 +673,7 @@ def add_job_commands(sub: Any) -> None:
     )
     _add_scope_flags(idem)
 
-    # xcom (Phase 6): cross-task data hand-off within a dag_run
+    # xcom: cross-task data hand-off within a dag_run
     xcom = sub.add_parser(
         "xcom",
         help="publish or read a DAG task output (XCom) within a dag_run",

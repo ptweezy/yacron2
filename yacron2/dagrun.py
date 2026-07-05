@@ -1,4 +1,4 @@
-"""Phase 6 DAG runtime: the driver that turns the pure state machine durable.
+"""The DAG runtime: the driver that turns the pure state machine durable.
 
 :mod:`yacron2.dag` is the pure, I/O-free state machine; this module is the
 daemon-side driver that gives it a store, a clock, leases and subprocesses.  It
@@ -11,11 +11,11 @@ the ``_proc_token`` / ``_state_host`` identity, ``_track_state_write``).
 
 The durable model, in one paragraph: each ``dag_run`` is a single mutable
 *document* (``dagrun/<dag>`` keyed by a run key), advanced only by the node
-that holds that run's Phase 4 *lease* (``dagadvance/<dag>/<key>``).  An advance
+that holds that run's advance *lease* (``dagadvance/<dag>/<key>``).  An advance
 is one flock-guarded read-modify-write that atomically claims every ready task
 ``pending -> running``; the driver then launches a real subprocess per claimed
 task (through the same :class:`~yacron2.job.RunningJob` path a job uses, with
-the Phase 5 env injected so the task can call ``yacron2 xcom`` / ``artifact`` /
+the durable env injected so the task can call ``yacron2 xcom`` / ``artifact`` /
 ``state``), and records the pid in a second RMW.  A task's completion is routed
 back here by the reaper, recorded, and triggers a fresh advance.  Because the
 lease gates who advances *and* who reconciles, and the RMW claim is atomic, the
@@ -423,7 +423,7 @@ class DagScheduler:
         return bool(created)
 
     # =====================================================================
-    # Ownership: the per-run advance lease (Phase 4 lease trio, per run)
+    # Ownership: the per-run advance lease (the TTL lease trio, per run)
     # =====================================================================
 
     async def _try_own(self, dagcfg: Any, ref: RunRef) -> bool:

@@ -99,7 +99,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
         "--dry-run", default=False, action="store_true"
     )
 
-    # Phase 5: the job-facing state commands. The KV actions (get/set/delete/
+    # The job-facing state commands. The KV actions (get/set/delete/
     # keys) hang off the SAME `state` subparser as the admin actions above and
     # coexist with them (the action name routes); the other verbs (cursor/
     # lock/artifact/idempotent/secret) are their own top-level commands. Both

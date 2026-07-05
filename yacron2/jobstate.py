@@ -1,4 +1,4 @@
-"""Phase 5 job-facing state primitives, as pure functions over a backend.
+"""The job-facing state primitives, as pure functions over a backend.
 
 This module is the *logic* half of "state as a first-class job primitive": it
 turns the small, general surface of a :class:`yacron2.state.StateBackend`
@@ -11,7 +11,7 @@ into the six primitives a job command actually reaches for:
 * **idempotency keys** -- a fleet-wide create-if-absent claim so a retried or
   duplicated run can tell "already did this" from "first time";
 * **named artifact store** -- small blobs published under a name and read back
-  by later runs or peer nodes (the cross-task hand-off Phase 6 builds on).
+  by later runs or peer nodes (the cross-task hand-off DAGs build on).
 
 The mutex/semaphore and run-scoped secrets are *not* here: those need the live
 daemon (a lease held and renewed on the run's behalf, secrets staged in

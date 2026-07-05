@@ -185,7 +185,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     # Floor 5 (enforced): a tiny TTL leaves no room for renew latency on a
     # network mount and would expire live holders.
     "slotTtlSeconds": 30,
-    # the job-facing state API (Phase 5): the loopback HTTP endpoint + the
+    # the job-facing state API: the loopback HTTP endpoint + the
     # `yacron2 state|cursor|lock|artifact|idempotent|secret` job commands.
     # Merged (not replaced) over DEFAULT_JOB_API in _build_state_config, so a
     # partial `jobApi:` block keeps the untouched defaults. See the defaults.
@@ -486,7 +486,7 @@ _job_defaults_common = {
     Opt("onPermanentFailure"): Map({Opt("report"): _report_schema}),
     Opt("onSuccess"): Map({Opt("report"): _report_schema}),
     Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
-    # run-scoped secrets (Phase 5): each is resolved fresh per run and served
+    # run-scoped secrets: each is resolved fresh per run and served
     # to the job over the loopback endpoint (`yacron2 secret get NAME`) rather
     # than placed in the environment, so it never shows in /proc/<pid>/environ
     # or a `ps -E`. The same value/fromFile/fromEnvVar source triple every
@@ -540,7 +540,7 @@ _job_schema_dict.update(
     }
 )
 
-# Phase 6 orchestration: a task is a job invocation, so it reuses the shared
+# Orchestration: a task is a job invocation, so it reuses the shared
 # launch fields (shell/environment/capture/timeouts/user/secrets/...) and adds
 # the DAG-node fields (id, dependsOn edges, node type, per-task retries,
 # dynamic mapping, sensor poke schedule, approval reject policy).  ``command``
@@ -761,7 +761,7 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("gcGraceSeconds"): Int(),
                 Opt("maxOpsPerSecond"): Int() | Float(),
                 Opt("slotTtlSeconds"): Int() | Float(),
-                # the job-facing state API (Phase 5): the loopback endpoint
+                # the job-facing state API: the loopback endpoint
                 # and the `yacron2 state|cursor|lock|artifact|...` commands.
                 # See yacron2.jobapi. Defaults filled from DEFAULT_JOB_API.
                 Opt("jobApi"): Map(
@@ -2395,7 +2395,7 @@ class Yacron2Config:
     # Optional durable state backend (yacron2.state); None keeps the classic
     # stateless, in-memory behaviour. Defaulted for the same reason as above.
     state_config: Optional[StateConfig] = None
-    # Phase 6 orchestration DAGs; empty keeps the classic no-DAG behaviour.
+    # Orchestration DAGs; empty keeps the classic no-DAG behaviour.
     # A mutable default needs field(default_factory), never a shared [].
     dags: List["DagConfig"] = field(default_factory=list)
 
@@ -2609,7 +2609,7 @@ def _validate_dags(config: Yacron2Config) -> None:
     """Cross-section invariants for the orchestration DAGs.
 
     DAGs live entirely on the durable store (each ``dag_run`` is a document,
-    per-task state and XCom ride the Phase 5 primitives), and their tasks reach
+    per-task state and XCom ride the durable store), and their tasks reach
     the store through the loopback endpoint, so a DAG needs a ``state`` section
     with ``jobApi`` enabled.  DAG names must be unique across the whole config.
     The per-DAG graph (acyclic, resolvable deps, valid expand targets) is

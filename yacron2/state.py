@@ -685,7 +685,7 @@ class FilesystemStateBackend(StateBackend):
         self.root = os.path.abspath(os.path.expanduser(config["path"]))
         # a stable prefix so several deployments can share one store without
         # colliding; job-set scoping (like the lease backends' @reboot set) is
-        # layered on top by callers via the stream name, in later phases.
+        # layered on top by callers via the stream name.
         self.namespace = config.get("deploymentId") or "default"
         self._configured_topology: str = config.get("topology", "auto")
         self._topology = "unknown"

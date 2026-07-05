@@ -578,7 +578,7 @@ async def test_cron_state_start_failure_is_swallowed(tmp_path, caplog):
     )
 
 
-# --- Phase 1: retention / pruning ----------------------------------------
+# --- retention / pruning ----------------------------------------
 
 
 async def test_prune_keeps_newest(tmp_path):
@@ -614,7 +614,7 @@ async def test_prune_missing_stream(tmp_path):
     assert await backend.prune_records("nope", keep=5) == 0
 
 
-# --- Phase 1: config retention knob --------------------------------------
+# --- config retention knob --------------------------------------
 
 
 def test_state_max_runs_default():
@@ -626,7 +626,7 @@ def test_state_max_runs_custom():
     assert cfg["maxRunsPerJob"] == 5
 
 
-# --- Phase 1: JobRunInfo reconstruction ----------------------------------
+# --- JobRunInfo reconstruction ----------------------------------
 
 
 def test_job_run_info_from_dict_roundtrip():
@@ -671,7 +671,7 @@ def test_job_run_info_from_dict_bad_record_returns_none():
     assert _job_run_info_from_dict({"finished_at": 123}) is None
 
 
-# --- Phase 1: Cron durable run ledger ------------------------------------
+# --- Cron durable run ledger ------------------------------------
 
 
 async def test_record_run_persists_to_ledger(tmp_path):
@@ -721,7 +721,7 @@ async def test_persist_error_is_swallowed(tmp_path, caplog):
     )
 
 
-# --- Phase 1: warm-dashboard rehydration + watermark ---------------------
+# --- warm-dashboard rehydration + watermark ---------------------
 
 
 async def _prepopulate_ledger(tmp_path, finished_isos):
@@ -789,7 +789,7 @@ async def test_durable_last_run_at_no_backend():
     assert await cron.durable_last_run_at("j") is None
 
 
-# --- Phase 2: missed-run catch-up ----------------------------------------
+# --- missed-run catch-up ----------------------------------------
 
 _NOW = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
 
@@ -1067,7 +1067,7 @@ async def test_run_catch_up_revalidates_after_jitter(tmp_path):
     assert calls == []
 
 
-# --- Phase 3: depends_on_past (onlyIfLastSucceeded) -----------------------
+# --- depends_on_past (onlyIfLastSucceeded) -----------------------
 
 _DEP_JOB = (
     "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
@@ -1153,7 +1153,7 @@ async def test_launch_scheduled_job_skips_on_depends_on_past(tmp_path, caplog):
     )
 
 
-# --- Phase 3: output/log archival with redaction -------------------------
+# --- output/log archival with redaction -------------------------
 
 
 def _archive_yaml(archive=True, redact=True):

@@ -1,7 +1,7 @@
-"""Phase 5 -- the loopback job-state API and its cron wiring.
+"""The loopback job-state API and its cron wiring.
 
-Where test_state_phase5.py exercises the backend primitives and the pure logic
-layer, this file exercises the *server*: it starts a real
+Where test_state_job_primitives.py exercises the backend primitives and the
+pure logic layer, this file exercises the *server*: it starts a real
 :class:`yacron2.jobapi.JobStateAPI` (which binds an ephemeral 127.0.0.1 port)
 and drives it over real HTTP with an aiohttp client -- the same wire the
 `yacron2` job CLI speaks -- covering auth, every primitive's endpoint, the

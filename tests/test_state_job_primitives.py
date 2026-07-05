@@ -1,8 +1,8 @@
-"""Phase 5 -- state as a first-class job primitive.
+"""State as a first-class job primitive.
 
 Two layers are exercised here:
 
-* the backend primitives the whole phase rests on -- the mutable *document*
+* the backend primitives it all rests on -- the mutable *document*
   store (one file per key, atomic-rename rewrite under an advisory flock) and
   the content-addressed *blob* store -- driven straight against a real temp
   directory through :func:`tests.test_state._backend`;
@@ -11,7 +11,7 @@ Two layers are exercised here:
 
 Style matches the other state test files: no frozen clock, bare ``async def``
 tests (``asyncio_mode = auto``), module seams monkeypatched rather than time
-asserted.  Server/CLI wiring lives in test_state_phase5_api.py.
+asserted.  Server/CLI wiring lives in test_state_job_api.py.
 """
 
 import os

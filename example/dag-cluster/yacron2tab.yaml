@@ -11,7 +11,7 @@
 # How the coordination works with no extra service:
 #   * `state` is a shared POSIX mount (here a Docker volume shared by all three
 #     nodes). Every dag_run is one document on it, per-task state and XCom ride
-#     the Phase 5 primitives, and each run is advanced only by the node holding
+#     the durable store, and each run is advanced only by the node holding
 #     that run's advance lease -- so a task is launched exactly once.
 #   * `cluster.backend: filesystem` elects a leader using the SAME shared mount
 #     (a flock-guarded TTL lease), so only the leader CREATES the scheduled

@@ -1,6 +1,6 @@
 """The loopback endpoint that hands the durable store to job commands.
 
-Phase 5 exposes yacron2's durable state to the *jobs it runs*, not just to
+yacron2 exposes its durable state to the *jobs it runs*, not just to
 the scheduler.  The mechanism is a small HTTP server bound to loopback that
 the daemon stands up alongside the dashboard, plus a per-run bearer token the
 daemon injects into every job's environment.  A job's ``yacron2 state|cursor|

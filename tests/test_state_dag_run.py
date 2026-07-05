@@ -1,6 +1,6 @@
-"""Phase 6 -- the DAG runtime driven against a real backend + loopback API.
+"""The DAG runtime driven against a real backend + loopback API.
 
-Where test_state_phase6.py exercises the pure state machine, this file drives
+Where test_state_dag.py exercises the pure state machine, this file drives
 :class:`yacron2.dagrun.DagScheduler` end to end: a real
 :class:`~yacron2.state.FilesystemStateBackend` in a temp dir, the real loopback
 job-state API bound to an ephemeral port, and real task subprocesses (launched

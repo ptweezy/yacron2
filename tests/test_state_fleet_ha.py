@@ -1,4 +1,4 @@
-"""Phase 4 fleet-HA scheduler features over the shared state store.
+"""Fleet-HA scheduler features over the shared state store.
 
 Covers cluster-wide concurrencyPolicy (the ``concurrencyScope: cluster``
 slot lease: claim/deny/adopt, the Replace pursuit and its cancel channel,
@@ -811,7 +811,7 @@ async def test_consume_aborts_when_ladder_was_claimed_away(tmp_path):
 
 
 async def test_consume_unchanged_without_resume(tmp_path):
-    # single-node stores keep the exact Phase 3 consume semantics: the
+    # single-node stores keep the classic (pre-cluster) consume semantics: the
     # newest-record re-check and the claim lease never engage.
     cron = await _stateful_cron(tmp_path, _RETRY_JOB)
     try:

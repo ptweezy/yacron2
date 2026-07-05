@@ -1,4 +1,4 @@
-# yacron2 orchestration: a durable DAG (the Phase 6 tier).
+# yacron2 orchestration: a durable DAG.
 #
 # A `dags:` section turns the scheduler into a small, durable workflow engine.
 # Each DAG is a graph of tasks with `dependsOn` edges; the daemon runs them in

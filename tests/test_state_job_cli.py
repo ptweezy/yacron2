@@ -1,4 +1,4 @@
-"""Phase 5 -- the job-facing CLI (`yacron2 state|cursor|lock|artifact|...`).
+"""The job-facing CLI (`yacron2 state|cursor|lock|artifact|...`).
 
 Drives the commands the way a shell in a job would: through
 ``yacron2.__main__.main_loop`` with a fake ``sys.argv`` and the injected
@@ -7,7 +7,7 @@ the __main__ routing that tells a job-facing ``state get`` from an admin
 ``state gc``.  The one HTTP seam (``yacron2.jobcli._http``) is monkeypatched
 with a recorder, so every verb's request-building, output, and exit code are
 asserted deterministically without a live server (the real wire is covered in
-test_state_phase5_api.py).
+test_state_job_api.py).
 """
 
 import asyncio

@@ -532,13 +532,13 @@ class RunningJob:
         dag_ref: Optional[Any] = None,
     ) -> None:
         self.config = config
-        # Phase 6: when set, this RunningJob is one DAG task instance rather
+        # when set, this RunningJob is one DAG task instance rather
         # than a scheduled job; the reaper routes its completion to the DAG
         # scheduler (yacron2.dagrun) instead of the normal record/retry path.
         # An opaque marker carrying (dag, run_key, taskkey, ...) the scheduler
         # needs to move the graph forward.
         self.dag_ref = dag_ref
-        # Phase 5: environment the daemon injects on top of the job's own
+        # environment the daemon injects on top of the job's own
         # (the loopback state-API URL + a per-run bearer token + run context).
         # Applied unconditionally in start(), after config.environment, so the
         # control-channel vars are present on every job and win over a same-

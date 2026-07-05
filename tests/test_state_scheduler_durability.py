@@ -1,9 +1,9 @@
-"""Phase 3/3.5 scheduler-side durability features.
+"""Scheduler-side durability features.
 
-Covers the rest of Phase 3 -- restart-surviving retries (absolute-deadline
-re-arming + per-job digest invalidation), standalone @reboot dedupe via the
-durable boot marker, durable Prometheus counter snapshots, and the
-/jobs/{name}/trends SLA aggregates -- plus the Phase 3.5 scheduler hooks:
+Covers restart-surviving retries (absolute-deadline re-arming + per-job digest
+invalidation), standalone @reboot dedupe via the durable boot marker, durable
+Prometheus counter snapshots, and the /jobs/{name}/trends SLA aggregates --
+plus the scheduler hooks:
 the onStoreUnavailable policy, the manifest stream, automatic GC's keep-set
 assembly, and the dropped-write accounting.  Backend-level mechanics (GC
 deletion rules, migrate-schema, op stats, rate limiting) live in

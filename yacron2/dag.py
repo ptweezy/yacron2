@@ -1,7 +1,7 @@
-"""Phase 6 orchestration core: the DAG state machine, as pure functions.
+"""The DAG orchestration core: the state machine, as pure functions.
 
 This module is the *logic* half of the durable DAG tier -- the analogue of
-:mod:`yacron2.jobstate` for Phase 5.  It turns a static DAG definition plus the
+:mod:`yacron2.jobstate`.  It turns a static DAG definition plus the
 current durable ``dag_run`` document into the decisions the scheduler acts on:
 which tasks are ready, which to claim (``pending -> running``), how a finished
 task moves the graph forward, how a dynamically-mapped task fans out, and when
@@ -17,7 +17,7 @@ task ``pending -> running`` only if it is still pending" -- is a
 compare-and-set, exactly what ``mutate_document`` (a flock-guarded
 read-modify-write) provides, and modelling the whole run as one document lets a
 single atomic RMW claim every ready task at once.  The scheduler advances a run
-only while holding that run's Phase 4 lease, so a fleet never double-advances;
+only while holding that run's advance lease, so a fleet never double-advances;
 the RMW claim is the correctness backstop underneath the lease (two would-be
 advancers cannot both flip the same task, because the RMW serialises them).
 
@@ -37,21 +37,21 @@ from typing import Any, Dict, List, Optional, Tuple
 # --------------------------------------------------------------------------
 
 #: document namespace prefix for a dag's runs: ``dagrun/<dag_name>`` keyed by
-#: the run key.  Documents live outside the record garbage collector (Phase 5),
+#: the run key.  Documents live outside the record garbage collector,
 #: so old terminal runs are reclaimed by the DAG-owned pruner, not the record
 #: GC keep-set.
 DAG_RUN_NS_PREFIX = "dagrun/"
 
-#: lease-name prefix the scheduler advances a run under (Phase 4 lease trio);
+#: lease-name prefix the scheduler advances a run under (the TTL lease trio);
 #: one lease per run, distinct from every job/slot lease name.
 DAG_LEASE_PREFIX = "dagadvance/"
 
 #: artifact-stream scope prefix for a run's XCom: the cross-task hand-off is
-#: the Phase 5 artifact store scoped by ``dagxcom/<dag_name>/<run_id>``.
+#: the durable artifact store scoped by ``dagxcom/<dag_name>/<run_id>``.
 XCOM_SCOPE_PREFIX = "dagxcom/"
 
 # Environment variables the daemon injects into every DAG task (on top of the
-# Phase 5 ``YACRON2_STATE_*`` control-channel vars), so the task -- and the
+# durable ``YACRON2_STATE_*`` control-channel vars), so the task -- and the
 # ``yacron2 xcom`` CLI it calls -- knows which run/task it is and where its
 # XCom scope lives.  Defined here (a dependency-free module) so both the daemon
 # (:mod:`yacron2.dagrun`) and the offline CLI (:mod:`yacron2.jobcli`) share the
@@ -267,7 +267,7 @@ def run_key_for_logical(logical_iso: str) -> str:
 
 
 def xcom_scope(dag_name: str, run_id: str) -> str:
-    """The Phase 5 artifact scope holding a run's XCom hand-offs."""
+    """The artifact scope holding a run's XCom hand-offs."""
     return "{}{}/{}".format(XCOM_SCOPE_PREFIX, dag_name, run_id)
 
 
@@ -971,8 +971,9 @@ def reconcile_crashed(
     """Transform that recovers tasks a crash left ``running`` with a dead proc.
 
     Called on rehydration, whenever a fresh dag_run lease is won, and at the
-    top of every advance (the same seam Phase 4 uses for jobs).  A ``running``
-    instance is left alone when it belongs to *this* live process (``proc ==
+    top of every advance (the same seam the job reconciler uses).  A
+    ``running`` instance is left alone when it belongs to *this* live process
+    (``proc ==
     our token``) or to a live child on this host (``pid_alive``); otherwise its
     owner is gone.  A plain task is then treated as an interrupted attempt --
     retried if attempts remain, else failed.  A crashed sensor *poke* is

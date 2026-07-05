@@ -11,7 +11,7 @@ mount itself:
     exactly once across the fleet (never double-fired);
   * `cluster.backend: filesystem` elects a leader using that same shared mount
     (a flock-guarded TTL lease), so only the leader creates the scheduled runs;
-  * cross-task data (XCom) and per-task state ride the Phase 5 primitives on
+  * cross-task data (XCom) and per-task state ride the durable store on
     the same store, so any node can inspect or act on any run;
   * kill the leader mid-run and another node adopts its in-flight runs within a
     lease TTL and resumes them from durable per-task state (crash-resume).

@@ -253,6 +253,12 @@ jobs:
           # the binary cleanly uses asyncio.
           uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
           uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
+          # Bundle orjson (the `speedups` extra) to accelerate the durable-state
+          # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
+          # needed). The shared script round-trip-verifies it and drops a broken
+          # build, so the binary falls back to stdlib json (yacron2/_json).
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_orjson.sh
           uv run pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           mv dist/yacron2 "dist/yacron2-linux-${{ matrix.arch }}"
@@ -349,6 +355,11 @@ jobs:
               # asyncio.
               pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
               python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
+              # Bundle orjson (the `speedups` extra): a musllinux wheel on amd64/
+              # arm64, else a Rust source build (RUST_SETUP installs the toolchain
+              # only when the wheel is missing). The shared script round-trip-
+              # verifies it and drops a broken QEMU build -> stdlib json fallback.
+              RUST_SETUP="apk add --no-cache rust cargo" sh pyinstaller/install_orjson.sh
               pyinstaller pyinstaller/yacron2.spec
               dist/yacron2 --version            # smoke test: a musl binary on a musl host
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
@@ -432,6 +443,11 @@ jobs:
               # asyncio.
               pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
               python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
+              # Bundle orjson (the `speedups` extra): a manylinux wheel on amd64/
+              # arm64, else a Rust source build (RUST_SETUP installs rustc/cargo
+              # only when the wheel is missing). The shared script round-trip-
+              # verifies it and drops a broken QEMU build -> stdlib json fallback.
+              RUST_SETUP="apt-get update && apt-get install -y --no-install-recommends rustc cargo" sh pyinstaller/install_orjson.sh
               pyinstaller pyinstaller/yacron2.spec
               dist/yacron2 --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
@@ -496,6 +512,12 @@ jobs:
           # (yacron2/__main__._new_event_loop).
           uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
           uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
+          # Bundle orjson (the `speedups` extra) to accelerate the durable-state
+          # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
+          # needed). The shared script round-trip-verifies it and drops a broken
+          # build, so the binary falls back to stdlib json (yacron2/_json).
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_orjson.sh
           uv run pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           # Assert the binary is the intended native arch: Rosetta would happily
@@ -612,6 +634,12 @@ jobs:
           uv venv --python 3.14
           uv pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
           uv pip install .                     # bakes the pinned version into yacron2/version.py
+          # Bundle orjson (the `speedups` extra) for the durable-state / cluster
+          # JSON paths; Windows amd64 ships a wheel (arm64 falls back if none).
+          # The shared script round-trip-verifies it and drops a broken build,
+          # so the binary falls back to stdlib json (yacron2/_json).
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_orjson.sh
           uv run pyinstaller pyinstaller/yacron2.spec
           ./dist/yacron2.exe --version      # smoke test: fails the job if the bundle is broken
           mv dist/yacron2.exe "dist/yacron2-windows-${{ matrix.arch }}.exe"

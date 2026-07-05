@@ -49,6 +49,32 @@ RUN set -eux; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
+# Best-effort orjson (the `speedups` extra) to accelerate the durable-state and
+# cluster-gossip JSON paths; yacron2/_json falls back to the stdlib json when it
+# is absent, so this never fails the build -- it just logs, per arch, which way
+# this image went. amd64/arm64 install a manylinux wheel and need no toolchain;
+# the other published arches (386/armv7/ppc64le/s390x/riscv64) have no orjson
+# wheel, so install rustc/cargo and source-build it. A source build (especially
+# under QEMU) can import yet be miscompiled, so orjson_ok() round-trips it and a
+# failure uninstalls it -- a broken orjson is never shipped. rustc/cargo and the
+# apt lists live only in this builder stage; the runtime image carries just the
+# small compiled orjson .so inside /opt/venv when the build succeeded.
+RUN set -eux; \
+    orjson_ok() { \
+        /opt/venv/bin/python -c 'import orjson,sys; s={"v":1,"a":[1,2.5,True,None],"z":"x"}; b=orjson.dumps(s,option=orjson.OPT_SORT_KEYS); sys.exit(0 if isinstance(b,bytes) and orjson.loads(b)==s else 1)'; \
+    }; \
+    if /opt/venv/bin/pip install --no-cache-dir --timeout 120 "orjson>=3.9" && orjson_ok; then \
+        echo "orjson: bundled (wheel)"; \
+    elif apt-get -o Acquire::Retries=5 update \
+        && apt-get -o Acquire::Retries=5 install -y --no-install-recommends rustc cargo \
+        && /opt/venv/bin/pip install --no-cache-dir --timeout 300 "orjson>=3.9" && orjson_ok; then \
+        echo "orjson: bundled (source build)"; \
+    else \
+        echo "orjson: unavailable on this arch; using stdlib json"; \
+        /opt/venv/bin/pip uninstall -y orjson || true; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
+
 # ---- runtime stage ------------------------------------------------------
 FROM python:3.14-slim
 

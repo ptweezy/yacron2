@@ -23,7 +23,7 @@ stays stable and backend-independent whether or not a given host has orjson.
 """
 
 import json as _stdlib
-from typing import Any, Union
+from typing import Any, Union, cast
 
 try:
     import orjson
@@ -36,7 +36,9 @@ if orjson is not None:
     def dumps_bytes(obj: Any, *, sort_keys: bool = False) -> bytes:
         """Serialize ``obj`` to compact UTF-8 JSON bytes."""
         option = orjson.OPT_SORT_KEYS if sort_keys else 0
-        return orjson.dumps(obj, option=option)
+        # cast: the tox mypy env runs --ignore-missing-imports (orjson not a
+        # dev dep), so orjson.dumps reads as Any and warn_return_any fires.
+        return cast(bytes, orjson.dumps(obj, option=option))
 
     def loads(data: Union[bytes, str]) -> Any:
         """Parse JSON from ``bytes`` or ``str``."""

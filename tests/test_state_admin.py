@@ -624,6 +624,133 @@ def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
     assert "gc would remove" in out
 
 
+def _seed_gc_manifests(backend_coro_store):
+    """Manifests letting a default-grace (7 day) CLI gc prove absence."""
+
+    async def go():
+        backend = _backend(backend_coro_store)
+        now = datetime.datetime.now(_UTC)
+        await backend.append_record(
+            "manifests/old-host",
+            {
+                "jobSetId": "v1:old",
+                "host": "old-host",
+                "jobs": [],
+                "at": (now - datetime.timedelta(days=8)).isoformat(),
+            },
+        )
+        await backend.append_record(
+            "manifests/other-host",
+            {
+                "jobSetId": "v1:other",
+                "host": "other-host",
+                "jobs": [],
+                "scopes": [],
+                "dags": [],
+                "at": now.isoformat(),
+            },
+        )
+
+    _run(go())
+
+
+def test_cli_gc_reclaims_artifacts_and_blobs(tmp_path, monkeypatch, capsys):
+    # `yacron2 state gc` must reclaim what the daemon pass reclaims: a
+    # removed scope's artifact stream ages out and the orphaned payload
+    # blob is swept -- with --dry-run reporting both without deleting.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        from yacron2 import jobstate
+
+        backend = _backend(store)
+        await backend.start()
+        old = state_mod._now() - 8 * 86400.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old)
+        try:
+            gone = await jobstate.artifact_put(
+                backend, "gone", "a", b"gone-payload"
+            )
+            kept = await jobstate.artifact_put(
+                backend, "j", "k", b"job-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        for rec in (gone, kept):
+            os.utime(backend._blob_path(rec["sha256"]), (old, old))
+        return gone, kept
+
+    gone, kept = _run(seed())
+    _seed_gc_manifests(store)
+
+    # dry run: the stream and its blob are reported, nothing is deleted.
+    assert _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "gc would remove" in out
+    assert "would remove 1 orphaned artifact blob(s)" in out
+    assert len(_read_store(store, "artifacts/gone")) == 1
+
+    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "removed 1 orphaned artifact blob(s)" in out
+    assert _read_store(store, "artifacts/gone") == []
+    # the config job's artifact scope survives, record and blob alike.
+    assert len(_read_store(store, "artifacts/j")) == 1
+
+    async def blobs():
+        backend = _backend(store)
+        return (
+            await backend.get_blob(gone["sha256"]),
+            await backend.get_blob(kept["sha256"]),
+        )
+
+    gone_blob, kept_blob = _run(blobs())
+    assert gone_blob is None
+    assert kept_blob == b"job-payload"
+
+
+def test_cli_gc_sweep_skipped_on_hidden_artifact_stream(
+    tmp_path, monkeypatch, capsys
+):
+    # the KEEP fail-safe end to end: a legacy truncated artifact stream
+    # (no name sidecar) makes the enumeration incomplete, so the CLI must
+    # skip the blob sweep, say why, and leave the hidden stream's payload
+    # untouched.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        from yacron2 import jobstate
+
+        backend = _backend(store)
+        await backend.start()
+        old = state_mod._now() - 8 * 86400.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old)
+        try:
+            rec = await jobstate.artifact_put(
+                backend, "S" * 200, "a", b"hidden-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        os.utime(backend._blob_path(rec["sha256"]), (old, old))
+        stream_dir = backend._stream_dir("artifacts/" + "S" * 200)
+        os.unlink(os.path.join(stream_dir, state_mod._STREAM_NAME_SIDECAR))
+        return rec
+
+    rec = _run(seed())
+    _seed_gc_manifests(store)
+    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "orphan-blob sweep skipped" in out
+
+    async def check():
+        backend = _backend(store)
+        return await backend.get_blob(rec["sha256"])
+
+    assert _run(check()) == b"hidden-payload"
+
+
 def test_cli_migrate_schema(tmp_path, monkeypatch, capsys):
     store = tmp_path / "store"
     config = _write_config(tmp_path, store)

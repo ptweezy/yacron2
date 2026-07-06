@@ -260,6 +260,23 @@ MAX_JOB_SUMMARY_TS_LEN = 64  # an ISO-8601 finished_at timestamp
 # the only run outcomes a peer summary may carry (mirrors JobRunInfo.outcome)
 _SUMMARY_OUTCOMES = frozenset({"success", "failure", "cancelled"})
 
+# The fixed set of numeric fields a gossiped node_stats block may carry (the
+# whole-node CPU/memory readout, see yacron2.resources.NodeResourceSampler).
+# A CA-vouched-but-untrusted peer's block is rebuilt to exactly these keys and
+# nothing else, each coerced to a finite number (bools/NaN/Inf/extra keys
+# dropped), so a hostile peer cannot plant unbounded or non-JSON values in our
+# authenticated /fleet response. A tiny fixed-shape blob, so unlike
+# job_summaries it needs no cardinality cap.
+_NODE_STATS_FIELDS = (
+    "cpu_percent",
+    "cpu_count",
+    "mem_percent",
+    "mem_used_bytes",
+    "mem_total_bytes",
+    "proc_rss_bytes",
+    "proc_cpu_percent",
+)
+
 # Conditional /peer exchange (see _handle_peer / _observe_peer): a poller
 # echoes the ETag of the last full body a peer served it, and an unchanged
 # peer answers with a bodyless 304. The stored tag is re-sent as a request
@@ -463,6 +480,30 @@ def _aged_job_summaries(
             entry = dict(entry, scheduled_in=max(0.0, scheduled - elapsed))
         aged[name] = entry
     return aged
+
+
+def _parse_node_stats(raw: Any) -> Optional[Dict[str, Any]]:
+    """Validate a peer's gossiped ``node_stats`` block into a fresh dict.
+
+    Like :func:`_parse_job_summaries`, the peer is CA-vouched but otherwise
+    untrusted: every value is re-coerced to a finite number through
+    :func:`_finite_number` (rejecting bools, NaN/Inf and non-numbers), only the
+    whitelisted :data:`_NODE_STATS_FIELDS` are copied, and anything else is
+    dropped. Returns ``None`` (not ``{}``) when the field is absent, not an
+    object, or carries no usable value -- so "a peer sharing no node stats"
+    stays distinguishable from "a node reporting zero load" in the fleet view.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: Dict[str, Any] = {}
+    for field in _NODE_STATS_FIELDS:
+        value = _finite_number(raw.get(field))
+        if value is None:
+            continue
+        # cpu_count is a whole number of cores; keep it integral so the fleet
+        # JSON reads naturally. The rest stay floats.
+        out[field] = int(value) if field == "cpu_count" else value
+    return out or None
 
 
 def _peer_sees_me_agreed(
@@ -756,6 +797,14 @@ class PeerState:
     # it -- see _aged_job_summaries. Internal, like job_summaries' shape;
     # not surfaced in to_dict.
     job_summaries_at: Optional[datetime.datetime] = None
+    # the peer's last-reported whole-node CPU/memory (see
+    # yacron2.resources.NodeResourceSampler), for the fleet view's per-node
+    # load readout. Like job_summaries: None (a peer sharing none, or never
+    # polled) leaves any previously-absorbed value in place rather than
+    # blanking, so a briefly-unreachable node shows its last-known load aged by
+    # last_seen. No separate _at: node stats carry no countdown to re-derive,
+    # so last_seen alone conveys freshness. Not in to_dict (fleet_view shape).
+    node_stats: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -809,6 +858,7 @@ class ClusterView:
         peer_job_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
         peer_job_summaries_truncated: bool = False,
         peer_job_summaries_at: Optional[datetime.datetime] = None,
+        peer_node_stats: Optional[Dict[str, Any]] = None,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -834,6 +884,11 @@ class ClusterView:
                 if peer_job_summaries_at is not None
                 else now
             )
+        # node stats: same None-keeps-last-known contract as job_summaries, so
+        # a briefly-unreachable node keeps its last load aged by last_seen. No
+        # _at stamp: node stats carry no countdown to re-derive.
+        if peer_node_stats is not None:
+            peer.node_stats = peer_node_stats
         # whether this response actually carried a members list (current build)
         # or omitted it (a legacy peer mid rolling upgrade); drives the one-
         # directional fallback in _agreeing_peers. Defaults True so existing
@@ -1180,6 +1235,26 @@ class ClusterManager(LeadershipBackend):
         self, provider: Callable[[], Dict[str, Any]]
     ) -> None:
         self._job_summaries_provider = provider
+
+    def set_node_stats_provider(
+        self, provider: Callable[[], Optional[Dict[str, Any]]]
+    ) -> None:
+        self._node_stats_provider = provider
+
+    def _advertised_node_stats(self) -> Optional[Dict[str, Any]]:
+        """Our own whole-node CPU/memory to gossip, or ``None``.
+
+        Trusted local input (our own :class:`NodeResourceSampler`), so it is
+        emitted as-is -- a small fixed-shape blob, no cap needed. ``None`` when
+        no provider is installed (node-stats sharing not enabled) or the
+        sampler returned nothing (psutil unavailable); the key is then omitted
+        from the /peer payload so a cluster not sharing node stats gossips
+        exactly the same bytes as before.
+        """
+        provider = self._node_stats_provider
+        if provider is None:
+            return None
+        return provider()
 
     def _advertised_job_summaries(
         self,

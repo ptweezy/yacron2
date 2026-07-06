@@ -410,8 +410,30 @@ class JobStateAPI:
         port = parsed.port if parsed.port is not None else 0
         return host, port
 
+    def _client_max_size(self) -> int:
+        """The transport-level body cap, derived from the configured limits.
+
+        aiohttp defaults ``client_max_size`` to 1 MiB, which would silently
+        override ``maxArtifactBytes``/``maxValueBytes`` (a put under the
+        64 MiB artifact default would 413 at 1 MiB regardless).  0 in either
+        configured limit is the documented "no limit", so the transport cap
+        is lifted too (0 disables aiohttp's check); otherwise allow the
+        larger limit plus JSON-envelope headroom (string escaping can
+        inflate a maxValueBytes value up to 6x on the wire).  The handlers
+        still enforce the configured limits with truthful 413s.
+        """
+        if self._max_value_bytes <= 0 or self._max_artifact_bytes <= 0:
+            return 0
+        return (
+            max(self._max_artifact_bytes, self._max_value_bytes * 6)
+            + 64 * 1024
+        )
+
     async def start(self) -> None:
-        app = web.Application(middlewares=self._middlewares())
+        app = web.Application(
+            middlewares=self._middlewares(),
+            client_max_size=self._client_max_size(),
+        )
         app.add_routes(self._routes())
         runner = web.AppRunner(app)
         await runner.setup()
@@ -500,8 +522,16 @@ class JobStateAPI:
         scheme, _, presented = header.partition(" ")
         if scheme.lower() != "bearer" or not presented:
             raise web.HTTPUnauthorized()
+        try:
+            # compare as bytes: compare_digest raises TypeError on any
+            # non-ASCII str (turning a garbage token into a 500, not a 401),
+            # and a header that cannot even encode (surrogates from raw
+            # header bytes) can never match a real token.
+            presented_bytes = presented.encode("utf-8")
+        except UnicodeEncodeError:
+            raise web.HTTPUnauthorized() from None
         for token, ctx in self._runs.items():
-            if hmac.compare_digest(presented, token):
+            if hmac.compare_digest(presented_bytes, token.encode("utf-8")):
                 return ctx
         raise web.HTTPUnauthorized()
 
@@ -533,6 +563,10 @@ class JobStateAPI:
             return {}
         try:
             body = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            # the transport cap fired while reading the body: that is a
+            # truthful 413, not "not valid JSON" -- let it out unmasked.
+            raise
         except Exception as ex:  # noqa: BLE001 - a malformed body is a 400
             raise JobStateError("request body is not valid JSON") from ex
         if not isinstance(body, dict):
@@ -677,7 +711,10 @@ class JobStateAPI:
         payload = await self._json_body(request)
         scope = self._scope(ctx, payload.get("scope"))
         key = self._require(payload.get("key"), "key")
-        ttl = float(payload.get("ttl") or 0.0)
+        try:
+            ttl = float(payload.get("ttl") or 0.0)
+        except (TypeError, ValueError) as ex:
+            raise JobStateError("ttl must be a number") from ex
         result = await jobstate.idempotency_claim(
             self._backend(), scope, key, ttl=ttl
         )
@@ -761,14 +798,19 @@ class JobStateAPI:
         except (TypeError, ValueError) as ex:
             raise JobStateError("permits must be an integer") from ex
         ttl = payload.get("ttl")
+        try:
+            ttl_seconds = float(ttl) if ttl is not None else None
+            block_seconds = float(payload.get("blockSeconds") or 0.0)
+        except (TypeError, ValueError) as ex:
+            raise JobStateError("ttl and blockSeconds must be numbers") from ex
         result = await self.locks.acquire(
             ctx.token,
             scope,
             name,
             permits=permits,
-            ttl=float(ttl) if ttl is not None else None,
+            ttl=ttl_seconds,
             wait=bool(payload.get("wait")),
-            block_seconds=float(payload.get("blockSeconds") or 0.0),
+            block_seconds=block_seconds,
         )
         return web.json_response(result)
 

@@ -22,6 +22,8 @@ import datetime
 import json
 import sys
 
+import pytest
+
 from yacron2 import dag, dagrun
 from yacron2.cron import Cron
 
@@ -657,6 +659,258 @@ async def test_finish_removed_task_is_noop(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Release-review regressions: busy-loops, wedges, stale owners, poisoned dags
+# --------------------------------------------------------------------------
+
+
+async def test_decision_on_unowned_run_does_not_pin_wake(tmp_path):
+    # regression: approve() on a node that does NOT own the run (the
+    # documented cross-node decision flow) left a permanent 0.0 wake entry;
+    # next_wake_delay() then returned 0.0 forever and the main loop busy-spun
+    # at 100% CPU until restart.
+    yaml = (
+        "dags:\n  - name: ap2\n    tasks:\n"
+        "      - id: gate\n        type: approval\n"
+        "      - id: b\n        command: 'x'\n        dependsOn:\n"
+        "          - gate\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "ap2", "b", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("ap2")
+        body = await _drive(cron, "ap2", run_key)
+        assert body["tasks"]["gate"]["awaitingApproval"] is True
+        ref = ("ap2", run_key)
+        # simulate the non-owning peer: this node holds no advance lease
+        cron._dag._drop_owned(ref)
+        cron._dag._next_sched_check = dagrun._now() + 20.0
+        res = await cron._dag.approve(
+            "ap2", run_key, "gate", approved=True, by="bob"
+        )
+        assert res["ok"] is True  # the decision IS durably recorded
+        await _drain_pending(cron)
+        # the stale wake hint is gone and the loop sleeps a positive interval
+        assert ref not in cron._dag._wake
+        delay = cron._dag.next_wake_delay()
+        assert delay is not None and delay > 0
+        body = await cron._dag.get_run("ap2", run_key)
+        assert body["tasks"]["gate"]["approval"]["by"] == "bob"
+    finally:
+        await _teardown(cron)
+
+
+async def test_wake_ignores_inflight_sensor_poke(tmp_path):
+    # regression: a RUNNING sensor whose poke subprocess is in flight kept
+    # its stale PAST nextPokeAt as a wake candidate, pinning the loop's sleep
+    # at 0 for the poke's whole duration (full advance per iteration).
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        spec = cron.cron_dags["lin"].spec
+        now = 1000.0
+        inflight = {
+            "tasks": {
+                "s": {
+                    "state": dag.RUNNING,
+                    "nextPokeAt": now - 100.0,  # stale due instant
+                    "proc": "tok",
+                    "pid": 4242,
+                }
+            }
+        }
+        assert cron._dag._compute_wake(spec, inflight, now) > now
+        # an IDLE sensor's due instant still drives the wake
+        idle = {
+            "tasks": {
+                "s": {
+                    "state": dag.RUNNING,
+                    "nextPokeAt": now + 30.0,
+                    "proc": None,
+                    "pid": None,
+                }
+            }
+        }
+        assert cron._dag._compute_wake(spec, idle, now) == now + 30.0
+    finally:
+        await _teardown(cron)
+
+
+async def test_failed_completion_record_is_retried(tmp_path):
+    # regression: a single failed completion RMW (a >10s store stall) left
+    # the task RUNNING under our own proc token forever -- protected from
+    # reconciliation, its lease renewed indefinitely, the run wedged until a
+    # daemon restart.  The completion must be queued and retried until it
+    # lands.
+    yaml = (
+        "dags:\n  - name: fc\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "fc", "a", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("fc")
+        ref = ("fc", run_key)
+
+        # the store stalls exactly when the reaper records the completion
+        async def _stalled(dag_name, key, transform):
+            raise asyncio.TimeoutError()
+
+        orig = cron._dag._mutate
+        cron._dag._mutate = _stalled
+        await _reap_running(cron)
+        await _drain_pending(cron)
+        cron._dag._mutate = orig
+        # the completion was queued, not lost; the entry is still RUNNING
+        assert (ref, "a") in cron._dag._pending_completions
+        body = await cron._dag.get_run("fc", run_key)
+        assert body["tasks"]["a"]["state"] == dag.RUNNING
+        assert cron._dag.next_wake_delay() is not None  # retry is a wake
+        # a later service pass (store healthy again) lands it
+        for pc in cron._dag._pending_completions.values():
+            pc["nextTryAt"] = 0.0
+        await cron._dag._retry_completions(dagrun._now())
+        await _drain_pending(cron)
+        assert not cron._dag._pending_completions
+        body = await _drive(cron, "fc", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert body["tasks"]["a"]["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_superseded_owner_stops_advancing_after_lease_lapse(tmp_path):
+    # regression: after a lease lapse + peer takeover (store unreachable, so
+    # the renew loop never positively learned of it), the stale owner kept
+    # advancing and would reconcile-fail the new owner's LIVE tasks.  An
+    # expired local lease must be verified against the store's fence before
+    # any mutate; positively superseded -> drop ownership, touch nothing.
+    yaml = (
+        "dags:\n  - name: st\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        dagcfg = cron.cron_dags["st"]
+        run_key = "manual-takeover"
+        assert await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+        ref = ("st", run_key)
+        lease_name = cron._dag._lease_name(ref)
+        lease = await cron.state_backend.acquire_lease(
+            lease_name, cron._slot_holder(), 30.0
+        )
+        cron._dag._owned[ref] = lease
+        cron._dag._locks.setdefault(ref, asyncio.Lock())
+        # the peer re-claimed task `a` under its own proc token; its
+        # subprocess is live on the peer host (the pid is dead HERE)
+        ns = dag.DAG_RUN_NS_PREFIX + "st"
+
+        def _peer_claims(body):
+            entry = body["tasks"]["a"]
+            entry["state"] = dag.RUNNING
+            entry["proc"] = "peer-proc#1"
+            entry["host"] = "peer-host"
+            entry["pid"] = 2147480000
+            return body, None
+
+        await cron.state_backend.mutate_document(ns, run_key, _peer_claims)
+        # our lease lapsed while the store was unreachable, and the peer took
+        # it over (expire-in-place + acquire bumps the fence, as a real
+        # expiry takeover does)
+        lease.expires_at = dagrun._now() - 5.0
+        await cron.state_backend.release_lease(lease)
+        peer = await cron.state_backend.acquire_lease(
+            lease_name, "peer-node", 30.0
+        )
+        assert peer is not None and peer.fence == lease.fence + 1
+        # the stale owner's next advance must NOT touch the run
+        await cron._dag.advance_one(ref)
+        assert ref not in cron._dag._owned  # ownership dropped
+        body = await cron._dag.get_run("st", run_key)
+        entry = body["tasks"]["a"]
+        assert entry["state"] == dag.RUNNING  # the live task was NOT failed
+        assert entry["proc"] == "peer-proc#1"
+        assert entry["failReason"] is None
+        assert not any(cron.running_jobs.values())  # nothing launched here
+    finally:
+        await _teardown(cron)
+
+
+async def test_noncrontab_schedule_does_not_crash_service(tmp_path):
+    # regression: a schedule string the parser passes through verbatim (the
+    # documented "@reboot") crashed the seed/backfill paths (an
+    # AttributeError once -OO strips the assert in _compute_next_fire),
+    # starving every other dag's service work.  It must degrade to "never
+    # fires" plus a clean backfill refusal.
+    yaml = (
+        "dags:\n"
+        "  - name: bad\n    schedule: '* * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "  - name: good\n    schedule: '* * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        cron.cron_dags["bad"].schedule_job.schedule = "@reboot"
+        await cron._dag._seed_dags(dagrun._now())  # must not raise
+        assert "good" in cron._dag._seeded
+        assert "bad" not in cron._dag._next_logical  # it simply never fires
+        res = await cron._dag.backfill(
+            "bad", "2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+00:00"
+        )
+        assert res["ok"] is False  # clean refusal, not an exception/500
+    finally:
+        await _teardown(cron)
+
+
+async def test_one_dag_seed_failure_does_not_starve_others(tmp_path):
+    # regression: one dag's raising seed aborted the WHOLE service pass
+    # (fire/adopt/advance/GC for every other dag) every cycle, spamming the
+    # log.  It must be isolated, and logged/attempted once per signature.
+    yaml = (
+        "dags:\n"
+        "  - name: p\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "  - name: q\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        calls = {"p": 0}
+        orig = cron._dag._seed_dag
+
+        async def flaky(dagcfg, now_dt):
+            if dagcfg.name == "p":
+                calls["p"] += 1
+                raise RuntimeError("poisoned")
+            return await orig(dagcfg, now_dt)
+
+        cron._dag._seed_dag = flaky
+        await cron._dag._seed_dags(dagrun._now())
+        assert "q" in cron._dag._seeded  # the healthy dag still seeded
+        assert "p" in cron._dag._seed_failed
+        # the poisoned dag is not re-attempted (and re-logged) every cadence
+        await cron._dag._seed_dags(dagrun._now())
+        assert calls["p"] == 1
+    finally:
+        await _teardown(cron)
+
+
+async def test_trigger_with_backend_down_raises(tmp_path):
+    # regression: trigger_run returned a runKey (-> HTTP 200 + a success
+    # toast) even when the run document was never written because no state
+    # backend was available; the run silently never existed.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        backend = cron.state_backend
+        cron.state_backend = None  # the store failed to start / is down
+        with pytest.raises(RuntimeError, match="could not be recorded"):
+            await cron._dag.trigger_run("lin")
+        cron.state_backend = backend
+        assert await cron._dag.trigger_run("ghost") is None  # unknown: 404
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
 # HTTP control API (real server)
 # --------------------------------------------------------------------------
 
@@ -746,4 +1000,176 @@ async def test_http_approval_decision_and_backfill(tmp_path):
                 assert (await r.json())["created"] == 2
     finally:
         await cron.start_stop_web_app(None)
+        await _teardown(cron)
+
+# --------------------------------------------------------------------------
+# Retention / removed-dag GC and XCom blob reclamation
+# --------------------------------------------------------------------------
+
+_RETAIN_ONE = """
+dags:
+  - name: rt
+    retainRuns: 1
+    tasks:
+      - id: a
+        command: 'x'
+"""
+
+
+async def test_retention_prune_releases_xcom_blobs_to_the_sweep(tmp_path):
+    # THE leak from the GC review: dagrun's retention pruned XCom RECORD
+    # streams (keep=0) but the content-addressed payload blobs they named
+    # were never unlinked -- a dag pushing unique XCom payloads leaked one
+    # blob per run forever.  Once records are pruned, the daemon sweep must
+    # reclaim exactly the pruned run's blobs and keep the retained run's.
+    import os
+
+    import yacron2.state as state_mod
+    from yacron2 import jobstate
+
+    cron = await _make_cron(tmp_path, _RETAIN_ONE)
+    try:
+        _set_cmd(cron, "rt", "a", [_PY, "-c", "pass"])
+        backend = cron.state_backend
+        keys, digests = [], []
+        for i in range(2):
+            run_key = await cron._dag.trigger_run("rt")
+            body = await _drive(cron, "rt", run_key)
+            assert body["state"] == dag.SUCCESS
+            keys.append(run_key)
+            scope = dag.xcom_scope("rt", str(body["runId"]))
+            rec = await jobstate.artifact_put(
+                backend, scope, "a#0/k", "unique-{}".format(i).encode()
+            )
+            digests.append(rec["sha256"])
+        # retainRuns 1: the older run's document AND its XCom stream go.
+        await cron._dag._gc_one_dag(backend, "rt", cron.cron_dags["rt"])
+        docs = await backend.list_documents("dagrun/rt")
+        assert [b["runKey"] for b in docs] == [keys[1]]
+        # both payloads are old enough to sweep; only the orphan may go.
+        old = state_mod._now() - 7200.0
+        for digest in digests:
+            os.utime(backend._blob_path(digest), (old, old))
+        await cron._sweep_orphan_artifact_blobs(backend, 3600.0)
+        assert await backend.get_blob(digests[0]) is None
+        assert await backend.get_blob(digests[1]) == b"unique-1"
+    finally:
+        await _teardown(cron)
+
+
+async def test_gc_removed_dags_grace_and_active_run_protection(tmp_path):
+    # a dag briefly removed during a config edit must not lose run history:
+    # gc_removed_dags takes only a TERMINAL run older than the grace, never
+    # a recent or an active one -- and a dag still in config is untouched
+    # even when named.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        backend = cron.state_backend
+        run_key = await cron._dag.trigger_run("lin")
+        body = await _drive(cron, "lin", run_key)
+        assert body["state"] == dag.SUCCESS
+        # still configured: nothing may be collected even when named.
+        await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
+        assert len(await backend.list_documents("dagrun/lin")) == 1
+        cron.cron_dags.clear()  # the dag is removed from config
+        # terminal but recent (within the grace): kept.
+        await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
+        assert len(await backend.list_documents("dagrun/lin")) == 1
+
+        def _age(cur):
+            cur["updatedAt"] = cur["updatedAt"] - 7200.0
+            return cur, None
+
+        await backend.mutate_document("dagrun/lin", run_key, _age)
+        # an ACTIVE (non-terminal) aged run of the removed dag: kept too.
+        def _activate(cur):
+            cur["state"] = dag.RUNNING
+            return cur, None
+
+        await backend.mutate_document("dagrun/lin", run_key, _activate)
+        await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
+        assert len(await backend.list_documents("dagrun/lin")) == 1
+        # terminal AND aged past the grace: collected.
+        def _finish(cur):
+            cur["state"] = dag.SUCCESS
+            return cur, None
+
+        await backend.mutate_document("dagrun/lin", run_key, _finish)
+        await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
+        assert await backend.list_documents("dagrun/lin") == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_removed_dag_history_collected_by_daemon_gc_pass(tmp_path,
+                                                               monkeypatch):
+    # end to end through cron._collect_state_garbage: a dag removed from
+    # config has its aged terminal run document deleted, its XCom stream
+    # pruned, and the pruned records' payload blob swept -- while an active
+    # run of the same removed dag survives untouched.
+    import os
+
+    import yacron2.state as state_mod
+    from yacron2 import jobstate
+
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        backend = cron.state_backend
+        run_key = await cron._dag.trigger_run("lin")
+        body = await _drive(cron, "lin", run_key)
+        assert body["state"] == dag.SUCCESS
+        scope = dag.xcom_scope("lin", str(body["runId"]))
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            rec = await jobstate.artifact_put(
+                backend, scope, "a#0/k", b"xcom-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        os.utime(backend._blob_path(rec["sha256"]), (old_epoch, old_epoch))
+
+        def _age(cur):
+            cur["updatedAt"] = old_epoch
+            return cur, None
+
+        await backend.mutate_document("dagrun/lin", run_key, _age)
+        # a second, still-active run: trigger only, never driven.
+        run_key2 = await cron._dag.trigger_run("lin")
+        await _drain_pending(cron)
+        cron.cron_dags.clear()  # the dag is removed from config
+        now = _utcnow()
+        await backend.append_record(
+            "manifests/old-host",
+            {
+                "jobSetId": "v1:old",
+                "host": "old-host",
+                "jobs": [],
+                "at": (
+                    now - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+            },
+        )
+        await backend.append_record(
+            "manifests/other-host",
+            {
+                "jobSetId": "v1:other",
+                "host": "other-host",
+                "jobs": [],
+                "scopes": [],
+                "dags": [],
+                "at": now.isoformat(),
+            },
+        )
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        docs = await backend.list_documents("dagrun/lin")
+        assert [b["runKey"] for b in docs] == [run_key2]
+        assert await backend.list_records("artifacts/" + scope) == []
+        assert await backend.get_blob(rec["sha256"]) is None
+    finally:
         await _teardown(cron)

@@ -82,6 +82,24 @@ async def test_auth_required(tmp_path):
         await backend.stop()
 
 
+async def test_auth_non_ascii_token_is_401_not_500(tmp_path):
+    # compare_digest raises TypeError for a non-ASCII str, which used to
+    # escape the auth check as a 500 + logged traceback; a garbage token can
+    # never validate, so the answer on this boundary must be a clean 401.
+    api, backend = await _make_api(tmp_path)
+    api.register_run(_ctx())
+    try:
+        async with aiohttp.ClientSession() as s:
+            r = await s.get(
+                api.base_url + "/v1/run",
+                headers={"Authorization": "Bearer t\xf6k"},
+            )
+            assert r.status == 401
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
 # --------------------------------------------------------------------------
 # KV over HTTP
 # --------------------------------------------------------------------------
@@ -317,6 +335,72 @@ async def test_artifact_size_limit_413(tmp_path):
         await backend.stop()
 
 
+async def test_artifact_put_2mib_with_no_limit(tmp_path):
+    # maxArtifactBytes 0 is the documented "no limit": aiohttp's default
+    # 1 MiB client_max_size must not override it with a spurious 413.
+    api, backend = await _make_api(tmp_path)  # _make_api sets both limits 0
+    api.register_run(_ctx())
+    payload = b"x" * (2 * 1024 * 1024)
+    try:
+        async with aiohttp.ClientSession(headers=_auth()) as s:
+            r = await s.post(
+                api.base_url + "/v1/artifact/put?name=big", data=payload
+            )
+            assert r.status == 200
+            assert (await r.json())["size"] == len(payload)
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
+async def test_artifact_and_kv_2mib_within_raised_limits(tmp_path):
+    # with finite limits the transport cap is derived from them: a payload
+    # under the configured maxArtifactBytes/maxValueBytes but over aiohttp's
+    # 1 MiB default must succeed (xcom push rides the same artifact route).
+    api, backend = await _make_api(
+        tmp_path,
+        maxArtifactBytes=8 * 1024 * 1024,
+        maxValueBytes=8 * 1024 * 1024,
+    )
+    api.register_run(_ctx())
+    try:
+        async with aiohttp.ClientSession(headers=_auth()) as s:
+            r = await s.post(
+                api.base_url + "/v1/artifact/put?name=big",
+                data=b"x" * (2 * 1024 * 1024),
+            )
+            assert r.status == 200
+            r = await s.post(
+                api.base_url + "/v1/kv/set",
+                json={"key": "k", "value": "v" * (2 * 1024 * 1024)},
+            )
+            assert r.status == 200
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
+async def test_json_body_over_transport_cap_is_413_not_400(tmp_path):
+    # a JSON body larger than the derived transport cap is a 413 and must
+    # surface as one: _json_body used to swallow HTTPRequestEntityTooLarge
+    # and mislabel it 400 "request body is not valid JSON".
+    api, backend = await _make_api(
+        tmp_path, maxValueBytes=1024, maxArtifactBytes=1024
+    )
+    api.register_run(_ctx())
+    try:
+        async with aiohttp.ClientSession(headers=_auth()) as s:
+            r = await s.post(
+                api.base_url + "/v1/kv/set",
+                json={"key": "k", "value": "v" * (512 * 1024)},
+            )
+            assert r.status == 413
+            assert "not valid JSON" not in (await r.text())
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
 # --------------------------------------------------------------------------
 # Secrets (run-scoped, in memory)
 # --------------------------------------------------------------------------
@@ -486,6 +570,40 @@ async def test_lock_per_acquire_ttl_used_for_hold(tmp_path):
         await backend.stop()
 
 
+async def test_lock_acquire_non_numeric_fields_400(tmp_path):
+    # ttl/blockSeconds that cannot convert are the caller's bad input: a
+    # clean 400 (like permits two lines above), not ValueError -> 500.
+    api, backend = await _make_api(tmp_path)
+    api.register_run(_ctx())
+    try:
+        async with aiohttp.ClientSession(headers=_auth()) as s:
+            for body in (
+                {"name": "L", "ttl": "abc"},
+                {"name": "L", "blockSeconds": "zz"},
+                {"name": "L", "ttl": {"nested": 1}},
+            ):
+                r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
+                assert r.status == 400, body
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
+async def test_idempotency_claim_non_numeric_ttl_400(tmp_path):
+    api, backend = await _make_api(tmp_path)
+    api.register_run(_ctx())
+    try:
+        async with aiohttp.ClientSession(headers=_auth()) as s:
+            r = await s.post(
+                api.base_url + "/v1/idempotency/claim",
+                json={"key": "k", "ttl": "abc"},
+            )
+            assert r.status == 400
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
 async def test_cursor_value_size_limit_413(tmp_path):
     api, backend = await _make_api(tmp_path, maxValueBytes=8)
     api.register_run(_ctx())
@@ -617,6 +735,55 @@ async def test_end_to_end_real_subprocess(tmp_path):
 
         body = await jobstate.kv_get(cron.state_backend, "j", "greeting")
         assert body is not None and body["value"] == "hi"
+        await cron._job_api.finish_run(token)
+    finally:
+        await cron._stop_job_api()
+        if cron.state_backend is not None:
+            await cron.state_backend.stop()
+
+
+async def test_cli_subprocess_ignores_proxy_env(tmp_path):
+    # http_proxy in the job's environment (inherited from the host, common
+    # behind corporate proxies) must not reroute loopback state calls: the
+    # CLI pins a proxy-free opener, so the request still lands on the
+    # daemon instead of shipping the bearer run token to an external proxy.
+    # Nothing listens on the proxy address, so a proxied request would fail.
+    cron = Cron(None, config_yaml=_ONE_JOB.format(path=tmp_path))
+    await cron.start_stop_state(_state_cfg(_ONE_JOB.format(path=tmp_path)))
+    try:
+        job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
+        token, env = cron._prepare_job_api_run(job, None)
+        proxy = "http://127.0.0.1:1"
+        child_env = {
+            **os.environ,
+            **env,
+            "http_proxy": proxy,
+            "HTTP_PROXY": proxy,
+            "https_proxy": proxy,
+            "HTTPS_PROXY": proxy,
+            "all_proxy": proxy,
+            "ALL_PROXY": proxy,
+            "no_proxy": "",
+            "NO_PROXY": "",
+        }
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "yacron2",
+            "state",
+            "set",
+            "via",
+            "loopback",
+            env=child_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await proc.communicate()
+        assert proc.returncode == 0, err.decode(errors="replace")
+        from yacron2 import jobstate
+
+        body = await jobstate.kv_get(cron.state_backend, "j", "via")
+        assert body is not None and body["value"] == "loopback"
         await cron._job_api.finish_run(token)
     finally:
         await cron._stop_job_api()

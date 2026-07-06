@@ -16,6 +16,7 @@ fixes regresses, the matching test here must fail.  Covered:
 
 import asyncio
 import datetime
+import os
 
 from tests.test_state import (
     _NOW,
@@ -92,6 +93,36 @@ async def _put_ledger(cron, outcome, iso, name="j"):
 
 async def _raise_oserror(*args, **kwargs):
     raise OSError("state store went away")
+
+
+async def _seed_gc_anchor(cron, covered=True):
+    """Manifests letting a GC pass with grace 3600 prove absence.
+
+    One manifest older than the grace (history-depth guard) plus one recent
+    one; ``covered`` controls whether the recent manifest advertises its
+    scopes/dags (all-new-fleet) or predates them (mid-rolling-upgrade).
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    backend = cron.state_backend
+    await backend.append_record(
+        "manifests/old-host",
+        {
+            "jobSetId": "v1:old",
+            "host": "old-host",
+            "jobs": [],
+            "at": (now - datetime.timedelta(seconds=7200)).isoformat(),
+        },
+    )
+    recent = {
+        "jobSetId": "v1:other",
+        "host": "other-host",
+        "jobs": [],
+        "at": now.isoformat(),
+    }
+    if covered:
+        recent["scopes"] = []
+        recent["dags"] = []
+    await backend.append_record("manifests/other-host", recent)
 
 
 # --- scheduler-crash containment on store errors --------------------------
@@ -655,3 +686,214 @@ async def test_backfill_idle_wait_is_bounded_for_allow_policy(
     cron.running_jobs["j"].append(object())  # ever-running scheduled instance
     await cron._run_catch_up(cron.cron_jobs["j"], 1, 0.0, _NOW)
     assert calls == ["j"]
+
+
+# --- cluster slot: stale release vs fresh same-fence re-claim ----------------
+
+
+_FORBID_CLUSTER_JOB = (
+    "jobs:\n"
+    "  - name: j\n"
+    "    command: 'true'\n"
+    "    schedule: '* * * * *'\n"
+    "    concurrencyPolicy: Forbid\n"
+    "    concurrencyScope: cluster\n"
+)
+
+
+async def _cluster_cron(tmp_path):
+    cron = Cron(None, config_yaml=_FORBID_CLUSTER_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    return cron
+
+
+async def _stop_cluster_cron(cron):
+    for task in list(cron._slot_renewers.values()):
+        task.cancel()
+    cron._slot_renewers.clear()
+    cron._slot_leases.clear()
+    cron._slot_refs.clear()
+    await asyncio.gather(*list(cron._pending_state_writes))
+    if cron.state_backend is not None:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+async def test_stale_slot_release_stands_down_for_fresh_reclaim(tmp_path):
+    # regression (slot-protocol): _release_cluster_slot pops the lease under
+    # the per-job mutex but writes the on-disk release fire-and-forget, and
+    # a same-holder re-acquire KEEPS the fence -- so a stale release landing
+    # after a fresh re-claim still matched on disk and revoked the new
+    # claim's lease, letting a peer's Forbid claim double-run. The release
+    # must re-check under the mutex and stand down for a live claim.
+    cron = await _cluster_cron(tmp_path)
+    try:
+        backend = cron.state_backend
+        holder = cron._slot_holder()
+        stale = await backend.acquire_lease("slots/j", holder, cron._slot_ttl)
+        fresh = await backend.acquire_lease("slots/j", holder, cron._slot_ttl)
+        assert stale is not None and fresh is not None
+        assert fresh.fence == stale.fence  # the kept-fence re-acquire
+        cron._slot_leases["j"] = fresh
+        cron._slot_refs["j"] = 1
+        await cron._release_slot_lease("j", stale)
+        assert await backend.read_lease("slots/j") is not None
+        # ...while with no live claim the release still frees the slot
+        cron._slot_leases.pop("j", None)
+        cron._slot_refs.pop("j", None)
+        await cron._release_slot_lease("j", fresh)
+        assert await backend.read_lease("slots/j") is None
+    finally:
+        await _stop_cluster_cron(cron)
+
+
+async def test_gc_reclaims_removed_scope_artifacts_and_orphan_blobs(
+    tmp_path, monkeypatch
+):
+    # regression (GC review): artifact streams were absent from the daemon
+    # GC's keep map ("unrecognised: kept forever") and the fully-implemented
+    # blob sweep had no production caller, so a removed job's artifacts --
+    # and every orphaned payload blob -- leaked without bound.  One pass
+    # must age out a removed scope's stream and sweep its blob, while a
+    # config job's scope, the shared scope, a referenced blob, and a
+    # just-written (not-yet-recorded) blob all survive.
+    import yacron2.state as state_mod
+    from yacron2 import jobstate
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            gone = await jobstate.artifact_put(
+                backend, "gone", "a", b"gone-payload"
+            )
+            kept = await jobstate.artifact_put(
+                backend, "j", "k", b"job-payload"
+            )
+            shared = await jobstate.artifact_put(
+                backend, "global", "g", b"shared-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        for rec in (gone, kept, shared):
+            path = backend._blob_path(rec["sha256"])
+            os.utime(path, (old_epoch, old_epoch))
+        # unreferenced but young: the put-then-record window's blob.
+        young = await backend.put_blob(b"just-put-no-record-yet")
+        await _seed_gc_anchor(cron)
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        assert await backend.list_records("artifacts/gone") == []
+        assert await backend.get_blob(gone["sha256"]) is None
+        assert len(await backend.list_records("artifacts/j")) == 1
+        assert await backend.get_blob(kept["sha256"]) == b"job-payload"
+        assert len(await backend.list_records("artifacts/global")) == 1
+        assert await backend.get_blob(shared["sha256"]) == b"shared-payload"
+        assert await backend.get_blob(young) is not None
+    finally:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+async def test_gc_blob_sweep_skipped_when_artifact_stream_hidden(
+    tmp_path, monkeypatch
+):
+    # the fail-safe: a legacy length-truncated stream directory without its
+    # name sidecar is skipped by enumeration, so its records -- and the blob
+    # references inside them -- are invisible.  The sweep must then not run
+    # at all this pass (the hidden stream's blob would otherwise read as an
+    # orphan and a LIVE payload would be deleted).
+    import yacron2.state as state_mod
+    from yacron2 import jobstate
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        hidden_scope = "S" * 200
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            hidden = await jobstate.artifact_put(
+                backend, hidden_scope, "a", b"hidden-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        os.utime(
+            backend._blob_path(hidden["sha256"]), (old_epoch, old_epoch)
+        )
+        stream_dir = backend._stream_dir("artifacts/" + hidden_scope)
+        os.unlink(os.path.join(stream_dir, state_mod._STREAM_NAME_SIDECAR))
+        await _seed_gc_anchor(cron)
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        # the unclassifiable stream is kept (existing collect_garbage rule)
+        # AND its blob survived, proving the sweep stood down.
+        recs = await backend.list_records("artifacts/" + hidden_scope)
+        assert len(recs) == 1
+        assert await backend.get_blob(hidden["sha256"]) == b"hidden-payload"
+    finally:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+async def test_gc_leaves_artifacts_unmanaged_without_scope_manifests(
+    tmp_path, monkeypatch
+):
+    # rolling-upgrade safety: while any recent manifest predates scope/dag
+    # advertising, its node's shared artifact scopes are unknowable, so
+    # artifact streams must stay wholly unmanaged (kept) -- even an aged,
+    # unreferenced scope -- while ordinary job streams still collect.
+    import yacron2.state as state_mod
+    from yacron2 import jobstate
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            gone = await jobstate.artifact_put(
+                backend, "gone", "a", b"gone-payload"
+            )
+            await backend.append_record("runs/orphan", {"finished_at": "x"})
+        finally:
+            monkeypatch.undo()
+        os.utime(backend._blob_path(gone["sha256"]), (old_epoch, old_epoch))
+        await _seed_gc_anchor(cron, covered=False)
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        assert await backend.list_records("runs/orphan") == []
+        assert len(await backend.list_records("artifacts/gone")) == 1
+        # its record survived, so its blob is referenced and kept too.
+        assert await backend.get_blob(gone["sha256"]) == b"gone-payload"
+    finally:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+async def test_slot_release_write_yields_to_racing_reclaim(tmp_path):
+    # the same hazard through the production path: the finish-path release
+    # schedules its write fire-and-forget, the job's next fire re-claims
+    # immediately (same holder, fence kept), and only then does the
+    # scheduled write run. The slot must still be held on disk afterwards,
+    # under the original fence -- the new run's claim survived.
+    cron = await _cluster_cron(tmp_path)
+    try:
+        job = cron.cron_jobs["j"]
+        backend = cron.state_backend
+        assert await cron._claim_cluster_slot(job) is True
+        first = cron._slot_leases["j"]
+        await cron._release_cluster_slot(job)  # schedules the stale write
+        assert await cron._claim_cluster_slot(job) is True  # fresh re-claim
+        await asyncio.gather(*list(cron._pending_state_writes))
+        observed = await backend.read_lease("slots/j")
+        assert observed is not None
+        assert observed.holder == cron._slot_holder()
+        assert observed.fence == first.fence
+    finally:
+        await _stop_cluster_cron(cron)

@@ -25,7 +25,8 @@ durable stream of finished-run records per job (distinct from the
 derived "last fired" cursor, computed as the maximum over a stream's immutable
 records, never stored as a mutable file. A **lease** is a TTL claim guarded by
 an advisory `flock`. A **manifest** is a node's periodic record of which job
-names its loaded config defines, the anchor for garbage collection.
+names (plus which shared artifact scopes and dag names) its loaded config
+defines, the anchor for garbage collection.
 
 **On this page:**
 [Quickstart](#quickstart) ·
@@ -206,13 +207,16 @@ with no native rename:
   (`slots/<job>`, behind
   [`concurrencyScope: cluster`](Clustering-and-Leader-Election)) and the
   cross-node retry claim (`retry-claim/<job>`; see
-  [Restart-surviving retries](#restart-surviving-retries)). Lease files are
-  never deleted, deliberately: a lease file is its fence counter's only
-  home, and removing it would hand the next taker a reset fence a stale
-  holder could not be told apart from. The price is that a renamed or
-  removed job leaks one tiny lease file, which GC leaves alone. Locked
-  read-modify-writes run in a worker thread so a blocking lock can never
-  freeze the event loop.
+  [Restart-surviving retries](#restart-surviving-retries)). A lease file is
+  its fence counter's only home, so within the GC grace window lease files
+  are never touched: removing one would hand the next taker a reset fence a
+  stale holder could not be told apart from. A lease *provably* dead for a
+  whole grace window -- both its recorded expiry and its last write older
+  than `gcGraceSeconds` -- is reclaimed by
+  [GC](#garbage-collection-and-manifests) together with its `.lock`
+  side-file; every fence it ever issued expired at least a grace ago, so
+  the reset is unobservable. Locked read-modify-writes run in a worker
+  thread so a blocking lock can never freeze the event loop.
 * **Writes never stall scheduling.** Durable writes are fire-and-forget
   background tasks; a failed write is dropped with a warning and counted
   (`yacron2_state_dropped_writes_total`). The few *reads* on scheduling paths
@@ -233,9 +237,14 @@ The layout under `<path>/<deploymentId>/`:
 │   ├── inflight%2F<job>/ #   in-flight run records (open/closed)
 │   ├── slots%2F<job>/    #   cluster concurrency-slot cancel requests
 │   ├── counters%2F<host>/#   Prometheus counter snapshots
+│   ├── artifacts%2F<scope>/ # artifact records (job-facing state / DAG XCom)
 │   ├── manifests/        #   per-node job manifests (the GC anchor)
 │   └── meta/             #   the store's version stamp
-├── leases/               # lock + lease files (never deleted, never GC'd)
+├── docs/                 # mutable job-facing documents (KV, cursors,
+│                         #   idempotency claims) and dag_run documents
+├── blobs/                # content-addressed artifact payloads (sha256)
+├── leases/               # lock + lease files (GC'd only when provably dead
+│                         #   for a whole grace window; see the GC section)
 ├── quarantine/           # records quarantined on read
 └── tmp/                  # write-temps, atomically renamed into records/
 ```
@@ -674,22 +683,41 @@ Jobs get renamed and deleted; without GC their streams would sit in the store
 forever. The store cleans up after itself, conservatively, anchored on
 **manifests**:
 
-* Every node records a **manifest** (stream `manifests`): its host, job-set
-  id, and the job names of its loaded config -- written on backend start and
+* Every node records a **manifest** (stream `manifests/<host>`): its host,
+  job-set id, the job names of its loaded config, plus the shared artifact
+  scopes and dag names that config can write -- written on backend start and
   every 6 hours.
 * A **GC pass** (every 24 hours per process, plus on demand via
   [`yacron2 state gc`](#administering-the-store)) deletes the streams (runs,
   logs, catch-up, retries, reboot markers, in-flight records, slot cancel
-  records) of jobs that **no recent manifest**
+  records, artifact streams) of jobs that **no recent manifest**
   -- from *any* node, *any* job set, same `deploymentId` -- references, *and*
   whose newest record is older than `gcGraceSeconds` (default 7 days).
-  Counter streams of hosts no recent manifest names are collected likewise.
+  Counter and manifest streams of hosts no recent manifest names are
+  collected likewise.
+* **Artifacts age out with their scope.** A removed scope's `artifacts/`
+  stream -- a removed job's artifacts, or a pruned dag_run's XCom -- ages out
+  under the same manifest-anchored grace rules as every other stream, and
+  the run documents of a dag removed from the config are deleted once the
+  dag has been absent from every config and recent manifest for a full
+  grace window (terminal runs only; an active or still-owned run is never
+  touched). After each successful pass, content-addressed payload **blobs**
+  that no surviving artifact record references *and* that are older than
+  the grace are swept. All of it is biased to KEEP: artifact streams and
+  dag-run documents stay unmanaged until every recent manifest advertises
+  its scopes and dags (so a mixed-version fleet is safe, and management
+  starts one grace window after an upgrade); the blob sweep stands down
+  with a logged reason when any artifact stream cannot be enumerated or any
+  record read; and a just-written or re-published blob is age-guarded.
+* **Dead leases are reclaimed.** Within the grace window lease files are
+  never touched (a lease file is its fence counter's only home, so fences
+  stay monotonic); a lease whose recorded expiry *and* last write are both
+  older than the grace is deleted along with its `.lock` side-file.
 * The pass also sweeps crashed write-temp files older than a day and
   quarantined records older than the grace.
-* **Never touched:** unrecognised streams, lease files, and the `manifests` /
-  `meta` streams themselves. A store shared by several deployments is safe:
-  each namespace GCs only itself, and anything GC does not positively
-  recognise as garbage stays.
+* **Never touched:** unrecognised streams and the `meta` stream. A store
+  shared by several deployments is safe: each namespace GCs only itself, and
+  anything GC does not positively recognise as garbage stays.
 * **Deferred until it can prove absence:** nothing is deleted until the
   retained manifest history spans one full grace window. A fresh store --
   or the first passes after upgrading a store that predates manifests --
@@ -812,8 +840,10 @@ deliberate rewind).
 ### Idempotency keys
 
 `yacron2 idempotent KEY` claims a key once, fleet-wide: the first caller wins
-(exit `0`, do the work), every later caller loses (exit `1`, skip). It is the
-"run this side effect at most once" guard for a retried or duplicated run:
+(exit `0`, do the work), every later caller loses (exit `5`, skip). A
+transport or store error exits `1` instead, so an outage is distinguishable
+from "already done". It is the "run this side effect at most once" guard for
+a retried or duplicated run:
 
 ```shell
 if yacron2 idempotent "charge-$(date -u +%F)"; then
@@ -871,7 +901,9 @@ yacron2 artifact list                             # one name per line
 `put` refuses a payload larger than `maxArtifactBytes`. Artifacts are durable
 and accumulate until their scope is [garbage
 collected](#garbage-collection-and-manifests) with the rest of a removed job's
-state; blobs deduplicate across scopes.
+state; blobs deduplicate across scopes, and a payload blob no surviving
+artifact record references is swept by the same GC pass once it is older
+than the grace.
 
 ### Run-scoped secrets
 
@@ -915,10 +947,10 @@ codes: `0` success, `1` error, `2` usage. Full flags and examples are in the
 
 | Command | Does |
 | --- | --- |
-| `yacron2 state backup -o FILE.tar.gz` | Writes a `.tar.gz` of the store (records and leases; `tmp/` and `quarantine/` excluded). Safe against a live daemon. |
-| `yacron2 state restore FILE.tar.gz [--force]` | Restores a backup into the store; refuses a non-empty store without `--force`, and sanitises archive members. |
+| `yacron2 state backup -o FILE.tar.gz` | Writes an owner-only (`0o600`) `.tar.gz` of the store (records, documents, blobs, and leases; `tmp/` and `quarantine/` excluded). Safe against a live daemon. |
+| `yacron2 state restore FILE.tar.gz [--force]` | Restores a backup into the store; refuses a non-empty store without `--force` (which merges, keeping the newer lease fences), and sanitises archive members. Not safe while a daemon uses the store. |
 | `yacron2 state migrate --dest PATH [--dest-deployment-id ID]` | Copies the store between paths/mounts (local ↔ Amazon S3 Files / EFS) with torn-read-safe atomic placement; then point `state.path` at the new home. |
-| `yacron2 state gc [--dry-run]` | Runs a manual [GC pass](#garbage-collection-and-manifests). |
+| `yacron2 state gc [--dry-run]` | Runs a manual [GC pass](#garbage-collection-and-manifests); reports the reclaimed streams and orphaned artifact blobs, or why the blob sweep was skipped. |
 | `yacron2 state check` | Probes writability and prints an inventory of the store. |
 | `yacron2 state migrate-schema [--dry-run]` | Rewrites records of older *known* record schemes to the current one. `v1` is the only scheme so far, so today this reports and converts nothing; unknown versions are left to quarantine-on-read. |
 
@@ -974,7 +1006,9 @@ A backend read error at scrape time omits the state families from that scrape
   reduces what lands in the files; it does not replace encrypting the volume.
 * **Backups.** `yacron2 state backup` is safe to run against a live daemon
   (immutable records mean a backup never races a rewrite); pair it with
-  `state restore` / `state migrate` for moves between hosts or mounts.
+  `state restore` / `state migrate` for moves between hosts or mounts
+  (those two are *not* safe against a store a daemon is actively using;
+  stop the daemon first).
 
 ## See also
 

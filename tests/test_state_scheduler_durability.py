@@ -676,6 +676,100 @@ async def test_retry_consume_fail_closed_without_backend(tmp_path):
     assert await cron._retry_consume_ok("j", 1, quiet=False)
 
 
+async def test_retry_consume_survives_raised_store_error(
+    tmp_path, monkeypatch
+):
+    # regression (crash-safety): the cross-node consume's claim-lease calls
+    # were guarded only against TimeoutError, but the filesystem backend
+    # RAISES OSError on a sick shared mount (flock ENOLCK/EIO/ESTALE). The
+    # escape killed the schedule_retry_job task -- silently dropping the
+    # due retry -- and was later re-raised out of cancel_job_retries'
+    # awaiter, crashing the whole scheduler. A raised store error must
+    # follow onStoreUnavailable exactly like a timeout: degrade (the
+    # default) proceeds unserialized rather than dying.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        monkeypatch.setattr(
+            cron, "_retry_cross_node_eligible", lambda job: True
+        )
+
+        async def _boom(*_a, **_k):
+            raise OSError("no locks available")
+
+        cron.state_backend.acquire_lease = _boom  # type: ignore[method-assign]
+        cron.state_backend.read_lease = _boom  # type: ignore[method-assign]
+        calls, fake = _count_launcher()
+        cron.maybe_launch_job = fake  # type: ignore[method-assign]
+        state = JobRetryState(1, 2, 60)
+        state.next_delay()
+        cron.retry_state["j"] = state
+        task = asyncio.create_task(cron.schedule_retry_job("j", 0.01, 1))
+        state.task = task
+        # on regression this re-raises the escaped OSError
+        await asyncio.wait_for(task, timeout=20)
+        assert task.exception() is None  # nothing stored for a later awaiter
+        assert calls == ["j"]  # the retry fired instead of being dropped
+        # the job's next fire cancels the ladder: must not re-raise either
+        await cron.cancel_job_retries("j", settle="superseded")
+    finally:
+        await _stop_state(cron)
+
+
+async def test_retry_consume_fail_closed_defers_on_raised_store_error(
+    tmp_path, monkeypatch
+):
+    # fail-closed maps the raised store error to a deferral (the ladder
+    # stays armed and re-checks), never to a launch without a claim -- and
+    # never to an escape.
+    cron = await _stateful_cron(
+        tmp_path,
+        _RETRY_JOB,
+        extra_state="  onStoreUnavailable: fail-closed\n",
+    )
+    try:
+        monkeypatch.setattr(
+            cron, "_retry_cross_node_eligible", lambda job: True
+        )
+
+        async def _boom(*_a, **_k):
+            raise OSError("no locks available")
+
+        cron.state_backend.acquire_lease = _boom  # type: ignore[method-assign]
+        cron.state_backend.read_lease = _boom  # type: ignore[method-assign]
+        decision = await cron._retry_consume_decision(
+            cron.cron_jobs["j"], 1, quiet=False
+        )
+        assert decision == "defer"
+    finally:
+        await _stop_state(cron)
+
+
+async def test_cancel_job_retries_swallows_dead_task_error(tmp_path, caplog):
+    # belt and suspenders for the same crash: cancel_job_retries runs on
+    # the launch path (launch_scheduled_job), outside run()'s try/except,
+    # so an exception stored in a dead retry task must be logged and
+    # swallowed there -- never re-raised into the scheduler loop.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        state = JobRetryState(1, 2, 60)
+        state.next_delay()
+
+        async def _dead():
+            raise OSError("flock: no locks available")
+
+        task = asyncio.create_task(_dead())
+        await asyncio.wait({task})
+        state.task = task
+        cron.retry_state["j"] = state
+        await cron.cancel_job_retries("j", settle="superseded")
+        assert "j" not in cron.retry_state
+        assert any(
+            "retry task died" in r.getMessage() for r in caplog.records
+        )
+    finally:
+        await _stop_state(cron)
+
+
 # --- standalone @reboot dedupe --------------------------------------------
 
 

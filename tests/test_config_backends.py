@@ -5,6 +5,8 @@ the backend dispatch in _build_cluster_config, and each lease backend's
 defaults, validation, and secret resolution.
 """
 
+import os
+
 import pytest
 
 from yacron2.config import (
@@ -13,8 +15,10 @@ from yacron2.config import (
     DEFAULT_K8S,
     ConfigError,
     _redact_userinfo,
+    _validate_cross_sections,
     cluster_config_warnings,
     parse_config_string,
+    parse_config_with_sources,
 )
 
 
@@ -864,3 +868,199 @@ def test_filesystem_gossip_only_keys_are_advisories():
     assert any("interval" in w for w in warnings)
     assert any("electLeader" in w for w in warnings)
     assert cfg["electLeader"] is True  # the override stands
+
+
+# --- non-finite floats in the state / filesystem range checks ---------------
+# strictyaml's Float() accepts '.nan' and overflow literals like '1e309'
+# (== inf), and 'nan < floor' is False, so a floor-only check waves them
+# through into the lease/TTL arithmetic (a nan lease is never validly held; an
+# inf one never expires). The validators must reject non-finite values.
+
+
+def test_filesystem_ttl_rejects_non_finite():
+    for bad in (".nan", "1e309"):
+        with pytest.raises(ConfigError, match="ttl must be >= 3"):
+            _cluster(_FS + "    ttl: {}\n".format(bad))
+
+
+def test_state_floats_reject_non_finite():
+    cases = (
+        "  slotTtlSeconds: {}\n",
+        "  maxOpsPerSecond: {}\n",
+        "  jobApi:\n    lockTtlSeconds: {}\n",
+    )
+    for extra in cases:
+        for bad in (".nan", "1e309"):
+            with pytest.raises(ConfigError, match="finite"):
+                parse_config_string(
+                    "state:\n  path: /x\n" + extra.format(bad), ""
+                )
+
+
+def test_state_floats_accept_finite_values():
+    # the pre-existing valid range must stay valid (no over-tightening).
+    cfg = parse_config_string(
+        "state:\n"
+        "  path: /x\n"
+        "  slotTtlSeconds: 30\n"
+        "  maxOpsPerSecond: 0\n"
+        "  jobApi:\n"
+        "    lockTtlSeconds: 5.5\n",
+        "",
+    ).state_config
+    assert cfg["slotTtlSeconds"] == 30
+    assert cfg["jobApi"]["lockTtlSeconds"] == 5.5
+
+
+# --- state.jobApi.listen port validation ------------------------------------
+# an unvalidated port passed config validation and then blew up the API
+# startup at runtime (urlparse().port raises), permanently disabling the
+# loopback endpoint; the config load must catch it instead.
+
+
+def test_jobapi_listen_bad_port_rejected():
+    for bad in ("127.0.0.1:99999", "127.0.0.1:abc", "127.0.0.1:0"):
+        with pytest.raises(ConfigError, match="1-65535"):
+            parse_config_string(
+                "state:\n  path: /x\n  jobApi:\n"
+                "    listen: '{}'\n".format(bad),
+                "",
+            )
+
+
+def test_jobapi_listen_valid_forms_parse():
+    # bare host:port, a portless host (ephemeral bind, same as the default)
+    # and the http:// URL form must all stay valid.
+    for good in ("127.0.0.1:8080", "127.0.0.1", "http://localhost:9000"):
+        cfg = parse_config_string(
+            "state:\n  path: /x\n  jobApi:\n"
+            "    listen: '{}'\n".format(good),
+            "",
+        ).state_config
+        assert cfg["jobApi"]["listen"] == good
+
+
+# --- DAG config validation (schedule form, retries, name collisions) --------
+
+_STATE = "state:\n  path: /tmp/x\n"
+
+
+def _xsect(yaml):
+    _validate_cross_sections(parse_config_string(_STATE + yaml, ""))
+
+
+def test_dag_reboot_schedule_rejected():
+    # "@reboot" survives _parse_schedule as a plain string, but every DAG
+    # scheduling path computes next-fire instants from a CronTab; reject at
+    # load rather than crash the scheduler.
+    with pytest.raises(ConfigError, match="not supported for dags"):
+        parse_config_string(
+            "dags:\n  - name: d\n    schedule: '@reboot'\n    tasks:\n"
+            "      - id: t\n        command: 'echo'\n",
+            "",
+        )
+
+
+def test_dag_alias_schedules_parse():
+    # aliases the crontab library expands into a real CronTab stay valid --
+    # the rejection is structural (whatever stays a string), not a blacklist.
+    for alias in ("@daily", "@hourly"):
+        cfg = parse_config_string(
+            "dags:\n  - name: d\n    schedule: '{}'\n    tasks:\n"
+            "      - id: t\n        command: 'echo'\n".format(alias),
+            "",
+        )
+        assert cfg.dags[0].schedule_job is not None
+
+
+def test_dag_task_negative_retries_rejected():
+    # the job-level maximumRetries documents -1 as retry-forever; on a dag
+    # task a negative value would silently mean ZERO retries, so reject it.
+    for bad in (-1, -5):
+        with pytest.raises(ConfigError, match="not supported for dag tasks"):
+            parse_config_string(
+                "dags:\n  - name: d\n    tasks:\n"
+                "      - id: t\n        command: 'echo'\n"
+                "        retries: {}\n".format(bad),
+                "",
+            )
+
+
+def test_dag_task_zero_retries_parses():
+    cfg = parse_config_string(
+        "dags:\n  - name: d\n    tasks:\n"
+        "      - id: t\n        command: 'echo'\n        retries: 0\n",
+        "",
+    )
+    assert cfg.dags[0].tasks[0].spec.max_attempts == 1
+
+
+def test_job_name_colliding_with_dag_task_template_rejected():
+    # dag tasks launch under '<dag>.<taskId>' and share the scheduler's
+    # per-name bookkeeping with jobs: a job named 'etl.extract' with
+    # concurrencyPolicy Replace would cancel the unrelated in-flight dag
+    # task (Forbid silently skips). Rejected at load, naming both parties.
+    with pytest.raises(ConfigError, match="collides with dag 'etl'"):
+        _xsect(
+            "jobs:\n  - name: etl.extract\n    command: echo\n"
+            "    schedule: '* * * * *'\n"
+            "dags:\n  - name: etl\n    tasks:\n"
+            "      - id: extract\n        command: 'echo'\n"
+        )
+
+
+def test_dag_dot_task_ids_colliding_across_dags_rejected():
+    # task ids may contain '.', so dag 'a' task 'b.c' and dag 'a.b' task 'c'
+    # both mint the template name 'a.b.c'.
+    with pytest.raises(ConfigError, match="both launch"):
+        _xsect(
+            "dags:\n"
+            "  - name: a\n    tasks:\n"
+            "      - id: b.c\n        command: 'echo'\n"
+            "  - name: a.b\n    tasks:\n"
+            "      - id: c\n        command: 'echo'\n"
+        )
+
+
+def test_near_miss_job_and_dag_names_still_parse():
+    # near-misses must not be caught: a job 'etl-extract' next to dag 'etl'
+    # task 'extract', and a job sharing the BARE dag name (the synthetic
+    # schedule job is 'dag:'-prefixed and never launched, and dag run/XCom
+    # state lives under its own scopes, so bare names never collide).
+    _xsect(
+        "jobs:\n"
+        "  - name: etl-extract\n    command: echo\n"
+        "    schedule: '* * * * *'\n"
+        "  - name: etl\n    command: echo\n"
+        "    schedule: '* * * * *'\n"
+        "dags:\n  - name: etl\n    tasks:\n"
+        "      - id: extract\n        command: 'echo'\n"
+    )
+
+
+# --- DAG task env_file paths belong to the reload source set ----------------
+
+
+def test_dag_task_env_file_in_reload_sources(tmp_path):
+    # the scheduler stats the source set to skip an unchanged reparse; a dag
+    # task's env_file missing from it meant edits (e.g. a rotated credential)
+    # never triggered a reload.
+    job_env = tmp_path / "job.env"
+    task_env = tmp_path / "task.env"
+    job_env.write_text("A=1\n")
+    task_env.write_text("B=2\n")
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(
+        "state:\n  path: /tmp/x\n"
+        "jobs:\n  - name: j\n    command: echo\n"
+        "    schedule: '* * * * *'\n"
+        "    env_file: '{}'\n"
+        "dags:\n  - name: d\n    tasks:\n"
+        "      - id: t\n        command: 'echo'\n"
+        "        env_file: '{}'\n".format(
+            job_env.as_posix(), task_env.as_posix()
+        )
+    )
+    _, sources = parse_config_with_sources(str(cfg_file))
+    assert os.path.abspath(str(job_env)) in sources
+    assert os.path.abspath(str(task_env)) in sources

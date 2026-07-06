@@ -12,6 +12,7 @@ import asyncio
 import datetime
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ import pytest
 
 import yacron2.__main__
 import yacron2.state as state_mod
+from yacron2.platform import IS_WINDOWS
 from yacron2.state import _TokenBucket
 from tests.test_state import _backend
 
@@ -455,6 +457,109 @@ def test_cli_backup_restore_carries_docs_and_blobs(tmp_path, monkeypatch):
     assert blob == b"artifact-payload"  # the artifact blob survived too
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="POSIX file modes are not representable on Windows"
+)
+def test_cli_backup_archive_created_0600(tmp_path, monkeypatch):
+    # the archive flattens records/docs/blobs -- captured job output, KV
+    # values, artifact payloads, where secrets live -- into one file: it
+    # must get the store's own 0o600, not the default 0o644, including
+    # when the output path already exists with wider permissions.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    archive = tmp_path / "backup.tar.gz"
+    archive.write_bytes(b"stale")
+    os.chmod(archive, 0o644)
+    assert (
+        _cli(
+            monkeypatch,
+            ["state", "backup", "-c", config, "-o", str(archive)],
+        )
+        == 0
+    )
+    assert stat.S_IMODE(os.stat(archive).st_mode) == 0o600
+
+
+def test_cli_restore_force_does_not_regress_lease_fences(
+    tmp_path, monkeypatch, capsys
+):
+    # a backup's lease files are older by definition; restoring them over
+    # the store's current ones would regress the fence counters (a lease
+    # file is its fence's only home), re-issuing already-handed-out fence
+    # values -- the double-execution hazard in a fleet.  Restore must keep
+    # the newer current lease (fence-max merge) and say so.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def _seed():
+        backend = _backend(store)
+        await backend.start()
+        await backend.append_record("runs/j", {"outcome": "success"})
+        return await backend.acquire_lease("slot", "n1", ttl=30.0)
+
+    lease = _run(_seed())
+    assert lease is not None and lease.fence == 1
+
+    archive = str(tmp_path / "backup.tar.gz")
+    assert (
+        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        == 0
+    )
+
+    # bump the store's fence past the archived one: taking over a released
+    # lease increments it (release marks the lease expired in place).
+    async def _bump():
+        backend = _backend(store)
+        await backend.start()
+        current = await backend.read_lease("slot")
+        await backend.release_lease(current)
+        return await backend.acquire_lease("slot", "n2", ttl=30.0)
+
+    bumped = _run(_bump())
+    assert bumped is not None and bumped.fence == 2
+
+    capsys.readouterr()
+    assert (
+        _cli(
+            monkeypatch,
+            ["state", "restore", "-c", config, "--force", archive],
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "kept 1 current lease file" in out
+
+    async def _after():
+        backend = _backend(store)
+        await backend.start()
+        return await backend.read_lease("slot")
+
+    after = _run(_after())
+    assert after is not None
+    assert after.fence == 2  # NOT regressed to the archived fence 1
+    assert after.holder == "n2"
+    # the non-lease payload still merged in.
+    recs = _read_store(store, "runs/j")
+    assert {"outcome": "success"} in recs
+
+    # into an EMPTY store (disaster recovery) the archived lease IS carried,
+    # fence and all, so fence issuance continues from the archived value.
+    store2 = tmp_path / "restored"
+    config2 = _write_config(tmp_path, store2, name="cfg2.yaml")
+    assert (
+        _cli(monkeypatch, ["state", "restore", "-c", config2, archive]) == 0
+    )
+
+    async def _fresh():
+        backend = _backend(store2)
+        await backend.start()
+        return await backend.read_lease("slot")
+
+    fresh = _run(_fresh())
+    assert fresh is not None and fresh.fence == 1
+
+
 def test_cli_migrate(tmp_path, monkeypatch, capsys):
     store = tmp_path / "store"
     config = _write_config(tmp_path, store)
@@ -517,6 +622,133 @@ def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
     )
     out = capsys.readouterr().out
     assert "gc would remove" in out
+
+
+def _seed_gc_manifests(backend_coro_store):
+    """Manifests letting a default-grace (7 day) CLI gc prove absence."""
+
+    async def go():
+        backend = _backend(backend_coro_store)
+        now = datetime.datetime.now(_UTC)
+        await backend.append_record(
+            "manifests/old-host",
+            {
+                "jobSetId": "v1:old",
+                "host": "old-host",
+                "jobs": [],
+                "at": (now - datetime.timedelta(days=8)).isoformat(),
+            },
+        )
+        await backend.append_record(
+            "manifests/other-host",
+            {
+                "jobSetId": "v1:other",
+                "host": "other-host",
+                "jobs": [],
+                "scopes": [],
+                "dags": [],
+                "at": now.isoformat(),
+            },
+        )
+
+    _run(go())
+
+
+def test_cli_gc_reclaims_artifacts_and_blobs(tmp_path, monkeypatch, capsys):
+    # `yacron2 state gc` must reclaim what the daemon pass reclaims: a
+    # removed scope's artifact stream ages out and the orphaned payload
+    # blob is swept -- with --dry-run reporting both without deleting.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        from yacron2 import jobstate
+
+        backend = _backend(store)
+        await backend.start()
+        old = state_mod._now() - 8 * 86400.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old)
+        try:
+            gone = await jobstate.artifact_put(
+                backend, "gone", "a", b"gone-payload"
+            )
+            kept = await jobstate.artifact_put(
+                backend, "j", "k", b"job-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        for rec in (gone, kept):
+            os.utime(backend._blob_path(rec["sha256"]), (old, old))
+        return gone, kept
+
+    gone, kept = _run(seed())
+    _seed_gc_manifests(store)
+
+    # dry run: the stream and its blob are reported, nothing is deleted.
+    assert _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "gc would remove" in out
+    assert "would remove 1 orphaned artifact blob(s)" in out
+    assert len(_read_store(store, "artifacts/gone")) == 1
+
+    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "removed 1 orphaned artifact blob(s)" in out
+    assert _read_store(store, "artifacts/gone") == []
+    # the config job's artifact scope survives, record and blob alike.
+    assert len(_read_store(store, "artifacts/j")) == 1
+
+    async def blobs():
+        backend = _backend(store)
+        return (
+            await backend.get_blob(gone["sha256"]),
+            await backend.get_blob(kept["sha256"]),
+        )
+
+    gone_blob, kept_blob = _run(blobs())
+    assert gone_blob is None
+    assert kept_blob == b"job-payload"
+
+
+def test_cli_gc_sweep_skipped_on_hidden_artifact_stream(
+    tmp_path, monkeypatch, capsys
+):
+    # the KEEP fail-safe end to end: a legacy truncated artifact stream
+    # (no name sidecar) makes the enumeration incomplete, so the CLI must
+    # skip the blob sweep, say why, and leave the hidden stream's payload
+    # untouched.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        from yacron2 import jobstate
+
+        backend = _backend(store)
+        await backend.start()
+        old = state_mod._now() - 8 * 86400.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old)
+        try:
+            rec = await jobstate.artifact_put(
+                backend, "S" * 200, "a", b"hidden-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        os.utime(backend._blob_path(rec["sha256"]), (old, old))
+        stream_dir = backend._stream_dir("artifacts/" + "S" * 200)
+        os.unlink(os.path.join(stream_dir, state_mod._STREAM_NAME_SIDECAR))
+        return rec
+
+    rec = _run(seed())
+    _seed_gc_manifests(store)
+    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "orphan-blob sweep skipped" in out
+
+    async def check():
+        backend = _backend(store)
+        return await backend.get_blob(rec["sha256"])
+
+    assert _run(check()) == b"hidden-payload"
 
 
 def test_cli_migrate_schema(tmp_path, monkeypatch, capsys):

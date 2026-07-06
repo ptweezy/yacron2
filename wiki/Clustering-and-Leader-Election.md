@@ -1266,8 +1266,10 @@ treat its own freshly-won lease as expired).
 * **Sharing a directory with `state:`.** Legal, and recommended when both are
   used (same `path` *and* `deploymentId`): the election's embedded store runs
   none of the scheduler's durable-state chores (no manifests, no GC, no
-  counters), the stream namespaces are disjoint, and lease files are never
-  garbage-collected.
+  counters), the stream namespaces are disjoint, and lease files are left
+  alone while they can matter -- the scheduler's GC reclaims a lease only
+  once both its expiry and its last write are a full `gcGraceSeconds` old,
+  which a live election lease (constantly renewed) never is.
 * **`@reboot` one-shots.** Same semantics as the other lease backends: once
   per job **configuration**, not once per boot. The "already ran" set is
   persisted as **append-only records** (one per newly-ran job, tagged with

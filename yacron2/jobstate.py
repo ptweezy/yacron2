@@ -396,18 +396,24 @@ async def artifact_list(
 
 
 async def referenced_blob_digests(
-    backend: StateBackend, scopes: List[str]
+    backend: StateBackend, scopes: List[str], *, strict: bool = False
 ) -> "set[str]":
     """Every blob digest the surviving artifact records of ``scopes`` name.
 
     Fed to :meth:`StateBackend.sweep_orphan_blobs` by the garbage collector so
     a blob is kept while any live artifact record still points at it (blobs
     dedupe across scopes, so the reference set must span every surviving
-    scope, not one).
+    scope, not one).  The collectors pass ``strict=True``: a record that
+    cannot be read right now (an NFS blip, a newer node's schema) then
+    PROPAGATES instead of being skipped, because a silently-missed record
+    would present its still-live blob to the sweep as an orphan.  The caller
+    treats the exception as "reference set unknown" and skips the sweep.
     """
     digests: set[str] = set()
     for scope in scopes:
-        records = await backend.list_records(ARTIFACT_STREAM_PREFIX + scope)
+        records = await backend.list_records(
+            ARTIFACT_STREAM_PREFIX + scope, strict=strict
+        )
         for record in records:
             digest = record.get("sha256")
             if isinstance(digest, str):

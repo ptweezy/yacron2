@@ -55,7 +55,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
         "--force",
         default=False,
         action="store_true",
-        help="merge into a non-empty store",
+        help="merge into a non-empty store (NOT safe while a daemon uses it)",
     )
     migrate = _with_config(
         actions.add_parser(

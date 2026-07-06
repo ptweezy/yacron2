@@ -220,6 +220,34 @@ async def test_call_survives_abandoned_await(tmp_path):
     assert captured == []
 
 
+async def test_inventory_runs_via_call_daemon_thread(tmp_path):
+    # inventory() used to submit its full listdir walk to the DEFAULT
+    # executor (loop.run_in_executor(None, ...)), bypassing _call's
+    # abandonable daemon threads, lane cap and throttle: a dashboard
+    # polling GET /state against a hung mount wedged the non-daemon
+    # default workers one by one, after which config reload -- and the
+    # interpreter-exit join of those workers -- hung behind them.  The
+    # walk must ride the same "yacron2-state" daemon lane as every other
+    # op, and be accounted in the per-op stats like one.
+    backend = _backend(tmp_path)
+    await backend.start()
+    seen = {}
+    real_inventory = backend._inventory_sync
+
+    def spy():
+        thread = threading.current_thread()
+        seen["daemon"] = thread.daemon
+        seen["name"] = thread.name
+        return real_inventory()
+
+    backend._inventory_sync = spy  # type: ignore[method-assign]
+    inv = await backend.inventory()
+    assert inv["enumerable"] is True
+    assert seen["daemon"] is True
+    assert seen["name"].startswith("yacron2-state")
+    assert "inventory" in backend.stats()["ops"]
+
+
 # --- Cron.run(): the shutdown flush ----------------------------------------
 
 

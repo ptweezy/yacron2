@@ -107,7 +107,7 @@ reachable in every task:
 ```bash
 # in an upstream task:
 echo '{"rows": 42}' | yacron2 xcom push --key summary
-producer_output_file.json | yacron2 xcom push --key summary   # or from a file
+yacron2 xcom push --key summary producer_output_file.json    # or from a file
 
 # in a downstream task:
 yacron2 xcom pull --task upstream_id --key summary            # -> stdout
@@ -147,6 +147,12 @@ The expanded item set is recorded **once** in the dag_run and never recomputed,
 so a crash-resumed run reconstructs the identical set of mapped instances
 rather than re-deriving it from a possibly-changed upstream output.
 
+A fan-out is capped at **1000 items**: a larger XCom list fails the mapped
+task with an explanatory reason instead of materialising the flood (its
+`all_success` downstream sees `upstream_failed`). A single scheduler pass
+also launches at most 32 instances at a time, so a large fan-out ramps up in
+bounded bursts rather than one subprocess stampede.
+
 ## Sensors
 
 A `type: sensor` task polls an external condition on a bounded, jittered,
@@ -185,8 +191,12 @@ downstream). The decision (`by`, timestamp) is recorded durably.
 
 ## Scheduling, catch-up, and backfill
 
-A scheduled DAG reuses the job [schedule grammar](Schedules-and-Timezones) and
-the [catch-up discipline](Durable-State#missed-run-catch-up): `onMissed`
+A scheduled DAG reuses the job [schedule grammar](Schedules-and-Timezones)
+with one restriction: the schedule must parse to a cron expression, so
+`@reboot` is rejected at config load (`DAG schedules must be cron
+expressions; @reboot is not supported for dags`), while `@daily` /
+`@hourly`-style aliases still work. It follows the
+[catch-up discipline](Durable-State#missed-run-catch-up): `onMissed`
 (`skip` / `run-once` / `run-all`) and `startingDeadlineSeconds` bound how many
 missed logical dates a restart replays, capped like a job's catch-up. A DAG
 with no `schedule` is manual-only.
@@ -223,11 +233,18 @@ that must be exactly-once should guard its side effect with an
 
 ## Retention and GC
 
-A dag_run document is durable and is **not** swept by the record garbage
-collector. Instead each DAG keeps its newest `retainRuns` **terminal** runs
-(default 50) and prunes the rest, along with their XCom, on a periodic
-DAG-owned pass. Artifact payload blobs are content-addressed and never swept,
-so a retained run's XCom can never dangle.
+A dag_run document is durable and, while its DAG is configured, is **not**
+swept by the record garbage collector. Instead each DAG keeps its newest
+`retainRuns` **terminal** runs (default 50) and prunes the rest, along with
+their XCom, on a periodic DAG-owned pass. A DAG *removed from every config*
+ages out like a removed job: once it has been absent from every config and
+recent manifest for a full `state.gcGraceSeconds`, the daemon's
+[GC pass](Durable-State#garbage-collection-and-manifests) deletes its
+terminal run documents (an active run is never touched, so a re-added DAG
+resumes it) and its aged XCom streams. Artifact payload blobs are
+content-addressed; a blob any surviving record still references is never
+swept, so a retained run's XCom can never dangle -- only blobs no surviving
+record references, and older than the grace, are reclaimed.
 
 ## Inspecting and controlling runs
 

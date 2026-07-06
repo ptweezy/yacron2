@@ -144,10 +144,13 @@ yacron2 state ACTION [options] [-c FILE-OR-DIR]
 configuration's `state:` section (the daemon-side store on disk or on a shared
 mount -- not the [Web Dashboard](Web-Dashboard)'s browser-side IndexedDB run
 ledger, which is a separate, purely client-side feature). Every action works
-offline, straight from the configuration, with no running daemon required; and
-every action stays safe against a *running* daemon, because records are
-immutable and copies/reads never lock. A backup taken mid-write is a
-point-in-time-ish snapshot rather than an exact one.
+offline, straight from the configuration, with no running daemon required.
+Actions that read or copy *out of* the store (`backup`, `check`,
+`migrate-schema`) and the `gc` pass stay safe against a *running* daemon,
+because records are immutable and copies/reads never lock; a backup taken
+mid-write is a point-in-time-ish snapshot rather than an exact one.
+Restoring or migrating *into* a store a daemon is actively using is **not**
+safe (see [`state restore`](#state-restore) / [`state migrate`](#state-migrate)).
 
 Each action accepts its own `-c`/`--config`, with the same meaning and default
 as the daemon flag, so both positions work: `yacron2 -c /etc/yacron2.d state gc`
@@ -173,13 +176,17 @@ yacron2 state backup -o FILE.tar.gz [-c FILE-OR-DIR]
 ```
 
 Writes a gzipped tar of the store's namespace to `-o`/`--output` (required).
-The archive carries the immutable records (`records/`) and the lease files
-(`leases/`) -- a lease file is the only home of its fence counter, so dropping
-it would re-issue fence values. Deliberately *not* carried: `tmp/` (transient
-write debris) and `quarantine/` (poison records; forensics stay with the
-source store). Against a live daemon, a file that disappears mid-backup (a
-prune, a lease rewrite) is skipped, by design. Exits `1` when the store
-directory does not exist (`nothing to back up`).
+The archive carries the full store: the immutable records (`records/`), the
+mutable documents (`docs/` -- KV entries, cursors, idempotency claims, and
+dag_run documents), the content-addressed artifact payloads (`blobs/`), and
+the lease files (`leases/` -- a lease file is the only home of its fence
+counter, so dropping it would re-issue fence values). Deliberately *not*
+carried: `tmp/` (transient write debris) and `quarantine/` (poison records;
+forensics stay with the source store). The archive is created owner-only
+(mode `0600`): it flattens captured job output, KV values, and artifact
+payloads into a single file. Against a live daemon, a file that disappears
+mid-backup (a prune, a lease rewrite) is skipped, by design. Exits `1` when
+the store directory does not exist (`nothing to back up`).
 
 ### `state restore`
 
@@ -188,11 +195,17 @@ yacron2 state restore FILE.tar.gz [--force] [-c FILE-OR-DIR]
 ```
 
 Extracts a backup archive into the configured store. It refuses to restore
-into a store that already contains records or leases and exits `1`; pass
-`--force` to merge the archive into it. Archive members are sanitised: only
-plain files that extract strictly inside the store are honored (no absolute
-paths, no `..` escapes, no symlinks or devices), and each file lands with
-mode `0600`.
+into a store that already contains data and exits `1`; pass `--force` to
+merge the archive into it. Restoring is **not** safe while a daemon uses the
+store -- stop the daemon first. Archive members are sanitised: only plain
+files that extract strictly inside the store are honored (no absolute paths,
+no `..` escapes, no symlinks or devices), and each file lands with mode
+`0600` via a temp sibling plus atomic replace, so a concurrent reader never
+sees a torn record. When merging into a populated store, `.lock` side-files
+are skipped (a live daemon may hold an OS lock on that very inode), and a
+lease file replaces the current one only when its archived fence counter is
+provably not older -- a fence-max merge; regressing a fence would re-issue
+fence values already handed out. The kept-lease count is reported.
 
 ### `state migrate`
 
@@ -222,12 +235,18 @@ yacron2 state gc [--dry-run] [-c FILE-OR-DIR]
 ```
 
 Runs one manual garbage-collection pass with the same rules as the daemon's
-automatic periodic pass: it removes the streams of jobs that no recent
-manifest references and whose newest record is older than
-`state.gcGraceSeconds`, plus counter streams of unmanifested hosts, crashed
-write-temp files, and quarantined records older than the grace. It prints
-what was removed (or, with `--dry-run`, what would be) and the kept-stream
-count. Like the automatic pass, it defers (exit `0`, with a message) until
+automatic periodic pass: it removes the streams of jobs (and artifact
+scopes) that no recent manifest references and whose newest record is older
+than `state.gcGraceSeconds`, plus counter and manifest streams of
+unmanifested hosts, provably dead lease files, crashed write-temp files, and
+quarantined records older than the grace, then sweeps artifact payload
+blobs no surviving record references. It prints what was removed (or, with
+`--dry-run`, what would be), the kept-stream count, and the reclaimed
+orphan-blob count -- or the reason the blob sweep stood down (an
+unenumerable artifact stream or an unreadable record keeps every blob). Run
+documents of removed DAGs are left to the running daemon's own pass, which
+alone knows what it owns. Like the automatic pass, it defers (exit `0`,
+with a message) until
 the store's manifest history spans one full grace window -- a store that
 cannot yet prove absence deletes nothing. When GC is disabled
 (`gcGraceSeconds` <= 0) the command reports that there is nothing to collect
@@ -311,10 +330,11 @@ The commands share one exit-code convention, made for shell branching:
 | Code | Meaning |
 | --- | --- |
 | `0` | Success (or, for `idempotent`, the claim was fresh). |
-| `1` | An error (or, for `idempotent`, the key was already claimed -- a duplicate). |
+| `1` | An error (a transport or store failure). |
 | `2` | Usage error (argparse; e.g. a command invoked with no action). |
 | `3` | A `lock acquire` / `lock run` did not get the lock. |
 | `4` | The looked-up key, cursor, artifact, or secret does not exist. |
+| `5` | The `idempotent` key was already claimed -- a duplicate. |
 
 ### `state get|set|delete|keys` (durable key/value)
 
@@ -384,8 +404,10 @@ yacron2 idempotent KEY [--ttl S] [--release] [--scope NAME | --global]
 ```
 
 A fleet-wide create-if-absent claim: the first caller to claim `KEY` exits `0`
-(fresh -- do the work), every later caller exits `1` (a duplicate -- skip it),
-made for a shell guard around an at-most-once side effect. `--ttl S` expires the
+(fresh -- do the work), every later caller exits `5` (a duplicate -- skip it),
+made for a shell guard around an at-most-once side effect. A transport or
+store error exits `1` instead, distinct from the duplicate code, so an outage
+is detectable rather than reading as "already done". `--ttl S` expires the
 claim after `S` seconds (`0`, the default, is a permanent claim); `--release`
 drops the claim instead of making it, so `KEY` can be claimed fresh again.
 

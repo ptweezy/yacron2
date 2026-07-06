@@ -152,10 +152,10 @@ def test_job_to_dict_cluster_slot_block():
     d = cron._job_to_dict("clustered", cron.cron_jobs["clustered"])
     assert d["concurrencyScope"] == "cluster"
     assert d["slot"] == {"held": False, "holder": None, "refs": 0}
-    # now hold the slot lease
+    # now hold the slot lease -- keyed by plain job name, as production does
     slot = cron._slot_name("clustered")
-    cron._slot_leases[slot] = Lease(slot, "host-a#tok", 3, 9e18)
-    cron._slot_refs[slot] = 2
+    cron._slot_leases["clustered"] = Lease(slot, "host-a#tok", 3, 9e18)
+    cron._slot_refs["clustered"] = 2
     d = cron._job_to_dict("clustered", cron.cron_jobs["clustered"])
     assert d["slot"] == {"held": True, "holder": "host-a#tok", "refs": 2}
 

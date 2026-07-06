@@ -34,6 +34,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from crontab import CronTab
+
 from yacron2 import _json, dag, platform
 from yacron2.dag import DagSpec
 from yacron2.job import RunningJob
@@ -65,6 +67,19 @@ APPROVAL_POLL_INTERVAL = 5.0
 # Hard cap on how many missed occurrences a single catch-up replays, mirroring
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
 DAG_MAX_CATCHUP = 100
+
+# When an advance cannot proceed (a failed pass, or a lapsed lease that cannot
+# be verified against the store), re-check after this long instead of leaving
+# a due wake in place -- a fast-failing store must not spin the main loop.
+ADVANCE_RETRY_DELAY = 5.0
+
+# A failed completion RMW is re-attempted on later service passes with this
+# bounded backoff.  Retrying until it lands is safe (mark_task_finished is
+# fenced and idempotent) and necessary: giving up would wedge the run forever,
+# since the RUNNING entry is protected from reconciliation by its own proc
+# token while this daemon lives.
+COMPLETION_RETRY_DELAY = 5.0
+COMPLETION_RETRY_MAX_DELAY = 60.0
 
 RunRef = Tuple[str, str]  # (dag_name, run_key)
 
@@ -124,6 +139,15 @@ class DagScheduler:
         # that changes a schedule (or disables a dag) re-seeds strictly-future
         # instead of replaying the gap (mirrors the job _refresh_schedule).
         self._seeded: Dict[str, str] = {}
+        # dag name -> the schedule signature whose seed raised, so a poisoned
+        # dag is logged once and skipped (a reload changing its schedule
+        # retries) instead of failing -- and spamming -- every seed cadence.
+        self._seed_failed: Dict[str, str] = {}
+        # (ref, taskkey) -> a completion whose RMW failed, queued for retry on
+        # later service passes (see COMPLETION_RETRY_DELAY).
+        self._pending_completions: Dict[
+            Tuple[RunRef, str], Dict[str, Any]
+        ] = {}
         self._service_task: Optional[asyncio.Task] = None
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
@@ -206,6 +230,10 @@ class DagScheduler:
             or now >= self._next_adopt
             or now >= self._next_gc
             or any(w <= now for w in self._wake.values())
+            or any(
+                pc["nextTryAt"] <= now
+                for pc in self._pending_completions.values()
+            )
             or any(w.timestamp() <= now for w in self._next_logical.values())
         )
         if not due:
@@ -226,6 +254,7 @@ class DagScheduler:
             if now >= self._next_adopt:
                 self._next_adopt = now + ADOPT_SCAN_INTERVAL
                 await self._adopt_orphans()
+            await self._retry_completions(now)
             await self._advance_owned(now)
             if now >= self._next_gc:
                 self._next_gc = now + GC_INTERVAL
@@ -244,8 +273,16 @@ class DagScheduler:
         if self._backend() is None or not self.has_dags():
             return None
         now = _now()
+        # prune wake hints for runs this node does not own (a decision or a
+        # completion recorded here for a peer-owned run): a stale 0.0 entry
+        # would pin the loop's sleep at 0 forever.
+        for ref in list(self._wake):
+            if ref not in self._owned:
+                del self._wake[ref]
         candidates = [self._next_sched_check]
         candidates.extend(self._wake.values())
+        for pc in self._pending_completions.values():
+            candidates.append(pc["nextTryAt"])
         for when in self._next_logical.values():
             candidates.append(when.timestamp())
         if self._owned:
@@ -289,18 +326,57 @@ class DagScheduler:
             ):
                 self._next_logical.pop(name, None)
                 self._seeded.pop(name, None)
+        for name in list(self._seed_failed):
+            dagcfg = live.get(name)
+            if (
+                dagcfg is None
+                or dagcfg.schedule_job is None
+                or self._seed_failed.get(name) != self._sched_sig(dagcfg)
+            ):
+                self._seed_failed.pop(name, None)  # removed/changed: retry
         for name, dagcfg in live.items():
             sched = dagcfg.schedule_job
             if sched is None or not dagcfg.enabled:
                 continue
             if not self._cron._cluster_allows(sched):
                 continue
-            if name not in self._seeded:
+            if name in self._seeded or name in self._seed_failed:
+                continue
+            try:
                 await self._seed_dag(dagcfg, now_dt)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - isolate the poisoned dag
+                # one dag's bad seed must not starve every other dag's
+                # fire/adopt/advance; logged once per schedule signature.
+                self._seed_failed[name] = self._sched_sig(dagcfg)
+                logger.exception(
+                    "dag %s: seeding its schedule failed; it will not fire "
+                    "until a reload changes its schedule",
+                    name,
+                )
+
+    def _next_fire(
+        self, sched: Any, after: datetime.datetime
+    ) -> Optional[datetime.datetime]:
+        """``Cron._compute_next_fire``, guarded for a non-crontab schedule.
+
+        A schedule string the parser passes through verbatim (the documented
+        "@reboot") has no computable occurrences; ``None`` (never fires) keeps
+        the service pass alive instead of crashing it -- the isinstance assert
+        inside ``_compute_next_fire`` is stripped in the -OO release binary,
+        leaving a raw AttributeError.
+        """
+        if not isinstance(sched.schedule, CronTab):
+            return None
+        nxt: Optional[datetime.datetime] = self._cron._compute_next_fire(
+            sched, after
+        )
+        return nxt
 
     async def _seed_dag(self, dagcfg: Any, now_dt: datetime.datetime) -> None:
         sched = dagcfg.schedule_job
-        nxt = self._cron._compute_next_fire(sched, now_dt)
+        nxt = self._next_fire(sched, now_dt)
         if nxt is not None:
             self._next_logical[dagcfg.name] = nxt
         self._seeded[dagcfg.name] = self._sched_sig(dagcfg)
@@ -314,7 +390,7 @@ class DagScheduler:
 
     async def _fire_scheduled(self, now: float) -> None:
         now_dt = datetime.datetime.now(datetime.timezone.utc)
-        for name, dagcfg in self._dags().items():
+        for name, dagcfg in list(self._dags().items()):
             sched = dagcfg.schedule_job
             if sched is None or not dagcfg.enabled:
                 continue
@@ -322,7 +398,14 @@ class DagScheduler:
                 continue  # not seeded yet (waits for the next seed cadence)
             if not self._cron._cluster_allows(sched):
                 continue
-            await self._fire_forward(dagcfg, now_dt)
+            try:
+                await self._fire_forward(dagcfg, now_dt)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - isolate per-dag failures
+                logger.exception(
+                    "dag %s: firing its scheduled runs failed", name
+                )
 
     async def _fire_forward(
         self, dagcfg: Any, now_dt: datetime.datetime
@@ -334,7 +417,7 @@ class DagScheduler:
             if nxt is None or nxt > now_dt:
                 break
             await self._create_run(dagcfg, nxt, "scheduled")
-            following = self._cron._compute_next_fire(sched, nxt)
+            following = self._next_fire(sched, nxt)
             if following is None:
                 # the schedule has no further occurrence (a fixed past year):
                 # drop the index rather than poisoning it with None, which the
@@ -356,12 +439,12 @@ class DagScheduler:
             if cutoff > after:
                 after = cutoff
         missed: List[datetime.datetime] = []
-        nxt = self._cron._compute_next_fire(sched, after)
+        nxt = self._next_fire(sched, after)
         while (
             nxt is not None and nxt <= now_dt and len(missed) < DAG_MAX_CATCHUP
         ):
             missed.append(nxt)
-            nxt = self._cron._compute_next_fire(sched, nxt)
+            nxt = self._next_fire(sched, nxt)
         if not missed:
             return
         targets = missed[-1:] if sched.onMissed == "run-once" else missed
@@ -537,22 +620,32 @@ class DagScheduler:
             return
         for name, dagcfg in list(self._dags().items()):
             try:
-                docs = await asyncio.wait_for(
-                    backend.list_documents(self._ns(name)),
-                    timeout=STATE_OP_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
+                await self._adopt_one_dag(backend, name, dagcfg)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - isolate per-dag failures
+                logger.exception("dag %s: orphan adoption failed", name)
+
+    async def _adopt_one_dag(
+        self, backend: StateBackend, name: str, dagcfg: Any
+    ) -> None:
+        try:
+            docs = await asyncio.wait_for(
+                backend.list_documents(self._ns(name)),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return
+        for body in docs:
+            if dag.is_terminal_run(body):
                 continue
-            for body in docs:
-                if dag.is_terminal_run(body):
-                    continue
-                run_key = body.get("runKey")
-                if not isinstance(run_key, str):
-                    continue
-                ref = (name, run_key)
-                if ref in self._owned:
-                    continue
-                await self._try_own(dagcfg, ref)
+            run_key = body.get("runKey")
+            if not isinstance(run_key, str):
+                continue
+            ref = (name, run_key)
+            if ref in self._owned:
+                continue
+            await self._try_own(dagcfg, ref)
 
     # =====================================================================
     # Advancing an owned run
@@ -566,11 +659,25 @@ class DagScheduler:
     async def advance_one(self, ref: RunRef) -> None:
         lock = self._locks.setdefault(ref, asyncio.Lock())
         async with lock:
-            if ref not in self._owned:
+            lease = self._owned.get(ref)
+            if lease is None:
+                # not ours to advance (e.g. a decision/completion recorded
+                # here for a run a peer owns): drop the wake hint too, or
+                # next_wake_delay() would return 0.0 forever and busy-spin
+                # the main loop.  The durable record itself is safe -- the
+                # owner picks it up via its own poll/advance wakes.
+                self._wake.pop(ref, None)
                 return
             dagcfg = self._dags().get(ref[0])
             if dagcfg is None:
                 await self._release(ref)  # dag removed on reload
+                return
+            if not await self._lease_usable(ref, lease):
+                if ref in self._owned:
+                    # unverifiable (store unreachable) or expired-but-untaken:
+                    # skip this advance and re-check shortly; the renew loop
+                    # re-establishes a live TTL or learns of the takeover.
+                    self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
                 return
             try:
                 await self._do_advance(dagcfg, ref)
@@ -580,6 +687,50 @@ class DagScheduler:
                 logger.exception(
                     "dag run %s/%s: advance failed", ref[0], ref[1]
                 )
+                if ref in self._owned:
+                    # a due wake left in place would retry instantly every
+                    # loop pass against a fast-failing store; back off a bit.
+                    self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
+
+    async def _lease_usable(self, ref: RunRef, lease: Lease) -> bool:
+        """Whether our advance lease still plausibly gates ``ref``.
+
+        ``ref in _owned`` alone is not enough: while the store is unreachable
+        the renew loop cannot positively learn of a takeover (renew raises
+        instead of returning ``None``), so a lapsed lease lingers in
+        ``_owned`` -- and advancing on it would reconcile-fail the new owner's
+        live tasks.  A lease past its ``expires_at`` is verified against the
+        store's fence (the field exists exactly for stale-holder detection):
+        positively superseded -> drop ownership; expired-but-untaken or
+        unverifiable -> fail closed and skip the advance (renewing an expired
+        lease nobody took over is still allowed, so the renew loop recovers).
+        """
+        if _now() < lease.expires_at:
+            return True
+        backend = self._backend()
+        if backend is None:
+            return False
+        try:
+            observed = await asyncio.wait_for(
+                backend.read_lease(self._lease_name(ref)),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - unverifiable: fail closed
+            return False
+        if observed is not None and (
+            observed.holder != lease.holder or observed.fence != lease.fence
+        ):
+            logger.warning(
+                "dag run %s/%s: advance lease lapsed and was taken over; "
+                "dropping ownership here (at-least-once)",
+                ref[0],
+                ref[1],
+            )
+            self._drop_owned(ref)
+            return False
+        return False
 
     async def _do_advance(self, dagcfg: Any, ref: RunRef) -> None:
         spec = dagcfg.spec
@@ -637,6 +788,10 @@ class DagScheduler:
         final = stored if stored is not None else body
         if dag.is_terminal_run(final):
             await self._on_terminal(ref)
+        elif result.deferred:
+            # the claim quota capped this pass (dag.MAX_CLAIMS_PER_PASS):
+            # more instances are claimable right now, so re-service promptly.
+            self._wake[ref] = now
         else:
             self._wake[ref] = self._compute_wake(spec, final, now)
 
@@ -681,8 +836,10 @@ class DagScheduler:
             return None  # transient: retry next pass
         except jobstate.JobStateError:
             # the record survives but its blob is gone (410): definitively
-            # unrecoverable, so map to empty rather than retry forever (blobs
-            # are never swept in practice, so this is a belt-and-braces guard).
+            # unrecoverable, so map to empty rather than retry forever.  The
+            # orphan-blob sweep never deletes a blob a surviving record
+            # references, so this arises only from external interference
+            # (a partial restore, manual deletion).
             logger.warning(
                 "dag %s: xcom %r from %r has a missing blob; mapping to an "
                 "empty fan-out",
@@ -754,7 +911,13 @@ class DagScheduler:
             if state == dag.RUNNING and entry.get("awaitingApproval"):
                 soonest = min(soonest, now + APPROVAL_POLL_INTERVAL)
             elif state == dag.RUNNING and entry.get("nextPokeAt") is not None:
-                soonest = min(soonest, float(entry["nextPokeAt"]))
+                # only an IDLE sensor's due instant is a wake candidate: with
+                # a poke in flight (proc/pid set) a stale past nextPokeAt --
+                # written before claims cleared it -- would pin the loop's
+                # sleep at 0 for the poke's whole duration.  The completion
+                # itself forces the next advance.
+                if entry.get("proc") is None and entry.get("pid") is None:
+                    soonest = min(soonest, float(entry["nextPokeAt"]))
             elif state == dag.UP_FOR_RETRY and entry.get("nextRetryAt"):
                 soonest = min(soonest, float(entry["nextRetryAt"]))
         return soonest
@@ -946,7 +1109,9 @@ class DagScheduler:
         task = dagcfg.spec.by_id.get(task_id)
         if task is None:
             # the task was removed from the DAG (a config reload) while its
-            # instance was running: drop the stale completion.
+            # instance was running: drop the stale completion (including a
+            # queued retry of it, which would otherwise re-run forever).
+            self._pending_completions.pop((ref, taskkey), None)
             return
         jitter = _jitter(task.poke_jitter) if task.type == dag.SENSOR else 0.0
         transform = self._wrap(
@@ -962,11 +1127,100 @@ class DagScheduler:
                 expected_attempt=attempt,
             )
         )
-        await self._mutate(ref[0], ref[1], transform)
+        try:
+            await self._mutate(ref[0], ref[1], transform)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one failed RMW must not wedge
+            # the run: unrecorded, the entry stays RUNNING under our proc
+            # token, which reconciliation trusts forever while this daemon
+            # lives (and the lease keeps peers out) -- so queue the
+            # completion for retry on later service passes.
+            self._queue_completion(
+                ref,
+                taskkey,
+                task_id,
+                success=success,
+                exit_code=exit_code,
+                fail_reason=fail_reason,
+                proc=proc,
+                attempt=attempt,
+            )
+        else:
+            self._pending_completions.pop((ref, taskkey), None)
         # trigger a fresh advance without blocking the reaper on the per-run
         # lock (a concurrent periodic advance may hold it).
         self._wake[ref] = 0.0
         self._cron._track_state_write(self.advance_one(ref))
+
+    def _queue_completion(
+        self,
+        ref: RunRef,
+        taskkey: str,
+        task_id: str,
+        *,
+        success: bool,
+        exit_code: Optional[int],
+        fail_reason: Optional[str],
+        proc: Optional[str],
+        attempt: Optional[int],
+    ) -> None:
+        key = (ref, taskkey)
+        prior = self._pending_completions.get(key)
+        delay = COMPLETION_RETRY_DELAY
+        if prior is not None:
+            delay = min(prior["delay"] * 2.0, COMPLETION_RETRY_MAX_DELAY)
+        self._pending_completions[key] = {
+            "ref": ref,
+            "taskkey": taskkey,
+            "taskId": task_id,
+            "success": success,
+            "exitCode": exit_code,
+            "failReason": fail_reason,
+            "proc": proc,
+            "attempt": attempt,
+            "delay": delay,
+            "nextTryAt": _now() + delay,
+        }
+        logger.warning(
+            "dag run %s/%s: recording task %s completion failed; retrying "
+            "in %.0fs",
+            ref[0],
+            ref[1],
+            taskkey,
+            delay,
+        )
+
+    async def _retry_completions(self, now: float) -> None:
+        """Re-attempt completion records an earlier store hiccup dropped.
+
+        ``mark_task_finished`` is fenced and idempotent (a duplicate or
+        superseded apply is a no-op), so re-running the whole transform is
+        safe even when the failed mutate partially landed.  Success pops the
+        queue entry; another failure re-queues it with a bounded backoff.
+        """
+        for key in list(self._pending_completions):
+            pc = self._pending_completions.get(key)
+            if pc is None or pc["nextTryAt"] > now:
+                continue
+            ref = pc["ref"]
+            dagcfg = self._dags().get(ref[0])
+            if dagcfg is None:
+                # dag removed on reload: the stale completion is dropped,
+                # like on_task_finished drops it.
+                self._pending_completions.pop(key, None)
+                continue
+            await self._finish_task(
+                dagcfg,
+                ref,
+                pc["taskkey"],
+                pc["taskId"],
+                success=pc["success"],
+                exit_code=pc["exitCode"],
+                fail_reason=pc["failReason"],
+                proc=pc["proc"],
+                attempt=pc["attempt"],
+            )
 
     # =====================================================================
     # Crash reconciliation
@@ -1062,7 +1316,13 @@ class DagScheduler:
     async def trigger_run(
         self, dag_name: str, *, logical_date: Optional[str] = None
     ) -> Optional[str]:
-        """Create a manual run of ``dag_name`` now; return its run key."""
+        """Create a manual run of ``dag_name`` now; return its run key.
+
+        ``None`` for an unknown dag; raises when the run document could not
+        be created (no state backend available), so the caller never gets a
+        run key for a run that does not exist -- the web handler surfaces the
+        exception instead of a false 200.
+        """
         dagcfg = self._dags().get(dag_name)
         if dagcfg is None:
             return None
@@ -1070,8 +1330,14 @@ class DagScheduler:
         created = await self._create_doc(
             dagcfg, run_key, logical_date, "manual"
         )
-        if created:
-            await self._try_own(dagcfg, (dag_name, run_key))
+        if not created:
+            # the key is random, so "already exists" is not a real case:
+            # not-created means no backend was available to write it.
+            raise RuntimeError(
+                "dag {}: the manual run could not be recorded (state "
+                "backend unavailable)".format(dag_name)
+            )
+        await self._try_own(dagcfg, (dag_name, run_key))
         return run_key
 
     async def backfill(
@@ -1087,19 +1353,26 @@ class DagScheduler:
         dagcfg = self._dags().get(dag_name)
         if dagcfg is None or dagcfg.schedule_job is None:
             return {"ok": False, "reason": "no such scheduled dag"}
+        sched = dagcfg.schedule_job
+        if not isinstance(sched.schedule, CronTab):
+            # e.g. the literal "@reboot": no computable instants to replay --
+            # a clean refusal (-> 400), not a 500 out of _compute_next_fire.
+            return {
+                "ok": False,
+                "reason": "the dag's schedule has no computable instants",
+            }
         start = _parse_iso(start_iso)
         end = _parse_iso(end_iso)
         if start is None or end is None or end < start:
             return {"ok": False, "reason": "bad date range"}
-        sched = dagcfg.schedule_job
         created = 0
         # step from just before start so an instant exactly at start counts
         cursor = start - datetime.timedelta(seconds=1)
-        nxt = self._cron._compute_next_fire(sched, cursor)
+        nxt = self._next_fire(sched, cursor)
         while nxt is not None and nxt <= end and created < DAG_MAX_CATCHUP:
             await self._create_run(dagcfg, nxt, "backfill")
             created += 1
-            nxt = self._cron._compute_next_fire(sched, nxt)
+            nxt = self._next_fire(sched, nxt)
         return {"ok": True, "created": created}
 
     async def list_dags(self) -> List[Dict[str, Any]]:
@@ -1294,29 +1567,92 @@ class DagScheduler:
             return
         for body in terminal[:excess]:
             run_key = body.get("runKey")
-            run_id = body.get("runId")
             if not run_key:
                 continue
-            await asyncio.wait_for(
-                backend.delete_document(self._ns(name), run_key),
-                timeout=STATE_OP_TIMEOUT,
-            )
-            if run_id:
-                # drop the run's XCom record stream too (its blobs are
-                # content-addressed and never swept, so no XCom can ever
-                # reference a collected blob).
-                from yacron2.jobstate import ARTIFACT_STREAM_PREFIX
+            await self._delete_run(backend, name, run_key, body.get("runId"))
 
-                scope = dag.xcom_scope(name, str(run_id))
-                try:
-                    await asyncio.wait_for(
-                        backend.prune_records(
-                            ARTIFACT_STREAM_PREFIX + scope, keep=0
-                        ),
-                        timeout=STATE_OP_TIMEOUT,
+    async def _delete_run(
+        self,
+        backend: StateBackend,
+        name: str,
+        run_key: str,
+        run_id: Any,
+    ) -> None:
+        """Delete one run document and prune its XCom record stream.
+
+        The stream's blobs become unreferenced once the records are gone;
+        the state GC's orphan-blob sweep (cron._collect_state_garbage /
+        `yacron2 state gc`) reclaims them on its next pass.  Record order
+        matters: the document goes FIRST, so a crash between the two leaves
+        a doc-less stream the stream GC ages out, never a live run whose
+        XCom vanished.
+        """
+        await asyncio.wait_for(
+            backend.delete_document(self._ns(name), run_key),
+            timeout=STATE_OP_TIMEOUT,
+        )
+        if run_id:
+            from yacron2.jobstate import ARTIFACT_STREAM_PREFIX
+
+            scope = dag.xcom_scope(name, str(run_id))
+            try:
+                await asyncio.wait_for(
+                    backend.prune_records(
+                        ARTIFACT_STREAM_PREFIX + scope, keep=0
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+
+    async def gc_removed_dags(
+        self,
+        backend: StateBackend,
+        dag_names: "set[str]",
+        grace: float,
+    ) -> None:
+        """Collect run documents (and XCom) of dags gone from every config.
+
+        Called from the daemon's state GC pass (cron._collect_state_garbage)
+        with the dag names that exist in the store's ``dagrun/`` namespaces
+        but are in NEITHER this node's config NOR any recent manifest -- the
+        same absence anchor job streams use, so a dag briefly removed during
+        a config edit keeps its whole run history for a full gcGraceSeconds.
+        Belt and braces on top of that anchor: only a TERMINAL run whose
+        last update is itself older than ``grace`` is deleted; an active,
+        owned, or undatable run is never touched, so a re-added dag resumes
+        it exactly where it stopped.
+        """
+        now = _now()
+        for name in sorted(dag_names):
+            if name in self._dags():
+                continue  # re-added since the caller built the live set
+            try:
+                docs = await asyncio.wait_for(
+                    backend.list_documents(self._ns(name)),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+                for body in docs:
+                    if not dag.is_terminal_run(body):
+                        continue
+                    run_key = body.get("runKey")
+                    if not isinstance(run_key, str) or not run_key:
+                        continue
+                    if (name, run_key) in self._owned:
+                        continue
+                    updated = body.get("updatedAt") or body.get("createdAt")
+                    if (
+                        not isinstance(updated, (int, float))
+                        or now - float(updated) < grace
+                    ):
+                        continue  # too recent, or undatable: keep
+                    await self._delete_run(
+                        backend, name, run_key, body.get("runId")
                     )
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one dag must not stop the pass
+                logger.exception("dag %s: removed-dag run GC failed", name)
 
     # =====================================================================
     # Shutdown
@@ -1351,6 +1687,10 @@ class DagScheduler:
         self._locks.clear()
         self._next_logical.clear()
         self._seeded.clear()
+        self._seed_failed.clear()
+        # queued completions targeted the old store; the new store's runs are
+        # reconciled from scratch (a still-RUNNING entry is recovered there).
+        self._pending_completions.clear()
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
         self._next_gc = 0.0

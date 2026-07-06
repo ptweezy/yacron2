@@ -1359,6 +1359,17 @@ class DagTaskConfig:
             raise ConfigError(
                 "dag {!r}: task {!r} needs a command".format(dag_name, self.id)
             )
+        retries = int(node["retries"])
+        if retries < 0:
+            # the job-level onFailure.retry.maximumRetries documents -1 as
+            # the "retry forever" sentinel; a dag task has no such sentinel,
+            # and a negative value here would silently mean ZERO retries
+            # (max_attempts = retries + 1), the opposite of that intent.
+            raise ConfigError(
+                "dag {!r}: task {!r}: retries must be >= 0 (the job-level "
+                "-1 retry-forever sentinel is not supported for dag "
+                "tasks)".format(dag_name, self.id)
+            )
         job_dict = dict(mergedicts(DEFAULT_CONFIG, merged))
         job_dict["name"] = "{}.{}".format(dag_name, self.id)
         # never auto-fires: task templates are not in the scheduler's job set,
@@ -1375,7 +1386,7 @@ class DagTaskConfig:
             type=self.type,
             depends_on=tuple(node["dependsOn"]),
             trigger_rule=node["triggerRule"],
-            max_attempts=int(node["retries"]) + 1,
+            max_attempts=retries + 1,
             retry_delay=float(node["retryDelaySeconds"]),
             expand=(
                 dag.ExpandSpec(from_task=expand["fromTask"], key=expand["key"])
@@ -1461,9 +1472,23 @@ class DagConfig:
                 overrides[key] = raw[key]
         job_dict = dict(mergedicts(DEFAULT_CONFIG, overrides))
         try:
-            return JobConfig(job_dict)
+            job = JobConfig(job_dict)
         except ConfigError as ex:
             raise ConfigError("dag {!r}: {}".format(self.name, ex)) from ex
+        # every DAG scheduling path (seeding, catch-up, backfill) computes
+        # next-fire instants from a CronTab; a schedule _parse_schedule leaves
+        # as a plain string ("@reboot", the boot marker) has none and would
+        # crash the scheduler at runtime instead of failing the load here.
+        # Structural on purpose: whatever parses into a CronTab (including
+        # the @daily/@hourly-style aliases the crontab library expands) is
+        # fine, anything that stays a string is not.
+        if not isinstance(job.schedule, CronTab):
+            raise ConfigError(
+                "dag {!r}: schedule {!r} is not a cron expression; DAG "
+                "schedules must be cron expressions (@reboot is not "
+                "supported for dags)".format(self.name, schedule)
+            )
+        return job
 
 
 def parse_environment_file(path: str) -> Dict[str, str]:
@@ -1747,8 +1772,14 @@ def _build_state_config(raw: dict) -> StateConfig:
     cfg.update(raw)
     if not cfg.get("path") or not str(cfg["path"]).strip():
         raise ConfigError("state.path is required and must be non-empty")
-    if float(cfg.get("maxOpsPerSecond") or 0) < 0:
-        raise ConfigError("state.maxOpsPerSecond must be >= 0")
+    # The float checks below are written NaN-rejecting on purpose: strictyaml's
+    # Float() accepts 'nan' and overflow literals like '1e309' (== inf), and a
+    # plain 'x < floor' comparison is False for NaN, so a non-finite value
+    # would sail through into the lease/TTL arithmetic it silently breaks
+    # (expires_at = now + nan is never "validly held"; + inf never expires).
+    ops = float(cfg.get("maxOpsPerSecond") or 0)
+    if not math.isfinite(ops) or ops < 0:
+        raise ConfigError("state.maxOpsPerSecond must be >= 0 and finite")
     grace = int(cfg.get("gcGraceSeconds") or 0)
     if 0 < grace < 86400:
         # a grace below the manifest cadence would make every live peer's
@@ -1757,19 +1788,23 @@ def _build_state_config(raw: dict) -> StateConfig:
         raise ConfigError(
             "state.gcGraceSeconds must be <= 0 (GC disabled) or >= 86400"
         )
-    if float(cfg.get("slotTtlSeconds") or 0) < 5:
+    slot_ttl = float(cfg.get("slotTtlSeconds") or 0)
+    if not math.isfinite(slot_ttl) or slot_ttl < 5:
         # the slot lease is renewed at ttl/3 by a live holder; below ~5s
         # one slow renew on a network mount expires a healthy holder's
         # slot and invites the cross-node double-run the lease fences.
-        raise ConfigError("state.slotTtlSeconds must be >= 5")
+        raise ConfigError("state.slotTtlSeconds must be >= 5 and finite")
     # jobApi is a nested block: merge its raw keys over the defaults explicitly
     # (cfg.update above is a shallow merge that would drop the untouched
     # DEFAULT_JOB_API keys of a partially-specified `jobApi:` block).
     job_api = dict(DEFAULT_JOB_API)
     job_api.update(cfg.get("jobApi") or {})
     cfg["jobApi"] = job_api
-    if float(job_api.get("lockTtlSeconds") or 0) < 5:
-        raise ConfigError("state.jobApi.lockTtlSeconds must be >= 5")
+    lock_ttl = float(job_api.get("lockTtlSeconds") or 0)
+    if not math.isfinite(lock_ttl) or lock_ttl < 5:
+        raise ConfigError(
+            "state.jobApi.lockTtlSeconds must be >= 5 and finite"
+        )
     if int(job_api.get("maxValueBytes") or 0) < 0:
         raise ConfigError("state.jobApi.maxValueBytes must be >= 0")
     if int(job_api.get("maxArtifactBytes") or 0) < 0:
@@ -1784,6 +1819,29 @@ def _build_state_config(raw: dict) -> StateConfig:
             "state.jobApi.listen must be an http:// URL or a bare host:port "
             "(the job CLI reaches the loopback endpoint over TCP only)"
         )
+    if listen:
+        # validate the port the same way the runtime bind parses it
+        # (urlparse().port raises on a non-numeric or out-of-range port);
+        # left unchecked, the ValueError would escape the API startup and
+        # permanently disable the loopback endpoint instead of failing the
+        # config load. No port at all is fine (an OS-assigned ephemeral one,
+        # same as the default), but an explicit one must be usable.
+        text = str(listen)
+        parsed = urlparse(text if "://" in text else "http://" + text)
+        try:
+            port = parsed.port
+        except ValueError as err:
+            raise ConfigError(
+                "state.jobApi.listen has an invalid port in {!r}: the port "
+                "must be an integer in 1-65535 (or omitted for an "
+                "OS-assigned ephemeral one)".format(text)
+            ) from err
+        if port is not None and not 0 < port <= 65535:
+            raise ConfigError(
+                "state.jobApi.listen has an invalid port in {!r}: the port "
+                "must be an integer in 1-65535 (or omitted for an "
+                "OS-assigned ephemeral one)".format(text)
+            )
     if listen and not job_api.get("allowNonLoopbackBind"):
         text = str(listen)
         parsed = urlparse(text if "://" in text else "http://" + text)
@@ -2383,10 +2441,14 @@ def _build_filesystem_cluster_config(raw: dict) -> ClusterConfig:
         )
     if not str(fsb.get("electionName") or "").strip():
         raise ConfigError("cluster.filesystem.electionName must be non-empty")
-    if fsb["ttl"] < 3:
+    # NaN-rejecting on purpose, like the state TTL floors: 'nan < 3' is False
+    # and '1e309' parses as inf, and either silently breaks the lease expiry
+    # arithmetic (multiple leaders / a crashed leader's lease never expiring).
+    if not math.isfinite(float(fsb["ttl"])) or fsb["ttl"] < 3:
         raise ConfigError(
-            "cluster.filesystem.ttl must be >= 3 seconds (the leader "
-            "holds the lease only until ttl minus a clock-skew margin and "
+            "cluster.filesystem.ttl must be >= 3 seconds and finite (the "
+            "leader holds the lease only until ttl minus a clock-skew "
+            "margin and "
             "renews every max(1s, ttl/3); a smaller ttl makes a node that "
             "wins the election immediately treat its own lease as "
             "expired, so no Leader job ever runs); got {}".format(fsb["ttl"])
@@ -2759,6 +2821,41 @@ def _validate_dags(config: Yacron2Config) -> None:
     dups = sorted({n for n in names if names.count(n) > 1})
     if dups:
         raise ConfigError("duplicate dag name(s): {}".format(", ".join(dups)))
+    # Each task's launch template is named '<dag>.<taskId>' and shares the
+    # scheduler's per-name bookkeeping (running_jobs, concurrencyPolicy, the
+    # durable in-flight record) with regular jobs, so a name collision
+    # entangles unrelated runs: a Replace job would cancel an in-flight DAG
+    # task mid-run, a Forbid job silently skips fires while it runs. Task ids
+    # may themselves contain '.', so two dags can also mint the same template
+    # name (dag 'a' task 'b.c' vs dag 'a.b' task 'c'). Reject both at load.
+    # A job named after a bare dag is fine: the dag's synthetic schedule job
+    # carries a 'dag:' prefix and is never launched, and dag run/XCom state
+    # lives under its own 'dagrun/'/'dagxcom/' scopes.
+    job_names = {job.name for job in config.jobs}
+    template_owner: Dict[str, Tuple[str, str]] = {}
+    for d in config.dags:
+        for task in d.tasks:
+            template = task.job_template.name
+            if template in job_names:
+                raise ConfigError(
+                    "job {!r} collides with dag {!r} task {!r}: dag tasks "
+                    "launch under the template name '<dag>.<taskId>' and "
+                    "would share that job's concurrency bookkeeping; "
+                    "rename the job or the task".format(
+                        template, d.name, task.id
+                    )
+                )
+            owner = template_owner.get(template)
+            if owner is not None:
+                raise ConfigError(
+                    "dag {!r} task {!r} and dag {!r} task {!r} both launch "
+                    "under the template name {!r} (task ids may contain "
+                    "'.', so distinct dag/task pairs can collide); rename "
+                    "one so their runs are not entangled".format(
+                        owner[0], owner[1], d.name, task.id, template
+                    )
+                )
+            template_owner[template] = (d.name, task.id)
     if config.state_config is None:
         raise ConfigError(
             "dags require a `state` section (each dag_run and its per-task "
@@ -2797,7 +2894,8 @@ def parse_config_with_sources(
 
     Returns ``(config, sources)`` where ``sources`` is the absolute path of
     every YAML/crontab file consulted (the top-level file or directory entries,
-    plus anything they ``include`` transitively) and every job's ``env_file``.
+    plus anything they ``include`` transitively) and every job's and DAG
+    task's ``env_file``.
     The scheduler stats this exact set to detect that nothing changed on disk
     and skip the (strictyaml-heavy) reparse on an unchanged config; because it
     covers includes and env_files, an edit to any file that actually feeds the
@@ -2810,6 +2908,12 @@ def parse_config_with_sources(
     for job in config.jobs:
         if job.env_file is not None:
             sources.add(os.path.abspath(job.env_file))
+    # DAG task templates read their env_file at parse time exactly like jobs
+    # do, so an edit to one must bust the reparse-skip signature the same way.
+    for dag_cfg in config.dags:
+        for template in dag_cfg.task_templates.values():
+            if template.env_file is not None:
+                sources.add(os.path.abspath(template.env_file))
     return config, frozenset(sources)
 
 

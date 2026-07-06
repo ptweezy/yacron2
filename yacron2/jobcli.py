@@ -44,10 +44,14 @@ ENV_DAG_XCOM_SCOPE = "YACRON2_DAG_XCOM_SCOPE"
 ENV_DAG_TASKKEY = "YACRON2_DAG_TASKKEY"
 
 # Exit codes: 0 success, 1 a real error, 2 usage, 3 lock not acquired, 4 the
-# looked-up thing does not exist (so a script can branch on "missing").
+# looked-up thing does not exist (so a script can branch on "missing"), 5 an
+# idempotency key already claimed.  "Duplicate" gets its own code rather than
+# sharing 1 with errors: a store outage must never masquerade as "a prior
+# caller already did the work" to a guard script.
 EXIT_ERROR = 1
 EXIT_NOT_ACQUIRED = 3
 EXIT_NOT_FOUND = 4
+EXIT_DUPLICATE = 5
 
 # Every job-facing action name, so __main__ can tell a `state get` (this
 # module) from a `state backup` (yacron2.state_admin) without guessing.
@@ -56,6 +60,19 @@ STATE_JOB_ACTIONS = frozenset({"get", "set", "delete", "keys"})
 
 class _CliError(Exception):
     """A user-facing failure: printed to stderr, exits non-zero."""
+
+
+# Loopback control traffic must never be proxied: the default urllib opener
+# honors http_proxy/HTTP_PROXY, which would route every state call -- bearer
+# run token included -- to an external proxy that cannot reach the daemon's
+# 127.0.0.1 endpoint anyway (CPython's bypass logic does not exempt loopback).
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# Every request gets a deadline so a wedged daemon (state store on a dead
+# mount) cannot hang the calling job forever.  Every verb but a blocking lock
+# acquire is answered in milliseconds, so this is generous; the long poll
+# passes its own deadline (blockSeconds plus this margin).
+_DEFAULT_TIMEOUT = 30.0
 
 
 # --------------------------------------------------------------------------
@@ -83,11 +100,14 @@ def _http(
     query: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
     data: Optional[bytes] = None,
+    timeout: Optional[float] = None,
 ) -> Tuple[int, Dict[str, str], bytes]:
     """One request to the endpoint; return ``(status, headers, body)``.
 
     The single seam the whole CLI goes through, so a test monkeypatches this
-    to drive every verb without a live server.
+    to drive every verb without a live server.  ``timeout`` overrides the
+    default deadline (the blocking lock acquire needs its long poll to be
+    ended by the server, not the socket).
     """
     url, token = _endpoint()
     full = url.rstrip("/") + path
@@ -106,8 +126,10 @@ def _http(
     req = urllib.request.Request(
         full, data=body, method=method, headers=headers
     )
+    if timeout is None:
+        timeout = _DEFAULT_TIMEOUT
     try:
-        with urllib.request.urlopen(req) as resp:  # noqa: S310 - loopback only
+        with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as ex:
         return ex.code, dict(ex.headers or {}), ex.read()
@@ -125,9 +147,15 @@ def _json(
     *,
     query: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
 ) -> Tuple[int, Dict[str, Any]]:
+    # timeout is forwarded only when explicitly set: _http applies the
+    # default itself, and test fakes of the _http seam predate the kwarg.
+    kwargs: Dict[str, Any] = {}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
     status, _headers, body = _http(
-        method, path, query=query, json_body=json_body
+        method, path, query=query, json_body=json_body, **kwargs
     )
     try:
         parsed = json.loads(body) if body else {}
@@ -277,10 +305,12 @@ def _cmd_idempotent(args: argparse.Namespace) -> int:
         "/v1/idempotency/claim",
         json_body={"scope": scope, "key": args.key, "ttl": args.ttl},
     )
-    # exit 0 when this caller won the claim (fresh: do the work), 1 when a
+    # exit 0 when this caller won the claim (fresh: do the work), 5 when a
     # prior caller already claimed it (a duplicate: skip). Made for a shell
-    # guard: `yacron2 idempotent "$KEY" && do-the-side-effect`.
-    return 0 if _ok(status, data).get("fresh") else EXIT_ERROR
+    # guard: `yacron2 idempotent "$KEY" && do-the-side-effect`.  Distinct
+    # from EXIT_ERROR (1, used for transport/store failures) so an outage
+    # is detectable instead of reading as "already done".
+    return 0 if _ok(status, data).get("fresh") else EXIT_DUPLICATE
 
 
 def _cmd_secret(args: argparse.Namespace) -> int:
@@ -439,6 +469,9 @@ def _write_output(path: Optional[str], data: bytes) -> None:
 
 def _lock_acquire(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
     scope = _scope_of(args)
+    # a --wait long poll is server-bounded by blockSeconds: the client
+    # deadline is that plus margin, so the server (not the socket) ends it.
+    deadline = args.timeout + _DEFAULT_TIMEOUT if args.wait else None
     status, data = _json(
         "POST",
         "/v1/lock/acquire",
@@ -450,6 +483,7 @@ def _lock_acquire(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
             "blockSeconds": args.timeout,
             "ttl": args.ttl,
         },
+        timeout=deadline,
     )
     data = _ok(status, data)
     return bool(data.get("acquired")), data.get("token")
@@ -662,7 +696,8 @@ def add_job_commands(sub: Any) -> None:
     # idempotent
     idem = sub.add_parser(
         "idempotent",
-        help="claim a key once fleet-wide (exit 0 fresh, 1 duplicate)",
+        help="claim a key once fleet-wide (exit 0 fresh, 5 duplicate, "
+        "1 error)",
     )
     idem.add_argument("key")
     idem.add_argument(

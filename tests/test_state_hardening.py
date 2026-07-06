@@ -14,7 +14,19 @@ regresses, the matching test fails.  Covered invariants:
 * two backend instances over one mount (the shared-mount deployment) keep a
   coherent, non-colliding ledger;
 * ``~`` in ``state.path`` means the home directory, not a literal ``~``
-  directory under the daemon's CWD.
+  directory under the daemon's CWD;
+* length-truncated stream tokens round-trip through ``list_stream_names``
+  via the logical-name sidecar, and a legacy truncated dir without one is
+  skipped/kept -- never returned garbled or collected;
+* garbage collection reclaims lease files (and ``delete_document`` its
+  ``.lock`` side-file) only once provably dead past the whole grace
+  window, with the fence reset unobservable to any stale holder;
+* stream/document-namespace enumeration reports hidden (unnameable)
+  entries, the orphan-blob sweep's age guard keeps young payloads, and a
+  dedupe re-put re-arms that guard -- the KEEP biases the blob sweep
+  builds on;
+* the document delete path rides out Windows sharing violations like the
+  replace-write path does.
 
 No tight wall-clock timing anywhere: lease expiry is driven by
 monkeypatching ``yacron2.state._now`` (the one time source), so nothing here
@@ -25,6 +37,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 
 import pytest
 
@@ -382,3 +395,331 @@ async def test_lease_write_failure_denies_instead_of_raising(
         state, "_now", lambda: lease.expires_at + 1.0
     )  # expire it
     assert await backend.acquire_lease("leader", "node-b", 30.0) is None
+
+
+# --- 11: truncated stream tokens round-trip through list_stream_names -------
+
+
+async def test_list_stream_names_roundtrips_truncated_tokens(tmp_path):
+    # _fs_safe truncates a >_FS_SAFE_MAX token to head + "%." + digest, and
+    # unquote()ing that token back produced a GARBLED name that re-encoded
+    # to a DIFFERENT token: a host with a long (or multibyte -- 9 encoded
+    # chars per CJK char) hostname had its manifest stream invisible to
+    # every GC keep-set builder, and its jobs' durable state was collected
+    # as garbage.  The name sidecar written on append must make every
+    # returned name round-trip exactly to its on-disk token.
+    backend = _backend(tmp_path)
+    await backend.start()
+    long_ascii = "manifests/" + "H" * 140  # uppercase: 3 encoded chars each
+    multibyte = "manifests/" + "主机" * 20  # a CJK hostname
+    plain = "manifests/plain-host"
+    for stream in (long_ascii, multibyte, plain):
+        await backend.append_record(stream, {"x": 1})
+    names = await backend.list_stream_names("manifests/")
+    assert set(names) == {long_ascii, multibyte, plain}
+    # the property under test: _fs_safe over every returned name reproduces
+    # exactly the set of on-disk stream tokens (nothing garbled, nothing
+    # skipped), so keep-sets built from these names protect the real dirs.
+    records_root = os.path.join(backend.base, "records")
+    prefix_token = state._fs_safe_fragment("manifests/")
+    on_disk = {
+        t for t in os.listdir(records_root) if t.startswith(prefix_token)
+    }
+    assert {state._fs_safe(n) for n in names} == on_disk
+    # and each name feeds straight back into a record read, the exact call
+    # the GC keep-set builders make.
+    for name in names:
+        assert await backend.list_records(name) == [{"x": 1}]
+
+
+async def test_gc_keeps_legacy_truncated_stream_and_skips_its_name(
+    tmp_path, monkeypatch
+):
+    # A store written BEFORE the sidecar existed: a truncated dir's logical
+    # name is unrecoverable, so enumeration must SKIP it (never return a
+    # garbled, non-round-tripping name) and GC must treat it as
+    # unclassifiable (keep) -- until an append lands the sidecar and makes
+    # it classifiable again.
+    backend = _backend(tmp_path)
+    await backend.start()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    long_job = "runs/" + "J" * 200
+    await backend.append_record(long_job, {"x": 1})
+    stream_dir = backend._stream_dir(long_job)
+    # simulate the legacy dir by removing the sidecar the append wrote.
+    os.unlink(os.path.join(stream_dir, state._STREAM_NAME_SIDECAR))
+    assert await backend.list_stream_names("runs/") == []
+    # aged far past the grace and unreferenced: still KEPT, because its
+    # absence from the keep map proves nothing (the builder never saw it).
+    clock["t"] = 1000.0 + 8 * 86400.0
+    result = await backend.collect_garbage(
+        keep={"runs/": set()}, grace=7 * 86400.0
+    )
+    assert result["streams_removed"] == 0
+    assert await backend.list_records(long_job) == [{"x": 1}]
+    # the next append self-heals the sidecar: enumerable again...
+    await backend.append_record(long_job, {"x": 2})
+    assert await backend.list_stream_names("runs/") == [long_job]
+    # ...and therefore classifiable: aged and unreferenced now really goes.
+    clock["t"] = 1000.0 + 16 * 86400.0
+    result = await backend.collect_garbage(
+        keep={"runs/": set()}, grace=7 * 86400.0
+    )
+    assert result["streams_removed"] == 1
+    assert not os.path.isdir(stream_dir)
+
+
+async def test_list_stream_names_audit_reports_hidden_streams(tmp_path):
+    # The orphan-blob sweep builds its referenced-digest set from the stream
+    # listing, so it must be able to tell "these are ALL the artifact
+    # streams" from "a legacy truncated dir is hiding one": a hidden
+    # stream's records still reference blobs, and a sweep that could not
+    # see them would delete live payloads.
+    backend = _backend(tmp_path)
+    await backend.start()
+    long_scope = "artifacts/" + "S" * 200
+    await backend.append_record("artifacts/plain", {"sha256": "a" * 64})
+    await backend.append_record(long_scope, {"sha256": "b" * 64})
+    names, complete = await backend.list_stream_names_audit("artifacts/")
+    assert complete is True
+    assert set(names) == {"artifacts/plain", long_scope}
+    # a legacy dir (pre-sidecar store): the stream becomes unnameable and
+    # the audit must say so instead of silently shrinking the listing.
+    stream_dir = backend._stream_dir(long_scope)
+    os.unlink(os.path.join(stream_dir, state._STREAM_NAME_SIDECAR))
+    names, complete = await backend.list_stream_names_audit("artifacts/")
+    assert complete is False
+    assert names == ["artifacts/plain"]
+    # the plain (non-audit) listing keeps its established best-effort shape.
+    assert await backend.list_stream_names("artifacts/") == [
+        "artifacts/plain"
+    ]
+    # a prefix with nothing hidden under it stays complete.
+    names, complete = await backend.list_stream_names_audit("manifests/")
+    assert (names, complete) == ([], True)
+
+
+async def test_list_document_namespaces_skips_truncated_namespace(tmp_path):
+    # The GC discovers dag-run namespaces (dagrun/<dag>) through this
+    # listing; a length-truncated namespace has no name sidecar to recover
+    # its logical name from, so it must be reported as an INCOMPLETE
+    # listing -- never returned garbled (a garbled name would be treated as
+    # a removed dag and its runs' XCom scopes left unprotected).
+    backend = _backend(tmp_path)
+    await backend.start()
+
+    def put(body):
+        return lambda _cur: (body, None)
+
+    await backend.mutate_document("dagrun/a", "r1", put({"runId": "1"}))
+    await backend.mutate_document("dagrun/b", "r1", put({"runId": "2"}))
+    await backend.mutate_document("kv/x", "k", put({"value": 1}))
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert (names, complete) == (["dagrun/a", "dagrun/b"], True)
+    await backend.mutate_document(
+        "dagrun/" + "D" * 200, "r1", put({"runId": "3"})
+    )
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert names == ["dagrun/a", "dagrun/b"]
+    assert complete is False
+    # unrelated prefixes are unaffected by the truncated dagrun namespace.
+    assert await backend.list_document_namespaces("kv/") == (["kv/x"], True)
+
+
+async def test_sweep_orphan_blobs_keeps_young_unreferenced_blobs(tmp_path):
+    # The put-blob-then-append-record window: a payload that has just
+    # landed has no record yet, so an unreferenced-but-young blob must
+    # survive the sweep (the grace is the age guard) and only a blob both
+    # unreferenced AND older than the grace may go.
+    backend = _backend(tmp_path)
+    await backend.start()
+    digest = await backend.put_blob(b"just-landed")
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 0
+    assert await backend.get_blob(digest) is not None
+    old = time.time() - 7200.0
+    os.utime(backend._blob_path(digest), (old, old))
+    # dry run counts it but must not delete...
+    assert (
+        await backend.sweep_orphan_blobs(set(), 3600.0, dry_run=True) == 1
+    )
+    assert await backend.get_blob(digest) is not None
+    # ...the real pass reclaims it.
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 1
+    assert await backend.get_blob(digest) is None
+
+
+async def test_put_blob_dedupe_rearms_the_sweep_age_guard(tmp_path):
+    # a re-put of identical content dedupes to the EXISTING blob file; if
+    # that file kept its old mtime, a sweep racing the re-putter's
+    # record append would read the blob as an aged orphan (its previous
+    # references may be mid-deletion) and delete a payload about to be
+    # referenced again.  The dedupe hit must refresh the mtime, re-arming
+    # the age guard.
+    backend = _backend(tmp_path)
+    await backend.start()
+    digest = await backend.put_blob(b"republished-content")
+    old = time.time() - 7200.0
+    os.utime(backend._blob_path(digest), (old, old))
+    assert await backend.put_blob(b"republished-content") == digest
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 0
+    assert await backend.get_blob(digest) == b"republished-content"
+
+
+# --- 12: GC reclaims lease files only once dead past the whole grace --------
+
+
+async def test_gc_reclaims_leases_dead_past_grace_only(tmp_path, monkeypatch):
+    # dagrun takes one uniquely-named advance lease per DAG run, and nothing
+    # ever deleted the files: ~210k permanent files/year for a 5-minute DAG.
+    # GC must reclaim a lease (and its .lock sibling) once dead past the
+    # whole grace window -- and never sooner.
+    backend = _backend(tmp_path)
+    await backend.start()
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    lease = await backend.acquire_lease("dagadvance/d/r1", "A", ttl=10.0)
+    assert lease is not None
+    lock_path, lease_path = backend._lease_paths("dagadvance/d/r1")
+    grace = 3600.0
+    # expired, but within the grace window: never touched (the fence home).
+    clock["t"] = t0 + 60.0
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["leases_removed"] == 0
+    assert os.path.exists(lease_path)
+    # dead past the whole window: dry run counts it but deletes nothing...
+    clock["t"] = t0 + grace + 60.0
+    dry = await backend.collect_garbage(keep={}, grace=grace, dry_run=True)
+    assert dry["leases_removed"] == 1
+    assert os.path.exists(lease_path) and os.path.exists(lock_path)
+    # ...and the real pass reclaims BOTH files.
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["leases_removed"] == 1
+    assert not os.path.exists(lease_path)
+    assert not os.path.exists(lock_path)
+
+
+async def test_gc_dates_released_lease_by_mtime_not_expiry(
+    tmp_path, monkeypatch
+):
+    # release marks expiresAt 0.0 IN PLACE -- ancient by expiry alone.  A
+    # lease released moments ago must survive the full grace window (a
+    # stale fence from just before the release could still be live), so
+    # the sweep dates a release by the file's mtime and the fence counter
+    # survives.
+    backend = _backend(tmp_path)
+    await backend.start()
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    lease = await backend.acquire_lease("leader", "A", ttl=30.0)
+    assert lease is not None
+    await backend.release_lease(lease)
+    clock["t"] = t0 + 120.0  # well within the grace window
+    result = await backend.collect_garbage(keep={}, grace=3600.0)
+    assert result["leases_removed"] == 0
+    _lock_path, lease_path = backend._lease_paths("leader")
+    assert os.path.exists(lease_path)  # the fence counter's only home
+    nxt = await backend.acquire_lease("leader", "B", ttl=30.0)
+    assert nxt is not None and nxt.fence == lease.fence + 1
+
+
+async def test_lease_gc_fence_reset_cannot_enable_stale_ops(
+    tmp_path, monkeypatch
+):
+    # The safety argument for deleting a lease file at all, as a test: a
+    # lease GC reclaims has every fence it ever issued expired >= grace
+    # ago, so the post-reclaim fence reset to 1 must be unobservable -- a
+    # stale Lease from before the reclaim (same holder, higher fence) can
+    # neither renew nor release the reborn lease.
+    backend = _backend(tmp_path)
+    await backend.start()
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    first = await backend.acquire_lease("L", "A", ttl=10.0)
+    assert first is not None and first.fence == 1
+    clock["t"] = t0 + 60.0
+    stale = await backend.acquire_lease("L", "A", ttl=10.0)  # takeover
+    assert stale is not None and stale.fence == 2
+    grace = 3600.0
+    clock["t"] = t0 + 60.0 + grace + 60.0  # both fences dead past grace
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["leases_removed"] == 1
+    lock_path, lease_path = backend._lease_paths("L")
+    assert not os.path.exists(lease_path)
+    assert not os.path.exists(lock_path)
+    reborn = await backend.acquire_lease("L", "A", ttl=30.0)
+    assert reborn is not None and reborn.fence == 1
+    # fence EQUALITY (never >=) is what keeps the reset safe: the stale
+    # renew and the stale release must both miss the reborn lease.
+    assert await backend.renew_lease(stale, ttl=30.0) is None
+    await backend.release_lease(stale)
+    current = await backend.read_lease("L")
+    assert current is not None
+    assert current.holder == "A" and current.fence == 1  # untouched
+
+
+# --- 13: delete_document reclaims the .lock side-file ------------------------
+
+
+async def test_delete_document_reclaims_lock_sibling(tmp_path):
+    # _doc_paths gives every key a .lock side-file; the delete path used to
+    # unlink only the .doc, orphaning one .lock per deleted key forever
+    # (dagrun deletes one uniquely-keyed run document per DAG run).
+    backend = _backend(tmp_path)
+    await backend.start()
+
+    def put(value):
+        def transform(_current):
+            return {"v": value}, None
+
+        return transform
+
+    await backend.mutate_document("dagrun/d", "r1", put(1))
+    lock_path, doc_path = backend._doc_paths("dagrun/d", "r1")
+    assert os.path.exists(doc_path) and os.path.exists(lock_path)
+    assert await backend.delete_document("dagrun/d", "r1") is True
+    assert not os.path.exists(doc_path)
+    assert not os.path.exists(lock_path)  # the orphan that used to pile up
+    # the key stays fully usable after reclamation: a fresh mutation
+    # recreates both files and reads back.
+    body, _ = await backend.mutate_document("dagrun/d", "r1", put(2))
+    assert body == {"v": 2}
+    assert await backend.read_document("dagrun/d", "r1") == {"v": 2}
+    assert os.path.exists(lock_path)
+
+
+# --- 14: document delete rides out Windows sharing violations ---------------
+
+
+async def test_document_delete_retries_sharing_violation(
+    tmp_path, monkeypatch
+):
+    # On Windows a concurrent reader/AV scan holding a .doc open makes
+    # os.unlink raise PermissionError; the write path always retried this
+    # (see _replace) but the delete path surfaced it as a spurious error
+    # from a healthy store.  The unlink must retry the transient hold away.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "k", lambda _c: ({"v": 1}, None))
+    _lock_path, doc_path = backend._doc_paths("ns", "k")
+    monkeypatch.setattr(state, "IS_WINDOWS", True)  # force the retry path
+    calls = {"n": 0}
+    real_unlink = os.unlink
+
+    def flaky_unlink(path, *args, **kwargs):
+        if (
+            os.path.normpath(str(path)) == os.path.normpath(doc_path)
+            and calls["n"] < 2
+        ):
+            calls["n"] += 1
+            raise PermissionError(5, "sharing violation", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "unlink", flaky_unlink)
+    assert await backend.delete_document("ns", "k") is True
+    assert calls["n"] == 2  # the transient hold really was retried away
+    assert not os.path.exists(doc_path)
+    assert await backend.read_document("ns", "k") is None

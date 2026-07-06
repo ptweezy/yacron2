@@ -1174,6 +1174,106 @@ def test_set_task_pid_fenced_to_attempt():
     assert body["tasks"]["a"]["pid"] == 8
 
 
+def test_duplicate_depends_on_is_not_a_cycle():
+    # regression: a repeated dependsOn entry is one edge; counting it twice
+    # left a phantom indegree and a false 'cycle' rejection of an acyclic
+    # graph.
+    spec = _spec(TaskSpec("a"), TaskSpec("b", depends_on=("a", "a")))
+    dag.validate_graph(spec)  # no raise
+    ex = _Executor(spec, outcomes={"a": True, "b": True})
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.SUCCESS
+
+
+def test_dag_duplicate_dependson_config_accepted():
+    # the same graph through the YAML path: dependsOn: [a, a] must load.
+    cfg = _dagcfg(
+        "dags:\n  - name: d\n    tasks:\n"
+        "      - id: a\n        command: 'e'\n"
+        "      - id: b\n        command: 'e'\n        dependsOn:\n"
+        "          - a\n          - a\n"
+    )
+    assert cfg.dags[0].name == "d"
+
+
+def test_sensor_repoke_clears_stale_due_instant():
+    # regression: poke N>=2 must clear nextPokeAt at claim time -- a stale
+    # past due-instant on an in-flight poke reads as a due wake and busy-spun
+    # the driver loop for the poke's whole duration.
+    spec = _spec(
+        TaskSpec("s", type=dag.SENSOR, poke_interval=10.0, poke_timeout=1e9),
+    )
+    body = _body(spec)
+    task = spec.by_id["s"]
+    body, _ = _apply(dag.plan_and_claim(spec, 100.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason=None,
+            now=100.0, task=task,
+        ),
+        body,
+    )
+    assert body["tasks"]["s"]["nextPokeAt"] == 110.0
+    # poke 2 claimed at its due instant: the in-flight poke owns the schedule
+    body, res = _apply(dag.plan_and_claim(spec, 111.0, "p", "h", {}), body)
+    assert len(res.launches) == 1
+    assert body["tasks"]["s"]["proc"] == "p"
+    assert body["tasks"]["s"]["nextPokeAt"] is None
+    # its completion re-sets the schedule
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason=None,
+            now=112.0, task=task,
+        ),
+        body,
+    )
+    assert body["tasks"]["s"]["nextPokeAt"] == 122.0
+
+
+def test_mapped_fanout_item_cap_fails_task_cleanly():
+    # regression: an oversized XCom list must FAIL the mapped task with a
+    # clear reason instead of materialising thousands of instances into the
+    # run document and stampeding the host.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work", depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    items = list(range(dag.MAX_MAPPED_ITEMS + 1))
+    ex = _Executor(spec, outcomes={"gen": True}, xcom={"gen": items})
+    body = ex.run(_body(spec))
+    assert body["state"] == dag.FAILED
+    assert _state(body, "work") == dag.FAILED
+    assert "exceeds the cap" in body["tasks"]["work"]["failReason"]
+    assert "work" not in body["mapped"]  # the flood was never materialised
+    assert "work#0" not in body["tasks"]
+    assert _state(body, "collect") == dag.UPSTREAM_FAILED
+
+
+def test_claims_are_batched_per_pass(monkeypatch):
+    # regression: one advance pass must not claim (and so launch) an
+    # unbounded batch; the remainder stays claimable, the result is marked
+    # deferred, and later passes drain it.
+    monkeypatch.setattr(dag, "MAX_CLAIMS_PER_PASS", 2)
+    spec = _spec(*[TaskSpec("t{}".format(i)) for i in range(5)])
+    body = _body(spec)
+    body, res = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    assert len(res.launches) == 2
+    assert res.deferred is True
+    body, res = _apply(dag.plan_and_claim(spec, 2.0, "p", "h", {}), body)
+    assert len(res.launches) == 2
+    assert res.deferred is True
+    body, res = _apply(dag.plan_and_claim(spec, 3.0, "p", "h", {}), body)
+    assert len(res.launches) == 1
+    assert res.deferred is False
+    assert all(
+        _state(body, "t{}".format(i)) == dag.RUNNING for i in range(5)
+    )
+
+
 def test_reload_added_dependency_does_not_wedge_run():
     # A run is created for A -> B (all_success). A config reload then adds task
     # C and repoints B at [A, C]. C is absent from the already-created run

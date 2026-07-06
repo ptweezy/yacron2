@@ -4215,7 +4215,7 @@
     const order = ["success", "running", "failed", "skipped", "up_for_retry", "pending", "upstream_failed", "unknown"];
     let bar = '<span class="tsbar" style="width:90px" title="' +
       escAttr(order.filter((k) => counts[k]).map((k) => counts[k] + " " + k).join(" · ")) + '">';
-    order.forEach((k) => { if (counts[k]) bar += '<span class="' + k + '" style="width:' + (100 * counts[k] / total).toFixed(1) + '%"></span>'; });
+    order.forEach((k) => { if (counts[k]) bar += '<i class="' + k + '" style="width:' + (100 * counts[k] / total).toFixed(1) + '%"></i>'; });
     return bar + "</span>";
   }
 
@@ -4413,7 +4413,7 @@
     for (let i = 0; i < n; i++) {
       const s = (tasks[id + "#" + i] || {}).state || "pending";
       const cls = s === "success" ? "success" : (s === "failed" || s === "upstream_failed") ? "failed" : (s === "running" || s === "up_for_retry") ? "running" : "";
-      bar += '<span class="' + cls + '" style="width:' + (100 / n).toFixed(2) + '%"></span>';
+      bar += '<i class="' + cls + '" style="width:' + (100 / n).toFixed(2) + '%"></i>';
     }
     return bar + "</span>";
   }
@@ -4563,7 +4563,7 @@
       const stroke = "var(--" + v + ")";
       const glyph = st ? dstGlyph(st) : (t.type === "approval" ? "?" : t.type === "sensor" ? "⏲" : "·");
       svg += '<g class="node" data-gtask="' + escAttr(t.id) + '"><title>' + escAttr(t.id + (st ? " · " + st : "") + (t.type !== "task" ? " (" + t.type + ")" : "")) + "</title>";
-      svg += '<rect x="' + p.x + '" y="' + p.y + '" width="' + L.NW + '" height="' + L.NH + '" rx="3" fill="' + fill + '" stroke="' + stroke + '"/>';
+      svg += '<rect x="' + p.x + '" y="' + p.y + '" width="' + L.NW + '" height="' + L.NH + '" rx="3" style="fill:' + fill + ';stroke:' + stroke + '"/>';
       svg += '<text x="' + (p.x + 8) + '" y="' + (p.y + L.NH / 2 + 3.5) + '">' + esc(glyph + " " + truncStr(t.id, 17)) + "</text>";
       if (t.type !== "task") svg += '<text x="' + (p.x + L.NW - 6) + '" y="' + (p.y + 10) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">' + esc(t.type) + "</text>";
       if (t.mapped) svg += '<text x="' + (p.x + L.NW - 6) + '" y="' + (p.y + L.NH - 4) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">fan-out</text>';
@@ -4809,12 +4809,14 @@
     } else if (tab === "slots") {
       const rows = (data.node.slots || []).map((s) =>
         "<tr><td><b>" + esc(s.slot) + "</b></td><td class='muted'>" + esc(s.holder || "—") + "</td><td>" + esc(s.refs) + "</td>" +
-        '<td class="muted" data-ago-epoch="' + escAttr(s.expiresAt) + '">' + agoEpoch(s.expiresAt) + "</td></tr>").join("");
+        '<td class="muted" data-until-epoch="' + escAttr(s.expiresAt) + '">' + untilEpoch(s.expiresAt) + "</td></tr>").join("");
       body.innerHTML = '<table class="runtable"><thead><tr><th>Slot</th><th>Holder</th><th>Refs</th><th>Expires</th></tr></thead><tbody>' + rows + "</tbody></table>";
     } else if (tab === "locks") {
       const rows = (data.leases || []).map((l) =>
         "<tr><td><b>" + esc(l.name) + "</b></td><td class='muted'>" + esc(l.holder || "—") + "</td><td>" + esc(l.fence) + "</td>" +
-        '<td class="' + (l.expired ? "faint" : "") + '" data-ago-epoch="' + escAttr(l.expiresAt) + '">' + (l.expired ? "expired " : "") + agoEpoch(l.expiresAt) + "</td></tr>").join("");
+        '<td class="' + (l.expired ? "faint" : "") + '">' + (l.expired
+          ? 'expired <span data-ago-epoch="' + escAttr(l.expiresAt) + '">' + agoEpoch(l.expiresAt) + "</span>"
+          : '<span data-until-epoch="' + escAttr(l.expiresAt) + '">' + untilEpoch(l.expiresAt) + "</span>") + "</td></tr>").join("");
       body.innerHTML = '<table class="runtable"><thead><tr><th>Lease</th><th>Holder</th><th>Fence</th><th>Expires</th></tr></thead><tbody>' +
         (rows || '<tr><td colspan="4" class="faint">no active leases</td></tr>') + "</tbody></table>";
     } else {

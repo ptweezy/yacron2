@@ -85,8 +85,23 @@ All routes are registered in `start_stop_web_app`:
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
 | `POST` | `/jobs/{name}/cancel` | `_web_cancel_job` | `200` |
 | `GET` | `/jobs/{name}/logs` | `_web_job_logs` | `200` (SSE stream) |
+| `GET` | `/dags` | `_web_list_dags` | `200` |
+| `GET` | `/dags/{name}/runs` | `_web_dag_runs` | `200` |
+| `GET` | `/dags/{name}/runs/{run_key}` | `_web_dag_run` | `200` |
+| `GET` | `/dags/{name}/runs/{run_key}/xcom` | `_web_dag_xcom` | `200` |
+| `GET` | `/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs` | `_web_dag_task_logs` | `200` (SSE stream) |
+| `POST` | `/dags/{name}/trigger` | `_web_dag_trigger` | `200` |
+| `POST` | `/dags/{name}/backfill` | `_web_dag_backfill` | `200` |
+| `POST` | `/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision` | `_web_dag_decision` | `200` |
+| `GET` | `/state` | `_web_state` | `200` |
+| `GET` | `/state/documents` | `_web_state_documents` | `200` |
+| `GET` | `/state/records` | `_web_state_records` | `200` |
 | `GET` | `/metrics` | `_web_metrics` | `200` (Prometheus exposition; omitted when `metrics: false`) |
 | `GET` | `/` | `_web_index` | `200` (dashboard page; omitted when `ui: false`) |
+
+The `/dags/...` routes are documented under [DAG endpoints](#dag-endpoints)
+and the `/state...` routes under
+[State inspector endpoints](#state-inspector-endpoints).
 
 The configured `headers` map is applied to every `200` success response across
 all routes (including `/cluster` and `/job-set-id`) and to the `409` conflict
@@ -644,7 +659,9 @@ expansion (`mapped`), and approval decisions. `404` if the run is unknown.
 #### `POST /dags/{name}/trigger`
 
 Create and start a manual run now; returns `{"dag": …, "runKey": …}`. `404`
-if the DAG is not configured.
+if the DAG is not configured; a run that could not be durably recorded (the
+state backend is unavailable) surfaces as a `500` error rather than a
+`runKey` for a run that does not exist.
 
 #### `POST /dags/{name}/backfill`
 
@@ -657,6 +674,48 @@ bounded. Returns `{"ok": true, "created": <N>}`; `400` on a bad range.
 Approve or reject an [approval gate](Orchestration-and-DAGs#approval-gates).
 Body: `{"decision": "approve"|"reject", "by": "<who>"}`. `200` on success,
 `400` on a bad decision value, `409` if the task is not awaiting a decision.
+
+#### `GET /dags/{name}/runs/{run_key}/xcom`
+
+The XCom outputs the run's tasks published, as a flat list of entries (task,
+key, sha256, size, timestamp) with small text values inlined and larger ones
+metadata-only; `truncated` flags a run with more entries than the cap. `404`
+if the DAG or run is unknown.
+
+#### `GET /dags/{name}/runs/{run_key}/tasks/{taskkey}/logs`
+
+An SSE stream of a *running* task instance's live captured output, in the
+same event shape as [`GET /jobs/{name}/logs`](#get-jobsnamelogs). A finished
+instance's buffer is not retained, so the stream then ends immediately with
+`event: end` and `{"reason": "no-output"}`. `404` if the DAG is not
+configured.
+
+### State inspector endpoints
+
+The dashboard's [durable state](Durable-State) inspector is fed by three
+**metadata-only** routes: record payloads, KV values, and archived output
+never cross this surface. All are token-gated like the job endpoints.
+
+#### `GET /state`
+
+Store health and topology plus an inventory: per-prefix stream and document
+counts, capped scope lists, active leases, the quarantine count, and this
+node's live retry ladders and held concurrency slots. Returns
+`{"enabled": false}` when no `state:` section is configured; an unreadable
+store degrades to health-only rather than erroring.
+
+#### `GET /state/documents?ns=<namespace>`
+
+The documents of one `kv/`, `cursor/`, or `idem/` namespace (`400` for any
+other namespace). KV values are redacted to a `valueSize` / `valueType`
+summary; cursor watermarks and idempotency claim metadata are returned
+verbatim.
+
+#### `GET /state/records?stream=<stream>&limit=<n>`
+
+The newest records of one stream, newest first (default 100, max 500).
+Archived-output `logs/` streams are refused with `403`: they carry raw job
+output, which the metadata-only stance keeps off this surface.
 
 ### `GET /job-set-id`
 
@@ -898,10 +957,16 @@ section but `jobApi.enabled: false`, never starts it and injects nothing.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Serve the loopback endpoint and inject the `YACRON2_*` environment into every job. |
-| `listen` | string | (ephemeral) | Address to bind, as `host:port` or `http://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; keep it on loopback. |
-| `maxValueBytes` | int | (unlimited) | Reject a KV or cursor value larger than this many bytes (JSON-encoded) with `413`. `0` or absent means no limit. |
-| `maxArtifactBytes` | int | (unlimited) | Reject an artifact payload larger than this many bytes with `413`. `0` or absent means no limit. |
+| `listen` | string | (ephemeral) | Address to bind, as `host:port` or `http://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; an explicit port must be in `1`-`65535`, and a non-loopback host needs `allowNonLoopbackBind`. |
+| `maxValueBytes` | int | `1048576` (1 MiB) | Reject a KV or cursor value larger than this many bytes (JSON-encoded) with `413`. `0` means no limit. |
+| `maxArtifactBytes` | int | `67108864` (64 MiB) | Reject an artifact payload larger than this many bytes with `413`. `0` means no limit. |
 | `lockTtlSeconds` | float | `30` | Default lease TTL for a job lock (floored at `5`); the daemon renews it at a third of the TTL while the job holds it. |
+| `allowNonLoopbackBind` | bool | `false` | Explicit opt-in for a non-loopback `listen` host; without it such a host is a `ConfigError` (the endpoint serves per-run tokens and staged secrets over plaintext HTTP). |
+
+The server's own transport-level body cap is derived from these limits (the
+larger of the two, plus envelope headroom), so an oversized request body is
+refused with `413` rather than silently truncated; setting either limit to
+`0` lifts the transport cap too -- genuinely unlimited.
 
 ### Injected environment
 

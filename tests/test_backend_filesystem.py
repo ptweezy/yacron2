@@ -314,6 +314,87 @@ async def test_reboot_ran_appends_are_unioned(tmp_path, monkeypatch):
         await _stop(a, b)
 
 
+async def test_takeover_refreshes_ran_set_before_leading(
+    tmp_path, monkeypatch
+):
+    # CRITICAL regression: a takeover must force the ran-set re-read even
+    # when the periodic throttle is nowhere near due, and it must complete
+    # BEFORE leadership is usable -- a failover leader whose cache
+    # predates the old leader's mark would otherwise re-run the one-shot.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a", jsid="v1:s1"))
+    b = await _started(_backend(tmp_path, "node-b", jsid="v1:s1"))
+    try:
+        await a._renew_once()
+        clock.advance(1.0)
+        await b._renew_once()  # follower: cache read while stream is empty
+        assert b._reboot_ran_synced is True
+        await a.mark_reboot_ran("boot-job")  # the old leader's boot run
+        # expire A well inside B's 60s refresh throttle, then B takes over
+        clock.advance(a.ttl + 5.0)
+        await b._renew_once()
+        assert b.is_leader() is True
+        assert b.reboot_ran("boot-job") is True  # no double-fire
+    finally:
+        await _stop(a, b)
+
+
+async def test_takeover_with_failing_ran_refresh_defers_one_shots(
+    tmp_path, monkeypatch
+):
+    # CRITICAL regression: when the takeover's forced ran-set re-read
+    # FAILS, the new leader must not answer "not ran" from its stale cache
+    # (cron would launch the one-shot the old leader already marked).  The
+    # conservative answer is a raise -- cron's guard keeps the one-shot
+    # pending -- and the refresh throttle must NOT be pre-advanced, so the
+    # very next round retries and recovers.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a", jsid="v1:s1"))
+    b = await _started(_backend(tmp_path, "node-b", jsid="v1:s1"))
+    try:
+        await a._renew_once()
+        clock.advance(1.0)
+        await b._renew_once()  # follower: last good refresh predates the mark
+        throttle_before = b._reboot_refresh_next
+        await a.mark_reboot_ran("boot-job")  # the old leader's boot run
+        clock.advance(a.ttl + 5.0)  # still inside B's refresh throttle
+
+        broken = {"on": True}
+        real_list = b._store.list_records
+
+        async def _list(*args, **kw):
+            if broken["on"]:
+                raise OSError("mount recovering")
+            return await real_list(*args, **kw)
+
+        monkeypatch.setattr(b._store, "list_records", _list)
+        await b._renew_once()  # takeover; the forced re-read fails
+        assert b.is_leader() is True
+        # the answer is UNKNOWN, never a stale False: cron treats the raise
+        # as "not known to have run" and keeps the one-shot pending.
+        with pytest.raises(fsb_mod.RebootRanUnknownError):
+            b.reboot_ran("boot-job")
+        # positive answers stay available while the gate is closed: a mark
+        # this node made itself is not deferred.
+        await b.mark_reboot_ran("b-local")
+        assert b.reboot_ran("b-local") is True
+        # the throttle was NOT pre-advanced by the failed attempt
+        assert b._reboot_refresh_next == throttle_before
+        # a non-holder is never gated: a stale False cannot launch there
+        # (cron's _cluster_allows refuses a follower), so no raise.
+        c = _backend(tmp_path, "node-c", jsid="v1:s1")
+        assert c._reboot_ran_synced is False
+        assert c.reboot_ran("boot-job") is False
+        # store recovers: the NEXT round's retry re-reads and recovers
+        broken["on"] = False
+        clock.advance(b.renew_period)
+        await b._renew_once()
+        assert b.is_leader() is True
+        assert b.reboot_ran("boot-job") is True  # no double-fire, no loss
+    finally:
+        await _stop(a, b)
+
+
 # --- lock-fidelity probe -----------------------------------------------------
 
 
@@ -418,6 +499,28 @@ async def test_start_stop_lifecycle_releases_the_lease(tmp_path):
         assert lease.fence >= 2
     finally:
         await _stop(other)
+
+
+async def test_stop_survives_release_failure_on_a_sick_mount(
+    tmp_path, monkeypatch
+):
+    # CRITICAL regression: stop() runs unguarded inside cron.run()'s
+    # shutdown sequence, and the lease release is a best-effort courtesy
+    # write -- a sick/vanished mount raises OSError (ESTALE/EIO/ENOENT)
+    # IMMEDIATELY rather than timing out, and an escape here would skip
+    # the job drain, the DAG shutdown and the state flush. Nothing the
+    # release raises may abort a shutdown; TTL expiry is the fallback.
+    backend = _backend(tmp_path)
+    await backend.start()
+    assert backend.is_leader() is True
+
+    async def _sick(_lease):
+        raise OSError("stale file handle")
+
+    monkeypatch.setattr(backend._store, "release_lease", _sick)
+    await backend.stop()  # must complete without raising
+    assert backend.is_leader() is False
+    assert backend._task is None
 
 
 async def test_view_dict_and_lease_detail_shape(tmp_path, monkeypatch):

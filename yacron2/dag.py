@@ -96,6 +96,17 @@ APPROVAL = "approval"
 ALL_SUCCESS = "all_success"
 ALL_DONE = "all_done"
 
+#: Hard cap on a mapped task's fan-out: a cron daemon shares its host, so an
+#: unbounded XCom list must not become an unbounded instance set (run-document
+#: bloat, subprocess stampede); past the cap the mapped task FAILS with an
+#: explanatory reason instead of expanding.
+MAX_MAPPED_ITEMS = 1000
+
+#: At most this many instances are claimed -- and therefore launched -- by one
+#: advance pass; the rest stays claimable and the driver re-services promptly
+#: (``AdvanceResult.deferred``), bounding any single pass's spawn burst.
+MAX_CLAIMS_PER_PASS = 32
+
 
 # --------------------------------------------------------------------------
 # Static DAG specification (built by config.py, consumed here)
@@ -224,19 +235,18 @@ def _validate_expand(task: TaskSpec, seen: Dict[str, TaskSpec]) -> None:
 
 
 def _check_acyclic(spec: DagSpec) -> None:
-    # Kahn's algorithm: if not every node can be topologically ordered, the
-    # leftover nodes form at least one cycle.
-    indeg = {t.id: 0 for t in spec.tasks}
-    for task in spec.tasks:
-        for _dep in task.depends_on:
-            indeg[task.id] += 1
+    # Kahn's algorithm over the DEDUPED edge set: a repeated dependsOn entry
+    # is one edge (counting it twice would leave a phantom indegree and a
+    # false cycle verdict on an acyclic graph).
+    deps = {t.id: set(t.depends_on) for t in spec.tasks}
+    indeg = {t.id: len(deps[t.id]) for t in spec.tasks}
     ready = [tid for tid, d in indeg.items() if d == 0]
     ordered = 0
     while ready:
         tid = ready.pop()
         ordered += 1
         for task in spec.tasks:
-            if tid in task.depends_on:
+            if tid in deps[task.id]:
                 indeg[task.id] -= 1
                 if indeg[task.id] == 0:
                     ready.append(task.id)
@@ -375,6 +385,9 @@ class AdvanceResult:
     launches: List[LaunchIntent] = field(default_factory=list)
     changed: bool = False
     run_terminal: bool = False
+    # claims hit MAX_CLAIMS_PER_PASS: more instances are claimable right now,
+    # so the driver should re-service promptly rather than wait for a wake.
+    deferred: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -476,6 +489,12 @@ def tasks_awaiting_expansion(
             continue
         if task.id in body.get("mapped", {}):
             continue
+        entry = body.get("tasks", {}).get(task.id)
+        if entry is not None and entry.get("state") != PENDING:
+            # the placeholder already resolved without expanding (upstream
+            # failed/skipped, or the fan-out failed the item cap): re-reading
+            # its XCom every pass would be wasted work forever.
+            continue
         if effective_state(spec, body, task.expand.from_task) == SUCCESS:
             out.append((task.id, task.expand.from_task, task.expand.key))
     return out
@@ -556,6 +575,21 @@ def _apply_expansions(
             continue  # already expanded (stale pre-read); idempotent
         if effective_state(spec, body, task.expand.from_task) != SUCCESS:
             continue  # upstream no longer success under this fresh body
+        if len(items) > MAX_MAPPED_ITEMS:
+            # an oversized fan-out is a per-task failure, never a run wedge:
+            # the placeholder terminalises with a clear reason (downstreams
+            # see upstream_failed) instead of materialising the flood.
+            placeholder = body["tasks"].get(task_id)
+            if placeholder is not None and (
+                placeholder.get("state") == PENDING
+            ):
+                placeholder["failReason"] = (
+                    "mapped fan-out of {} items exceeds the cap of {}".format(
+                        len(items), MAX_MAPPED_ITEMS
+                    )
+                )
+                _terminalise_task(placeholder, FAILED, now, result)
+            continue
         body.setdefault("mapped", {})[task_id] = {
             "items": list(items),
             "expandedAt": now,
@@ -696,6 +730,14 @@ def _advance_task(
     _claim_task(task, taskkey, map_index, item, entry, now, proc, host, result)
 
 
+def _claims_full(result: AdvanceResult) -> bool:
+    """Whether this pass used its claim quota (marks the result deferred)."""
+    if len(result.launches) < MAX_CLAIMS_PER_PASS:
+        return False
+    result.deferred = True
+    return True
+
+
 def _advance_running(
     task, taskkey, map_index, item, entry, now, proc, host, result
 ) -> None:
@@ -712,6 +754,8 @@ def _advance_running(
         entry["failReason"] = "sensor timed out"
         _terminalise_task(entry, FAILED, now, result)
         return
+    if _claims_full(result):
+        return  # this pass's launch quota is spent; re-poke next pass
     poke_number = int(entry.get("pokeCount", 0))
     result.launches.append(
         LaunchIntent(
@@ -731,6 +775,10 @@ def _advance_running(
     entry["proc"] = proc
     entry["host"] = host
     entry["pid"] = None
+    # the in-flight poke owns the schedule now: a stale past due-instant left
+    # here would read as a due wake for the poke's whole duration (busy-spin);
+    # completion re-sets it (not-yet) or terminalises (success).
+    entry["nextPokeAt"] = None
     entry["updatedAt"] = now
     result.changed = True
 
@@ -753,6 +801,8 @@ def _claim_task(
         entry["updatedAt"] = now
         result.changed = True
         return
+    if _claims_full(result):
+        return  # launch quota spent; stays claimable for the next pass
     is_sensor = task.type == SENSOR
     entry["state"] = RUNNING
     # take ownership at claim time (its pid is filled in after the subprocess

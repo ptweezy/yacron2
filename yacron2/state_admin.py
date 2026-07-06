@@ -5,9 +5,12 @@ migration (local disk <-> an Amazon S3 Files / EFS mount -- the same POSIX
 layout either way, so a migration is a faithful file copy), manual garbage
 collection, a health/inventory check, and record-scheme migration.  All of
 it works offline, straight from the ``state`` config section, with no
-running daemon required; against a RUNNING daemon every command stays safe
-(records are immutable, copies/reads never lock), though a backup taken
-mid-write is a point-in-time-ish snapshot rather than an exact one.
+running daemon required.  Against a RUNNING daemon the commands that only
+read the store (or write through the backend's own locked paths) stay safe
+-- records are immutable, copies/reads never lock -- though a backup taken
+mid-write is a point-in-time-ish snapshot rather than an exact one.  The
+exceptions are ``restore --force`` and ``migrate --force``: both write
+straight into a store's namespace and are NOT safe while a daemon uses it.
 
 Imported lazily by ``yacron2.__main__`` only when a ``state`` subcommand is
 used, so the daemon's import graph (and the stateless install) pays nothing
@@ -16,6 +19,7 @@ for it.
 
 import asyncio
 import io
+import json
 import os
 import shutil
 import socket
@@ -66,8 +70,25 @@ def _load_state_backend(config_arg: str) -> FilesystemStateBackend:
     return backend
 
 
-def _job_names(config_arg: str) -> Set[str]:
-    return {job.name for job in parse_config(config_arg).jobs}
+def _config_keep_sets(config_arg: str) -> Tuple[Set[str], Set[str], Set[str]]:
+    """(job names, extra artifact scopes, dag names) the config keeps alive.
+
+    The same three seed sets the daemon derives from its loaded config for a
+    GC pass (see Cron._collect_state_garbage / _artifact_scope_names), so a
+    manual ``yacron2 state gc`` protects exactly what a daemon running this
+    config would.
+    """
+    config = parse_config(config_arg)
+    names = {job.name for job in config.jobs}
+    scopes: Set[str] = set()
+    for job in config.jobs:
+        scopes.update(job.stateAllowedScopes)
+    dag_names: Set[str] = set()
+    for dagcfg in config.dags:
+        dag_names.add(dagcfg.name)
+        for template in dagcfg.task_templates.values():
+            scopes.update(template.stateAllowedScopes)
+    return names, scopes, dag_names
 
 
 def _walk_carried(base: str) -> Iterator[Tuple[str, str]]:
@@ -88,23 +109,34 @@ def cmd_backup(config_arg: str, output: str) -> int:
         print("state: nothing to back up: {} does not exist".format(base))
         return 1
     count = 0
-    with tarfile.open(output, "w:gz") as tar:
-        for full, arcname in _walk_carried(base):
-            # Read the file fully BEFORE writing its tar header: tar.add
-            # streams header-then-data, so a read failing midway (a prune,
-            # a Windows sharing violation) would truncate the member and
-            # silently corrupt the whole archive. Records are small; a
-            # file that cannot be read is skipped, by design for a backup
-            # taken against a live daemon.
-            try:
-                with open(full, "rb") as fobj:
-                    payload = fobj.read()
-                info = tar.gettarinfo(full, arcname=arcname)
-            except OSError:
-                continue
-            info.size = len(payload)
-            tar.addfile(info, io.BytesIO(payload))
-            count += 1
+    # The archive gets the store's own 0o600, not the default 0o644: it
+    # flattens records/docs/blobs -- captured job output, KV values,
+    # artifact payloads, exactly where secrets live -- into one file, so a
+    # world-readable archive would leak everything the store's 0o700/0o600
+    # tree keeps private.  os.open's mode only applies to a NEW file, so a
+    # pre-existing output is chmod'ed too, before any content is written.
+    # (On Windows the POSIX mode is mostly a no-op; POSIX is where the
+    # leak is.)
+    out_fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(out_fd, "wb") as out_fobj:
+        os.chmod(output, 0o600)
+        with tarfile.open(fileobj=out_fobj, mode="w:gz") as tar:
+            for full, arcname in _walk_carried(base):
+                # Read the file fully BEFORE writing its tar header: tar.add
+                # streams header-then-data, so a read failing midway (a
+                # prune, a Windows sharing violation) would truncate the
+                # member and silently corrupt the whole archive. Records are
+                # small; a file that cannot be read is skipped, by design
+                # for a backup taken against a live daemon.
+                try:
+                    with open(full, "rb") as fobj:
+                        payload = fobj.read()
+                    info = tar.gettarinfo(full, arcname=arcname)
+                except OSError:
+                    continue
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+                count += 1
     print(
         "state: backed up {} file(s) from {} to {}".format(count, base, output)
     )
@@ -133,8 +165,26 @@ def _safe_members(
         yield member
 
 
+def _lease_fence(payload: bytes) -> Optional[int]:
+    """The fence counter in a lease file's JSON; ``None`` if unparseable."""
+    try:
+        return int(json.loads(payload)["fence"])
+    except Exception:  # noqa: BLE001 - unparseable means unprovable
+        return None
+
+
 def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
-    """Extract a backup archive into the configured store namespace."""
+    """Extract a backup archive into the configured store namespace.
+
+    Every member lands via a temp sibling + atomic replace (the same
+    pattern as :func:`cmd_migrate`), never a stream into the final path: a
+    concurrent reader of a half-written ``.json`` would see a torn record,
+    which the store QUARANTINES -- silently losing the restored record.
+    When merging into a populated store, a lease file only replaces the
+    current one if its archived fence is not older (fence-max merge): a
+    lease file is its fence counter's only home, and regressing it would
+    hand out already-issued fence values (double execution in a fleet).
+    """
     backend = _load_state_backend(config_arg)
     base = backend.base
     populated = any(
@@ -145,23 +195,75 @@ def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
     if populated and not force:
         print(
             "state: refusing to restore into the non-empty store at {} "
-            "(pass --force to merge into it)".format(base)
+            "(pass --force to merge into it; NOT safe while a daemon "
+            "uses it)".format(base)
         )
         return 1
     os.makedirs(base, mode=0o700, exist_ok=True)
     count = 0
+    skipped_leases = 0
     with tarfile.open(archive, "r:gz") as tar:
         for member in _safe_members(tar, base):
-            # extract with modest permissions; the daemon re-creates its
-            # directory modes, and record files carry job output (0o600).
-            member.mode = 0o600
-            tar.extract(member, path=base)
+            fobj = tar.extractfile(member)
+            if fobj is None:
+                continue
+            payload = fobj.read()
+            target = os.path.join(base, member.name.replace("/", os.sep))
+            if populated and member.name.startswith(LEASES_DIR + "/"):
+                if not member.name.endswith(".lease"):
+                    # a .lock side-file carries no data, and a live daemon
+                    # may hold an OS lock on that very inode: replacing it
+                    # would split the lock across two inodes.
+                    continue
+                current: Optional[int] = None
+                current_exists = os.path.exists(target)
+                if current_exists:
+                    try:
+                        with open(target, "rb") as cur:
+                            current = _lease_fence(cur.read())
+                    except OSError:
+                        current = None
+                archived = _lease_fence(payload)
+                if current_exists and (
+                    archived is None or current is None or archived < current
+                ):
+                    # cannot prove the archived fence is >= the store's:
+                    # keep the current lease file.
+                    skipped_leases += 1
+                    continue
+            os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+            tmp = target + ".restoring"
+            try:
+                # created 0o600 (record files carry job output) and swapped
+                # in via the backend's replace, which rides out transient
+                # Windows sharing violations (AV scans, readers).
+                fdesc = os.open(
+                    tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(fdesc, "wb") as tmp_fobj:
+                    tmp_fobj.write(payload)
+                FilesystemStateBackend._replace(tmp, target)
+            except OSError as ex:
+                print(
+                    "state: failed to restore {}: {}".format(member.name, ex)
+                )
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return 1
             count += 1
     print(
         "state: restored {} file(s) from {} into {}".format(
             count, archive, base
         )
     )
+    if skipped_leases:
+        print(
+            "state: kept {} current lease file(s) whose archived fence "
+            "was older (restoring those would regress fence "
+            "counters)".format(skipped_leases)
+        )
     return 0
 
 
@@ -247,7 +349,11 @@ def cmd_migrate(
 
 
 async def _gc_async(
-    backend: FilesystemStateBackend, keep_names: Set[str], dry_run: bool
+    backend: FilesystemStateBackend,
+    keep_names: Set[str],
+    keep_scopes: Set[str],
+    keep_dags: Set[str],
+    dry_run: bool,
 ) -> Dict[str, Any]:
     import datetime
 
@@ -263,9 +369,13 @@ async def _gc_async(
         RETRY_STREAM_PREFIX,
         RUN_STREAM_PREFIX,
         SLOT_STREAM_PREFIX,
+        _fold_manifest,
+        _manifests_cover_scopes,
         _parse_iso_utc,
         get_now,
     )
+    from yacron2.dag import DAG_RUN_NS_PREFIX, xcom_scope
+    from yacron2.jobstate import ARTIFACT_STREAM_PREFIX, GLOBAL_SCOPE
 
     await backend.start()
     grace = float(backend.config.get("gcGraceSeconds") or 0)
@@ -302,16 +412,17 @@ async def _gc_async(
     # keep this machine's own counter snapshots even if no daemon has
     # manifested from here recently.
     hosts: Set[str] = {socket.gethostname() or "localhost"}
+    art_scopes = set(keep_scopes) | {GLOBAL_SCOPE}
+    live_dags = set(keep_dags)
+    recent: List[Dict[str, Any]] = []
     for rec in manifests:
         at = _parse_iso_utc(rec.get("at"))
         if at is None or (now - at).total_seconds() > grace:
             continue
-        jobs = rec.get("jobs")
-        if isinstance(jobs, list):
-            names.update(str(job) for job in jobs)
-        host = rec.get("host")
-        if isinstance(host, str) and host:
-            hosts.add(host)
+        recent.append(rec)
+        _fold_manifest(rec, names, hosts, art_scopes, live_dags)
+    # job names keep their default artifact scope too.
+    art_scopes |= names
     keep: Dict[str, Set[str]] = {
         RUN_STREAM_PREFIX: names,
         LOG_STREAM_PREFIX: names,
@@ -326,16 +437,95 @@ async def _gc_async(
         SLOT_STREAM_PREFIX: names,
         MANIFEST_STREAM_PREFIX: hosts,
     }
-    return await backend.collect_garbage(
+    # artifact streams are managed only when (a) every recent manifest
+    # advertises its scopes/dags (an older node's silence proves nothing --
+    # mirrors the daemon's pass) and (b) every dagrun/<dag> namespace could
+    # be enumerated by name, so every live run's XCom scope is protectable.
+    # Run DOCUMENTS of removed dags are left to the daemon's DagScheduler,
+    # which alone knows what it owns; once it deletes them, this pass
+    # collects their aged streams too.
+    if _manifests_cover_scopes(recent):
+        namespaces, complete = await backend.list_document_namespaces(
+            DAG_RUN_NS_PREFIX
+        )
+        if complete:
+            for ns in namespaces:
+                dag_name = ns[len(DAG_RUN_NS_PREFIX) :]
+                for body in await backend.list_documents(ns):
+                    run_id = body.get("runId")
+                    if run_id:
+                        art_scopes.add(xcom_scope(dag_name, str(run_id)))
+            keep[ARTIFACT_STREAM_PREFIX] = art_scopes
+    result = await backend.collect_garbage(
         keep=keep, grace=grace, dry_run=dry_run
+    )
+    removed, skip_reason = await _sweep_blobs_async(
+        backend,
+        grace,
+        dry_run,
+        # dry run: collect_garbage only REPORTED these stream tokens, so
+        # their records still exist; exclude them from the reference walk
+        # so the count matches what a real pass would free.
+        set(result.get("removed") or []) if dry_run else set(),
+    )
+    result["blobs_removed"] = removed
+    if skip_reason:
+        result["blob_sweep_skipped"] = skip_reason
+    return result
+
+
+async def _sweep_blobs_async(
+    backend: FilesystemStateBackend,
+    grace: float,
+    dry_run: bool,
+    pruned_tokens: Set[str],
+) -> Tuple[int, Optional[str]]:
+    """One orphan-blob sweep; ``(count, why-skipped-or-None)``.
+
+    Biased to KEEP on every doubt, exactly like the daemon's pass
+    (Cron._sweep_orphan_artifact_blobs): skipped outright when any artifact
+    stream is unenumerable or any record unreadable, and the backend's age
+    guard keeps blobs younger than the grace.
+    """
+    from yacron2.jobstate import (
+        ARTIFACT_STREAM_PREFIX,
+        referenced_blob_digests,
+    )
+    from yacron2.state import _fs_safe
+
+    stream_names, complete = await backend.list_stream_names_audit(
+        ARTIFACT_STREAM_PREFIX
+    )
+    if not complete:
+        return 0, (
+            "an artifact stream exists whose records cannot be enumerated, "
+            "so its blob references cannot be ruled out"
+        )
+    scopes = [
+        name[len(ARTIFACT_STREAM_PREFIX) :]
+        for name in stream_names
+        if _fs_safe(name) not in pruned_tokens
+    ]
+    try:
+        referenced = await referenced_blob_digests(
+            backend, scopes, strict=True
+        )
+    except Exception as ex:  # noqa: BLE001 - a missed reference must KEEP
+        return 0, (
+            "an artifact record could not be read, so its blob reference "
+            "cannot be ruled out ({})".format(ex)
+        )
+    return (
+        await backend.sweep_orphan_blobs(referenced, grace, dry_run=dry_run),
+        None,
     )
 
 
 def cmd_gc(config_arg: str, dry_run: bool) -> int:
     """Run one manual garbage-collection pass (respects gcGraceSeconds)."""
     backend = _load_state_backend(config_arg)
-    names = _job_names(config_arg)
-    result = asyncio.run(_gc_async(backend, names, dry_run))
+    names, scopes, dag_names = _config_keep_sets(config_arg)
+    result = asyncio.run(_gc_async(backend, names, scopes, dag_names, dry_run))
     if result.get("deferred"):
         print(
             "state: gc deferred: the manifest history does not yet span "
@@ -354,6 +544,18 @@ def cmd_gc(config_arg: str, dry_run: bool) -> int:
             result.get("streams_kept", 0),
         )
     )
+    if result.get("blob_sweep_skipped"):
+        print(
+            "state: orphan-blob sweep skipped: {}".format(
+                result["blob_sweep_skipped"]
+            )
+        )
+    else:
+        print(
+            "state: gc {} {} orphaned artifact blob(s)".format(
+                verb, result.get("blobs_removed", 0)
+            )
+        )
     for token in result.get("removed") or []:
         print("  - {}".format(token))
     return 0

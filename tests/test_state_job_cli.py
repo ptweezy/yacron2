@@ -13,6 +13,7 @@ test_state_job_api.py).
 import asyncio
 import json
 import sys
+import urllib.request
 
 import pytest
 
@@ -35,7 +36,16 @@ class _FakeHTTP:
         self.responses = responses or {}
         self.calls = []
 
-    def __call__(self, method, path, *, query=None, json_body=None, data=None):
+    def __call__(
+        self,
+        method,
+        path,
+        *,
+        query=None,
+        json_body=None,
+        data=None,
+        timeout=None,
+    ):
         self.calls.append(
             {
                 "method": method,
@@ -43,6 +53,7 @@ class _FakeHTTP:
                 "query": query,
                 "json": json_body,
                 "data": data,
+                "timeout": timeout,
             }
         )
         status, body = self.responses.get(path, (200, {}))
@@ -162,7 +173,7 @@ def test_cursor_no_action_exit_2(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# idempotent (exit 0 fresh / exit 1 duplicate)
+# idempotent (exit 0 fresh / 5 duplicate / 1 error)
 # --------------------------------------------------------------------------
 
 
@@ -171,9 +182,23 @@ def test_idempotent_fresh_exit_0(monkeypatch):
     assert _cli(monkeypatch, ["idempotent", "order-1"], http) == 0
 
 
-def test_idempotent_duplicate_exit_1(monkeypatch):
+def test_idempotent_duplicate_exit_5(monkeypatch):
+    # "a prior caller did the work" must not share exit 1 with transport/
+    # store errors, or an outage masquerades as "already done" to a guard
+    # script; the duplicate outcome has its own code.
     http = _FakeHTTP({"/v1/idempotency/claim": (200, {"fresh": False})})
+    assert _cli(monkeypatch, ["idempotent", "order-1"], http) == 5
+
+
+def test_idempotent_store_error_exit_1(monkeypatch, capsys):
+    # a state endpoint failure is a real error (1), distinct from the
+    # duplicate skip (5), so `if yacron2 idempotent K; then ...` cannot
+    # silently drop the side effect for the length of a store outage.
+    http = _FakeHTTP(
+        {"/v1/idempotency/claim": (503, {"error": "store down"})}
+    )
     assert _cli(monkeypatch, ["idempotent", "order-1"], http) == 1
+    assert "store down" in capsys.readouterr().err
 
 
 def test_idempotent_release(monkeypatch):
@@ -224,6 +249,28 @@ def test_lock_run_denied_does_not_run(monkeypatch):
     ]
     assert _cli(monkeypatch, argv, http) == 3
     assert not any(c["path"] == "/v1/lock/release" for c in http.calls)
+
+
+def test_lock_acquire_wait_passes_client_deadline(monkeypatch):
+    # a --wait long poll is ended by the server (blockSeconds); the client
+    # deadline is that plus margin, so a wedged daemon still cannot hang
+    # the job forever while a healthy long poll is never cut short.
+    http = _FakeHTTP(
+        {"/v1/lock/acquire": (200, {"acquired": True, "token": "h1"})}
+    )
+    argv = ["lock", "acquire", "L", "--wait", "--timeout", "300"]
+    assert _cli(monkeypatch, argv, http) == 0
+    assert http.calls[0]["timeout"] == 300.0 + jobcli._DEFAULT_TIMEOUT
+
+
+def test_lock_acquire_non_wait_uses_default_deadline(monkeypatch):
+    # without --wait no explicit deadline is passed; _http applies
+    # _DEFAULT_TIMEOUT (every request must have one).
+    http = _FakeHTTP(
+        {"/v1/lock/acquire": (200, {"acquired": True, "token": "h1"})}
+    )
+    assert _cli(monkeypatch, ["lock", "acquire", "L"], http) == 0
+    assert http.calls[0]["timeout"] is None
 
 
 def test_lock_run_parses_flags_before_command(monkeypatch):
@@ -317,6 +364,22 @@ def test_typed_value_parsing():
     assert jobcli._typed_value("100") == 100
     assert jobcli._typed_value("1.5") == 1.5
     assert jobcli._typed_value("2026-07-01") == "2026-07-01"
+
+
+def test_http_opener_carries_no_proxies():
+    # the CLI's opener is built with ProxyHandler({}): urllib drops the
+    # no-op handler entirely, so no handler in the chain carries a proxy
+    # map -- the default opener would honor http_proxy env vars and route
+    # loopback state calls (bearer run token included) through an external
+    # proxy.  The live-wire proof is test_cli_subprocess_ignores_proxy_env
+    # in test_state_job_api.py.
+    assert not any(
+        getattr(h, "proxies", None) for h in jobcli._OPENER.handlers
+    )
+    assert not any(
+        isinstance(h, urllib.request.ProxyHandler)
+        for h in jobcli._OPENER.handlers
+    )
 
 
 # --------------------------------------------------------------------------

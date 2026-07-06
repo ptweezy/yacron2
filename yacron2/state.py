@@ -189,6 +189,22 @@ _WINDOWS_RESERVED = frozenset(
 # every append/list for its stream fail with ENAMETOOLONG forever.
 _FS_SAFE_MAX = 130
 
+# Marker joining a length-truncated token's kept head to its digest (see
+# _fs_safe).  The natural encoding ("%" + two uppercase hex digits) can never
+# emit it, so its presence in an on-disk token positively identifies a
+# truncated token -- one whose logical name is NOT recoverable from the
+# token alone.
+_FS_TRUNCATION_MARKER = "%."
+
+# Filename of the sidecar written inside a length-truncated stream's
+# directory, holding the exact logical stream name (raw UTF-8) -- the only
+# way such a stream's name can round-trip back out of list_stream_names
+# (a garbled name re-encodes to a DIFFERENT token, making the stream
+# invisible to the GC keep-set builders and its state collectable as
+# garbage).  Deliberately not ``.json`` so record listing/pruning/migration
+# never mistake it for a record.
+_STREAM_NAME_SIDECAR = "stream-name.txt"
+
 
 def _now() -> float:
     """Wall-clock epoch seconds; the one time source, so tests can patch it.
@@ -232,7 +248,7 @@ def _fs_safe(name: str) -> str:
         token = "%{:02X}".format(ord(token[0])) + token[1:]
     if len(token) > _FS_SAFE_MAX:
         digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
-        token = token[: _FS_SAFE_MAX - 34] + "%." + digest
+        token = token[: _FS_SAFE_MAX - 34] + _FS_TRUNCATION_MARKER + digest
     return token
 
 
@@ -520,8 +536,17 @@ class StateBackend(abc.ABC):
         *,
         limit: Optional[int] = None,
         newest_first: bool = False,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Read back a stream's records (corrupt ones quarantined)."""
+        """Read back a stream's records (corrupt ones quarantined).
+
+        ``strict=True`` makes an environmentally-unreadable record (an NFS
+        blip) or one written by a NEWER schema PROPAGATE as an exception
+        instead of being silently skipped -- required by any caller for whom
+        a missed record is worse than a failed read (the orphan-blob sweep,
+        which must not mistake "a reference I could not read" for "no
+        reference").  The default stays best-effort.
+        """
 
     @abc.abstractmethod
     async def list_stream_names(self, prefix: str) -> List[str]:
@@ -535,6 +560,22 @@ class StateBackend(abc.ABC):
         first discover which members currently exist.  Best-effort: an
         unreadable store returns ``[]`` rather than raising.
         """
+
+    async def list_stream_names_audit(
+        self, prefix: str
+    ) -> "Tuple[List[str], bool]":
+        """``(names, complete)``: the listing plus whether it is exhaustive.
+
+        ``complete`` is ``False`` when a stream matching ``prefix`` exists
+        but could not be NAMED (a legacy length-truncated directory without
+        its logical-name sidecar, which :meth:`list_stream_names` silently
+        skips).  A caller that will DELETE based on the listing -- the
+        orphan-blob sweep builds its referenced-digest set from it -- must
+        distinguish "no other streams" from "streams I cannot see" and keep
+        on any doubt.  The base backend cannot enumerate at all, so it
+        reports an incomplete empty listing.
+        """
+        return [], False
 
     @abc.abstractmethod
     async def derive_max(self, stream: str, field: str) -> Optional[Any]:
@@ -598,6 +639,22 @@ class StateBackend(abc.ABC):
     @abc.abstractmethod
     async def list_documents(self, namespace: str) -> List[Dict[str, Any]]:
         """Every readable document body in ``namespace``, order-independent."""
+
+    async def list_document_namespaces(
+        self, prefix: str
+    ) -> "Tuple[List[str], bool]":
+        """``(namespaces, complete)``: namespaces starting with ``prefix``.
+
+        The garbage collector uses this to discover the per-dag run-document
+        namespaces (``dagrun/<dag>``) so it can keep every live run's XCom
+        stream and collect the runs of dags removed from config.  ``complete``
+        is ``False`` when a matching namespace exists on disk but its logical
+        name is unrecoverable (a length-truncated directory -- document
+        namespaces have no name sidecar), so a deleting caller keeps instead.
+        The base backend cannot enumerate at all, so it reports an incomplete
+        empty listing.
+        """
+        return [], False
 
     # --- content-addressed blobs (job-facing artifact payloads) ----------
 
@@ -1116,6 +1173,30 @@ class FilesystemStateBackend(StateBackend):
                     raise
                 time.sleep(0.02 * (attempt + 1))
 
+    @staticmethod
+    def _unlink(path: str) -> None:
+        """``os.unlink`` that rides out Windows sharing violations.
+
+        The delete-side twin of :meth:`_replace`: unlinking a file another
+        handle transiently has open (a concurrent read/list on another
+        worker thread, an antivirus/backup scan) raises ``PermissionError``
+        on Windows because CPython opens files without FILE_SHARE_DELETE.
+        Such holds clear in milliseconds, so retry briefly instead of
+        surfacing a spurious error from a healthy store; on POSIX this is a
+        single plain unlink.
+        """
+        if not IS_WINDOWS:
+            os.unlink(path)
+            return
+        for attempt in range(5):
+            try:
+                os.unlink(path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+
     def _atomic_write(self, dest: str, payload: bytes) -> None:
         """Write ``payload`` to ``dest`` via a temp file + atomic rename.
 
@@ -1184,6 +1265,12 @@ class FilesystemStateBackend(StateBackend):
     def _append_sync(self, stream: str, data: Dict[str, Any]) -> str:
         stream_dir = self._stream_dir(stream)
         self._makedirs_durable(stream_dir)
+        token = os.path.basename(stream_dir)
+        if _FS_TRUNCATION_MARKER in token:
+            # a truncated token cannot round-trip through enumeration on its
+            # own; land (or lazily repair) the logical-name sidecar so
+            # list_stream_names can return the exact name.
+            self._ensure_stream_name_sidecar(stream_dir, token, stream)
         # Filename sort key is the write-time epoch (zero-padded so it sorts
         # lexicographically == chronologically), then instance+seq for
         # uniqueness.  The record's own logical timestamp lives in ``data`` and
@@ -1313,9 +1400,10 @@ class FilesystemStateBackend(StateBackend):
         *,
         limit: Optional[int] = None,
         newest_first: bool = False,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
         return await self._call(
-            "list", self._list_sync, stream, limit, newest_first
+            "list", self._list_sync, stream, limit, newest_first, strict
         )
 
     async def list_stream_names(self, prefix: str) -> List[str]:
@@ -1323,30 +1411,103 @@ class FilesystemStateBackend(StateBackend):
             "list-stream-names", self._list_stream_names_sync, prefix
         )
 
+    async def list_stream_names_audit(
+        self, prefix: str
+    ) -> Tuple[List[str], bool]:
+        return await self._call(
+            "list-stream-names", self._list_stream_names_audit_sync, prefix
+        )
+
+    def _read_stream_name_sidecar(
+        self, stream_dir: str, token: str
+    ) -> Optional[str]:
+        """The logical stream name recorded inside a truncated stream dir.
+
+        ``None`` when the sidecar is absent, unreadable, or fails the
+        round-trip check: ``_fs_safe(name)`` must reproduce ``token``
+        exactly, or the name is corrupt/foreign and handing it to a keep-set
+        builder would protect the WRONG token while this one gets collected.
+        """
+        path = os.path.join(stream_dir, _STREAM_NAME_SIDECAR)
+        try:
+            with open(path, "rb") as fobj:
+                name = fobj.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not name or _fs_safe(name) != token:
+            return None
+        return name
+
+    def _ensure_stream_name_sidecar(
+        self, stream_dir: str, token: str, stream: str
+    ) -> None:
+        """Durably record a truncated stream's exact logical name.
+
+        A length-truncated token cannot be decoded back to its logical name
+        (the digest replaced the tail), so without the sidecar
+        :meth:`list_stream_names` would hand every consumer a garbled name
+        that re-encodes to a different token -- and the GC keep-set built
+        from it would miss this stream entirely.  Best-effort: a failed
+        sidecar write must never fail the append it rides on (the stream is
+        then merely skipped by enumeration until a later append lands it).
+        """
+        if self._read_stream_name_sidecar(stream_dir, token) == stream:
+            return
+        with contextlib.suppress(OSError):
+            self._atomic_write(
+                os.path.join(stream_dir, _STREAM_NAME_SIDECAR),
+                stream.encode("utf-8"),
+            )
+
     def _list_stream_names_sync(self, prefix: str) -> List[str]:
+        return self._list_stream_names_audit_sync(prefix)[0]
+
+    def _list_stream_names_audit_sync(
+        self, prefix: str
+    ) -> Tuple[List[str], bool]:
         from urllib.parse import unquote
 
         records_root = os.path.join(self.base, RECORDS_DIR)
         token_prefix = _fs_safe_fragment(prefix)
         try:
             tokens = os.listdir(records_root)
+        except FileNotFoundError:
+            # no store written yet: exhaustively empty, not unreadable.
+            return [], True
         except OSError:
-            return []
+            return [], False
         names: List[str] = []
+        complete = True
         for token in tokens:
             if not token.startswith(token_prefix):
                 continue
-            if not os.path.isdir(os.path.join(records_root, token)):
+            stream_dir = os.path.join(records_root, token)
+            if not os.path.isdir(stream_dir):
+                continue
+            if _FS_TRUNCATION_MARKER in token:
+                # a length-truncated token is not decodable: only its name
+                # sidecar knows the logical name.  A stream without a
+                # verifiable sidecar is SKIPPED, never returned garbled --
+                # a garbled name re-encodes to a different token, so a GC
+                # keep-set built from it would miss the real stream and its
+                # host's state would be collected as garbage.  The skip is
+                # reported through ``complete`` so the orphan-blob sweep can
+                # tell this listing hides a stream (whose records may still
+                # reference blobs) and keep instead.
+                name = self._read_stream_name_sidecar(stream_dir, token)
+                if name is not None:
+                    names.append(name)
+                else:
+                    complete = False
                 continue
             names.append(unquote(token, errors="replace"))
-        return sorted(names)
+        return sorted(names), complete
 
     def _list_sync(
         self,
         stream: str,
         limit: Optional[int],
         newest_first: bool,
-        *,
         strict: bool = False,
     ) -> List[Dict[str, Any]]:
         stream_dir = self._stream_dir(stream)
@@ -1426,24 +1587,44 @@ class FilesystemStateBackend(StateBackend):
         data file is replaced by an atomic rename, which would swap the inode
         out from under a lock taken on it; locking a stable side-file avoids
         that entirely.
+
+        Lock files are also RECLAIMED (a deleted document's ``.lock`` by
+        :meth:`delete_document`, a dead lease's by garbage collection), so a
+        waiter can win the flock on an inode that was unlinked while it
+        waited -- a ghost nobody arriving later will ever contend on.  After
+        acquiring, re-verify the path still names the locked inode and
+        re-open if not; without this, one mutator serialises on the ghost
+        while another serialises on the reclaimer's replacement file, and
+        the mutual exclusion silently splits across two inodes.
         """
         self._makedirs_durable(os.path.dirname(lock_path))
-        fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            # msvcrt.locking needs a byte present to lock; guarantee one.
-            if os.fstat(fdesc).st_size == 0:
-                os.write(fdesc, b"\0")
-            began = time.perf_counter()
-            with exclusive_file_lock(fdesc):
-                # time-to-acquire is the contention signal: near zero on an
-                # idle store, and the cross-host wait on a fought-over lease.
-                waited = time.perf_counter() - began
-                with self._stats_lock:
-                    self._lock_acquisitions += 1
-                    self._lock_wait_seconds += waited
-                yield
-        finally:
-            os.close(fdesc)
+        began = time.perf_counter()
+        while True:
+            fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                # msvcrt.locking needs a byte present to lock; guarantee one.
+                if os.fstat(fdesc).st_size == 0:
+                    os.write(fdesc, b"\0")
+                with exclusive_file_lock(fdesc):
+                    try:
+                        same = os.path.samestat(
+                            os.fstat(fdesc), os.stat(lock_path)
+                        )
+                    except OSError:
+                        same = False
+                    if not same:
+                        continue  # ghost inode: re-open and contend afresh
+                    # time-to-acquire is the contention signal: near zero on
+                    # an idle store, and the cross-host wait on a fought-over
+                    # lease.
+                    waited = time.perf_counter() - began
+                    with self._stats_lock:
+                        self._lock_acquisitions += 1
+                        self._lock_wait_seconds += waited
+                    yield
+                    return
+            finally:
+                os.close(fdesc)
 
     def _read_lease_file(
         self, lease_path: str, *, strict: bool = False
@@ -1707,31 +1888,57 @@ class FilesystemStateBackend(StateBackend):
         # the lock file's directory is the namespace dir, created here so the
         # very first write to a fresh namespace has somewhere to land.
         self._makedirs_durable(os.path.dirname(lock_path))
-        with self._locked(lock_path):
-            current = self._read_doc_file(doc_path, strict=True)
-            new_body, result = transform(current)
-            if new_body is DOC_KEEP:
-                return current, result
-            if new_body is DOC_DELETE:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(doc_path)
-                    # without this, a released idempotency key or a deleted
-                    # KV entry can RESURRECT after a power loss (the unlink
-                    # never became durable), silently un-doing the delete and
-                    # letting guarded once-only work run again.
-                    fsync_directory(os.path.dirname(doc_path))
-                return None, result
-            if not isinstance(new_body, dict):
-                raise TypeError(
-                    "mutate_document transform must return a dict body, "
-                    "DOC_KEEP or DOC_DELETE"
+        reclaim_lock_post_release = False
+        try:
+            with self._locked(lock_path):
+                current = self._read_doc_file(doc_path, strict=True)
+                new_body, result = transform(current)
+                if new_body is DOC_KEEP:
+                    return current, result
+                if new_body is DOC_DELETE:
+                    with contextlib.suppress(FileNotFoundError):
+                        self._unlink(doc_path)
+                        # without this, a released idempotency key or a
+                        # deleted KV entry can RESURRECT after a power loss
+                        # (the unlink never became durable), silently
+                        # un-doing the delete and letting guarded once-only
+                        # work run again.
+                        fsync_directory(os.path.dirname(doc_path))
+                    # reclaim the ``.lock`` side-file too: a deleted
+                    # document's lock file is otherwise orphaned forever
+                    # (dagrun deletes one uniquely-keyed run document per
+                    # DAG run, so the orphans grow without bound).
+                    if IS_WINDOWS:
+                        # our own open handle forbids the unlink while the
+                        # lock is held; do it post-release below, where a
+                        # concurrent acquirer's open handle (no
+                        # FILE_SHARE_DELETE) makes it fail harmlessly
+                        # instead of racing.
+                        reclaim_lock_post_release = True
+                    else:
+                        # unlink while STILL HOLDING the flock: _locked
+                        # re-verifies inode identity after acquiring, so a
+                        # waiter blocked on this unlinked inode re-opens
+                        # instead of splitting the mutex with a mutator on
+                        # the replacement file.
+                        with contextlib.suppress(OSError):
+                            os.unlink(lock_path)
+                    return None, result
+                if not isinstance(new_body, dict):
+                    raise TypeError(
+                        "mutate_document transform must return a dict body, "
+                        "DOC_KEEP or DOC_DELETE"
+                    )
+                payload = _json.dumps_bytes(
+                    {"schemaVersion": SCHEME_VERSION, "data": new_body},
+                    sort_keys=True,
                 )
-            payload = _json.dumps_bytes(
-                {"schemaVersion": SCHEME_VERSION, "data": new_body},
-                sort_keys=True,
-            )
-            self._atomic_write(doc_path, payload)
-            return new_body, result
+                self._atomic_write(doc_path, payload)
+                return new_body, result
+        finally:
+            if reclaim_lock_post_release:
+                with contextlib.suppress(OSError):
+                    os.unlink(lock_path)
 
     async def delete_document(self, namespace: str, key: str) -> bool:
         def _delete(current: Optional[Dict[str, Any]]) -> Tuple[Any, bool]:
@@ -1744,6 +1951,45 @@ class FilesystemStateBackend(StateBackend):
         return await self._call(
             "doc-list", self._list_documents_sync, namespace
         )
+
+    async def list_document_namespaces(
+        self, prefix: str
+    ) -> Tuple[List[str], bool]:
+        return await self._call(
+            "doc-list", self._list_document_namespaces_sync, prefix
+        )
+
+    def _list_document_namespaces_sync(
+        self, prefix: str
+    ) -> Tuple[List[str], bool]:
+        from urllib.parse import unquote
+
+        docs_root = os.path.join(self.base, DOCS_DIR)
+        token_prefix = _fs_safe_fragment(prefix)
+        try:
+            tokens = os.listdir(docs_root)
+        except FileNotFoundError:
+            # no document ever written: exhaustively empty, not unreadable.
+            return [], True
+        except OSError:
+            return [], False
+        names: List[str] = []
+        complete = True
+        for token in tokens:
+            if not token.startswith(token_prefix):
+                continue
+            if not os.path.isdir(os.path.join(docs_root, token)):
+                continue
+            if _FS_TRUNCATION_MARKER in token:
+                # a truncated namespace token is not decodable and (unlike a
+                # record stream) has no logical-name sidecar to recover it
+                # from: report the listing incomplete rather than hand a
+                # garbled name to the GC, which would then collect the XCom
+                # streams this namespace's run documents still anchor.
+                complete = False
+                continue
+            names.append(unquote(token, errors="replace"))
+        return sorted(names), complete
 
     def _list_documents_sync(self, namespace: str) -> List[Dict[str, Any]]:
         ns_dir = self._doc_dir(namespace)
@@ -1767,8 +2013,14 @@ class FilesystemStateBackend(StateBackend):
         digest = hashlib.sha256(data).hexdigest()
         path = self._blob_path(digest)
         # content-addressed: an existing blob with this digest already holds
-        # exactly this payload, so skip the rewrite (and its fsync cost).
+        # exactly this payload, so skip the rewrite (and its fsync cost) --
+        # but refresh its mtime, which is the orphan-blob sweep's age guard:
+        # this payload was just (re)published and its new record has not
+        # landed yet, so a concurrent sweep whose surviving references are
+        # all mid-deletion must read it as too-young, not as an aged orphan.
         if os.path.exists(path):
+            with contextlib.suppress(OSError):
+                os.utime(path)
             return digest
         self._makedirs_durable(os.path.dirname(path))
         # _atomic_write renames over any existing file; a concurrent writer of
@@ -1880,9 +2132,22 @@ class FilesystemStateBackend(StateBackend):
         when it POSITIVELY matches a managed prefix, its suffix is not kept,
         AND its newest record is older than ``grace`` seconds (belt and
         braces for a store whose manifests are missing).  Anything that
-        cannot be classified is kept; :data:`PROTECTED_STREAMS` and lease
-        files are never touched (a lease file is its fence counter's only
-        home).  Also sweeps crash debris: write-temp files older than
+        cannot be classified is kept -- including a length-truncated stream
+        directory without a verifiable logical-name sidecar, whose name the
+        keep-set builder could never have seen; :data:`PROTECTED_STREAMS`
+        are never touched.
+
+        Lease files are never touched within the grace window: a lease file
+        is its fence counter's only home, and deleting one resets the next
+        acquire to fence 1, re-issuing fence values already handed out.  A
+        lease PROVABLY dead for the whole window -- both its expiry and its
+        last write (release marks expiry ``0.0`` in place, so the file
+        mtime, not the expiry, dates a release) older than ``grace`` -- is
+        reclaimed together with its ``.lock`` side-file: every fence ever
+        issued for that name expired at least ``grace`` ago (each takeover
+        happens strictly after its predecessor's expiry), so no live actor
+        can still hold a stale ``Lease`` and the fence reset is
+        unobservable.  Also sweeps crash debris: write-temp files older than
         :data:`TMP_MAX_AGE` and quarantined records older than ``grace``.
         """
         return await self._call("gc", self._gc_sync, keep, grace, dry_run)
@@ -1917,6 +2182,18 @@ class FilesystemStateBackend(StateBackend):
                 # is still wanted or cannot be classified.
                 kept_streams += 1
                 continue
+            if (
+                _FS_TRUNCATION_MARKER in token
+                and self._read_stream_name_sidecar(stream_dir, token) is None
+            ):
+                # a length-truncated token with no verifiable name sidecar
+                # (a legacy dir written before sidecars existed) was
+                # invisible to the keep-set builder -- list_stream_names
+                # skips it -- so its absence from ``keep`` proves nothing:
+                # unclassifiable, keep.  The next append to the stream
+                # lands the sidecar and makes it classifiable again.
+                kept_streams += 1
+                continue
             try:
                 names = os.listdir(stream_dir)
             except OSError:
@@ -1949,6 +2226,7 @@ class FilesystemStateBackend(StateBackend):
             # non-empty; the rmdir then fails and the next pass converges.
             with contextlib.suppress(OSError):
                 os.rmdir(stream_dir)
+        leases_removed = self._gc_leases_sync(cutoff, dry_run)
         tmp_removed = self._sweep_dir_sync(
             os.path.join(self.base, TMP_DIR), now - TMP_MAX_AGE, dry_run
         )
@@ -1961,9 +2239,89 @@ class FilesystemStateBackend(StateBackend):
             "removed": removed_streams,
             "records_removed": removed_records,
             "streams_kept": kept_streams,
+            "leases_removed": leases_removed,
             "tmp_removed": tmp_removed,
             "quarantine_removed": quarantine_removed,
         }
+
+    def _lease_dead_past_grace(self, lease_path: str, cutoff: float) -> bool:
+        """Whether a lease was provably dead for the whole grace window.
+
+        True only when BOTH the recorded expiry and the file's mtime (the
+        last acquire/renew/release write -- release marks expiry ``0.0`` in
+        place, so the expiry alone cannot date it) predate ``cutoff``.
+        Every fence ever issued for the name then expired at least the
+        grace window ago (each takeover happens strictly after its
+        predecessor's expiry, and the release write postdates the fence it
+        retires), so no live actor can still hold a stale ``Lease`` and
+        deleting the file -- resetting the fence -- is unobservable.
+        Anything unreadable is NOT reclaimable: never delete what cannot be
+        classified.
+        """
+        try:
+            mtime = os.stat(lease_path).st_mtime
+            lease = self._read_lease_file(lease_path, strict=True)
+        except (OSError, _LeaseUnreadable):
+            return False
+        if lease is None:
+            return False
+        return lease.expires_at < cutoff and mtime < cutoff
+
+    def _gc_leases_sync(self, cutoff: float, dry_run: bool) -> int:
+        """Reclaim lease files (and lock side-files) dead past the grace.
+
+        Bounded per-job lease names would be harmless to keep forever, but
+        dagrun takes one uniquely-named advance lease PER DAG RUN, so
+        without reclamation the flat leases/ directory grows without bound.
+        The check-and-delete runs under the per-lease flock so it cannot
+        race a concurrent re-acquire (which holds the same flock); the
+        ``.lock`` sibling goes LAST -- an acquirer recreating it after the
+        ``.lease`` vanished simply takes a fresh fence-1 lease, which the
+        grace argument (see :meth:`_lease_dead_past_grace`) makes safe.
+        """
+        removed = 0
+        lease_root = os.path.join(self.base, LEASES_DIR)
+        try:
+            names = os.listdir(lease_root)
+        except OSError:
+            return 0
+        for name in names:
+            if not name.endswith(".lease"):
+                continue
+            lease_path = os.path.join(lease_root, name)
+            lock_path = lease_path[: -len(".lease")] + ".lock"
+            # cheap unlocked pre-check: skip anything plausibly live before
+            # paying for its flock.
+            if not self._lease_dead_past_grace(lease_path, cutoff):
+                continue
+            if dry_run:
+                removed += 1
+                continue
+            with self._locked(lock_path):
+                # re-judge under the lock: a concurrent re-acquire may have
+                # just revived (rewritten) it.
+                if not self._lease_dead_past_grace(lease_path, cutoff):
+                    continue
+                with contextlib.suppress(OSError):
+                    os.unlink(lease_path)
+                    removed += 1
+                if not IS_WINDOWS:
+                    # drop the lock side-file while STILL HOLDING it:
+                    # _locked re-verifies inode identity after acquiring,
+                    # so waiters on this unlinked inode re-open instead of
+                    # splitting the mutex with the recreated file.
+                    with contextlib.suppress(OSError):
+                        os.unlink(lock_path)
+            if IS_WINDOWS:
+                # post-release: our own handle is closed now; a concurrent
+                # acquirer's open handle (no FILE_SHARE_DELETE) makes this
+                # fail harmlessly and a later pass converges.
+                with contextlib.suppress(OSError):
+                    os.unlink(lock_path)
+        if removed and not dry_run:
+            # make the reclamation itself crash-durable, once per pass.
+            fsync_directory(lease_root)
+        return removed
 
     @staticmethod
     def _sweep_dir_sync(path: str, cutoff: float, dry_run: bool) -> int:
@@ -2186,10 +2544,14 @@ class FilesystemStateBackend(StateBackend):
 
         Walks the on-disk tree off the event loop and returns per-prefix
         stream/document counts, capped scope lists, and active leases -- never
-        a record payload or a document value.
+        a record payload or a document value.  Routed through :meth:`_call`
+        like every other op -- never the default executor, whose non-daemon
+        threads a dashboard polling this against a hung mount would wedge
+        one by one until config reload (and interpreter exit) hang behind
+        them; ``_call``'s abandonable daemon threads, lane cap and throttle
+        exist for exactly that store.
         """
-        loop = asyncio.get_running_loop()
-        base_dict = await loop.run_in_executor(None, self._inventory_sync)
+        base_dict = await self._call("inventory", self._inventory_sync)
         base_dict["view"] = self.view_dict()
         base_dict["stats"] = self.stats()
         base_dict["enumerable"] = True

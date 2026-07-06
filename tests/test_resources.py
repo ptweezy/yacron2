@@ -5,7 +5,11 @@ import sys
 
 import pytest
 
-from yacron2.resources import ResourceMonitor, ResourceUsage
+from yacron2.resources import (
+    NodeResourceSampler,
+    ResourceMonitor,
+    ResourceUsage,
+)
 
 # a short busy-loop that also holds a chunk of memory, so both CPU time and
 # RSS are non-trivially observable while the monitor samples it. Runs the test
@@ -87,6 +91,40 @@ async def test_monitor_samples_a_real_process():
     # it burned CPU and held memory; both must be strictly positive.
     assert usage.cpu_total_seconds > 0.0
     assert usage.max_rss_bytes > 0
+
+
+@pytest.mark.asyncio
+async def test_monitor_live_snapshot():
+    proc = await _spawn_busy(0.6)
+    monitor = ResourceMonitor(proc.pid, job_name="busy", interval=0.05)
+    # no sample yet -> no live snapshot
+    assert monitor.snapshot() is None
+    monitor.start()
+    await asyncio.sleep(0.2)  # let a couple of samples land while it runs
+    snap = monitor.snapshot()
+    assert snap is not None
+    assert set(snap) == {"cpu_seconds", "cpu_percent", "rss_bytes"}
+    assert snap["rss_bytes"] > 0
+    assert snap["cpu_percent"] >= 0.0
+    await proc.wait()
+    await monitor.stop()
+
+
+def test_node_sampler_snapshot():
+    sampler = NodeResourceSampler()
+    snap = sampler.snapshot()
+    # psutil is a core dependency, so a snapshot is expected here
+    assert snap is not None
+    for key in ("cpu_percent", "mem_percent", "mem_used_bytes",
+                "mem_total_bytes"):
+        assert key in snap
+    assert 0 <= snap["mem_percent"] <= 100
+    assert snap["mem_total_bytes"] > 0
+
+
+def test_node_sampler_without_psutil(monkeypatch):
+    monkeypatch.setattr("yacron2.resources.psutil", None)
+    assert NodeResourceSampler().snapshot() is None
 
 
 @pytest.mark.asyncio

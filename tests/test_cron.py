@@ -1114,6 +1114,63 @@ def test_record_run_caps_history():
 
 
 @pytest.mark.asyncio
+async def test_web_get_node_returns_resources():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        pass
+
+    resp = await cron._web_get_node(Req())
+    data = json.loads(resp.text)
+    assert data["node_name"]
+    # psutil is a core dep, so the node snapshot is populated in tests
+    assert data["resources"] is not None
+    assert "cpu_percent" in data["resources"]
+    assert "mem_percent" in data["resources"]
+
+
+@pytest.mark.asyncio
+async def test_job_to_dict_includes_live_running_resources():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    job = cron.cron_jobs["alpha"]
+
+    class FakeRunning:
+        proc = None
+
+        def live_resources(self):
+            return {"cpu_percent": 40.0, "cpu_seconds": 2.0, "rss_bytes": 1000}
+
+    cron.running_jobs["alpha"] = [FakeRunning(), FakeRunning()]
+    d = cron._job_to_dict("alpha", job)
+    # summed across the two running instances
+    assert d["running_resources"] == {
+        "cpu_percent": 80.0,
+        "cpu_seconds": 4.0,
+        "rss_bytes": 2000,
+        "instances": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_job_to_dict_omits_running_resources_when_unmonitored():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    job = cron.cron_jobs["alpha"]
+
+    class FakeRunning:
+        proc = None
+
+        def live_resources(self):
+            return None  # unmonitored / no sample yet
+
+    cron.running_jobs["alpha"] = [FakeRunning()]
+    d = cron._job_to_dict("alpha", job)
+    assert "running_resources" not in d
+
+
+@pytest.mark.asyncio
 async def test_web_list_jobs_includes_history_and_timezone():
     import json
 

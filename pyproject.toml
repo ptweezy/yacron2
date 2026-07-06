@@ -48,6 +48,14 @@ dependencies = [
     # zoneinfo's tz database, so timezones resolve on minimal/slim images
     # that don't ship the system tzdata.
     "tzdata>=2024.1",
+    # per-run CPU/memory accounting (opt-in `monitorResources`; see
+    # yacron2.resources). psutil gives a portable, process-tree-aware read of
+    # a job's CPU time and resident memory on Linux, macOS and Windows alike --
+    # asyncio's own subprocess reaping only surfaces the exit code. The feature
+    # is off by default, but the import is unconditional so `yacron2 --help`
+    # and the type checker resolve it everywhere; it ships wheels for the
+    # mainstream targets and builds from source elsewhere.
+    "psutil>=5.9",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",

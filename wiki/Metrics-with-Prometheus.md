@@ -104,6 +104,16 @@ All metrics are prefixed `yacron2_`. Per-job metrics carry the job name in a `jo
 | `yacron2_job_last_run_duration_seconds{job_name}` | gauge | Duration of the most recent finished run. |
 | `yacron2_job_last_run_exit_code{job_name}` | gauge | Exit code of the most recent finished run. |
 | `yacron2_job_last_run_success{job_name}` | gauge | `1` if the most recent finished run succeeded, else `0` (a cancelled run counts as `0`). |
+| `yacron2_job_cpu_seconds_total{job_name, mode}` | counter | CPU time consumed by [`monitorResources`](Configuration-Reference#metrics) runs, `mode="user"` / `"system"`, summed over the job's monitored runs. Emitted only once the job has a monitored run (an unmonitored job exports no CPU series). |
+| `yacron2_job_peak_rss_bytes{job_name}` | gauge | Highest resident-set size (bytes) observed across all of the job's monitored runs. Absent until the first monitored run. |
+| `yacron2_job_last_run_cpu_seconds{job_name}` | gauge | Total CPU time of the most recent monitored run. Absent unless that run had `monitorResources` on. |
+| `yacron2_job_last_run_max_rss_bytes{job_name}` | gauge | Peak resident-set size (bytes) of the most recent monitored run. Absent unless that run had `monitorResources` on. |
+
+The four resource families above require the job to opt into
+[`monitorResources`](Configuration-Reference#metrics); they are sampled and
+best-effort. Like the run counters, `yacron2_job_cpu_seconds_total` and
+`yacron2_job_peak_rss_bytes` are made restart-durable by a `state:` store (see
+[Semantics and guarantees](#semantics-and-guarantees)).
 
 ### State backend
 

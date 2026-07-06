@@ -408,6 +408,58 @@ jobs:
     }
 
 
+def test_monitor_resources_default_off():
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    assert conf.jobs[0].monitorResources is False
+
+
+def test_monitor_resources_from_defaults_and_override():
+    conf = config.parse_config_string(
+        """
+defaults:
+  monitorResources: true
+
+jobs:
+  - name: on-from-default
+    command: foo
+    schedule: "* * * * *"
+  - name: explicit-off
+    command: bar
+    schedule: "* * * * *"
+    monitorResources: false
+""",
+        "",
+    )
+    by_name = {j.name: j.monitorResources for j in conf.jobs}
+    assert by_name == {"on-from-default": True, "explicit-off": False}
+
+
+def test_monitor_resources_applies_to_dag_tasks():
+    conf = config.parse_config_string(
+        """
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+        monitorResources: true
+""",
+        "",
+    )
+    task = conf.dags[0].tasks[0]
+    assert task.id == "a"
+    assert task.job_template.monitorResources is True
+
+
 def test_report_defaults_not_aliased():
     # onFailure/onPermanentFailure/onSuccess report blocks must be independent
     # objects so mutating one cannot corrupt the others (or the global

@@ -59,6 +59,18 @@ When the job stops (normal exit, timeout, or cancellation), yacron2 computes the
 - `<prefix>.success:<1|0>|g`: gauge. `1` if the job did **not** fail, `0` if it failed. The value comes from `0 if job.failed else 1`, where `job.failed` is the [failure-detection](Failure-Detection-and-Retries) result (`failsWhen`). A nonzero exit code, output on a watched stream, or `failsWhen: always` therefore reports `success:0`.
 - `<prefix>.duration:<ms>|ms|@0.1`: timer (`|ms`) with a sample rate suffix of `@0.1`. The numeric value is the integer wall-clock duration in milliseconds, measured with `perf_counter` between start and stop. The `@0.1` sample-rate flag is sent literally on every datagram; yacron2 does not actually sample (it sends one duration per run), so the flag instructs the statsd server to scale the metric accordingly. Configure your statsd/dashboards to account for this.
 
+When the job has [`monitorResources`](Configuration-Reference#metrics) on, the same stop datagram also carries the run's resource accounting:
+
+```text
+<prefix>.cpu:<ms>|ms|@0.1
+<prefix>.max_rss:<bytes>|g
+```
+
+- `<prefix>.cpu:<ms>|ms|@0.1`: timer, the total CPU time (user + system) of the run's process tree in milliseconds. Same `@0.1` sample-rate caveat as `duration`.
+- `<prefix>.max_rss:<bytes>|g`: gauge, the peak resident-set size observed during the run, in bytes.
+
+These two lines are omitted for a run that was not monitored (or where sampling caught nothing), so an unmonitored job's stop datagram is unchanged.
+
 A run whose command never launches (the subprocess could not be spawned; `start_failed` is set) emits neither metric: `wait()` returns early on that path and `_on_stop` (hence `job_stopped`) is never called, and `_on_start` was likewise never reached. Separately, `job_stopped` itself guards on a recorded start time (`if self.start_time is None: return`), which suppresses a stop metric for a run that was stopped without a corresponding `job_started` (for example, the `cancel()`/`wait()` race under `concurrencyPolicy: Replace`).
 
 ## Best-effort delivery

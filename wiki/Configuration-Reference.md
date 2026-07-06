@@ -519,11 +519,27 @@ is raised. Privilege switching is **not supported on Windows**: a job with
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `statsd` | `Map({"prefix": Str, "host": Str, "port": Int})` | none | When set, emit start/stop/success/duration metrics over UDP. All three keys are required. |
+| `monitorResources` | `Bool` | `false` | Sample each run's CPU time and peak resident memory (RSS) by polling the job's process tree while it runs. Observability only: the numbers ride the run record into the dashboard, `GET /metrics` and statsd, but never change a run's success/failure verdict. Off by default; a per-instance sampling task is spawned only when it is on. Set it under `defaults:` to enable it fleet-wide. |
 
 See [Metrics with statsd](Metrics-with-Statsd). Prometheus metrics are not
 configured per job: the `GET /metrics` endpoint is global, tuned under
 `web.metrics` in the `web` section above. See
 [Metrics with Prometheus](Metrics-with-Prometheus).
+
+**Resource accounting (`monitorResources`).** With it on, a run is sampled by
+[psutil](https://github.com/giampaolo/psutil) (a core dependency) over its
+whole process tree, so a job that shells out to child processes is accounted
+too. The result — total user/system CPU seconds and the peak RSS observed —
+appears in the dashboard run history and stats, in the durable run record's
+`resources` object (so it survives a restart), and as the metrics listed in
+[Metrics with Prometheus](Metrics-with-Prometheus). Report templates and the
+shell reporter also receive `cpu_seconds` / `max_rss_bytes`
+(`YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES`). The numbers are **sampled**,
+so a run that finishes between two samples is measured approximately; the long,
+heavy runs whose resource use actually matters are sampled many times. It is
+best-effort: if psutil cannot read a process (already exited, permission
+denied) the run simply carries no resource stats, and monitoring never fails a
+job.
 
 ## Load-time numeric validation
 

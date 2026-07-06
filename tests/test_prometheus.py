@@ -212,6 +212,64 @@ def test_registry_counts_runs_and_outcome_timestamps():
     ) == 2
 
 
+def test_registry_accumulates_cpu_and_peak_rss():
+    from yacron2.resources import ResourceUsage
+
+    metrics = PrometheusMetrics()
+    metrics.job_run_recorded(
+        "j", "success", 2.0, ResourceUsage(1.0, 0.5, 1000, 3)
+    )
+    metrics.job_run_recorded(
+        "j", "success", 3.0, ResourceUsage(2.0, 1.0, 4000, 5)
+    )
+    text = _registry_text(metrics)
+    # user/system CPU accumulate as a per-mode counter
+    assert sample_value(
+        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+    ) == 3.0
+    assert sample_value(
+        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="system"
+    ) == 1.5
+    # peak RSS is a high-water mark across runs, not a sum
+    assert sample_value(
+        text, "yacron2_job_peak_rss_bytes", job_name="j"
+    ) == 4000
+
+
+def test_registry_cpu_absent_for_unmonitored_job():
+    metrics = PrometheusMetrics()
+    metrics.job_run_recorded("j", "success", 2.0)  # no resources
+    text = _registry_text(metrics)
+    # an unmonitored job exports no CPU counter / peak-RSS gauge at all
+    assert sample_value(
+        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+    ) is None
+    assert sample_value(
+        text, "yacron2_job_peak_rss_bytes", job_name="j"
+    ) is None
+
+
+def test_counter_snapshot_round_trip_seeds_cpu():
+    from yacron2.resources import ResourceUsage
+
+    metrics = PrometheusMetrics()
+    metrics.job_run_recorded(
+        "j", "success", 2.0, ResourceUsage(1.0, 0.5, 8000, 3)
+    )
+    snap = metrics.counters_snapshot()
+
+    restored = PrometheusMetrics()
+    seeded = restored.seed_counters(snap, keep=["j"])
+    assert seeded == 1
+    text = _registry_text(restored)
+    assert sample_value(
+        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+    ) == 1.0
+    assert sample_value(
+        text, "yacron2_job_peak_rss_bytes", job_name="j"
+    ) == 8000
+
+
 def test_registry_prune_drops_removed_jobs():
     metrics = PrometheusMetrics()
     metrics.job_run_recorded("keep", "success", 1.0)

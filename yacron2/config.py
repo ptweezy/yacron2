@@ -345,6 +345,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # output before it is written. On by default; captured stdout/stderr
     # routinely carries credentials. Only applies when archiveOutput is set.
     "redactArchivedSecrets": True,
+    # sample each run's CPU time and peak resident memory (opt-in; needs the
+    # psutil-backed sampler, see yacron2.resources). Observability only: the
+    # numbers ride the run record into the web UI, /metrics and statsd but
+    # never change a run's success/failure verdict. Off by default -- it spawns
+    # a lightweight sampling task per running instance.
+    "monitorResources": False,
     "captureStderr": True,
     "captureStdout": False,
     "saveLimit": 4096,
@@ -467,6 +473,7 @@ _job_defaults_common = {
     Opt("onlyIfLastSucceeded"): Bool(),
     Opt("archiveOutput"): Bool(),
     Opt("redactArchivedSecrets"): Bool(),
+    Opt("monitorResources"): Bool(),
     Opt("captureStderr"): Bool(),
     Opt("captureStdout"): Bool(),
     Opt("saveLimit"): Int(),
@@ -564,6 +571,7 @@ _dag_task_launch_fields = {
     Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
     Opt("captureStderr"): Bool(),
     Opt("captureStdout"): Bool(),
+    Opt("monitorResources"): Bool(),
     Opt("saveLimit"): Int(),
     Opt("maxLineLength"): Int(),
     Opt("streamPrefix"): Str(),
@@ -953,6 +961,7 @@ class JobConfig:
         "onlyIfLastSucceeded",
         "archiveOutput",
         "redactArchivedSecrets",
+        "monitorResources",
         "captureStderr",
         "captureStdout",
         "streamPrefix",
@@ -1010,6 +1019,7 @@ class JobConfig:
         self.onlyIfLastSucceeded = config.pop("onlyIfLastSucceeded")
         self.archiveOutput = config.pop("archiveOutput")
         self.redactArchivedSecrets = config.pop("redactArchivedSecrets")
+        self.monitorResources = config.pop("monitorResources")
         self.captureStderr = config.pop("captureStderr")
         self.captureStdout = config.pop("captureStdout")
         self.streamPrefix = config.pop("streamPrefix")

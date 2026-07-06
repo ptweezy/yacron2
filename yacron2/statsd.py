@@ -57,16 +57,26 @@ class StatsdJobMetricWriter:
             return
         duration_seconds = time.perf_counter() - self.start_time
         duration = int(round(duration_seconds * 1000))
-        await send_to_statsd(
-            self.host,
-            self.port,
-            (
-                "{prefix}.stop:1|g\n"
-                "{prefix}.success:{success}|g\n"
-                "{prefix}.duration:{duration}|ms|@0.1\n"
+        message = (
+            "{prefix}.stop:1|g\n"
+            "{prefix}.success:{success}|g\n"
+            "{prefix}.duration:{duration}|ms|@0.1\n"
+        ).format(
+            prefix=self.prefix,
+            success=0 if self.job.failed else 1,
+            duration=duration,
+        )
+        # When the run was resource-monitored (see yacron2.resources) ship the
+        # CPU time and peak RSS alongside the duration. resource_usage is
+        # finalized in RunningJob._on_stop before this hook runs, so it is
+        # already populated here; None when monitoring was off or unavailable.
+        usage = getattr(self.job, "resource_usage", None)
+        if usage is not None:
+            message += (
+                "{prefix}.cpu:{cpu}|ms|@0.1\n{prefix}.max_rss:{rss}|g\n"
             ).format(
                 prefix=self.prefix,
-                success=0 if self.job.failed else 1,
-                duration=duration,
-            ),
-        )
+                cpu=int(round(usage.cpu_total_seconds * 1000)),
+                rss=usage.max_rss_bytes,
+            )
+        await send_to_statsd(self.host, self.port, message)

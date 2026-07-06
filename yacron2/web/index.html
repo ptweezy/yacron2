@@ -1549,6 +1549,16 @@
     const h = Math.floor(m / 60);
     return h + "h " + (m % 60) + "m";
   }
+  // human-readable byte size for peak-RSS readouts (1 KiB = 1024 B). Mirrors
+  // fmtDuration's null -> "—" contract so callers need no guard.
+  function fmtBytes(n) {
+    if (n == null) return "—";
+    if (n < 1024) return n + " B";
+    const units = ["KiB", "MiB", "GiB", "TiB"];
+    let v = n / 1024, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (v < 10 ? v.toFixed(1) : Math.round(v)) + " " + units[i];
+  }
   function fmtIn(sec) {
     if (sec == null) return "—";
     if (sec <= 0) return "now";
@@ -2946,6 +2956,11 @@
     if (lr) {
       parts.push("<span>last " + fmtAgo(lr.finished_at) + (lr.exit_code == null ? "" : " · exit " + esc(lr.exit_code)) + "</span>");
       if (lr.duration != null) parts.push("<span>took " + fmtDuration(lr.duration) + "</span>");
+      // resource usage present only when the run had monitorResources on
+      if (lr.resources) {
+        parts.push("<span>cpu <b>" + fmtDuration(lr.resources.cpu_total_seconds) + "</b></span>");
+        parts.push("<span>peak mem <b>" + fmtBytes(lr.resources.max_rss_bytes) + "</b></span>");
+      }
     }
     if (caps.length) parts.push('<span class="faint">capture: ' + esc(caps.join(", ")) + "</span>");
     // clusterPolicy is only present in the payload when leader election is on
@@ -2988,6 +3003,12 @@
       stat("avg", fmtDuration(s.avg_duration)) +
       stat("min", fmtDuration(s.min_duration)) +
       stat("max", fmtDuration(s.max_duration)) +
+      // CPU/memory stats appear only when at least one run in the window was
+      // resource-monitored (monitorResources); otherwise these are all null
+      // and the strip stays duration-only.
+      (s.avg_cpu_seconds != null ? stat("avg cpu", fmtDuration(s.avg_cpu_seconds)) : "") +
+      (s.max_cpu_seconds != null ? stat("max cpu", fmtDuration(s.max_cpu_seconds)) : "") +
+      (s.max_rss_bytes != null ? stat("peak mem", fmtBytes(s.max_rss_bytes)) : "") +
       "</div>";
     const durs = runs.map((r) => r.duration).filter((d) => d != null);
     const max = durs.length ? Math.max.apply(null, durs) : 0;
@@ -2998,6 +3019,9 @@
       bars += '<i class="' + cls + '" style="height:' + ht + 'px" title="' + escAttr((r.outcome) + " · " + fmtDuration(r.duration)) + '"></i>';
     }
     bars += "</div>";
+    // show the CPU/mem columns only when the window has monitored runs, so an
+    // unmonitored job's run table keeps its original five columns.
+    const hasRes = runs.some((r) => r.resources);
     let rows = "";
     for (let i = runs.length - 1; i >= 0; i--) {
       const r = runs[i];
@@ -3007,10 +3031,14 @@
         "<td>" + (r.exit_code == null ? "—" : esc(r.exit_code)) + "</td>" +
         '<td class="nowrap" title="' + escAttr(r.finished_at) + '">' + fmtAgo(r.finished_at) + "</td>" +
         "<td>" + fmtDuration(r.duration) + "</td>" +
+        (hasRes ? "<td>" + (r.resources ? fmtDuration(r.resources.cpu_total_seconds) : "—") + "</td>" +
+                  "<td>" + (r.resources ? fmtBytes(r.resources.max_rss_bytes) : "—") + "</td>" : "") +
         '<td class="reason">' + esc(r.fail_reason || "") + "</td>" +
       "</tr>";
     }
-    const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th><th>Reason</th></tr></thead><tbody>' + rows + "</tbody></table>";
+    const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th>' +
+      (hasRes ? "<th>CPU</th><th>Peak mem</th>" : "") +
+      '<th>Reason</th></tr></thead><tbody>' + rows + "</tbody></table>";
     // opt-in run ledger: long-horizon totals this browser has accumulated,
     // beyond the server's in-memory 50-run window shown above.
     let ledgerNote = "";

@@ -26,6 +26,7 @@ import aiohttp
 
 from yacron2 import platform
 from yacron2.config import JobConfig
+from yacron2.resources import ResourceMonitor, ResourceUsage
 from yacron2.statsd import StatsdJobMetricWriter
 
 if TYPE_CHECKING:
@@ -447,6 +448,15 @@ class ShellReporter(Reporter):
                 "1" if len(std_out_str_safe) != len(std_out_str) else "0"
             ),
         }
+        # resource accounting, when the run was monitored; empty otherwise so
+        # the reporter command can test for presence.
+        usage = job.resource_usage
+        env["YACRON2_CPU_SECONDS"] = (
+            repr(usage.cpu_total_seconds) if usage is not None else ""
+        )
+        env["YACRON2_MAX_RSS_BYTES"] = (
+            str(usage.max_rss_bytes) if usage is not None else ""
+        )
 
         logger.debug("Executing shell report cmd: %s", cmd)
         try:
@@ -608,6 +618,13 @@ class RunningJob:
         self.execution_deadline = None  # type: Optional[float]
         self.retry_state = retry_state
         self.env = None  # type: Optional[Dict[str, str]]
+        # per-run CPU/memory accounting (opt-in via config.monitorResources).
+        # _resource_monitor samples the process tree while the job runs;
+        # resource_usage holds the finished result (None when monitoring is
+        # off, unavailable, or the run was too short to sample). Finalized in
+        # _on_stop, before the statsd emission that reports it.
+        self._resource_monitor: Optional[ResourceMonitor] = None
+        self.resource_usage: Optional[ResourceUsage] = None
         # set when the subprocess could not be launched at all (e.g. the
         # command does not exist). Lets wait() treat it as a normal job
         # failure instead of raising RuntimeError("process is not running").
@@ -656,6 +673,23 @@ class RunningJob:
         if self._stopped:
             return
         self._stopped = True
+        # Finalize resource accounting before statsd reports it. _on_stop is
+        # the single choke point every completion path funnels through (normal
+        # exit, executionTimeout, cancel/replace), and it is idempotent, so
+        # stopping the monitor here captures usage exactly once no matter how
+        # the run ended. Errors are swallowed inside stop(); guard anyway so a
+        # monitor bug can never break job completion.
+        if self._resource_monitor is not None:
+            try:
+                self.resource_usage = await self._resource_monitor.stop()
+            except Exception:  # noqa: BLE001 - accounting must never be fatal
+                logger.warning(
+                    "Job %s: failed to finalize resource monitoring",
+                    self.config.name,
+                    exc_info=True,
+                )
+            finally:
+                self._resource_monitor = None
         if self.statsd_writer:
             try:
                 await self.statsd_writer.job_stopped()
@@ -741,6 +775,16 @@ class RunningJob:
             return
 
         await self._on_start()
+
+        if self.config.monitorResources and self.proc.pid is not None:
+            # Begin sampling the child's process tree. Best-effort: if psutil
+            # cannot attach (already exited, permission denied) the monitor
+            # stays inert and resource_usage ends up None. Started here, right
+            # after launch, so a long run is sampled from as early as possible.
+            self._resource_monitor = ResourceMonitor(
+                self.proc.pid, job_name=self.config.name
+            )
+            self._resource_monitor.start()
 
         if self.config.captureStderr:
             assert self.proc.stderr is not None
@@ -932,6 +976,7 @@ class RunningJob:
     @property
     def template_vars(self) -> dict:
         fail_reason = self.fail_reason
+        usage = self.resource_usage
         return {
             "name": self.config.name,
             "success": fail_reason is None,
@@ -942,4 +987,10 @@ class RunningJob:
             "command": self.config.command,
             "shell": self.config.shell,
             "environment": self.env,
+            # resource accounting for report templates; all None when the run
+            # was not monitored (monitorResources off / unavailable).
+            "cpu_seconds": usage.cpu_total_seconds if usage else None,
+            "cpu_user_seconds": usage.cpu_user_seconds if usage else None,
+            "cpu_system_seconds": usage.cpu_system_seconds if usage else None,
+            "max_rss_bytes": usage.max_rss_bytes if usage else None,
         }

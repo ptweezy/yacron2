@@ -906,6 +906,52 @@ jobs:
 
 
 @pytest.mark.asyncio
+async def test_monitor_resources_populates_usage():
+    # a monitored job records CPU time + peak RSS on the RunningJob, which the
+    # reaper then folds into the run record / metrics.
+    conf = yacron2.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_sleep(0.4))
+        + """
+    monitorResources: true
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    # the monitor takes an immediate first sample when its task first runs
+    # (during the wait below), so even this sub-second run is measured once.
+    await job.start()
+    await job.wait()
+    assert job.resource_usage is not None
+    assert job.resource_usage.samples >= 1
+    assert job.resource_usage.max_rss_bytes > 0
+    # exposed to report templates as well
+    assert (
+        job.template_vars["max_rss_bytes"]
+        == job.resource_usage.max_rss_bytes
+    )
+
+
+@pytest.mark.asyncio
+async def test_monitor_resources_off_by_default():
+    conf = yacron2.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print(out="hi"))
+        + """
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    assert job.config.monitorResources is False
+    await job.start()
+    await job.wait()
+    assert job.resource_usage is None
+    assert job.template_vars["cpu_seconds"] is None
+
+
+@pytest.mark.asyncio
 async def test_execution_timeout():
     conf = yacron2.config.parse_config_string(
         "jobs:\n  - name: test\n"
@@ -1033,6 +1079,51 @@ async def test_statsd(command):
     success = 0 if job.failed else 1
     assert any("the.prefix.success:%i" % success in r for r in received[1:])
     assert any("the.prefix.duration" in r for r in received[1:])
+
+
+@pytest.mark.asyncio
+async def test_statsd_resource_metrics():
+    # with monitorResources on, job_stopped also ships cpu + max_rss gauges.
+    loop = asyncio.get_event_loop()
+    received = []
+
+    class UDPServerProtocol:
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def datagram_received(self, data, addr):
+            received.extend(m for m in data.decode().split("\n") if m)
+
+        def connection_lost(*_):
+            pass
+
+    transport, _ = await loop.create_datagram_endpoint(
+        UDPServerProtocol, local_addr=("127.0.0.1", 0)
+    )
+    _host, port = transport.get_extra_info("sockname")
+    conf = yacron2.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_sleep(0.3))
+        + """
+    schedule: "* * * * *"
+    monitorResources: true
+    statsd:
+      host: 127.0.0.1
+      port: {port}
+      prefix: the.prefix
+""".format(port=port),
+        "",
+    )
+    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    await job.start()
+    await job.wait()
+    await asyncio.sleep(0.05)
+    transport.close()
+    await asyncio.sleep(0.05)
+
+    assert job.resource_usage is not None
+    assert any("the.prefix.cpu:" in r for r in received)
+    assert any("the.prefix.max_rss:" in r for r in received)
 
 
 @pytest.mark.asyncio
@@ -1338,6 +1429,10 @@ GOLDEN_SHELL_ENV_KEYS = frozenset(
         "YACRON2_STDOUT",
         "YACRON2_STDERR_TRUNCATED",
         "YACRON2_STDOUT_TRUNCATED",
+        # resource accounting: always exported (empty when the run was not
+        # monitored), see ShellReporter.report / yacron2.resources.
+        "YACRON2_CPU_SECONDS",
+        "YACRON2_MAX_RSS_BYTES",
     }
 )
 
@@ -1388,6 +1483,7 @@ async def _capture_shell_reporter_env(
         retcode=retcode,
         fail_reason=fail_reason,
         failed=failed,
+        resource_usage=None,
     )
     await yacron2.job.ShellReporter().report(
         False, job, job_config.onFailure["report"]
@@ -1412,6 +1508,9 @@ async def test_report_shell_full_env_contract(monkeypatch):
     assert env["YACRON2_JOB_SCHEDULE"] == "*/5 * * * *"
     assert env["YACRON2_FAILED"] == "1"
     assert env["YACRON2_RETCODE"] == "7"
+    # unmonitored run: resource vars present but empty
+    assert env["YACRON2_CPU_SECONDS"] == ""
+    assert env["YACRON2_MAX_RSS_BYTES"] == ""
     assert env["YACRON2_FAIL_REASON"] == "boom"
     assert env["YACRON2_STDOUT"] == "out"
     assert env["YACRON2_STDERR"] == "err"

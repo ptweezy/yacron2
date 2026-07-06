@@ -65,6 +65,7 @@ from yacron2.prometheus import (
     resolve_metrics_config,
 )
 from yacron2.redact import redact_lines
+from yacron2.resources import ResourceUsage
 from yacron2.state import Lease, StateBackend, make_state_backend
 
 logger = logging.getLogger("yacron2")
@@ -287,6 +288,11 @@ class JobRunInfo:
     finished_at: datetime.datetime
     fail_reason: Optional[str]
     output: JobOutputStream
+    # sampled CPU time + peak RSS for the run, when the job opted into
+    # monitorResources; None otherwise (the common case). Defaulted so every
+    # existing JobRunInfo construction site stays valid; the reaper fills it
+    # from the finished RunningJob.
+    resource_usage: Optional[ResourceUsage] = None
 
     @property
     def duration(self) -> Optional[float]:
@@ -307,6 +313,14 @@ class JobRunInfo:
             "finished_at": self.finished_at.isoformat(),
             "duration": self.duration,
             "fail_reason": self.fail_reason,
+            # omitted (null) for unmonitored runs so the record shape is
+            # unchanged for the default config; a monitored run carries the
+            # cpu/rss sub-object (see ResourceUsage.to_dict).
+            "resources": (
+                self.resource_usage.to_dict()
+                if self.resource_usage is not None
+                else None
+            ),
         }
 
 
@@ -322,6 +336,14 @@ def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
     # so the dashboard can call out interrupted runs distinctly.
     unknown = sum(1 for r in runs if r.outcome == "unknown")
     durations = [r.duration for r in runs if r.duration is not None]
+    # resource-monitored runs only (monitorResources); an unmonitored history
+    # leaves these all None/absent so the dashboard hides the section.
+    monitored = [
+        r.resource_usage for r in runs if r.resource_usage is not None
+    ]
+    cpu_totals = [u.cpu_total_seconds for u in monitored]
+    rss_values = [u.max_rss_bytes for u in monitored]
+    last_usage = runs[-1].resource_usage if runs else None
     return {
         "total": total,
         "success": success,
@@ -339,6 +361,22 @@ def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
         "min_duration": min(durations) if durations else None,
         "max_duration": max(durations) if durations else None,
         "last_duration": runs[-1].duration if runs else None,
+        # CPU time (seconds) and peak resident memory (bytes) over the
+        # monitored runs; None when no run in the window was monitored.
+        "avg_cpu_seconds": (
+            (sum(cpu_totals) / len(cpu_totals)) if cpu_totals else None
+        ),
+        "max_cpu_seconds": max(cpu_totals) if cpu_totals else None,
+        "last_cpu_seconds": (
+            last_usage.cpu_total_seconds if last_usage is not None else None
+        ),
+        "avg_rss_bytes": (
+            (sum(rss_values) / len(rss_values)) if rss_values else None
+        ),
+        "max_rss_bytes": max(rss_values) if rss_values else None,
+        "last_rss_bytes": (
+            last_usage.max_rss_bytes if last_usage is not None else None
+        ),
     }
 
 
@@ -403,6 +441,10 @@ def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
         finished_at=finished,
         fail_reason=fail_reason if isinstance(fail_reason, str) else None,
         output=empty,
+        # ResourceUsage.from_dict tolerates absent/foreign "resources" fields
+        # (returns None), so a pre-monitoring or hand-edited record rehydrates
+        # cleanly with no resource stats.
+        resource_usage=ResourceUsage.from_dict(rec.get("resources")),
     )
 
 
@@ -5249,7 +5291,9 @@ class Cron:
         self.run_history[name].append(info)
         # every recorded run also feeds the Prometheus counters/histogram,
         # so /metrics and the run-history API always agree on outcomes.
-        self.metrics.job_run_recorded(name, info.outcome, info.duration)
+        self.metrics.job_run_recorded(
+            name, info.outcome, info.duration, info.resource_usage
+        )
         # and, when a durable state backend is configured, persist the run to
         # the ledger so history/last-run survive a restart. Fire-and-forget: a
         # slow store must never stall run handling, so the write is a tracked
@@ -5886,6 +5930,7 @@ class Cron:
                     finished_at=get_now(datetime.timezone.utc),
                     fail_reason="cancelled via web UI",
                     output=job.output,
+                    resource_usage=getattr(job, "resource_usage", None),
                 ),
             )
             await self.cancel_job_retries(job.config.name, settle="cancelled")
@@ -5918,6 +5963,7 @@ class Cron:
                 finished_at=get_now(datetime.timezone.utc),
                 fail_reason=fail_reason,
                 output=job.output,
+                resource_usage=getattr(job, "resource_usage", None),
             ),
         )
         if fail_reason is not None:

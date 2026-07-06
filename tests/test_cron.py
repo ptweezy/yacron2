@@ -1051,6 +1051,54 @@ def _mk_run(outcome, exit_code=0, dur=1.0):
     )
 
 
+def test_job_run_info_resources_round_trip():
+    from yacron2.resources import ResourceUsage
+
+    run = _mk_run("success")
+    run.resource_usage = ResourceUsage(1.0, 0.5, 9000, 4)
+    d = run.to_dict()
+    assert d["resources"]["cpu_total_seconds"] == 1.5
+    assert d["resources"]["max_rss_bytes"] == 9000
+    # rehydrate from the ledger record
+    restored = yacron2.cron._job_run_info_from_dict(d)
+    assert restored is not None
+    assert restored.resource_usage == run.resource_usage
+
+
+def test_job_run_info_round_trip_without_resources():
+    d = _mk_run("success").to_dict()
+    assert d["resources"] is None
+    restored = yacron2.cron._job_run_info_from_dict(d)
+    assert restored is not None
+    assert restored.resource_usage is None
+
+
+def test_run_stats_cpu_and_memory_aggregates():
+    from yacron2.resources import ResourceUsage
+
+    runs = []
+    for cpu, rss in ((1.0, 1000), (3.0, 5000)):
+        r = _mk_run("success")
+        r.resource_usage = ResourceUsage(cpu, 0.0, rss, 1)
+        runs.append(r)
+    # one unmonitored run in the window: it must not skew the averages
+    runs.append(_mk_run("success"))
+    stats = yacron2.cron._run_stats(runs)
+    assert stats["avg_cpu_seconds"] == 2.0
+    assert stats["max_cpu_seconds"] == 3.0
+    assert stats["max_rss_bytes"] == 5000
+    # the last run was unmonitored -> last_* are None
+    assert stats["last_cpu_seconds"] is None
+    assert stats["last_rss_bytes"] is None
+
+
+def test_run_stats_no_monitored_runs_leaves_resource_fields_none():
+    stats = yacron2.cron._run_stats([_mk_run("success"), _mk_run("failure")])
+    assert stats["avg_cpu_seconds"] is None
+    assert stats["max_rss_bytes"] is None
+    assert stats["last_cpu_seconds"] is None
+
+
 def test_record_run_caps_history():
     cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
     limit = yacron2.cron.RUN_HISTORY_LIMIT

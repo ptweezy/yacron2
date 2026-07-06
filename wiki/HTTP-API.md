@@ -446,7 +446,10 @@ aggregate statistics. Returns `404 Not Found` for an unknown job.
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
-`fail_reason`). Besides `success`, `failure`, and `cancelled`, `outcome` can
+`fail_reason`, and `resources`). `resources` is `null` unless the job opted
+into [`monitorResources`](Configuration-Reference#metrics), in which case it is
+`{cpu_user_seconds, cpu_system_seconds, cpu_total_seconds, max_rss_bytes,
+samples}` for that run. Besides `success`, `failure`, and `cancelled`, `outcome` can
 be `unknown`: a crash-reconciled run, recorded when the daemon exited or lost
 the [state store](Durable-State) mid-run so no completion was ever written.
 It is a non-verdict: excluded from `success_rate`, counted only in `total`,
@@ -458,6 +461,8 @@ with no `started_at` or `duration` (`fail_reason` explains the interruption).
 | `total`, `success`, `failure`, `cancelled` | Counts by outcome over the retained history. |
 | `success_rate` | Success rate over runs that ran to completion. Cancellations are user-initiated, not a verdict on the job, so they are excluded; `null` when no run has completed. |
 | `avg_duration`, `min_duration`, `max_duration`, `last_duration` | Duration aggregates in seconds, over runs with a recorded duration; `null` when there are none. |
+| `avg_cpu_seconds`, `max_cpu_seconds`, `last_cpu_seconds` | CPU-time aggregates over the [`monitorResources`](Configuration-Reference#metrics) runs in the window; `null` when none were monitored. |
+| `avg_rss_bytes`, `max_rss_bytes`, `last_rss_bytes` | Peak-RSS aggregates (bytes) over the monitored runs; `null` when none were monitored. |
 
 ```shell
 $ http get http://127.0.0.1:8080/jobs/test-01/runs

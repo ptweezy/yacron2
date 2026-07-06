@@ -46,6 +46,7 @@ import yacron2.version
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle guard, types only
     from yacron2.cron import Cron
+    from yacron2.resources import ResourceUsage
 
 logger = logging.getLogger("prometheus")
 
@@ -243,6 +244,10 @@ class _JobMetrics:
         "bucket_counts",
         "last_success_time",
         "last_failure_time",
+        "cpu_user_sum",
+        "cpu_system_sum",
+        "cpu_count",
+        "max_rss_observed",
     )
 
     def __init__(self, n_buckets: int) -> None:
@@ -257,6 +262,14 @@ class _JobMetrics:
         self.bucket_counts = [0] * n_buckets
         self.last_success_time: Optional[float] = None
         self.last_failure_time: Optional[float] = None
+        # CPU accounting over the resource-monitored runs (monitorResources).
+        # The two sums back a per-mode counter; cpu_count lets a scrape tell
+        # "no monitored runs yet" (all zero) from "monitored, used ~0 CPU".
+        self.cpu_user_sum = 0.0
+        self.cpu_system_sum = 0.0
+        self.cpu_count = 0
+        # high-water peak RSS across every monitored run of this job (bytes).
+        self.max_rss_observed = 0
 
 
 class PrometheusMetrics:
@@ -320,7 +333,11 @@ class PrometheusMetrics:
     # -- event hooks (called from yacron2.cron) ----------------------------
 
     def job_run_recorded(
-        self, name: str, outcome: str, duration: Optional[float]
+        self,
+        name: str,
+        outcome: str,
+        duration: Optional[float],
+        resources: Optional["ResourceUsage"] = None,
     ) -> None:
         job = self._job(name)
         job.runs[outcome] = job.runs.get(outcome, 0) + 1
@@ -335,6 +352,13 @@ class PrometheusMetrics:
             for i, bound in enumerate(self._buckets):
                 if duration <= bound:
                     job.bucket_counts[i] += 1
+        if resources is not None:
+            job.cpu_user_sum += resources.cpu_user_seconds
+            job.cpu_system_sum += resources.cpu_system_seconds
+            job.cpu_count += 1
+            job.max_rss_observed = max(
+                job.max_rss_observed, resources.max_rss_bytes
+            )
 
     def job_start_failed(self, name: str) -> None:
         self._job(name).start_failures += 1
@@ -382,6 +406,10 @@ class PrometheusMetrics:
                 "bucket_counts": list(job.bucket_counts),
                 "last_success_time": job.last_success_time,
                 "last_failure_time": job.last_failure_time,
+                "cpu_user_sum": job.cpu_user_sum,
+                "cpu_system_sum": job.cpu_system_sum,
+                "cpu_count": job.cpu_count,
+                "max_rss_observed": job.max_rss_observed,
             }
         return {"buckets": list(self._buckets), "jobs": jobs}
 
@@ -436,6 +464,32 @@ class PrometheusMetrics:
                     and value > 0
                 ):
                     setattr(job, attr, getattr(job, attr) + value)
+            # CPU accumulators (float sums + an int count) are unrelated to the
+            # duration buckets, so they seed regardless of buckets_match --
+            # mirroring the outcome counters. Added, not assigned, like the
+            # rest (pre-seed boot events stay disjoint from the snapshot).
+            for attr in ("cpu_user_sum", "cpu_system_sum"):
+                value = data.get(attr)
+                if isinstance(value, (int, float)) and not isinstance(
+                    value, bool
+                ):
+                    setattr(job, attr, getattr(job, attr) + float(value))
+            cpu_count = data.get("cpu_count")
+            if (
+                isinstance(cpu_count, int)
+                and not isinstance(cpu_count, bool)
+                and cpu_count > 0
+            ):
+                job.cpu_count += cpu_count
+            # peak RSS is a high-water mark, not a sum: take the larger of the
+            # live value and the persisted one.
+            max_rss = data.get("max_rss_observed")
+            if (
+                isinstance(max_rss, int)
+                and not isinstance(max_rss, bool)
+                and max_rss > job.max_rss_observed
+            ):
+                job.max_rss_observed = max_rss
             if buckets_match:
                 self._seed_histogram(job, data)
             for attr in ("last_success_time", "last_failure_time"):
@@ -736,6 +790,18 @@ class PrometheusMetrics:
             "gauge",
             "Unix time this job last finished as a failure.",
         )
+        cpu_seconds = MetricFamily(
+            "yacron2_job_cpu_seconds",
+            "counter",
+            "CPU time consumed by resource-monitored runs, by mode "
+            "(requires monitorResources on the job).",
+        )
+        peak_rss = MetricFamily(
+            "yacron2_job_peak_rss_bytes",
+            "gauge",
+            "Highest resident-set size observed across the job's "
+            "resource-monitored runs (requires monitorResources).",
+        )
         for name in sorted(self._jobs):
             job = self._jobs[name]
             labels = {"job_name": name}
@@ -747,6 +813,18 @@ class PrometheusMetrics:
             retries.add(labels, job.retries)
             permanent.add(labels, job.permanent_failures)
             start_failures.add(labels, job.start_failures)
+            # CPU counters emit only once the job has a monitored run, so an
+            # unmonitored job does not export permanently-frozen zeros; peak
+            # RSS likewise appears only after a real observation.
+            if job.cpu_count:
+                cpu_seconds.add(
+                    {"job_name": name, "mode": "user"}, job.cpu_user_sum
+                )
+                cpu_seconds.add(
+                    {"job_name": name, "mode": "system"}, job.cpu_system_sum
+                )
+            if job.max_rss_observed:
+                peak_rss.add(labels, job.max_rss_observed)
             # bucket_counts is stored cumulatively (every bound >= the
             # observation is incremented), so the counts render as-is. The "le"
             # label strings are precomputed (self._bucket_bound_strs).
@@ -812,6 +890,18 @@ class PrometheusMetrics:
             "Whether the job's most recent finished run succeeded "
             "(cancelled runs count as 0).",
         )
+        last_run_cpu = MetricFamily(
+            "yacron2_job_last_run_cpu_seconds",
+            "gauge",
+            "CPU time consumed by the job's most recent monitored run "
+            "(absent unless that run had monitorResources on).",
+        )
+        last_run_max_rss = MetricFamily(
+            "yacron2_job_last_run_max_rss_bytes",
+            "gauge",
+            "Peak resident-set size of the job's most recent monitored run "
+            "(absent unless that run had monitorResources on).",
+        )
         for name, job_config in cron.cron_jobs.items():
             labels = {"job_name": name}
             info.add(
@@ -859,6 +949,13 @@ class PrometheusMetrics:
                 last_run_success.add(
                     labels, 1 if last.outcome == "success" else 0
                 )
+                if last.resource_usage is not None:
+                    last_run_cpu.add(
+                        labels, last.resource_usage.cpu_total_seconds
+                    )
+                    last_run_max_rss.add(
+                        labels, last.resource_usage.max_rss_bytes
+                    )
         return [
             runs,
             retries,
@@ -867,6 +964,8 @@ class PrometheusMetrics:
             duration,
             last_success,
             last_failure,
+            cpu_seconds,
+            peak_rss,
             info,
             enabled,
             running,
@@ -875,6 +974,8 @@ class PrometheusMetrics:
             last_run_duration,
             last_run_exit_code,
             last_run_success,
+            last_run_cpu,
+            last_run_max_rss,
         ]
 
     def _cluster_families(self, cron: "Cron") -> List[MetricFamily]:

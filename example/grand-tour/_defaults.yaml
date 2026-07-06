@@ -23,6 +23,11 @@ defaults:
   # (silent-cleanup) or lean on it (the failsWhen / stderr demos).
   captureStdout: true
   captureStderr: true
+  # Sample each run's CPU time and peak resident memory. The numbers surface in
+  # the dashboard run history, at GET /metrics (yacron2_job_cpu_seconds_total,
+  # yacron2_job_last_run_max_rss_bytes) and over statsd — observability only,
+  # never changing a run's verdict.  [feature: monitorResources]
+  monitorResources: true
   # Inline environment shared by every job here; individual jobs layer more on
   # top, and backup-warehouse additionally pulls an env_file.  [feature: environment]
   environment:

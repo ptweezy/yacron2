@@ -63,6 +63,9 @@ The following variables are available when rendering any report template:
 | `command` | str or list | The job's command. |
 | `shell` | str | The job's shell. |
 | `environment` | dict or None | The subprocess environment (`None` when the job defines no `environment`). |
+| `cpu_seconds` | float or None | Total CPU time (user + system) of the run's process tree, or `None` when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored. |
+| `cpu_user_seconds` / `cpu_system_seconds` | float or None | The user- and system-mode components of `cpu_seconds`. |
+| `max_rss_bytes` | int or None | Peak resident-set size (bytes) observed during the run, or `None` when unmonitored. |
 
 The README's variable list omits `fail_reason`; the code provides it (it is
 also used by the default body template). To capture output for inclusion in reports, enable `captureStderr`
@@ -291,6 +294,8 @@ following variables describing the job outcome:
 | `YACRON2_STDOUT` | Captured stdout (possibly truncated; see below). |
 | `YACRON2_STDERR_TRUNCATED` | `"1"` if `YACRON2_STDERR` was truncated, `"0"` otherwise. |
 | `YACRON2_STDOUT_TRUNCATED` | `"1"` if `YACRON2_STDOUT` was truncated, `"0"` otherwise. |
+| `YACRON2_CPU_SECONDS` | Total CPU seconds of the run's process tree, or empty string when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored. |
+| `YACRON2_MAX_RSS_BYTES` | Peak resident-set size in bytes, or empty string when unmonitored. |
 
 **Truncation:** stdout and stderr can be large, and there are OS limits on
 argument/environment sizes. yacron2 truncates each stream to a maximum of

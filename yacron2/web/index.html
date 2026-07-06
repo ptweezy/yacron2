@@ -668,6 +668,11 @@
   #fleetPanel .nname2.selfcol { color: var(--accent); }
   #fleetPanel .nsub { display: block; font-weight: 400; font-size: 10px; color: var(--fg-faint); }
   #fleetPanel .nsub .cdot { margin-right: 4px; }
+  /* per-node CPU/memory readout in a fleet column header (cluster.observability) */
+  #fleetPanel .nload { display: block; font-weight: 400; font-size: 10px; color: var(--fg-dim); font-variant-numeric: tabular-nums; margin-top: 1px; }
+  #fleetPanel .nload b { color: var(--fg); font-weight: 700; }
+  #fleetPanel .nload.warn b { color: var(--fail); }
+  #fleetPanel .nload.none { color: var(--fg-faint); }
   #fleetPanel .cell .age { color: var(--fg-faint); font-size: 10.5px; margin-left: 5px; }
   #fleetPanel .cell.ok { color: var(--ok); }
   #fleetPanel .cell.fail { color: var(--fail); font-weight: 700; }
@@ -2710,6 +2715,18 @@
       }
     }
   }
+  // compact per-node CPU/mem line for a fleet column header (from node_stats,
+  // shared via cluster.observability). Empty string when this node shares none.
+  function nodeLoad(ns) {
+    if (!ns) return '<span class="nload none" title="this node is not sharing CPU/memory">cpu — · mem —</span>';
+    const cpu = ns.cpu_percent, mem = ns.mem_percent;
+    const warn = (cpu != null && cpu > 85) || (mem != null && mem > 85);
+    const tip = "node CPU " + fmtPercent(cpu) + (ns.cpu_count ? " across " + ns.cpu_count + " cores" : "") +
+      " · memory " + fmtPercent(mem) +
+      (ns.mem_used_bytes != null && ns.mem_total_bytes != null ? " (" + fmtBytes(ns.mem_used_bytes) + " / " + fmtBytes(ns.mem_total_bytes) + ")" : "");
+    return '<span class="nload' + (warn ? " warn" : "") + '" title="' + escAttr(tip) + '">cpu <b>' +
+      fmtPercent(cpu) + "</b> · mem <b>" + fmtPercent(mem) + "</b></span>";
+  }
   function renderFleet() {
     const box = $("fleetPanel");
     $("fleetBtn").classList.toggle("on", prefs.fleet);
@@ -2743,12 +2760,16 @@
       '<span class="grow"></span>' +
       "<span>peer data rides gossip" + (data.interval ? " (every " + esc(String(data.interval)) + "s)" : "") + "</span>" +
       "</div>";
+    const anyLoad = nodes.some((n) => n.node_stats);
     const th = nodes.map((n) => {
       const st = n.self ? "self" : (n.status || "unknown");
       const age = n.self ? "live" : (n.as_of ? agoShort(n.as_of) + " ago" : "never reached");
       return '<th><span class="nname2' + (n.self ? " selfcol" : "") + '">' + esc(n.node_name || n.host || "?") + "</span>" +
         '<span class="nsub"><span class="cdot ' + esc(st) + '"></span>' + esc(n.self ? "this node" : st) + " · " + esc(age) +
-        (n.truncated ? " · partial" : "") + "</span></th>";
+        (n.truncated ? " · partial" : "") + "</span>" +
+        // per-node live CPU/memory when the cluster shares node stats
+        // (cluster.observability); the whole row is omitted when no node does.
+        (anyLoad ? nodeLoad(n.node_stats) : "") + "</th>";
     }).join("");
     html += '<div class="fleetwrap"><table><thead><tr><th class="jobcol">job</th>' + th + "</tr></thead><tbody>";
     for (const j of rows) {

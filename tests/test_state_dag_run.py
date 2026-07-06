@@ -1001,3 +1001,175 @@ async def test_http_approval_decision_and_backfill(tmp_path):
     finally:
         await cron.start_stop_web_app(None)
         await _teardown(cron)
+
+# --------------------------------------------------------------------------
+# Retention / removed-dag GC and XCom blob reclamation
+# --------------------------------------------------------------------------
+
+_RETAIN_ONE = """
+dags:
+  - name: rt
+    retainRuns: 1
+    tasks:
+      - id: a
+        command: 'x'
+"""
+
+
+async def test_retention_prune_releases_xcom_blobs_to_the_sweep(tmp_path):
+    # THE leak from the GC review: dagrun's retention pruned XCom RECORD
+    # streams (keep=0) but the content-addressed payload blobs they named
+    # were never unlinked -- a dag pushing unique XCom payloads leaked one
+    # blob per run forever.  Once records are pruned, the daemon sweep must
+    # reclaim exactly the pruned run's blobs and keep the retained run's.
+    import os
+
+    import yacron2.state as state_mod
+    from yacron2 import jobstate
+
+    cron = await _make_cron(tmp_path, _RETAIN_ONE)
+    try:
+        _set_cmd(cron, "rt", "a", [_PY, "-c", "pass"])
+        backend = cron.state_backend
+        keys, digests = [], []
+        for i in range(2):
+            run_key = await cron._dag.trigger_run("rt")
+            body = await _drive(cron, "rt", run_key)
+            assert body["state"] == dag.SUCCESS
+            keys.append(run_key)
+            scope = dag.xcom_scope("rt", str(body["runId"]))
+            rec = await jobstate.artifact_put(
+                backend, scope, "a#0/k", "unique-{}".format(i).encode()
+            )
+            digests.append(rec["sha256"])
+        # retainRuns 1: the older run's document AND its XCom stream go.
+        await cron._dag._gc_one_dag(backend, "rt", cron.cron_dags["rt"])
+        docs = await backend.list_documents("dagrun/rt")
+        assert [b["runKey"] for b in docs] == [keys[1]]
+        # both payloads are old enough to sweep; only the orphan may go.
+        old = state_mod._now() - 7200.0
+        for digest in digests:
+            os.utime(backend._blob_path(digest), (old, old))
+        await cron._sweep_orphan_artifact_blobs(backend, 3600.0)
+        assert await backend.get_blob(digests[0]) is None
+        assert await backend.get_blob(digests[1]) == b"unique-1"
+    finally:
+        await _teardown(cron)
+
+
+async def test_gc_removed_dags_grace_and_active_run_protection(tmp_path):
+    # a dag briefly removed during a config edit must not lose run history:
+    # gc_removed_dags takes only a TERMINAL run older than the grace, never
+    # a recent or an active one -- and a dag still in config is untouched
+    # even when named.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        backend = cron.state_backend
+        run_key = await cron._dag.trigger_run("lin")
+        body = await _drive(cron, "lin", run_key)
+        assert body["state"] == dag.SUCCESS
+        # still configured: nothing may be collected even when named.
+        await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
+        assert len(await backend.list_documents("dagrun/lin")) == 1
+        cron.cron_dags.clear()  # the dag is removed from config
+        # terminal but recent (within the grace): kept.
+        await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
+        assert len(await backend.list_documents("dagrun/lin")) == 1
+
+        def _age(cur):
+            cur["updatedAt"] = cur["updatedAt"] - 7200.0
+            return cur, None
+
+        await backend.mutate_document("dagrun/lin", run_key, _age)
+        # an ACTIVE (non-terminal) aged run of the removed dag: kept too.
+        def _activate(cur):
+            cur["state"] = dag.RUNNING
+            return cur, None
+
+        await backend.mutate_document("dagrun/lin", run_key, _activate)
+        await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
+        assert len(await backend.list_documents("dagrun/lin")) == 1
+        # terminal AND aged past the grace: collected.
+        def _finish(cur):
+            cur["state"] = dag.SUCCESS
+            return cur, None
+
+        await backend.mutate_document("dagrun/lin", run_key, _finish)
+        await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
+        assert await backend.list_documents("dagrun/lin") == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_removed_dag_history_collected_by_daemon_gc_pass(tmp_path,
+                                                               monkeypatch):
+    # end to end through cron._collect_state_garbage: a dag removed from
+    # config has its aged terminal run document deleted, its XCom stream
+    # pruned, and the pruned records' payload blob swept -- while an active
+    # run of the same removed dag survives untouched.
+    import os
+
+    import yacron2.state as state_mod
+    from yacron2 import jobstate
+
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        backend = cron.state_backend
+        run_key = await cron._dag.trigger_run("lin")
+        body = await _drive(cron, "lin", run_key)
+        assert body["state"] == dag.SUCCESS
+        scope = dag.xcom_scope("lin", str(body["runId"]))
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            rec = await jobstate.artifact_put(
+                backend, scope, "a#0/k", b"xcom-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        os.utime(backend._blob_path(rec["sha256"]), (old_epoch, old_epoch))
+
+        def _age(cur):
+            cur["updatedAt"] = old_epoch
+            return cur, None
+
+        await backend.mutate_document("dagrun/lin", run_key, _age)
+        # a second, still-active run: trigger only, never driven.
+        run_key2 = await cron._dag.trigger_run("lin")
+        await _drain_pending(cron)
+        cron.cron_dags.clear()  # the dag is removed from config
+        now = _utcnow()
+        await backend.append_record(
+            "manifests/old-host",
+            {
+                "jobSetId": "v1:old",
+                "host": "old-host",
+                "jobs": [],
+                "at": (
+                    now - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+            },
+        )
+        await backend.append_record(
+            "manifests/other-host",
+            {
+                "jobSetId": "v1:other",
+                "host": "other-host",
+                "jobs": [],
+                "scopes": [],
+                "dags": [],
+                "at": now.isoformat(),
+            },
+        )
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        docs = await backend.list_documents("dagrun/lin")
+        assert [b["runKey"] for b in docs] == [run_key2]
+        assert await backend.list_records("artifacts/" + scope) == []
+        assert await backend.get_blob(rec["sha256"]) is None
+    finally:
+        await _teardown(cron)

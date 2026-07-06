@@ -1126,8 +1126,9 @@ class _FakeMesh:
     def set_job_summaries_provider(self, p):
         self.job_summaries_provider = p
 
-    def set_node_stats_provider(self, p):
+    def set_node_stats_provider(self, p, share=True):
         self.node_stats_provider = p
+        self.node_stats_share = share
 
     def tls_files_changed(self):
         return False
@@ -1166,9 +1167,10 @@ async def test_start_stop_observability_builds_mesh_and_installs_providers(
     await cron.start_stop_observability(cluster_config)
     assert cron.observability_mesh is built[0]
     assert built[0].started is True
-    # both fleet providers installed on the overlay mesh
+    # both fleet providers installed on the overlay mesh, node stats SHARED
     assert built[0].job_summaries_provider == cron.fleet_job_summaries
     assert built[0].node_stats_provider == cron.node_resource_snapshot
+    assert built[0].node_stats_share is True
     # a reload dropping the observability section tears the mesh down
     await cron.start_stop_observability({"observabilityMesh": None})
     assert cron.observability_mesh is None
@@ -1189,7 +1191,10 @@ async def test_start_stop_observability_respects_share_opt_out(monkeypatch):
         {"observabilityMesh": {"backend": "gossip"}, "shareNodeStats": False}
     )
     assert made[0].job_summaries_provider == cron.fleet_job_summaries
-    assert made[0].node_stats_provider is None  # node stats NOT shared
+    # the provider is still installed (for the overlay's own self readout) but
+    # NOT gossiped to peers
+    assert made[0].node_stats_provider == cron.node_resource_snapshot
+    assert made[0].node_stats_share is False
 
 
 @pytest.mark.asyncio

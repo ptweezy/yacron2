@@ -4383,7 +4383,7 @@ async def test_handle_peer_advertises_job_summaries(no_tls):
 
 
 @pytest.mark.asyncio
-async def test_handle_peer_advertises_node_stats_only_when_provided(no_tls):
+async def test_handle_peer_advertises_node_stats_only_when_shared(no_tls):
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
     )
@@ -4391,15 +4391,44 @@ async def test_handle_peer_advertises_node_stats_only_when_provided(no_tls):
     # sharing node stats gossips byte-identical payloads (and keeps 304s).
     payload = json.loads((await mgr._handle_peer(_Req())).text)
     assert "node_stats" not in payload
+    # provider installed WITHOUT sharing: still omitted from the /peer body
+    # (the provider is for this node's own local readout only).
     mgr.set_node_stats_provider(
-        lambda: {"cpu_percent": 12.0, "mem_percent": 34.0}
+        lambda: {"cpu_percent": 12.0, "mem_percent": 34.0}, share=False
+    )
+    payload = json.loads((await mgr._handle_peer(_Req())).text)
+    assert "node_stats" not in payload
+    # sharing on: now it rides the /peer body
+    mgr.set_node_stats_provider(
+        lambda: {"cpu_percent": 12.0, "mem_percent": 34.0}, share=True
     )
     payload = json.loads((await mgr._handle_peer(_Req())).text)
     assert payload["node_stats"] == {"cpu_percent": 12.0, "mem_percent": 34.0}
     # a provider that returns None (psutil unavailable) also omits the key
-    mgr.set_node_stats_provider(lambda: None)
+    mgr.set_node_stats_provider(lambda: None, share=True)
     payload = json.loads((await mgr._handle_peer(_Req())).text)
     assert "node_stats" not in payload
+
+
+def test_view_dict_carries_peer_node_stats_and_local_readout(no_tls):
+    # the /cluster peer panel: per-peer node_stats (populated when shared) and
+    # the local readout independent of sharing.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    # a provider installed WITHOUT sharing still drives the LOCAL readout
+    mgr.set_node_stats_provider(
+        lambda: {"cpu_percent": 5.0, "mem_percent": 6.0}, share=False
+    )
+    assert mgr._local_node_stats() == {"cpu_percent": 5.0, "mem_percent": 6.0}
+    peer = mgr.view.peers["b:1"]
+    peer.node_stats = {"cpu_percent": 70.0, "mem_percent": 20.0}
+    view = mgr.view_dict()
+    by_host = {p["host"]: p for p in view["peers"]}
+    assert by_host["b:1"]["node_stats"] == {
+        "cpu_percent": 70.0,
+        "mem_percent": 20.0,
+    }
 
 
 @pytest.mark.asyncio

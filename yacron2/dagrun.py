@@ -836,8 +836,10 @@ class DagScheduler:
             return None  # transient: retry next pass
         except jobstate.JobStateError:
             # the record survives but its blob is gone (410): definitively
-            # unrecoverable, so map to empty rather than retry forever (blobs
-            # are never swept in practice, so this is a belt-and-braces guard).
+            # unrecoverable, so map to empty rather than retry forever.  The
+            # orphan-blob sweep never deletes a blob a surviving record
+            # references, so this arises only from external interference
+            # (a partial restore, manual deletion).
             logger.warning(
                 "dag %s: xcom %r from %r has a missing blob; mapping to an "
                 "empty fan-out",

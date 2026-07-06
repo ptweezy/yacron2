@@ -798,12 +798,13 @@ class PeerState:
     # not surfaced in to_dict.
     job_summaries_at: Optional[datetime.datetime] = None
     # the peer's last-reported whole-node CPU/memory (see
-    # yacron2.resources.NodeResourceSampler), for the fleet view's per-node
-    # load readout. Like job_summaries: None (a peer sharing none, or never
-    # polled) leaves any previously-absorbed value in place rather than
-    # blanking, so a briefly-unreachable node shows its last-known load aged by
-    # last_seen. No separate _at: node stats carry no countdown to re-derive,
-    # so last_seen alone conveys freshness. Not in to_dict (fleet_view shape).
+    # yacron2.resources.NodeResourceSampler), for the per-node load readout in
+    # both the cluster panel (to_dict below) and the fleet view. Like
+    # job_summaries: None (a peer sharing none, or never polled) leaves any
+    # previously-absorbed value in place rather than blanking, so a briefly-
+    # unreachable node shows its last-known load aged by last_seen. No separate
+    # _at: node stats carry no countdown to re-derive, so last_seen conveys
+    # freshness.
     node_stats: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -819,6 +820,9 @@ class PeerState:
             ),
             "last_error": self.last_error,
             "mismatch_streak": self.mismatch_streak,
+            # this peer's last-absorbed load (None unless the cluster shares
+            # node stats); the dashboard's cluster panel renders it per peer.
+            "node_stats": self.node_stats,
         }
 
 
@@ -1231,11 +1235,15 @@ class ClusterManager(LeadershipBackend):
             Callable[[], Dict[str, Any]]
         ] = None
         # our own whole-node CPU/memory provider (the scheduler's
-        # NodeResourceSampler.snapshot), installed the same way when node-stats
-        # sharing is enabled; None leaves node_stats out of the /peer payload.
+        # NodeResourceSampler.snapshot). Installing it makes THIS node's own
+        # load available locally (the /cluster + /fleet self readouts) even when
+        # not shared; _share_node_stats separately gates whether we ADVERTISE it
+        # to peers in the /peer payload -- so a cluster that only wants the local
+        # readout adds no gossip traffic and keeps the /peer bytes (and 304s).
         self._node_stats_provider: Optional[
             Callable[[], Optional[Dict[str, Any]]]
         ] = None
+        self._share_node_stats = False
 
     def set_job_summaries_provider(
         self, provider: Callable[[], Dict[str, Any]]
@@ -1243,24 +1251,38 @@ class ClusterManager(LeadershipBackend):
         self._job_summaries_provider = provider
 
     def set_node_stats_provider(
-        self, provider: Callable[[], Optional[Dict[str, Any]]]
+        self,
+        provider: Callable[[], Optional[Dict[str, Any]]],
+        share: bool = True,
     ) -> None:
         self._node_stats_provider = provider
+        self._share_node_stats = share
 
-    def _advertised_node_stats(self) -> Optional[Dict[str, Any]]:
-        """Our own whole-node CPU/memory to gossip, or ``None``.
+    def _local_node_stats(self) -> Optional[Dict[str, Any]]:
+        """This node's own whole-node CPU/memory, or ``None``.
 
-        Trusted local input (our own :class:`NodeResourceSampler`), so it is
-        emitted as-is -- a small fixed-shape blob, no cap needed. ``None`` when
-        no provider is installed (node-stats sharing not enabled) or the
-        sampler returned nothing (psutil unavailable); the key is then omitted
-        from the /peer payload so a cluster not sharing node stats gossips
-        exactly the same bytes as before.
+        Trusted local input (our own :class:`NodeResourceSampler`), emitted
+        as-is -- a small fixed-shape blob, no cap needed. ``None`` when no
+        provider is installed or the sampler returned nothing (psutil
+        unavailable). Used for the local self readout everywhere; whether it is
+        also gossiped to peers is gated by ``_share_node_stats`` at the /peer
+        payload (see :meth:`_advertised_node_stats`).
         """
         provider = self._node_stats_provider
         if provider is None:
             return None
         return provider()
+
+    def _advertised_node_stats(self) -> Optional[Dict[str, Any]]:
+        """Our node stats to put in the outgoing /peer body, or ``None``.
+
+        ``None`` unless node-stats sharing is on (``_share_node_stats``): the
+        key is then omitted from the /peer payload so a cluster not sharing node
+        stats gossips exactly the same bytes as before (and keeps its 304s).
+        """
+        if not self._share_node_stats:
+            return None
+        return self._local_node_stats()
 
     def _advertised_job_summaries(
         self,
@@ -3129,10 +3151,12 @@ class ClusterManager(LeadershipBackend):
                 "as_of": now.isoformat(),
                 "jobs": job_summaries,
                 "truncated": summaries_truncated,
-                # our own live node load, sampled fresh (None when node-stats
-                # sharing is off / psutil unavailable). Peers carry their
-                # last-absorbed reading below.
-                "node_stats": self._advertised_node_stats(),
+                # our own live node load, sampled fresh -- shown whenever the
+                # provider is installed, even if we are not gossiping it to
+                # peers (None only when psutil is unavailable). Peers carry
+                # their last-absorbed reading below (populated only when the
+                # cluster shares node stats).
+                "node_stats": self._local_node_stats(),
             }
         ]
         seen_instances = {self.instance_id}

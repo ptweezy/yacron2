@@ -240,17 +240,21 @@ class LeadershipBackend(abc.ABC):
         """
 
     def set_node_stats_provider(  # noqa: B027
-        self, provider: Callable[[], Optional[Dict[str, Any]]]
+        self,
+        provider: Callable[[], Optional[Dict[str, Any]]],
+        share: bool = True,
     ) -> None:
         """Install the scheduler's whole-node CPU/memory snapshot callable.
 
         The provider returns this node's live load (see
-        :meth:`yacron2.resources.NodeResourceSampler.snapshot`); the gossip
-        backend overrides this to piggyback it on its ``/peer`` response so the
-        fleet view shows every node's load. Default no-op: a lease backend has
-        no node-to-node channel, so there is nothing to install (a lease
-        cluster shares node load through a separate gossip observability
-        overlay instead -- see ``cluster.observability``).
+        :meth:`yacron2.resources.NodeResourceSampler.snapshot`). The gossip
+        backend overrides this: installing it makes this node's own load
+        available in its ``/cluster`` and ``/fleet`` self readouts, while
+        ``share`` gates whether it is also gossiped to peers (so a cluster can
+        show its local load without adding any gossip traffic). Default no-op: a
+        lease backend has no node-to-node channel, so there is nothing to
+        install (a lease cluster shares node load through a separate gossip
+        observability overlay instead -- see ``cluster.observability``).
         """
 
     def fleet_view(self) -> Optional[Dict[str, Any]]:

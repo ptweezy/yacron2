@@ -1295,6 +1295,11 @@ class Cron:
             )
         payload = dict(self.cluster_manager.view_dict())
         payload["enabled"] = True
+        # this node's own live CPU/memory, sampled fresh: always shown in the
+        # cluster panel (it is local and free), independent of whether peers
+        # share theirs. Peer load rides view_dict's per-peer node_stats (only
+        # populated when the cluster shares node stats via cluster.observability).
+        payload["node_stats"] = self.node_resource_snapshot()
         return web.json_response(payload, headers=headers)
 
     async def _web_get_fleet(self, request: web.Request) -> web.Response:
@@ -2414,17 +2419,18 @@ class Cron:
                 # absorbed snapshot should carry our jobs rather than an
                 # empty block. No-op for the lease backends.
                 manager.set_job_summaries_provider(self.fleet_job_summaries)
-                # Share this node's CPU/memory over the ELECTION gossip mesh
-                # when observability is enabled with backend: gossip (no
-                # separate overlay mesh). The lease + overlay case installs the
-                # provider on the overlay instead (start_stop_observability).
-                if (
-                    cluster_config.get("shareNodeStats")
-                    and cluster_config.get("observabilityMesh") is None
-                ):
-                    manager.set_node_stats_provider(
-                        self.node_resource_snapshot
-                    )
+                # Always install the node-stats provider so a gossip cluster
+                # shows THIS node's own load in its /cluster + /fleet self
+                # readouts (local, free); `share` gates whether we ALSO gossip
+                # it to peers -- on only when observability is enabled with
+                # backend: gossip (no separate overlay mesh; the lease + overlay
+                # case installs on the overlay in start_stop_observability). A
+                # no-op on the lease backends (their seam default ignores it).
+                manager.set_node_stats_provider(
+                    self.node_resource_snapshot,
+                    share=bool(cluster_config.get("shareNodeStats"))
+                    and cluster_config.get("observabilityMesh") is None,
+                )
                 await manager.start()
             except (
                 OSError,
@@ -2527,10 +2533,15 @@ class Cron:
                 # peers polling us back, and their first absorbed snapshot
                 # should already carry our jobs + load, not an empty block.
                 mgr.set_job_summaries_provider(self.fleet_job_summaries)
-                if cluster_config is not None and cluster_config.get(
-                    "shareNodeStats"
-                ):
-                    mgr.set_node_stats_provider(self.node_resource_snapshot)
+                # always install (so the overlay's own /fleet self readout
+                # shows this node's load); share gates gossiping it to peers.
+                mgr.set_node_stats_provider(
+                    self.node_resource_snapshot,
+                    share=bool(
+                        cluster_config is not None
+                        and cluster_config.get("shareNodeStats")
+                    ),
+                )
                 await mgr.start()
             except (
                 OSError,

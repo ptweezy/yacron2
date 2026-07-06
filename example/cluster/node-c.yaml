@@ -13,4 +13,6 @@ cluster:
   electLeader: true
   interval: 10
   driftAfter: 2
+  observability:                    # share CPU/memory across the cluster
+    shareNodeStats: true            # (match on all nodes)
   # distribution: spread            # opt-in; must match the other nodes

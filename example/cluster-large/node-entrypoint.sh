@@ -48,6 +48,13 @@ cp /config/jobs.yaml "$DIR/jobs.yaml"
   echo "  distribution: ${DISTRIBUTION:-spread}"
   echo "  interval: ${INTERVAL:-10}"
   echo "  driftAfter: ${DRIFT_AFTER:-2}"
+  # Share each node's live CPU/memory across the cluster (backend is gossip, so
+  # this is just an opt-in marker -- the election mesh carries the data). The
+  # dashboard's fleet view and cluster panel then show per-node load, the
+  # natural companion to this CPU-heavy demo. Set SHARE_NODE_STATS=false to
+  # keep the fleet job summaries but not the load numbers.
+  echo "  observability:"
+  echo "    shareNodeStats: ${SHARE_NODE_STATS:-true}"
   echo "  peers:"
   # split CLUSTER_HOSTS on commas/spaces, drop our own entry
   for hp in $(echo "$CLUSTER_HOSTS" | tr ',' ' '); do

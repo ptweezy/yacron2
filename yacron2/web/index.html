@@ -339,6 +339,11 @@
   /* per-node ownership tally in the cluster panel (spread only) */
   .col-owns { display: none; text-align: right; }
   #clusterTable.show-owns .col-owns { display: table-cell; }
+  /* per-peer CPU/mem load column, shown only when peers share node stats */
+  .col-load { display: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #clusterTable.show-load .col-load { display: table-cell; }
+  #clusterTable .col-load b { color: var(--fg); font-weight: 700; }
+  #clusterTable .col-load.warn b { color: var(--fail); }
   .exit { font-size: 10.5px; padding: 0 5px; border-radius: 3px; margin-left: 6px; }
   .exit.zero { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, transparent); }
   .exit.nonzero { color: var(--fail); background: color-mix(in srgb, var(--fail) 16%, transparent); }
@@ -1143,7 +1148,7 @@
   <div class="card" id="clusterCard" style="display:none">
     <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><button class="ghostbtn mini" id="fleetBtn" title="Fleet view: every node's runs in one pane" style="display:none">⊞ fleet</button><button class="ghostbtn mini" id="swimBtn" title="Peer status timeline" style="display:none">▚ timeline</button><span id="clusterSummary"></span></div>
     <table id="clusterTable">
-      <thead><tr><th>Peer</th><th>Node</th><th class="col-owns">Owns</th><th>Status</th><th>Job set</th></tr></thead>
+      <thead><tr><th>Peer</th><th>Node</th><th class="col-load">Load</th><th class="col-owns">Owns</th><th>Status</th><th>Job set</th></tr></thead>
       <tbody id="clusterRows"></tbody>
     </table>
     <table id="clusterLease" style="display:none">
@@ -2726,6 +2731,18 @@
       (ns.mem_used_bytes != null && ns.mem_total_bytes != null ? " (" + fmtBytes(ns.mem_used_bytes) + " / " + fmtBytes(ns.mem_total_bytes) + ")" : "");
     return '<span class="nload' + (warn ? " warn" : "") + '" title="' + escAttr(tip) + '">cpu <b>' +
       fmtPercent(cpu) + "</b> · mem <b>" + fmtPercent(mem) + "</b></span>";
+  }
+  // a cluster-table "Load" cell for a peer's node_stats (or "—" when the peer
+  // shares none). Warn-tinted past 85% on either axis.
+  function loadCell(ns) {
+    if (!ns) return '<td class="col-load muted" title="this peer is not sharing node stats (enable cluster.observability)">—</td>';
+    const cpu = ns.cpu_percent, mem = ns.mem_percent;
+    const warn = (cpu != null && cpu > 85) || (mem != null && mem > 85);
+    const tip = "CPU " + fmtPercent(cpu) + (ns.cpu_count ? " across " + ns.cpu_count + " cores" : "") +
+      " · memory " + fmtPercent(mem) +
+      (ns.mem_used_bytes != null && ns.mem_total_bytes != null ? " (" + fmtBytes(ns.mem_used_bytes) + " / " + fmtBytes(ns.mem_total_bytes) + ")" : "");
+    return '<td class="col-load' + (warn ? " warn" : "") + '" title="' + escAttr(tip) + '"><b>' +
+      fmtPercent(cpu) + "</b> / <b>" + fmtPercent(mem) + "</b></td>";
   }
   function renderFleet() {
     const box = $("fleetPanel");
@@ -5210,7 +5227,13 @@
     else if (data.quorate && data.leader) role = "follower (leader: " + data.leader + ")";
     else if (data.quorate) role = "follower";
     else role = "no quorum (store unreachable)";
-    const line = (data.node_name || "?") + " · " + data.backend + " · " + role;
+    let line = (data.node_name || "?") + " · " + data.backend + " · " + role;
+    // this node's own live load (local, always available even on a lease
+    // backend that shares nothing node-to-node)
+    if (data.node_stats) {
+      line += " · this node " + fmtPercent(data.node_stats.cpu_percent) +
+        " cpu / " + fmtPercent(data.node_stats.mem_percent) + " mem";
+    }
     $("clusterSummary").textContent = line;
     state.clusterLine = line;
     // the swimlane and fleet view both chart the gossip peer set; lease
@@ -5371,13 +5394,23 @@
           (policies ? " (" + policies + ")" : "") +
           " — Leader jobs paused";
       }
+      // this node's own live load in the summary (always available, local)
+      if (data.node_stats) {
+        summary += " · this node " + fmtPercent(data.node_stats.cpu_percent) +
+          " cpu / " + fmtPercent(data.node_stats.mem_percent) + " mem";
+      }
       $("clusterSummary").textContent = summary;
       state.clusterLine = summary;
       // the Owns column lists each peer's job count; reveal it only under spread
       $("clusterTable").classList.toggle("show-owns", spread);
+      // the Load column appears only when peers actually share node stats
+      // (cluster.observability); otherwise those cells would be a wall of "—"
+      const anyPeerLoad = peers.some((p) => p.node_stats);
+      $("clusterTable").classList.toggle("show-load", anyPeerLoad);
       $("clusterRows").innerHTML = peers.map((p) =>
         '<tr><td><span class="cdot ' + esc(p.status) + '"></span>' + esc(p.host) + "</td>" +
         "<td>" + esc(p.node_name || "—") + "</td>" +
+        loadCell(p.node_stats) +
         '<td class="col-owns">' + (ownsCounts && p.node_name ? esc(ownsCounts[p.node_name] || 0) : "—") + "</td>" +
         "<td>" + esc(p.status) + "</td>" +
         '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"

@@ -16,6 +16,11 @@ cluster:
   electLeader: true                 # only the elected leader runs scheduled jobs
   interval: 10                      # poll every 10s so the demo reacts quickly
   driftAfter: 2                     # report drift after 2 mismatched rounds
+  observability:                    # share each node's CPU/memory across the
+    shareNodeStats: true            # cluster (backend is gossip, so just a
+                                    # marker). The dashboard fleet view + cluster
+                                    # panel then show per-node load. Set on ALL
+                                    # nodes together.
   # distribution: spread            # OPT-IN: per-job ownership instead of one
                                     # leader, so jobs fan out across nodes. Set
                                     # it on ALL three node files together, then

@@ -414,6 +414,47 @@ def test_cli_backup_restore_roundtrip(tmp_path, monkeypatch, capsys):
     )
 
 
+def test_cli_backup_restore_carries_docs_and_blobs(tmp_path, monkeypatch):
+    # docs/ (idempotency keys, KV, cursors, distributed-lock docs) and blobs/
+    # (artifact payloads) are committed durable state: backup+restore must
+    # carry them, or a restore silently loses idempotency/KV/cursor/lock state
+    # (a once-only guarded job re-runs) and orphans every artifact (410 gone).
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def _seed():
+        backend = _backend(store)
+        await backend.start()
+        await backend.mutate_document(
+            "kv/j", "k", lambda cur: ({"value": "v"}, None)
+        )
+        return await backend.put_blob(b"artifact-payload")
+
+    digest = _run(_seed())
+
+    archive = str(tmp_path / "backup.tar.gz")
+    assert _cli(
+        monkeypatch, ["state", "backup", "-c", config, "-o", archive]
+    ) == 0
+
+    store2 = tmp_path / "restored"
+    config2 = _write_config(tmp_path, store2, name="cfg2.yaml")
+    assert _cli(
+        monkeypatch, ["state", "restore", "-c", config2, archive]
+    ) == 0
+
+    async def _check():
+        backend = _backend(store2)
+        await backend.start()
+        doc = await backend.read_document("kv/j", "k")
+        blob = await backend.get_blob(digest)
+        return doc, blob
+
+    doc, blob = _run(_check())
+    assert doc is not None  # the job-state document survived the round-trip
+    assert blob == b"artifact-payload"  # the artifact blob survived too
+
+
 def test_cli_migrate(tmp_path, monkeypatch, capsys):
     store = tmp_path / "store"
     config = _write_config(tmp_path, store)

@@ -241,6 +241,61 @@ async def test_abandon_retry_settles_owner_moved(tmp_path):
         await _stop_state(cron)
 
 
+async def test_abandon_retry_handoff_carries_armed_at(tmp_path, monkeypatch):
+    # The cross-node hand-off must carry the attempt's ORIGINAL arm time in
+    # ``armedAt`` (notBefore stays "now" for prompt resume), so the new owner's
+    # superseded-by-run guard anchors on the arm, not the hand-off instant.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        monkeypatch.setattr(
+            cron, "_retry_cross_node_eligible", lambda job: True
+        )
+        state = JobRetryState(1, 2, 60)
+        state.next_delay()
+        t_arm = datetime.datetime(2026, 7, 1, 0, 0, 0, tzinfo=_UTC)
+        state.armed_at = t_arm
+        cron.retry_state["j"] = state
+        cron._abandon_retry(cron.cron_jobs["j"], 1)
+        await _drain_state_writes(cron)
+        rec = await _newest(cron, "retries/j")
+        assert rec is not None
+        assert rec["kind"] == "handoff"
+        assert rec["armedAt"] == t_arm.isoformat()
+        assert rec["notBefore"] != t_arm.isoformat()  # "now", not the arm
+    finally:
+        await _stop_state(cron)
+
+
+async def test_retry_handoff_armedat_anchors_superseded_guard(tmp_path):
+    # A hand-off whose armedAt predates a run the new owner ALREADY completed
+    # must read as RESOLVED (not claimable) -- else the completed retry re-runs
+    # across failover. Without armedAt the guard anchors on the (fresh)
+    # hand-off instant and mis-reads the earlier run as older: the bug.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        job = cron.cron_jobs["j"]
+        t_arm = datetime.datetime(2026, 7, 1, 0, 0, 0, tzinfo=_UTC)
+        t_handoff = datetime.datetime(2026, 7, 1, 0, 0, 50, tzinfo=_UTC)
+        # a run finished at 00:00:30 -- AFTER the arm, BEFORE the hand-off.
+        cron.last_run["j"] = _info(second=30)
+        base = {
+            "kind": "handoff",
+            "attempt": 2,
+            "notBefore": t_handoff.isoformat(),
+            "jobDigest": job_digest(job),
+            "fromHost": "other",
+            "at": t_handoff.isoformat(),
+        }
+        with_armed = dict(base, armedAt=t_arm.isoformat())
+        assert cron._retry_record_claimable("j", job, with_armed) is None
+        # control: the SAME record without armedAt anchors on the hand-off
+        # instant and (wrongly) reads as claimable -- the double-fire the
+        # field closes.
+        assert cron._retry_record_claimable("j", job, base) is not None
+    finally:
+        await _stop_state(cron)
+
+
 # --- durable retries: restart re-arming -----------------------------------
 
 

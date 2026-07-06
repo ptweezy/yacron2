@@ -1130,3 +1130,69 @@ def test_dag_task_id_charset_rejected():
         )
     with pytest.raises(dag.DagValidationError, match="may not contain"):
         dag.validate_graph(DagSpec.build("d", [TaskSpec("a#0")]))
+
+
+# --------------------------------------------------------------------------
+# Adversarial-review regressions
+# --------------------------------------------------------------------------
+
+
+def test_set_task_pid_fenced_to_claiming_proc():
+    # A stale pid write from a superseded former owner must NOT clobber the
+    # live claim's proc/pid -- doing so would fence out the real completion.
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "proc-B", "h", {}), body)
+    assert body["tasks"]["a"]["proc"] == "proc-B"  # stamped at claim
+    # a long-superseded former owner "proc-A" tries to record its pid
+    body, changed = _apply(dag.set_task_pid("a", "proc-A", 999, 2.0), body)
+    assert changed is False  # dropped: the entry is proc-B's claim now
+    assert body["tasks"]["a"]["proc"] == "proc-B"  # unclobbered
+    assert body["tasks"]["a"]["pid"] is None
+    # the live owner's own pid write still applies
+    body, changed = _apply(dag.set_task_pid("a", "proc-B", 4321, 3.0), body)
+    assert changed is True
+    assert body["tasks"]["a"]["pid"] == 4321
+
+
+def test_set_task_pid_fenced_to_attempt():
+    # A pid write stamped for a stale attempt is dropped even when the proc
+    # token matches (a same-node reclaim after a retry bumps the attempt).
+    spec = _spec(TaskSpec("a", max_attempts=3))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "proc-A", "h", {}), body)
+    body["tasks"]["a"]["attempt"] = 1  # a newer attempt is now the live one
+    body, changed = _apply(
+        dag.set_task_pid("a", "proc-A", 7, 2.0, attempt=0), body
+    )
+    assert changed is False
+    assert body["tasks"]["a"]["pid"] is None
+    body, changed = _apply(
+        dag.set_task_pid("a", "proc-A", 8, 3.0, attempt=1), body
+    )
+    assert changed is True
+    assert body["tasks"]["a"]["pid"] == 8
+
+
+def test_reload_added_dependency_does_not_wedge_run():
+    # A run is created for A -> B (all_success). A config reload then adds task
+    # C and repoints B at [A, C]. C is absent from the already-created run
+    # document (creation materialises only the then-current tasks); it must not
+    # gate B, or the run would wait on C forever and never terminalise.
+    old = _spec(TaskSpec("a"), TaskSpec("b", depends_on=("a",)))
+    body = _body(old)
+    body["tasks"]["a"]["state"] = dag.SUCCESS  # A already ran this run
+    body["tasks"]["a"]["finishedAt"] = 5.0
+    reloaded = _spec(
+        TaskSpec("a"),
+        TaskSpec("c"),
+        TaskSpec("b", depends_on=("a", "c")),
+    )
+    # B is ready despite C's absence, and the run drives to a terminal state.
+    assert dag._deps_verdict(reloaded, body, reloaded.by_id["b"]) == "ready"
+    ex = _Executor(reloaded, outcomes={"b": True})
+    body = ex.run(body)
+    assert "b" in ex.launched  # B actually ran
+    assert _state(body, "b") == dag.SUCCESS
+    assert dag.is_terminal_run(body)
+    assert body["state"] == dag.SUCCESS  # C's absence did not wedge it

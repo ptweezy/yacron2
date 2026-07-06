@@ -226,6 +226,29 @@ def test_lock_run_denied_does_not_run(monkeypatch):
     assert not any(c["path"] == "/v1/lock/release" for c in http.calls)
 
 
+def test_lock_run_parses_flags_before_command(monkeypatch):
+    # the documented form puts our flags BEFORE the `--`:
+    #   lock run NAME --wait --timeout 300 -- cmd
+    # argparse must PARSE --wait/--timeout/--ttl (nargs=REMAINDER swallowed
+    # them into the command, leaving the lock non-blocking and mis-execing
+    # "--wait") AND still run the wrapped command after `--`.
+    http = _FakeHTTP(
+        {
+            "/v1/lock/acquire": (200, {"acquired": True, "token": "h1"}),
+            "/v1/lock/release": (200, {"released": True}),
+        }
+    )
+    argv = [
+        "lock", "run", "L", "--wait", "--timeout", "300", "--ttl", "42", "--",
+        sys.executable, "-c", "import sys; sys.exit(7)",
+    ]
+    assert _cli(monkeypatch, argv, http) == 7  # the wrapped command ran
+    acquire = next(c for c in http.calls if c["path"] == "/v1/lock/acquire")
+    assert acquire["json"]["wait"] is True
+    assert acquire["json"]["blockSeconds"] == 300.0
+    assert acquire["json"]["ttl"] == 42.0
+
+
 # --------------------------------------------------------------------------
 # artifact + secret
 # --------------------------------------------------------------------------

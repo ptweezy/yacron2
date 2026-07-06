@@ -541,6 +541,13 @@ class JobRetryState:
         # no retry is pending.
         self.next_retry_at = None  # type: Optional[datetime]
         self.scheduled_delay = None  # type: Optional[float]
+        # the instant this ladder's current attempt was ARMED (its pending
+        # first written). Copied into a cross-node HANDOFF record's
+        # ``armedAt`` so the new owner's superseded-by-run guard anchors on
+        # the original arm time, not the hand-off instant -- otherwise a run
+        # the new owner already completed BETWEEN arming and hand-off would
+        # look "older" than the record and be re-run (a double-fire).
+        self.armed_at = None  # type: Optional[datetime]
 
     def next_delay(self) -> float:
         delay = self.delay

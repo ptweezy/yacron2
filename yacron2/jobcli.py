@@ -624,7 +624,14 @@ def add_job_commands(sub: Any) -> None:
             # invocation.
             p.add_argument(
                 "run_command",
-                nargs=argparse.REMAINDER,
+                # nargs="*", NOT argparse.REMAINDER: REMAINDER swallows any
+                # option appearing after NAME into the command list, so the
+                # documented `lock run NAME --wait --timeout 300 -- cmd` would
+                # silently leave --wait/--timeout/--ttl at their defaults (the
+                # lock never blocks) and then try to exec "--wait". With "*",
+                # argparse parses our own flags normally and takes the wrapped
+                # command from after the "--" separator.
+                nargs="*",
                 metavar="command",
                 help="the command to run while holding the lock (after --)",
             )

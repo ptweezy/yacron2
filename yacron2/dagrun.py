@@ -394,6 +394,18 @@ class DagScheduler:
     async def _create_run(
         self, dagcfg: Any, logical_dt: datetime.datetime, kind: str
     ) -> Optional[RunRef]:
+        # Canonicalise the instant to UTC before it becomes the run key. The
+        # scheduled/catch-up paths already hand in UTC-aware instants, but
+        # backfill preserves whatever offset the operator's ISO range carried,
+        # so 14:00Z and 09:00-05:00 (the SAME instant) would otherwise derive
+        # different keys and defeat the create-if-absent dedup -- re-running
+        # every task for an instant that already executed. A naive instant is
+        # read as UTC (matching the scheduled path), never shifted by local
+        # time.
+        if logical_dt.tzinfo is None:
+            logical_dt = logical_dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            logical_dt = logical_dt.astimezone(datetime.timezone.utc)
         run_key = dag.run_key_for_logical(logical_dt.isoformat())
         created = await self._create_doc(
             dagcfg, run_key, logical_dt.isoformat(), kind
@@ -697,6 +709,23 @@ class DagScheduler:
             )
             return []
         if isinstance(parsed, list):
+            try:
+                _json.ensure_portable(parsed)
+            except _json.UnsupportedValue as exc:
+                # a value that parses but is not fleet-portable (an int outside
+                # the 64-bit window, a non-finite float): embedding it in the
+                # run document would make _json.dumps_bytes raise on EVERY
+                # advance, wedging the run forever. Treat a mis-published
+                # upstream like the not-a-list case -- warn and map to empty.
+                logger.warning(
+                    "dag %s: xcom %r from %r contains a non-portable value "
+                    "(%s); mapping it to an empty fan-out",
+                    dag_name,
+                    key,
+                    taskkey,
+                    exc,
+                )
+                return []
             return parsed
         logger.warning(
             "dag %s: xcom %r from %r is a %s, not a list; mapping it to an "
@@ -788,7 +817,7 @@ class DagScheduler:
         # will record its completion; a failed pid write must not abort the
         # launch batch or, worse, fail an already-running task.
         try:
-            await self._set_pid(dagcfg, ref, taskkey, pid)
+            await self._set_pid(dagcfg, ref, taskkey, pid, dref.attempt)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - the pid is an optimisation
@@ -860,10 +889,21 @@ class DagScheduler:
         return ctx.token, env
 
     async def _set_pid(
-        self, dagcfg: Any, ref: RunRef, taskkey: str, pid: Optional[int]
+        self,
+        dagcfg: Any,
+        ref: RunRef,
+        taskkey: str,
+        pid: Optional[int],
+        attempt: Optional[int] = None,
     ) -> None:
         transform = self._wrap(
-            dag.set_task_pid(taskkey, self._cron._proc_token, pid, _now())
+            dag.set_task_pid(
+                taskkey,
+                self._cron._proc_token,
+                pid,
+                _now(),
+                attempt=attempt,
+            )
         )
         await self._mutate(ref[0], ref[1], transform)
 

@@ -430,7 +430,18 @@ def _deps_verdict(spec: DagSpec, body: Dict[str, Any], task: TaskSpec) -> str:
     an upstream failed (``all_success``); ``skip`` -- an upstream was skipped
     (``all_success``).  ``all_done`` only ever returns ready or wait.
     """
-    ups = [effective_state(spec, body, d) for d in task.depends_on]
+    tasks = body.get("tasks", {})
+    # A dependency with NO entry in this run document was added to the DAG by a
+    # config reload AFTER the run was created (creation materialises every
+    # then-current task): it is not part of this run's plan, so it cannot gate
+    # the dependent -- an ``effective_state`` of PENDING would leave the
+    # dependent, and the whole run, waiting forever.  Mirrors the same
+    # "not materialised -> skip" rule in :func:`_maybe_terminalise`.
+    ups = [
+        effective_state(spec, body, d)
+        for d in task.depends_on
+        if d in tasks
+    ]
     if not all(s in TERMINAL_STATES for s in ups):
         return "wait"
     if task.trigger_rule == ALL_DONE:
@@ -826,12 +837,26 @@ def _maybe_terminalise(spec, body, now, result) -> None:
 # --------------------------------------------------------------------------
 
 
-def set_task_pid(taskkey: str, proc: str, pid: Optional[int], now: float):
+def set_task_pid(
+    taskkey: str,
+    proc: str,
+    pid: Optional[int],
+    now: float,
+    *,
+    attempt: Optional[int] = None,
+):
     """Transform recording the OS pid of a just-launched task instance.
 
-    Runs right after a successful ``start()``; before it, the claimed instance
-    has ``proc=None`` so reconciliation on this process leaves it alone (it is
-    ours, mid-launch), and on a *different* process treats it as crashed.
+    The instance's ``proc`` token is stamped at CLAIM time (see
+    :func:`_claim_task`), so this only fills in the pid.  It FENCES that write
+    to the exact claim that launched the subprocess -- the same proc-token /
+    attempt identity :func:`mark_task_finished` and :func:`reconcile_crashed`
+    fence on.  A superseded former owner (its lease lost, the task since
+    reconciled -> re-claimed by another node with a fresh proc token / bumped
+    attempt) whose launch loop only now reaches the pid write would otherwise
+    overwrite the LIVE claim's proc/pid -- fencing out the real attempt's
+    completion and dropping its result.  When the stamped identity no longer
+    matches the entry, the write is dropped exactly like a duplicate.
     """
 
     def transform(body):
@@ -840,7 +865,16 @@ def set_task_pid(taskkey: str, proc: str, pid: Optional[int], now: float):
         entry = body.get("tasks", {}).get(taskkey)
         if entry is None or entry.get("state") != RUNNING:
             return _DOC_KEEP, False
-        entry["proc"] = proc
+        if entry.get("proc") != proc:
+            # the entry was re-claimed by another owner after we launched: not
+            # our instance to stamp a pid on.
+            return _DOC_KEEP, False
+        if (
+            attempt is not None
+            and int(entry.get("attempt", 0)) != attempt
+        ):
+            # a newer attempt is the live one; this is a stale launch's pid.
+            return _DOC_KEEP, False
         entry["pid"] = pid
         entry["updatedAt"] = now
         body["updatedAt"] = now

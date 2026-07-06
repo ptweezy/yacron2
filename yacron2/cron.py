@@ -5660,7 +5660,13 @@ class Cron:
             # (nor lurk until a later config revert).
             self._persist_retry_settled(name, "config-changed", attempt)
             return None
-        armed_at = _parse_iso_utc(rec.get("at")) or not_before
+        # a handoff carries the original arm time in ``armedAt`` (a pending has
+        # only ``at``, which for a pending IS its arm time).
+        armed_at = (
+            _parse_iso_utc(rec.get("armedAt"))
+            or _parse_iso_utc(rec.get("at"))
+            or not_before
+        )
         last = self.last_run.get(name)
         if last is not None and last.finished_at > armed_at:
             # a run finished AFTER this retry was armed: the ladder was
@@ -6005,16 +6011,19 @@ class Cron:
         # via the per-job write chain (_queue_retry_write).
         pending_job = self.cron_jobs.get(job_name)
         if pending_job is not None:
-            not_before = get_now(datetime.timezone.utc) + datetime.timedelta(
-                seconds=delay
-            )
+            now_arm = get_now(datetime.timezone.utc)
+            not_before = now_arm + datetime.timedelta(seconds=delay)
             self._persist_retry_pending(pending_job, retry_num, not_before)
             # record the armed retry's absolute fire time so GET /jobs can
-            # render a live next-retry countdown (see _job_to_dict).
+            # render a live next-retry countdown (see _job_to_dict), and the
+            # arm instant so a later cross-node hand-off can anchor its
+            # superseded-by-run guard on when the attempt was ARMED rather than
+            # on the hand-off instant (see _abandon_retry).
             armed_state = self.retry_state.get(job_name)
             if armed_state is not None:
                 armed_state.next_retry_at = not_before
                 armed_state.scheduled_delay = delay
+                armed_state.armed_at = now_arm
         await asyncio.sleep(delay)
         deferrals = 0
         while True:
@@ -6639,8 +6648,13 @@ class Cron:
             return False
         # superseded-by-run against the DURABLE ledger: the run that
         # resolved this ladder most likely happened on ANOTHER host,
-        # which this node's in-memory history knows nothing about.
-        armed_at = rec.get("at") or rec.get("notBefore")
+        # which this node's in-memory history knows nothing about.  A handoff
+        # carries the original arm time in ``armedAt`` (its ``at`` is the
+        # hand-off instant, which would hide a run the prior owner already
+        # completed); a pending's own ``at`` is its arm time.
+        armed_at = (
+            rec.get("armedAt") or rec.get("at") or rec.get("notBefore")
+        )
         try:
             last_durable = await asyncio.wait_for(
                 self.durable_last_run_at(name),
@@ -6731,7 +6745,14 @@ class Cron:
         if deadline and (now - not_before).total_seconds() > deadline:
             return None
         last = self.last_run.get(name)
-        armed_at = _parse_iso_utc(rec.get("at")) or not_before
+        # a handoff carries the original arm time in ``armedAt``; its ``at`` is
+        # the hand-off instant, which would hide a run the prior owner already
+        # completed (a pending has no ``armedAt`` and its ``at`` is its arm).
+        armed_at = (
+            _parse_iso_utc(rec.get("armedAt"))
+            or _parse_iso_utc(rec.get("at"))
+            or not_before
+        )
         if last is not None and last.finished_at > armed_at:
             return None  # locally-known newer run; the ladder resolved
         if kind == "handoff":
@@ -6821,6 +6842,15 @@ class Cron:
         self.retry_state.pop(job_name, None)
         if self._retry_cross_node_eligible(job):
             now = get_now(datetime.timezone.utc)
+            # Anchor the new owner's superseded-by-run guard on when this
+            # attempt was originally ARMED, not on this hand-off instant. A
+            # peer that took ownership while we were demoted-but-blind may
+            # have claimed and RUN this attempt; that run finished BEFORE now,
+            # so a now-stamped anchor ("at") would make the completed run look
+            # older than the record and the new owner would re-run it -- a
+            # double-fire across failover. notBefore stays now so the new owner
+            # still runs a genuinely-unresolved ladder promptly.
+            armed_at = state.armed_at if state is not None else None
             self._queue_retry_write(
                 job_name,
                 {
@@ -6830,6 +6860,11 @@ class Cron:
                     "jobDigest": job_digest(job),
                     "fromHost": self._state_host,
                     "at": now.isoformat(),
+                    "armedAt": (
+                        armed_at.isoformat()
+                        if armed_at is not None
+                        else now.isoformat()
+                    ),
                 },
             )
             logger.warning(

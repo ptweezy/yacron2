@@ -286,6 +286,42 @@ async def test_mapped_upstream_publishes_nothing_expands_empty(tmp_path):
         await _teardown(cron)
 
 
+async def test_mapped_upstream_nonportable_value_does_not_wedge(tmp_path):
+    # A mapped task whose upstream publishes a value that PARSES but is not
+    # fleet-portable (an int outside the 64-bit window) must not wedge the run.
+    # On the stdlib-json baseline the value stays an exact out-of-range int, so
+    # embedding it in the run document would raise UnsupportedValue on EVERY
+    # advance forever; _read_xcom_list now drops it to an empty fan-out. (With
+    # orjson the loader coerces/rejects it first; either way the run must reach
+    # a terminal state, never wedge.)
+    yaml = (
+        "dags:\n  - name: np\n    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: work\n        command: 'x'\n        dependsOn:\n"
+        "          - gen\n        expand:\n"
+        "          fromTask: gen\n          key: items\n"
+        "      - id: after\n        command: 'x'\n        dependsOn:\n"
+        "          - work\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        items_file = tmp_path / "items.json"
+        items_file.write_text("[100000000000000000000]")  # 10^20 > 2^64 - 1
+        _set_cmd(
+            cron, "np", "gen",
+            [_PY, "-m", "yacron2", "xcom", "push", "--key", "items",
+             str(items_file)],
+        )
+        _set_cmd(cron, "np", "work", [_PY, "-c", "pass"])
+        _set_cmd(cron, "np", "after", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("np")
+        body = await _drive(cron, "np", run_key, max_rounds=80)
+        assert body["state"] == dag.SUCCESS, _states(body)  # not wedged
+        assert body["tasks"]["after"]["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
 async def test_e2e_crash_resume(tmp_path):
     yaml = (
         "dags:\n  - name: cr\n    tasks:\n"
@@ -446,6 +482,34 @@ async def test_backfill_creates_runs(tmp_path):
         assert len(keys) == 3  # exactly three distinct runs
         bad = await cron._dag.backfill("bf", "bad", "worse")
         assert bad["ok"] is False
+    finally:
+        await _teardown(cron)
+
+
+async def test_backfill_nonutc_range_dedupes_with_utc(tmp_path):
+    # A backfill range in a non-UTC offset must derive the SAME (UTC) run keys
+    # as the scheduled/catch-up path, or the same logical instant gets a second
+    # run document and every task double-fires.
+    yaml = (
+        "dags:\n  - name: bf\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "bf", "a", [_PY, "-c", "pass"])
+        # 00:00, 01:00, 02:00 UTC
+        res = await cron._dag.backfill(
+            "bf", "2026-01-01T00:00:00+00:00", "2026-01-01T02:30:00+00:00"
+        )
+        assert res["created"] == 3
+        # the SAME instants expressed at -05:00 (prior day 19:00-21:30 local):
+        # must dedupe onto the UTC keys, not create three more runs.
+        await cron._dag.backfill(
+            "bf", "2025-12-31T19:00:00-05:00", "2025-12-31T21:30:00-05:00"
+        )
+        keys = {r["runKey"] for r in await cron._dag.list_runs("bf")}
+        assert len(keys) == 3  # deduped across the offset, not 6
+        assert all(k.startswith("2026-01-01T0") for k in keys)  # canonical UTC
     finally:
         await _teardown(cron)
 

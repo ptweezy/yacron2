@@ -24,17 +24,24 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from yacron2.config import ConfigError, parse_config
 from yacron2.state import (
+    BLOBS_DIR,
+    DOCS_DIR,
     LEASES_DIR,
     RECORDS_DIR,
     FilesystemStateBackend,
     make_state_backend,
 )
 
-# what a backup/migration carries: the immutable records and the lease files
-# (a lease file is its fence counter's only home, so dropping it would
-# re-issue fence values). Deliberately NOT carried: tmp/ (transient debris)
-# and quarantine/ (poison records; forensics stay with the source store).
-_CARRIED_DIRS = (RECORDS_DIR, LEASES_DIR)
+# what a backup/migration carries: the FULL durable state -- the immutable
+# records, the mutable job-state documents (idempotency keys, KV, cursors and
+# distributed-lock docs all live under docs/), the content-addressed artifact
+# payloads (blobs/), and the lease files (a lease file is its fence counter's
+# only home, so dropping it would re-issue fence values). Omitting docs/ or
+# blobs/ would silently lose idempotency/KV/cursor/lock state on restore (a
+# once-only guarded job would re-run) and orphan every artifact record (its
+# blob gone -> 410). Deliberately NOT carried: tmp/ (transient debris) and
+# quarantine/ (poison records; forensics stay with the source store).
+_CARRIED_DIRS = (RECORDS_DIR, DOCS_DIR, BLOBS_DIR, LEASES_DIR)
 
 
 def _load_state_backend(config_arg: str) -> FilesystemStateBackend:

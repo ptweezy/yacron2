@@ -766,6 +766,35 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         ),
                     }
                 ),
+                # --- observability overlay: gossip as a secondary data plane ---
+                # Share per-node CPU/memory (and job summaries) across the
+                # cluster for the dashboard's fleet view, independent of which
+                # backend owns election. With backend: gossip the election mesh
+                # already carries it, so this is an empty marker that just opts
+                # into node-stats sharing (listen/tls/peers are rejected as
+                # redundant). With a lease backend (kubernetes/etcd/filesystem)
+                # it stands up a dedicated, election-inert gossip mesh, so it
+                # requires listen/tls/peers just like backend: gossip does. See
+                # yacron2.cron.start_stop_observability and the overlay build in
+                # _build_cluster_config.
+                Opt("observability"): Map(
+                    {
+                        Opt("shareNodeStats"): Bool(),
+                        Opt("listen"): Str(),
+                        Opt("tls"): Map(
+                            {
+                                "ca": Str(),
+                                "cert": Str(),
+                                "key": Str(),
+                            }
+                        ),
+                        Opt("peers"): Seq(Map({"host": Str()})),
+                        Opt("nodeName"): Str(),
+                        Opt("interval"): Int(),
+                        Opt("driftAfter"): Int(),
+                        Opt("connectTimeout"): Int(),
+                    }
+                ),
             }
         ),
         # Optional state section: an opt-in durable store (a local filesystem
@@ -1627,15 +1656,83 @@ def _cluster_base(raw: dict) -> "Dict[str, Any]":
 
 
 def _build_cluster_config(raw: dict) -> ClusterConfig:
-    """Build a ClusterConfig, dispatching on the chosen ``backend``."""
+    """Build a ClusterConfig, dispatching on the chosen ``backend``.
+
+    An optional ``observability`` block is resolved on top of whichever backend
+    was chosen and attached to the returned config as two derived keys the
+    scheduler reads (the backends themselves ignore them):
+
+    * ``shareNodeStats`` -- gossip this node's CPU/memory for the fleet view.
+    * ``observabilityMesh`` -- a resolved, election-inert gossip ClusterConfig
+      to stand up as a *second* manager (lease backends only); ``None`` under
+      ``backend: gossip``, where the election mesh already carries the data.
+    """
     backend = raw.get("backend", DEFAULT_CLUSTER["backend"])
     if backend == "kubernetes":
-        return _build_kubernetes_cluster_config(raw)
-    if backend == "etcd":
-        return _build_etcd_cluster_config(raw)
-    if backend == "filesystem":
-        return _build_filesystem_cluster_config(raw)
-    return _build_gossip_cluster_config(raw)
+        cfg = _build_kubernetes_cluster_config(raw)
+    elif backend == "etcd":
+        cfg = _build_etcd_cluster_config(raw)
+    elif backend == "filesystem":
+        cfg = _build_filesystem_cluster_config(raw)
+    else:
+        cfg = _build_gossip_cluster_config(raw)
+    _attach_observability(cfg, raw, backend)
+    return cfg
+
+
+def _attach_observability(
+    cfg: "Dict[str, Any]", raw: dict, backend: str
+) -> None:
+    """Resolve a ``cluster.observability`` block onto a built cluster config.
+
+    Sets ``cfg["shareNodeStats"]`` and ``cfg["observabilityMesh"]`` (see
+    :func:`_build_cluster_config`). No-op when the block is absent, so a config
+    without it is byte-identical to before (and gossips the same bytes).
+    """
+    cfg["shareNodeStats"] = False
+    cfg["observabilityMesh"] = None
+    obs = raw.get("observability")
+    if obs is None:
+        return
+    # explicit opt-out is allowed (configure the overlay mesh for fleet job
+    # summaries but not CPU/memory); defaults to on -- sharing load is the point
+    cfg["shareNodeStats"] = obs.get("shareNodeStats", True)
+    transport_keys = ("listen", "tls", "peers")
+    has_transport = any(obs.get(k) is not None for k in transport_keys)
+    if backend == "gossip":
+        # the election gossip mesh already exchanges /peer bodies, so the
+        # overlay would be a redundant second mesh on the same nodes: reject
+        # its transport and simply ride the existing mesh.
+        if has_transport:
+            raise ConfigError(
+                "cluster.observability.{listen,tls,peers} is redundant with "
+                "backend: gossip (the election mesh already carries fleet "
+                "data); drop them -- an empty `observability:` block, or just "
+                "`shareNodeStats`, is enough to share node CPU/memory"
+            )
+        return
+    # a lease backend has no node-to-node channel, so the overlay must stand up
+    # its own gossip mesh -- which needs the full gossip transport, and runs
+    # election-inert (electLeader forced false: it never gates jobs).
+    for key in transport_keys:
+        if obs.get(key) is None:
+            raise ConfigError(
+                "cluster.observability requires cluster.observability.{} "
+                "when backend is {!r} (the overlay stands up its own gossip "
+                "mesh to carry fleet data)".format(key, backend)
+            )
+    mesh_raw = {
+        "backend": "gossip",
+        "electLeader": False,
+        "distribution": "single-leader",
+        "listen": obs["listen"],
+        "tls": obs["tls"],
+        "peers": obs["peers"],
+    }
+    for key in ("nodeName", "interval", "driftAfter", "connectTimeout"):
+        if obs.get(key) is not None:
+            mesh_raw[key] = obs[key]
+    cfg["observabilityMesh"] = _build_gossip_cluster_config(mesh_raw)
 
 
 def _build_state_config(raw: dict) -> StateConfig:

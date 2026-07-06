@@ -3129,6 +3129,10 @@ class ClusterManager(LeadershipBackend):
                 "as_of": now.isoformat(),
                 "jobs": job_summaries,
                 "truncated": summaries_truncated,
+                # our own live node load, sampled fresh (None when node-stats
+                # sharing is off / psutil unavailable). Peers carry their
+                # last-absorbed reading below.
+                "node_stats": self._advertised_node_stats(),
             }
         ]
         seen_instances = {self.instance_id}
@@ -3154,6 +3158,9 @@ class ClusterManager(LeadershipBackend):
                         peer.job_summaries, peer.job_summaries_at, now
                     ),
                     "truncated": peer.job_summaries_truncated,
+                    # the peer's last-absorbed node load (None when it shares
+                    # none), shown aged by as_of like its job summaries.
+                    "node_stats": peer.node_stats,
                 }
             )
         return {

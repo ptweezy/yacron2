@@ -681,6 +681,14 @@ class Cron:
         self.web_config = None  # type: Optional[WebConfig]
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
+        # optional gossip observability overlay: a SECOND, election-inert gossip
+        # manager stood up alongside a lease leadership backend so a
+        # kubernetes/etcd/filesystem cluster can still share fleet data (per-node
+        # CPU/memory + job summaries). None when unused -- including under
+        # backend: gossip, where the election mesh (cluster_manager) already
+        # carries fleet data and IS the fleet backend. See
+        # start_stop_observability and _fleet_backend.
+        self.observability_mesh: Optional[LeadershipBackend] = None
         # the durable state backend, when a `state` section is configured; None
         # keeps yacron2's classic stateless, in-memory behaviour. See
         # start_stop_state and yacron2.state.
@@ -2392,6 +2400,15 @@ class Cron:
                 # absorbed snapshot should carry our jobs rather than an
                 # empty block. No-op for the lease backends.
                 manager.set_job_summaries_provider(self.fleet_job_summaries)
+                # Share this node's CPU/memory over the ELECTION gossip mesh
+                # when observability is enabled with backend: gossip (no
+                # separate overlay mesh). The lease + overlay case installs the
+                # provider on the overlay instead (start_stop_observability).
+                if (
+                    cluster_config.get("shareNodeStats")
+                    and cluster_config.get("observabilityMesh") is None
+                ):
+                    manager.set_node_stats_provider(self.node_resource_snapshot)
                 await manager.start()
             except (
                 OSError,

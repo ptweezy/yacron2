@@ -270,9 +270,9 @@ async def _gc_async(
     # pass): a single shared, count-pruned stream would have its retained
     # history shrink as the fleet grows, eventually falling under grace and
     # deferring GC forever.
-    stream_names = sorted(set(await backend.list_stream_names(
-        MANIFEST_STREAM_PREFIX
-    )))[:MANIFEST_HOSTS_CAP]
+    stream_names = sorted(
+        set(await backend.list_stream_names(MANIFEST_STREAM_PREFIX))
+    )[:MANIFEST_HOSTS_CAP]
     manifests: List[Dict[str, Any]] = []
     for name in stream_names:
         manifests.extend(

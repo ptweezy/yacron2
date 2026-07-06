@@ -1682,14 +1682,14 @@ def _build_state_config(raw: dict) -> StateConfig:
         parsed = urlparse(text if "://" in text else "http://" + text)
         host = parsed.hostname or ""
         if host != "localhost" and _loopback_ip_version(host) is None:
-            raise ConfigError(
+            msg = (
                 "state.jobApi.listen host {!r} is not loopback; this "
                 "endpoint serves per-run bearer tokens and staged job "
                 "secrets over plaintext HTTP, so binding it beyond this "
                 "host needs state.jobApi.allowNonLoopbackBind: true (and "
                 "should be paired with a reverse proxy adding TLS/auth)"
-                .format(host)
             )
+            raise ConfigError(msg.format(host))
     return StateConfig(cfg)
 
 

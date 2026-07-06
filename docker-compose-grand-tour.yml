@@ -104,7 +104,9 @@ x-node: &node
 services:
   # Mints a throwaway cluster CA + one leaf cert per node into the shared certs
   # volume before the nodes start. Demo-only: see gen-certs.sh for the caveats.
-  # (Only the gossip backend uses these; BACKEND=filesystem ignores them.)
+  # The gossip backend uses these for election; BACKEND=filesystem elects over
+  # the lease instead but still uses them for its observability overlay (the
+  # gossip mesh that shares per-node CPU/memory -- see node-entrypoint.sh).
   certgen:
     image: alpine:3.20
     command: ["sh", "/gen-certs.sh"]

@@ -4341,6 +4341,7 @@ class Cron:
             scheduled_at=slot.isoformat() if slot is not None else None,
             host=self._state_host,
             default_scope=job.name,
+            allowed_scopes=set(job.stateAllowedScopes),
             secrets=secrets,
         )
         api.register_run(ctx)

@@ -67,6 +67,28 @@ def test_jobapi_listen_rejects_unix():
         )
 
 
+def test_jobapi_listen_loopback_bind_allowed_by_default():
+    for host in ("127.0.0.1:9000", "'[::1]:9000'", "localhost:9000"):
+        cfg = _cfg(
+            "state:\n  path: /x\n  jobApi:\n    listen: {}\n".format(host)
+        ).state_config
+        assert cfg["jobApi"]["listen"] == host.strip("'")
+
+
+def test_jobapi_listen_non_loopback_bind_refused():
+    with pytest.raises(ConfigError, match="is not loopback"):
+        _cfg("state:\n  path: /x\n  jobApi:\n    listen: 0.0.0.0:9000\n")
+
+
+def test_jobapi_listen_non_loopback_bind_allowed_with_explicit_opt_in():
+    cfg = _cfg(
+        "state:\n  path: /x\n  jobApi:\n"
+        "    listen: 0.0.0.0:9000\n"
+        "    allowNonLoopbackBind: true\n"
+    ).state_config
+    assert cfg["jobApi"]["listen"] == "0.0.0.0:9000"
+
+
 def test_secrets_parsed():
     cfg = _cfg(
         "state:\n  path: /x\n"
@@ -77,6 +99,27 @@ def test_secrets_parsed():
     )
     (job,) = cfg.jobs
     assert job.secrets == [{"name": "TOKEN", "value": "hunter2"}]
+
+
+def test_state_allowed_scopes_default_empty():
+    cfg = _cfg(
+        "state:\n  path: /x\n"
+        "jobs:\n  - name: j\n    command: 'true'\n"
+        "    schedule: '* * * * *'\n"
+    )
+    (job,) = cfg.jobs
+    assert job.stateAllowedScopes == []
+
+
+def test_state_allowed_scopes_parsed():
+    cfg = _cfg(
+        "state:\n  path: /x\n"
+        "jobs:\n  - name: j\n    command: 'true'\n"
+        "    schedule: '* * * * *'\n"
+        "    stateAllowedScopes:\n      - shared-team\n"
+    )
+    (job,) = cfg.jobs
+    assert job.stateAllowedScopes == ["shared-team"]
 
 
 def test_secret_missing_source_rejected():

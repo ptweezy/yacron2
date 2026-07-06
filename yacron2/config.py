@@ -218,6 +218,11 @@ DEFAULT_JOB_API: Dict[str, Any] = {
     # daemon) dies the lock frees itself after at most this long. Floor 5, like
     # slotTtlSeconds, for the same renew-latency reason.
     "lockTtlSeconds": 30,
+    # explicit opt-in required for a `listen` host that is not loopback. The
+    # endpoint serves per-run bearer tokens and staged job secrets in
+    # plaintext HTTP, so binding it to a routable interface without this set
+    # would serve them to anything that can reach the port.
+    "allowNonLoopbackBind": False,
 }
 
 
@@ -370,6 +375,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # {name, value|fromFile|fromEnvVar}. Resolved fresh per run, never durably
     # stored. Inert without a `state` section with jobApi enabled.
     "secrets": [],
+    # extra scope names (besides this job's own name and the conventional
+    # `global` namespace) this job's loopback state calls may explicitly
+    # name. Without an entry here, a `--scope OTHER` naming any other job's
+    # own name is refused (403) rather than reaching that job's private
+    # state. See yacron2.jobapi.JobStateAPI._scope.
+    "stateAllowedScopes": [],
     "env_file": None,
     "executionTimeout": None,
     "killTimeout": 30,
@@ -501,6 +512,9 @@ _job_defaults_common = {
             }
         )
     ),
+    # allowlist of extra scope names this job may explicitly name in its
+    # loopback state calls; see yacron2.jobapi.JobStateAPI._scope.
+    Opt("stateAllowedScopes"): Seq(Str()),
     Opt("env_file"): Str(),
     Opt("executionTimeout"): Float(),
     Opt("killTimeout"): Float(),
@@ -577,6 +591,7 @@ _dag_task_launch_fields = {
             }
         )
     ),
+    Opt("stateAllowedScopes"): Seq(Str()),
 }
 
 _dag_task_schema_dict = dict(_dag_task_launch_fields)
@@ -771,6 +786,7 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("maxValueBytes"): Int(),
                         Opt("maxArtifactBytes"): Int(),
                         Opt("lockTtlSeconds"): Int() | Float(),
+                        Opt("allowNonLoopbackBind"): Bool(),
                     }
                 ),
             }
@@ -952,6 +968,7 @@ class JobConfig:
         "env_file",
         "environment",
         "secrets",
+        "stateAllowedScopes",
         "executionTimeout",
         "killTimeout",
         "statsd",
@@ -1014,6 +1031,7 @@ class JobConfig:
         self.environment = config.pop("environment")
         self.secrets = config.pop("secrets")
         self._validate_secrets()
+        self.stateAllowedScopes = config.pop("stateAllowedScopes")
         if self.env_file is not None:
             self._merge_env_file()
 
@@ -1659,6 +1677,19 @@ def _build_state_config(raw: dict) -> StateConfig:
             "state.jobApi.listen must be an http:// URL or a bare host:port "
             "(the job CLI reaches the loopback endpoint over TCP only)"
         )
+    if listen and not job_api.get("allowNonLoopbackBind"):
+        text = str(listen)
+        parsed = urlparse(text if "://" in text else "http://" + text)
+        host = parsed.hostname or ""
+        if host != "localhost" and _loopback_ip_version(host) is None:
+            raise ConfigError(
+                "state.jobApi.listen host {!r} is not loopback; this "
+                "endpoint serves per-run bearer tokens and staged job "
+                "secrets over plaintext HTTP, so binding it beyond this "
+                "host needs state.jobApi.allowNonLoopbackBind: true (and "
+                "should be paired with a reverse proxy adding TLS/auth)"
+                .format(host)
+            )
     return StateConfig(cfg)
 
 

@@ -397,15 +397,52 @@ async def test_corrupt_json_is_quarantined(tmp_path):
     assert any(n.startswith("00000-bad.json") for n in os.listdir(quarantine))
 
 
-async def test_unknown_schema_version_is_quarantined(tmp_path):
+async def test_unrecognised_schema_version_is_left_in_place(tmp_path):
+    # A well-formed record with a schemaVersion this build doesn't recognise
+    # is most likely written by a newer peer mid rolling-upgrade: it must be
+    # skipped, never destructively quarantined (deleting it would erase that
+    # peer's record fleet-wide the moment an old node reads the shared store).
     backend = _backend(tmp_path)
     await backend.start()
     stream_dir = backend._stream_dir("s")
     os.makedirs(stream_dir, exist_ok=True)
-    with open(os.path.join(stream_dir, "00001-old.json"), "w") as fobj:
-        json.dump({"schemaVersion": "v0", "data": {"x": 1}}, fobj)
+    with open(os.path.join(stream_dir, "00001-new.json"), "w") as fobj:
+        json.dump({"schemaVersion": "v99", "data": {"x": 1}}, fobj)
     assert await backend.list_records("s") == []
-    assert "00001-old.json" not in os.listdir(stream_dir)
+    assert "00001-new.json" in os.listdir(stream_dir)
+    quarantine = os.path.join(backend.base, "quarantine")
+    assert not os.path.isdir(quarantine) or os.listdir(quarantine) == []
+
+
+async def test_unrecognised_schema_version_fails_closed_when_strict(tmp_path):
+    from yacron2.state import _DocumentUnreadable
+
+    backend = _backend(tmp_path)
+    await backend.start()
+    stream_dir = backend._stream_dir("s")
+    os.makedirs(stream_dir, exist_ok=True)
+    with open(os.path.join(stream_dir, "00001-new.json"), "w") as fobj:
+        json.dump({"schemaVersion": "v99", "data": {"finished_at": "x"}}, fobj)
+    with pytest.raises(_DocumentUnreadable):
+        await backend.derive_max("s", "finished_at")
+
+
+async def test_malformed_record_shape_is_still_quarantined(tmp_path):
+    # Distinct from an unrecognised-but-well-formed schemaVersion: a record
+    # whose "data" isn't even a dict is genuinely unreadable content, not a
+    # forward-compat gap, so destructive quarantine is still correct here.
+    backend = _backend(tmp_path)
+    await backend.start()
+    stream_dir = backend._stream_dir("s")
+    os.makedirs(stream_dir, exist_ok=True)
+    with open(os.path.join(stream_dir, "00001-bad.json"), "w") as fobj:
+        json.dump(
+            {"schemaVersion": state.SCHEME_VERSION, "data": "not-a-dict"}, fobj
+        )
+    assert await backend.list_records("s") == []
+    assert "00001-bad.json" not in os.listdir(stream_dir)
+    quarantine = os.path.join(backend.base, "quarantine")
+    assert any(n.startswith("00001-bad.json") for n in os.listdir(quarantine))
 
 
 # --- lease primitive ------------------------------------------------------

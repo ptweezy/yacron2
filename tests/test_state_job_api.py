@@ -29,7 +29,7 @@ _ONE_JOB = (
 )
 
 
-def _ctx(token="tok", job="job", secrets=None):
+def _ctx(token="tok", job="job", secrets=None, allowed_scopes=None):
     return RunContext(
         token=token,
         run_id="rid-" + token,
@@ -38,6 +38,7 @@ def _ctx(token="tok", job="job", secrets=None):
         scheduled_at=None,
         host="h",
         default_scope=job,
+        allowed_scopes=set(allowed_scopes or ()),
         secrets=secrets or {},
     )
 
@@ -146,6 +147,62 @@ async def test_kv_explicit_scope_shared(tmp_path):
                 headers=_auth("b"),
             )
             assert (await r.json())["value"] == "x"
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
+async def test_kv_scope_naming_another_jobs_scope_is_forbidden(tmp_path):
+    # "beta" is job alpha's own private default scope: without an explicit
+    # allowlist entry, alpha may not name it (would let one job read/write/
+    # destroy an unrelated job's state -- see yacron2.jobapi._scope).
+    api, backend = await _make_api(tmp_path)
+    api.register_run(_ctx(token="a", job="alpha"))
+    api.register_run(_ctx(token="b", job="beta"))
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(
+                api.base_url + "/v1/kv/set",
+                json={"key": "k", "value": "secret"},
+                headers=_auth("b"),
+            )
+            r = await s.get(
+                api.base_url + "/v1/kv/get?scope=beta&key=k",
+                headers=_auth("a"),
+            )
+            assert r.status == 403
+            r = await s.post(
+                api.base_url + "/v1/kv/delete",
+                json={"scope": "beta", "key": "k"},
+                headers=_auth("a"),
+            )
+            assert r.status == 403
+        # beta's value survived the attempted cross-job reach-in.
+        from yacron2 import jobstate
+
+        got = await jobstate.kv_get(backend, "beta", "k")
+        assert got["value"] == "secret"
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
+async def test_kv_scope_allowlisted_explicitly_permitted(tmp_path):
+    api, backend = await _make_api(tmp_path)
+    api.register_run(
+        _ctx(token="a", job="alpha", allowed_scopes=["shared-team"])
+    )
+    try:
+        async with aiohttp.ClientSession(headers=_auth("a")) as s:
+            r = await s.post(
+                api.base_url + "/v1/kv/set",
+                json={"scope": "shared-team", "key": "k", "value": "v"},
+            )
+            assert r.status == 200
+            r = await s.get(
+                api.base_url + "/v1/kv/get?scope=shared-team&key=k"
+            )
+            assert (await r.json())["value"] == "v"
     finally:
         await api.stop()
         await backend.stop()

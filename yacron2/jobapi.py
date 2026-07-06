@@ -40,7 +40,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 from yacron2 import _json, jobstate
-from yacron2.jobstate import JobStateError
+from yacron2.jobstate import GLOBAL_SCOPE, JobStateError
 from yacron2.state import Lease, StateBackend, _DocumentUnreadable
 
 logger = logging.getLogger("yacron2.jobapi")
@@ -72,8 +72,13 @@ class RunContext:
     Keyed by its opaque ``token`` (the bearer secret injected into the job's
     environment).  ``default_scope`` is the job's own name, so a job's KV /
     cursor / artifact calls land in its private namespace unless it names a
-    shared scope.  ``secrets`` is the run-scoped, in-memory staging table --
-    resolved by the daemon at launch and dropped when the run ends.
+    shared scope.  ``allowed_scopes`` is the operator-configured allowlist
+    (``job.stateAllowedScopes``) of additional scope names this run may name
+    explicitly -- without it, a run could pass ANY string as ``scope`` and
+    reach straight into another job's private namespace (which is simply that
+    job's name), reading, overwriting or destroying its state.  ``secrets`` is
+    the run-scoped, in-memory staging table -- resolved by the daemon at
+    launch and dropped when the run ends.
     """
 
     token: str
@@ -83,6 +88,7 @@ class RunContext:
     scheduled_at: Optional[str]
     host: str
     default_scope: str
+    allowed_scopes: Set[str] = field(default_factory=set)
     secrets: Dict[str, str] = field(default_factory=dict)
 
 
@@ -535,7 +541,30 @@ class JobStateAPI:
 
     @staticmethod
     def _scope(ctx: RunContext, given: Optional[str]) -> str:
-        return given or ctx.default_scope
+        """The scope a call may act in, authorising any explicitly-named one.
+
+        A run always reaches its own ``default_scope`` and the conventional
+        shared ``global`` namespace (the documented ``--global`` coordination
+        path); any OTHER name must be in the job's configured
+        ``stateAllowedScopes`` -- otherwise it is most likely another job's
+        own name, i.e. that job's private scope, and letting it through would
+        let one job read, overwrite or destroy an unrelated job's state.
+        """
+        if not given:
+            return ctx.default_scope
+        if (
+            given != ctx.default_scope
+            and given != GLOBAL_SCOPE
+            and given not in ctx.allowed_scopes
+        ):
+            raise JobStateError(
+                "scope {!r} is not permitted for job {!r}; add it to "
+                "stateAllowedScopes to allow this job to use it".format(
+                    given, ctx.job_name
+                ),
+                status=403,
+            )
+        return given
 
     @staticmethod
     def _require(value: Optional[str], what: str) -> str:

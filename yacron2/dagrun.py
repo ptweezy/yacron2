@@ -851,6 +851,7 @@ class DagScheduler:
             scheduled_at=None,
             host=self._cron._state_host,
             default_scope=scope,
+            allowed_scopes=set(template.stateAllowedScopes),
             secrets=secrets,
         )
         api.register_run(ctx)

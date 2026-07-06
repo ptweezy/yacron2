@@ -114,10 +114,11 @@ serve otherwise) takes these sub-keys:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Run the loopback endpoint and inject its address into every job. Set `false` to keep the durable scheduler features but expose nothing to job commands. |
-| `listen` | *(ephemeral)* | Override the bind, as an `http://host:port` URL. Unset binds an OS-assigned ephemeral port on `127.0.0.1`, reachable only from this host's jobs. A `unix://` path is not accepted (the job CLI speaks TCP only). |
+| `listen` | *(ephemeral)* | Override the bind, as an `http://host:port` URL. Unset binds an OS-assigned ephemeral port on `127.0.0.1`, reachable only from this host's jobs. A `unix://` path is not accepted (the job CLI speaks TCP only). A non-loopback host is refused unless `allowNonLoopbackBind` is also set: the endpoint serves per-run bearer tokens and staged job secrets over plaintext HTTP. |
 | `maxValueBytes` | `1048576` | Cap on one KV / cursor value in bytes; a larger set is refused. |
 | `maxArtifactBytes` | `67108864` | Cap on one artifact payload in bytes; a larger put is refused. |
 | `lockTtlSeconds` | `30` | TTL of a [job mutex/semaphore](#mutex-and-semaphore) lease, renewed by the daemon at a third of the TTL. Must be `>= 5`, for the same reason as `slotTtlSeconds`. |
+| `allowNonLoopbackBind` | `false` | Explicit opt-in required for `listen` to bind a non-loopback host. Pair with a reverse proxy adding TLS/auth -- the endpoint itself speaks plaintext HTTP. |
 
 ### Per-job stateful options
 
@@ -137,6 +138,7 @@ history -- its memory then just resets on restart (see
 | `archiveOutput` | `false` | Persist the job's captured output to the store, one archived record per finished run. See [Output archival](#output-archival-and-secret-redaction). |
 | `redactArchivedSecrets` | `true` | Scrub recognisable secrets from output before archiving it (only applies with `archiveOutput`). |
 | `secrets` | *(none)* | Run-scoped secrets staged for the job over the loopback endpoint (each `{name, value\|fromFile\|fromEnvVar}`). Needs `jobApi` enabled. See [Run-scoped secrets](#run-scoped-secrets). |
+| `stateAllowedScopes` | *(none)* | Extra scope names (besides the job's own name and `global`) this job's state calls may explicitly name. See [Scopes](#scopes). |
 
 The full option schema is in the
 [Configuration Reference](Configuration-Reference).
@@ -762,8 +764,13 @@ injecting nothing and running no endpoint.
 
 Every KV / cursor / artifact / lock call lands in a **scope** -- a namespace
 that defaults to the calling **job's own name**, so one job cannot read
-another's keys by accident. Pass `--global` (or `--scope NAME`) to act in a
-shared namespace for deliberate cross-job coordination. Secrets are always
+another's keys by accident, or by design: naming any *other* scope is
+authorised, not just defaulted-away. A run may always act in its own scope
+and the conventional shared `global` namespace (`--global`, for deliberate
+cross-job coordination); naming any other scope needs that name in the job's
+`stateAllowedScopes` list, or the loopback endpoint answers `403`. Without an
+entry there, `--scope NAME` cannot be used to reach into an unrelated job's
+private state (which is simply that job's own name). Secrets are always
 scoped to the single run they were staged for.
 
 ### Durable key/value

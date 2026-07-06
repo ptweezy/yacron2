@@ -233,10 +233,11 @@ The `state.jobApi` sub-keys:
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `enabled` | `Bool` | `true` | Run the loopback endpoint and inject its address/token into every job. `false` keeps the durable scheduler features but exposes nothing to jobs. |
-| `listen` | `Str` | *(ephemeral)* | Override the bind, as an `http://host:port` URL (a `unix://` URL is a `ConfigError`: the job CLI speaks TCP only). Unset binds an OS-assigned ephemeral port on `127.0.0.1`. |
+| `listen` | `Str` | *(ephemeral)* | Override the bind, as an `http://host:port` URL (a `unix://` URL is a `ConfigError`: the job CLI speaks TCP only). Unset binds an OS-assigned ephemeral port on `127.0.0.1`. A non-loopback host is a `ConfigError` unless `allowNonLoopbackBind` is also `true`. |
 | `maxValueBytes` | `Int` | `1048576` | Cap (bytes) on one KV / cursor value; a larger set is refused (HTTP 413). Must be `>= 0`. |
 | `maxArtifactBytes` | `Int` | `67108864` | Cap (bytes) on one artifact payload; a larger put is refused (HTTP 413). Must be `>= 0`. |
 | `lockTtlSeconds` | `Int` or `Float` | `30` | TTL of a job mutex/semaphore lease, renewed by the daemon at a third of this. Must be `>= 5` (a `ConfigError`, `state.jobApi.lockTtlSeconds must be >= 5`), for the same reason as `slotTtlSeconds`. |
+| `allowNonLoopbackBind` | `Bool` | `false` | Explicit opt-in for a non-loopback `listen` host. Without it, a non-loopback host is a `ConfigError`: the endpoint serves per-run bearer tokens and staged job secrets over plaintext HTTP, so exposing it beyond this host needs a deliberate choice (and should be paired with a reverse proxy adding TLS/auth). |
 
 `path` is the only required key. Full behavior -- the store layout and
 durability model, restart-surviving retries, missed-run catch-up, `@reboot`
@@ -287,7 +288,7 @@ Per-task keys:
 Plus the shared launch fields a job takes: `shell`, `environment`,
 `captureStdout` / `captureStderr`, `saveLimit`, `maxLineLength`, `streamPrefix`,
 `failsWhen`, `executionTimeout`, `killTimeout`, `user` / `group`, `env_file`,
-`secrets`.
+`secrets`, `stateAllowedScopes`.
 
 The graph is validated at load: unknown/duplicate ids, a cycle, a self-edge, or
 an `expand.fromTask` that is not a direct non-mapped dependency are config
@@ -483,6 +484,7 @@ in-memory history alone (the gate then resets on restart). See
 | `environment` | `Seq(Map({"key": Str, "value": Str}))` | `[]` | Environment variables set for the process. Both `key` and `value` are required per entry. Merged by key with `defaults` and with `env_file` (config values win). |
 | `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
 | `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and exactly one source (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). The job reads one with `yacron2 secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
+| `stateAllowedScopes` | `Seq(Str)` | `[]` | Extra scope names (besides the job's own name and `global`) this job's `yacron2 state\|cursor\|lock\|artifact` calls may explicitly name via `--scope`. Naming any other scope -- most dangerously another job's own name, which IS that job's private scope -- is refused (`403`). See [Scopes](Durable-State#scopes). |
 
 ```yaml
 jobs:

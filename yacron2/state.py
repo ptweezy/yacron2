@@ -1235,12 +1235,38 @@ class FilesystemStateBackend(StateBackend):
             # caller is reading the stream ("never fatal" is the invariant).
             self._quarantine(path, name, "unreadable-or-invalid-json")
             return None
-        if (
-            not isinstance(obj, dict)
-            or obj.get("schemaVersion") != SCHEME_VERSION
-            or not isinstance(obj.get("data"), dict)
-        ):
+        if not isinstance(obj, dict) or not isinstance(obj.get("data"), dict):
+            # the SHAPE is wrong regardless of schemaVersion: not a genuine
+            # record this or any version of this code ever wrote.
+            # Unrecoverable, so quarantine.
             self._quarantine(path, name, "unknown-schema")
+            return None
+        if obj.get("schemaVersion") != SCHEME_VERSION:
+            # Well-formed, just a schema version this build does not
+            # recognise -- almost always a NEWER version written by a peer
+            # ahead in a rolling upgrade, not corruption. Quarantining (i.e.
+            # deleting) it here would let an old node erase a new node's
+            # records fleet-wide the moment it starts reading a shared store
+            # mid-upgrade, losing whatever it encoded (a retry ladder, a
+            # dedupe marker, ...). Leave it in place, exactly like the
+            # environmental-error branch above: this build simply cannot
+            # interpret it (yet).
+            logger.warning(
+                "state: record %s has unrecognised schemaVersion %r; "
+                "leaving it in place (likely written by a newer version)",
+                name,
+                obj.get("schemaVersion"),
+            )
+            if strict:
+                # Mirrors the environmental-error branch: a derived
+                # watermark/cursor read must fail closed rather than silently
+                # compute the max over the subset it understood, which could
+                # be a value strictly below the true max.
+                raise _DocumentUnreadable(
+                    "record {} has unrecognised schemaVersion {!r}".format(
+                        name, obj.get("schemaVersion")
+                    )
+                )
             return None
         data: Dict[str, Any] = obj["data"]
         return data

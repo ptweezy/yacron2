@@ -438,9 +438,7 @@ def _deps_verdict(spec: DagSpec, body: Dict[str, Any], task: TaskSpec) -> str:
     # dependent, and the whole run, waiting forever.  Mirrors the same
     # "not materialised -> skip" rule in :func:`_maybe_terminalise`.
     ups = [
-        effective_state(spec, body, d)
-        for d in task.depends_on
-        if d in tasks
+        effective_state(spec, body, d) for d in task.depends_on if d in tasks
     ]
     if not all(s in TERMINAL_STATES for s in ups):
         return "wait"
@@ -869,10 +867,7 @@ def set_task_pid(
             # the entry was re-claimed by another owner after we launched: not
             # our instance to stamp a pid on.
             return _DOC_KEEP, False
-        if (
-            attempt is not None
-            and int(entry.get("attempt", 0)) != attempt
-        ):
+        if attempt is not None and int(entry.get("attempt", 0)) != attempt:
             # a newer attempt is the live one; this is a stale launch's pid.
             return _DOC_KEEP, False
         entry["pid"] = pid

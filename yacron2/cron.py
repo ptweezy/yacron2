@@ -6652,9 +6652,7 @@ class Cron:
         # carries the original arm time in ``armedAt`` (its ``at`` is the
         # hand-off instant, which would hide a run the prior owner already
         # completed); a pending's own ``at`` is its arm time.
-        armed_at = (
-            rec.get("armedAt") or rec.get("at") or rec.get("notBefore")
-        )
+        armed_at = rec.get("armedAt") or rec.get("at") or rec.get("notBefore")
         try:
             last_durable = await asyncio.wait_for(
                 self.durable_last_run_at(name),

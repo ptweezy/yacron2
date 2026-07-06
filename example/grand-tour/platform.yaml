@@ -57,6 +57,11 @@
 #   Metrics/API     statsd push metrics, native Prometheus /metrics (map form:
 #                   public scrape + custom buckets), custom web.headers, the
 #                   HTTP control API + dashboard, opt-in bearer authToken
+#   Resources       per-job CPU time + peak RSS (monitorResources, in
+#                   _defaults.yaml) with live per-job load in the dashboard, AND
+#                   per-node whole-host CPU/memory shared across the cluster
+#                   (cluster.observability) shown in the cluster panel + fleet
+#                   view — driven by the resource-heavy jobs in section 3b
 #   Config          include: (this file pulls in _defaults.yaml), a classic
 #                   Vixie crontab in the same dir (legacy.crontab)
 #

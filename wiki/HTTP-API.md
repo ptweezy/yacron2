@@ -304,7 +304,11 @@ Per node: `jobs` maps each job name to
 `{outcome, finished_at, duration, exit_code}` or `null` for a job that has not
 run since that node started. `jobs: null` (as opposed to `{}`) means no
 snapshot is held for that node at all: it was never reached, or it runs an
-older build that does not gossip summaries. `truncated: true` flags a node
+older build that does not gossip summaries. Each node also carries `node_stats`
+— its whole-node CPU/memory (the same shape as [`GET /node`](#get-node)'s
+`resources`) — when the cluster shares node load via
+[`cluster.observability`](Configuration-Reference#observability-overlay);
+`null` when that node shares none. `truncated: true` flags a node
 with more jobs than the per-payload cap (512), whose advertised set is the
 sorted-name prefix. A briefly unreachable peer keeps its last-known summaries
 with the old `as_of` rather than being blanked, so stale data is visibly stale

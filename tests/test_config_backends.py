@@ -63,6 +63,85 @@ def test_gossip_requires_transport_keys():
             _cluster(yaml)
 
 
+# --- observability overlay ------------------------------------------------
+
+_OBS_TRANSPORT = (
+    "  observability:\n"
+    "    listen: '0.0.0.0:8140'\n"
+    "    tls:\n      ca: /oca\n      cert: /ocert\n      key: /okey\n"
+    "    peers:\n      - host: b:8140\n"
+)
+
+
+def test_observability_absent_defaults_off():
+    cfg = _gossip("    - host: b:8443\n")
+    assert cfg["shareNodeStats"] is False
+    assert cfg["observabilityMesh"] is None
+
+
+def test_observability_gossip_backend_shares_node_stats():
+    # under backend: gossip the election mesh carries the data, so an
+    # observability block just opts into node-stats sharing (no second mesh)
+    cfg = _gossip(
+        "    - host: b:8443\n",
+        extra="  observability:\n    shareNodeStats: true\n",
+    )
+    assert cfg["shareNodeStats"] is True
+    assert cfg["observabilityMesh"] is None
+
+
+def test_observability_gossip_backend_rejects_transport():
+    with pytest.raises(ConfigError, match="redundant with backend: gossip"):
+        _gossip(
+            "    - host: b:8443\n",
+            extra=_OBS_TRANSPORT,
+        )
+
+
+def test_observability_lease_requires_transport():
+    with pytest.raises(ConfigError, match="observability requires"):
+        _cluster(
+            "cluster:\n"
+            "  backend: kubernetes\n"
+            "  nodeName: node-a\n"
+            "  observability:\n    shareNodeStats: true\n"
+        )
+
+
+def test_observability_lease_builds_election_inert_mesh():
+    cfg = _cluster(
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  nodeName: node-a\n" + _OBS_TRANSPORT
+    )
+    assert cfg["backend"] == "kubernetes"
+    assert cfg["shareNodeStats"] is True
+    mesh = cfg["observabilityMesh"]
+    assert mesh is not None
+    assert mesh["backend"] == "gossip"
+    # the overlay never elects (electLeader forced false)
+    assert mesh["electLeader"] is False
+    assert mesh["listen"] == "0.0.0.0:8140"
+    assert [p["host"] for p in mesh["peers"]] == ["b:8140"]
+
+
+def test_observability_lease_share_node_stats_opt_out():
+    cfg = _cluster(
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  nodeName: node-a\n"
+        "  observability:\n"
+        "    shareNodeStats: false\n"
+        "    listen: '0.0.0.0:8140'\n"
+        "    tls:\n      ca: /oca\n      cert: /ocert\n      key: /okey\n"
+        "    peers:\n      - host: b:8140\n"
+    )
+    # the overlay mesh is still stood up (for fleet job summaries) but node
+    # stats are not shared
+    assert cfg["shareNodeStats"] is False
+    assert cfg["observabilityMesh"] is not None
+
+
 # --- kubernetes -----------------------------------------------------------
 
 _K8S = "cluster:\n  backend: kubernetes\n  nodeName: node-a\n"

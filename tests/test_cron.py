@@ -1113,6 +1113,94 @@ def test_record_run_caps_history():
     assert cron.last_run["alpha"].exit_code == limit + 9
 
 
+class _FakeMesh:
+    """A stand-in leadership backend capturing provider installs + lifecycle."""
+
+    def __init__(self, config):
+        self.config = config
+        self.job_summaries_provider = None
+        self.node_stats_provider = None
+        self.started = False
+        self.stopped = False
+
+    def set_job_summaries_provider(self, p):
+        self.job_summaries_provider = p
+
+    def set_node_stats_provider(self, p):
+        self.node_stats_provider = p
+
+    def tls_files_changed(self):
+        return False
+
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+
+def test_fleet_backend_prefers_observability_mesh():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.cluster_manager = object()
+    assert cron._fleet_backend() is cron.cluster_manager
+    mesh = object()
+    cron.observability_mesh = mesh
+    assert cron._fleet_backend() is mesh
+
+
+@pytest.mark.asyncio
+async def test_start_stop_observability_builds_mesh_and_installs_providers(
+    monkeypatch,
+):
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    built = []
+    monkeypatch.setattr(
+        yacron2.cron,
+        "make_backend",
+        lambda cfg, jsid: built.append(_FakeMesh(cfg)) or built[-1],
+    )
+    cluster_config = {
+        "observabilityMesh": {"backend": "gossip", "marker": 1},
+        "shareNodeStats": True,
+    }
+    await cron.start_stop_observability(cluster_config)
+    assert cron.observability_mesh is built[0]
+    assert built[0].started is True
+    # both fleet providers installed on the overlay mesh
+    assert built[0].job_summaries_provider is cron.fleet_job_summaries
+    assert built[0].node_stats_provider is cron.node_resource_snapshot
+    # a reload dropping the observability section tears the mesh down
+    await cron.start_stop_observability({"observabilityMesh": None})
+    assert cron.observability_mesh is None
+    assert built[0].stopped is True
+
+
+@pytest.mark.asyncio
+async def test_start_stop_observability_respects_share_opt_out(monkeypatch):
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    made = []
+    monkeypatch.setattr(
+        yacron2.cron,
+        "make_backend",
+        lambda cfg, jsid: made.append(_FakeMesh(cfg)) or made[-1],
+    )
+    # mesh configured (for job summaries) but shareNodeStats off
+    await cron.start_stop_observability(
+        {"observabilityMesh": {"backend": "gossip"}, "shareNodeStats": False}
+    )
+    assert made[0].job_summaries_provider is cron.fleet_job_summaries
+    assert made[0].node_stats_provider is None  # node stats NOT shared
+
+
+@pytest.mark.asyncio
+async def test_start_stop_observability_none_is_noop():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    await cron.start_stop_observability(None)
+    assert cron.observability_mesh is None
+    await cron.start_stop_observability({"observabilityMesh": None})
+    assert cron.observability_mesh is None
+
+
 @pytest.mark.asyncio
 async def test_web_get_node_returns_resources():
     import json

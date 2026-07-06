@@ -1298,7 +1298,7 @@ class Cron:
         # this node's own live CPU/memory, sampled fresh: always shown in the
         # cluster panel (it is local and free), independent of whether peers
         # share theirs. Peer load rides view_dict's per-peer node_stats (only
-        # populated when the cluster shares node stats via cluster.observability).
+        # populated when the cluster shares node stats -- observability).
         payload["node_stats"] = self.node_resource_snapshot()
         return web.json_response(payload, headers=headers)
 
@@ -2423,7 +2423,7 @@ class Cron:
                 # shows THIS node's own load in its /cluster + /fleet self
                 # readouts (local, free); `share` gates whether we ALSO gossip
                 # it to peers -- on only when observability is enabled with
-                # backend: gossip (no separate overlay mesh; the lease + overlay
+                # backend: gossip (no separate overlay mesh; the lease+overlay
                 # case installs on the overlay in start_stop_observability). A
                 # no-op on the lease backends (their seam default ignores it).
                 manager.set_node_stats_provider(

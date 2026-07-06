@@ -1236,10 +1236,10 @@ class ClusterManager(LeadershipBackend):
         ] = None
         # our own whole-node CPU/memory provider (the scheduler's
         # NodeResourceSampler.snapshot). Installing it makes THIS node's own
-        # load available locally (the /cluster + /fleet self readouts) even when
-        # not shared; _share_node_stats separately gates whether we ADVERTISE it
-        # to peers in the /peer payload -- so a cluster that only wants the local
-        # readout adds no gossip traffic and keeps the /peer bytes (and 304s).
+        # load available locally (the /cluster + /fleet self readouts) even
+        # when not shared; _share_node_stats separately gates whether we
+        # ADVERTISE it to peers in the /peer payload -- so a cluster that only
+        # wants the local readout adds no gossip traffic (and keeps its 304s).
         self._node_stats_provider: Optional[
             Callable[[], Optional[Dict[str, Any]]]
         ] = None
@@ -1277,8 +1277,8 @@ class ClusterManager(LeadershipBackend):
         """Our node stats to put in the outgoing /peer body, or ``None``.
 
         ``None`` unless node-stats sharing is on (``_share_node_stats``): the
-        key is then omitted from the /peer payload so a cluster not sharing node
-        stats gossips exactly the same bytes as before (and keeps its 304s).
+        key is then omitted from the /peer payload so a cluster not sharing
+        node stats gossips exactly the same bytes as before (and keeps 304s).
         """
         if not self._share_node_stats:
             return None

@@ -1207,6 +1207,29 @@ async def test_start_stop_observability_none_is_noop():
 
 
 @pytest.mark.asyncio
+async def test_web_get_cluster_injects_local_node_stats():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class FakeMgr:
+        def view_dict(self):
+            return {"backend": "gossip", "peers": []}
+
+    cron.cluster_manager = FakeMgr()
+
+    class Req:
+        pass
+
+    resp = await cron._web_get_cluster(Req())
+    data = json.loads(resp.text)
+    # this node's own live load is always injected (local, free)
+    assert data["node_stats"] is not None
+    assert "cpu_percent" in data["node_stats"]
+
+
+@pytest.mark.asyncio
 async def test_web_get_node_returns_resources():
     import json
 

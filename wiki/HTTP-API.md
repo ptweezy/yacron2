@@ -175,9 +175,18 @@ whether any conflict is pausing `Leader` jobs (`conflict`, the umbrella flag),
 whether this node is `quorate`, the elected `leader`
 (`null` when this node is not quorate, and always `null` in `spread` mode) and
 `is_leader` (always `false` in `spread` mode), and a `peers` array (each with
-`host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`, and
-`mismatch_streak`). Under `distribution: spread`, per-job owners instead appear
-as a `clusterOwner` field on each leader-gated job in `GET /jobs`.
+`host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`,
+`mismatch_streak`, and `node_stats`). Under `distribution: spread`, per-job
+owners instead appear as a `clusterOwner` field on each leader-gated job in
+`GET /jobs`.
+
+A top-level `node_stats` object carries **this** node's own live CPU/memory
+(the same shape as [`GET /node`](#get-node)'s `resources`), always present (it
+is local and free). Each peer's `node_stats` is its last-shared load — `null`
+unless the cluster shares node stats via
+[`cluster.observability`](Configuration-Reference#observability-overlay). The
+dashboard's cluster panel renders this node's load in the summary and a per-peer
+**Load** column when peers share.
 
 The umbrella `conflict` flag is set by any of three triggers, each with its own
 detail list, and all three stand `Leader` jobs down: a duplicate `nodeName` (the

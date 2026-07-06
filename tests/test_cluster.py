@@ -374,6 +374,7 @@ def test_to_dict_shape():
         "last_seen",
         "last_error",
         "mismatch_streak",
+        "node_stats",
     }
     # instance_id is an internal liveness token, deliberately not surfaced
     assert "instance_id" not in d

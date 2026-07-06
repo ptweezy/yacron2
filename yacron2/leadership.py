@@ -251,8 +251,8 @@ class LeadershipBackend(abc.ABC):
         backend overrides this: installing it makes this node's own load
         available in its ``/cluster`` and ``/fleet`` self readouts, while
         ``share`` gates whether it is also gossiped to peers (so a cluster can
-        show its local load without adding any gossip traffic). Default no-op: a
-        lease backend has no node-to-node channel, so there is nothing to
+        show its local load without adding any gossip traffic). Default no-op:
+        a lease backend has no node-to-node channel, so there is nothing to
         install (a lease cluster shares node load through a separate gossip
         observability overlay instead -- see ``cluster.observability``).
         """

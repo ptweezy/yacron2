@@ -1114,7 +1114,7 @@ def test_record_run_caps_history():
 
 
 class _FakeMesh:
-    """A stand-in leadership backend capturing provider installs + lifecycle."""
+    """A stand-in leadership backend capturing provider installs/lifecycle."""
 
     def __init__(self, config):
         self.config = config
@@ -1167,8 +1167,8 @@ async def test_start_stop_observability_builds_mesh_and_installs_providers(
     assert cron.observability_mesh is built[0]
     assert built[0].started is True
     # both fleet providers installed on the overlay mesh
-    assert built[0].job_summaries_provider is cron.fleet_job_summaries
-    assert built[0].node_stats_provider is cron.node_resource_snapshot
+    assert built[0].job_summaries_provider == cron.fleet_job_summaries
+    assert built[0].node_stats_provider == cron.node_resource_snapshot
     # a reload dropping the observability section tears the mesh down
     await cron.start_stop_observability({"observabilityMesh": None})
     assert cron.observability_mesh is None
@@ -1188,7 +1188,7 @@ async def test_start_stop_observability_respects_share_opt_out(monkeypatch):
     await cron.start_stop_observability(
         {"observabilityMesh": {"backend": "gossip"}, "shareNodeStats": False}
     )
-    assert made[0].job_summaries_provider is cron.fleet_job_summaries
+    assert made[0].job_summaries_provider == cron.fleet_job_summaries
     assert made[0].node_stats_provider is None  # node stats NOT shared
 
 

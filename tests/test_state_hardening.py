@@ -21,6 +21,10 @@ regresses, the matching test fails.  Covered invariants:
 * garbage collection reclaims lease files (and ``delete_document`` its
   ``.lock`` side-file) only once provably dead past the whole grace
   window, with the fence reset unobservable to any stale holder;
+* stream/document-namespace enumeration reports hidden (unnameable)
+  entries, the orphan-blob sweep's age guard keeps young payloads, and a
+  dedupe re-put re-arms that guard -- the KEEP biases the blob sweep
+  builds on;
 * the document delete path rides out Windows sharing violations like the
   replace-write path does.
 
@@ -543,6 +547,23 @@ async def test_sweep_orphan_blobs_keeps_young_unreferenced_blobs(tmp_path):
     # ...the real pass reclaims it.
     assert await backend.sweep_orphan_blobs(set(), 3600.0) == 1
     assert await backend.get_blob(digest) is None
+
+
+async def test_put_blob_dedupe_rearms_the_sweep_age_guard(tmp_path):
+    # a re-put of identical content dedupes to the EXISTING blob file; if
+    # that file kept its old mtime, a sweep racing the re-putter's
+    # record append would read the blob as an aged orphan (its previous
+    # references may be mid-deletion) and delete a payload about to be
+    # referenced again.  The dedupe hit must refresh the mtime, re-arming
+    # the age guard.
+    backend = _backend(tmp_path)
+    await backend.start()
+    digest = await backend.put_blob(b"republished-content")
+    old = time.time() - 7200.0
+    os.utime(backend._blob_path(digest), (old, old))
+    assert await backend.put_blob(b"republished-content") == digest
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 0
+    assert await backend.get_blob(digest) == b"republished-content"
 
 
 # --- 12: GC reclaims lease files only once dead past the whole grace --------

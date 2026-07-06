@@ -624,13 +624,12 @@ def add_job_commands(sub: Any) -> None:
             # invocation.
             p.add_argument(
                 "run_command",
-                # nargs="*", NOT argparse.REMAINDER: REMAINDER swallows any
-                # option appearing after NAME into the command list, so the
-                # documented `lock run NAME --wait --timeout 300 -- cmd` would
-                # silently leave --wait/--timeout/--ttl at their defaults (the
-                # lock never blocks) and then try to exec "--wait". With "*",
-                # argparse parses our own flags normally and takes the wrapped
-                # command from after the "--" separator.
+                # The command after "--" is split off BEFORE argparse, in
+                # __main__.main_loop (portable across Python versions; see
+                # the note there -- argparse's own "--"/trailing handling is
+                # inconsistent before 3.13, and REMAINDER would swallow our
+                # own --wait/--timeout/--ttl). This positional only holds the
+                # default [] and a command given WITHOUT a "--" separator.
                 nargs="*",
                 metavar="command",
                 help="the command to run while holding the lock (after --)",

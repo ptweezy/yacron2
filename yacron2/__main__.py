@@ -133,7 +133,27 @@ def main_loop(loop):
     )
     parser.add_argument("--version", default=False, action="store_true")
     _add_state_subcommands(parser)
-    args = parser.parse_args()
+    # `lock run NAME [flags] -- CMD...` carries an arbitrary trailing command.
+    # argparse cannot capture it portably: nargs=REMAINDER swallows our own
+    # flags into the command list, while nargs="*" only picks up the tokens
+    # after "--" on Python >= 3.13 (older argparse reports them as
+    # "unrecognized arguments"). So split the command off at the first "--"
+    # ourselves -- identical on every supported Python -- and hand argparse
+    # only the head, where our flags and NAME parse cleanly everywhere.
+    argv = sys.argv[1:]
+    trailing_command = None
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, trailing_command = argv[:cut], argv[cut + 1 :]
+    args = parser.parse_args(argv)
+    if trailing_command is not None:
+        if (
+            getattr(args, "command", None) == "lock"
+            and getattr(args, "lock_command", None) == "run"
+        ):
+            args.run_command = trailing_command
+        else:
+            parser.error("`--` is only valid before a `lock run` command")
 
     logging.basicConfig(level=getattr(logging, args.log_level))
     # logging.getLogger("asyncio").setLevel(logging.WARNING)

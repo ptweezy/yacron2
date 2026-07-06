@@ -460,12 +460,13 @@ def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
     _seed_store(store)
 
     # seed a manifest OLDER than the grace window so the history-depth
-    # guard is satisfied (grace is the default 7 days)
+    # guard is satisfied (grace is the default 7 days). Manifests are
+    # per-host streams under "manifests/<host>" (see MANIFEST_STREAM_PREFIX).
     async def seed_manifest():
         backend = _backend(store)
         old = datetime.datetime.now(_UTC) - datetime.timedelta(days=8)
         await backend.append_record(
-            "manifests",
+            "manifests/h",
             {"jobSetId": "v1:x", "host": "h", "jobs": [], "at": old.isoformat()},
         )
 

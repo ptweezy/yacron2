@@ -328,3 +328,85 @@ def exclusive_file_lock(
             yield
         finally:
             fcntl.flock(fileno, fcntl.LOCK_UN)
+
+
+def fsync_directory(path: str) -> None:
+    """Best-effort flush of a directory's own durability to disk.
+
+    A file's own fsync only guarantees ITS bytes are durable; the directory
+    ENTRY that makes the file (or a freshly created subdirectory) reachable
+    from its parent is separate metadata, and needs its own flush -- without
+    it a power loss can drop a perfectly-fsynced file because the directory
+    forgot it was ever created.  Used by
+    :class:`yacron2.state.FilesystemStateBackend` after an atomic rename, a
+    document delete, and when a stream/namespace/blob-shard directory is
+    freshly created.
+
+    POSIX opens the directory like any other file handle and fsyncs it. The
+    ``os`` module has no equivalent for Windows, so this reaches for the
+    underlying Win32 calls via ctypes: ``CreateFileW`` with
+    ``FILE_FLAG_BACKUP_SEMANTICS`` to obtain a directory handle at all
+    (``GENERIC_WRITE`` access -- a directory handle opened read-only is
+    accepted but ``FlushFileBuffers`` on it fails with ACCESS_DENIED), then
+    ``FlushFileBuffers`` on it.  Best-effort either way: any failure (a
+    filesystem that does not support it, a permissions quirk, a path that
+    vanished) is swallowed, because the data this guards is still correct
+    without it, just not crash-durable for this one write.
+    """
+    if IS_WINDOWS:  # pragma: no cover - Windows-only path
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            GENERIC_WRITE = 0x40000000
+            FILE_SHARE_READ = 0x00000001
+            FILE_SHARE_WRITE = 0x00000002
+            FILE_SHARE_DELETE = 0x00000004
+            OPEN_EXISTING = 3
+            FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            kernel32.FlushFileBuffers.restype = wintypes.BOOL
+            kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+            handle = kernel32.CreateFileW(
+                path,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+            if handle in (0, INVALID_HANDLE_VALUE):
+                return
+            try:
+                kernel32.FlushFileBuffers(handle)
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - best-effort; never raise
+            return
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)

@@ -157,18 +157,34 @@ REBOOT_STREAM_KEEP = 32
 # boots are further apart than this in practice; where an exact boot_id
 # exists (Linux) it is used instead and this never applies.
 BOOT_TIME_TOLERANCE = 60.0
-# Stream of per-node job manifests: each node periodically records the job
-# names its loaded config defines. The union of RECENT manifests (any node,
-# any job set, same deploymentId) is what anchors cross-jobset garbage
-# collection: a job stream is garbage only when nobody has claimed its name
-# for state.gcGraceSeconds.
-MANIFEST_STREAM = "manifests"
-# Manifest records retained (count-pruned, shared across every node writing
-# to the store). Sized so the count prune cannot shrink the anchor's reach
-# below the grace window for realistic fleets: at 4 manifests/node/day, 512
-# records span 7 days for ~18 nodes (and the GC pass additionally refuses to
-# run until the retained history provably covers one full grace window).
+# Prefix for the per-HOST job manifest streams: each node periodically
+# records the job names its loaded config defines to its OWN stream
+# (``manifests/<host>``), mirroring COUNTER_STREAM_PREFIX. The union of
+# RECENT manifests (every host's stream, same deploymentId) is what anchors
+# cross-jobset garbage collection: a job stream is garbage only when nobody
+# has claimed its name for state.gcGraceSeconds. Per-host (rather than one
+# stream shared and count-pruned across the whole fleet) so the retained
+# history a node can prove absence over never shrinks as the fleet grows --
+# a single shared stream's count-based prune was reached by write VOLUME
+# (nodes x writes/day), so past a fleet-size threshold the retained span fell
+# under gcGraceSeconds and GC deferred forever, growing every removed job's
+# streams without bound.
+MANIFEST_STREAM_PREFIX = "manifests/"
+# Manifest records retained per HOST (count-pruned; independent of fleet
+# size). At 4 manifests/node/day, 512 records span ~128 days for any single
+# host, comfortably outliving any realistic gcGraceSeconds regardless of how
+# many other nodes share the store. (The GC pass additionally refuses to run
+# until the retained history -- across every host's stream -- provably
+# covers one full grace window.) A host that stops writing (scaled down,
+# renamed) leaves its manifest stream at whatever size it last reached; that
+# stream is then swept by the normal collect_garbage prefix/keep-set path
+# once it ages past grace, exactly like an abandoned counters/<host> stream.
 MANIFEST_STREAM_KEEP = 512
+# Safety cap on distinct per-host manifest streams read in one GC pass (a
+# pathological fleet with churning, never-reused host identities could in
+# principle accumulate more members than is worth reading every pass); a
+# real deployment is nowhere near this. Truncation is logged, never silent.
+MANIFEST_HOSTS_CAP = 2000
 # How often each node re-records its manifest (also written on every backend
 # start), and how often the GC pass runs. Loop-clock gated, per process.
 STATE_MANIFEST_INTERVAL = 21600.0
@@ -2496,14 +2512,21 @@ class Cron:
                 self._retry_claim_scan()
             )
 
+    def _manifest_stream(self) -> str:
+        return MANIFEST_STREAM_PREFIX + self._state_host
+
     async def _persist_manifest(self) -> None:
-        """Record this node's loaded job set in the shared manifest stream.
+        """Record this node's loaded job set to its OWN manifest stream.
 
         The anchor for cross-jobset garbage collection: a job's durable
-        streams are garbage only when NO recent manifest -- from any node,
-        running any job set, under this deploymentId -- references its name.
-        Every node sharing the store contributes one, so a fleet whose
-        members run different job sets never collects each other's state.
+        streams are garbage only when NO recent manifest -- from any host's
+        stream, running any job set, under this deploymentId -- references
+        its name. Every node sharing the store contributes its own
+        ``manifests/<host>`` stream (see :data:`MANIFEST_STREAM_PREFIX`), so a
+        fleet whose members run different job sets never collects each
+        other's state, and the retained history never shrinks as the fleet
+        grows (each host's own count-based prune is independent of every
+        other host's write volume).
         """
         backend = self.state_backend
         if backend is None:
@@ -2514,11 +2537,10 @@ class Cron:
             "jobs": sorted(self.cron_jobs),
             "at": get_now(datetime.timezone.utc).isoformat(),
         }
+        stream = self._manifest_stream()
         try:
-            await backend.append_record(MANIFEST_STREAM, record)
-            await backend.prune_records(
-                MANIFEST_STREAM, keep=MANIFEST_STREAM_KEEP
-            )
+            await backend.append_record(stream, record)
+            await backend.prune_records(stream, keep=MANIFEST_STREAM_KEEP)
         except Exception as ex:  # noqa: BLE001 - best-effort; log, survive
             self.metrics.state_write_dropped("manifest")
             logger.warning("state: failed to record the job manifest: %s", ex)
@@ -2526,31 +2548,63 @@ class Cron:
     async def _collect_state_garbage(self) -> None:
         """One automatic garbage-collection pass (see state.gcGraceSeconds).
 
-        Builds the keep-set from the union of recent manifests (bounded
-        read) plus this node's own loaded config -- so GC still cannot eat
-        live jobs even when the manifest stream is unreadable or empty --
-        and hands the deletion to the backend.  Every failure degrades to
-        "collect nothing this pass".
+        Builds the keep-set from the union of recent manifests -- read across
+        every host's own ``manifests/<host>`` stream, bounded per host -- plus
+        this node's own loaded config, so GC still cannot eat live jobs even
+        when a manifest stream is unreadable or empty, and hands the deletion
+        to the backend.  Every failure degrades to "collect nothing this
+        pass".
         """
         backend = self.state_backend
         grace = self._state_gc_grace
         if backend is None or grace <= 0:
             return
         try:
-            manifests = await asyncio.wait_for(
-                backend.list_records(
-                    MANIFEST_STREAM,
-                    limit=MANIFEST_STREAM_KEEP,
-                    newest_first=True,
-                ),
+            stream_names = await asyncio.wait_for(
+                backend.list_stream_names(MANIFEST_STREAM_PREFIX),
                 timeout=STATE_OP_TIMEOUT,
             )
         except asyncio.CancelledError:
             raise
         except Exception as ex:  # noqa: BLE001 - degrade, never crash
             logger.warning(
+                "state: skipping garbage collection: cannot enumerate the "
+                "manifest streams (%s)",
+                ex,
+            )
+            return
+        # this node's own stream must always be included even if the
+        # enumeration above raced its very first write.
+        stream_names = sorted(set(stream_names) | {self._manifest_stream()})
+        if len(stream_names) > MANIFEST_HOSTS_CAP:
+            logger.warning(
+                "state: %d manifest streams found, reading only the first "
+                "%d this pass (a churning fleet with never-reused host "
+                "identities?); the rest are considered this GC pass only "
+                "once a run drops the count back under the cap",
+                len(stream_names),
+                MANIFEST_HOSTS_CAP,
+            )
+            stream_names = stream_names[:MANIFEST_HOSTS_CAP]
+        manifests: List[Dict[str, Any]] = []
+        try:
+            for name in stream_names:
+                manifests.extend(
+                    await asyncio.wait_for(
+                        backend.list_records(
+                            name,
+                            limit=MANIFEST_STREAM_KEEP,
+                            newest_first=True,
+                        ),
+                        timeout=STATE_OP_TIMEOUT,
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
                 "state: skipping garbage collection: cannot read the "
-                "manifest stream (%s)",
+                "manifest streams (%s)",
                 ex,
             )
             return
@@ -2594,6 +2648,12 @@ class Cron:
             COUNTER_STREAM_PREFIX: hosts,
             INFLIGHT_STREAM_PREFIX: names,
             SLOT_STREAM_PREFIX: names,
+            # a host that stops writing (scaled down, renamed) leaves its own
+            # manifests/<host> stream behind forever otherwise; sweeping it
+            # once it is not among the currently-seen hosts and has aged past
+            # grace mirrors exactly how an abandoned counters/<host> stream
+            # is collected above.
+            MANIFEST_STREAM_PREFIX: hosts,
         }
         try:
             # bounded: a worker thread wedged in a dead-mount syscall must

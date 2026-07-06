@@ -136,3 +136,18 @@ def test_pid_alive_own_and_bogus_pid():
     assert platform.pid_alive(os.getpid()) is True
     assert platform.pid_alive(2**22 + 12345) in (False, None)
     assert platform.pid_alive(0) is None
+
+
+def test_fsync_directory_on_existing_and_nested_dir(tmp_path):
+    # must not raise for a plain existing dir, nor for a directory nested
+    # several levels deep and freshly created in this same test (the case
+    # that matters: a stream/namespace dir a state write just makedirs'd).
+    platform.fsync_directory(str(tmp_path))
+    nested = tmp_path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    platform.fsync_directory(str(nested))
+
+
+def test_fsync_directory_swallows_missing_path(tmp_path):
+    # best-effort: a vanished/never-existed path must not raise.
+    platform.fsync_directory(str(tmp_path / "does" / "not" / "exist"))

@@ -377,6 +377,56 @@ async def test_stats_reports_worker_lane_occupancy(tmp_path):
     await backend.stop()
 
 
+# --- directory-entry durability -------------------------------------------
+
+
+async def test_append_to_fresh_stream_fsyncs_new_directory_chain(
+    tmp_path, monkeypatch
+):
+    # the very first append into a stream that never existed before must
+    # makedirs it durably: without flushing each newly-created level's
+    # PARENT, a power loss right after could drop the whole new subtree
+    # (parent and all), silently taking the just-fsynced record with it.
+    flushed = []
+    monkeypatch.setattr(
+        state, "fsync_directory", lambda p: flushed.append(p)
+    )
+    backend = _backend(tmp_path)
+    await backend.start()
+    flushed.clear()
+    await backend.append_record("brand-new-stream", {"x": 1})
+    stream_dir = backend._stream_dir("brand-new-stream")
+    # the stream dir's own PARENT (records/) must have been flushed, so the
+    # newly-created stream directory's entry is durable.
+    assert os.path.dirname(stream_dir) in flushed
+    # and a second append into the now-existing stream does not re-walk/
+    # re-flush the directory chain (it already exists).
+    flushed.clear()
+    await backend.append_record("brand-new-stream", {"x": 2})
+    assert os.path.dirname(stream_dir) not in flushed
+
+
+async def test_document_delete_fsyncs_namespace_directory(
+    tmp_path, monkeypatch
+):
+    # without this, an unlinked idempotency/KV document can RESURRECT after
+    # a power loss (the unlink itself was never made durable), silently
+    # undoing the delete and letting guarded once-only work run again.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "k", lambda c: ({"v": 1}, None))
+    flushed = []
+    monkeypatch.setattr(
+        state, "fsync_directory", lambda p: flushed.append(p)
+    )
+    await backend.mutate_document(
+        "ns", "k", lambda c: (state.DOC_DELETE, None)
+    )
+    _lock_path, doc_path = backend._doc_paths("ns", "k")
+    assert os.path.dirname(doc_path) in flushed
+    assert await backend.read_document("ns", "k") is None
+
+
 # --- corrupt-record quarantine -------------------------------------------
 
 

@@ -71,7 +71,7 @@ from typing import (
 
 from yacron2 import _json
 from yacron2.config import ConfigError, StateConfig
-from yacron2.platform import IS_WINDOWS, exclusive_file_lock
+from yacron2.platform import IS_WINDOWS, exclusive_file_lock, fsync_directory
 
 _T = TypeVar("_T")
 
@@ -522,6 +522,19 @@ class StateBackend(abc.ABC):
         newest_first: bool = False,
     ) -> List[Dict[str, Any]]:
         """Read back a stream's records (corrupt ones quarantined)."""
+
+    @abc.abstractmethod
+    async def list_stream_names(self, prefix: str) -> List[str]:
+        """Logical stream names currently on disk starting with ``prefix``.
+
+        For a *family* of per-host/per-scope streams sharing a prefix (e.g.
+        ``"manifests/"`` -- one stream per host, see
+        :data:`yacron2.cron.MANIFEST_STREAM_PREFIX`) a caller that must read
+        every member's own records (not just check keep-set membership, which
+        :meth:`collect_garbage`'s ``keep`` mapping already covers) needs to
+        first discover which members currently exist.  Best-effort: an
+        unreadable store returns ``[]`` rather than raising.
+        """
 
     @abc.abstractmethod
     async def derive_max(self, stream: str, field: str) -> Optional[Any]:
@@ -983,9 +996,7 @@ class FilesystemStateBackend(StateBackend):
             DOCS_DIR,
             BLOBS_DIR,
         ):
-            os.makedirs(
-                os.path.join(self.base, sub), mode=0o700, exist_ok=True
-            )
+            self._makedirs_durable(os.path.join(self.base, sub))
         self._topology = self._resolve_topology()
         # Fail start() loudly if the store is not actually writable (a bad
         # mount, wrong permissions) rather than silently swallowing every later
@@ -1115,8 +1126,8 @@ class FilesystemStateBackend(StateBackend):
 
         Data files are created 0o600 (narrowed further by the umask): records
         and archived output can carry job output, which is exactly where
-        secrets live.  After the rename the parent directory is fsync'd (POSIX
-        only; a directory cannot be opened on Windows), because without it the
+        secrets live.  After the rename the parent directory is flushed (see
+        :func:`yacron2.platform.fsync_directory`), because without it the
         rename itself is not crash-durable -- a power loss could silently
         drop an acknowledged record, regress the derived watermark, and
         double-run jobs on the next boot.
@@ -1134,20 +1145,45 @@ class FilesystemStateBackend(StateBackend):
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
             raise
-        if not IS_WINDOWS:
-            with contextlib.suppress(OSError):
-                dfd = os.open(os.path.dirname(dest), os.O_RDONLY)
-                try:
-                    os.fsync(dfd)
-                finally:
-                    os.close(dfd)
+        fsync_directory(os.path.dirname(dest))
+
+    def _makedirs_durable(self, path: str) -> None:
+        """``os.makedirs(path, exist_ok=True)``, but crash-durably.
+
+        A freshly created stream/namespace/blob-shard directory can have
+        every file written into it individually fsynced, yet the directory
+        ENTRY that makes the subtree reachable from its parent was never
+        itself made durable -- a power loss right after can drop the whole
+        newly-created subtree (parent and all), taking every acknowledged
+        record inside it with it.  Walks up from ``path`` to the first
+        already-existing ancestor *before* creating anything, so exactly the
+        newly-created levels are known; after ``makedirs``, flushes each
+        newly-created directory's PARENT (the parent is where the "this
+        subdirectory exists" entry actually lives) -- which is exactly the
+        pre-existing ancestor plus every newly-created level except the
+        leaf itself (the leaf's own directory entry is covered by whichever
+        write follows into it, e.g. :meth:`_atomic_write`).
+        """
+        if os.path.isdir(path):
+            return
+        created = []
+        cur = path
+        while cur and not os.path.isdir(cur):
+            created.append(cur)
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        for level in created:
+            fsync_directory(os.path.dirname(level))
 
     async def append_record(self, stream: str, data: Dict[str, Any]) -> str:
         return await self._call("append", self._append_sync, stream, data)
 
     def _append_sync(self, stream: str, data: Dict[str, Any]) -> str:
         stream_dir = self._stream_dir(stream)
-        os.makedirs(stream_dir, mode=0o700, exist_ok=True)
+        self._makedirs_durable(stream_dir)
         # Filename sort key is the write-time epoch (zero-padded so it sorts
         # lexicographically == chronologically), then instance+seq for
         # uniqueness.  The record's own logical timestamp lives in ``data`` and
@@ -1282,6 +1318,29 @@ class FilesystemStateBackend(StateBackend):
             "list", self._list_sync, stream, limit, newest_first
         )
 
+    async def list_stream_names(self, prefix: str) -> List[str]:
+        return await self._call(
+            "list-stream-names", self._list_stream_names_sync, prefix
+        )
+
+    def _list_stream_names_sync(self, prefix: str) -> List[str]:
+        from urllib.parse import unquote
+
+        records_root = os.path.join(self.base, RECORDS_DIR)
+        token_prefix = _fs_safe_fragment(prefix)
+        try:
+            tokens = os.listdir(records_root)
+        except OSError:
+            return []
+        names: List[str] = []
+        for token in tokens:
+            if not token.startswith(token_prefix):
+                continue
+            if not os.path.isdir(os.path.join(records_root, token)):
+                continue
+            names.append(unquote(token, errors="replace"))
+        return sorted(names)
+
     def _list_sync(
         self,
         stream: str,
@@ -1368,7 +1427,7 @@ class FilesystemStateBackend(StateBackend):
         out from under a lock taken on it; locking a stable side-file avoids
         that entirely.
         """
-        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+        self._makedirs_durable(os.path.dirname(lock_path))
         fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             # msvcrt.locking needs a byte present to lock; guarantee one.
@@ -1647,7 +1706,7 @@ class FilesystemStateBackend(StateBackend):
         lock_path, doc_path = self._doc_paths(namespace, key)
         # the lock file's directory is the namespace dir, created here so the
         # very first write to a fresh namespace has somewhere to land.
-        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+        self._makedirs_durable(os.path.dirname(lock_path))
         with self._locked(lock_path):
             current = self._read_doc_file(doc_path, strict=True)
             new_body, result = transform(current)
@@ -1656,6 +1715,11 @@ class FilesystemStateBackend(StateBackend):
             if new_body is DOC_DELETE:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(doc_path)
+                    # without this, a released idempotency key or a deleted
+                    # KV entry can RESURRECT after a power loss (the unlink
+                    # never became durable), silently un-doing the delete and
+                    # letting guarded once-only work run again.
+                    fsync_directory(os.path.dirname(doc_path))
                 return None, result
             if not isinstance(new_body, dict):
                 raise TypeError(
@@ -1706,7 +1770,7 @@ class FilesystemStateBackend(StateBackend):
         # exactly this payload, so skip the rewrite (and its fsync cost).
         if os.path.exists(path):
             return digest
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        self._makedirs_durable(os.path.dirname(path))
         # _atomic_write renames over any existing file; a concurrent writer of
         # the same content is therefore harmless (identical bytes either way).
         self._atomic_write(path, data)

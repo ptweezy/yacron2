@@ -247,12 +247,15 @@ async def _gc_async(
     from yacron2.cron import (
         CATCHUP_STREAM_PREFIX,
         COUNTER_STREAM_PREFIX,
+        INFLIGHT_STREAM_PREFIX,
         LOG_STREAM_PREFIX,
-        MANIFEST_STREAM,
+        MANIFEST_HOSTS_CAP,
         MANIFEST_STREAM_KEEP,
+        MANIFEST_STREAM_PREFIX,
         REBOOT_STREAM_PREFIX,
         RETRY_STREAM_PREFIX,
         RUN_STREAM_PREFIX,
+        SLOT_STREAM_PREFIX,
         _parse_iso_utc,
         get_now,
     )
@@ -263,9 +266,20 @@ async def _gc_async(
         raise ConfigError(
             "state.gcGraceSeconds is disabled (<= 0); nothing to collect"
         )
-    manifests = await backend.list_records(
-        MANIFEST_STREAM, limit=MANIFEST_STREAM_KEEP, newest_first=True
-    )
+    # read every host's own manifests/<host> stream (see cron.py's automatic
+    # pass): a single shared, count-pruned stream would have its retained
+    # history shrink as the fleet grows, eventually falling under grace and
+    # deferring GC forever.
+    stream_names = sorted(set(await backend.list_stream_names(
+        MANIFEST_STREAM_PREFIX
+    )))[:MANIFEST_HOSTS_CAP]
+    manifests: List[Dict[str, Any]] = []
+    for name in stream_names:
+        manifests.extend(
+            await backend.list_records(
+                name, limit=MANIFEST_STREAM_KEEP, newest_first=True
+            )
+        )
     now = get_now(datetime.timezone.utc)
     # same young-history deferral as the daemon's automatic pass: unless
     # the manifest history spans one full grace window, absence cannot be
@@ -298,6 +312,12 @@ async def _gc_async(
         RETRY_STREAM_PREFIX: names,
         REBOOT_STREAM_PREFIX: names,
         COUNTER_STREAM_PREFIX: hosts,
+        # without these two, a manual `yacron2 state gc` diverges from the
+        # daemon's automatic pass and never reclaims in-flight/slot-lease
+        # bookkeeping for a removed job.
+        INFLIGHT_STREAM_PREFIX: names,
+        SLOT_STREAM_PREFIX: names,
+        MANIFEST_STREAM_PREFIX: hosts,
     }
     return await backend.collect_garbage(
         keep=keep, grace=grace, dry_run=dry_run

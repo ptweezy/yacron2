@@ -939,7 +939,7 @@ async def test_state_periodic_writes_manifest(tmp_path):
     try:
         cron._state_periodic()
         await _drain_state_writes(cron)
-        rec = await _newest(cron, "manifests")
+        rec = await _newest(cron, cron._manifest_stream())
         assert rec is not None
         assert rec["jobs"] == ["j"]
         assert rec["host"] == cron._state_host
@@ -969,8 +969,9 @@ async def test_collect_state_garbage_keeps_manifested_jobs(
         monkeypatch.undo()
         # an OLD manifest satisfying the history-depth guard (the manifest
         # window must span the grace before anything may be deleted) ...
+        # manifests are per-host streams under "manifests/<host>".
         await backend.append_record(
-            "manifests",
+            "manifests/old-host",
             {
                 "jobSetId": "v1:old",
                 "host": "old-host",
@@ -982,7 +983,7 @@ async def test_collect_state_garbage_keeps_manifested_jobs(
         )
         # ... and a recent manifest from "another node" claiming 'manifested'
         await backend.append_record(
-            "manifests",
+            "manifests/other-host",
             {
                 "jobSetId": "v1:other",
                 "host": "other-host",
@@ -1000,6 +1001,70 @@ async def test_collect_state_garbage_keeps_manifested_jobs(
         assert streams["runs/orphan"] == []
         assert len(streams["runs/manifested"]) == 1  # manifest kept it
         assert len(streams["runs/j"]) == 1  # loaded config kept it
+    finally:
+        await _stop_state(cron)
+
+
+async def test_manifest_per_host_streams_survive_large_fleet(
+    tmp_path, monkeypatch
+):
+    # Regression test: every node used to write to ONE shared, count-pruned
+    # manifest stream, so a large fleet's write volume pushed the retained
+    # history's oldest record younger than gcGraceSeconds and automatic GC
+    # deferred FOREVER (removed jobs' streams then grew without bound).
+    # Per-host streams (manifests/<host>) mean one host's own retained span
+    # never shrinks no matter how many OTHER hosts join the fleet.
+    import yacron2.state as state_mod
+
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        await backend.append_record("runs/orphan", {"finished_at": "x"})
+        monkeypatch.undo()
+        # this node's own manifest satisfies the history-depth guard.
+        await backend.append_record(
+            cron._manifest_stream(),
+            {
+                "jobSetId": "v1:self",
+                "host": cron._state_host,
+                "jobs": [],
+                "at": (
+                    _now_utc() - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+            },
+        )
+        # a "fleet" of 50 OTHER hosts, each writing its OWN fresh manifest --
+        # exactly the write-volume scenario that starved the old shared
+        # stream's retained history once the fleet grew past a few nodes.
+        for i in range(50):
+            await backend.append_record(
+                "manifests/other-{}".format(i),
+                {
+                    "jobSetId": "v1:other",
+                    "host": "other-{}".format(i),
+                    "jobs": [],
+                    "at": _now_utc().isoformat(),
+                },
+            )
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        # GC proceeded rather than deferring: the orphan stream is gone.
+        assert await backend.list_records("runs/orphan") == []
+    finally:
+        await _stop_state(cron)
+
+
+async def test_list_stream_names_finds_prefix_members_only(tmp_path):
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        backend = cron.state_backend
+        await backend.append_record("manifests/a", {"x": 1})
+        await backend.append_record("manifests/b", {"x": 1})
+        await backend.append_record("runs/unrelated", {"x": 1})
+        names = await backend.list_stream_names("manifests/")
+        assert set(names) == {"manifests/a", "manifests/b"}
     finally:
         await _stop_state(cron)
 

@@ -2422,7 +2422,9 @@ class Cron:
                     cluster_config.get("shareNodeStats")
                     and cluster_config.get("observabilityMesh") is None
                 ):
-                    manager.set_node_stats_provider(self.node_resource_snapshot)
+                    manager.set_node_stats_provider(
+                        self.node_resource_snapshot
+                    )
                 await manager.start()
             except (
                 OSError,
@@ -2525,9 +2527,8 @@ class Cron:
                 # peers polling us back, and their first absorbed snapshot
                 # should already carry our jobs + load, not an empty block.
                 mgr.set_job_summaries_provider(self.fleet_job_summaries)
-                if (
-                    cluster_config is not None
-                    and cluster_config.get("shareNodeStats")
+                if cluster_config is not None and cluster_config.get(
+                    "shareNodeStats"
                 ):
                     mgr.set_node_stats_provider(self.node_resource_snapshot)
                 await mgr.start()
@@ -2541,9 +2542,7 @@ class Cron:
             ) as ex:
                 # same swallow-and-keep-running contract as the election
                 # backend: a bad overlay cert/listen/peer must not stop jobs.
-                logger.error(
-                    "cluster.observability: failed to start: %s", ex
-                )
+                logger.error("cluster.observability: failed to start: %s", ex)
                 return
             self.observability_mesh = mgr
 

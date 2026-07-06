@@ -11,6 +11,7 @@ import datetime
 import json
 import logging
 import os
+import threading
 
 import pytest
 
@@ -290,6 +291,90 @@ async def test_derive_max_still_skips_poison_record(tmp_path):
     with open(os.path.join(stream_dir, "00000-bad.json"), "w") as fobj:
         fobj.write("{not json")
     assert await backend.derive_max("s", "ts") == 5
+
+
+# --- worker lanes: lease isolation + wedge observability -----------------
+
+
+async def _wait_until(predicate, timeout=3.0):
+    """Poll ``predicate`` (generous window; never tightens on slow CI)."""
+    for _ in range(int(timeout / 0.01)):
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
+async def test_lease_lane_isolated_from_saturated_bulk_pool(tmp_path):
+    # H2/M27: lease/coordination ops run in a DEDICATED worker lane, so a bulk
+    # pool fully saturated by slow or wedged record writes cannot starve a
+    # lease renew below its TTL -- which would expire a live holder's lease and
+    # hand its fenced work to a standby (split-brain / double-fire).  Saturate
+    # every bulk slot with a wedged op and prove a lease op still gets through
+    # while a further bulk op does not.
+    backend = _backend(tmp_path)
+    await backend.start()
+    gate = threading.Event()
+
+    def _wedge():
+        gate.wait(timeout=30.0)  # hold the worker (and its bulk slot) hostage
+
+    bulk = [
+        asyncio.create_task(backend._call("bulk-wedge", _wedge))
+        for _ in range(state.BULK_CALL_SLOTS)
+    ]
+    try:
+        # every wedged op acquires its bulk slot: the bulk lane is now full.
+        assert await _wait_until(
+            lambda: backend.stats()["workers"]["bulk_inflight"]
+            == state.BULK_CALL_SLOTS
+        )
+        assert backend.stats()["workers"]["lease_inflight"] == 0
+        # a LEASE op still completes promptly on its own lane...
+        got = await asyncio.wait_for(
+            backend._call("lease-probe", lambda: "ok"), timeout=2.0
+        )
+        assert got == "ok"
+        # ...while a further BULK op is blocked (the bulk lane is exhausted).
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                backend._call("bulk-extra", lambda: "nope"), timeout=0.3
+            )
+    finally:
+        gate.set()
+        await asyncio.gather(*bulk)
+    await backend.stop()
+
+
+async def test_stats_reports_worker_lane_occupancy(tmp_path):
+    # M27: a wedged store must be VISIBLE.  The op counters only tick when an
+    # op FINISHES, so a hung mount reads as idle; the worker gauge shows the
+    # live occupancy, so a lane pinned at capacity is the "wedged" signal.
+    backend = _backend(tmp_path)
+    await backend.start()
+    w = backend.stats()["workers"]
+    assert w["bulk_capacity"] == state.BULK_CALL_SLOTS
+    assert w["lease_capacity"] == state.LEASE_CALL_SLOTS
+    assert w["bulk_inflight"] == 0 and w["lease_inflight"] == 0
+    assert w["bulk_peak"] >= 1  # start() itself ran a bulk op
+
+    gate = threading.Event()
+    task = asyncio.create_task(
+        backend._call("bulk-wedge", lambda: gate.wait(30.0))
+    )
+    try:
+        # the wedged op is observable as one in-flight bulk worker.
+        assert await _wait_until(
+            lambda: backend.stats()["workers"]["bulk_inflight"] == 1
+        )
+    finally:
+        gate.set()
+        await task
+    # and it returns to zero once the op drains.
+    assert await _wait_until(
+        lambda: backend.stats()["workers"]["bulk_inflight"] == 0
+    )
+    await backend.stop()
 
 
 # --- corrupt-record quarantine -------------------------------------------

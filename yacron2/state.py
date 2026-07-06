@@ -122,6 +122,19 @@ TMP_DIR = "tmp"
 DOCS_DIR = "docs"
 BLOBS_DIR = "blobs"
 
+# Worker-thread concurrency caps (see :meth:`FilesystemStateBackend._call`).
+# BULK bounds the high-volume record/document ops so a wedged mount plus a busy
+# scheduler cannot pile up an unbounded number of stuck daemon threads.  LEASE
+# is a SEPARATE, dedicated lane for the coordination ops (lease acquire /
+# renew / release / read): a burst of bulk record writes -- or bulk threads
+# wedged on a hung mount -- must never hold every slot and starve a lease renew
+# below its TTL, which would expire a live holder's lease and hand its fenced
+# work to a standby (split-brain / double-fire).  Leases are few and each op is
+# tiny, so a small isolated lane both prevents the starvation and still bounds
+# how many lease threads a fully-hung mount can strand.
+BULK_CALL_SLOTS = 16
+LEASE_CALL_SLOTS = 8
+
 # Sentinels a :meth:`StateBackend.mutate_document` transform returns *in place
 # of* a new document body: leave the document exactly as it was (KEEP), or
 # delete it (DELETE).  Anything else the transform returns is the new document
@@ -657,7 +670,8 @@ class StateBackend(abc.ABC):
 
     def stats(self) -> Dict[str, Any]:
         """Self-observability counters (op counts/errors/latency, lock
-        contention, throttling); ``{}`` for a backend with none."""
+        contention, throttling, worker-lane occupancy); ``{}`` for a backend
+        with none."""
         return {}
 
     def view_dict(self) -> Dict[str, Any]:
@@ -723,8 +737,12 @@ class FilesystemStateBackend(StateBackend):
         # a hung store abandonable, but without a cap a wedged mount plus a
         # busy scheduler would pile up one stuck thread per finished run;
         # excess calls queue on the semaphore (cheap pending tasks) instead.
-        # Created lazily so construction needs no running event loop.
+        # Created lazily so construction needs no running event loop.  The
+        # LEASE lane is deliberately SEPARATE (see BULK_CALL_SLOTS /
+        # LEASE_CALL_SLOTS) so bulk record traffic can never starve a lease
+        # renew below its TTL.
         self._call_slots: Optional[asyncio.Semaphore] = None
+        self._lease_slots: Optional[asyncio.Semaphore] = None
         # Optional request-rate control (state.maxOpsPerSecond): every op
         # takes a token before its worker thread is spawned, so a billing-
         # sensitive mount sees a bounded request rate. 0/absent -> off.
@@ -740,6 +758,16 @@ class FilesystemStateBackend(StateBackend):
         self._lock_wait_seconds = 0.0
         self._throttled_ops = 0
         self._throttle_wait_seconds = 0.0
+        # Live worker-thread gauges per lane, plus high-water marks.  A slot is
+        # held for a thread's whole lifetime, so a hung mount pins its lane's
+        # gauge at capacity -- exactly the "the store is wedged" signal that
+        # the completed-op counters above (which only tick when an op FINISHES)
+        # cannot show.  Touched only from the event-loop thread, but guarded by
+        # _stats_lock so stats() reads a consistent snapshot.
+        self._inflight_bulk = 0
+        self._inflight_lease = 0
+        self._inflight_peak_bulk = 0
+        self._inflight_peak_lease = 0
 
     # --- paths -----------------------------------------------------------
 
@@ -817,7 +845,8 @@ class FilesystemStateBackend(StateBackend):
         accumulated per label and surfaced via :meth:`stats`.
         """
         loop = asyncio.get_running_loop()
-        if self._rate_limit is not None and not op.startswith("lease-"):
+        is_lease = op.startswith("lease-")
+        if self._rate_limit is not None and not is_lease:
             # take the rate token BEFORE a worker slot, so a throttled op
             # queues as a cheap pending coroutine, not a held thread slot.
             # Lease operations BYPASS the bucket: they are tiny, and a
@@ -831,19 +860,33 @@ class FilesystemStateBackend(StateBackend):
                 with self._stats_lock:
                     self._throttled_ops += 1
                     self._throttle_wait_seconds += waited
-        if self._call_slots is None:
-            self._call_slots = asyncio.Semaphore(16)
-        slots = self._call_slots
+        # Pick the worker lane.  Lease/coordination ops get their OWN pool so a
+        # burst of bulk record writes -- or bulk threads wedged on a hung mount
+        # -- can never hold every slot and delay a lease renew past its TTL.
+        # Same split-brain hazard the rate-limiter bypass above guards against,
+        # extended to the worker-slot pool it left exposed: the bypass kept a
+        # renew off the throttle queue, but it still had to win one of the
+        # shared slots, which a bulk burst/wedge can exhaust.
+        if is_lease:
+            if self._lease_slots is None:
+                self._lease_slots = asyncio.Semaphore(LEASE_CALL_SLOTS)
+            slots = self._lease_slots
+        else:
+            if self._call_slots is None:
+                self._call_slots = asyncio.Semaphore(BULK_CALL_SLOTS)
+            slots = self._call_slots
         # The slot is held for the THREAD's lifetime, released from its
         # completion callback -- not scoped to this await, which a wait_for
         # timeout can cancel while the thread is still stuck in a syscall.
         # Scoping it here would un-bound the thread count in exactly the
         # hung-store case the cap exists for.
         await slots.acquire()
+        self._enter_inflight(is_lease)
         future: asyncio.Future = loop.create_future()
 
         def _resolve(result: Any, exc: Optional[BaseException]) -> None:
             slots.release()
+            self._exit_inflight(is_lease)
             if future.cancelled():
                 return  # the awaiter timed out / went away: nobody to tell
             if exc is not None:
@@ -883,8 +926,31 @@ class FilesystemStateBackend(StateBackend):
             ).start()
         except BaseException:
             slots.release()  # the thread never ran; nobody else will free it
+            self._exit_inflight(is_lease)
             raise
         return cast(_T, await future)
+
+    def _enter_inflight(self, is_lease: bool) -> None:
+        """Count a just-acquired worker slot (and track the lane's peak)."""
+        with self._stats_lock:
+            if is_lease:
+                self._inflight_lease += 1
+                self._inflight_peak_lease = max(
+                    self._inflight_peak_lease, self._inflight_lease
+                )
+            else:
+                self._inflight_bulk += 1
+                self._inflight_peak_bulk = max(
+                    self._inflight_peak_bulk, self._inflight_bulk
+                )
+
+    def _exit_inflight(self, is_lease: bool) -> None:
+        """Release a worker slot from the live gauge (peak is left intact)."""
+        with self._stats_lock:
+            if is_lease:
+                self._inflight_lease -= 1
+            else:
+                self._inflight_bulk -= 1
 
     # --- lifecycle -------------------------------------------------------
 
@@ -1998,6 +2064,20 @@ class FilesystemStateBackend(StateBackend):
                 "throttle": {
                     "count": self._throttled_ops,
                     "wait_seconds": self._throttle_wait_seconds,
+                },
+                # Live worker-lane occupancy.  ``*_inflight`` at its
+                # ``*_capacity`` (especially sustained) is the "store wedged"
+                # signal the op counters cannot show -- they only advance when
+                # an op FINISHES, so a fully-hung mount otherwise reads idle.
+                # The lease lane is separate, so a saturated bulk lane does
+                # not imply lease renewals are blocked.
+                "workers": {
+                    "bulk_inflight": self._inflight_bulk,
+                    "bulk_peak": self._inflight_peak_bulk,
+                    "bulk_capacity": BULK_CALL_SLOTS,
+                    "lease_inflight": self._inflight_lease,
+                    "lease_peak": self._inflight_peak_lease,
+                    "lease_capacity": LEASE_CALL_SLOTS,
                 },
             }
 

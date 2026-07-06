@@ -601,6 +601,36 @@ class PrometheusMetrics:
             )
             throttle_wait.add({}, throttle.get("wait_seconds", 0.0))
             families.append(throttle_wait)
+
+        workers = stats.get("workers") or {}
+        if workers:
+            inflight = MetricFamily(
+                "yacron2_state_workers_inflight",
+                "gauge",
+                "State worker threads in flight per lane; sustained at the "
+                "lane's capacity signals a wedged/slow mount -- the op "
+                "counters only advance when an op finishes, so a hung store "
+                "otherwise reads as idle. The lease lane is separate, so a "
+                "saturated bulk lane need not block lease renewals.",
+            )
+            capacity = MetricFamily(
+                "yacron2_state_workers_capacity",
+                "gauge",
+                "Worker-slot concurrency cap per lane.",
+            )
+            peak = MetricFamily(
+                "yacron2_state_workers_peak",
+                "gauge",
+                "High-water mark of in-flight worker threads per lane.",
+            )
+            for lane in ("bulk", "lease"):
+                labels = {"lane": lane}
+                inflight.add(labels, workers.get(lane + "_inflight", 0))
+                capacity.add(labels, workers.get(lane + "_capacity", 0))
+                peak.add(labels, workers.get(lane + "_peak", 0))
+            families.append(inflight)
+            families.append(capacity)
+            families.append(peak)
         return families
 
     def _daemon_families(self, cron: "Cron") -> List[MetricFamily]:

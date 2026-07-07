@@ -5,7 +5,7 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
-## 1.2.8
+## 1.2.8 (2026-07-07)
 
 This release answers "what is this actually *using*?" Opt-in per-job
 **resource monitoring** records every run's CPU time and peak memory and
@@ -81,7 +81,7 @@ default and the observability overlay is opt-in.
   wiki's Configuration-Reference, HTTP-API, Clustering, Metrics, and
   Reporting pages.
 
-## 1.2.7
+## 1.2.7 (2026-07-06)
 
 This release makes yacron2 **stateful**. An opt-in durable state store lets
 the scheduler remember across restarts -- retries that survive a daemon

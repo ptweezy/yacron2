@@ -5166,22 +5166,30 @@
     });
     document.addEventListener("click", () => toggleColsMenu(false));
     const mark = $("mark");
-    let markDeg = 0, markVel = 0, markRaf = 0, markLast = 0;
+    // the mark idles at a lazy cruise; friction bleeds any nudge back toward
+    // the cruise speed rather than toward a standstill. reduced-motion parks
+    // the cruise (a deliberate click can still shove it, same as before).
+    const MARK_CRUISE = 345;                                   // deg/s -- one lap every 10s
+    const markCruise = () => (reduceMotion() ? 0 : MARK_CRUISE);
+    let markDeg = 0, markVel = markCruise(), markRaf = 0, markLast = 0;
     const spinMark = (t) => {
       const dt = Math.min((t - markLast) / 1000, 0.1);
       markLast = t;
       markDeg = (markDeg + markVel * dt) % 360;
-      markVel *= Math.pow(0.757822222, dt);
+      const cruise = markCruise();
+      markVel = cruise + (markVel - cruise) * Math.pow(0.757822222, dt);
+      // magnitude of the excess, not its sign: a click coasts back down to
+      // cruise, a right-click coasts back up from spinning backwards
+      if (Math.abs(markVel - cruise) <= 3) markVel = cruise;
       mark.style.transform = `rotate(${markDeg}deg)`;
-      // magnitude, not sign: a negative velocity means it's coasting backwards
-      if (Math.abs(markVel) > 3) { markRaf = requestAnimationFrame(spinMark); }
-      else { markVel = 0; markRaf = 0; }
+      if (markVel || cruise) { markRaf = requestAnimationFrame(spinMark); }
+      else { markRaf = 0; }  // parked: reduced motion with no nudge in flight
     };
-    // one nudge = one click's worth of spin; the sign picks the direction
-    const nudgeMark = (d) => {
-      markVel += d;
+    const kickMark = () => {
       if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
     };
+    // one nudge = one click's worth of spin; the sign picks the direction
+    const nudgeMark = (d) => { markVel += d; kickMark(); };
     const bumpMark = () => nudgeMark(360);
     // right-click drives it the other way instead of popping the browser menu
     const slowMark = (e) => { e.preventDefault(); nudgeMark(-360); };
@@ -5190,6 +5198,12 @@
     // clicking the wordmark spins the logo too; right-click there brakes it
     $("brandName").addEventListener("click", bumpMark);
     $("brandName").addEventListener("contextmenu", slowMark);
+    kickMark();                                               // start the idle cruise
+    // restart the cruise if the OS motion preference is relaxed while parked
+    if (window.matchMedia) {
+      const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+      if (mq.addEventListener) mq.addEventListener("change", kickMark);
+    }
     // header text is unselectable; these chips hand out their value on click
     $("ver").addEventListener("click", () => { const v = $("ver").textContent; if (v) copyText(v, "version"); });
     $("jobset").addEventListener("click", () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); });

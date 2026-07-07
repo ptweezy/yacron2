@@ -3120,6 +3120,7 @@
     if (state.connected !== ok) {
       state.connected = ok;
       $("conn").innerHTML = '<span class="dot ' + (ok ? "live" : "dead") + '"></span><span>' + (ok ? "live" : "no signal") + "</span>";
+      kickMark();  // the logo's idle cruise follows the live state (parks at 0 while dead)
     }
     updateConnTooltip();
   }

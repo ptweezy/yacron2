@@ -5,6 +5,82 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.2.8
+
+This release answers "what is this actually *using*?" Opt-in per-job
+**resource monitoring** records every run's CPU time and peak memory and
+carries the numbers everywhere a run already reports -- the dashboard, the
+HTTP API, Prometheus, statsd, and failure reports -- while a new `GET /node`
+endpoint and a `cluster.observability` block put live whole-node load beside
+the jobs, on every node in the fleet. One footprint note: **psutil joins the
+core dependencies**, the fork's first addition to the core install (it ships
+wheels for the mainstream targets and builds from source elsewhere).
+Behavior is unchanged without the new config: `monitorResources` is off by
+default and the observability overlay is opt-in.
+
+- **Per-job resource monitoring (`monitorResources: true`).** A
+  psutil-backed sampler polls the run's whole process tree and records its
+  total CPU time (user and system) and its sampled peak resident memory.
+  Accounting is best-effort by design: a process that exits mid-sample, a
+  platform that denies the read, or psutil failing outright simply yields
+  whatever was captured so far -- monitoring never crashes a job, never
+  delays it, and never changes its success/failure verdict. Peak RSS is a
+  sampled high-water mark and per-member CPU is banked as the tree shrinks,
+  so the long, heavy runs that matter are measured well; only a child that
+  spawns *and* exits within a single sampling gap escapes entirely.
+
+- **The numbers surface everywhere a run does.** The dashboard overview
+  shows live CPU/memory chips on a running job, and the history tab adds
+  per-run CPU and peak-memory columns and stats. The HTTP API carries
+  `resources` on each run in the history, live `running_resources` on a
+  running job, and windowed CPU/RSS aggregates in the job stats. Prometheus
+  grows `yacron2_job_cpu_seconds_total{job_name, mode}` (user/system),
+  `yacron2_job_peak_rss_bytes`, and last-run CPU/RSS gauges -- emitted only
+  once a job has a monitored run, and persisted across restarts by the
+  durable metrics snapshot. A monitored run's statsd stop datagram gains a
+  `cpu` timer and a `max_rss` gauge (an unmonitored job's datagram is
+  unchanged), and failure reports get `cpu_seconds` / `max_rss_bytes` (and
+  friends) plus `YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES` template
+  variables.
+
+- **`GET /node`: the node's own live load.** A new endpoint samples the
+  serving host's CPU and memory fresh per request -- whole-host utilisation
+  plus the daemon's own footprint -- and drives a node meter in the
+  dashboard header. It is container-aware: under a cgroup v2 limit
+  (Docker/Kubernetes limits, systemd slices) the numbers describe the
+  daemon's *slice* -- the effective memory limit with reclaimable page cache
+  excluded (the same accounting `docker stats` shows) and utilisation of the
+  CPU quota -- with memory and CPU switching over independently. Unlimited
+  cgroups, cgroup v1 hosts, and non-Linux platforms report whole-host
+  numbers, and the response shape never changes.
+
+- **`cluster.observability`: gossip as a secondary data plane.** Opt in and
+  every node shares its whole-node CPU/memory across the cluster. Under
+  `backend: gossip` the reading rides the election mesh as a small
+  `X-Yacron2-Node-Stats` response header on full and `304` responses alike,
+  so a sharing cluster's steady-state round still costs headers only. The
+  lease backends (`kubernetes`/`etcd`/`filesystem`), which have no
+  node-to-node channel of their own, can stand up a *second,
+  election-inert* gossip mesh purely for observability data -- which also
+  brings the fleet view to lease-backed clusters. The dashboard's cluster
+  panel gains per-peer load meters and the fleet view puts each node's live
+  load in its column header. Like the run summaries, node stats are
+  best-effort display data: a malformed peer payload degrades to "no data",
+  never poisoning the view or any decision.
+
+- **Dashboard themes.** A new `carolina-light` theme joins the palette, and
+  `carolina` replaces `amber` as the default.
+
+- **Docs and examples.** The README is rebuilt around a sixty-second quick
+  start, four tutorials (alerting and retries, durable restarts, a first
+  DAG, two-replica leader election), and a screenshot tour of the
+  dashboard; the screenshots themselves are now reproducible via a scripted
+  pipeline under `docs/screenshots/` that captures a live grand-tour fleet.
+  The grand tour gains resource-monitored CPU- and memory-heavy demo jobs
+  and the observability overlay, and the new features are documented on the
+  wiki's Configuration-Reference, HTTP-API, Clustering, Metrics, and
+  Reporting pages.
+
 ## 1.2.7
 
 This release makes yacron2 **stateful**. An opt-in durable state store lets

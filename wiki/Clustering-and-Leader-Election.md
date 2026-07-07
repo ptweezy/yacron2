@@ -791,7 +791,12 @@ run/skip decision ignore them, and a malformed summary from a peer degrades to
 mechanism can carry more than election. Opt in and each node also gossips its
 **whole-node CPU/memory** (the [`GET /node`](HTTP-API#get-node) numbers), so the
 fleet view shows every node's live load beside its runs — invaluable in `spread`
-mode for watching work distribute. Crucially this is **available to any
+mode for watching work distribute. The reading rides each `/peer` response as a
+small `X-Yacron2-Node-Stats` header rather than in the body, on full responses
+and bodyless `304`s alike, so live load values never defeat the exchange's
+conditional `304` optimisation: a sharing cluster's steady-state round still
+costs headers only, and each absorbed reading is as fresh as the last
+successful poll. Crucially this is **available to any
 backend**: a `kubernetes`/`etcd`/`filesystem` cluster (which has no node-to-node
 channel of its own) can stand up a *second, election-inert* gossip mesh purely
 for this observability data, leaving election with the lease store. See

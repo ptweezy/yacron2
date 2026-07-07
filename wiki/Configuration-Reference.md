@@ -223,9 +223,9 @@ Two shapes:
   here are a `ConfigError` (redundant), and so are the overlay tuning keys
   `nodeName`/`interval`/`driftAfter`/`connectTimeout` (there is no overlay mesh
   to tune; the stats gossip at `cluster.interval`, so set the cluster-level keys
-  instead). Note this makes each `/peer` body ship
-  every gossip round (the live load values roll the response ETag), trading away
-  the idle `304` optimisation — the intended cost of fresh fleet-wide load.
+  instead). The stats ride each `/peer` response as an `X-Yacron2-Node-Stats`
+  header, never in the body, so sharing live load keeps the mesh's idle `304`
+  optimisation intact.
 - **A lease backend** (`kubernetes`/`etcd`/`filesystem`) — election stays with the
   lease store; `observability` stands up a dedicated gossip mesh (its own
   `listen`/`tls`/`peers`, all required) that **never elects** (it holds no

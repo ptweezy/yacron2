@@ -63,7 +63,10 @@ The trust model is deliberately simple and keeps no shared state:
   fresh timestamp and every gate (mutual attestation, conflict detection, the
   drift debounce) advances exactly as if the identical body had been re-sent
   (see :meth:`ClusterManager._observe_peer`).  Bodies that do go out are
-  gzip-compressed when large enough to be worth it.
+  gzip-compressed when large enough to be worth it.  Live per-response data
+  (the shared node-stats reading) rides a response *header* on the ``200``
+  and the ``304`` alike, so it stays fresh without ever rolling the tag (see
+  :data:`NODE_STATS_HEADER`).
 
 When ``electLeader`` is set, the same attestation drives a **quorum-gated
 leader election** (see :func:`elect_leader`): each node independently elects,
@@ -279,16 +282,18 @@ _NODE_STATS_FIELDS = (
 
 # How many poll intervals an absorbed peer node_stats reading stays renderable
 # without a fresh one before it expires from the view (serialized as None). A
-# sharing peer refreshes the reading every successful round (a full /peer body
-# re-stamps it, and a 304 attests the identical body -- node_stats included --
-# is still current), so only a peer that STOPPED reporting ages past this:
-# shareNodeStats toggled off, psutil broken, a downgraded build. Its last_seen
-# keeps advancing on those successful polls, so unlike job_summaries the
-# staleness is invisible to the dashboard -- and a load number cannot be
-# re-derived from its age the way a scheduled_in countdown can (see
-# _aged_job_summaries), so the reading must expire rather than show hours-old
-# CPU/memory as current. Three rounds mirrors driftAfter's default debounce:
-# one missed reading is noise, three consecutive is a real signal.
+# sharing peer refreshes the reading every successful round (it rides the
+# NODE_STATS_HEADER response header on the 200 and the 304 alike, so every
+# reachable poll of a sharing peer carries a live reading), so only a peer
+# that STOPPED reporting ages past this: shareNodeStats toggled off, psutil
+# broken, a downgraded build. Its last_seen keeps advancing on those
+# successful polls, so unlike job_summaries the staleness is invisible to the
+# dashboard -- and a load number cannot be re-derived from its age the way a
+# scheduled_in countdown can (see _aged_job_summaries), so the reading must
+# expire rather than show hours-old CPU/memory as current. Three rounds
+# mirrors driftAfter's default debounce: one missed reading is noise (e.g. a
+# transiently failing sampler on the peer), three consecutive is a real
+# signal.
 NODE_STATS_STALE_ROUNDS = 3
 
 # Conditional /peer exchange (see _handle_peer / _observe_peer): a poller
@@ -300,6 +305,19 @@ NODE_STATS_STALE_ROUNDS = 3
 # outweighs the few bytes saved.
 MAX_PEER_ETAG_LEN = 128  # a stored / echoed ETag header value
 MIN_COMPRESS_BYTES = 1024  # smallest /peer body worth gzip-compressing
+
+# Gossiped node stats ride a /peer response HEADER, not the body: the live
+# CPU/memory values would roll the body's ETag every round and defeat the 304
+# optimisation for any sharing cluster. The header travels on the 200 and the
+# 304 alike (HTTP explicitly permits headers on a 304), so a reading stays
+# per-response fresh while the body stays conditional; absence of the header
+# means "not sharing right now". See _handle_peer / _observe_peer.
+NODE_STATS_HEADER = "X-Yacron2-Node-Stats"
+# Bound on a header value the poller will parse. Our own serialised block is
+# a few hundred bytes and aiohttp's per-header transport limit (~8K) already
+# applies, so this is belt-and-braces against a CA-vouched-but-hostile peer
+# padding the value.
+MAX_NODE_STATS_HEADER_LEN = 1024
 
 
 def _parse_members(
@@ -518,6 +536,28 @@ def _parse_node_stats(raw: Any) -> Optional[Dict[str, Any]]:
         # JSON reads naturally. The rest stay floats.
         out[field] = int(value) if field == "cpu_count" else value
     return out or None
+
+
+def _parse_node_stats_header(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    """A peer's :data:`NODE_STATS_HEADER` value as a validated stats dict.
+
+    ``None`` for an absent header (a peer not sharing right now, or an older
+    build) -- absence is the signal, not an error.  The value is
+    CA-vouched-but-untrusted input, so anything unusable also degrades to
+    ``None`` rather than ever failing the poll: an over-long value (see
+    :data:`MAX_NODE_STATS_HEADER_LEN`), unparseable JSON, or a block
+    :func:`_parse_node_stats` rejects all read as "no reading this round".
+    """
+    if raw is None or len(raw) > MAX_NODE_STATS_HEADER_LEN:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        # unparseable (ValueError covers JSONDecodeError) or too deeply nested
+        # for the JSON scanner (RecursionError) -- junk from a buggy/hostile
+        # peer, never a poll failure.
+        return None
+    return _parse_node_stats(data)
 
 
 def _peer_sees_me_agreed(
@@ -819,16 +859,16 @@ class PeerState:
     # unreachable node shows its last-known load aged by last_seen.
     node_stats: Optional[Dict[str, Any]] = None
     # when the node_stats reading above was last known current: stamped on
-    # every successful poll whose body carried the block, INCLUDING a 304
-    # replay (the peer attests the identical payload -- node_stats included --
-    # is still live; a peer that stops sharing drops the key, which rolls its
-    # ETag, so a 304 can never refresh a discontinued reading). Unlike
-    # job_summaries_at this is a freshness bound, not an ageing baseline: a
-    # load number cannot be re-derived from its age, and last_seen keeps
-    # advancing on successful polls that carry no stats (peer toggled
-    # shareNodeStats off, psutil broke, a downgraded build), so without this
-    # stamp the view would serve an hours-old reading as current forever --
-    # see fresh_node_stats.
+    # every successful poll whose response carried the NODE_STATS_HEADER
+    # sidecar -- a 200 and a 304 alike, since the header rides both (per-
+    # response freshness, independent of the body's ETag; a peer that stops
+    # sharing simply stops sending the header, so a conditional round can
+    # never refresh a discontinued reading). Unlike job_summaries_at this is
+    # a freshness bound, not an ageing baseline: a load number cannot be
+    # re-derived from its age, and last_seen keeps advancing on successful
+    # polls that carry no header (peer toggled shareNodeStats off, psutil
+    # broke, a downgraded build), so without this stamp the view would serve
+    # an hours-old reading as current forever -- see fresh_node_stats.
     node_stats_at: Optional[datetime.datetime] = None
 
     def fresh_node_stats(
@@ -947,12 +987,13 @@ class ClusterView:
         # ever replaces EXPIRES from the view (see fresh_node_stats) instead
         # of riding an ever-fresh last_seen as if it were current (a peer that
         # flipped shareNodeStats off, lost psutil, or was downgraded still
-        # polls successfully every round). Stamping `now` is correct for a 304
-        # replay too: unlike job_summaries_at there is no countdown to keep
-        # ageing, and the 304 attests the identical body -- node_stats
-        # included -- is still the peer's live payload (a peer that stopped
-        # sharing drops the key, rolling its ETag, so a 304 can never refresh
-        # a discontinued reading).
+        # polls successfully every round). Freshness is per RESPONSE, not per
+        # body: the reading rides the NODE_STATS_HEADER sidecar on the 200
+        # and the 304 alike, so a caller passes a live reading (or None) on
+        # every successful poll and stamping `now` is always correct --
+        # unlike job_summaries_at there is no countdown to keep ageing, and a
+        # peer that stopped sharing simply stops sending the header, so a
+        # conditional round can never resurrect a discontinued reading.
         if peer_node_stats is not None:
             peer.node_stats = peer_node_stats
             peer.node_stats_at = now
@@ -1308,8 +1349,8 @@ class ClusterManager(LeadershipBackend):
         # NodeResourceSampler.snapshot). Installing it makes THIS node's own
         # load available locally (the /cluster + /fleet self readouts) even
         # when not shared; _share_node_stats separately gates whether we
-        # ADVERTISE it to peers in the /peer payload -- so a cluster that only
-        # wants the local readout adds no gossip traffic (and keeps its 304s).
+        # ADVERTISE it to peers as the NODE_STATS_HEADER on /peer responses
+        # -- so a cluster that only wants the local readout gossips nothing.
         self._node_stats_provider: Optional[
             Callable[[], Optional[Dict[str, Any]]]
         ] = None
@@ -1334,9 +1375,9 @@ class ClusterManager(LeadershipBackend):
         Trusted local input (our own :class:`NodeResourceSampler`), emitted
         as-is -- a small fixed-shape blob, no cap needed. ``None`` when no
         provider is installed or the sampler returned nothing (psutil
-        unavailable). Used for the local self readout everywhere; whether it is
-        also gossiped to peers is gated by ``_share_node_stats`` at the /peer
-        payload (see :meth:`_advertised_node_stats`).
+        unavailable). Used for the local self readout everywhere; whether it
+        is also gossiped to peers is gated by ``_share_node_stats`` at the
+        /peer response header (see :meth:`_advertised_node_stats`).
         """
         provider = self._node_stats_provider
         if provider is None:
@@ -1344,11 +1385,12 @@ class ClusterManager(LeadershipBackend):
         return provider()
 
     def _advertised_node_stats(self) -> Optional[Dict[str, Any]]:
-        """Our node stats to put in the outgoing /peer body, or ``None``.
+        """Our node stats for the outgoing /peer response, or ``None``.
 
-        ``None`` unless node-stats sharing is on (``_share_node_stats``): the
-        key is then omitted from the /peer payload so a cluster not sharing
-        node stats gossips exactly the same bytes as before (and keeps 304s).
+        ``None`` unless node-stats sharing is on (``_share_node_stats``).
+        A reading never enters the /peer *body*: it is attached as the
+        :data:`NODE_STATS_HEADER` response header (see :meth:`_handle_peer`),
+        and ``None`` means no header at all -- absence is the signal.
         """
         if not self._share_node_stats:
             return None
@@ -1388,7 +1430,6 @@ class ClusterManager(LeadershipBackend):
     def _peer_payload(self) -> Dict[str, Any]:
         """The full /peer response body (see :meth:`_handle_peer`)."""
         job_summaries, summaries_truncated = self._advertised_job_summaries()
-        node_stats = self._advertised_node_stats()
         payload: Dict[str, Any] = {
             "node_name": self.node_name,
             "job_set_id": self.get_job_set_id(),
@@ -1448,14 +1489,12 @@ class ClusterManager(LeadershipBackend):
             "job_summaries": job_summaries,
             "job_summaries_truncated": summaries_truncated,
         }
-        # node stats ride along ONLY when node-stats sharing is enabled and the
-        # sampler produced a reading: the key is omitted otherwise so a cluster
-        # not sharing them gossips byte-identical payloads (and keeps the 304
-        # optimisation intact). When present its live values roll the ETag each
-        # round, so a full body ships at the poll cadence -- the intended cost
-        # of fresh fleet-wide load numbers.
-        if node_stats is not None:
-            payload["node_stats"] = node_stats
+        # node stats deliberately do NOT ride this body: they travel as the
+        # NODE_STATS_HEADER response-header sidecar (see _handle_peer)
+        # precisely so their live values never touch the body's ETag -- the
+        # payload is byte-identical whether or not sharing is on, and a
+        # sharing cluster keeps the idle-304 optimisation while its readings
+        # stay per-response fresh.
         return payload
 
     @staticmethod
@@ -1510,6 +1549,18 @@ class ClusterManager(LeadershipBackend):
             payload,
             datetime.datetime.now(datetime.timezone.utc).timestamp(),
         )
+        headers = {"ETag": etag}
+        # The node-stats sidecar: a live reading (when sharing) travels as a
+        # compact-JSON response header rather than in the body, so it never
+        # rolls the ETag. Attached to the 200 AND the 304 below (HTTP
+        # explicitly permits headers on a 304), which is what keeps absorbed
+        # readings fresh across conditional rounds; no header when not
+        # sharing or the sampler produced nothing -- absence is the signal.
+        node_stats = self._advertised_node_stats()
+        if node_stats is not None:
+            headers[NODE_STATS_HEADER] = json.dumps(
+                node_stats, separators=(",", ":")
+            )
         # Conditional exchange: a poller echoes the ETag of the last full
         # body we served it; when nothing change-relevant differs, a bodyless
         # 304 lets it replay its cached observation (see _observe_peer), so a
@@ -1518,8 +1569,8 @@ class ClusterManager(LeadershipBackend):
         # foreign If-None-Match shape simply gets the full body (a safe,
         # slightly-wasteful degradation).
         if request.headers.get("If-None-Match") == etag:
-            return web.Response(status=304, headers={"ETag": etag})
-        resp = web.json_response(payload, headers={"ETag": etag})
+            return web.Response(status=304, headers=headers)
+        resp = web.json_response(payload, headers=headers)
         # Compress bodies worth compressing. The poller advertises gzip
         # support on every request (aiohttp's default Accept-Encoding) and
         # decompresses -- and caps the DECOMPRESSED size -- as it reads (see
@@ -1936,6 +1987,7 @@ class ClusterManager(LeadershipBackend):
         cached = self._peer_observation_cache.get(host)
         status = 0
         response_etag: Optional[str] = None
+        raw_stats_header: Optional[str] = None
         raw, too_large = b"", False
         try:
             # allow_redirects=False: a legitimate peer endpoint never
@@ -1954,6 +2006,10 @@ class ClusterManager(LeadershipBackend):
                 ),
             ) as resp:
                 status = resp.status
+                # the node-stats sidecar rides the response header on the
+                # 200 and the 304 alike (see _handle_peer), so capture it
+                # for both paths before the body handling diverges.
+                raw_stats_header = resp.headers.get(NODE_STATS_HEADER)
                 if status != 304:
                     resp.raise_for_status()
                     raw, too_large = await _read_capped(
@@ -1981,6 +2037,15 @@ class ClusterManager(LeadershipBackend):
         # link) -- and a 304 replay would then carry that skew for as long
         # as the peer's tag holds.
         now = datetime.datetime.now(datetime.timezone.utc)
+        # The peer's whole-node CPU/memory rides the NODE_STATS_HEADER
+        # response header -- on the 200 and the 304 alike -- so parse it once
+        # here for both paths: reading freshness is per RESPONSE, decoupled
+        # from the body's ETag. A missing header is a peer not sharing right
+        # now (or an older build); a malformed/oversized one is junk from a
+        # buggy or hostile peer -- either degrades to None (keep-last-known
+        # in record_success, expiring via fresh_node_stats) and must never
+        # fail the poll.
+        peer_node_stats = _parse_node_stats_header(raw_stats_header)
         if status == 304:
             if cached is None:
                 # a 304 answers a conditional request, and we sent none: a
@@ -2000,13 +2065,18 @@ class ClusterManager(LeadershipBackend):
             # exactly as if the identical full body had been re-sent. The
             # cached kwargs carry the ORIGINAL job_summaries_at, so the fleet
             # view keeps ageing the snapshot's countdowns (see
-            # _aged_job_summaries) instead of re-stamping them.
+            # _aged_job_summaries) instead of re-stamping them. Node stats
+            # are NOT part of the cached observation: this round's header
+            # (parsed above) supplies them, so a 304 delivers a live reading
+            # -- or none -- exactly like a full body, and a replay can never
+            # resurrect a stale reading from the cache.
             self.view.record_success(
                 host,
                 my_id=my_id,
                 now=now,
                 my_name=self.node_name,
                 my_instance=self.instance_id,
+                peer_node_stats=peer_node_stats,
                 **cached[1],
             )
             return
@@ -2119,7 +2189,10 @@ class ClusterManager(LeadershipBackend):
         # now, and _peer_observation_cache keeps it (keyed by the response's
         # ETag) so a later 304 can replay it verbatim -- which is also why
         # my_id/now/my_name/my_instance stay OUT of it: they are supplied
-        # live on every call, replayed or not.
+        # live on every call, replayed or not. peer_node_stats stays out for
+        # the same reason: it arrives per RESPONSE via the NODE_STATS_HEADER
+        # (parsed above), so caching it would let a 304 replay resurrect a
+        # stale reading.
         observation: Dict[str, Any] = {
             "peer_name": fields["node_name"],
             "peer_id": fields["job_set_id"],
@@ -2181,11 +2254,6 @@ class ClusterManager(LeadershipBackend):
             # unchanged, so fleet_view ages the countdowns from the true
             # receipt time; see PeerState.job_summaries_at).
             "peer_job_summaries_at": now,
-            # the peer's whole-node CPU/memory, re-built field-by-field from
-            # the untrusted payload (see _parse_node_stats). None (absent -- a
-            # peer not sharing node stats, or an older build) keeps any
-            # previously-absorbed reading rather than blanking it.
-            "peer_node_stats": _parse_node_stats(data.get("node_stats")),
         }
         self.view.record_success(
             host,
@@ -2193,6 +2261,7 @@ class ClusterManager(LeadershipBackend):
             now=now,
             my_name=self.node_name,
             my_instance=self.instance_id,
+            peer_node_stats=peer_node_stats,
             **observation,
         )
         # Remember (etag -> observation) for conditional re-polls. Only a

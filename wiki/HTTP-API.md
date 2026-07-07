@@ -294,7 +294,11 @@ The per-peer `status` values (`agreed`, `syncing`, `drifted`, `unreachable`,
 
 > The separate `GET /peer` attestation endpoint is **not** part of this web API.
 > It is served only on the cluster's own mutual-TLS `listen` address (default
-> port `8443`), never on the public `web` listeners. See
+> port `8443`), never on the public `web` listeners. When node stats are
+> shared, each `/peer` response carries the node's live load as an
+> `X-Yacron2-Node-Stats` response header (on `200` and `304` responses alike,
+> never in the body), so sharing preserves that exchange's conditional `304`
+> optimisation. See
 > [Clustering and Leader Election](Clustering-and-Leader-Election).
 
 ### `GET /fleet`

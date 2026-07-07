@@ -404,6 +404,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 | `c` | Copy the selected job's command |
 | `g` | Refresh now |
 | `t` | Cycle the theme |
+| `T` | Flip light / dark (phosphor ↔ paper) |
 | `w` | Toggle the [wallboard / TV mode](#wallboard--tv-mode) |
 | `i` | Open the [incident timeline](#incident-tools-verdict-bar-timeline-and-mitigate-console) |
 | `?` | Show the shortcut list |
@@ -415,8 +416,8 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 The settings panel (and the command palette) expose:
 
-- **Three themes**: amber and green **phosphor CRT**, or a flat **modern** theme. Cycle them with `t`.
-- **CRT effects** (phosphor glow, vignette, and a subtle flicker) and **scanlines**, each toggleable. They apply only to the CRT themes and automatically respect `prefers-reduced-motion`.
+- **Ten themes**: amber, green, and carolina **phosphor CRT** plus flat **modern** and **standard** looks, each in a dark (phosphor) and a light (paper) variant — the light ones trade the glass-black glow for dark ink on tinted paper, and **standard** is the plain white-and-saturated-color default. Cycle hues with `t`; flip light/dark with `T`.
+- **CRT effects** (phosphor glow, vignette, and a subtle flicker) and **scanlines**, each toggleable. They apply only to the CRT themes (much softer on the paper variants) and automatically respect `prefers-reduced-motion`.
 - **Compact density** for tighter rows.
 - **Desktop notifications** that fire when a job fails (after you grant the browser permission).
 - A **refresh interval** of 1s / 2s / 3s / 5s / 10s, or paused.

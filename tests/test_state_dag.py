@@ -1230,6 +1230,61 @@ def test_sensor_repoke_clears_stale_due_instant():
     assert body["tasks"]["s"]["nextPokeAt"] == 122.0
 
 
+def test_sensor_completion_poke_fence():
+    # regression: a delayed re-apply of poke N's completion (its mutate timed
+    # out but actually landed) carries the SAME proc token and attempt as the
+    # live poke N+1 -- a re-poke claim re-stamps proc and never bumps attempt,
+    # so only the poke number tells them apart.  A stale poke fence must
+    # no-op; the matching one must apply.
+    spec = _spec(
+        TaskSpec("s", type=dag.SENSOR, poke_interval=10.0, poke_timeout=1e9),
+    )
+    body = _body(spec)
+    task = spec.by_id["s"]
+    # poke 0 claimed, its completion lands (pokeCount -> 1)
+    body, res = _apply(dag.plan_and_claim(spec, 100.0, "p", "h", {}), body)
+    assert [i.poke_number for i in res.launches] == [0]
+    body, applied = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason=None,
+            now=100.0, task=task,
+            expected_proc="p", expected_attempt=0, expected_poke=0,
+        ),
+        body,
+    )
+    assert applied is True
+    assert body["tasks"]["s"]["pokeCount"] == 1
+    # poke 1 claimed: same proc token, same attempt, only pokeCount differs
+    body, res = _apply(dag.plan_and_claim(spec, 111.0, "p", "h", {}), body)
+    assert [i.poke_number for i in res.launches] == [1]
+    assert body["tasks"]["s"]["proc"] == "p"
+    # a stale re-apply of poke 0's completion must NOT touch the live poke
+    body, applied = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason=None,
+            now=112.0, task=task,
+            expected_proc="p", expected_attempt=0, expected_poke=0,
+        ),
+        body,
+    )
+    assert applied is False
+    entry = body["tasks"]["s"]
+    assert entry["proc"] == "p"  # the live poke keeps its claim
+    assert entry["pokeCount"] == 1
+    assert entry["nextPokeAt"] is None  # in-flight poke owns the schedule
+    # the live poke's own completion (matching poke fence) applies
+    body, applied = _apply(
+        dag.mark_task_finished(
+            "s", success=True, exit_code=0, fail_reason=None,
+            now=113.0, task=task,
+            expected_proc="p", expected_attempt=0, expected_poke=1,
+        ),
+        body,
+    )
+    assert applied is True
+    assert _state(body, "s") == dag.SUCCESS
+
+
 def test_mapped_fanout_item_cap_fails_task_cleanly():
     # regression: an oversized XCom list must FAIL the mapped task with a
     # clear reason instead of materialising thousands of instances into the

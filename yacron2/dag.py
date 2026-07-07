@@ -43,7 +43,13 @@ from typing import Any, Dict, List, Optional, Tuple
 DAG_RUN_NS_PREFIX = "dagrun/"
 
 #: lease-name prefix the scheduler advances a run under (the TTL lease trio);
-#: one lease per run, distinct from every job/slot lease name.
+#: one lease per run, distinct from every job/slot lease name.  The GC
+#: callers pass this prefix as the one EPHEMERAL lease class the backend may
+#: reclaim: a ``dagadvance/<dag>/<run_key>`` name recurs only if the same
+#: run key is re-created after its run document was already GC'd, and no
+#: fence for it is persisted outside the run document's own lifetime --
+#: unlike slot/retry-claim leases, whose fences live on in durable slot
+#: cancel records.
 DAG_LEASE_PREFIX = "dagadvance/"
 
 #: artifact-stream scope prefix for a run's XCom: the cross-task hand-off is
@@ -939,6 +945,7 @@ def mark_task_finished(
     jitter: float = 0.0,
     expected_proc: Optional[str] = None,
     expected_attempt: Optional[int] = None,
+    expected_poke: Optional[int] = None,
 ):
     """Transform moving a finished instance to its terminal (or retry) state.
 
@@ -958,6 +965,17 @@ def mark_task_finished(
     wrong outcome).  When the stamped identity no longer matches the entry, the
     completion is dropped exactly like a duplicate.  ``None`` (the default)
     disables the check, so pre-existing callers and tests are unaffected.
+
+    ``expected_poke`` extends the fence to sensors, whose proc/attempt
+    identity does NOT change between pokes: a re-poke claim
+    (:func:`_advance_running`) re-stamps the SAME proc token and never bumps
+    ``attempt``, only ``pokeCount`` -- so a delayed retry of poke N's
+    completion (a mutate that timed out but actually landed) would otherwise
+    pass the proc+attempt fence and clear the LIVE poke N+1's proc/pid under
+    its running subprocess.  The completion carries the ``pokeCount`` observed
+    at its claim; when the entry's current count differs, a later poke is the
+    live one and the stale completion is dropped.  ``None`` (plain tasks, and
+    pre-existing callers) disables the check.
     """
 
     def transform(body):
@@ -976,6 +994,14 @@ def mark_task_finished(
             and int(entry.get("attempt", 0)) != expected_attempt
         ):
             # a newer attempt is the live one; this is a stale completion.
+            return _DOC_KEEP, False
+        if (
+            expected_poke is not None
+            and int(entry.get("pokeCount", 0)) != expected_poke
+        ):
+            # a later poke of the same sensor claim is the live one; this is
+            # a stale poke's completion (see the docstring: proc/attempt do
+            # not distinguish pokes).
             return _DOC_KEEP, False
         if task.type == SENSOR:
             _finish_sensor(entry, success, now, task, jitter)

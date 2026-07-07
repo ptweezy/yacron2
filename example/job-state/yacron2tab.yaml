@@ -44,16 +44,22 @@ jobs:
 
   # A job that must not run its side effect twice, even across a retry or a
   # duplicate fire on another node. `yacron2 idempotent` claims a key once
-  # fleet-wide: exit 0 the first time (do the work), exit 1 afterwards (skip).
+  # fleet-wide: exit 0 the first time (do the work), exit 5 when the key is
+  # already claimed (skip), exit 1 on a transport/store error. Treat 1 as a
+  # failure, never as "already done" -- a store outage must not silently
+  # drop the side effect.
   - name: charge-invoices
     command: |
       set -eu
       key="invoices-$(date -u +%Y-%m-%d)"
-      if yacron2 idempotent "$key"; then
+      yacron2 idempotent "$key" && rc=0 || rc=$?
+      if [ "$rc" -eq 0 ]; then
         echo "charging today's invoices"
         # ... the exactly-once side effect ...
-      else
+      elif [ "$rc" -eq 5 ]; then
         echo "already charged for today; skipping"
+      else
+        exit "$rc"    # store unreachable: fail the run, do not skip
       fi
     schedule: "0 * * * *"
 

@@ -139,6 +139,16 @@ def _http(
                 url, ex.reason
             )
         ) from ex
+    except (TimeoutError, OSError) as ex:
+        # urllib wraps only errors from SENDING the request in URLError; a
+        # deadline that fires while waiting for or reading the response
+        # escapes as a raw TimeoutError (an OSError that is NOT a URLError
+        # subclass).  Same transport failure, same clean error.  Ordered
+        # after HTTPError/URLError on purpose: both subclass OSError, and
+        # an HTTP error response must keep its status semantics.
+        raise _CliError(
+            "cannot reach the yacron2 state endpoint at {}: {}".format(url, ex)
+        ) from ex
 
 
 def _json(

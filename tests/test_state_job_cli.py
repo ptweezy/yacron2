@@ -63,8 +63,8 @@ class _FakeHTTP:
         return status, {}, payload
 
 
-def _cli(monkeypatch, argv, http=None, stdin=b""):
-    monkeypatch.setenv("YACRON2_STATE_URL", "http://127.0.0.1:1")
+def _cli(monkeypatch, argv, http=None, stdin=b"", url="http://127.0.0.1:1"):
+    monkeypatch.setenv("YACRON2_STATE_URL", url)
     monkeypatch.setenv("YACRON2_STATE_TOKEN", "tok")
     if http is not None:
         monkeypatch.setattr(jobcli, "_http", http)
@@ -426,3 +426,34 @@ def test_artifact_put_bad_file_clean_error(monkeypatch, capsys, tmp_path):
     assert _cli(monkeypatch, ["artifact", "put", "n", missing], http) == 1
     assert "cannot read" in capsys.readouterr().err
     assert http.calls == []  # failed before any request
+
+
+def test_response_timeout_clean_error(monkeypatch, capsys):
+    # a daemon that ACCEPTS the connection but never answers (state store
+    # wedged on a dead mount -- the exact case the request deadline was
+    # added for) must fail like every other transport error: exit 1 with
+    # the one-line "cannot reach" message.  urllib wraps only request-SEND
+    # errors in URLError; the timeout waiting for the response escapes as
+    # a raw TimeoutError, which used to crash the CLI with a traceback.
+    # Driven over a real socket, NOT the _http seam, so the whole urllib
+    # path is exercised.
+    import socket
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)  # never accepted: the backlog completes the connect,
+    # the request is sent, and no response ever comes back.
+    port = srv.getsockname()[1]
+    monkeypatch.setattr(jobcli, "_DEFAULT_TIMEOUT", 0.25)
+    try:
+        code = _cli(
+            monkeypatch,
+            ["state", "get", "k"],
+            url="http://127.0.0.1:{}".format(port),
+        )
+    finally:
+        srv.close()
+    assert code == 1  # the transport-error exit code, not a crash
+    err = capsys.readouterr().err
+    assert "cannot reach the yacron2 state endpoint" in err
+    assert "Traceback" not in err

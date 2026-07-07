@@ -699,10 +699,14 @@ class StateBackend(abc.ABC):
         *,
         keep: Dict[str, "Set[str]"],
         grace: float,
+        ephemeral_lease_prefixes: "Tuple[str, ...]" = (),
         dry_run: bool = False,
     ) -> Dict[str, Any]:
         """Remove streams no recent manifest references (see the filesystem
-        backend for semantics); the base backend has nothing to collect."""
+        backend for semantics).  ``ephemeral_lease_prefixes`` names the
+        per-run lease classes whose dead files may be reclaimed; every
+        other lease is never touched.  The base backend has nothing to
+        collect."""
         return {}
 
     async def migrate_schema(self, *, dry_run: bool = False) -> Dict[str, Any]:
@@ -1580,7 +1584,9 @@ class FilesystemStateBackend(StateBackend):
     # --- lease -----------------------------------------------------------
 
     @contextlib.contextmanager
-    def _locked(self, lock_path: str) -> Iterator[None]:
+    def _locked(
+        self, lock_path: str, *, touch: bool = False
+    ) -> Iterator[None]:
         """Hold the advisory exclusive lock on ``lock_path`` for the block.
 
         The lock file is separate from the ``.lease`` data file on purpose: the
@@ -1588,14 +1594,21 @@ class FilesystemStateBackend(StateBackend):
         out from under a lock taken on it; locking a stable side-file avoids
         that entirely.
 
-        Lock files are also RECLAIMED (a deleted document's ``.lock`` by
-        :meth:`delete_document`, a dead lease's by garbage collection), so a
+        Lock files are also RECLAIMED by garbage collection (a dead
+        ephemeral lease's, an orphaned idle lock's -- see
+        :meth:`_gc_orphan_locks_sync`; never on any hot path), so a
         waiter can win the flock on an inode that was unlinked while it
         waited -- a ghost nobody arriving later will ever contend on.  After
         acquiring, re-verify the path still names the locked inode and
         re-open if not; without this, one mutator serialises on the ghost
         while another serialises on the reclaimer's replacement file, and
-        the mutual exclusion silently splits across two inodes.
+        the mutual exclusion silently splits across two inodes.  Sound on a
+        local filesystem, where ``os.stat`` cannot be stale.
+
+        ``touch`` (the document lane only) refreshes the lock file's mtime
+        after acquiring: a flock never updates mtime, and the orphan-lock
+        sweep uses mtime as the activity signal that keeps a live
+        document's lock out of its reach.
         """
         self._makedirs_durable(os.path.dirname(lock_path))
         began = time.perf_counter()
@@ -1614,6 +1627,15 @@ class FilesystemStateBackend(StateBackend):
                         same = False
                     if not same:
                         continue  # ghost inode: re-open and contend afresh
+                    if touch:
+                        # best-effort: a missed touch only ages the lock
+                        # towards the sweep, which still requires the
+                        # document ABSENT and runs under this same flock.
+                        with contextlib.suppress(OSError):
+                            if os.utime in os.supports_fd:
+                                os.utime(fdesc)
+                            else:
+                                os.utime(lock_path)
                     # time-to-acquire is the contention signal: near zero on
                     # an idle store, and the cross-host wait on a fought-over
                     # lease.
@@ -1888,57 +1910,42 @@ class FilesystemStateBackend(StateBackend):
         # the lock file's directory is the namespace dir, created here so the
         # very first write to a fresh namespace has somewhere to land.
         self._makedirs_durable(os.path.dirname(lock_path))
-        reclaim_lock_post_release = False
-        try:
-            with self._locked(lock_path):
-                current = self._read_doc_file(doc_path, strict=True)
-                new_body, result = transform(current)
-                if new_body is DOC_KEEP:
-                    return current, result
-                if new_body is DOC_DELETE:
-                    with contextlib.suppress(FileNotFoundError):
-                        self._unlink(doc_path)
-                        # without this, a released idempotency key or a
-                        # deleted KV entry can RESURRECT after a power loss
-                        # (the unlink never became durable), silently
-                        # un-doing the delete and letting guarded once-only
-                        # work run again.
-                        fsync_directory(os.path.dirname(doc_path))
-                    # reclaim the ``.lock`` side-file too: a deleted
-                    # document's lock file is otherwise orphaned forever
-                    # (dagrun deletes one uniquely-keyed run document per
-                    # DAG run, so the orphans grow without bound).
-                    if IS_WINDOWS:
-                        # our own open handle forbids the unlink while the
-                        # lock is held; do it post-release below, where a
-                        # concurrent acquirer's open handle (no
-                        # FILE_SHARE_DELETE) makes it fail harmlessly
-                        # instead of racing.
-                        reclaim_lock_post_release = True
-                    else:
-                        # unlink while STILL HOLDING the flock: _locked
-                        # re-verifies inode identity after acquiring, so a
-                        # waiter blocked on this unlinked inode re-opens
-                        # instead of splitting the mutex with a mutator on
-                        # the replacement file.
-                        with contextlib.suppress(OSError):
-                            os.unlink(lock_path)
-                    return None, result
-                if not isinstance(new_body, dict):
-                    raise TypeError(
-                        "mutate_document transform must return a dict body, "
-                        "DOC_KEEP or DOC_DELETE"
-                    )
-                payload = _json.dumps_bytes(
-                    {"schemaVersion": SCHEME_VERSION, "data": new_body},
-                    sort_keys=True,
+        # ``touch``: every mutate refreshes the lock file's mtime, the idle
+        # clock the GC orphan-lock sweep judges a doc ``.lock`` by.
+        with self._locked(lock_path, touch=True):
+            current = self._read_doc_file(doc_path, strict=True)
+            new_body, result = transform(current)
+            if new_body is DOC_KEEP:
+                return current, result
+            if new_body is DOC_DELETE:
+                with contextlib.suppress(FileNotFoundError):
+                    self._unlink(doc_path)
+                    # without this, a released idempotency key or a
+                    # deleted KV entry can RESURRECT after a power loss
+                    # (the unlink never became durable), silently
+                    # un-doing the delete and letting guarded once-only
+                    # work run again.
+                    fsync_directory(os.path.dirname(doc_path))
+                # the ``.lock`` side-file is deliberately NOT unlinked
+                # here: on a shared NFS/EFS store a waiter's post-acquire
+                # ``os.stat`` re-verify can be answered from a stale
+                # dentry/attribute cache, pass samestat against the ghost
+                # inode, and split the document mutex across nodes.
+                # Orphaned doc locks are reclaimed by the GC sweep
+                # (:meth:`_gc_orphan_locks_sync`) once idle past the
+                # grace window instead.
+                return None, result
+            if not isinstance(new_body, dict):
+                raise TypeError(
+                    "mutate_document transform must return a dict body, "
+                    "DOC_KEEP or DOC_DELETE"
                 )
-                self._atomic_write(doc_path, payload)
-                return new_body, result
-        finally:
-            if reclaim_lock_post_release:
-                with contextlib.suppress(OSError):
-                    os.unlink(lock_path)
+            payload = _json.dumps_bytes(
+                {"schemaVersion": SCHEME_VERSION, "data": new_body},
+                sort_keys=True,
+            )
+            self._atomic_write(doc_path, payload)
+            return new_body, result
 
     async def delete_document(self, namespace: str, key: str) -> bool:
         def _delete(current: Optional[Dict[str, Any]]) -> Tuple[Any, bool]:
@@ -2120,6 +2127,7 @@ class FilesystemStateBackend(StateBackend):
         *,
         keep: Dict[str, Set[str]],
         grace: float,
+        ephemeral_lease_prefixes: Tuple[str, ...] = (),
         dry_run: bool = False,
     ) -> Dict[str, Any]:
         """Remove durable state nothing references anymore.
@@ -2137,23 +2145,41 @@ class FilesystemStateBackend(StateBackend):
         keep-set builder could never have seen; :data:`PROTECTED_STREAMS`
         are never touched.
 
-        Lease files are never touched within the grace window: a lease file
-        is its fence counter's only home, and deleting one resets the next
-        acquire to fence 1, re-issuing fence values already handed out.  A
-        lease PROVABLY dead for the whole window -- both its expiry and its
-        last write (release marks expiry ``0.0`` in place, so the file
-        mtime, not the expiry, dates a release) older than ``grace`` -- is
-        reclaimed together with its ``.lock`` side-file: every fence ever
-        issued for that name expired at least ``grace`` ago (each takeover
-        happens strictly after its predecessor's expiry), so no live actor
-        can still hold a stale ``Lease`` and the fence reset is
-        unobservable.  Also sweeps crash debris: write-temp files older than
-        :data:`TMP_MAX_AGE` and quarantined records older than ``grace``.
+        Lease files: only the EPHEMERAL per-run classes named by
+        ``ephemeral_lease_prefixes`` (the callers pass dagrun's
+        ``dagadvance/`` prefix) are ever reclaimed, and then only when
+        PROVABLY dead for the whole grace window -- both the recorded
+        expiry and the last write (release marks expiry ``0.0`` in place,
+        so the file mtime, not the expiry, dates a release) older than
+        ``grace``.  Every other lease file is never deleted, whatever its
+        age: a lease file is its fence counter's only home, and fence
+        values are PERSISTED beyond it (a Replace-cancel record in a
+        ``slots/<job>`` stream carries the fence it cancelled and stays
+        newest until the next cancel), so a fence reset after ANY grace
+        window can re-collide with such a record and silently cancel a
+        healthy future run (see :meth:`_gc_leases_sync`).
+
+        Orphaned ``.lock`` side-files -- a deleted document's, a reclaimed
+        or half-reclaimed lease's -- are swept once idle past the grace
+        window (:meth:`_gc_orphan_locks_sync`).  Also sweeps crash debris:
+        write-temp files older than :data:`TMP_MAX_AGE` and quarantined
+        records older than ``grace``.
         """
-        return await self._call("gc", self._gc_sync, keep, grace, dry_run)
+        return await self._call(
+            "gc",
+            self._gc_sync,
+            keep,
+            grace,
+            ephemeral_lease_prefixes,
+            dry_run,
+        )
 
     def _gc_sync(
-        self, keep: Dict[str, Set[str]], grace: float, dry_run: bool
+        self,
+        keep: Dict[str, Set[str]],
+        grace: float,
+        ephemeral_lease_prefixes: Tuple[str, ...],
+        dry_run: bool,
     ) -> Dict[str, Any]:
         now = _now()
         cutoff = now - max(0.0, grace)
@@ -2226,7 +2252,10 @@ class FilesystemStateBackend(StateBackend):
             # non-empty; the rmdir then fails and the next pass converges.
             with contextlib.suppress(OSError):
                 os.rmdir(stream_dir)
-        leases_removed = self._gc_leases_sync(cutoff, dry_run)
+        leases_removed = self._gc_leases_sync(
+            cutoff, dry_run, ephemeral_lease_prefixes
+        )
+        locks_removed = self._gc_orphan_locks_sync(cutoff, dry_run)
         tmp_removed = self._sweep_dir_sync(
             os.path.join(self.base, TMP_DIR), now - TMP_MAX_AGE, dry_run
         )
@@ -2240,6 +2269,7 @@ class FilesystemStateBackend(StateBackend):
             "records_removed": removed_records,
             "streams_kept": kept_streams,
             "leases_removed": leases_removed,
+            "locks_removed": locks_removed,
             "tmp_removed": tmp_removed,
             "quarantine_removed": quarantine_removed,
         }
@@ -2253,10 +2283,12 @@ class FilesystemStateBackend(StateBackend):
         Every fence ever issued for the name then expired at least the
         grace window ago (each takeover happens strictly after its
         predecessor's expiry, and the release write postdates the fence it
-        retires), so no live actor can still hold a stale ``Lease`` and
-        deleting the file -- resetting the fence -- is unobservable.
-        Anything unreadable is NOT reclaimable: never delete what cannot be
-        classified.
+        retires), so no live actor can still hold a stale ``Lease``.
+        That alone does NOT make deletion safe: fence values can be
+        persisted in durable records that outlive any grace window, which
+        is why only the ephemeral lease classes are ever eligible (see
+        :meth:`_gc_leases_sync`).  Anything unreadable is NOT reclaimable:
+        never delete what cannot be classified.
         """
         try:
             mtime = os.stat(lease_path).st_mtime
@@ -2267,18 +2299,47 @@ class FilesystemStateBackend(StateBackend):
             return False
         return lease.expires_at < cutoff and mtime < cutoff
 
-    def _gc_leases_sync(self, cutoff: float, dry_run: bool) -> int:
-        """Reclaim lease files (and lock side-files) dead past the grace.
+    def _gc_leases_sync(
+        self,
+        cutoff: float,
+        dry_run: bool,
+        ephemeral_prefixes: Tuple[str, ...],
+    ) -> int:
+        """Reclaim EPHEMERAL lease files dead past the grace window.
 
-        Bounded per-job lease names would be harmless to keep forever, but
-        dagrun takes one uniquely-named advance lease PER DAG RUN, so
-        without reclamation the flat leases/ directory grows without bound.
+        Only a lease whose logical name matches one of
+        ``ephemeral_prefixes`` is eligible; every other lease file is
+        never deleted, whatever its age.  A lease file is its fence
+        counter's only home, and fences are PERSISTED beyond it: a
+        ``slots/<job>`` stream keeps ``{kind: cancel, fence: N}`` records
+        (written by Replace takeovers, pruned only by the next cancel)
+        that outlive any grace window, so resetting a slot or retry-claim
+        fence lets a reborn fence re-collide with a stale cancel record
+        and silently cancel a healthy future run.  Those bounded per-job
+        names are harmless to keep forever anyway; only dagrun's per-run
+        ``dagadvance/<dag>/<run_key>`` leases grow without bound (one
+        uniquely-named file per DAG run).  Reclaiming those is safe: the
+        name recurs only if the same run key is re-created after its run
+        document was already GC'd, and no fence for it is persisted
+        outside the run document's own lifetime -- the grace argument
+        (:meth:`_lease_dead_past_grace`) covers every in-memory holder.
+
         The check-and-delete runs under the per-lease flock so it cannot
         race a concurrent re-acquire (which holds the same flock); the
         ``.lock`` sibling goes LAST -- an acquirer recreating it after the
-        ``.lease`` vanished simply takes a fresh fence-1 lease, which the
-        grace argument (see :meth:`_lease_dead_past_grace`) makes safe.
+        ``.lease`` vanished simply takes a fresh fence-1 lease.
         """
+        if not ephemeral_prefixes:
+            return 0
+        # prefix matching happens on the encoded filename: _fs_safe only
+        # rewrites a token's first character (whole-token reserved names)
+        # or its over-length tail, so an encoded prefix survives verbatim
+        # at the front -- same argument as the stream keep-set matching.
+        prefix_tokens = tuple(
+            _fs_safe_fragment(p) for p in ephemeral_prefixes if p
+        )
+        if not prefix_tokens:
+            return 0
         removed = 0
         lease_root = os.path.join(self.base, LEASES_DIR)
         try:
@@ -2288,8 +2349,11 @@ class FilesystemStateBackend(StateBackend):
         for name in names:
             if not name.endswith(".lease"):
                 continue
+            token = name[: -len(".lease")]
+            if not any(token.startswith(p) for p in prefix_tokens):
+                continue  # non-ephemeral: never touched
             lease_path = os.path.join(lease_root, name)
-            lock_path = lease_path[: -len(".lease")] + ".lock"
+            lock_path = os.path.join(lease_root, token + ".lock")
             # cheap unlocked pre-check: skip anything plausibly live before
             # paying for its flock.
             if not self._lease_dead_past_grace(lease_path, cutoff):
@@ -2315,13 +2379,132 @@ class FilesystemStateBackend(StateBackend):
             if IS_WINDOWS:
                 # post-release: our own handle is closed now; a concurrent
                 # acquirer's open handle (no FILE_SHARE_DELETE) makes this
-                # fail harmlessly and a later pass converges.
+                # fail harmlessly; a lost race orphans a BARE .lock, which
+                # the orphan-lock sweep (not this .lease-keyed loop)
+                # converges on a later pass.
                 with contextlib.suppress(OSError):
-                    os.unlink(lock_path)
+                    self._unlink(lock_path)
         if removed and not dry_run:
             # make the reclamation itself crash-durable, once per pass.
             fsync_directory(lease_root)
         return removed
+
+    def _gc_orphan_locks_sync(self, cutoff: float, dry_run: bool) -> int:
+        """Sweep ``.lock`` side-files whose owner is gone and idle past grace.
+
+        Two orphan classes, both otherwise permanent:
+
+        * a document ``.lock`` whose ``.doc`` is ABSENT -- ``DOC_DELETE``
+          never unlinks the lock file (an eager unlink split the document
+          mutex across nodes on NFS/EFS: a waiter's post-acquire stat
+          re-verify can be served by a stale dentry/attribute cache and
+          pass samestat against the ghost inode while another node locks a
+          fresh file).  mutate_document touches the lock's mtime on every
+          acquire, so idle-past-grace means no mutator ran for a whole
+          grace window;
+        * a BARE lease ``.lock`` with no ``.lease`` sibling -- the Windows
+          post-release unlink in :meth:`_gc_leases_sync` can lose to a
+          scanner's transient handle, and the ``.lease``-keyed loop never
+          revisits the name.  No ``.lease`` means no durable fence, so no
+          prefix restriction is needed here.
+
+        Each candidate is re-judged and deleted under its own flock, with
+        :meth:`_locked`'s ghost re-verify protecting any waiter.  Accepted
+        residual risk, on shared mounts only: deleting a lock idle for >=
+        the grace window can in principle race a waiter that opened it in
+        the deletion instant and stat-verifies through a stale NFS cache;
+        the idle-past-grace gate plus the daily GC cadence bounds this to
+        a vanishing window, unlike the constant hot-path window the eager
+        DOC_DELETE-time unlink had.
+        """
+        removed = 0
+        docs_root = os.path.join(self.base, DOCS_DIR)
+        try:
+            ns_tokens = os.listdir(docs_root)
+        except OSError:
+            ns_tokens = []
+        for ns_token in ns_tokens:
+            ns_dir = os.path.join(docs_root, ns_token)
+            if not os.path.isdir(ns_dir):
+                continue
+            try:
+                names = os.listdir(ns_dir)
+            except OSError:
+                continue
+            for name in names:
+                if not name.endswith(".lock"):
+                    continue
+                lock_path = os.path.join(ns_dir, name)
+                doc_path = os.path.join(ns_dir, name[: -len(".lock")]) + ".doc"
+                if self._reclaim_idle_lock_sync(
+                    lock_path, doc_path, cutoff, dry_run
+                ):
+                    removed += 1
+        lease_root = os.path.join(self.base, LEASES_DIR)
+        try:
+            names = os.listdir(lease_root)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.endswith(".lock"):
+                continue
+            lock_path = os.path.join(lease_root, name)
+            lease_path = (
+                os.path.join(lease_root, name[: -len(".lock")]) + ".lease"
+            )
+            if self._reclaim_idle_lock_sync(
+                lock_path, lease_path, cutoff, dry_run
+            ):
+                removed += 1
+        # no fsync: a lock unlink that never becomes durable merely
+        # resurfaces the orphan for the next pass.
+        return removed
+
+    def _reclaim_idle_lock_sync(
+        self, lock_path: str, sibling_path: str, cutoff: float, dry_run: bool
+    ) -> bool:
+        """Check-and-delete one orphaned ``.lock`` (see the sweep above).
+
+        Reclaims only when the lock's mtime predates ``cutoff`` AND its
+        owning data file (``sibling_path``) is absent, judged both before
+        paying for the flock and again while holding it.
+        """
+        try:
+            if os.stat(lock_path).st_mtime >= cutoff:
+                return False
+        except OSError:
+            # gone or unreadable: nothing to reclaim / cannot classify.
+            return False
+        if os.path.exists(sibling_path):
+            return False
+        if dry_run:
+            return True
+        with self._locked(lock_path):
+            # re-judge under the flock: a concurrent acquire may have just
+            # touched the lock or re-created the sibling (and _locked's
+            # O_CREAT may have re-created a fresh file if another sweeper
+            # won the race -- its new mtime fails the age gate).
+            try:
+                if os.stat(lock_path).st_mtime >= cutoff:
+                    return False
+            except OSError:
+                return False
+            if os.path.exists(sibling_path):
+                return False
+            if not IS_WINDOWS:
+                # unlink while STILL HOLDING the flock: waiters re-verify
+                # inode identity and re-open instead of splitting the
+                # mutex with a recreated file.
+                with contextlib.suppress(OSError):
+                    os.unlink(lock_path)
+                return True
+        # Windows: our own open handle forbids the unlink under the lock;
+        # post-release, a concurrent acquirer's open handle (no
+        # FILE_SHARE_DELETE) makes this fail harmlessly and a later pass
+        # converges.
+        with contextlib.suppress(OSError):
+            self._unlink(lock_path)
+        return True
 
     @staticmethod
     def _sweep_dir_sync(path: str, cutoff: float, dry_run: bool) -> int:

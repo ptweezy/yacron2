@@ -876,6 +876,44 @@ async def test_gc_leaves_artifacts_unmanaged_without_scope_manifests(
         cron.state_backend = None
 
 
+async def test_gc_pass_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
+    # the daemon pass wires the ephemeral-lease prefix through to the
+    # backend: a dead-past-grace dagadvance/ per-run lease is reclaimed
+    # while a slots/ lease of the same age survives -- its fence can live
+    # on in durable Replace-cancel records (cron._request_replace /
+    # _slot_renewer), so no grace window ever makes a slot fence reset
+    # safe.
+    import yacron2.state as state_mod
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            assert await backend.acquire_lease(
+                "dagadvance/d/r1", "A", ttl=10.0
+            )
+            assert await backend.acquire_lease("slots/j", "A", ttl=10.0)
+        finally:
+            monkeypatch.undo()
+        dag_lock, dag_lease = backend._lease_paths("dagadvance/d/r1")
+        slot_lock, slot_lease = backend._lease_paths("slots/j")
+        for path in (dag_lease, slot_lease):
+            os.utime(path, (old_epoch, old_epoch))
+        await _seed_gc_anchor(cron)
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        assert not os.path.exists(dag_lease)
+        assert not os.path.exists(dag_lock)
+        assert os.path.exists(slot_lease)  # the fence line's only home
+        assert os.path.exists(slot_lock)
+    finally:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
 async def test_slot_release_write_yields_to_racing_reclaim(tmp_path):
     # the same hazard through the production path: the finish-path release
     # schedules its write fire-and-forget, the job's next fire re-claims

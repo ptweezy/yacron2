@@ -624,6 +624,42 @@ def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
     assert "gc would remove" in out
 
 
+def test_cli_gc_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
+    # `yacron2 state gc` must pass the ephemeral-lease prefix through like
+    # the daemon's pass: a dead-past-grace dagadvance/ per-run lease is
+    # reclaimed while a slots/ lease of the same age survives (its fence
+    # can live on in durable Replace-cancel records, so no grace window
+    # ever makes a slot fence reset safe).
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        backend = _backend(store)
+        await backend.start()
+        old = state_mod._now() - 8 * 86400.0  # dead past the 7-day grace
+        monkeypatch.setattr(state_mod, "_now", lambda: old)
+        try:
+            assert await backend.acquire_lease(
+                "dagadvance/d/r1", "A", ttl=10.0
+            )
+            assert await backend.acquire_lease("slots/j", "A", ttl=10.0)
+        finally:
+            monkeypatch.undo()
+        dag_paths = backend._lease_paths("dagadvance/d/r1")
+        slot_paths = backend._lease_paths("slots/j")
+        for path in (dag_paths[1], slot_paths[1]):
+            os.utime(path, (old, old))
+        return dag_paths, slot_paths
+
+    (dag_lock, dag_lease), (slot_lock, slot_lease) = _run(seed())
+    _seed_gc_manifests(store)
+    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    assert not os.path.exists(dag_lease)
+    assert not os.path.exists(dag_lock)
+    assert os.path.exists(slot_lease)  # never touched, whatever its age
+    assert os.path.exists(slot_lock)
+
+
 def _seed_gc_manifests(backend_coro_store):
     """Manifests letting a default-grace (7 day) CLI gc prove absence."""
 

@@ -18,9 +18,13 @@ regresses, the matching test fails.  Covered invariants:
 * length-truncated stream tokens round-trip through ``list_stream_names``
   via the logical-name sidecar, and a legacy truncated dir without one is
   skipped/kept -- never returned garbled or collected;
-* garbage collection reclaims lease files (and ``delete_document`` its
-  ``.lock`` side-file) only once provably dead past the whole grace
-  window, with the fence reset unobservable to any stale holder;
+* garbage collection reclaims ONLY the ephemeral per-run lease classes
+  (``dagadvance/``) once provably dead past the whole grace window --
+  never slot/retry-claim/election leases, whose fences persist in durable
+  slot cancel records -- and sweeps orphaned ``.lock`` side-files (a
+  deleted document's, a bare lease lock's) only once idle past the grace,
+  while ``delete_document`` itself never unlinks the ``.lock`` (an eager
+  unlink split the document mutex across nodes on NFS);
 * stream/document-namespace enumeration reports hidden (unnameable)
   entries, the orphan-blob sweep's age guard keeps young payloads, and a
   dedupe re-put re-arms that guard -- the KEEP biases the blob sweep
@@ -42,6 +46,7 @@ import time
 import pytest
 
 from yacron2 import state
+from yacron2.dag import DAG_LEASE_PREFIX
 from yacron2.state import FilesystemStateBackend
 
 
@@ -566,14 +571,16 @@ async def test_put_blob_dedupe_rearms_the_sweep_age_guard(tmp_path):
     assert await backend.get_blob(digest) == b"republished-content"
 
 
-# --- 12: GC reclaims lease files only once dead past the whole grace --------
+# --- 12: GC reclaims ONLY ephemeral leases, only once dead past grace -------
 
 
-async def test_gc_reclaims_leases_dead_past_grace_only(tmp_path, monkeypatch):
+async def test_gc_reclaims_ephemeral_leases_dead_past_grace_only(
+    tmp_path, monkeypatch
+):
     # dagrun takes one uniquely-named advance lease per DAG run, and nothing
     # ever deleted the files: ~210k permanent files/year for a 5-minute DAG.
-    # GC must reclaim a lease (and its .lock sibling) once dead past the
-    # whole grace window -- and never sooner.
+    # GC must reclaim a lease (and its .lock sibling) matching an EPHEMERAL
+    # prefix once dead past the whole grace window -- and never sooner.
     backend = _backend(tmp_path)
     await backend.start()
     t0 = time.time()
@@ -585,89 +592,153 @@ async def test_gc_reclaims_leases_dead_past_grace_only(tmp_path, monkeypatch):
     grace = 3600.0
     # expired, but within the grace window: never touched (the fence home).
     clock["t"] = t0 + 60.0
-    result = await backend.collect_garbage(keep={}, grace=grace)
+    result = await backend.collect_garbage(
+        keep={}, grace=grace, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
     assert result["leases_removed"] == 0
     assert os.path.exists(lease_path)
     # dead past the whole window: dry run counts it but deletes nothing...
     clock["t"] = t0 + grace + 60.0
-    dry = await backend.collect_garbage(keep={}, grace=grace, dry_run=True)
+    dry = await backend.collect_garbage(
+        keep={},
+        grace=grace,
+        ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,),
+        dry_run=True,
+    )
     assert dry["leases_removed"] == 1
     assert os.path.exists(lease_path) and os.path.exists(lock_path)
     # ...and the real pass reclaims BOTH files.
-    result = await backend.collect_garbage(keep={}, grace=grace)
+    result = await backend.collect_garbage(
+        keep={}, grace=grace, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
     assert result["leases_removed"] == 1
     assert not os.path.exists(lease_path)
     assert not os.path.exists(lock_path)
+    # without the prefix (a caller that names no ephemeral classes) the
+    # same dead-past-grace lease would never have been touched.
+    revived = await backend.acquire_lease("dagadvance/d/r2", "A", ttl=10.0)
+    assert revived is not None
+    clock["t"] = t0 + 2 * (grace + 60.0)
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["leases_removed"] == 0
+    assert os.path.exists(backend._lease_paths("dagadvance/d/r2")[1])
 
 
-async def test_gc_dates_released_lease_by_mtime_not_expiry(
-    tmp_path, monkeypatch
-):
-    # release marks expiresAt 0.0 IN PLACE -- ancient by expiry alone.  A
-    # lease released moments ago must survive the full grace window (a
-    # stale fence from just before the release could still be live), so
-    # the sweep dates a release by the file's mtime and the fence counter
-    # survives.
+async def test_gc_never_reclaims_non_ephemeral_leases(tmp_path, monkeypatch):
+    # REGRESSION of the previous fix round: reclaiming ANY dead lease reset
+    # slot fences that persisted Replace-cancel records still reference
+    # ({kind: cancel, fence: N} in slots/<job> stays newest until the next
+    # cancel), so a reborn fence could re-collide and a healthy future run
+    # be silently cancelled.  A slot lease dead past ANY grace window must
+    # survive GC and the next acquire must CONTINUE its fence line.
     backend = _backend(tmp_path)
     await backend.start()
     t0 = time.time()
     clock = {"t": t0}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
-    lease = await backend.acquire_lease("leader", "A", ttl=30.0)
+    first = await backend.acquire_lease("slots/j", "A", ttl=10.0)
+    assert first is not None and first.fence == 1
+    # the durable cancel record a Replace takeover leaves behind: it names
+    # fence 1 and nothing will ever prune it until another cancel lands.
+    await backend.append_record("slots/j", {"kind": "cancel", "fence": 1})
+    await backend.release_lease(first)
+    grace = 3600.0
+    clock["t"] = t0 + grace + 60.0  # dead past the whole grace window
+    result = await backend.collect_garbage(
+        keep={"slots/": {"j"}},
+        grace=grace,
+        ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,),
+    )
+    assert result["leases_removed"] == 0
+    lock_path, lease_path = backend._lease_paths("slots/j")
+    assert os.path.exists(lease_path)  # the fence counter's only home
+    assert os.path.exists(lock_path)
+    # the fence line CONTINUES: the reborn holder is at fence 2, so the
+    # stale fence-1 cancel record can never match it again.
+    nxt = await backend.acquire_lease("slots/j", "B", ttl=10.0)
+    assert nxt is not None and nxt.fence == first.fence + 1
+    records = await backend.list_records("slots/j")
+    assert records == [{"kind": "cancel", "fence": 1}]
+    assert all(rec["fence"] != nxt.fence for rec in records)
+
+
+async def test_gc_dates_released_lease_by_mtime_not_expiry(
+    tmp_path, monkeypatch
+):
+    # release marks expiresAt 0.0 IN PLACE -- ancient by expiry alone.  An
+    # ephemeral lease released moments ago must survive the full grace
+    # window (a stale fence from just before the release could still be
+    # live), so the sweep dates a release by the file's mtime and the
+    # fence counter survives.
+    backend = _backend(tmp_path)
+    await backend.start()
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    lease = await backend.acquire_lease("dagadvance/d/r1", "A", ttl=30.0)
     assert lease is not None
     await backend.release_lease(lease)
     clock["t"] = t0 + 120.0  # well within the grace window
-    result = await backend.collect_garbage(keep={}, grace=3600.0)
+    result = await backend.collect_garbage(
+        keep={}, grace=3600.0, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
     assert result["leases_removed"] == 0
-    _lock_path, lease_path = backend._lease_paths("leader")
+    _lock_path, lease_path = backend._lease_paths("dagadvance/d/r1")
     assert os.path.exists(lease_path)  # the fence counter's only home
-    nxt = await backend.acquire_lease("leader", "B", ttl=30.0)
+    nxt = await backend.acquire_lease("dagadvance/d/r1", "B", ttl=30.0)
     assert nxt is not None and nxt.fence == lease.fence + 1
 
 
 async def test_lease_gc_fence_reset_cannot_enable_stale_ops(
     tmp_path, monkeypatch
 ):
-    # The safety argument for deleting a lease file at all, as a test: a
-    # lease GC reclaims has every fence it ever issued expired >= grace
-    # ago, so the post-reclaim fence reset to 1 must be unobservable -- a
-    # stale Lease from before the reclaim (same holder, higher fence) can
-    # neither renew nor release the reborn lease.
+    # The safety argument for deleting an ephemeral lease file at all, as a
+    # test: a lease GC reclaims has every fence it ever issued expired >=
+    # grace ago, so the post-reclaim fence reset to 1 must be unobservable
+    # -- a stale Lease from before the reclaim (same holder, higher fence)
+    # can neither renew nor release the reborn lease.
     backend = _backend(tmp_path)
     await backend.start()
     t0 = time.time()
     clock = {"t": t0}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
-    first = await backend.acquire_lease("L", "A", ttl=10.0)
+    name = "dagadvance/d/rX"
+    first = await backend.acquire_lease(name, "A", ttl=10.0)
     assert first is not None and first.fence == 1
     clock["t"] = t0 + 60.0
-    stale = await backend.acquire_lease("L", "A", ttl=10.0)  # takeover
+    stale = await backend.acquire_lease(name, "A", ttl=10.0)  # takeover
     assert stale is not None and stale.fence == 2
     grace = 3600.0
     clock["t"] = t0 + 60.0 + grace + 60.0  # both fences dead past grace
-    result = await backend.collect_garbage(keep={}, grace=grace)
+    result = await backend.collect_garbage(
+        keep={}, grace=grace, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
     assert result["leases_removed"] == 1
-    lock_path, lease_path = backend._lease_paths("L")
+    lock_path, lease_path = backend._lease_paths(name)
     assert not os.path.exists(lease_path)
     assert not os.path.exists(lock_path)
-    reborn = await backend.acquire_lease("L", "A", ttl=30.0)
+    reborn = await backend.acquire_lease(name, "A", ttl=30.0)
     assert reborn is not None and reborn.fence == 1
     # fence EQUALITY (never >=) is what keeps the reset safe: the stale
     # renew and the stale release must both miss the reborn lease.
     assert await backend.renew_lease(stale, ttl=30.0) is None
     await backend.release_lease(stale)
-    current = await backend.read_lease("L")
+    current = await backend.read_lease(name)
     assert current is not None
     assert current.holder == "A" and current.fence == 1  # untouched
 
 
-# --- 13: delete_document reclaims the .lock side-file ------------------------
+# --- 13: delete_document leaves the .lock for the GC orphan sweep -----------
 
 
-async def test_delete_document_reclaims_lock_sibling(tmp_path):
-    # _doc_paths gives every key a .lock side-file; the delete path used to
-    # unlink only the .doc, orphaning one .lock per deleted key forever
-    # (dagrun deletes one uniquely-keyed run document per DAG run).
+async def test_delete_document_leaves_lock_sibling_alone(tmp_path):
+    # REGRESSION of the previous fix round: delete_document unlinked the
+    # .lock side-file eagerly, which splits the document mutex across nodes
+    # on a shared NFS/EFS store (a waiter that wins the flock on the ghost
+    # inode can pass the post-acquire stat re-verify through a stale
+    # dentry/attribute cache while another node locks a fresh file).  The
+    # hot path must never unlink a doc .lock; reclamation belongs to the
+    # GC orphan sweep, gated on idle-past-grace.
     backend = _backend(tmp_path)
     await backend.start()
 
@@ -682,13 +753,116 @@ async def test_delete_document_reclaims_lock_sibling(tmp_path):
     assert os.path.exists(doc_path) and os.path.exists(lock_path)
     assert await backend.delete_document("dagrun/d", "r1") is True
     assert not os.path.exists(doc_path)
-    assert not os.path.exists(lock_path)  # the orphan that used to pile up
-    # the key stays fully usable after reclamation: a fresh mutation
-    # recreates both files and reads back.
+    assert os.path.exists(lock_path)  # left for the GC sweep, never eager
+    # the key stays fully usable: a fresh mutation recreates the doc under
+    # the SAME lock file and reads back.
     body, _ = await backend.mutate_document("dagrun/d", "r1", put(2))
     assert body == {"v": 2}
     assert await backend.read_document("dagrun/d", "r1") == {"v": 2}
     assert os.path.exists(lock_path)
+
+
+# --- 13b: the GC orphan-lock sweep ------------------------------------------
+
+
+async def test_gc_sweeps_orphaned_doc_lock_only_when_doc_absent_and_idle(
+    tmp_path,
+):
+    # a doc .lock is swept only when BOTH hold: the document is absent AND
+    # the lock sat idle (mtime) past the whole grace window.  A present
+    # document keeps its lock whatever the mtime says.
+    backend = _backend(tmp_path)
+    await backend.start()
+    grace = 3600.0
+    old = time.time() - grace - 120.0
+
+    await backend.mutate_document("kv/a", "k", lambda _c: ({"v": 1}, None))
+    kept_lock, kept_doc = backend._doc_paths("kv/a", "k")
+    os.utime(kept_lock, (old, old))  # ancient, but the doc is PRESENT
+
+    await backend.mutate_document("kv/b", "k", lambda _c: ({"v": 1}, None))
+    await backend.delete_document("kv/b", "k")
+    young_lock, _young_doc = backend._doc_paths("kv/b", "k")
+    # doc absent but the lock was just touched: still within the grace.
+
+    await backend.mutate_document("kv/c", "k", lambda _c: ({"v": 1}, None))
+    await backend.delete_document("kv/c", "k")
+    dead_lock, dead_doc = backend._doc_paths("kv/c", "k")
+    os.utime(dead_lock, (old, old))  # doc absent AND idle past grace
+
+    dry = await backend.collect_garbage(keep={}, grace=grace, dry_run=True)
+    assert dry["locks_removed"] == 1
+    assert os.path.exists(dead_lock)  # dry run deletes nothing
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["locks_removed"] == 1
+    assert os.path.exists(kept_lock)  # doc present: never swept
+    assert os.path.exists(young_lock)  # idle clock not yet past grace
+    assert not os.path.exists(dead_lock)
+    assert not os.path.exists(dead_doc)
+
+
+async def test_mutate_touch_refreshes_the_doc_lock_idle_clock(tmp_path):
+    # a flock never updates mtime, so every mutate must utime the lock:
+    # a doc-absent .lock that was CONTENDED recently (an idempotency key
+    # between claims) must read as active and survive the sweep.
+    backend = _backend(tmp_path)
+    await backend.start()
+    grace = 3600.0
+    old = time.time() - grace - 120.0
+    await backend.mutate_document("kv/t", "k", lambda _c: ({"v": 1}, None))
+    await backend.delete_document("kv/t", "k")
+    lock_path, _doc_path = backend._doc_paths("kv/t", "k")
+    os.utime(lock_path, (old, old))
+    # a doc-keeping probe of the absent key: acquires (and touches) the
+    # lock without recreating the document.
+    body, _ = await backend.mutate_document(
+        "kv/t", "k", lambda _c: (state.DOC_KEEP, None)
+    )
+    assert body is None
+    assert os.stat(lock_path).st_mtime > old  # the touch really landed
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["locks_removed"] == 0
+    assert os.path.exists(lock_path)
+
+
+async def test_gc_sweeps_bare_lease_lock_only_once_idle_past_grace(tmp_path):
+    # REGRESSION of the previous fix round: _gc_leases_sync keys off .lease
+    # names, so a .lock orphaned by a lost post-release unlink (Windows AV
+    # scanner handle) was never revisited -- it leaked forever.  The orphan
+    # sweep must reclaim a BARE .lock (no .lease sibling) once idle past
+    # the grace, and keep both a fresh bare lock and a lock whose .lease
+    # still exists.
+    backend = _backend(tmp_path)
+    await backend.start()
+    grace = 3600.0
+    old = time.time() - grace - 120.0
+    lease_root = os.path.join(backend.base, state.LEASES_DIR)
+
+    # a live lease: .lock has its .lease sibling, whatever the mtime.
+    lease = await backend.acquire_lease("slots/j", "A", ttl=30.0)
+    assert lease is not None
+    live_lock, live_lease = backend._lease_paths("slots/j")
+    os.utime(live_lock, (old, old))
+
+    # the orphan: a bare .lock aged past the grace window.
+    dead_lock = os.path.join(lease_root, "dagadvance%2Fd%2Fgone.lock")
+    with open(dead_lock, "wb") as fobj:
+        fobj.write(b"\0")
+    os.utime(dead_lock, (old, old))
+
+    # a fresh bare .lock (an acquire between open and lease write).
+    young_lock = os.path.join(lease_root, "dagadvance%2Fd%2Fnew.lock")
+    with open(young_lock, "wb") as fobj:
+        fobj.write(b"\0")
+
+    dry = await backend.collect_garbage(keep={}, grace=grace, dry_run=True)
+    assert dry["locks_removed"] == 1
+    assert os.path.exists(dead_lock)
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["locks_removed"] == 1
+    assert not os.path.exists(dead_lock)
+    assert os.path.exists(live_lock) and os.path.exists(live_lease)
+    assert os.path.exists(young_lock)
 
 
 # --- 14: document delete rides out Windows sharing violations ---------------

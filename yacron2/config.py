@@ -1717,8 +1717,9 @@ def _build_state_config(raw: dict) -> StateConfig:
         # (urlparse().port raises on a non-numeric or out-of-range port);
         # left unchecked, the ValueError would escape the API startup and
         # permanently disable the loopback endpoint instead of failing the
-        # config load. No port at all is fine (an OS-assigned ephemeral one,
-        # same as the default), but an explicit one must be usable.
+        # config load. An explicit :0 is fine -- jobapi._bind_target maps
+        # a missing port to 0 anyway, and the bind treats both as the
+        # OS-assigned ephemeral default -- but anything else must be usable.
         text = str(listen)
         parsed = urlparse(text if "://" in text else "http://" + text)
         try:
@@ -1726,14 +1727,14 @@ def _build_state_config(raw: dict) -> StateConfig:
         except ValueError as err:
             raise ConfigError(
                 "state.jobApi.listen has an invalid port in {!r}: the port "
-                "must be an integer in 1-65535 (or omitted for an "
-                "OS-assigned ephemeral one)".format(text)
+                "must be an integer in 0-65535 (0 or omitted binds an "
+                "OS-assigned ephemeral port)".format(text)
             ) from err
-        if port is not None and not 0 < port <= 65535:
+        if port is not None and not 0 <= port <= 65535:
             raise ConfigError(
                 "state.jobApi.listen has an invalid port in {!r}: the port "
-                "must be an integer in 1-65535 (or omitted for an "
-                "OS-assigned ephemeral one)".format(text)
+                "must be an integer in 0-65535 (0 or omitted binds an "
+                "OS-assigned ephemeral port)".format(text)
             )
     if listen and not job_api.get("allowNonLoopbackBind"):
         text = str(listen)

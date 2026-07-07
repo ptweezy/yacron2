@@ -840,8 +840,8 @@ def test_state_floats_accept_finite_values():
 
 
 def test_jobapi_listen_bad_port_rejected():
-    for bad in ("127.0.0.1:99999", "127.0.0.1:abc", "127.0.0.1:0"):
-        with pytest.raises(ConfigError, match="1-65535"):
+    for bad in ("127.0.0.1:99999", "127.0.0.1:abc"):
+        with pytest.raises(ConfigError, match="0-65535"):
             parse_config_string(
                 "state:\n  path: /x\n  jobApi:\n"
                 "    listen: '{}'\n".format(bad),
@@ -853,6 +853,19 @@ def test_jobapi_listen_valid_forms_parse():
     # bare host:port, a portless host (ephemeral bind, same as the default)
     # and the http:// URL form must all stay valid.
     for good in ("127.0.0.1:8080", "127.0.0.1", "http://localhost:9000"):
+        cfg = parse_config_string(
+            "state:\n  path: /x\n  jobApi:\n"
+            "    listen: '{}'\n".format(good),
+            "",
+        ).state_config
+        assert cfg["jobApi"]["listen"] == good
+
+
+def test_jobapi_listen_explicit_port_zero_parses():
+    # an explicit :0 is the ephemeral-bind idiom, identical at runtime to
+    # omitting the port (jobapi._bind_target maps a missing port to 0);
+    # rejecting it broke configs that worked before the port validation.
+    for good in ("127.0.0.1:0", "http://127.0.0.1:0"):
         cfg = parse_config_string(
             "state:\n  path: /x\n  jobApi:\n"
             "    listen: '{}'\n".format(good),

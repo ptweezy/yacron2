@@ -2749,12 +2749,22 @@ class Cron:
                 "advertise its scopes/dags (a node predating them, or the "
                 "first grace window after upgrading)"
             )
+        from yacron2.dag import DAG_LEASE_PREFIX
+
         try:
             # bounded: a worker thread wedged in a dead-mount syscall must
             # not leave _gc_task pending forever -- the single-flight check
             # would then disable automatic GC for the life of the process.
             result = await asyncio.wait_for(
-                backend.collect_garbage(keep=keep, grace=grace),
+                backend.collect_garbage(
+                    keep=keep,
+                    grace=grace,
+                    # only the per-run advance leases are reclaimable: every
+                    # other lease's fence can outlive the grace window inside
+                    # persisted slot cancel records (see the backend's GC
+                    # docstring).
+                    ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,),
+                ),
                 timeout=STATE_GC_TIMEOUT,
             )
         except asyncio.CancelledError:

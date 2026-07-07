@@ -777,6 +777,77 @@ async def test_failed_completion_record_is_retried(tmp_path):
         await _teardown(cron)
 
 
+async def test_stale_sensor_poke_completion_retry_is_fenced(tmp_path):
+    # regression: a sensor completion whose mutate TIMED OUT but actually
+    # landed (partial landing: wait_for raised while the executor's write
+    # still committed) was queued for retry; the next poke was then claimed
+    # under the SAME proc token and attempt (a re-poke bumps only pokeCount),
+    # so the stale retry passed the proc+attempt fence and cleared the LIVE
+    # poke's proc under its running subprocess.  The poke-number fence must
+    # drop it, and the settled queue entry must not retry forever.
+    yaml = (
+        "dags:\n  - name: sn\n    tasks:\n"
+        "      - id: s\n        type: sensor\n        command: 'x'\n"
+        "        pokeIntervalSeconds: 0\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        flag = tmp_path / "cond"
+        _set_cmd(
+            cron,
+            "sn",
+            "s",
+            [
+                _PY,
+                "-c",
+                "import os,sys; sys.exit(0 if os.path.exists({!r}) "
+                "else 1)".format(str(flag)),
+            ],
+        )
+        run_key = await cron._dag.trigger_run("sn")
+        ref = ("sn", run_key)
+
+        # poke 0's completion mutate COMMITS but the caller times out
+        async def _partial(dag_name, key, transform):
+            await orig(dag_name, key, transform)
+            raise asyncio.TimeoutError()
+
+        orig = cron._dag._mutate
+        cron._dag._mutate = _partial
+        await _reap_running(cron)
+        cron._dag._mutate = orig
+        # the completion was queued (as a poke-0 completion) even though it
+        # landed on disk
+        pc = cron._dag._pending_completions.get((ref, "s"))
+        assert pc is not None and pc["poke"] == 0
+        # pokeIntervalSeconds 0 < COMPLETION_RETRY_DELAY: the next poke is
+        # claimed BEFORE the retry fires
+        await _drain_pending(cron)
+        body = await cron._dag.get_run("sn", run_key)
+        entry = body["tasks"]["s"]
+        assert entry["pokeCount"] == 1  # poke 0's completion DID land
+        assert entry["proc"] == cron._proc_token  # poke 1 is in flight
+        # the stale queued completion fires: the poke fence must drop it (the
+        # live poke keeps its claim) and settle the queue entry
+        for q in cron._dag._pending_completions.values():
+            q["nextTryAt"] = 0.0
+        await cron._dag._retry_completions(dagrun._now())
+        assert not cron._dag._pending_completions
+        body = await cron._dag.get_run("sn", run_key)
+        entry = body["tasks"]["s"]
+        assert entry["state"] == dag.RUNNING
+        assert entry["proc"] == cron._proc_token  # NOT cleared by the retry
+        assert entry["pokeCount"] == 1
+        await _drain_pending(cron)
+        # the live poke's own completion still lands and the run converges
+        flag.write_text("ok")
+        body = await _drive(cron, "sn", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert body["tasks"]["s"]["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
 async def test_superseded_owner_stops_advancing_after_lease_lapse(tmp_path):
     # regression: after a lease lapse + peer takeover (store unreachable, so
     # the renew loop never positively learned of it), the stale owner kept

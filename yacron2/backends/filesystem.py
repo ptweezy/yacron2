@@ -116,12 +116,17 @@ _REBOOT_RAN_KEEP = 512
 # How often (seconds, monotonic) the reboot-ran stream is re-read.  It
 # changes only when a one-shot runs, so re-listing it every renew round
 # would be pointless mount traffic; a takeover forces an immediate
-# refresh so a new leader never acts on a stale set.  The throttle
-# advances only when a re-read COMPLETES (see _refresh_reboot_ran): a
-# failed forced refresh at takeover must be retried every round, not
-# leave the new leader trusting a stale set for a whole period, and
-# until one completes reboot_ran() refuses to answer "not ran" (see
-# FilesystemBackend.reboot_ran).
+# refresh so a new leader never acts on a stale set.  On a node holding
+# (or winning) the lease the throttle advances only when a re-read
+# COMPLETES (see _refresh_reboot_ran): a failed forced refresh at
+# takeover must be retried every round, not leave the new leader
+# trusting a stale set for a whole period, and until one completes
+# reboot_ran() refuses to answer "not ran" (see
+# FilesystemBackend.reboot_ran).  A FOLLOWER's failed unsynced read
+# advances it instead -- a follower defers no one-shots and a takeover
+# forces its own re-read, so per-round retries would just hammer a sick
+# store (see _maintain_reboot_ran).  The same period also rate-limits
+# the leader's "deferring one-shots" WARNING.
 _REBOOT_RAN_REFRESH = 60.0
 
 
@@ -243,6 +248,11 @@ class FilesystemBackend(LeaseBackend):
 
         # reboot-ran refresh bookkeeping (see _refresh_reboot_ran)
         self._reboot_refresh_next = 0.0
+        # rate-limits ONLY the holder's "deferring one-shots" WARNING in
+        # _maintain_reboot_ran; the failed read itself keeps retrying
+        # every round there.  Reset by a completed refresh so the first
+        # failure of a NEW outage warns immediately.
+        self._reboot_warn_next = 0.0
         # INVARIANT (failover double-fire guard): False from construction
         # and from every leadership GAIN until a re-read of the persisted
         # ran-set completes; while False, a holder answers reboot_ran()
@@ -705,20 +715,28 @@ class FilesystemBackend(LeaseBackend):
 
         Runs inside the renew round.  The stream is re-listed only every
         :data:`_REBOOT_RAN_REFRESH` seconds -- it changes rarely -- except
-        that while ``_reboot_ran_synced`` is False (construction, or a
-        leadership gain cleared it) EVERY round attempts the re-read, so a
-        failover leader never re-runs a one-shot the old leader marked
-        moments ago.  The throttle advances only when a re-read COMPLETES
-        (in :meth:`_refresh_reboot_ran`): pre-advancing it on failure
-        would leave a new leader trusting a stale set for a whole period.
+        that while ``_reboot_ran_synced`` is False a node holding (or
+        winning) the lease attempts the re-read EVERY round, so a failover
+        leader never re-runs a one-shot the old leader marked moments ago.
+        On such a node the read throttle advances only when a re-read
+        COMPLETES (in :meth:`_refresh_reboot_ran`): pre-advancing it on
+        failure would leave a new leader trusting a stale set for a whole
+        period.  A FOLLOWER's failed unsynced read advances it instead: a
+        follower defers no one-shots (reboot_ran's raise gate is
+        leader-gated) and only needs the set by takeover, and the takeover
+        path forces its own re-read regardless of the throttle -- so
+        per-round retries would just hammer a persistently sick store.
         Best-effort throughout: a failure here must never cost the round
         its election work -- reboot_ran()'s conservative gate is what
         protects the pending one-shots meanwhile.
         """
+        # "holding (or winning)": the raw win flag reboot_ran's raise gate
+        # keys on, OR a lease in hand -- a takeover's forced re-read runs
+        # BEFORE _apply_round sets the flag and must not be throttled.
+        leaderish = self._is_leader or self._lease is not None
         if (
-            not self._reboot_ran_synced
-            or _monotonic() >= self._reboot_refresh_next
-        ):
+            leaderish and not self._reboot_ran_synced
+        ) or _monotonic() >= self._reboot_refresh_next:
             try:
                 await self._refresh_reboot_ran()
             except (OSError, asyncio.TimeoutError) as ex:
@@ -727,13 +745,35 @@ class FilesystemBackend(LeaseBackend):
                         "cluster: could not refresh the @reboot-ran set: %s",
                         ex,
                     )
-                else:
-                    # a leader is deferring its pending @reboot one-shots
-                    # on this (see reboot_ran) -- surface it.
+                elif not leaderish:
+                    # a follower defers no one-shots on this and a
+                    # takeover forces its own re-read, so: DEBUG, and
+                    # advance the read throttle so a persistently failing
+                    # store is retried once per period, not every round.
+                    self._reboot_refresh_next = (
+                        _monotonic() + _REBOOT_RAN_REFRESH
+                    )
+                    logger.debug(
+                        "cluster: could not read the @reboot-ran set: %s "
+                        "(not leading; a takeover forces a fresh read)",
+                        ex,
+                    )
+                elif _monotonic() >= self._reboot_warn_next:
+                    # a holder IS deferring its pending @reboot one-shots
+                    # on this (see reboot_ran) -- surface it, at most once
+                    # per refresh period; the read itself keeps retrying
+                    # every round.
+                    self._reboot_warn_next = _monotonic() + _REBOOT_RAN_REFRESH
                     logger.warning(
                         "cluster: could not read the @reboot-ran set (%s); "
                         "deferring pending @reboot one-shots until a "
                         "re-read succeeds",
+                        ex,
+                    )
+                else:
+                    logger.debug(
+                        "cluster: could not read the @reboot-ran set: %s "
+                        "(still deferring pending @reboot one-shots)",
                         ex,
                     )
         with contextlib.suppress(OSError, asyncio.TimeoutError):
@@ -759,9 +799,13 @@ class FilesystemBackend(LeaseBackend):
         self._note_persisted(live_id, jobs)
         # a COMPLETED re-read: the cache now reflects the store, so the
         # conservative reboot_ran() gate opens and the throttle advances
-        # -- ONLY here, so a failed refresh retries unthrottled.
+        # -- ONLY here for a holder, so ITS failed refresh retries
+        # unthrottled (a follower's failure advances it in
+        # _maintain_reboot_ran).  The warn throttle resets so the first
+        # failure of the NEXT outage warns immediately.
         self._reboot_ran_synced = True
         self._reboot_refresh_next = _monotonic() + _REBOOT_RAN_REFRESH
+        self._reboot_warn_next = 0.0
 
     def _note_persisted(self, job_set_id: str, jobs: Set[str]) -> None:
         if self._reboot_persisted_job_set_id != job_set_id:

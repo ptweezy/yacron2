@@ -374,7 +374,7 @@ async def _gc_async(
         _parse_iso_utc,
         get_now,
     )
-    from yacron2.dag import DAG_RUN_NS_PREFIX, xcom_scope
+    from yacron2.dag import DAG_LEASE_PREFIX, DAG_RUN_NS_PREFIX, xcom_scope
     from yacron2.jobstate import ARTIFACT_STREAM_PREFIX, GLOBAL_SCOPE
 
     await backend.start()
@@ -457,7 +457,13 @@ async def _gc_async(
                         art_scopes.add(xcom_scope(dag_name, str(run_id)))
             keep[ARTIFACT_STREAM_PREFIX] = art_scopes
     result = await backend.collect_garbage(
-        keep=keep, grace=grace, dry_run=dry_run
+        keep=keep,
+        grace=grace,
+        # mirror the daemon's pass: only dagrun's per-run advance leases
+        # are ephemeral; every other lease's fence can be persisted in
+        # slot cancel records and must survive any grace window.
+        ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,),
+        dry_run=dry_run,
     )
     removed, skip_reason = await _sweep_blobs_async(
         backend,

@@ -15,6 +15,7 @@ tests/test_config_backends.py.
 
 import asyncio
 import contextlib
+import logging
 
 import pytest
 
@@ -393,6 +394,111 @@ async def test_takeover_with_failing_ran_refresh_defers_one_shots(
         assert b.reboot_ran("boot-job") is True  # no double-fire, no loss
     finally:
         await _stop(a, b)
+
+
+def _failing_list_records(monkeypatch, backend):
+    """Break the backend store's ran-stream listing; return a call counter."""
+    calls = {"n": 0}
+
+    async def _list(*args, **kw):
+        calls["n"] += 1
+        raise OSError("records unreadable")
+
+    monkeypatch.setattr(backend._store, "list_records", _list)
+    return calls
+
+
+def _ran_read_failures(caplog):
+    return [
+        r
+        for r in caplog.records
+        if "could not read the @reboot-ran set" in r.getMessage()
+    ]
+
+
+async def test_follower_failing_ran_read_is_debug_and_throttled(
+    tmp_path, monkeypatch, caplog
+):
+    # regression: a permanent follower whose ran-stream read persistently
+    # fails (e.g. a records/ subtree owned by a different user) used to
+    # emit the leader-worded "deferring pending @reboot one-shots" WARNING
+    # every renew round.  A follower defers nothing (reboot_ran's raise
+    # gate is leader-gated) and only needs the set by takeover -- which
+    # forces its own re-read -- so it logs DEBUG and retries the read at
+    # most once per _REBOOT_RAN_REFRESH.
+    clock = _Clock(monkeypatch)
+    ttl = "    ttl: 30\n"
+    a = await _started(_backend(tmp_path, "node-a", jsid="v1:s1", extra=ttl))
+    b = await _started(_backend(tmp_path, "node-b", jsid="v1:s1", extra=ttl))
+    try:
+        calls = _failing_list_records(monkeypatch, b)
+        caplog.set_level(
+            logging.DEBUG, logger="yacron2.backends.filesystem"
+        )
+        for _ in range(6):  # spans just under one refresh period
+            await a._renew_once()  # A keeps leading throughout
+            await b._renew_once()
+            assert b.is_leader() is False
+            clock.advance(10.0)
+        assert calls["n"] == 1  # ONE probe in the period, not one per round
+        failures = _ran_read_failures(caplog)
+        assert failures and all(
+            r.levelno == logging.DEBUG for r in failures
+        )
+        assert not any(
+            "deferring pending @reboot one-shots" in r.getMessage()
+            for r in caplog.records
+        )
+        # the next period gets exactly one more retry
+        await a._renew_once()
+        await b._renew_once()
+        assert calls["n"] == 2
+        assert all(
+            r.levelno == logging.DEBUG for r in _ran_read_failures(caplog)
+        )
+    finally:
+        await _stop(a, b)
+
+
+async def test_leader_failing_ran_read_warns_once_per_period(
+    tmp_path, monkeypatch, caplog
+):
+    # a holder really IS deferring its one-shots, so the WARNING stays --
+    # but at most once per _REBOOT_RAN_REFRESH; the read itself must keep
+    # retrying EVERY round (the takeover-recovery cadence pinned by
+    # test_takeover_with_failing_ran_refresh_defers_one_shots).
+    clock = _Clock(monkeypatch)
+    ttl = "    ttl: 30\n"
+    a = await _started(_backend(tmp_path, "node-a", jsid="v1:s1", extra=ttl))
+    try:
+        calls = _failing_list_records(monkeypatch, a)
+        caplog.set_level(
+            logging.DEBUG, logger="yacron2.backends.filesystem"
+        )
+        for _ in range(6):  # spans just under one warn period
+            await a._renew_once()
+            assert a.is_leader() is True
+            clock.advance(10.0)
+        assert calls["n"] == 6  # the read retried every round, unthrottled
+
+        def _warnings():
+            return [
+                r
+                for r in _ran_read_failures(caplog)
+                if r.levelno == logging.WARNING
+            ]
+
+        assert len(_warnings()) == 1  # once per period, not per round
+        assert "deferring pending @reboot one-shots" in (
+            _warnings()[0].getMessage()
+        )
+        # a period later the (still failing, still deferring) leader may
+        # surface it again
+        await a._renew_once()
+        assert calls["n"] == 7
+        assert len(_warnings()) == 2
+    finally:
+        await _stop(a)
 
 
 # --- lock-fidelity probe -----------------------------------------------------

@@ -118,6 +118,11 @@ class _DagRef:
     # superseded attempt's late completion cannot terminalise a re-claimed one.
     proc: str
     attempt: int
+    # for a sensor, the pokeCount observed at this poke's claim (None for a
+    # plain task).  Extends the completion fence to pokes: a re-poke re-stamps
+    # the SAME proc token and never bumps attempt, so only the poke number
+    # distinguishes a stale queued completion from the live in-flight poke.
+    poke: Optional[int] = None
 
 
 class DagScheduler:
@@ -783,6 +788,7 @@ class DagScheduler:
                     fail_reason="launch error",
                     proc=proc,
                     attempt=intent.attempt,
+                    poke=intent.poke_number if intent.is_sensor else None,
                 )
         # 5. terminal? release the lease; else schedule the next wake.
         final = stored if stored is not None else body
@@ -946,6 +952,7 @@ class DagScheduler:
             taskkey=taskkey,
             proc=self._cron._proc_token,
             attempt=intent.attempt,
+            poke=intent.poke_number if intent.is_sensor else None,
         )
         running = RunningJob(
             template,
@@ -970,6 +977,7 @@ class DagScheduler:
                 fail_reason="launch failed",
                 proc=dref.proc,
                 attempt=dref.attempt,
+                poke=dref.poke,
             )
             return
         self._cron.running_jobs[template.name].append(running)
@@ -1091,6 +1099,7 @@ class DagScheduler:
             fail_reason=running.fail_reason,
             proc=dref.proc,
             attempt=dref.attempt,
+            poke=dref.poke,
         )
 
     async def _finish_task(
@@ -1105,6 +1114,7 @@ class DagScheduler:
         fail_reason: Optional[str],
         proc: Optional[str] = None,
         attempt: Optional[int] = None,
+        poke: Optional[int] = None,
     ) -> None:
         task = dagcfg.spec.by_id.get(task_id)
         if task is None:
@@ -1125,10 +1135,11 @@ class DagScheduler:
                 jitter=jitter,
                 expected_proc=proc,
                 expected_attempt=attempt,
+                expected_poke=poke,
             )
         )
         try:
-            await self._mutate(ref[0], ref[1], transform)
+            _, applied = await self._mutate(ref[0], ref[1], transform)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - one failed RMW must not wedge
@@ -1145,9 +1156,21 @@ class DagScheduler:
                 fail_reason=fail_reason,
                 proc=proc,
                 attempt=attempt,
+                poke=poke,
             )
         else:
+            # fenced out (a duplicate, a superseded attempt, or a stale poke's
+            # queued retry) or applied: either way this completion is settled,
+            # so a queued copy must not retry forever.
             self._pending_completions.pop((ref, taskkey), None)
+            if not applied:
+                logger.debug(
+                    "dag run %s/%s: task %s completion dropped as "
+                    "stale/duplicate by the fence",
+                    ref[0],
+                    ref[1],
+                    taskkey,
+                )
         # trigger a fresh advance without blocking the reaper on the per-run
         # lock (a concurrent periodic advance may hold it).
         self._wake[ref] = 0.0
@@ -1164,6 +1187,7 @@ class DagScheduler:
         fail_reason: Optional[str],
         proc: Optional[str],
         attempt: Optional[int],
+        poke: Optional[int],
     ) -> None:
         key = (ref, taskkey)
         prior = self._pending_completions.get(key)
@@ -1179,6 +1203,7 @@ class DagScheduler:
             "failReason": fail_reason,
             "proc": proc,
             "attempt": attempt,
+            "poke": poke,
             "delay": delay,
             "nextTryAt": _now() + delay,
         }
@@ -1196,8 +1221,12 @@ class DagScheduler:
 
         ``mark_task_finished`` is fenced and idempotent (a duplicate or
         superseded apply is a no-op), so re-running the whole transform is
-        safe even when the failed mutate partially landed.  Success pops the
-        queue entry; another failure re-queues it with a bounded backoff.
+        safe even when the failed mutate partially landed: a sensor
+        completion that landed despite the timeout bumped ``pokeCount``, so
+        the queued copy fails the poke fence and is dropped instead of being
+        applied to a later in-flight poke (proc/attempt alone cannot tell
+        pokes apart).  A settled entry (applied OR fenced out as stale) pops
+        the queue entry; another failure re-queues it with a bounded backoff.
         """
         for key in list(self._pending_completions):
             pc = self._pending_completions.get(key)
@@ -1220,6 +1249,7 @@ class DagScheduler:
                 fail_reason=pc["failReason"],
                 proc=pc["proc"],
                 attempt=pc["attempt"],
+                poke=pc["poke"],
             )
 
     # =====================================================================

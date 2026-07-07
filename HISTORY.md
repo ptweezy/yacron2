@@ -5,6 +5,133 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.2.7
+
+This release makes yacron2 **stateful**. An opt-in durable state store lets
+the scheduler remember across restarts -- retries that survive a daemon
+restart, `@reboot` that really means once per boot, Prometheus counters that
+do not reset -- and turns a shared directory into fleet-wide coordination:
+cluster-scoped concurrency, cross-node retry takeover, and leader election
+with nothing but a mount both nodes can reach. On top of the store sit a
+state API handed to every job (key-value, cursors, fleet locks, idempotency
+claims, artifacts, run-scoped secrets) and durable **DAG orchestration**
+(dependencies, XCom, fan-out, sensors, approval gates, backfills) with
+crash-resume. All of it is opt-in: without a `state:` block (and a `dags:`
+block for pipelines) nothing changes -- no new behavior, no new files on
+disk, and the zero-new-dependency, architecture-portable core install is
+untouched.
+
+- **A durable state store behind a single `state:` block.** `state.path`
+  names a directory -- a local disk or a shared NFS/EFS-style mount -- and
+  the daemon keeps everything under `<path>/<deploymentId>`: append-only
+  JSON record streams, mutable documents, content-addressed blobs, and
+  `flock`-guarded TTL leases with monotonic fence counters. The write
+  discipline is crash-safe on POSIX and Windows alike (atomic
+  temp-plus-rename with directory fsyncs; a record that cannot be parsed is
+  quarantined, never trusted and never fatal), files are owner-only
+  (`0o700`/`0o600` -- archived job output is exactly where secrets live),
+  and archived output additionally passes through a conservative
+  best-effort secret redactor before it is written. A store outage degrades
+  the stateful features, never scheduling: durable writes are
+  fire-and-forget, reads on scheduling paths are bounded and fall back,
+  store calls run on abandonable worker threads so a hung hard mount cannot
+  wedge the daemon or its shutdown, and `state.maxOpsPerSecond` throttles
+  everything except lease renewals, which must never queue behind bulk
+  work. The full model is documented on the wiki's Durable-State page.
+
+- **Restart-surviving scheduling.** With a store configured, a pending
+  retry re-arms after a daemon restart instead of vanishing; `@reboot`
+  distinguishes a real boot from a mere restart (and, under election, runs
+  once per fleet); Prometheus counters persist across restarts; the run
+  ledger, optionally archived output (`archiveOutput`), and catch-up
+  checkpoints are durable; and in-flight run records let a restarted daemon
+  settle the runs that died with it, so failure handlers and retries fire
+  for work a crash orphaned.
+
+- **Garbage collection that can prove absence.** Every node periodically
+  writes a manifest of the jobs, scopes, and dags it carries; GC deletes a
+  stream only when no recent manifest references it *and* its newest record
+  is older than `state.gcGraceSeconds` (default seven days), and it defers
+  wholesale until the retained manifest history spans a full grace window
+  -- "nobody has manifested yet" never reads as "nobody wants this".
+  Artifact streams and payload blobs age out with their scope, run
+  documents of removed dags are collected by the daemon that owned them,
+  and of the lease files only the per-run DAG advance class is ever
+  reclaimed: every other lease carries fences that persist in durable
+  records, so it is never deleted at any age. A node that is merely down
+  loses nothing.
+
+- **Fleet HA through a shared directory.** A new `cluster.backend:
+  filesystem` runs leader election over the same flock-and-lease machinery
+  -- no gossip ports, no Kubernetes, no etcd -- and composes with
+  everything clustering shipped in 1.2.1. `concurrencyScope: cluster` makes
+  `concurrencyPolicy: Forbid`/`Replace` hold fleet-wide through per-job
+  slot leases (a `Replace` fired anywhere cancels the run wherever it
+  lives; a crashed holder's slot frees by TTL), a pending retry left by a
+  dead node can be claimed and resumed by a survivor -- serialized on a
+  claim lease and re-checked under it; the contract is at-least-once,
+  honestly -- and `@reboot` under election survives leader failover in the
+  safe direction: a takeover can delay a one-shot, never double-run it.
+
+- **Every job gets a state API.** With `state.jobApi` (on by default once a
+  store is configured) the daemon serves a loopback-only HTTP endpoint and
+  injects its address and a per-run bearer token into each job's
+  environment; the `yacron2` binary doubles as the client. `yacron2 state
+  get/set/delete/keys` is durable KV; `yacron2 cursor` keeps resumable
+  positions; `yacron2 lock` gives fleet-wide mutexes and semaphores backed
+  by the same TTL leases the cluster uses, with fencing tokens and a
+  `lock run --` wrapper; `yacron2 idempotent` makes run-once guards honest
+  (exit `0` fresh, `5` duplicate, `1` transport or store error); `yacron2
+  artifact` stores content-addressed payloads under configurable size caps.
+  A job's `secrets:` block stages secrets over the endpoint for exactly one
+  run -- resolved fresh, served only to that run, never in the environment
+  and never in the durable store -- read back with `yacron2 secret get`.
+  Scopes default to the job's own name; `stateAllowedScopes` opens shared
+  ones.
+
+- **DAG orchestration.** A new `dags:` section defines multi-step pipelines
+  on the job grammar: tasks with `dependsOn` and per-task retries, XCom
+  hand-off between tasks (`yacron2 xcom push/pull`), mapped fan-out over a
+  pushed list (capped, launched in bounded batches), sensors that poke on
+  an interval, and approval gates a human resolves from the dashboard or
+  API. Dags run on cron schedules (the job schedule grammar, minus
+  `@reboot`), manual triggers, and date-range backfills. A per-run advance
+  lease makes exactly one node drive each run; when a driver dies, the
+  lease lapses and a peer adopts the run mid-flight, reconciling exactly
+  what was and was not still running. Run history is retained per-dag and
+  collected under the same grace rules. See the wiki's
+  Orchestration-and-DAGs page.
+
+- **Dashboard and HTTP API.** The dashboard gains DAG cards with a run
+  drawer and task graph (trigger, backfill, and approve/reject inline),
+  cluster/HA chips, per-job durable run history, and a metadata-only state
+  inspector -- streams, documents, leases, and blob inventory by name and
+  size, never values. The HTTP API adds the matching `/dags/...` routes
+  (runs, XCom, live task logs) and `/state` inventory routes, and the
+  Prometheus endpoint grows state-store and DAG metric families. All routes
+  are documented on the wiki's HTTP-API page.
+
+- **Store administration.** `yacron2 state backup` writes an owner-only
+  `.tar.gz` of the whole store, safe against a live daemon; `state restore`
+  merges it back atomically (fence-aware, refuses a non-empty store without
+  `--force`, and is not safe while a daemon uses the store); `state
+  migrate` copies a store across paths or mounts without a reader ever
+  seeing a torn record; `state gc [--dry-run]` runs or previews a
+  collection pass; `state check` verifies the store is usable and prints an
+  inventory; `state migrate-schema` rewrites records of older known
+  schemes.
+
+- **Packaging and examples.** orjson joins uvloop in the `speedups` extra,
+  accelerating the durable-state and cluster-gossip JSON paths through
+  `yacron2._json`, whose stdlib fallback is behavior-identical -- the core
+  install stays zero-new-dependency and architecture-portable, and the
+  prebuilt binaries bundle orjson wherever a real wheel or verified source
+  build exists, with a verify-or-strip step mirroring uvloop's. New
+  examples: `example/job-state` (the CLI primitives), `example/dag` and
+  `example/dag-cluster` (pipelines, single-node and fleet), and
+  `example/grand-tour` (a docker-compose fleet exercising the whole
+  feature set end to end).
+
 ## 1.2.6 (2026-07-03)
 
 A toolchain and packaging release. There are **no behavior, API, or

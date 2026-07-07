@@ -5268,6 +5268,7 @@ class Cron:
         expiry, so a single unreadable blip self-heals.
         """
         period = max(1.0, self._slot_ttl / 3)
+        me = asyncio.current_task()
         while True:
             await asyncio.sleep(period)
             backend = self.state_backend
@@ -5325,6 +5326,22 @@ class Cron:
                     name,
                 )
                 continue
+            if self._slot_renewers.get(name) is not me:
+                # We were retired mid-renew: _release_cluster_slot popped us
+                # from _slot_renewers, popped the lease, and scheduled its
+                # release (or a re-acquire replaced us).  A cancel racing this
+                # exact point does NOT reliably raise: on Python <=3.11
+                # asyncio.wait_for returns the resolved renew result instead of
+                # propagating the CancelledError (`if fut.done(): return
+                # fut.result()`), so the cancel only lands at the next sleep --
+                # after this iteration's tail would otherwise run.  Stand down
+                # now, without touching _slot_leases: re-populating the entry
+                # the release just popped would make _release_slot_lease treat
+                # it as a fresh claim and skip the release (leaking the slot a
+                # whole TTL, its would-be holder spinning); the takeover branch
+                # below could likewise pop a genuine re-claim's lease.  The
+                # finish path owns the release from here.
+                return
             if renewed is not None:
                 self._slot_leases[name] = renewed
                 continue

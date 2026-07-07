@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<!-- The GitHub social-preview card (1280x640), rendered by
+     capture_social_card.py. Colors and type mirror the dashboard's carolina
+     phosphor theme (yacron2/web/index.html). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>yacron2 social card</title>
+<style>
+  :root {
+    --bg:      #04070b;
+    --panel:   #081019;
+    --border:  #173347;
+    --border2: #22506e;
+    --fg:      #5cabde;
+    --fg-dim:  #4b9cd3;
+    --fg-faint:#5a90b0;
+    --accent:  #b5ddf5;
+    --glow:    rgba(92, 171, 222, .5);
+    --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code",
+            Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { width: 1280px; height: 640px; overflow: hidden; }
+  .card {
+    position: relative; width: 1280px; height: 640px;
+    background: radial-gradient(120% 130% at 22% 18%, #071019 0%, var(--bg) 58%);
+    font-family: var(--mono); color: var(--fg);
+  }
+  /* faint CRT scanlines over everything, like body.scan */
+  .card::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0 2px, rgba(0,0,0,.16) 2px 4px);
+  }
+  .left { position: absolute; left: 72px; top: 72px; width: 620px; }
+  .brandline { display: flex; align-items: baseline; gap: 30px; white-space: nowrap; }
+  .mark {
+    font-size: 88px; font-weight: 700; line-height: 1;
+    text-shadow: 0 0 26px var(--glow), 0 0 8px var(--glow);
+    display: inline-block; transform: rotate(-12deg); transform-origin: 50% 55%;
+  }
+  h1 {
+    font-size: 82px; font-weight: 700; letter-spacing: 2px;
+    text-shadow: 0 0 22px var(--glow);
+  }
+  .tag { margin-top: 14px; font-size: 25px; color: var(--fg-faint); letter-spacing: 1px; }
+  .pitch { margin-top: 30px; font-size: 29px; line-height: 1.45; color: var(--accent); width: 590px; }
+  .chips { margin-top: 28px; display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+  .chip {
+    font-size: 19.5px; color: var(--fg-dim); white-space: nowrap;
+    border: 1px solid var(--border); background: var(--panel);
+    border-radius: 7px; padding: 7px 15px;
+  }
+  .install {
+    display: inline-block; margin-top: 26px;
+    font-size: 22px; color: var(--accent);
+    border: 1px solid var(--border2); background: var(--panel);
+    border-radius: 8px; padding: 11px 18px;
+    box-shadow: 0 0 24px rgba(92, 171, 222, .18);
+  }
+  .install b { color: var(--fg); font-weight: 700; }
+  .install .p { color: var(--fg-faint); }
+  /* the real dashboard, bleeding off the bottom-right corner */
+  .shot {
+    position: absolute; right: -74px; top: 118px; width: 660px;
+    border: 1px solid var(--border2); border-radius: 12px;
+    box-shadow: 0 0 60px rgba(92, 171, 222, .22), 0 24px 70px rgba(0, 0, 0, .65);
+    display: block;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="left">
+    <div class="brandline"><span class="mark">&#9626;</span><h1>yacron2</h1></div>
+    <div class="tag">// job scheduler</div>
+    <div class="pitch">The modern, container-native cron replacement.</div>
+    <div class="chips">
+      <span class="chip">runs in locked-down containers</span>
+      <span class="chip">prebuilt for every architecture</span>
+      <span class="chip">dashboard &middot; DAGs &middot; clustering built in</span>
+    </div>
+    <div><span class="install"><span class="p">$</span> <b>pip install yacron2</b></span></div>
+  </div>
+  <img class="shot" src="/docs/img/dashboard-overview.png" alt="">
+</div>
+</body>
+</html>

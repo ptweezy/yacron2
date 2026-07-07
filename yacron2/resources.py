@@ -124,9 +124,7 @@ class ResourceUsage:
         # json.loads accepts NaN/Infinity from hand-edited ledger records,
         # which aiohttp's default json.dumps would happily re-emit and
         # browsers then reject.  Both count as malformed here.
-        if any(
-            isinstance(v, bool) for v in (raw_user, raw_system, raw_rss)
-        ):
+        if any(isinstance(v, bool) for v in (raw_user, raw_system, raw_rss)):
             return None
         try:
             cpu_user = float(raw_user)
@@ -323,9 +321,7 @@ class ResourceMonitor:
         # sum.  The max() only guards against per-sample jitter in the
         # readings ever nudging a total backwards.
         cpu_user = self._departed_user + sum(u for u, _ in live.values())
-        cpu_system = self._departed_system + sum(
-            s for _, s in live.values()
-        )
+        cpu_system = self._departed_system + sum(s for _, s in live.values())
         self._cpu_user = max(self._cpu_user, cpu_user)
         self._cpu_system = max(self._cpu_system, cpu_system)
         self._max_rss = max(self._max_rss, rss)
@@ -511,9 +507,7 @@ class _CgroupV2Reader:
         """``memory.current`` less reclaimable file cache, or ``None``."""
         if self._dir is None:
             return None
-        raw = self._read_first_line(
-            os.path.join(self._dir, "memory.current")
-        )
+        raw = self._read_first_line(os.path.join(self._dir, "memory.current"))
         if raw is None:
             return None
         try:

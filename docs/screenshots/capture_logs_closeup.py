@@ -27,6 +27,11 @@ def main():
         ctx.add_init_script(
             "try{localStorage.setItem('yacron2.boot','false');"
             "localStorage.setItem('yacron2.zen','false');}catch(e){}"
+            # pin the idle-cruising logo upright (see capture_dashboard.py)
+            "document.addEventListener('DOMContentLoaded',()=>{"
+            "const s=document.createElement('style');"
+            "s.textContent='#mark{transform:none !important}';"
+            "document.head.appendChild(s)});"
         )
         page = ctx.new_page()
         page.goto(BASE)

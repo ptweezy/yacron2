@@ -1748,9 +1748,7 @@ def _attach_observability(
                     "cluster.observability.{} only applies to the overlay "
                     "mesh a lease backend (kubernetes/etcd/filesystem) "
                     "stands up; with backend: gossip node stats ride the "
-                    "election mesh, so set cluster.{} instead".format(
-                        key, key
-                    )
+                    "election mesh, so set cluster.{} instead".format(key, key)
                 )
         return
     # a lease backend has no node-to-node channel, so the overlay must stand up

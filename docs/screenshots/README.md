@@ -37,7 +37,31 @@ clipping. To refresh them after a UI change:
    python docs/screenshots/capture_logs_closeup.py
    ```
 
-4. Review the PNGs, then copy the keepers over `docs/img/` (re-saving with
+4. **The spinning-logo GIFs** (`logo-spin.gif` + `logo-spin-light.gif`) need
+   no daemon at all: the script serves the working tree itself and drives the
+   mark's angle frame-by-frame through an injected style, so the loop is
+   seamless and the replay speed tracks the page's `MARK_CRUISE` constant.
+   Needs Pillow alongside playwright:
+
+   ```shell
+   python docs/screenshots/capture_logo_gif.py
+   ```
+
+5. **The GitHub social-preview card** (`social-preview.png`, 1280x640) is
+   rendered from `social-card.html`, a static page styled after the carolina
+   theme with `docs/img/dashboard-overview.png` inset as the product shot, so
+   regenerate that overview first if the UI changed. Also needs Pillow:
+
+   ```shell
+   python docs/screenshots/capture_social_card.py
+   ```
+
+   GitHub has no API for the social preview: after regenerating, upload
+   `docs/img/social-preview.png` by hand under **Settings -> General ->
+   Social preview** (1 MB limit). That image is what link unfurls on Slack,
+   Discord, Teams, and X/Twitter show for the repo URL.
+
+6. Review the PNGs, then copy the keepers over `docs/img/` (re-saving with
    Pillow's `optimize=True` shaves a few percent).
 
 Notes:

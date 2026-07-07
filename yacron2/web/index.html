@@ -5128,6 +5128,10 @@
   // ===================================================================
   //  wiring
   // ===================================================================
+  // restarts the logo's idle-cruise loop when it's parked; assigned the real
+  // implementation in wire(), but callable from anywhere (setConnected fires
+  // it when the live state flips, which happens well after wire() has run)
+  let kickMark = () => {};
   function wire() {
     $("rows").addEventListener("click", (e) => {
       const runBtn = e.target.closest("[data-run]");
@@ -5166,11 +5170,12 @@
     });
     document.addEventListener("click", () => toggleColsMenu(false));
     const mark = $("mark");
-    // the mark idles at a lazy cruise; friction bleeds any nudge back toward
-    // the cruise speed rather than toward a standstill. reduced-motion parks
-    // the cruise (a deliberate click can still shove it, same as before).
-    const MARK_CRUISE = 345;                                   // deg/s -- one lap every 10s
-    const markCruise = () => (reduceMotion() ? 0 : MARK_CRUISE);
+    // the mark idles at a steady cruise while the daemon is live; friction
+    // bleeds any nudge back toward the cruise speed rather than toward a
+    // standstill. losing the signal (or reduced-motion) drops the cruise
+    // target to 0 so it coasts to a natural stop; clicks still shove it.
+    const MARK_CRUISE = 345;                                  // resting spin rate, deg/s
+    const markCruise = () => (reduceMotion() || !state.connected ? 0 : MARK_CRUISE);
     let markDeg = 0, markVel = markCruise(), markRaf = 0, markLast = 0;
     const spinMark = (t) => {
       const dt = Math.min((t - markLast) / 1000, 0.1);
@@ -5183,9 +5188,9 @@
       if (Math.abs(markVel - cruise) <= 3) markVel = cruise;
       mark.style.transform = `rotate(${markDeg}deg)`;
       if (markVel || cruise) { markRaf = requestAnimationFrame(spinMark); }
-      else { markRaf = 0; }  // parked: reduced motion with no nudge in flight
+      else { markRaf = 0; }  // parked: no signal / reduced motion, no nudge in flight
     };
-    const kickMark = () => {
+    kickMark = () => {
       if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
     };
     // one nudge = one click's worth of spin; the sign picks the direction

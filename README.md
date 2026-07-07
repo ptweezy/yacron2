@@ -14,6 +14,13 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/logo-spin-light.gif">
+    <img src="https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/logo-spin.gif" alt="The yacron2 mark, spinning the way it does in the live dashboard" height="46">
+  </picture>
+</p>
+
 A modern, container-friendly, optionally-distributed, fault-tolerant, highly available, leader-electing, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.

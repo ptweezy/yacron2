@@ -152,6 +152,13 @@ def main():
             "try{if(!localStorage.getItem('yacron2.bootWant'))"
             "localStorage.setItem('yacron2.boot','false');"
             "localStorage.setItem('yacron2.zen','false');}catch(e){}"
+            # the logo idle-cruises via JS inline transforms, which the
+            # reduced-motion CSS can't suppress; pin it upright so shots
+            # don't catch it at a random angle
+            "document.addEventListener('DOMContentLoaded',()=>{"
+            "const s=document.createElement('style');"
+            "s.textContent='#mark{transform:none !important}';"
+            "document.head.appendChild(s)});"
         )
         page = ctx.new_page()
         page.goto(BASE)

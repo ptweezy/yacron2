@@ -723,10 +723,16 @@ jobs:
         run: |
           set -euo pipefail
           # Pull this version's section out of HISTORY.md (everything between its
-          # "## X.Y.Z (...)" header and the next "## " header), dropping leading
-          # blank lines. Empty if there is no matching section.
+          # own "## X.Y.Z" header and the next "## " header), dropping leading
+          # blank lines. The header is matched on whitespace-split fields
+          # ($1 == "##", $2 == the exact version) so it hits whether the heading
+          # is still bare ("## 1.2.9") or already dated ("## 1.2.9 (2026-07-07)")
+          # -- at release time the newest entry is the undated form, so a
+          # trailing-space/substring match would silently miss it. The exact $2
+          # match also keeps releasing 1.2.1 from swallowing 1.2.10's section.
+          # Empty if there is no matching section.
           awk -v ver="$NEW" '
-            index($0, "## " ver " ") == 1 { cap = 1; next }
+            $1 == "##" && $2 == ver { cap = 1; next }
             cap && /^## / { exit }
             cap { print }
           ' HISTORY.md | sed '/./,$!d' > release-notes.md

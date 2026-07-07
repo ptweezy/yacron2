@@ -33,8 +33,9 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterator, List, Optional, Tuple
 
 try:
     import psutil
@@ -50,7 +51,25 @@ logger = logging.getLogger("yacron2")
 # sampled high-water mark, so a shorter interval catches sharper spikes at the
 # cost of more wakeups; total CPU is cumulative and re-read every sample, so it
 # converges regardless of the interval as long as the run outlives one tick.
+# Per-job override: monitorResources.interval (yacron2.config).
 SAMPLE_INTERVAL = 1.0
+
+# Default cap on the per-run CPU/RSS series retained for charts (points, not
+# samples: a run longer than the cap is downsampled in place, see
+# _SeriesRecorder).  Sized so a full series stays a few KB inside the durable
+# run record.  Per-job override: monitorResources.history; 0 disables the
+# series and keeps the summary numbers only.
+MONITOR_HISTORY_DEFAULT = 240
+
+# Hard cap applied when *parsing* a series out of a ledger record
+# (ResourceUsage.from_dict): a foreign or hand-edited record must not be able
+# to balloon the in-memory history, whatever it claims.
+MAX_SERIES_POINTS = 4096
+
+# Node history defaults: one sample every 5s, 720 points = the last hour.
+# Overrides: web.nodeHistory.{interval,points} (yacron2.config).
+NODE_HISTORY_INTERVAL = 5.0
+NODE_HISTORY_POINTS = 720
 
 # How long (seconds) a NodeResourceSampler.snapshot() result is memoised.
 # psutil.cpu_percent(interval=None) measures "since the previous call" on one
@@ -74,6 +93,130 @@ else:  # pragma: no cover - only when the optional import failed
     _TRANSIENT_ERRORS = ()
 
 
+class _SeriesRecorder:
+    """A bounded, self-downsampling time series of ``[t, cpu%, rss]`` points.
+
+    Samples arrive on a fixed cadence; the recorder groups them into buckets
+    of ``stride`` samples (initially 1) and emits one point per full bucket:
+    the bucket's *last* timestamp, its *average* CPU%, and its *peak* RSS --
+    the aggregates that keep a downsampled chart honest (an averaged RSS would
+    hide exactly the spikes people monitor memory for).  When the stored
+    points hit the cap, adjacent pairs are merged with the same aggregation
+    and the stride doubles, so a run of any length occupies at most
+    ``maxpoints`` points with uniform bucket widths and its resolution decays
+    gracefully (a 4-minute run keeps 1s buckets; a 3-day run ends up around
+    20-minute buckets).
+
+    Timestamps are wall-clock epoch seconds, so historical series from
+    different runs (and different nodes on a shared ledger) line up on a
+    common axis.  All mutation happens under the owning monitor's sample
+    lock; :meth:`points` copies, so readers never see a half-merged list.
+    """
+
+    __slots__ = (
+        "_max",
+        "_points",
+        "_stride",
+        "_count",
+        "_cpu_sum",
+        "_rss_max",
+        "_last_t",
+    )
+
+    def __init__(self, maxpoints: int) -> None:
+        self._max = max(2, maxpoints)
+        self._points: List[List[float]] = []
+        self._stride = 1  # samples per emitted point
+        # the accumulating (not yet emitted) bucket
+        self._count = 0
+        self._cpu_sum = 0.0
+        self._rss_max = 0
+        self._last_t = 0.0
+
+    def add(self, t: float, cpu_percent: float, rss: int) -> None:
+        self._count += 1
+        self._cpu_sum += cpu_percent
+        self._rss_max = max(self._rss_max, rss)
+        self._last_t = t
+        if self._count < self._stride:
+            return
+        self._points.append(
+            [
+                round(self._last_t, 2),
+                round(self._cpu_sum / self._count, 2),
+                self._rss_max,
+            ]
+        )
+        self._count = 0
+        self._cpu_sum = 0.0
+        self._rss_max = 0
+        if len(self._points) >= self._max:
+            self._compact()
+
+    def _compact(self) -> None:
+        """Merge adjacent point pairs and double the stride."""
+        merged: List[List[float]] = []
+        pts = self._points
+        for i in range(0, len(pts) - 1, 2):
+            a, b = pts[i], pts[i + 1]
+            merged.append(
+                [b[0], round((a[1] + b[1]) / 2.0, 2), max(a[2], b[2])]
+            )
+        if len(pts) % 2:
+            # an odd tail point (possible only right after a stride change)
+            # stays as-is: it is the newest data, never worth dropping.
+            merged.append(pts[-1])
+        self._points = merged
+        self._stride *= 2
+
+    def points(self) -> List[List[float]]:
+        """A copy of the emitted points, oldest first.
+
+        The accumulating partial bucket is included as a provisional final
+        point so a live chart tracks the newest reading instead of lagging up
+        to a full (possibly minutes-wide) bucket behind.
+        """
+        out = [list(p) for p in self._points]
+        if self._count:
+            out.append(
+                [
+                    round(self._last_t, 2),
+                    round(self._cpu_sum / self._count, 2),
+                    self._rss_max,
+                ]
+            )
+        return out
+
+
+def _parse_series(raw: Any) -> Optional[List[List[float]]]:
+    """Sanitise a ``series`` field from a ledger record, or ``None``.
+
+    Applies the same distrust as :meth:`ResourceUsage.from_dict`: entries
+    must be ``[t, cpu%, rss]`` triples of finite numbers (bools excluded --
+    they are int subclasses), anything else is dropped point-wise, and the
+    whole list is capped at :data:`MAX_SERIES_POINTS`.  Returns ``None``
+    rather than an empty list so "no series" has a single spelling.
+    """
+    if not isinstance(raw, list):
+        return None
+    out: List[List[float]] = []
+    for entry in raw[:MAX_SERIES_POINTS]:
+        if not isinstance(entry, list) or len(entry) != 3:
+            continue
+        if any(isinstance(v, bool) for v in entry):
+            continue
+        try:
+            t = float(entry[0])
+            cpu = float(entry[1])
+            rss = int(entry[2])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not (math.isfinite(t) and math.isfinite(cpu)):
+            continue
+        out.append([t, max(0.0, cpu), max(0, rss)])
+    return out or None
+
+
 @dataclass(slots=True)
 class ResourceUsage:
     """A finished run's sampled CPU and memory usage.
@@ -90,14 +233,25 @@ class ResourceUsage:
     cpu_system_seconds: float
     max_rss_bytes: int
     samples: int
+    # downsampled [t, cpu%, rss] chart series for the run (bounded by the
+    # job's monitorResources.history); None when series capture is off or
+    # nothing was recorded.  Defaulted so pre-existing construction sites
+    # (and summary-only ledger records) stay valid.
+    series: Optional[List[List[float]]] = None
 
     @property
     def cpu_total_seconds(self) -> float:
         return self.cpu_user_seconds + self.cpu_system_seconds
 
-    def to_dict(self) -> Dict[str, Any]:
-        """JSON-serialisable summary for the API / durable ledger."""
-        return {
+    def to_dict(self, *, include_series: bool = False) -> Dict[str, Any]:
+        """JSON-serialisable summary for the API / durable ledger.
+
+        The chart series is opt-in (``include_series``): the durable ledger
+        record and the dedicated resources endpoint carry it, while the
+        polled dashboard payloads keep the summary-only shape so a monitored
+        job does not multiply the size of every /jobs tick.
+        """
+        data: Dict[str, Any] = {
             "cpu_user_seconds": self.cpu_user_seconds,
             "cpu_system_seconds": self.cpu_system_seconds,
             # denormalised for convenience -- every consumer wants the total,
@@ -106,6 +260,9 @@ class ResourceUsage:
             "max_rss_bytes": self.max_rss_bytes,
             "samples": self.samples,
         }
+        if include_series and self.series:
+            data["series"] = [list(p) for p in self.series]
+        return data
 
     @classmethod
     def from_dict(cls, data: Any) -> Optional["ResourceUsage"]:
@@ -138,7 +295,13 @@ class ResourceUsage:
         samples = data.get("samples")
         if not isinstance(samples, int) or isinstance(samples, bool):
             samples = 0
-        return cls(cpu_user, cpu_system, max_rss, samples)
+        return cls(
+            cpu_user,
+            cpu_system,
+            max_rss,
+            samples,
+            series=_parse_series(data.get("series")),
+        )
 
 
 class ResourceMonitor:
@@ -160,10 +323,14 @@ class ResourceMonitor:
         *,
         job_name: str,
         interval: float = SAMPLE_INTERVAL,
+        history: int = MONITOR_HISTORY_DEFAULT,
     ) -> None:
         self._pid = pid
         self._job_name = job_name
         self._interval = interval
+        # bounded chart series of the run's samples (see _SeriesRecorder);
+        # history <= 0 keeps the summary numbers only.
+        self._recorder = _SeriesRecorder(history) if history > 0 else None
         self._task: Optional[asyncio.Task] = None
         self._proc: Any = None  # psutil.Process, once attached
         # Accumulated totals.  CPU time is tracked per tree member: _members
@@ -213,6 +380,20 @@ class ResourceMonitor:
             "cpu_percent": self._live_cpu_percent,
             "rss_bytes": self._live_rss,
         }
+
+    def series(self) -> Optional[List[List[float]]]:
+        """The run-so-far ``[t, cpu%, rss]`` chart series, oldest first.
+
+        ``None`` when series capture is off (history 0) or nothing has been
+        sampled yet.  Taken under the sample lock -- a worker-thread sample
+        may be mid-merge when the dashboard asks -- and already a copy, safe
+        to serialise as-is.
+        """
+        if self._recorder is None:
+            return None
+        with self._sample_lock:
+            pts = self._recorder.points()
+        return pts or None
 
     def start(self) -> None:
         """Attach to the pid and begin sampling (no-op if unavailable).
@@ -337,6 +518,11 @@ class ResourceMonitor:
                     0.0, (cpu_total - prev_total) / dt * 100.0
                 )
         self._prev_cpu = (cpu_total, now)
+        # chart series: one [t, cpu%, rss] point per sample, downsampled in
+        # place by the recorder.  The first sample's 0.0 CPU% is recorded
+        # as-is (there is no previous sample to measure against).
+        if self._recorder is not None:
+            self._recorder.add(time.time(), self._live_cpu_percent, rss)
 
     async def stop(self) -> Optional[ResourceUsage]:
         """Stop sampling and return the accumulated usage (``None`` if none).
@@ -364,6 +550,7 @@ class ResourceMonitor:
             cpu_system_seconds=self._cpu_system,
             max_rss_bytes=self._max_rss,
             samples=self._samples,
+            series=self.series(),
         )
 
 
@@ -612,6 +799,11 @@ class NodeResourceSampler:
             usage = self._cgroup.cpu_usage_seconds()
             if usage is not None:
                 self._cgroup_prev_cpu = (usage, time.monotonic())
+        # background node history (see start_history): a bounded ring of
+        # [t, cpu%, mem%] points feeding the dashboard's node chart.
+        self._history: Optional[Deque[List[float]]] = None
+        self._history_interval = NODE_HISTORY_INTERVAL
+        self._history_task: Optional[asyncio.Task] = None
 
     def snapshot(self) -> Optional[Dict[str, Any]]:
         """Current node CPU%/memory (+ this daemon's own), or ``None``."""
@@ -699,3 +891,98 @@ class NodeResourceSampler:
                 data["cpu_count"] = max(1, math.ceil(quota))
         except Exception:  # noqa: BLE001 - never fatal
             pass
+
+    def start_history(self, *, interval: float, points: int) -> None:
+        """Begin (or reconfigure) background node-history sampling.
+
+        Idempotent per configuration: called on every web-app (re)start, it
+        leaves a running task alone when nothing changed, and rebuilds the
+        ring -- carrying over the retained points -- when the window size
+        changes, so a config reload does not blank the node chart.  No-op
+        when psutil is unavailable (snapshots would never land anyway).
+        """
+        if psutil is None:
+            return
+        if (
+            self._history_task is not None
+            and not self._history_task.done()
+            and self._history is not None
+            and self._history.maxlen == points
+            and self._history_interval == interval
+        ):
+            return
+        retained = list(self._history) if self._history is not None else []
+        self._history = deque(retained[-points:], maxlen=points)
+        self._history_interval = interval
+        if self._history_task is not None:
+            self._history_task.cancel()
+        self._history_task = asyncio.create_task(self._history_run())
+
+    async def stop_history(self) -> None:
+        """Cancel the history task (retaining the ring for a later restart)."""
+        task, self._history_task = self._history_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _history_run(self) -> None:
+        try:
+            while True:
+                snap = self.snapshot()
+                history = self._history
+                if snap is not None and history is not None:
+                    history.append(
+                        [
+                            round(time.time(), 2),
+                            round(float(snap.get("cpu_percent") or 0.0), 2),
+                            round(float(snap.get("mem_percent") or 0.0), 2),
+                        ]
+                    )
+                await asyncio.sleep(self._history_interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - history must never crash the loop
+            logger.warning(
+                "node history sampler stopped on an unexpected error",
+                exc_info=True,
+            )
+
+    def history(self) -> Optional[Dict[str, Any]]:
+        """The retained node history, or ``None`` when never started.
+
+        ``points`` is oldest-first ``[t, cpu%, mem%]``; ``interval`` is the
+        sampling cadence so a chart can mark gaps (a stretch with no points
+        wider than the cadence means the daemon was down, not idle).
+        """
+        if self._history is None:
+            return None
+        return {
+            "interval": self._history_interval,
+            "points": [list(p) for p in self._history],
+        }
+
+
+def resolve_node_history_config(
+    web_config: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Resolve the raw ``web.nodeHistory`` option into effective settings.
+
+    Returns ``None`` when disabled, else ``{"interval", "points"}``.  Enabled
+    by default whenever the web API is on; ``nodeHistory: false`` /
+    ``nodeHistory: true`` are shorthands for the map form (mirroring how
+    ``web.metrics`` resolves in yacron2.prometheus).
+    """
+    raw = web_config.get("nodeHistory")
+    if raw is False:
+        return None
+    if raw is None or raw is True:
+        raw = {}
+    if not raw.get("enabled", True):
+        return None
+    return {
+        "interval": float(raw.get("interval", NODE_HISTORY_INTERVAL)),
+        "points": int(raw.get("points", NODE_HISTORY_POINTS)),
+    }

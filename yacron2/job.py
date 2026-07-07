@@ -782,7 +782,10 @@ class RunningJob:
             # stays inert and resource_usage ends up None. Started here, right
             # after launch, so a long run is sampled from as early as possible.
             self._resource_monitor = ResourceMonitor(
-                self.proc.pid, job_name=self.config.name
+                self.proc.pid,
+                job_name=self.config.name,
+                interval=self.config.monitorResourcesInterval,
+                history=self.config.monitorResourcesHistory,
             )
             self._resource_monitor.start()
 
@@ -817,6 +820,16 @@ class RunningJob:
         if self._resource_monitor is None:
             return None
         return self._resource_monitor.snapshot()
+
+    def live_resource_series(self) -> Optional[List[List[float]]]:
+        """The run-so-far CPU/RSS chart series, or ``None``.
+
+        Kept separate from :meth:`live_resources` so the polled /jobs payload
+        stays lean; only the dedicated resources endpoint asks for the series.
+        """
+        if self._resource_monitor is None:
+            return None
+        return self._resource_monitor.series()
 
     def _demote(self):
         # Runs in the child (preexec_fn) while still privileged. Order matters:

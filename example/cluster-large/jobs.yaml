@@ -21,11 +21,24 @@ defaults:
   # natural companion to `docker stats`: watch them in the dashboard run
   # history, at GET /metrics (yacron2_job_cpu_seconds_total,
   # yacron2_job_last_run_max_rss_bytes), or over statsd. Observability only.
-  monitorResources: true
+  # The map form samples the tree every `interval` seconds and keeps up to
+  # `history` chart points per run, powering the CPU/memory charts in the
+  # dashboard drawer's Resources tab (a bare `monitorResources: true` uses
+  # the 1.0s / 240-point defaults).
+  monitorResources:
+    interval: 0.5
+    history: 240
 
 web:
   listen:
     - http://0.0.0.0:8080
+  # Background node CPU/memory history for the dashboard's node chart (click
+  # the header meter, or GET /node/history) — on by default; this map form
+  # just makes the ~30s CPU burns below stand out at a tighter 2s cadence
+  # while still keeping a full hour (1800 points × 2s).
+  nodeHistory:
+    interval: 2
+    points: 1800
 
 jobs:
   # ---- EveryNode: run on all ten replicas -------------------------------

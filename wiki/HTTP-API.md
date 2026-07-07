@@ -78,9 +78,11 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/cluster` | `_web_get_cluster` | `200` |
 | `GET` | `/fleet` | `_web_get_fleet` | `200` |
 | `GET` | `/node` | `_web_get_node` | `200` |
+| `GET` | `/node/history` | `_web_node_history` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
+| `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
 | `GET` | `/jobs/{name}/trends` | `_web_job_trends` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
 | `POST` | `/jobs/{name}/cancel` | `_web_cancel_job` | `200` |
@@ -569,6 +571,94 @@ $ http get http://127.0.0.1:8080/jobs/test-01/runs
     }
 }
 ```
+
+### `GET /jobs/{name}/resources`
+
+Chart-grade CPU/RSS time series for one job — the heavyweight sibling of the
+summary numbers that ride `GET /jobs` and `GET /jobs/{name}/runs`. The
+dashboard fetches it lazily when a job's **Resources** tab is opened, never on
+the poll loop. Returns `404 Not Found` for an unknown job.
+
+```shell
+$ http get http://127.0.0.1:8080/jobs/test-01/resources runs==5
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "name": "test-01",
+    "monitored": true,
+    "interval": 1.0,
+    "live": [
+        {
+            "started_at": "2026-07-07T12:00:00+00:00",
+            "pid": 4242,
+            "current": {"cpu_seconds": 8.4, "cpu_percent": 96.2, "rss_bytes": 21430272},
+            "series": [[1751889600.0, 0.0, 20971520], [1751889601.0, 98.1, 21430272]]
+        }
+    ],
+    "runs": [
+        {
+            "outcome": "success",
+            "started_at": "2026-07-07T11:00:00+00:00",
+            "finished_at": "2026-07-07T11:00:42+00:00",
+            "duration": 42.1,
+            "exit_code": 0,
+            "fail_reason": null,
+            "resources": {
+                "cpu_user_seconds": 39.2,
+                "cpu_system_seconds": 1.1,
+                "cpu_total_seconds": 40.3,
+                "max_rss_bytes": 22020096,
+                "samples": 42,
+                "series": [[1751886000.0, 0.0, 20971520], [1751886001.0, 97.4, 22020096]]
+            }
+        }
+    ]
+}
+```
+
+A `series` is a list of `[t, cpu_percent, rss_bytes]` points, oldest first,
+with `t` in epoch seconds. Points are recorded every
+[`monitorResources.interval`](Configuration-Reference#metrics) seconds and
+downsampled in place once a run exceeds its configured `history` cap (mean
+CPU%, **peak** RSS per merged bucket, so spikes survive), so a series is
+bounded no matter how long the run. `live` carries the run-so-far series of
+each currently-running monitored instance plus its `current` instantaneous
+readings; `runs` the recorded series of recent finished **monitored** runs
+(oldest first, unmonitored runs are omitted), capped by the `runs` query
+parameter (default 20, clamped to the retained history). With a
+[durable state store](Durable-State), run series survive restarts inside the
+run ledger records. `monitored: false` with empty lists means the job never
+opted into `monitorResources` — distinguishable from "monitored but no data
+yet".
+
+### `GET /node/history`
+
+The serving node's retained CPU/memory history — the time-series companion to
+[`GET /node`](#get-node)'s live snapshot, driving the dashboard's node chart
+(click the header meter). Sampled in the background per
+[`web.nodeHistory`](Configuration-Reference#web) (every 5s, last hour, by
+default), independent of whether anyone is polling.
+
+```shell
+$ http get http://127.0.0.1:8080/node/history
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "node_name": "node-a",
+    "enabled": true,
+    "interval": 5.0,
+    "points": [[1751889600.0, 37.2, 61.4], [1751889605.0, 35.9, 61.5]]
+}
+```
+
+`points` is oldest-first `[t, cpu_percent, mem_percent]` (epoch seconds; the
+same cgroup-aware percentages `GET /node` reports). A gap between consecutive
+points much wider than `interval` means the daemon was down, not idle. The
+ring is in-memory only and resets on restart. `enabled: false` (with empty
+`points`) means the sampler is off — `web.nodeHistory: false`, or psutil
+cannot read this host.
 
 ### `GET /jobs/{name}/trends`
 

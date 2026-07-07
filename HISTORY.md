@@ -5,7 +5,69 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
-## 1.2.8
+## 1.2.9
+
+Resource monitoring grows a time axis. 1.2.8 answered "what did that run
+use?" with two numbers per run; this release records **how the run used it**
+-- a per-run CPU/memory chart series with a user-tunable sampling cadence --
+and puts proper charts in the dashboard: a live view of the running
+instance, the recorded profile of any recent run, per-run trend strips, and
+a whole-node history chart behind the header meter. Everything rides the
+existing HTTP+JSON surface and the durable run ledger; nothing changes for
+existing configs (`monitorResources: true` still means what it meant, with
+the same 1s cadence).
+
+- **`monitorResources` map form.** Alongside the bool, the option now takes
+  a map: `enabled` (default true -- writing the map at all opts in),
+  `interval` (seconds between process-tree samples, default `1.0`, floor
+  `0.1`), and `history` (chart points kept per run, default `240`, `0` for
+  summary-only, ceiling `2000`). Validated at load time with the other
+  numeric ranges, merged normally under `defaults:`, and accepted by DAG
+  tasks. Not fingerprinted, like the bool before it.
+
+- **Per-run chart series.** Each monitored run now records a
+  `[t, cpu%, rss]` point per sample, downsampled in place once it exceeds
+  the `history` cap: adjacent buckets merge with *mean* CPU but *peak* RSS,
+  so the memory spikes people monitor for survive downsampling, and a run
+  of any length stays a few KB with uniform bucket widths. The series is
+  embedded in the durable run record's `resources.series` -- charts survive
+  restarts and are bounded by the existing `state.maxRunsPerJob` pruning --
+  and is deliberately **excluded** from the polled `/jobs` and
+  `/jobs/{name}/runs` payloads, which keep their summary-only shape.
+
+- **`GET /jobs/{name}/resources`.** A lazy, chart-grade endpoint: the
+  run-so-far series of every currently-running monitored instance (plus its
+  live instantaneous readings) and the recorded series of recent finished
+  monitored runs, capped by a `runs` query parameter. `monitored: false`
+  with empty lists distinguishes "never opted in" from "no data yet".
+
+- **`GET /node/history` + `web.nodeHistory`.** A background sampler records
+  the node's CPU/memory (the same cgroup-aware percentages `GET /node`
+  reports) into an in-memory ring -- every 5s, keeping the last hour, by
+  default. It follows the web app's lifecycle, is on whenever the web API
+  is on, and is tuned or disabled via `web.nodeHistory`
+  (`interval`/`points`, or `false`). A gap wider than the cadence in the
+  returned points means the daemon was down, not idle.
+
+- **Dashboard: the Resources tab and the node card.** The job drawer gains
+  a **Resources** tab: CPU and memory drawn as separate small-multiple
+  charts (one honest 0-based axis each, never dual-axis) with a synced
+  crosshair and tooltip, chips to flip between the live instance and recent
+  runs, a refresh-cadence selector for the live view (1s-10s, persisted),
+  and clickable per-run CPU-time / peak-memory trend strips. Clicking the
+  header node meter opens a **node resources** card charting the retained
+  node history. Chart inks are the theme-aware blue/amber pair
+  (colorblind-safe and contrast-checked against every theme surface, light
+  and dark), gaps in sampling break the line rather than lying across it,
+  and unmonitored jobs get a pointer at the config instead of an empty
+  chart.
+
+- **Examples.** The grand tour (`_defaults.yaml` + `platform.yaml`) and the
+  large-cluster demo now use the map forms -- a 0.5s sampling cadence with
+  the default 240-point series, and a 2s x 1800-point node history ring --
+  so their resource-heavy jobs light the new charts up out of the box.
+
+## 1.2.8 (2026-07-07)
 
 This release answers "what is this actually *using*?" Opt-in per-job
 **resource monitoring** records every run's CPU time and peak memory and
@@ -81,7 +143,7 @@ default and the observability overlay is opt-in.
   wiki's Configuration-Reference, HTTP-API, Clustering, Metrics, and
   Reporting pages.
 
-## 1.2.7
+## 1.2.7 (2026-07-06)
 
 This release makes yacron2 **stateful**. An opt-in durable state store lets
 the scheduler remember across restarts -- retries that survive a daemon

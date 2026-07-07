@@ -40,6 +40,7 @@ from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
 from yacron2 import crontabs, dag, platform
+from yacron2.resources import MONITOR_HISTORY_DEFAULT, SAMPLE_INTERVAL
 
 logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
@@ -473,7 +474,17 @@ _job_defaults_common = {
     Opt("onlyIfLastSucceeded"): Bool(),
     Opt("archiveOutput"): Bool(),
     Opt("redactArchivedSecrets"): Bool(),
-    Opt("monitorResources"): Bool(),
+    # bool enables sampling with the defaults; the map form additionally
+    # tunes the sampling cadence and the per-run series retention (see
+    # _normalize_monitor_resources).
+    Opt("monitorResources"): Bool()
+    | Map(
+        {
+            Opt("enabled"): Bool(),
+            Opt("interval"): Float(),
+            Opt("history"): Int(),
+        }
+    ),
     Opt("captureStderr"): Bool(),
     Opt("captureStdout"): Bool(),
     Opt("saveLimit"): Int(),
@@ -571,7 +582,14 @@ _dag_task_launch_fields = {
     Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
     Opt("captureStderr"): Bool(),
     Opt("captureStdout"): Bool(),
-    Opt("monitorResources"): Bool(),
+    Opt("monitorResources"): Bool()
+    | Map(
+        {
+            Opt("enabled"): Bool(),
+            Opt("interval"): Float(),
+            Opt("history"): Int(),
+        }
+    ),
     Opt("saveLimit"): Int(),
     Opt("maxLineLength"): Int(),
     Opt("streamPrefix"): Str(),
@@ -677,6 +695,18 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("enabled"): Bool(),
                         Opt("public"): Bool(),
                         Opt("durationBuckets"): Seq(Float()),
+                    }
+                ),
+                # background node CPU/memory history ring for the dashboard's
+                # node chart (GET /node/history). On by default whenever the
+                # web API is on; `nodeHistory: false` disables the sampling
+                # task, the map form tunes cadence and window size.
+                Opt("nodeHistory"): Bool()
+                | Map(
+                    {
+                        Opt("enabled"): Bool(),
+                        Opt("interval"): Float(),
+                        Opt("points"): Int(),
                     }
                 ),
             }
@@ -847,6 +877,23 @@ CONFIG_SCHEMA = EmptyDict() | Map(
 )
 
 
+def _normalize_monitor_resources(raw: Any) -> Tuple[bool, float, int]:
+    """Collapse ``monitorResources``'s bool-or-map forms to one shape.
+
+    Returns ``(enabled, interval, history)``: the map form reads its three
+    optional keys (``enabled`` defaulting to true, so writing the map at all
+    turns monitoring on), the bool form takes the sampling defaults.  Range
+    checks live with the other numeric checks in ``_validate_numeric_ranges``.
+    """
+    if isinstance(raw, dict):
+        return (
+            bool(raw.get("enabled", True)),
+            float(raw.get("interval", SAMPLE_INTERVAL)),
+            int(raw.get("history", MONITOR_HISTORY_DEFAULT)),
+        )
+    return (bool(raw), SAMPLE_INTERVAL, MONITOR_HISTORY_DEFAULT)
+
+
 # Slightly modified version of https://stackoverflow.com/a/7205672/2211825
 def mergedicts(dict1, dict2):
     for k in set(dict1.keys()).union(dict2.keys()):
@@ -993,6 +1040,8 @@ class JobConfig:
         "archiveOutput",
         "redactArchivedSecrets",
         "monitorResources",
+        "monitorResourcesInterval",
+        "monitorResourcesHistory",
         "captureStderr",
         "captureStdout",
         "streamPrefix",
@@ -1050,7 +1099,14 @@ class JobConfig:
         self.onlyIfLastSucceeded = config.pop("onlyIfLastSucceeded")
         self.archiveOutput = config.pop("archiveOutput")
         self.redactArchivedSecrets = config.pop("redactArchivedSecrets")
-        self.monitorResources = config.pop("monitorResources")
+        # normalized from the bool-or-map config forms: a plain bool switch
+        # (every consumer tests truthiness, exactly as before) plus the
+        # sampling cadence and per-run series retention beside it.
+        (
+            self.monitorResources,
+            self.monitorResourcesInterval,
+            self.monitorResourcesHistory,
+        ) = _normalize_monitor_resources(config.pop("monitorResources"))
         self.captureStderr = config.pop("captureStderr")
         self.captureStdout = config.pop("captureStdout")
         self.streamPrefix = config.pop("streamPrefix")
@@ -1247,6 +1303,17 @@ class JobConfig:
         require(self.saveLimit >= 0, "saveLimit must be >= 0")
         require(self.maxLineLength > 0, "maxLineLength must be > 0")
         require(self.killTimeout >= 0, "killTimeout must be >= 0")
+        # sampling walks the whole process table each tick, so a sub-100ms
+        # cadence is a busy-loop footgun; the history cap bounds what one run
+        # can add to a durable ledger record (0 = summary only, no series).
+        require(
+            self.monitorResourcesInterval >= 0.1,
+            "monitorResources.interval must be >= 0.1 (seconds)",
+        )
+        require(
+            0 <= self.monitorResourcesHistory <= 2000,
+            "monitorResources.history must be between 0 and 2000 (points)",
+        )
         # Allow places no bound on concurrent instances, so widening its
         # scope to the cluster gates nothing -- a safety option that
         # silently does nothing is worse than an error the operator sees
@@ -2579,6 +2646,18 @@ def _validate_web_config(webconf: WebConfig) -> None:
     """Range checks the schema cannot express, mirroring the cluster
     builders: fail at parse time (so ``--validate-config`` catches it)
     rather than when the first scrape arrives."""
+    history = webconf.get("nodeHistory")
+    if isinstance(history, dict):
+        interval = history.get("interval")
+        # the sampler memoises snapshots for ~1s (NODE_SNAPSHOT_TTL), so a
+        # faster cadence would only record duplicate readings.
+        if interval is not None and interval < 1.0:
+            raise ConfigError("web.nodeHistory.interval must be >= 1 second")
+        points = history.get("points")
+        if points is not None and not (10 <= points <= 50000):
+            raise ConfigError(
+                "web.nodeHistory.points must be between 10 and 50000"
+            )
     metrics = webconf.get("metrics")
     if not isinstance(metrics, dict):
         return

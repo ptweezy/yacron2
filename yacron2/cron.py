@@ -65,7 +65,11 @@ from yacron2.prometheus import (
     resolve_metrics_config,
 )
 from yacron2.redact import redact_lines
-from yacron2.resources import NodeResourceSampler, ResourceUsage
+from yacron2.resources import (
+    NodeResourceSampler,
+    ResourceUsage,
+    resolve_node_history_config,
+)
 from yacron2.state import Lease, StateBackend, make_state_backend
 
 logger = logging.getLogger("yacron2")
@@ -300,8 +304,14 @@ class JobRunInfo:
             return None
         return (self.finished_at - self.started_at).total_seconds()
 
-    def to_dict(self) -> Dict[str, Any]:
-        """JSON-serializable summary (everything except the output stream)."""
+    def to_dict(self, *, include_series: bool = False) -> Dict[str, Any]:
+        """JSON-serializable summary (everything except the output stream).
+
+        ``include_series`` additionally embeds the run's downsampled CPU/RSS
+        chart series: on for the durable ledger record (so charts survive
+        restarts) and the dedicated resources endpoint, off for the polled
+        payloads (/jobs and /jobs/{name}/runs stay summary-sized).
+        """
         return {
             "outcome": self.outcome,
             "exit_code": self.exit_code,
@@ -317,7 +327,7 @@ class JobRunInfo:
             # unchanged for the default config; a monitored run carries the
             # cpu/rss sub-object (see ResourceUsage.to_dict).
             "resources": (
-                self.resource_usage.to_dict()
+                self.resource_usage.to_dict(include_series=include_series)
                 if self.resource_usage is not None
                 else None
             ),
@@ -1091,6 +1101,7 @@ class Cron:
             await self.state_backend.stop()
             self.state_backend = None
 
+        await self._node_sampler.stop_history()
         if self.web_runner is not None:
             logger.info("Stopping http server")
             await self.web_runner.cleanup()
@@ -1401,6 +1412,36 @@ class Cron:
                 "resources": self._node_sampler.snapshot(),
             },
             headers=headers,
+        )
+
+    async def _web_node_history(self, request: web.Request) -> web.Response:
+        """The node's retained CPU/memory history (the dashboard node chart).
+
+        Oldest-first ``[t, cpu%, mem%]`` points from the background sampler
+        (see ``web.nodeHistory``), fetched lazily when the chart is opened
+        rather than riding the /node poll.  ``enabled`` is false -- with no
+        points -- when the sampler is off (``nodeHistory: false``) or psutil
+        is unavailable, so the dashboard hides the chart instead of showing
+        an eternally-empty one.
+        """
+        assert self.web_config is not None
+        mgr = self.cluster_manager
+        node_name = (
+            mgr.node_name
+            if mgr is not None and getattr(mgr, "node_name", None)
+            else self._state_host
+        )
+        history = self._node_sampler.history()
+        return web.json_response(
+            {
+                "node_name": node_name,
+                "enabled": history is not None,
+                "interval": (
+                    history["interval"] if history is not None else None
+                ),
+                "points": history["points"] if history is not None else [],
+            },
+            headers=self.web_config.get("headers", None),
         )
 
     async def _web_metrics(self, request: web.Request) -> web.Response:
@@ -2040,6 +2081,64 @@ class Cron:
             headers=self.web_config.get("headers", None),
         )
 
+    async def _web_job_resources(self, request: web.Request) -> web.Response:
+        """Chart-grade CPU/RSS series for one job (monitorResources jobs).
+
+        The heavyweight sibling of the summary numbers that ride /jobs and
+        /jobs/{name}/runs: fetched lazily when the dashboard opens a job's
+        resource chart, never on the poll loop.  ``live`` carries the
+        run-so-far series of each currently-running monitored instance;
+        ``runs`` the recorded series of recent finished runs (oldest first,
+        rehydrated from the durable ledger across restarts), capped by the
+        ``runs`` query parameter.  Both are empty -- and ``monitored`` false
+        -- for a job that never opted in, so the dashboard can tell "not
+        monitored" from "no data yet".
+        """
+        assert self.web_config is not None
+        name = request.match_info["name"]
+        job = self.cron_jobs.get(name)
+        if job is None:
+            raise web.HTTPNotFound()
+        max_runs = self._web_int_query(
+            request, "runs", default=20, lo=0, hi=RUN_HISTORY_LIMIT
+        )
+        live = []
+        for runjob in self.running_jobs.get(name) or []:
+            series = runjob.live_resource_series()
+            snap = runjob.live_resources()
+            if series is None and snap is None:
+                continue  # unmonitored / not yet sampled
+            live.append(
+                {
+                    "started_at": (
+                        runjob.started_at.isoformat()
+                        if runjob.started_at is not None
+                        else None
+                    ),
+                    "pid": (
+                        runjob.proc.pid if runjob.proc is not None else None
+                    ),
+                    "current": snap,
+                    "series": series or [],
+                }
+            )
+        history = list(self.run_history.get(name) or [])
+        monitored = [r for r in history if r.resource_usage is not None]
+        runs = [
+            r.to_dict(include_series=True)
+            for r in monitored[len(monitored) - max_runs :]
+        ]
+        return web.json_response(
+            {
+                "name": name,
+                "monitored": bool(job.monitorResources),
+                "interval": job.monitorResourcesInterval,
+                "live": live,
+                "runs": runs,
+            },
+            headers=self.web_config.get("headers", None),
+        )
+
     async def _web_job_trends(self, request: web.Request) -> web.Response:
         """SLA trend aggregates over the durable run ledger.
 
@@ -2270,9 +2369,11 @@ class Cron:
                 web.get("/cluster", self._web_get_cluster),
                 web.get("/fleet", self._web_get_fleet),
                 web.get("/node", self._web_get_node),
+                web.get("/node/history", self._web_node_history),
                 web.get("/status", self._web_get_status),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
+                web.get("/jobs/{name}/resources", self._web_job_resources),
                 web.get("/jobs/{name}/trends", self._web_job_trends),
                 web.post("/jobs/{name}/start", self._web_start_job),
                 web.post("/jobs/{name}/cancel", self._web_cancel_job),
@@ -2326,6 +2427,24 @@ class Cron:
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
+
+        # Node history sampling follows the web API's lifecycle: the ring
+        # only feeds the dashboard's node chart, so it runs whenever the web
+        # app does (subject to web.nodeHistory) and stops with it. Both
+        # branches are idempotent: start_history no-ops when the running
+        # task already matches the config, stop_history when there is none.
+        history_config = (
+            resolve_node_history_config(web_config)
+            if web_config is not None and self.web_runner is not None
+            else None
+        )
+        if history_config is not None:
+            self._node_sampler.start_history(
+                interval=history_config["interval"],
+                points=history_config["points"],
+            )
+        else:
+            await self._node_sampler.stop_history()
 
     @staticmethod
     def _election_relevant(cluster_config: ClusterConfig) -> Dict[str, Any]:
@@ -5873,7 +5992,12 @@ class Cron:
             return
         stream = self._run_stream(name)
         try:
-            await backend.append_record(stream, info.to_dict())
+            # include_series: the ledger is what rehydrates the resource
+            # charts after a restart. Bounded per record by the job's
+            # monitorResources.history, per stream by the pruning below.
+            await backend.append_record(
+                stream, info.to_dict(include_series=True)
+            )
             if self._state_max_runs > 0:
                 await backend.prune_records(stream, keep=self._state_max_runs)
             job = self.cron_jobs.get(name)

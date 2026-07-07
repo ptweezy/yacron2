@@ -68,6 +68,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, yacron2 refuses to start. |
 | `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. Only ever applies to unix sockets, so it is irrelevant on Windows (where `unix://` listeners are unsupported). |
 | `metrics` | `Bool \| Map` with `enabled` / `public` (each `Bool`) and `durationBuckets` (`Seq(Float)`) | enabled | The Prometheus `GET /metrics` endpoint, served by default whenever the web API is on. `metrics: false` (bool shorthand) disables it; the map form sets `enabled` (default `true`), `public` (default `false`; exempts only `/metrics` from `authToken`), and `durationBuckets` (histogram bounds in seconds; must be finite, positive, and strictly increasing, else a `ConfigError`). See [Metrics with Prometheus](Metrics-with-Prometheus). |
+| `nodeHistory` | `Bool \| Map` with `enabled` (`Bool`), `interval` (`Float`) and `points` (`Int`) | enabled | Background node CPU/memory sampling for the dashboard's node history chart, served by `GET /node/history`. On by default whenever the web API is on; `nodeHistory: false` disables the sampling task. The map form sets `interval` (seconds between samples, default `5.0`, minimum `1.0`) and `points` (ring size, default `720` — the last hour at the default cadence; 10–50000). The ring is in-memory only and follows the web app's lifecycle. |
 
 `listen` is the only required key. Full behavior, authentication, and endpoint
 semantics are documented in [HTTP Control API](HTTP-API).
@@ -569,7 +570,7 @@ is raised. Privilege switching is **not supported on Windows**: a job with
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `statsd` | `Map({"prefix": Str, "host": Str, "port": Int})` | none | When set, emit start/stop/success/duration metrics over UDP. All three keys are required. |
-| `monitorResources` | `Bool` | `false` | Sample each run's CPU time and peak resident memory (RSS) by polling the job's process tree while it runs. Observability only: the numbers ride the run record into the dashboard, `GET /metrics` and statsd, but never change a run's success/failure verdict. Off by default; a per-instance sampling task is spawned only when it is on. Set it under `defaults:` to enable it fleet-wide. |
+| `monitorResources` | `Bool` or `Map` | `false` | Sample each run's CPU time and peak resident memory (RSS) by polling the job's process tree while it runs. Observability only: the numbers ride the run record into the dashboard, `GET /metrics` and statsd, but never change a run's success/failure verdict. Off by default; a per-instance sampling task is spawned only when it is on. Set it under `defaults:` to enable it fleet-wide. The map form tunes it: `enabled` (`Bool`, default `true`), `interval` (`Float` seconds between samples, default `1.0`), `history` (`Int` chart-series points kept per run, default `240`; `0` keeps summary numbers only). |
 
 See [Metrics with statsd](Metrics-with-Statsd). Prometheus metrics are not
 configured per job: the `GET /metrics` endpoint is global, tuned under
@@ -600,6 +601,34 @@ best-effort: if psutil cannot read a process (already exited, permission
 denied) the run simply carries no resource stats, and monitoring never fails a
 job.
 
+**Sampling cadence and chart series.** The map form controls how monitoring
+behaves:
+
+```yaml
+monitorResources:
+  interval: 0.5     # seconds between samples (default 1.0, minimum 0.1)
+  history: 240      # chart points kept per run (default 240; 0 = summary only)
+```
+
+`interval` sets the process-tree polling cadence: shorter intervals catch
+sharper RSS spikes at the cost of more wakeups (each sample walks the process
+table, hence the 0.1s floor). Alongside the summary numbers, each monitored
+run records a **downsampled CPU%/RSS time series** for the dashboard's
+Resources tab: one point per sample until `history` points accumulate, after
+which adjacent points merge (mean CPU%, peak RSS — spikes are never averaged
+away) and the effective resolution halves, so a run of any length stays within
+`history` points (at most 2000). The series is embedded in the durable run
+record's `resources.series`, so charts survive restarts and are bounded by the
+same `state.maxRunsPerJob` retention as run records; it is served by
+`GET /jobs/<name>/resources` and deliberately excluded from the polled
+`/jobs` and `/jobs/<name>/runs` payloads.
+
+The dashboard's node-level CPU/memory history chart is configured separately,
+under `web.nodeHistory` (see the `web` section): `interval` (`Float` seconds,
+default `5.0`, minimum `1.0`) and `points` (`Int` ring size, default `720` —
+an hour at the default cadence), or `nodeHistory: false` to disable the
+background node sampler entirely.
+
 ## Load-time numeric validation
 
 strictyaml enforces only the type (`Int`/`Float`). After type validation,
@@ -621,6 +650,8 @@ fork.
 | `onFailure.retry.initialDelay >= 0` | only when a `retry` block is present |
 | `onFailure.retry.maximumDelay > 0` | only when a `retry` block is present |
 | `onFailure.retry.backoffMultiplier > 0` | only when a `retry` block is present |
+| `monitorResources.interval >= 0.1` | always (a sub-100ms cadence would busy-loop the process-table walk) |
+| `0 <= monitorResources.history <= 2000` | always (bounds what one run adds to a durable ledger record) |
 
 ## Minimal valid example
 

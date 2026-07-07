@@ -57,11 +57,14 @@
 #   Metrics/API     statsd push metrics, native Prometheus /metrics (map form:
 #                   public scrape + custom buckets), custom web.headers, the
 #                   HTTP control API + dashboard, opt-in bearer authToken
-#   Resources       per-job CPU time + peak RSS (monitorResources, in
-#                   _defaults.yaml) with live per-job load in the dashboard, AND
-#                   per-node whole-host CPU/memory shared across the cluster
-#                   (cluster.observability) shown in the cluster panel + fleet
-#                   view — driven by the resource-heavy jobs in section 3b
+#   Resources       per-job CPU time + peak RSS (monitorResources map form, in
+#                   _defaults.yaml: tuned sampling interval + per-run chart
+#                   series) with live per-job load in the dashboard and full
+#                   CPU/memory charts in the drawer's Resources tab, a node
+#                   history chart behind the header meter (web.nodeHistory),
+#                   AND per-node whole-host CPU/memory shared across the
+#                   cluster (cluster.observability) shown in the cluster panel
+#                   + fleet view — driven by the resource-heavy jobs in 3b
 #   Config          include: (this file pulls in _defaults.yaml), a classic
 #                   Vixie crontab in the same dir (legacy.crontab)
 #
@@ -149,6 +152,16 @@ web:
       - 10
       - 30
       - 60
+  # [feature: web.nodeHistory map form] background node CPU/memory sampling
+  # for the dashboard's node history chart (click the header node meter, or
+  # GET /node/history). It is on by default whenever the web API is on — the
+  # map form tightens the cadence and sizes the window explicitly: every
+  # `interval` seconds one [t, cpu%, mem%] point lands in an in-memory ring of
+  # `points` entries, so 2s × 1800 keeps the last hour at 2s resolution. The
+  # resource-heavy jobs in section 3b are what make this chart move.
+  nodeHistory:
+    interval: 2
+    points: 1800
   # [feature: web.authToken] OPT-IN bearer-token auth for the dashboard + REST
   # API. Left commented so the tour boots OPEN by default (yacron2 refuses to
   # start if authToken is set but resolves to an empty token). To turn it on,
@@ -338,11 +351,14 @@ jobs:
   # =====================================================================
   #  3b. Resource-heavy workloads  (per-job + per-node monitoring)
   # =====================================================================
-  # Every job here is resource-monitored (monitorResources: true is set once in
-  # _defaults.yaml, so the whole fleet inherits it). Each run's CPU time and
-  # peak memory land in the dashboard run history / stats and at GET /metrics
-  # (yacron2_job_cpu_seconds_total, yacron2_job_peak_rss_bytes); while running,
-  # live CPU%/RSS shows on the job row + drawer. And because the cluster shares
+  # Every job here is resource-monitored (the monitorResources map form is set
+  # once in _defaults.yaml, so the whole fleet inherits it). Each run's CPU
+  # time and peak memory land in the dashboard run history / stats and at GET
+  # /metrics (yacron2_job_cpu_seconds_total, yacron2_job_peak_rss_bytes);
+  # while running, live CPU%/RSS shows on the job row + drawer, and the
+  # drawer's Resources tab charts each run's CPU/memory profile over time
+  # (live for the running instance, recorded for past runs, with per-run
+  # trend strips). And because the cluster shares
   # node stats (cluster.observability, see node-entrypoint.sh), each node's
   # whole-host CPU/memory shows in the cluster panel + fleet view — so these
   # jobs are what make the load numbers move. Watch alongside `docker stats`.

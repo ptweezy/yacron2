@@ -9,10 +9,13 @@ import pytest
 
 import yacron2.resources as resources
 from yacron2.resources import (
+    MAX_SERIES_POINTS,
     NODE_SNAPSHOT_TTL,
     NodeResourceSampler,
     ResourceMonitor,
     ResourceUsage,
+    _SeriesRecorder,
+    resolve_node_history_config,
 )
 
 # a short busy-loop that also holds a chunk of memory, so both CPU time and
@@ -515,3 +518,226 @@ def test_node_sampler_unlimited_cgroup_keeps_host_numbers(tmp_path):
     snap = sampler.snapshot()
     assert snap is not None
     assert snap["mem_total_bytes"] == resources.psutil.virtual_memory().total
+
+
+# ---- _SeriesRecorder (per-run chart series) --------------------------------
+
+
+def test_series_recorder_stride_one_keeps_every_sample():
+    rec = _SeriesRecorder(8)
+    for i in range(4):
+        rec.add(100.0 + i, 10.0 * i, 1000 * (i + 1))
+    assert rec.points() == [
+        [100.0, 0.0, 1000],
+        [101.0, 10.0, 2000],
+        [102.0, 20.0, 3000],
+        [103.0, 30.0, 4000],
+    ]
+
+
+def test_series_recorder_bucket_aggregates_avg_cpu_max_rss():
+    # hitting the cap merges adjacent pairs: last t, mean CPU%, peak RSS --
+    # the peak must never be averaged away (spikes are the point of the chart)
+    rec = _SeriesRecorder(4)
+    rec.add(0.0, 0.0, 100)
+    rec.add(1.0, 10.0, 50)
+    rec.add(2.0, 20.0, 300)
+    rec.add(3.0, 30.0, 200)
+    assert rec.points() == [[1.0, 5.0, 100], [3.0, 25.0, 300]]
+
+
+def test_series_recorder_stays_bounded_and_ordered():
+    rec = _SeriesRecorder(16)
+    for i in range(10_000):
+        rec.add(float(i), float(i % 7), i)
+    pts = rec.points()
+    assert len(pts) <= 16
+    ts = [p[0] for p in pts]
+    assert ts == sorted(ts)
+    # the global RSS peak (the last, largest sample) survives downsampling
+    assert max(p[2] for p in pts) == 9_999
+
+
+def test_series_recorder_partial_bucket_is_provisional():
+    # once the stride exceeds 1 an accumulating bucket may hold data for many
+    # seconds; points() must surface it so a live chart tracks the newest
+    # reading instead of lagging a full bucket behind.
+    rec = _SeriesRecorder(4)
+    for i in range(10):
+        rec.add(float(i), 0.0, i)
+    rec.add(99.0, 50.0, 123456)
+    pts = rec.points()
+    assert pts[-1][0] == 99.0
+    assert pts[-1][2] == 123456
+
+
+# ---- ResourceUsage.series (de)serialization --------------------------------
+
+
+def test_resource_usage_series_is_opt_in():
+    usage = ResourceUsage(1.0, 0.5, 2048, 3, series=[[1.0, 2.0, 300]])
+    # polled payloads stay summary-sized: no series unless asked for
+    assert "series" not in usage.to_dict()
+    data = usage.to_dict(include_series=True)
+    assert data["series"] == [[1.0, 2.0, 300]]
+    restored = ResourceUsage.from_dict(data)
+    assert restored is not None
+    assert restored.series == [[1.0, 2.0, 300]]
+    # a summary-only record rehydrates with no series (not an error)
+    summary = ResourceUsage.from_dict(usage.to_dict())
+    assert summary is not None
+    assert summary.series is None
+
+
+def test_resource_usage_series_drops_malformed_points():
+    base = {
+        "cpu_user_seconds": 1.0,
+        "cpu_system_seconds": 0.0,
+        "max_rss_bytes": 5,
+        "samples": 1,
+    }
+    usage = ResourceUsage.from_dict(
+        dict(
+            base,
+            series=[
+                [1.0, 2.0, 3],  # good
+                "junk",  # not a triple
+                [1.0, 2.0],  # wrong arity
+                [float("nan"), 1.0, 2],  # non-finite time
+                [1.0, True, 2],  # bool is not a CPU%
+                [2.0, -5.0, -7],  # negatives clamp to zero
+            ],
+        )
+    )
+    assert usage is not None
+    assert usage.series == [[1.0, 2.0, 3], [2.0, 0.0, 0]]
+    # nothing valid (or a non-list) collapses to "no series"
+    for bad in (["x"], "nope", 42, {}):
+        parsed = ResourceUsage.from_dict(dict(base, series=bad))
+        assert parsed is not None
+        assert parsed.series is None
+
+
+def test_resource_usage_series_parse_is_capped():
+    base = {
+        "cpu_user_seconds": 1.0,
+        "cpu_system_seconds": 0.0,
+        "max_rss_bytes": 5,
+        "samples": 1,
+    }
+    series = [[float(i), 1.0, 1] for i in range(MAX_SERIES_POINTS + 100)]
+    usage = ResourceUsage.from_dict(dict(base, series=series))
+    assert usage is not None
+    assert usage.series is not None
+    assert len(usage.series) == MAX_SERIES_POINTS
+
+
+# ---- ResourceMonitor series capture ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_monitor_records_chart_series():
+    proc = await _spawn_busy(0.6)
+    monitor = ResourceMonitor(proc.pid, job_name="busy", interval=0.05)
+    monitor.start()
+    await asyncio.sleep(0.25)
+    live = monitor.series()
+    assert live
+    assert all(len(p) == 3 for p in live)
+    await proc.wait()
+    usage = await monitor.stop()
+    assert usage is not None
+    assert usage.series
+    ts = [p[0] for p in usage.series]
+    assert ts == sorted(ts)
+    # per-point RSS never exceeds the run's recorded peak
+    assert max(p[2] for p in usage.series) <= usage.max_rss_bytes
+
+
+@pytest.mark.asyncio
+async def test_monitor_history_zero_disables_series():
+    proc = await _spawn_busy(0.4)
+    monitor = ResourceMonitor(
+        proc.pid, job_name="busy", interval=0.05, history=0
+    )
+    monitor.start()
+    await asyncio.sleep(0.15)
+    assert monitor.series() is None
+    await proc.wait()
+    usage = await monitor.stop()
+    assert usage is not None
+    assert usage.series is None
+
+
+# ---- NodeResourceSampler history ring --------------------------------------
+
+
+def test_node_sampler_history_none_before_start():
+    assert NodeResourceSampler().history() is None
+
+
+@pytest.mark.asyncio
+async def test_node_sampler_history_records_and_bounds():
+    sampler = NodeResourceSampler()
+    sampler.start_history(interval=0.05, points=10)
+    try:
+        await asyncio.sleep(0.4)
+        hist = sampler.history()
+        assert hist is not None
+        assert hist["interval"] == 0.05
+        pts = hist["points"]
+        assert pts
+        assert len(pts) <= 10
+        assert all(len(p) == 3 for p in pts)
+        ts = [p[0] for p in pts]
+        assert ts == sorted(ts)
+    finally:
+        await sampler.stop_history()
+
+
+@pytest.mark.asyncio
+async def test_node_sampler_history_reconfigure_keeps_points():
+    sampler = NodeResourceSampler()
+    sampler.start_history(interval=0.05, points=10)
+    try:
+        for _ in range(100):  # wait for a couple of samples, without flaking
+            await asyncio.sleep(0.05)
+            hist = sampler.history()
+            if hist is not None and len(hist["points"]) >= 2:
+                break
+        before = sampler.history()["points"]
+        assert before
+        # shrinking the window keeps the newest retained points
+        sampler.start_history(interval=0.05, points=5)
+        hist = sampler.history()
+        assert hist is not None
+        assert hist["points"] == before[-5:]
+    finally:
+        await sampler.stop_history()
+
+
+@pytest.mark.asyncio
+async def test_node_sampler_history_without_psutil(monkeypatch):
+    monkeypatch.setattr(resources, "psutil", None)
+    sampler = NodeResourceSampler()
+    sampler.start_history(interval=0.05, points=5)  # must stay inert
+    assert sampler.history() is None
+    await sampler.stop_history()
+
+
+def test_resolve_node_history_config():
+    # enabled by default whenever the web API is on
+    assert resolve_node_history_config({}) == {
+        "interval": resources.NODE_HISTORY_INTERVAL,
+        "points": resources.NODE_HISTORY_POINTS,
+    }
+    assert resolve_node_history_config({"nodeHistory": True}) is not None
+    assert resolve_node_history_config({"nodeHistory": False}) is None
+    assert (
+        resolve_node_history_config({"nodeHistory": {"enabled": False}})
+        is None
+    )
+    cfg = resolve_node_history_config(
+        {"nodeHistory": {"interval": 2, "points": 100}}
+    )
+    assert cfg == {"interval": 2.0, "points": 100}

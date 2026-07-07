@@ -969,3 +969,118 @@ def test_blank_second_is_not_second_granular(blank):
         "    schedule:\n      second: {}\n      minute: \"5\"\n".format(blank)
     )
     assert job.has_seconds is False
+
+
+# ---- monitorResources: bool-or-map forms ------------------------------------
+
+
+def _monitor_job(snippet):
+    conf = config.parse_config_string(
+        "jobs:\n"
+        "  - name: mon\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n' + snippet,
+        "",
+    )
+    return conf.jobs[0]
+
+
+def test_monitor_resources_defaults_off():
+    job = _monitor_job("")
+    assert job.monitorResources is False
+    # the sampling knobs still normalize so consumers never branch on shape
+    assert job.monitorResourcesInterval == config.SAMPLE_INTERVAL
+    assert job.monitorResourcesHistory == config.MONITOR_HISTORY_DEFAULT
+
+
+def test_monitor_resources_bool_form():
+    job = _monitor_job("    monitorResources: true\n")
+    assert job.monitorResources is True
+    assert job.monitorResourcesInterval == config.SAMPLE_INTERVAL
+    assert job.monitorResourcesHistory == config.MONITOR_HISTORY_DEFAULT
+
+
+def test_monitor_resources_map_form():
+    job = _monitor_job(
+        "    monitorResources:\n"
+        "      interval: 0.25\n"
+        "      history: 100\n"
+    )
+    # writing the map at all opts in (enabled defaults true)
+    assert job.monitorResources is True
+    assert job.monitorResourcesInterval == 0.25
+    assert job.monitorResourcesHistory == 100
+
+
+def test_monitor_resources_map_enabled_false():
+    job = _monitor_job(
+        "    monitorResources:\n"
+        "      enabled: false\n"
+        "      interval: 0.5\n"
+    )
+    assert job.monitorResources is False
+
+
+def test_monitor_resources_history_zero_allowed():
+    # 0 = summary numbers only, no chart series
+    job = _monitor_job("    monitorResources:\n      history: 0\n")
+    assert job.monitorResources is True
+    assert job.monitorResourcesHistory == 0
+
+
+def test_monitor_resources_defaults_block_merges_with_job_map():
+    conf = config.parse_config_string(
+        "defaults:\n"
+        "  monitorResources:\n"
+        "    interval: 0.5\n"
+        "jobs:\n"
+        "  - name: mon\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n'
+        "    monitorResources:\n"
+        "      history: 50\n",
+        "",
+    )
+    job = conf.jobs[0]
+    # both map forms merge key-wise (mergedicts), like every nested section
+    assert job.monitorResources is True
+    assert job.monitorResourcesInterval == 0.5
+    assert job.monitorResourcesHistory == 50
+
+
+def test_monitor_resources_interval_floor():
+    with pytest.raises(ConfigError, match="monitorResources.interval"):
+        _monitor_job("    monitorResources:\n      interval: 0.01\n")
+
+
+def test_monitor_resources_history_ceiling():
+    with pytest.raises(ConfigError, match="monitorResources.history"):
+        _monitor_job("    monitorResources:\n      history: 5000\n")
+
+
+# ---- web.nodeHistory validation ---------------------------------------------
+
+
+def _web_config(snippet):
+    return config.parse_config_string(
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n" + snippet, ""
+    ).web_config
+
+
+def test_web_node_history_forms_parse():
+    assert _web_config("")["listen"]  # no nodeHistory key at all
+    assert _web_config("  nodeHistory: false\n")["nodeHistory"] is False
+    cfg = _web_config("  nodeHistory:\n    interval: 2.0\n    points: 120\n")
+    assert cfg["nodeHistory"] == {"interval": 2.0, "points": 120}
+
+
+def test_web_node_history_interval_floor():
+    with pytest.raises(ConfigError, match="nodeHistory.interval"):
+        _web_config("  nodeHistory:\n    interval: 0.5\n")
+
+
+def test_web_node_history_points_range():
+    with pytest.raises(ConfigError, match="nodeHistory.points"):
+        _web_config("  nodeHistory:\n    points: 5\n")
+    with pytest.raises(ConfigError, match="nodeHistory.points"):
+        _web_config("  nodeHistory:\n    points: 999999\n")

@@ -26,8 +26,17 @@ defaults:
   # Sample each run's CPU time and peak resident memory. The numbers surface in
   # the dashboard run history, at GET /metrics (yacron2_job_cpu_seconds_total,
   # yacron2_job_last_run_max_rss_bytes) and over statsd — observability only,
-  # never changing a run's verdict.  [feature: monitorResources]
-  monitorResources: true
+  # never changing a run's verdict.  The MAP form (vs a bare `true`) tunes the
+  # sampler: `interval` is the process-tree polling cadence in seconds
+  # (default 1.0), and `history` caps the per-run CPU%/RSS chart series behind
+  # the dashboard's Resources tab and GET /jobs/<name>/resources (default 240
+  # points; the series downsamples in place so even a long run stays small,
+  # and 0 keeps the summary numbers only).  With the durable state store
+  # configured (platform.yaml), the series rides each run's ledger record, so
+  # the charts survive restarts.  [feature: monitorResources map form]
+  monitorResources:
+    interval: 0.5
+    history: 240
   # Inline environment shared by every job here; individual jobs layer more on
   # top, and backup-warehouse additionally pulls an env_file.  [feature: environment]
   environment:

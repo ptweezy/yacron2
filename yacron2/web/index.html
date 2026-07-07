@@ -629,6 +629,55 @@
   .barchart i { flex: 1; min-width: 2px; background: var(--fg-faint); border-radius: 1px 1px 0 0; min-height: 2px; }
   .barchart i.ok { background: var(--ok); } .barchart i.fail { background: var(--fail); } .barchart i.cancelled { background: var(--cancelled); } .barchart i.unknown { background: var(--unknown); }
 
+  /* ---------- resource charts (drawer Resources tab + node card) ---------- */
+  /* series inks: CPU wears --run (blue), memory --pending (amber) — the
+     blue/amber pair stays separable under every CVD type and both tokens are
+     already contrast-tuned per theme surface (see the theme blocks above) */
+  .rcgroup { position: relative; }
+  .rchart { margin-bottom: 12px; }
+  .rchart .rc-head { display: flex; align-items: baseline; gap: 8px; font-size: 11px; color: var(--fg-dim); margin-bottom: 3px; }
+  .rchart .rc-head .sw { width: 8px; height: 8px; border-radius: 2px; flex: none; align-self: center; }
+  .rchart .rc-head b { color: var(--fg); font-weight: 700; }
+  .rchart .rc-head .cur { margin-left: auto; color: var(--fg-faint); }
+  .rchart svg { display: block; width: 100%; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); }
+  .rchart .grid { stroke: var(--border); stroke-width: 1; }
+  /* the surface-colored halo (paint-order) keeps a label readable when the
+     data line runs through it */
+  .rchart .ylab, .rchart .xlab { fill: var(--fg-faint); font-size: 10px; font-family: var(--mono); paint-order: stroke; stroke: var(--bg2); stroke-width: 3px; }
+  .rchart .rc-x { stroke: var(--fg-faint); stroke-width: 1; stroke-dasharray: 3 3; visibility: hidden; }
+  .rchart .rc-dot { visibility: hidden; stroke: var(--bg2); stroke-width: 2; }
+  .rc-tip {
+    position: absolute; pointer-events: none; visibility: hidden; z-index: 5;
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: var(--radius);
+    padding: 5px 8px; font-size: 11px; color: var(--fg-dim); white-space: nowrap; box-shadow: var(--shadow-lg);
+  }
+  .rc-tip b { color: var(--fg); font-weight: 700; }
+  .rc-tip .t { color: var(--fg-faint); }
+  .res-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .res-tools .lbl { font-size: 10px; color: var(--fg-faint); letter-spacing: .5px; text-transform: uppercase; }
+  .res-chip {
+    border: 1px solid var(--border); background: var(--panel2); color: var(--fg-dim);
+    border-radius: var(--radius); padding: 3px 8px; font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+  }
+  .res-chip:hover { background: var(--hover); border-color: var(--border2); }
+  .res-chip.active { color: var(--fg); border-color: var(--accent); background: var(--selbg); }
+  .res-chip .g.ok { color: var(--ok); } .res-chip .g.fail { color: var(--fail); }
+  .res-chip .g.cancelled { color: var(--cancelled); } .res-chip .g.unknown { color: var(--unknown); }
+  .res-chip .g.live { color: var(--run); }
+  .res-note { font-size: 11px; color: var(--fg-faint); margin: -6px 0 14px; }
+  /* per-run trend strips: the run-history barchart idiom, but clickable to
+     select that run's series above */
+  .res-trend { margin-top: 4px; }
+  /* unlike the run-history barchart these strips can hold very few runs;
+     capped bar width keeps three runs from becoming three billboards */
+  .res-trend .barchart { cursor: pointer; justify-content: flex-start; gap: 3px; }
+  .res-trend .barchart i { max-width: 14px; }
+  .res-trend .barchart i.sel { outline: 1px solid var(--accent); outline-offset: 1px; }
+  /* node history card */
+  #nodeCardBody { padding: 10px 14px 4px; }
+  .nodemeter.clickable { cursor: pointer; }
+  .nodemeter.clickable:hover b { color: var(--accent); }
+
   .runtable { width: 100%; border-collapse: collapse; font-size: 11.5px; }
   .runtable th { text-align: left; color: var(--fg-faint); font-weight: 600; padding: 5px 8px; border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 10px; letter-spacing: .5px; }
   .runtable td { padding: 5px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent); white-space: nowrap; }
@@ -1273,6 +1322,11 @@
     <div class="heat-body" id="heatBody"></div>
   </div>
 
+  <div class="card" id="nodeCard" style="display:none">
+    <div class="card-label"><span>┌─ node resources</span><span class="grow"></span><span class="faint" id="nodeCardMeta"></span></div>
+    <div id="nodeCardBody"></div>
+  </div>
+
   <div class="card">
     <div class="card-label"><span>┌─ jobs</span><span class="grow"></span>
       <span class="colwrap">
@@ -1364,6 +1418,7 @@
   <div class="tabs" id="dTabs">
     <button data-tab="logs" class="active">Logs</button>
     <button data-tab="history">History</button>
+    <button data-tab="resources">Resources</button>
     <button data-tab="schedule">Schedule</button>
   </div>
   <div class="panes">
@@ -1388,6 +1443,10 @@
     <!-- history -->
     <section class="pane" data-pane="history">
       <div class="pane-scroll" id="historyPane"></div>
+    </section>
+    <!-- resources -->
+    <section class="pane" data-pane="resources">
+      <div class="pane-scroll" id="resourcesPane"></div>
     </section>
     <!-- schedule -->
     <section class="pane" data-pane="schedule">
@@ -1657,6 +1716,8 @@
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
+    // node-resources history card + live resource-chart refresh cadence (ms)
+    nodeCard: false, resMs: 2000,
     boot: true,   // BIOS-style boot self-test on load
     // opt-in run ledger (IndexedDB) + wallboard zen screensaver + alarm escalation
     ledger: false, zen: true, escalate: true, zenIdle: 30000,
@@ -3101,7 +3162,9 @@
   }
   function renderNodeMeter(r) {
     const el = $("nodeMeter");
-    if (!r) { el.innerHTML = ""; return; }  // no psutil / unavailable
+    if (!r) { el.innerHTML = ""; el.classList.remove("clickable"); return; }  // no psutil / unavailable
+    el.classList.add("clickable");
+    el.title = "This node's live CPU and memory — click for the history chart";
     const cpu = r.cpu_percent, mem = r.mem_percent;
     // CPU bar is scaled to a single core's worth (0..100); memory is a true
     // 0..100 fraction. Turn the bar red past LOAD_WARN_PCT.
@@ -3211,6 +3274,8 @@
   }
   function closeDrawer() {
     stopStream();
+    resStop();
+    resPane.sel = null; resPane.data = null;
     state.drawerJob = null;
     $("drawer").classList.remove("open");
     $("drawer").setAttribute("aria-hidden", "true");
@@ -3229,6 +3294,8 @@
     if (tab === "logs") startStream(name, true);
     else stopStream();
     if (tab === "history") renderHistory(name);
+    if (tab === "resources") renderResources(name);
+    else resStop();
     if (tab === "schedule") renderSchedule(name);
   }
   function renderDrawerMeta() {
@@ -3359,6 +3426,293 @@
     box.innerHTML = stats + ledgerNote + bars + table;
   }
   function stat(k, v, cls) { return '<div class="stat"><div class="k">' + esc(k) + '</div><div class="v ' + (cls || "") + '">' + esc(v == null ? "—" : v) + "</div></div>"; }
+
+  // ===================================================================
+  //  resource charts — shared renderer (drawer Resources tab + node card)
+  // ===================================================================
+  // rcRender(host, charts, opts) draws a group of small-multiple time
+  // charts sharing one x domain and a synced hover crosshair. Each chart is
+  // single-series with its own 0-based y axis (never dual-axis, never a
+  // truncated baseline):
+  //   charts: [{ label, color, pts: [[t, v], ...] oldest-first epoch-seconds,
+  //              fmt: value formatter, max: optional pinned y ceiling }]
+  //   opts:   { gapSec: break the line where consecutive samples are further
+  //             apart than this (daemon down / paused sampling) }
+  function rcNiceCeil(v) {
+    if (!(v > 0)) return 1;
+    const p = Math.pow(10, Math.floor(Math.log10(v)));
+    for (const m of [1, 1.25, 1.5, 2, 2.5, 4, 5, 7.5, 10]) { if (m * p >= v) return m * p; }
+    return 10 * p;
+  }
+  // one y ceiling per chart, shared by the render and the hover: a pinned
+  // ceiling (percent-of-total charts) is honored exactly, an auto-scaled one
+  // gets ~12% headroom so a flat-at-peak line doesn't ride the frame or the
+  // top label.
+  function rcVmax(c) {
+    let v = 0;
+    for (const p of c.pts) { if (p[1] > v) v = p[1]; }
+    return c.max != null ? Math.max(c.max, rcNiceCeil(v)) : rcNiceCeil(v * 1.12);
+  }
+  function rcClock(t) { try { return new Date(t * 1000).toLocaleTimeString([], { hour12: false }); } catch (_) { return "—"; } }
+  function rcRender(host, charts, opts) {
+    opts = opts || {};
+    host.classList.add("rcgroup");
+    let t0 = Infinity, t1 = -Infinity;
+    charts.forEach((c) => { for (const p of c.pts) { if (p[0] < t0) t0 = p[0]; if (p[0] > t1) t1 = p[0]; } });
+    if (!isFinite(t0)) { host.innerHTML = '<div class="term-empty">no samples yet</div>'; return; }
+    if (t1 - t0 < 1) t1 = t0 + 1;  // single-sample run: a 1s domain, dot at the left
+    const W = Math.max(260, Math.round(host.getBoundingClientRect().width) || 560);
+    const H = 92, PT = 8, PB = 16;
+    const plotH = H - PT - PB, baseY = PT + plotH;
+    const x = (t) => (t - t0) / (t1 - t0) * (W - 4) + 2;
+    let html = "";
+    const vmaxes = charts.map(rcVmax);
+    charts.forEach((c, ci) => {
+      const vmax = vmaxes[ci];
+      const y = (v) => baseY - Math.max(0, Math.min(1, v / vmax)) * plotH;
+      let line = "", area = "", seg = [];
+      const flush = () => {
+        if (!seg.length) return;
+        line += "M" + seg.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join("L");
+        area += "M" + seg[0][0].toFixed(1) + "," + baseY + "L" +
+          seg.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join("L") +
+          "L" + seg[seg.length - 1][0].toFixed(1) + "," + baseY + "Z";
+        seg = [];
+      };
+      for (let i = 0; i < c.pts.length; i++) {
+        const p = c.pts[i];
+        if (i && opts.gapSec && p[0] - c.pts[i - 1][0] > opts.gapSec) flush();
+        seg.push([x(p[0]), y(p[1])]);
+      }
+      flush();
+      const last = c.pts.length ? c.pts[c.pts.length - 1][1] : null;
+      html += '<div class="rchart" data-ci="' + ci + '">' +
+        '<div class="rc-head"><span class="sw" style="background:' + c.color + '"></span><span><b>' + esc(c.label) + "</b></span>" +
+        '<span class="cur">' + (last == null ? "" : "latest " + c.fmt(last)) + "</span></div>" +
+        '<svg viewBox="0 0 ' + W + " " + H + '" height="' + H + '" preserveAspectRatio="none" role="img" aria-label="' + escAttr(c.label + " over time") + '">' +
+        '<line class="grid" x1="0" y1="' + PT + '" x2="' + W + '" y2="' + PT + '"/>' +
+        '<line class="grid" x1="0" y1="' + (PT + plotH / 2) + '" x2="' + W + '" y2="' + (PT + plotH / 2) + '" stroke-dasharray="2 4"/>' +
+        '<line class="grid" x1="0" y1="' + baseY + '" x2="' + W + '" y2="' + baseY + '"/>' +
+        (area ? '<path d="' + area + '" style="fill:' + c.color + ';fill-opacity:.13;stroke:none"/>' : "") +
+        (line ? '<path d="' + line + '" style="fill:none;stroke:' + c.color + ';stroke-width:2;stroke-linejoin:round;stroke-linecap:round"/>' : "") +
+        (c.pts.length === 1 ? '<circle cx="' + x(c.pts[0][0]) + '" cy="' + y(c.pts[0][1]) + '" r="2.5" style="fill:' + c.color + '"/>' : "") +
+        '<text class="ylab" x="' + (W - 5) + '" y="' + (PT - 1) + '" text-anchor="end" dominant-baseline="auto" dy="9">' + esc(c.fmt(vmax)) + "</text>" +
+        '<text class="ylab" x="' + (W - 5) + '" y="' + (PT + plotH / 2 - 3) + '" text-anchor="end">' + esc(c.fmt(vmax / 2)) + "</text>" +
+        (ci === charts.length - 1
+          ? '<text class="xlab" x="4" y="' + (H - 4) + '">' + esc(rcClock(t0)) + '</text>' +
+            '<text class="xlab" x="' + (W - 4) + '" y="' + (H - 4) + '" text-anchor="end">' + esc(rcClock(t1)) + "</text>"
+          : "") +
+        '<line class="rc-x" x1="0" x2="0" y1="' + PT + '" y2="' + baseY + '"/>' +
+        '<circle class="rc-dot" r="3.5" style="fill:' + c.color + '"/>' +
+        "</svg></div>";
+    });
+    host.innerHTML = html + '<div class="rc-tip"></div>';
+    // synced crosshair: hovering any chart positions the marker on all of
+    // them and the tooltip lists every series' value at that instant.
+    const tip = host.querySelector(".rc-tip");
+    const els = charts.map((c, ci) => {
+      const root = host.querySelector('.rchart[data-ci="' + ci + '"] svg');
+      return { xline: root.querySelector(".rc-x"), dot: root.querySelector(".rc-dot"), svg: root };
+    });
+    const hide = () => { tip.style.visibility = "hidden"; els.forEach((e) => { e.xline.style.visibility = "hidden"; e.dot.style.visibility = "hidden"; }); };
+    const move = (ev) => {
+      const r0 = els[0].svg.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (ev.clientX - r0.left) / Math.max(1, r0.width)));
+      const t = t0 + frac * (t1 - t0);
+      let rows = "";
+      charts.forEach((c, ci) => {
+        if (!c.pts.length) { els[ci].xline.style.visibility = "hidden"; els[ci].dot.style.visibility = "hidden"; return; }
+        let best = 0;
+        for (let i = 1; i < c.pts.length; i++) { if (Math.abs(c.pts[i][0] - t) < Math.abs(c.pts[best][0] - t)) best = i; }
+        const p = c.pts[best];
+        const vmax = vmaxes[ci];
+        const px = x(p[0]), py = baseY - Math.max(0, Math.min(1, p[1] / vmax)) * plotH;
+        els[ci].xline.setAttribute("x1", px); els[ci].xline.setAttribute("x2", px);
+        els[ci].dot.setAttribute("cx", px); els[ci].dot.setAttribute("cy", py);
+        els[ci].xline.style.visibility = "visible"; els[ci].dot.style.visibility = "visible";
+        rows += '<div><span class="sw" style="display:inline-block;width:7px;height:7px;border-radius:2px;background:' + c.color + '"></span> ' +
+          esc(c.label) + " <b>" + c.fmt(p[1]) + "</b></div>";
+        if (!ci) rows = '<div class="t">' + esc(rcClock(p[0])) + "</div>" + rows;
+      });
+      tip.innerHTML = rows;
+      const hostR = host.getBoundingClientRect();
+      const left = ev.clientX - hostR.left, top = ev.clientY - hostR.top;
+      tip.style.visibility = "visible";
+      tip.style.left = Math.min(left + 14, hostR.width - tip.offsetWidth - 4) + "px";
+      tip.style.top = Math.max(0, top - tip.offsetHeight - 10) + "px";
+    };
+    els.forEach((e) => {
+      e.svg.addEventListener("mousemove", move);
+      e.svg.addEventListener("mouseleave", hide);
+    });
+  }
+  // active chart groups, redrawn on window resize (the SVGs are sized to
+  // their container at draw time so hover math stays pixel-true)
+  const rcActive = {};
+  let rcResizeT = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(rcResizeT);
+    rcResizeT = setTimeout(() => { for (const k in rcActive) rcActive[k](); }, 150);
+  });
+
+  // ---- resources pane (drawer Resources tab) ----
+  const resPane = { name: null, data: null, sel: null, timer: null, seq: 0 };
+  function resStop() {
+    if (resPane.timer) { clearTimeout(resPane.timer); resPane.timer = null; }
+    delete rcActive.res;
+  }
+  async function renderResources(name) {
+    resStop();
+    resPane.name = name;
+    const box = $("resourcesPane");
+    if (!resPane.data || resPane.data.name !== name) box.innerHTML = '<div class="term-empty">loading resource data…</div>';
+    const seq = ++resPane.seq;
+    let data;
+    try {
+      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/resources");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      data = await res.json();
+    } catch (e) {
+      if (e.message !== "unauthorized") box.innerHTML = '<div class="term-empty">could not load resource data</div>';
+      return;
+    }
+    // stale guard: the drawer moved on (or the tab changed) while loading
+    if (seq !== resPane.seq || state.drawerJob !== name || state.tab !== "resources") return;
+    resPane.data = data;
+    const live = data.live || [], runs = data.runs || [];
+    if (!data.monitored && !live.length && !runs.length) {
+      box.innerHTML = '<div class="term-empty">Resource monitoring is off for this job.<br><br>' +
+        'Opt in with <span class="chip">monitorResources: true</span> (or tune it: ' +
+        '<span class="chip">monitorResources: { interval: 0.5, history: 240 }</span>) to record CPU and memory per run.</div>';
+      return;
+    }
+    // selection: keep the current one when it still exists, else prefer the
+    // newest live instance, else the newest recorded run
+    let sel = resPane.sel;
+    const selOk = sel && ((sel.k === "live" && live[sel.i]) || (sel.k === "run" && runs[sel.i]));
+    if (!selOk) sel = live.length ? { k: "live", i: live.length - 1 } : { k: "run", i: runs.length - 1 };
+    resPane.sel = sel;
+    // ---- selector chips (live instances + recent recorded runs) ----
+    let chips = "";
+    live.forEach((inst, i) => {
+      chips += '<button class="res-chip' + (sel.k === "live" && sel.i === i ? " active" : "") + '" data-sel="live:' + i + '">' +
+        '<span class="g live">●</span>live' + (inst.pid != null ? " · pid " + esc(inst.pid) : "") + "</button>";
+    });
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const r = runs[i], g = outcomeCls(r.outcome);
+      chips += '<button class="res-chip' + (sel.k === "run" && sel.i === i ? " active" : "") + '" data-sel="run:' + i + '" title="' +
+        escAttr(r.outcome + " · finished " + r.finished_at) + '"><span class="g ' + g + '">' + GLYPH[g] + "</span>" + esc(fmtAgo(r.finished_at)) + "</button>";
+    }
+    const liveSel = sel.k === "live";
+    const refreshSel = liveSel
+      ? '<span class="lbl" style="margin-left:auto">refresh</span><select class="mini" id="resRefresh">' +
+        [1000, 2000, 5000, 10000].map((ms) => '<option value="' + ms + '"' + (prefs.resMs === ms ? " selected" : "") + ">" + ms / 1000 + "s</option>").join("") +
+        "</select>"
+      : "";
+    // ---- selected series → the two small-multiple charts ----
+    const series = liveSel ? (live[sel.i].series || []) : ((runs[sel.i].resources || {}).series || []);
+    const gapSec = Math.max(5, (data.interval || 1) * 5);
+    let note = "";
+    if (!liveSel) {
+      const r = runs[sel.i], u = r.resources || {};
+      note = '<div class="res-note">run ' + esc(fmtAgo(r.finished_at)) + " · " + esc(r.outcome) +
+        (r.duration != null ? " · took " + esc(fmtDuration(r.duration)) : "") +
+        (u.cpu_total_seconds != null ? " · cpu " + esc(fmtDuration(u.cpu_total_seconds)) : "") +
+        (u.max_rss_bytes != null ? " · peak mem " + esc(fmtBytes(u.max_rss_bytes)) : "") +
+        (u.samples ? " · " + esc(u.samples) + " samples" : "") + "</div>";
+    } else {
+      const cur = live[sel.i].current || {};
+      note = '<div class="res-note">sampling every ' + esc(data.interval) + "s" +
+        (cur.cpu_seconds != null ? " · cpu so far " + esc(fmtDuration(cur.cpu_seconds)) : "") + "</div>";
+    }
+    // ---- per-run trend strips (recorded runs; click a bar to open it) ----
+    let trend = "";
+    if (runs.length > 1) {
+      const cpuVals = runs.map((r) => (r.resources || {}).cpu_total_seconds || 0);
+      const rssVals = runs.map((r) => (r.resources || {}).max_rss_bytes || 0);
+      const bars = (vals, fmt, cls) => {
+        const mx = Math.max.apply(null, vals.concat([1e-9]));
+        return '<div class="barchart ' + cls + '" title="per run, newest right — click a bar to open that run">' +
+          runs.map((r, i) => {
+            const ht = Math.max(2, Math.round((vals[i] / mx) * 54));
+            return '<i class="' + outcomeCls(r.outcome) + (sel.k === "run" && sel.i === i ? " sel" : "") + '" data-runsel="' + i +
+              '" style="height:' + ht + 'px" title="' + escAttr(fmtAgo(r.finished_at) + " · " + fmt(vals[i])) + '"></i>';
+          }).join("") + "</div>";
+      };
+      trend = '<div class="res-trend">' +
+        '<div class="card-label" style="padding-left:0;border:0">cpu time per run</div>' + bars(cpuVals, fmtDuration, "cpu") +
+        '<div class="card-label" style="padding-left:0;border:0">peak memory per run</div>' + bars(rssVals, fmtBytes, "mem") +
+        "</div>";
+    }
+    box.innerHTML =
+      '<div class="res-tools"><span class="lbl">show</span>' + chips + refreshSel + "</div>" + note +
+      '<div id="resCharts"></div>' + trend;
+    // draw + register for resize redraws
+    const draw = () => rcRender($("resCharts"), [
+      { label: "cpu", color: "var(--run)", fmt: fmtPercent, pts: series.map((p) => [p[0], p[1]]) },
+      { label: "memory (rss)", color: "var(--pending)", fmt: fmtBytes, pts: series.map((p) => [p[0], p[2]]) },
+    ], { gapSec: gapSec });
+    draw();
+    rcActive.res = draw;
+    // wire the chips / trend bars / refresh select
+    box.querySelectorAll("[data-sel]").forEach((b) => b.addEventListener("click", () => {
+      const s = b.getAttribute("data-sel").split(":");
+      resPane.sel = { k: s[0], i: +s[1] };
+      renderResources(name);
+    }));
+    box.querySelectorAll("[data-runsel]").forEach((b) => b.addEventListener("click", () => {
+      resPane.sel = { k: "run", i: +b.getAttribute("data-runsel") };
+      renderResources(name);
+    }));
+    const rf = $("resRefresh");
+    if (rf) rf.addEventListener("change", () => { prefs.resMs = +rf.value || 2000; savePref("resMs"); renderResources(name); });
+    // live view: keep refetching while the tab stays open, at the chosen pace
+    if (liveSel) resPane.timer = setTimeout(() => renderResources(name), Math.max(500, prefs.resMs || 2000));
+  }
+
+  // ---- node resources card (header meter → history charts) ----
+  const nodeHist = { timer: null };
+  function nodeHistStop() {
+    if (nodeHist.timer) { clearTimeout(nodeHist.timer); nodeHist.timer = null; }
+    delete rcActive.node;
+  }
+  async function loadNodeHistory() {
+    nodeHistStop();
+    if (!prefs.nodeCard) return;
+    let data;
+    try {
+      const res = await apiFetch("/node/history");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      data = await res.json();
+    } catch (e) {
+      if (e.message !== "unauthorized") $("nodeCardBody").innerHTML = '<div class="term-empty">could not load node history</div>';
+      return;
+    }
+    if (!prefs.nodeCard) return; // toggled off while loading
+    const pts = data.points || [];
+    if (!data.enabled) {
+      $("nodeCardBody").innerHTML = '<div class="term-empty">Node history is unavailable (web.nodeHistory is off, or psutil could not read this host).</div>';
+      $("nodeCardMeta").textContent = "";
+      return;
+    }
+    const span = pts.length > 1 ? pts[pts.length - 1][0] - pts[0][0] : 0;
+    $("nodeCardMeta").textContent =
+      (span ? "last " + fmtDuration(span) + " · " : "") + "sampled every " + (data.interval || "?") + "s" +
+      (data.node_name ? " · " + data.node_name : "");
+    const draw = () => rcRender($("nodeCardBody"), [
+      { label: "node cpu", color: "var(--run)", fmt: fmtPercent, max: 100, pts: pts.map((p) => [p[0], p[1]]) },
+      { label: "node memory", color: "var(--pending)", fmt: fmtPercent, max: 100, pts: pts.map((p) => [p[0], p[2]]) },
+    ], { gapSec: Math.max(10, (data.interval || 5) * 3) });
+    draw();
+    rcActive.node = draw;
+    nodeHist.timer = setTimeout(loadNodeHistory, Math.max(5000, (data.interval || 5) * 1000));
+  }
+  function setNodeCard(v) {
+    prefs.nodeCard = v; savePref("nodeCard");
+    $("nodeCard").style.display = v ? "" : "none";
+    if (v) { $("nodeCardBody").innerHTML = '<div class="term-empty">loading node history…</div>'; loadNodeHistory(); }
+    else nodeHistStop();
+  }
 
   // ---- schedule pane ----
   function renderSchedule(name) {
@@ -5217,6 +5571,7 @@
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
     $("heatBtn").addEventListener("click", () => setHeat(!prefs.heat));
+    $("nodeMeter").addEventListener("click", () => setNodeCard(!prefs.nodeCard));
     $("tailBtn").addEventListener("click", () => { if (state.tail.open) closeTail(); else openTail([]); });
     $("tvBtn").addEventListener("click", () => setWallboard(!state.wallboard));
     $("swimBtn").addEventListener("click", () => setSwim(!prefs.swim));
@@ -6555,6 +6910,7 @@
   $("heatWindow").value = prefs.heatWindow;
   if (prefs.radar) renderRadar();
   if (prefs.heat) { renderHeatmap(); loadHeatmap(true); }
+  if (prefs.nodeCard) setNodeCard(true);
   // opt-in run ledger: hydrate the in-memory mirror from IndexedDB before the
   // first poll so anomaly baselines + the History note are ready immediately.
   state.ledger.on = prefs.ledger;

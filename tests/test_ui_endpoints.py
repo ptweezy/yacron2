@@ -10,14 +10,16 @@ real :class:`~yacron2.state.FilesystemStateBackend` in a temp dir like
 ``test_state_dag_run.py``.
 """
 
+import asyncio
 import datetime
 import json
 
 import pytest
 from aiohttp import web
 
-from yacron2.cron import Cron, JobRunInfo, _run_stats
+from yacron2.cron import Cron, JobRunInfo, _job_run_info_from_dict, _run_stats
 from yacron2.job import JobOutputStream, JobRetryState
+from yacron2.resources import ResourceUsage
 from yacron2.state import Lease
 
 _UTC = datetime.timezone.utc
@@ -304,3 +306,128 @@ async def test_dag_xcom_unknown_dag_is_none(tmp_path):
         assert await cron._dag.xcom_for_run("ghost", "x") is None
     finally:
         await _teardown(cron)
+
+
+# ---------------------------------------------------------------------------
+# /jobs/{name}/resources + /node/history (the resource-chart endpoints)
+# ---------------------------------------------------------------------------
+
+_RES_JOB = """
+jobs:
+  - name: heavy
+    command: echo hi
+    schedule: "*/5 * * * *"
+    monitorResources:
+      interval: 0.5
+      history: 50
+"""
+
+
+def _monitored_run(outcome, series):
+    info = _run(outcome)
+    info.resource_usage = ResourceUsage(
+        cpu_user_seconds=1.0,
+        cpu_system_seconds=0.5,
+        max_rss_bytes=2048,
+        samples=len(series),
+        series=series,
+    )
+    return info
+
+
+async def test_web_job_resources_payload():
+    cron = _cron(_RES_JOB)
+    series = [[1.0, 5.0, 1024], [2.0, 7.0, 2048]]
+    cron.run_history["heavy"].append(_monitored_run("success", series))
+    # an unmonitored run in the same history is filtered out of `runs`
+    cron.run_history["heavy"].append(_run("failure"))
+    resp = await cron._web_job_resources(Req(match={"name": "heavy"}))
+    body = json.loads(resp.text)
+    assert body["monitored"] is True
+    assert body["interval"] == 0.5  # the configured sampling cadence
+    assert body["live"] == []  # nothing running
+    assert len(body["runs"]) == 1
+    assert body["runs"][0]["resources"]["series"] == series
+
+
+async def test_web_job_resources_runs_param_and_404():
+    cron = _cron(_RES_JOB)
+    for _ in range(5):
+        cron.run_history["heavy"].append(
+            _monitored_run("success", [[1.0, 1.0, 1]])
+        )
+    body = json.loads(
+        (
+            await cron._web_job_resources(
+                Req(query={"runs": "2"}, match={"name": "heavy"})
+            )
+        ).text
+    )
+    assert len(body["runs"]) == 2
+    body = json.loads(
+        (
+            await cron._web_job_resources(
+                Req(query={"runs": "0"}, match={"name": "heavy"})
+            )
+        ).text
+    )
+    assert body["runs"] == []
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_job_resources(Req(match={"name": "ghost"}))
+
+
+async def test_web_job_resources_unmonitored_job():
+    cron = _cron(_RETRY_JOB)
+    body = json.loads(
+        (await cron._web_job_resources(Req(match={"name": "flaky"}))).text
+    )
+    assert body["monitored"] is False
+    assert body["live"] == [] and body["runs"] == []
+
+
+async def test_run_series_stays_out_of_polled_payloads():
+    # the chart series rides ONLY the ledger record and the dedicated
+    # resources endpoint; /jobs and /jobs/{name}/runs stay summary-sized.
+    cron = _cron(_RES_JOB)
+    info = _monitored_run("success", [[1.0, 5.0, 1024]])
+    cron.run_history["heavy"].append(info)
+    cron.last_run["heavy"] = info
+    runs_body = json.loads(
+        (await cron._web_job_runs(Req(match={"name": "heavy"}))).text
+    )
+    assert "series" not in runs_body["runs"][0]["resources"]
+    d = cron._job_to_dict("heavy", cron.cron_jobs["heavy"])
+    assert "series" not in d["last_run"]["resources"]
+    # ...while the durable ledger record carries it (chart restart survival)
+    assert info.to_dict(include_series=True)["resources"]["series"]
+
+
+def test_run_record_series_round_trip():
+    # the ledger record (to_dict include_series) rehydrates with its series
+    info = _monitored_run("success", [[1.0, 5.0, 1024]])
+    restored = _job_run_info_from_dict(info.to_dict(include_series=True))
+    assert restored is not None
+    assert restored.resource_usage is not None
+    assert restored.resource_usage.series == [[1.0, 5.0, 1024]]
+    # a summary-only record (the polled shape) rehydrates without one
+    summary = _job_run_info_from_dict(info.to_dict())
+    assert summary is not None
+    assert summary.resource_usage is not None
+    assert summary.resource_usage.series is None
+
+
+async def test_web_node_history_endpoint():
+    cron = _cron(_RETRY_JOB)
+    body = json.loads((await cron._web_node_history(Req())).text)
+    assert body["enabled"] is False
+    assert body["points"] == []
+    cron._node_sampler.start_history(interval=0.05, points=10)
+    try:
+        await asyncio.sleep(0.2)
+        body = json.loads((await cron._web_node_history(Req())).text)
+        assert body["enabled"] is True
+        assert body["interval"] == 0.05
+        assert body["points"]
+        assert all(len(p) == 3 for p in body["points"])
+    finally:
+        await cron._node_sampler.stop_history()

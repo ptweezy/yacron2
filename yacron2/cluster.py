@@ -277,6 +277,20 @@ _NODE_STATS_FIELDS = (
     "proc_cpu_percent",
 )
 
+# How many poll intervals an absorbed peer node_stats reading stays renderable
+# without a fresh one before it expires from the view (serialized as None). A
+# sharing peer refreshes the reading every successful round (a full /peer body
+# re-stamps it, and a 304 attests the identical body -- node_stats included --
+# is still current), so only a peer that STOPPED reporting ages past this:
+# shareNodeStats toggled off, psutil broken, a downgraded build. Its last_seen
+# keeps advancing on those successful polls, so unlike job_summaries the
+# staleness is invisible to the dashboard -- and a load number cannot be
+# re-derived from its age the way a scheduled_in countdown can (see
+# _aged_job_summaries), so the reading must expire rather than show hours-old
+# CPU/memory as current. Three rounds mirrors driftAfter's default debounce:
+# one missed reading is noise, three consecutive is a real signal.
+NODE_STATS_STALE_ROUNDS = 3
+
 # Conditional /peer exchange (see _handle_peer / _observe_peer): a poller
 # echoes the ETag of the last full body a peer served it, and an unchanged
 # peer answers with a bodyless 304. The stored tag is re-sent as a request
@@ -802,12 +816,44 @@ class PeerState:
     # both the cluster panel (to_dict below) and the fleet view. Like
     # job_summaries: None (a peer sharing none, or never polled) leaves any
     # previously-absorbed value in place rather than blanking, so a briefly-
-    # unreachable node shows its last-known load aged by last_seen. No separate
-    # _at: node stats carry no countdown to re-derive, so last_seen conveys
-    # freshness.
+    # unreachable node shows its last-known load aged by last_seen.
     node_stats: Optional[Dict[str, Any]] = None
+    # when the node_stats reading above was last known current: stamped on
+    # every successful poll whose body carried the block, INCLUDING a 304
+    # replay (the peer attests the identical payload -- node_stats included --
+    # is still live; a peer that stops sharing drops the key, which rolls its
+    # ETag, so a 304 can never refresh a discontinued reading). Unlike
+    # job_summaries_at this is a freshness bound, not an ageing baseline: a
+    # load number cannot be re-derived from its age, and last_seen keeps
+    # advancing on successful polls that carry no stats (peer toggled
+    # shareNodeStats off, psutil broke, a downgraded build), so without this
+    # stamp the view would serve an hours-old reading as current forever --
+    # see fresh_node_stats.
+    node_stats_at: Optional[datetime.datetime] = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def fresh_node_stats(
+        self, now: datetime.datetime, max_age: float
+    ) -> Optional[Dict[str, Any]]:
+        """The last-absorbed ``node_stats``, or ``None`` once expired.
+
+        ``max_age`` is the staleness window in seconds (the caller derives it
+        from its poll interval, see ``ClusterManager._node_stats_max_age``):
+        once no fresh reading has arrived within it, the stored one is treated
+        as expired and every consumer (``to_dict`` for the /cluster peer
+        panel, ``fleet_view``) renders ``None`` -- "no data" beats presenting
+        a stale load number as current.
+        """
+        if self.node_stats is None or self.node_stats_at is None:
+            return None
+        if (now - self.node_stats_at).total_seconds() > max_age:
+            return None
+        return self.node_stats
+
+    def to_dict(
+        self,
+        now: Optional[datetime.datetime] = None,
+        node_stats_max_age: Optional[float] = None,
+    ) -> Dict[str, Any]:
         return {
             "host": self.host,
             "status": self.status,
@@ -822,7 +868,15 @@ class PeerState:
             "mismatch_streak": self.mismatch_streak,
             # this peer's last-absorbed load (None unless the cluster shares
             # node stats); the dashboard's cluster panel renders it per peer.
-            "node_stats": self.node_stats,
+            # Expired once no fresh reading arrived within the staleness
+            # window (see fresh_node_stats); callers that surface peer stats
+            # pass now + the window, both-or-neither (ClusterManager.view_dict
+            # does).
+            "node_stats": (
+                self.fresh_node_stats(now, node_stats_max_age)
+                if now is not None and node_stats_max_age is not None
+                else self.node_stats
+            ),
         }
 
 
@@ -888,11 +942,20 @@ class ClusterView:
                 if peer_job_summaries_at is not None
                 else now
             )
-        # node stats: same None-keeps-last-known contract as job_summaries, so
-        # a briefly-unreachable node keeps its last load aged by last_seen. No
-        # _at stamp: node stats carry no countdown to re-derive.
+        # node stats: same None-keeps-last-known contract as job_summaries --
+        # but stamped with node_stats_at so a reading that no fresh report
+        # ever replaces EXPIRES from the view (see fresh_node_stats) instead
+        # of riding an ever-fresh last_seen as if it were current (a peer that
+        # flipped shareNodeStats off, lost psutil, or was downgraded still
+        # polls successfully every round). Stamping `now` is correct for a 304
+        # replay too: unlike job_summaries_at there is no countdown to keep
+        # ageing, and the 304 attests the identical body -- node_stats
+        # included -- is still the peer's live payload (a peer that stopped
+        # sharing drops the key, rolling its ETag, so a 304 can never refresh
+        # a discontinued reading).
         if peer_node_stats is not None:
             peer.node_stats = peer_node_stats
+            peer.node_stats_at = now
         # whether this response actually carried a members list (current build)
         # or omitted it (a legacy peer mid rolling upgrade); drives the one-
         # directional fallback in _agreeing_peers. Defaults True so existing
@@ -997,8 +1060,15 @@ class ClusterView:
         # _agreeing_peers skips it regardless; reset for tidiness).
         peer.reports_members = False
 
-    def to_list(self) -> List[Dict[str, Any]]:
-        return [peer.to_dict() for peer in self.peers.values()]
+    def to_list(
+        self,
+        now: Optional[datetime.datetime] = None,
+        node_stats_max_age: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        return [
+            peer.to_dict(now, node_stats_max_age)
+            for peer in self.peers.values()
+        ]
 
     def local_members(
         self, my_name: str, my_instance: str
@@ -3121,6 +3191,16 @@ class ClusterManager(LeadershipBackend):
             )
         )
 
+    def _node_stats_max_age(self) -> float:
+        """Seconds before an absorbed peer node_stats reading expires.
+
+        Scaled by the poll ``interval`` (a sharing peer refreshes the reading
+        once per round, so a fixed wall-clock constant would wrongly expire
+        healthy readings under a slow cadence); see NODE_STATS_STALE_ROUNDS
+        for why expiry exists at all.
+        """
+        return NODE_STATS_STALE_ROUNDS * float(self.config["interval"])
+
     def fleet_view(self) -> Dict[str, Any]:
         """The merged per-node job-summary view for ``GET /fleet``.
 
@@ -3142,6 +3222,7 @@ class ClusterManager(LeadershipBackend):
         """
         job_summaries, summaries_truncated = self._advertised_job_summaries()
         now = datetime.datetime.now(datetime.timezone.utc)
+        stats_max_age = self._node_stats_max_age()
         nodes: List[Dict[str, Any]] = [
             {
                 "node_name": self.node_name,
@@ -3183,8 +3264,10 @@ class ClusterManager(LeadershipBackend):
                     ),
                     "truncated": peer.job_summaries_truncated,
                     # the peer's last-absorbed node load (None when it shares
-                    # none), shown aged by as_of like its job summaries.
-                    "node_stats": peer.node_stats,
+                    # none), expired once no fresh reading arrived within the
+                    # staleness window -- a load number cannot be aged the way
+                    # the countdowns above are (see fresh_node_stats).
+                    "node_stats": peer.fresh_node_stats(now, stats_max_age),
                 }
             )
         return {
@@ -3240,5 +3323,10 @@ class ClusterManager(LeadershipBackend):
                 if spread
                 else (leader is not None and leader == self.node_name)
             ),
-            "peers": self.view.to_list(),
+            # now + the staleness window so each peer's absorbed node_stats
+            # expires from the /cluster panel too (see fresh_node_stats).
+            "peers": self.view.to_list(
+                datetime.datetime.now(datetime.timezone.utc),
+                self._node_stats_max_age(),
+            ),
         }

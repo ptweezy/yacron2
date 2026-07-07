@@ -350,6 +350,9 @@ def _new_task_entry(task: TaskSpec, now: float) -> Dict[str, Any]:
         "finishedAt": None,
         "exitCode": None,
         "failReason": None,
+        # sampled CPU/peak-RSS of the finished instance (monitorResources);
+        # absent from pre-feature documents, so read it with .get().
+        "resources": None,
         "updatedAt": now,
     }
     if task.expand is not None:
@@ -946,6 +949,7 @@ def mark_task_finished(
     expected_proc: Optional[str] = None,
     expected_attempt: Optional[int] = None,
     expected_poke: Optional[int] = None,
+    resources: Optional[Dict[str, Any]] = None,
 ):
     """Transform moving a finished instance to its terminal (or retry) state.
 
@@ -953,6 +957,13 @@ def mark_task_finished(
     rather than failed, until it succeeds or times out.  A failed plain task
     with retries left is parked ``failed`` with ``nextRetryAt`` set; the next
     advance re-claims it.  Otherwise the instance is terminal.
+
+    ``resources`` is the finished instance's sampled CPU/memory usage as an
+    already-serialised dict (``ResourceUsage.to_dict()``), recorded verbatim
+    on the entry -- this module stays a pure state machine and never touches
+    the sampler.  ``None`` (monitoring off, or nothing captured) leaves the
+    entry without stats; each plain-task attempt's completion overwrites the
+    previous attempt's value, and a sensor records only its succeeding poke.
 
     ``expected_proc`` / ``expected_attempt`` FENCE the completion to the exact
     claim that produced it -- the same ``proc``-token identity
@@ -1004,16 +1015,18 @@ def mark_task_finished(
             # not distinguish pokes).
             return _DOC_KEEP, False
         if task.type == SENSOR:
-            _finish_sensor(entry, success, now, task, jitter)
+            _finish_sensor(entry, success, now, task, jitter, resources)
         else:
-            _finish_plain(entry, success, exit_code, fail_reason, now, task)
+            _finish_plain(
+                entry, success, exit_code, fail_reason, now, task, resources
+            )
         body["updatedAt"] = now
         return body, True
 
     return transform
 
 
-def _finish_sensor(entry, success, now, task, jitter) -> None:
+def _finish_sensor(entry, success, now, task, jitter, resources=None) -> None:
     entry["proc"] = None
     entry["pid"] = None
     entry["pokeCount"] = int(entry.get("pokeCount", 0)) + 1
@@ -1021,6 +1034,10 @@ def _finish_sensor(entry, success, now, task, jitter) -> None:
         entry["state"] = SUCCESS
         entry["finishedAt"] = now
         entry["exitCode"] = 0
+        if resources is not None:
+            # only the succeeding poke's usage; a rescheduled poke keeps the
+            # entry as-is (it is still logically one running sensor).
+            entry["resources"] = resources
     else:
         # condition not met yet: schedule the next poke, bounded by the poke
         # timeout (enforced at claim time) and spread by the caller's jitter.
@@ -1030,10 +1047,14 @@ def _finish_sensor(entry, success, now, task, jitter) -> None:
     entry["updatedAt"] = now
 
 
-def _finish_plain(entry, success, exit_code, fail_reason, now, task) -> None:
+def _finish_plain(
+    entry, success, exit_code, fail_reason, now, task, resources=None
+) -> None:
     entry["proc"] = None
     entry["pid"] = None
     entry["exitCode"] = exit_code
+    if resources is not None:
+        entry["resources"] = resources
     if success:
         entry["state"] = SUCCESS
         entry["finishedAt"] = now

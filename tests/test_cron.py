@@ -1198,6 +1198,43 @@ async def test_start_stop_observability_respects_share_opt_out(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_start_stop_observability_reconciles_share_on_kept_mesh(
+    monkeypatch,
+):
+    # shareNodeStats lives on the CLUSTER config, not on the resolved mesh
+    # config the keep/rebuild comparison sees, so a toggle keeps the running
+    # mesh: the latched share flag must be re-reconciled every reload, or
+    # toggling off would keep gossiping CPU/memory until an unrelated restart
+    # and toggling on would never start.
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    made = []
+    monkeypatch.setattr(
+        yacron2.cron,
+        "make_backend",
+        lambda cfg, jsid: made.append(_FakeMesh(cfg)) or made[-1],
+    )
+    mesh_cfg = {"backend": "gossip", "marker": 1}
+    await cron.start_stop_observability(
+        {"observabilityMesh": mesh_cfg, "shareNodeStats": True}
+    )
+    assert made[0].node_stats_share is True
+    # toggle OFF: the mesh config is unchanged, so the mesh is KEPT...
+    await cron.start_stop_observability(
+        {"observabilityMesh": mesh_cfg, "shareNodeStats": False}
+    )
+    assert cron.observability_mesh is made[0]
+    assert made[0].stopped is False
+    # ...and the running mesh sees the new share value
+    assert made[0].node_stats_share is False
+    # toggling back ON reaches the kept mesh too
+    await cron.start_stop_observability(
+        {"observabilityMesh": mesh_cfg, "shareNodeStats": True}
+    )
+    assert cron.observability_mesh is made[0]
+    assert made[0].node_stats_share is True
+
+
+@pytest.mark.asyncio
 async def test_start_stop_observability_none_is_noop():
     cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
     await cron.start_stop_observability(None)
@@ -3095,6 +3132,10 @@ async def test_cluster_cert_rotation_keeps_manager_when_unloadable(caplog):
         def tls_files_loadable(self):
             return False  # half-written rotation: cannot load yet
 
+        def set_node_stats_provider(self, provider, share=True):
+            # the kept-manager path re-reconciles the share flag every reload
+            self.node_stats_share = share
+
         async def stop(self):
             self.stopped = True
 
@@ -3143,6 +3184,10 @@ class _ConfigChangeFakeMgr:
     def tls_files_loadable(self):  # pragma: no cover - not reached
         return False
 
+    def set_node_stats_provider(self, provider, share=True):
+        # the kept-manager path re-reconciles the share flag every reload
+        self.node_stats_share = share
+
     async def stop(self):
         self.stopped = True
 
@@ -3189,6 +3234,54 @@ async def test_cluster_config_change_tears_down_when_new_tls_loadable(
     await cron.start_stop_cluster(cfg_b)
     assert fake.stopped is True  # config change tears down
     assert cron.cluster_manager is None  # reconstruction fails closed
+
+
+def _observability_toggle_yamls():
+    yaml_off = (
+        "jobs:\n  - name: a\n    command: echo a\n"
+        '    schedule: "* * * * *"\n'
+        "cluster:\n"
+        '  listen: "127.0.0.1:18443"\n'
+        "  tls:\n"
+        "    ca: /nonexistent/ca.pem\n"
+        "    cert: /nonexistent/cert.pem\n"
+        "    key: /nonexistent/key.pem\n"
+        "  peers:\n"
+        "    - host: b:8443\n"
+        "    - host: c:8443\n"
+        "  electLeader: true\n"
+    )
+    yaml_on = yaml_off + "  observability:\n    shareNodeStats: true\n"
+    return (
+        parse_config_string(yaml_off, "").cluster_config,
+        parse_config_string(yaml_on, "").cluster_config,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cluster_observability_only_change_keeps_manager_reconciles():
+    # An observability-only edit (shareNodeStats toggled; the election
+    # section untouched) must NOT restart the election manager -- on a lease
+    # backend that would drop the leadership lease and pause Leader jobs
+    # fleet-wide for an election-inert change. Instead the kept manager's
+    # LATCHED share flag is re-reconciled to the new config every reload, so
+    # the toggle actually reaches the running gossip mesh.
+    cfg_off, cfg_on = _observability_toggle_yamls()
+    cron = yacron2.cron.Cron(None)
+    fake = _ConfigChangeFakeMgr(cfg_off)
+    cron.cluster_manager = fake
+    # toggle ON: manager kept, share flag reconciled to True
+    await cron.start_stop_cluster(cfg_on)
+    assert fake.stopped is False
+    assert cron.cluster_manager is fake
+    assert fake.node_stats_share is True
+    # toggle back OFF: still kept, flag reconciled to False
+    await cron.start_stop_cluster(cfg_off)
+    assert fake.stopped is False
+    assert cron.cluster_manager is fake
+    assert fake.node_stats_share is False
+    # (a genuine election-relevant change still restarting is covered by
+    # test_cluster_config_change_tears_down_when_new_tls_loadable)
 
 
 # ---------------------------------------------------------------------------

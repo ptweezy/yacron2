@@ -213,14 +213,17 @@ gossip mesh purely to carry that data.
 | --- | --- | --- | --- |
 | `shareNodeStats` | `Bool` | `true` | Gossip this node's whole-node CPU/memory for the fleet view. Set `false` to run the overlay mesh for job summaries only. |
 | `listen`, `tls`, `peers` | as `backend: gossip` | — | The overlay gossip transport. **Required with a lease backend** (the overlay is its own mesh); **rejected with `backend: gossip`** (redundant — the election mesh already carries fleet data). |
-| `nodeName`, `interval`, `driftAfter`, `connectTimeout` | as `backend: gossip` | gossip defaults | Optional overlay mesh tuning. |
+| `nodeName`, `interval`, `driftAfter`, `connectTimeout` | as `backend: gossip` | gossip defaults | Optional overlay mesh tuning. **Lease backends only** (they tune the dedicated overlay mesh); **rejected with `backend: gossip`**, where node stats ride the election mesh and the cluster-level keys of the same names already apply. |
 
 Two shapes:
 
 - **`backend: gossip`** — the election mesh already exchanges `/peer` bodies, so
   `observability` is just an opt-in marker: `observability: { shareNodeStats: true }`
   adds node CPU/memory to what that mesh already gossips. `listen`/`tls`/`peers`
-  here are a `ConfigError` (redundant). Note this makes each `/peer` body ship
+  here are a `ConfigError` (redundant), and so are the overlay tuning keys
+  `nodeName`/`interval`/`driftAfter`/`connectTimeout` (there is no overlay mesh
+  to tune; the stats gossip at `cluster.interval`, so set the cluster-level keys
+  instead). Note this makes each `/peer` body ship
   every gossip round (the live load values roll the response ETag), trading away
   the idle `304` optimisation — the intended cost of fresh fleet-wide load.
 - **A lease backend** (`kubernetes`/`etcd`/`filesystem`) — election stays with the
@@ -576,12 +579,21 @@ configured per job: the `GET /metrics` endpoint is global, tuned under
 **Resource accounting (`monitorResources`).** With it on, a run is sampled by
 [psutil](https://github.com/giampaolo/psutil) (a core dependency) over its
 whole process tree, so a job that shells out to child processes is accounted
-too. The result — total user/system CPU seconds and the peak RSS observed —
+too. The result (total user/system CPU seconds and the peak RSS observed)
 appears in the dashboard run history and stats, in the durable run record's
 `resources` object (so it survives a restart), and as the metrics listed in
 [Metrics with Prometheus](Metrics-with-Prometheus). Report templates and the
 shell reporter also receive `cpu_seconds` / `max_rss_bytes`
-(`YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES`). The numbers are **sampled**,
+(`YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES`).
+
+DAG tasks accept `monitorResources` too, but surface the result differently:
+a finished task instance's usage is recorded in the `resources` object of its
+task record inside the durable `dag_run` document (returned by
+`GET /dags/<name>/runs/<run_key>`), and sent to the task's statsd sink when
+one is configured. DAG task instances are ephemeral and do not appear in the
+per-job Prometheus families on `GET /metrics`.
+
+The numbers are **sampled**,
 so a run that finishes between two samples is measured approximately; the long,
 heavy runs whose resource use actually matters are sampled many times. It is
 best-effort: if psutil cannot read a process (already exited, permission

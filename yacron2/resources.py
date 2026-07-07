@@ -20,15 +20,17 @@ Two properties of the design matter:
   a job's success/failure verdict.
 
 * **Sampled, so approximate for short runs.**  Peak RSS is a sampled
-  high-water mark and total CPU is read from the live tree, so a run that
-  finishes between two samples (or whose short-lived grandchildren come and go
-  between samples) is accounted only approximately.  The runs whose resource
-  use actually matters -- the long, heavy ones -- are sampled many times and
-  measured well.
+  high-water mark, and CPU time is accumulated per tree member (a departing
+  member's last reading is banked before it is forgotten), so the only CPU
+  that escapes accounting entirely is a child that spawns *and* exits within
+  a single sampling gap.  The runs whose resource use actually matters -- the
+  long, heavy ones -- are sampled many times and measured well.
 """
 
 import asyncio
 import logging
+import math
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -48,6 +50,14 @@ logger = logging.getLogger("yacron2")
 # cost of more wakeups; total CPU is cumulative and re-read every sample, so it
 # converges regardless of the interval as long as the run outlives one tick.
 SAMPLE_INTERVAL = 1.0
+
+# How long (seconds) a NodeResourceSampler.snapshot() result is memoised.
+# psutil.cpu_percent(interval=None) measures "since the previous call" on one
+# shared counter, and several consumers read snapshots within the same tick
+# (the dashboard fires /cluster and /node together; every gossip peer payload
+# reads one too) -- without the cache the later readers would measure the
+# sub-100ms windows psutil documents as meaningless.
+NODE_SNAPSHOT_TTL = 1.0
 
 # psutil exceptions that mean "this particular process is gone / unreadable
 # right now" -- expected during sampling as a tree shrinks, and always
@@ -106,11 +116,25 @@ class ResourceUsage:
         """
         if not isinstance(data, dict):
             return None
+        raw_user: Any = data.get("cpu_user_seconds")
+        raw_system: Any = data.get("cpu_system_seconds")
+        raw_rss: Any = data.get("max_rss_bytes")
+        # bool is an int subclass, so float(True) would "succeed"; and stdlib
+        # json.loads accepts NaN/Infinity from hand-edited ledger records,
+        # which aiohttp's default json.dumps would happily re-emit and
+        # browsers then reject.  Both count as malformed here.
+        if any(
+            isinstance(v, bool) for v in (raw_user, raw_system, raw_rss)
+        ):
+            return None
         try:
-            cpu_user = float(data["cpu_user_seconds"])
-            cpu_system = float(data["cpu_system_seconds"])
-            max_rss = int(data["max_rss_bytes"])
-        except (KeyError, TypeError, ValueError):
+            cpu_user = float(raw_user)
+            cpu_system = float(raw_system)
+            max_rss = int(raw_rss)
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: int(float("inf")).
+            return None
+        if not (math.isfinite(cpu_user) and math.isfinite(cpu_system)):
             return None
         samples = data.get("samples")
         if not isinstance(samples, int) or isinstance(samples, bool):
@@ -143,13 +167,23 @@ class ResourceMonitor:
         self._interval = interval
         self._task: Optional[asyncio.Task] = None
         self._proc: Any = None  # psutil.Process, once attached
-        # Running high-water marks.  CPU totals are kept as a running max
-        # (see _sample) so a child's CPU is not forgotten when it leaves the
-        # tree between samples.
+        # Accumulated totals.  CPU time is tracked per tree member: _members
+        # maps a (pid, create_time) key -- so a reused pid reads as a new
+        # process -- to that member's last-seen (user, system) times, and a
+        # member that leaves the tree has its last reading banked into the
+        # _departed_* accumulators (see _sample), so sequential children all
+        # count.
         self._cpu_user = 0.0
         self._cpu_system = 0.0
         self._max_rss = 0
         self._samples = 0
+        self._members: Dict[tuple, tuple] = {}
+        self._departed_user = 0.0
+        self._departed_system = 0.0
+        # Serialises _sample.  Normally only the single sampling task runs
+        # it, but a cancelled to_thread call can leave its worker thread
+        # finishing in the background while stop() takes the final reading.
+        self._sample_lock = threading.Lock()
         # Live (instantaneous) readings for the "currently running" dashboard
         # view, updated every sample: the tree's current RSS (not the peak)
         # and its CPU% since the previous sample. _prev_cpu is (cpu_total,
@@ -204,7 +238,10 @@ class ResourceMonitor:
     async def _run(self) -> None:
         try:
             while True:
-                self._sample()
+                # Threaded because the sample walks the entire process table
+                # (a full /proc scan on Linux), which must not block the
+                # event loop.
+                await asyncio.to_thread(self._sample)
                 await asyncio.sleep(self._interval)
         except asyncio.CancelledError:
             # normal shutdown path (stop() cancels us); re-raise so the task
@@ -218,7 +255,17 @@ class ResourceMonitor:
             )
 
     def _sample(self) -> None:
-        """Read the process tree once, folding it into the high-water marks."""
+        """Read the process tree once, folding it into the running totals.
+
+        Runs in a worker thread (see :meth:`_run`), guarded by the sample
+        lock.  Everything written here is a plain int/float/dict read on the
+        event loop under the GIL; :meth:`snapshot` may observe a mid-sample
+        mix, which is harmless for a live readout.
+        """
+        with self._sample_lock:
+            self._sample_locked()
+
+    def _sample_locked(self) -> None:
         proc = self._proc
         if proc is None:
             return
@@ -230,32 +277,54 @@ class ResourceMonitor:
             tree = [proc]
         except Exception:  # noqa: BLE001 - never let sampling raise
             return
-        cpu_user = 0.0
-        cpu_system = 0.0
+        live: Dict[tuple, tuple] = {}
+        tree_pids = set()
         rss = 0
-        got = False
         for member in tree:
+            tree_pids.add(member.pid)
             try:
                 # oneshot() batches the per-process reads (one syscall set) so
-                # cpu_times() and memory_info() are cheap and consistent.
+                # cpu_times(), memory_info() and create_time() are cheap and
+                # consistent.
                 with member.oneshot():
                     times = member.cpu_times()
                     mem = member.memory_info()
+                    key = (member.pid, member.create_time())
             except _TRANSIENT_ERRORS:
                 continue  # this member exited mid-sample; skip it
             except Exception:  # noqa: BLE001 - never let sampling raise
                 continue
-            cpu_user += times.user
-            cpu_system += times.system
+            live[key] = (times.user, times.system)
             rss += mem.rss
-            got = True
-        if not got:
+        if not live:
             return
         self._samples += 1
-        # Per-process CPU time is monotonic, but the TREE's membership shrinks
-        # as children exit, so a later tree-sum can be smaller than an earlier
-        # one.  Keeping the running max preserves the CPU a since-departed
-        # child already contributed; the root's own time keeps climbing on top.
+        # Per-process CPU time is monotonic, but tree membership changes: a
+        # member missing from this sample has exited, so bank its last-seen
+        # reading in the departed accumulators before forgetting it.  The
+        # (pid, create_time) key keeps a reused pid from being mistaken for
+        # the process that departed.  A member that is still listed in the
+        # tree but failed this round's read (a transient AccessDenied, say)
+        # has NOT departed: carry its last reading forward instead, or its
+        # next successful read would double-count on top of the banked value.
+        live_pids = {k[0] for k in live}
+        for key, (user, system) in self._members.items():
+            if key in live:
+                continue
+            if key[0] in tree_pids and key[0] not in live_pids:
+                live[key] = (user, system)
+                continue
+            self._departed_user += user
+            self._departed_system += system
+        self._members = live
+        # Totals are departed + live, so sequential children (`sh -c 'a; b'`)
+        # accumulate instead of plateauing at the largest instantaneous tree
+        # sum.  The max() only guards against per-sample jitter in the
+        # readings ever nudging a total backwards.
+        cpu_user = self._departed_user + sum(u for u, _ in live.values())
+        cpu_system = self._departed_system + sum(
+            s for _, s in live.values()
+        )
         self._cpu_user = max(self._cpu_user, cpu_user)
         self._cpu_system = max(self._cpu_system, cpu_system)
         self._max_rss = max(self._max_rss, rss)
@@ -286,8 +355,11 @@ class ResourceMonitor:
                 pass
             self._task = None
         # One last opportunistic read: on a cancel/replace path the child may
-        # still be alive here, and this catches its final CPU/RSS.
-        self._sample()
+        # still be alive here, and this catches its final CPU/RSS (any
+        # still-live members are summed into the totals by _sample itself).
+        # Threaded like the periodic samples, to keep the process-table walk
+        # off the loop.
+        await asyncio.to_thread(self._sample)
         if self._samples == 0:
             return None
         return ResourceUsage(
@@ -306,7 +378,10 @@ class NodeResourceSampler:
     in a gossip cluster -- advertised to peers so the fleet view shows every
     node's load.  ``psutil.cpu_percent(interval=None)`` reports usage *since
     the previous call*, so the first snapshot after construction is a priming
-    ``0.0`` and every later one covers the interval since the last read.
+    ``0.0`` and every later one covers the interval since the last fresh read
+    (snapshots are memoised for :data:`NODE_SNAPSHOT_TTL`, so near-simultaneous
+    readers share one measurement window instead of shrinking it for each
+    other).
 
     Best-effort like everything else here: any psutil error yields ``None``
     rather than raising, so a node that cannot read its own stats simply shows
@@ -315,6 +390,9 @@ class NodeResourceSampler:
 
     def __init__(self) -> None:
         self._proc: Any = None
+        # snapshot() memoisation (see NODE_SNAPSHOT_TTL).
+        self._cache: Optional[Dict[str, Any]] = None
+        self._cache_time = 0.0
         if psutil is not None:
             try:
                 self._proc = psutil.Process()
@@ -329,6 +407,16 @@ class NodeResourceSampler:
         """Current node CPU%/memory (+ this daemon's own), or ``None``."""
         if psutil is None:
             return None
+        # Memoised (see NODE_SNAPSHOT_TTL) so back-to-back readers share one
+        # measurement window instead of each resetting the since-last-call
+        # CPU counters.  Callers get a copy, so mutating a returned snapshot
+        # cannot poison the cache.
+        now = time.monotonic()
+        if (
+            self._cache is not None
+            and now - self._cache_time < NODE_SNAPSHOT_TTL
+        ):
+            return dict(self._cache)
         try:
             vm = psutil.virtual_memory()
             data: Dict[str, Any] = {
@@ -353,4 +441,6 @@ class NodeResourceSampler:
                 )
             except Exception:  # noqa: BLE001 - never fatal
                 pass
-        return data
+        self._cache = data
+        self._cache_time = now
+        return dict(data)

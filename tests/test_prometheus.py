@@ -270,6 +270,46 @@ def test_counter_snapshot_round_trip_seeds_cpu():
     ) == 8000
 
 
+def test_seed_counters_skips_corrupt_cpu_sums():
+    from yacron2.resources import ResourceUsage
+
+    def snapshot_with(value):
+        return {
+            "buckets": list(DEFAULT_DURATION_BUCKETS),
+            "jobs": {"j": {"cpu_user_sum": value, "cpu_system_sum": value}},
+        }
+
+    # a corrupted or hand-edited snapshot (negative, NaN, or bool) must be
+    # skipped field-by-field, never fatal, and never poison the counter
+    for bad in (-1000, float("nan"), True):
+        metrics = PrometheusMetrics()
+        metrics.job_run_recorded(
+            "j", "success", 2.0, ResourceUsage(1.0, 0.5, 8000, 3)
+        )
+        metrics.seed_counters(snapshot_with(bad), keep=["j"])
+        text = _registry_text(metrics)
+        assert sample_value(
+            text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+        ) == 1.0
+        assert sample_value(
+            text, "yacron2_job_cpu_seconds_total", job_name="j", mode="system"
+        ) == 0.5
+
+    # a normal positive value still seeds (added to the live accumulator)
+    metrics = PrometheusMetrics()
+    metrics.job_run_recorded(
+        "j", "success", 2.0, ResourceUsage(1.0, 0.5, 8000, 3)
+    )
+    metrics.seed_counters(snapshot_with(2.5), keep=["j"])
+    text = _registry_text(metrics)
+    assert sample_value(
+        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+    ) == 3.5
+    assert sample_value(
+        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="system"
+    ) == 3.0
+
+
 def test_registry_prune_drops_removed_jobs():
     metrics = PrometheusMetrics()
     metrics.job_run_recorded("keep", "success", 1.0)

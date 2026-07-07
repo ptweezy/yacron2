@@ -772,7 +772,9 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 # backend owns election. With backend: gossip the election mesh
                 # already carries it, so this is an empty marker that just opts
                 # into node-stats sharing (listen/tls/peers are rejected as
-                # redundant). With a lease backend (kubernetes/etcd/filesystem)
+                # redundant, and the overlay tuning keys nodeName/interval/
+                # driftAfter/connectTimeout as lease-backend-only).
+                # With a lease backend (kubernetes/etcd/filesystem)
                 # it stands up a dedicated, election-inert gossip mesh, so it
                 # requires listen/tls/peers just like backend: gossip does. See
                 # yacron2.cron.start_stop_observability and the overlay build
@@ -1735,6 +1737,21 @@ def _attach_observability(
                 "data); drop them -- an empty `observability:` block, or just "
                 "`shareNodeStats`, is enough to share node CPU/memory"
             )
+        # the overlay tuning keys only configure the SEPARATE mesh a lease
+        # backend stands up; under gossip the stats ride the election mesh,
+        # whose cadence/identity the cluster-level keys already set -- so
+        # reject them rather than silently ignoring a value the operator
+        # believes is in effect.
+        for key in ("nodeName", "interval", "driftAfter", "connectTimeout"):
+            if obs.get(key) is not None:
+                raise ConfigError(
+                    "cluster.observability.{} only applies to the overlay "
+                    "mesh a lease backend (kubernetes/etcd/filesystem) "
+                    "stands up; with backend: gossip node stats ride the "
+                    "election mesh, so set cluster.{} instead".format(
+                        key, key
+                    )
+                )
         return
     # a lease backend has no node-to-node channel, so the overlay must stand up
     # its own gossip mesh -- which needs the full gossip transport, and runs

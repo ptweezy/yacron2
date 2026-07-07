@@ -1244,3 +1244,44 @@ async def test_removed_dag_history_collected_by_daemon_gc_pass(tmp_path,
         assert await backend.get_blob(rec["sha256"]) is None
     finally:
         await _teardown(cron)
+
+
+async def test_monitored_task_resources_land_in_run_record(tmp_path):
+    # a finished DAG task's sampled usage (RunningJob.resource_usage) must be
+    # recorded on its task record in the dag_run document and ride the run
+    # API (get_run returns the raw document, which _web_dag_run serves).
+    from yacron2.resources import ResourceUsage
+
+    yaml = (
+        "dags:\n  - name: mon\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "        monitorResources: true\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "mon", "a", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("mon")
+        await _drain_pending(cron)
+        if not any(cron.running_jobs.values()):
+            await cron._dag.advance_one(("mon", run_key))
+            await _drain_pending(cron)
+        rjs = [rj for jobs in cron.running_jobs.values() for rj in jobs]
+        assert len(rjs) == 1
+        rj = rjs[0]
+        await rj.wait()
+        # the run is far too short for the sampler to capture anything
+        # reliably, so stand in for the ResourceMonitor: inject the finished
+        # usage it would have produced (wait() has already finalised the real
+        # monitor) and route the completion through the real reaper path.
+        usage = ResourceUsage(2.0, 1.0, 2048, 5)
+        rj.resource_usage = usage
+        await cron._handle_finished_job(rj)
+        await _drain_pending(cron)
+        body = await _drive(cron, "mon", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert body["tasks"]["a"]["resources"] == usage.to_dict()
+        # and the tolerant parser round-trips what was stored
+        stored = body["tasks"]["a"]["resources"]
+        assert ResourceUsage.from_dict(stored) == usage
+    finally:
+        await _teardown(cron)

@@ -470,8 +470,11 @@ class PrometheusMetrics:
             # rest (pre-seed boot events stay disjoint from the snapshot).
             for attr in ("cpu_user_sum", "cpu_system_sum"):
                 value = data.get(attr)
-                if isinstance(value, (int, float)) and not isinstance(
-                    value, bool
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    and value > 0
                 ):
                     setattr(job, attr, getattr(job, attr) + float(value))
             cpu_count = data.get("cpu_count")

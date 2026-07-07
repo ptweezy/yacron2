@@ -1089,6 +1089,9 @@ class DagScheduler:
         if dagcfg is None:
             return  # dag removed mid-run; the doc is orphaned, GC handles it
         success = running.fail_reason is None
+        # sampled usage (monitorResources) rides the completion into the
+        # dag_run document, serialised here so dag.py stays data-only.
+        usage = running.resource_usage
         await self._finish_task(
             dagcfg,
             (dref.dag_name, dref.run_key),
@@ -1100,6 +1103,7 @@ class DagScheduler:
             proc=dref.proc,
             attempt=dref.attempt,
             poke=dref.poke,
+            resources=usage.to_dict() if usage is not None else None,
         )
 
     async def _finish_task(
@@ -1115,6 +1119,7 @@ class DagScheduler:
         proc: Optional[str] = None,
         attempt: Optional[int] = None,
         poke: Optional[int] = None,
+        resources: Optional[Dict[str, Any]] = None,
     ) -> None:
         task = dagcfg.spec.by_id.get(task_id)
         if task is None:
@@ -1136,6 +1141,7 @@ class DagScheduler:
                 expected_proc=proc,
                 expected_attempt=attempt,
                 expected_poke=poke,
+                resources=resources,
             )
         )
         try:
@@ -1157,6 +1163,7 @@ class DagScheduler:
                 proc=proc,
                 attempt=attempt,
                 poke=poke,
+                resources=resources,
             )
         else:
             # fenced out (a duplicate, a superseded attempt, or a stale poke's
@@ -1188,6 +1195,7 @@ class DagScheduler:
         proc: Optional[str],
         attempt: Optional[int],
         poke: Optional[int],
+        resources: Optional[Dict[str, Any]] = None,
     ) -> None:
         key = (ref, taskkey)
         prior = self._pending_completions.get(key)
@@ -1204,6 +1212,7 @@ class DagScheduler:
             "proc": proc,
             "attempt": attempt,
             "poke": poke,
+            "resources": resources,
             "delay": delay,
             "nextTryAt": _now() + delay,
         }
@@ -1250,6 +1259,7 @@ class DagScheduler:
                 proc=pc["proc"],
                 attempt=pc["attempt"],
                 poke=pc["poke"],
+                resources=pc.get("resources"),
             )
 
     # =====================================================================

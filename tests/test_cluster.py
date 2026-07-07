@@ -859,6 +859,49 @@ async def test_web_cluster_endpoint_enabled():
 
 
 @pytest.mark.asyncio
+async def test_web_cluster_lease_payload_carries_fleet_hint():
+    # a lease backend's /cluster payload tells the dashboard whether /fleet
+    # has data behind it: true exactly while the observability overlay mesh
+    # is installed (the same condition under which _fleet_backend() serves
+    # the overlay's fleet_view()), false without it.
+    import json
+
+    import yacron2.cron
+
+    class StubLease:
+        def view_dict(self):
+            return {"backend": "kubernetes", "node_name": "n", "peers": []}
+
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubLease()
+    resp = await cron._web_get_cluster(_Req())
+    assert json.loads(resp.text)["fleet"] is False
+    cron.observability_mesh = object()  # overlay installed
+    resp = await cron._web_get_cluster(_Req())
+    assert json.loads(resp.text)["fleet"] is True
+
+
+@pytest.mark.asyncio
+async def test_web_cluster_gossip_payload_has_no_fleet_hint():
+    # gossip serves the fleet view natively; its payload stays unchanged and
+    # the dashboard's gossip branch shows the fleet button unconditionally.
+    import json
+
+    import yacron2.cron
+
+    class StubGossip:
+        def view_dict(self):
+            return {"backend": "gossip", "node_name": "n", "peers": []}
+
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubGossip()
+    resp = await cron._web_get_cluster(_Req())
+    assert "fleet" not in json.loads(resp.text)
+
+
+@pytest.mark.asyncio
 async def test_web_fleet_endpoint_disabled_without_cluster():
     import json
 
@@ -4424,6 +4467,9 @@ def test_view_dict_carries_peer_node_stats_and_local_readout(no_tls):
     assert mgr._local_node_stats() == {"cpu_percent": 5.0, "mem_percent": 6.0}
     peer = mgr.view.peers["b:1"]
     peer.node_stats = {"cpu_percent": 70.0, "mem_percent": 20.0}
+    # record_success stamps this alongside the stats; a reading with no stamp
+    # (or one past the staleness window) renders None -- see the expiry test.
+    peer.node_stats_at = datetime.datetime.now(datetime.timezone.utc)
     view = mgr.view_dict()
     by_host = {p["host"]: p for p in view["peers"]}
     assert by_host["b:1"]["node_stats"] == {
@@ -4467,6 +4513,59 @@ async def test_poll_peer_absorbs_node_stats(no_tls):
         "mem_percent": 40.0,
         "cpu_count": 4,
     }
+    # the reading is stamped so it can expire once no fresh one arrives
+    assert mgr.view.peers["b:1"].node_stats_at is not None
+
+
+def test_view_expires_node_stats_without_fresh_reading(no_tls):
+    # A peer that STOPS reporting node_stats (shareNodeStats toggled off,
+    # psutil broken, a downgraded build) still polls successfully every round,
+    # so last_seen stays fresh while the absorbed reading ages silently: past
+    # the staleness window every consumer must render None rather than present
+    # hours-old load as current -- and a poll that DOES carry stats refreshes.
+    from yacron2.cluster import NODE_STATS_STALE_ROUNDS
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    window = NODE_STATS_STALE_ROUNDS * mgr.config["interval"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stats = {"cpu_percent": 70.0, "mem_percent": 20.0}
+
+    def poll(at, with_stats):
+        mgr.view.record_success(
+            "b:1",
+            "node-b",
+            "v1:mine",
+            SCHEME_VERSION,
+            "v1:mine",
+            at,
+            "node-a",
+            peer_instance="inst-b",
+            peer_node_stats=stats if with_stats else None,
+        )
+
+    def rendered():
+        view_peer = {p["host"]: p for p in mgr.view_dict()["peers"]}["b:1"]
+        fleet = {n["host"]: n for n in mgr.fleet_view()["nodes"]}
+        return view_peer["node_stats"], fleet["b:1"]["node_stats"]
+
+    # absorb one reading, then several successful polls carrying none, the
+    # last of them past the window
+    poll(now - datetime.timedelta(seconds=window + 5), with_stats=True)
+    for offset in (2, 1, 0):
+        poll(now - datetime.timedelta(seconds=offset), with_stats=False)
+    peer = mgr.view.peers["b:1"]
+    assert peer.last_seen == now  # the peer itself polls fresh...
+    assert peer.node_stats == stats  # ...and the raw reading is kept...
+    assert rendered() == (None, None)  # ...but every consumer expires it
+    # a poll WITH stats refreshes the reading
+    poll(now, with_stats=True)
+    assert rendered() == (stats, stats)
+    # and within the window, polls carrying none keep it rendered (the
+    # briefly-absent case: last-known beats blanking)
+    poll(now, with_stats=False)
+    assert rendered() == (stats, stats)
 
 
 def test_advertised_job_summaries_caps_deterministically(no_tls):
@@ -4641,6 +4740,8 @@ def test_fleet_view_includes_node_stats(no_tls):
     peer_b = mgr.view.peers["b:1"]
     peer_b.last_seen = NOW
     peer_b.node_stats = {"cpu_percent": 88.0, "mem_percent": 50.0}
+    # freshly stamped, as record_success would; expiry is covered separately
+    peer_b.node_stats_at = datetime.datetime.now(datetime.timezone.utc)
     fleet = mgr.fleet_view()
     # self carries its own freshly-sampled load
     assert fleet["nodes"][0]["node_stats"] == {

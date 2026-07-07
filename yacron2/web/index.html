@@ -2720,29 +2720,34 @@
       }
     }
   }
+  // percent past which a node CPU/memory readout is warn-tinted (either axis)
+  const LOAD_WARN_PCT = 85;
+  // shared warn flag + tooltip text for a node_stats payload; nodeLoad and
+  // loadCell wrap the result in their own markup. tipPrefix distinguishes
+  // "node CPU …" (fleet header) from plain "CPU …" (cluster table).
+  function describeLoad(ns, tipPrefix) {
+    const cpu = ns.cpu_percent, mem = ns.mem_percent;
+    const warn = (cpu != null && cpu > LOAD_WARN_PCT) || (mem != null && mem > LOAD_WARN_PCT);
+    const tip = tipPrefix + "CPU " + fmtPercent(cpu) + (ns.cpu_count ? " across " + ns.cpu_count + " cores" : "") +
+      " · memory " + fmtPercent(mem) +
+      (ns.mem_used_bytes != null && ns.mem_total_bytes != null ? " (" + fmtBytes(ns.mem_used_bytes) + " / " + fmtBytes(ns.mem_total_bytes) + ")" : "");
+    return { warn: warn, tip: tip, cpu: cpu, mem: mem };
+  }
   // compact per-node CPU/mem line for a fleet column header (from node_stats,
   // shared via cluster.observability). Empty string when this node shares none.
   function nodeLoad(ns) {
     if (!ns) return '<span class="nload none" title="this node is not sharing CPU/memory">cpu — · mem —</span>';
-    const cpu = ns.cpu_percent, mem = ns.mem_percent;
-    const warn = (cpu != null && cpu > 85) || (mem != null && mem > 85);
-    const tip = "node CPU " + fmtPercent(cpu) + (ns.cpu_count ? " across " + ns.cpu_count + " cores" : "") +
-      " · memory " + fmtPercent(mem) +
-      (ns.mem_used_bytes != null && ns.mem_total_bytes != null ? " (" + fmtBytes(ns.mem_used_bytes) + " / " + fmtBytes(ns.mem_total_bytes) + ")" : "");
-    return '<span class="nload' + (warn ? " warn" : "") + '" title="' + escAttr(tip) + '">cpu <b>' +
-      fmtPercent(cpu) + "</b> · mem <b>" + fmtPercent(mem) + "</b></span>";
+    const d = describeLoad(ns, "node ");
+    return '<span class="nload' + (d.warn ? " warn" : "") + '" title="' + escAttr(d.tip) + '">cpu <b>' +
+      fmtPercent(d.cpu) + "</b> · mem <b>" + fmtPercent(d.mem) + "</b></span>";
   }
   // a cluster-table "Load" cell for a peer's node_stats (or "—" when the peer
-  // shares none). Warn-tinted past 85% on either axis.
+  // shares none). Warn-tinted past LOAD_WARN_PCT on either axis.
   function loadCell(ns) {
     if (!ns) return '<td class="col-load muted" title="this peer is not sharing node stats (enable cluster.observability)">—</td>';
-    const cpu = ns.cpu_percent, mem = ns.mem_percent;
-    const warn = (cpu != null && cpu > 85) || (mem != null && mem > 85);
-    const tip = "CPU " + fmtPercent(cpu) + (ns.cpu_count ? " across " + ns.cpu_count + " cores" : "") +
-      " · memory " + fmtPercent(mem) +
-      (ns.mem_used_bytes != null && ns.mem_total_bytes != null ? " (" + fmtBytes(ns.mem_used_bytes) + " / " + fmtBytes(ns.mem_total_bytes) + ")" : "");
-    return '<td class="col-load' + (warn ? " warn" : "") + '" title="' + escAttr(tip) + '"><b>' +
-      fmtPercent(cpu) + "</b> / <b>" + fmtPercent(mem) + "</b></td>";
+    const d = describeLoad(ns, "");
+    return '<td class="col-load' + (d.warn ? " warn" : "") + '" title="' + escAttr(d.tip) + '"><b>' +
+      fmtPercent(d.cpu) + "</b> / <b>" + fmtPercent(d.mem) + "</b></td>";
   }
   function renderFleet() {
     const box = $("fleetPanel");
@@ -2895,7 +2900,7 @@
     if (!r) { el.innerHTML = ""; return; }  // no psutil / unavailable
     const cpu = r.cpu_percent, mem = r.mem_percent;
     // CPU bar is scaled to a single core's worth (0..100); memory is a true
-    // 0..100 fraction. Turn the bar red past 85%.
+    // 0..100 fraction. Turn the bar red past LOAD_WARN_PCT.
     const cpuBar = cpu == null ? 0 : Math.max(0, Math.min(100, cpu));
     const memBar = mem == null ? 0 : Math.max(0, Math.min(100, mem));
     const cpuTip = r.cpu_count ? "node CPU across " + r.cpu_count + " cores" : "node CPU";
@@ -2903,9 +2908,9 @@
       ? "node memory " + fmtBytes(r.mem_used_bytes) + " / " + fmtBytes(r.mem_total_bytes) : "node memory";
     el.innerHTML =
       '<span class="m" title="' + escAttr(cpuTip) + '">cpu <b>' + fmtPercent(cpu) +
-        '</b><span class="bar' + (cpuBar > 85 ? " warn" : "") + '"><i style="width:' + cpuBar + '%"></i></span></span>' +
+        '</b><span class="bar' + (cpuBar > LOAD_WARN_PCT ? " warn" : "") + '"><i style="width:' + cpuBar + '%"></i></span></span>' +
       '<span class="m" title="' + escAttr(memTip) + '">mem <b>' + fmtPercent(mem) +
-        '</b><span class="bar' + (memBar > 85 ? " warn" : "") + '"><i style="width:' + memBar + '%"></i></span></span>';
+        '</b><span class="bar' + (memBar > LOAD_WARN_PCT ? " warn" : "") + '"><i style="width:' + memBar + '%"></i></span></span>';
   }
   function setConnected(ok) {
     if (state.connected !== ok) {
@@ -4446,6 +4451,14 @@
       bits.push('<span class="' + (recon ? "recon" : "faint") + '" title="' + escAttr(e.failReason) + '">' +
         (recon ? "⚠ " : "") + esc(truncStr(e.failReason, 48)) + "</span>");
     }
+    // sampled CPU/peak-RSS, present only when the task ran with monitorResources
+    if (e.resources) {
+      bits.push('<span class="faint nowrap" title="' +
+        escAttr("user " + fmtDuration(e.resources.cpu_user_seconds) +
+          " · sys " + fmtDuration(e.resources.cpu_system_seconds)) +
+        '">cpu <b>' + fmtDuration(e.resources.cpu_total_seconds) +
+        "</b> · peak mem <b>" + fmtBytes(e.resources.max_rss_bytes) + "</b></span>");
+    }
     if (e.host) bits.push('<span class="faint">@' + esc(e.host) + "</span>");
     return bits.join(" · ") || '<span class="faint">—</span>';
   }
@@ -5238,13 +5251,23 @@
     }
     $("clusterSummary").textContent = line;
     state.clusterLine = line;
-    // the swimlane and fleet view both chart the gossip peer set; lease
-    // backends have none (and gossip no summaries).
+    // the swimlane charts gossip peer-agreement history; a lease backend has
+    // no peer set to chart, overlay or not.
     $("swimBtn").style.display = "none";
     $("swimPanel").style.display = "none";
-    state.fleet.data = null;
-    $("fleetBtn").style.display = "none";
-    $("fleetPanel").style.display = "none";
+    // the fleet view IS available on a lease backend when the observability
+    // overlay mesh is running -- /cluster says so via data.fleet -- so mirror
+    // the gossip branch: show the button and, while the panel is open, chain
+    // loadFleet() on this same poll so the view keeps refreshing. Without the
+    // overlay there are no per-job summaries; hide and clear as before.
+    if (data.fleet) {
+      $("fleetBtn").style.display = "";
+      if (prefs.fleet) loadFleet(); else renderFleet();
+    } else {
+      state.fleet.data = null;
+      $("fleetBtn").style.display = "none";
+      $("fleetPanel").style.display = "none";
+    }
     const lease = data.lease || {};
     const labels = { holder: "held by", expiry: "expires", fence: "fence", electionName: "election", identity: "our identity", path: "store path" };
     const order = ["holder", "expiry", "fence", "electionName", "identity", "path"];
@@ -5583,11 +5606,6 @@
     if (!f || job.running) return "";
     const r = f.ratio ? "×" + f.ratio.toFixed(1) : "";
     return '<span class="slow-chip" title="latest successful run ran unusually slow vs its ledger baseline">◱ slow ' + esc(r) + "</span>";
-  }
-  function fmtBytes(b) {
-    if (b < 1024) return b + " B";
-    if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
-    return (b / 1048576).toFixed(1) + " MB";
   }
   function refreshLedgerStat() {
     const row = $("ledgerStatRow"), out = $("ledgerStat");

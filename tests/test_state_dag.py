@@ -1351,3 +1351,88 @@ def test_reload_added_dependency_does_not_wedge_run():
     assert _state(body, "b") == dag.SUCCESS
     assert dag.is_terminal_run(body)
     assert body["state"] == dag.SUCCESS  # C's absence did not wedge it
+
+
+# --------------------------------------------------------------------------
+# Resource accounting on the task record (monitorResources)
+# --------------------------------------------------------------------------
+
+
+def test_finished_task_records_resources():
+    # a monitored instance's sampled usage rides mark_task_finished into the
+    # task record, and a later attempt's completion overwrites it.
+    from yacron2.resources import ResourceUsage
+
+    spec = _spec(TaskSpec("a", max_attempts=2, retry_delay=0.0))
+    body = _body(spec)
+    task = spec.by_id["a"]
+    now = 10.0
+    usage1 = ResourceUsage(1.5, 0.5, 1024, 3).to_dict()
+    body, res = _apply(dag.plan_and_claim(spec, now, "p", "h", {}), body)
+    assert res.launches[0].task_id == "a"
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=False, exit_code=1, fail_reason="x",
+            now=now, task=task, resources=usage1,
+        ),
+        body,
+    )
+    assert body["tasks"]["a"]["resources"] == usage1
+    # retry succeeds with different usage: the record carries the latest
+    body, _ = _apply(dag.plan_and_claim(spec, now + 1, "p", "h", {}), body)
+    usage2 = ResourceUsage(9.0, 1.0, 4096, 8).to_dict()
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=True, exit_code=0, fail_reason=None,
+            now=now + 2, task=task, resources=usage2,
+        ),
+        body,
+    )
+    assert _state(body, "a") == dag.SUCCESS
+    assert body["tasks"]["a"]["resources"] == usage2
+    # the stored dict round-trips through the tolerant parser
+    parsed = ResourceUsage.from_dict(body["tasks"]["a"]["resources"])
+    assert parsed is not None and parsed.max_rss_bytes == 4096
+
+
+def test_unmonitored_task_keeps_resources_none():
+    # monitoring off (or nothing captured) -> resources stays None, and a
+    # sensor's succeeding poke records its usage.
+    from yacron2.resources import ResourceUsage
+
+    spec = _spec(TaskSpec("a"))
+    ex = _Executor(spec, outcomes={"a": True})
+    body = ex.run(_body(spec))
+    assert body["tasks"]["a"]["resources"] is None
+    spec = _spec(TaskSpec("s", type=dag.SENSOR))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    usage = ResourceUsage(0.2, 0.1, 512, 1).to_dict()
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=True, exit_code=0, fail_reason=None,
+            now=2.0, task=spec.by_id["s"], resources=usage,
+        ),
+        body,
+    )
+    assert _state(body, "s") == dag.SUCCESS
+    assert body["tasks"]["s"]["resources"] == usage
+
+
+def test_task_record_without_resources_field_still_parses():
+    # backward compat: a pre-feature dag_run document has no "resources" key
+    # on its task entries; completing and reading it must not care.
+    from yacron2.resources import ResourceUsage
+
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    for entry in body["tasks"].values():
+        entry.pop("resources", None)  # simulate an old document
+    ex = _Executor(spec, outcomes={"a": True})
+    body = ex.run(body)
+    assert _state(body, "a") == dag.SUCCESS
+    assert body["tasks"]["a"].get("resources") is None
+    # a malformed stored value parses to None instead of raising
+    assert ResourceUsage.from_dict(body["tasks"]["a"].get("resources")) is None
+    assert ResourceUsage.from_dict("garbage") is None
+    assert ResourceUsage.from_dict({"cpu_user_seconds": "nan?"}) is None

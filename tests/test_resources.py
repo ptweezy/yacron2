@@ -1,11 +1,15 @@
 """Tests for per-run CPU/memory accounting (yacron2.resources)."""
 
 import asyncio
+import contextlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+import yacron2.resources as resources
 from yacron2.resources import (
+    NODE_SNAPSHOT_TTL,
     NodeResourceSampler,
     ResourceMonitor,
     ResourceUsage,
@@ -54,6 +58,34 @@ def test_resource_usage_to_dict_round_trip():
         {},  # missing required keys
         {"cpu_user_seconds": "x", "cpu_system_seconds": 0, "max_rss_bytes": 0},
         {"cpu_user_seconds": 1.0, "cpu_system_seconds": 1.0},  # no rss
+        # stdlib json.loads parses NaN/Infinity from hand-edited ledgers;
+        # neither may survive into API payloads (browsers reject them).
+        {
+            "cpu_user_seconds": float("nan"),
+            "cpu_system_seconds": 0.0,
+            "max_rss_bytes": 0,
+        },
+        {
+            "cpu_user_seconds": 0.0,
+            "cpu_system_seconds": float("inf"),
+            "max_rss_bytes": 0,
+        },
+        {
+            "cpu_user_seconds": 0.0,
+            "cpu_system_seconds": 0.0,
+            "max_rss_bytes": float("inf"),
+        },
+        # bool is an int subclass, but True is not a CPU time.
+        {
+            "cpu_user_seconds": True,
+            "cpu_system_seconds": 0.0,
+            "max_rss_bytes": 0,
+        },
+        {
+            "cpu_user_seconds": 0.0,
+            "cpu_system_seconds": 0.0,
+            "max_rss_bytes": False,
+        },
     ],
 )
 def test_resource_usage_from_dict_tolerates_garbage(bad):
@@ -110,6 +142,101 @@ async def test_monitor_live_snapshot():
     await monitor.stop()
 
 
+class _FakeProcess:
+    """Minimal psutil.Process stand-in for driving _sample() directly."""
+
+    def __init__(self, pid, create_time, user=0.0, system=0.0, rss=1024):
+        self.pid = pid
+        self._create_time = create_time
+        self.user = user
+        self.system = system
+        self.rss = rss
+        self.child_list = []
+
+    def oneshot(self):
+        return contextlib.nullcontext()
+
+    def cpu_times(self):
+        return SimpleNamespace(user=self.user, system=self.system)
+
+    def memory_info(self):
+        return SimpleNamespace(rss=self.rss)
+
+    def create_time(self):
+        return self._create_time
+
+    def children(self, recursive=False):
+        return list(self.child_list)
+
+
+@pytest.mark.asyncio
+async def test_monitor_accumulates_sequential_children():
+    # regression: an `sh -c 'a; b'` style run, where one child exits before
+    # the next starts, must accumulate every child's CPU time rather than
+    # plateauing at the largest instantaneous tree sum.
+    monitor = ResourceMonitor(123, job_name="seq", interval=0.05)
+    root = _FakeProcess(pid=123, create_time=100.0, user=0.1)
+    child_a = _FakeProcess(pid=200, create_time=101.0, user=10.0)
+    # child B reuses child A's pid (fresh create_time): the accounting must
+    # treat it as a new process, not a rewind of child A's counters.
+    child_b = _FakeProcess(pid=200, create_time=102.0, user=0.5)
+    monitor._proc = root
+
+    root.child_list = [child_a]
+    monitor._sample()
+
+    # child A exits; child B starts with fresh near-zero counters.
+    root.user = 0.2
+    root.child_list = [child_b]
+    monitor._sample()
+
+    child_b.user = 9.0
+    monitor._sample()
+
+    usage = await monitor.stop()
+    assert usage is not None
+    assert usage.samples == 4  # three explicit + stop()'s final read
+    # 10.0 (child A) + 9.0 (child B) + 0.2 (root), not the ~10.1 a running
+    # max of tree sums would report.
+    assert usage.cpu_user_seconds == pytest.approx(19.2)
+    # the live cumulative readout reflects the accumulated total too.
+    snap = monitor.snapshot()
+    assert snap is not None
+    assert snap["cpu_seconds"] == pytest.approx(19.2)
+
+
+@pytest.mark.asyncio
+async def test_monitor_transient_read_failure_does_not_double_count():
+    # regression: a member that stays in the tree but fails one read (a
+    # transient AccessDenied) has not departed -- its last reading must be
+    # carried forward, not banked, or the next successful read would count
+    # its CPU twice (banked total + full cumulative reading).
+    import psutil
+
+    monitor = ResourceMonitor(123, job_name="flaky", interval=0.05)
+    root = _FakeProcess(pid=123, create_time=100.0, user=0.1)
+    child = _FakeProcess(pid=200, create_time=101.0, user=5.0)
+    monitor._proc = root
+    root.child_list = [child]
+    monitor._sample()
+
+    # one transient failure while the child is still listed in the tree.
+    real_cpu_times = child.cpu_times
+    child.cpu_times = lambda: (_ for _ in ()).throw(psutil.AccessDenied(200))
+    monitor._sample()
+
+    # the read recovers with the cumulative counter a bit higher.
+    child.cpu_times = real_cpu_times
+    child.user = 6.0
+    monitor._sample()
+
+    usage = await monitor.stop()
+    assert usage is not None
+    # 0.1 (root) + 6.0 (child), not 11.1 from banking the 5.0 reading and
+    # then re-counting the child's full cumulative time on top.
+    assert usage.cpu_user_seconds == pytest.approx(6.1)
+
+
 def test_node_sampler_snapshot():
     sampler = NodeResourceSampler()
     snap = sampler.snapshot()
@@ -125,6 +252,41 @@ def test_node_sampler_snapshot():
 def test_node_sampler_without_psutil(monkeypatch):
     monkeypatch.setattr("yacron2.resources.psutil", None)
     assert NodeResourceSampler().snapshot() is None
+
+
+def test_node_sampler_snapshot_is_memoised(monkeypatch):
+    # snapshot() is cached for NODE_SNAPSHOT_TTL so near-simultaneous readers
+    # (dashboard endpoints, gossip payloads) share one measurement window
+    # instead of resetting psutil's since-last-call CPU counter on each
+    # other. Clock is monkeypatched -- no real sleeps, no timing windows.
+    sampler = NodeResourceSampler()
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(resources.time, "monotonic", lambda: clock["now"])
+    calls = []
+    real_cpu_percent = resources.psutil.cpu_percent
+
+    def counting_cpu_percent(interval=None):
+        calls.append(interval)
+        return real_cpu_percent(interval)
+
+    monkeypatch.setattr(resources.psutil, "cpu_percent",
+                        counting_cpu_percent)
+
+    first = sampler.snapshot()
+    second = sampler.snapshot()
+    assert first is not None
+    assert first == second
+    assert first is not second  # callers get copies, not the cache itself
+    assert len(calls) == 1  # psutil sampled once for both reads
+
+    # mutating a returned snapshot must not poison the cache.
+    second["cpu_percent"] = -12345.0
+    assert sampler.snapshot()["cpu_percent"] != -12345.0
+
+    # once the TTL lapses, the node is actually sampled again.
+    clock["now"] += NODE_SNAPSHOT_TTL + 0.001
+    assert sampler.snapshot() is not None
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

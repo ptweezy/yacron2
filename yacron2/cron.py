@@ -1338,6 +1338,13 @@ class Cron:
             )
         payload = dict(self.cluster_manager.view_dict())
         payload["enabled"] = True
+        # lease backends (kubernetes/etcd/filesystem) have no fleet view of
+        # their own, but the observability overlay mesh serves one when
+        # installed (see _fleet_backend) -- tell the dashboard whether its
+        # fleet view has data behind it. The gossip payload stays unchanged:
+        # its UI path always shows the fleet view.
+        if payload.get("backend") != "gossip":
+            payload["fleet"] = self.observability_mesh is not None
         # this node's own live CPU/memory, sampled fresh: always shown in the
         # cluster panel (it is local and free), independent of whether peers
         # share theirs. Peer load rides view_dict's per-peer node_stats (only
@@ -1354,8 +1361,8 @@ class Cron:
         :meth:`yacron2.cluster.ClusterManager.fleet_view`) -- serving this
         endpoint triggers no peer traffic.  ``enabled: false`` when there is
         no cluster, or the backend has no node-to-node channel to have
-        carried summaries (the lease backends); the dashboard then hides its
-        fleet view.
+        carried summaries (a lease backend without the observability
+        overlay); the dashboard then hides its fleet view.
         """
         assert self.web_config is not None
         headers = self.web_config.get("headers", None)
@@ -2320,6 +2327,26 @@ class Cron:
                     self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
 
+    @staticmethod
+    def _election_relevant(cluster_config: ClusterConfig) -> Dict[str, Any]:
+        """The cluster config minus its observability-only keys.
+
+        ``shareNodeStats`` and ``observabilityMesh`` are resolved onto the
+        same ClusterConfig dict (see
+        :func:`yacron2.config._attach_observability`) but are election-inert:
+        they feed the overlay lifecycle (:meth:`start_stop_observability`) and
+        the share-flag reconciliation in :meth:`start_stop_cluster`, never the
+        election manager's behavior. Restarting the manager on a difference in
+        them would, on a lease backend, drop the leadership lease and pause
+        Leader jobs fleet-wide for an edit that changes nothing about
+        election -- so the restart comparison strips them from both sides.
+        """
+        return {
+            key: value
+            for key, value in cluster_config.items()
+            if key not in ("shareNodeStats", "observabilityMesh")
+        }
+
     async def start_stop_cluster(
         self, cluster_config: Optional[ClusterConfig]
     ) -> None:
@@ -2338,7 +2365,13 @@ class Cron:
         # the old cert until it expires and then loses quorum fleet-wide.
         mgr = self.cluster_manager
         if mgr is not None:
-            if cluster_config is None or cluster_config != mgr.config:
+            # observability-only edits (shareNodeStats / observabilityMesh)
+            # are stripped from the comparison: they never require an election
+            # restart (see _election_relevant); the overlay lifecycle and the
+            # share-flag reconciliation below pick them up instead.
+            if cluster_config is None or self._election_relevant(
+                cluster_config
+            ) != self._election_relevant(mgr.config):
                 reason = "configuration changed"
             elif mgr.tls_files_changed():
                 reason = "TLS certificate files changed"
@@ -2440,6 +2473,23 @@ class Cron:
                 self._was_conflict = False
                 self._was_size_conflict = False
                 self._was_policy_conflict = False
+        if cluster_config is not None and self.cluster_manager is not None:
+            # The manager was KEPT across this reload (only observability
+            # keys -- or nothing -- changed), but it latched the node-stats
+            # share flag once, at whichever set_node_stats_provider call it
+            # last saw. Re-reconcile it to the NEW config unconditionally, or
+            # a shareNodeStats toggle would never reach a running gossip
+            # election mesh: off would keep gossiping CPU/memory until some
+            # unrelated restart, on would never start. Safe on a running
+            # manager -- the call only reassigns the provider and flag, picked
+            # up on the next /peer round -- and a no-op on the lease backends
+            # (their seam default ignores it). Same share expression as the
+            # build path below.
+            self.cluster_manager.set_node_stats_provider(
+                self.node_resource_snapshot,
+                share=bool(cluster_config.get("shareNodeStats"))
+                and cluster_config.get("observabilityMesh") is None,
+            )
         if cluster_config is not None and self.cluster_manager is None:
             # Emit non-fatal advisories here (only when a manager is actually
             # (re)started) rather than at parse time, which runs every reload
@@ -2571,6 +2621,24 @@ class Cron:
                 logger.info("cluster.observability: %s, stopping", reason)
                 await mesh.stop()
                 self.observability_mesh = None
+        if mesh_config is not None and self.observability_mesh is not None:
+            # The overlay was KEPT across this reload -- and shareNodeStats
+            # lives on the CLUSTER config, not on the resolved mesh config the
+            # keep/rebuild comparison above sees, so a toggle always lands
+            # here. The mesh latched the flag at its last
+            # set_node_stats_provider call, so re-reconcile it to the new
+            # config unconditionally or a toggle off keeps gossiping
+            # CPU/memory until an unrelated restart and a toggle on never
+            # starts. Safe on a running mesh: the call only reassigns the
+            # provider and flag, picked up on the next /peer round. Same share
+            # expression as the build path below.
+            self.observability_mesh.set_node_stats_provider(
+                self.node_resource_snapshot,
+                share=bool(
+                    cluster_config is not None
+                    and cluster_config.get("shareNodeStats")
+                ),
+            )
         if mesh_config is not None and self.observability_mesh is None:
             try:
                 mgr = make_backend(mesh_config, self.job_set_id)

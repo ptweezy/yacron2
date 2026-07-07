@@ -72,7 +72,11 @@ A task's readiness is governed by its `triggerRule`:
 
 Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `captureStderr`, `executionTimeout`, `killTimeout`, `user` / `group`,
-`failsWhen`, and run-scoped `secrets`. Per-task **retries** are DAG-owned
+`failsWhen`, run-scoped `secrets`, and `monitorResources` (a monitored task
+instance's sampled CPU time and peak RSS land in the `resources` object of its
+task record in the `dag_run` document, and in the task's statsd sink if one is
+configured; task instances do not appear in the per-job Prometheus families).
+Per-task **retries** are DAG-owned
 (independent of a job's `onFailure.retry`):
 
 ```yaml

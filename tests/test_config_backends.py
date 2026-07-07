@@ -102,6 +102,31 @@ def test_observability_gossip_backend_rejects_transport():
         )
 
 
+def test_observability_gossip_backend_rejects_overlay_tuning():
+    # nodeName/interval/driftAfter/connectTimeout configure the SEPARATE
+    # overlay mesh a lease backend stands up; under gossip the stats ride the
+    # election mesh (tuned by the cluster-level keys), so they must be
+    # rejected like the transport keys rather than silently ignored.
+    for key, value in (
+        ("nodeName", "obs-a"),
+        ("interval", "5"),
+        ("driftAfter", "2"),
+        ("connectTimeout", "3"),
+    ):
+        with pytest.raises(
+            ConfigError,
+            match="observability.{} only applies".format(key),
+        ):
+            _gossip(
+                "    - host: b:8443\n",
+                extra=(
+                    "  observability:\n"
+                    "    shareNodeStats: true\n"
+                    "    " + key + ": " + value + "\n"
+                ),
+            )
+
+
 def test_observability_lease_requires_transport():
     with pytest.raises(ConfigError, match="observability requires"):
         _cluster(

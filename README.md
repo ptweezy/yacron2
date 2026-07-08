@@ -19,8 +19,6 @@ kraahn-stuh-bl, like constable
 
 A stability-focused, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-inlcuded, security-hardened, production-ready cron replacement.
 
-cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
-
 ## Why cronstable?
 
 * **Built for locked-down containers.** Runs unmodified under restricted
@@ -1897,3 +1895,5 @@ Bug reports, feature ideas, and pull requests are welcome; see
 [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and
 [Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing)
 for how releases work. cronstable is [MIT-licensed](LICENSE).
+
+cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.

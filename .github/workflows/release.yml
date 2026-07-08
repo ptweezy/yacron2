@@ -837,6 +837,10 @@ jobs:
       contents: write   # upload assets to the existing Release
     env:
       GH_TOKEN: ${{ github.token }}
+      # This job has no `actions/checkout` step, so `gh` cannot infer the repo
+      # from a git remote (it shells out to git and dies with "not a git
+      # repository"). Point `gh release download/upload` at the repo explicitly.
+      GH_REPO: ${{ github.repository }}
       NEW: ${{ needs.version.outputs.new }}
     steps:
       # Pull down every per-arch binary that built (fast + slow). A too-narrow

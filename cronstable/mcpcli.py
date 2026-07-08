@@ -220,8 +220,9 @@ def _check(args: argparse.Namespace) -> int:
     try:
         _s, body2 = _post(
             args.url,
-            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            .encode(),
+            json.dumps(
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+            ).encode(),
             token,
             negotiated,
             args.timeout,

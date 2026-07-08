@@ -227,9 +227,7 @@ class MCPHandler:
 
     # -- JSON-RPC method handlers -----------------------------------------
 
-    async def _m_initialize(
-        self, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _m_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
         requested = params.get("protocolVersion")
         # echo the client's version when we can speak it, else offer ours.
         negotiated = (
@@ -264,9 +262,7 @@ class MCPHandler:
     async def _m_ping(self, params: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
-    async def _m_tools_list(
-        self, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _m_tools_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
         tools = [
             {
                 "name": t["name"],
@@ -280,9 +276,7 @@ class MCPHandler:
         ]
         return {"tools": tools}
 
-    async def _m_tools_call(
-        self, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _m_tools_call(self, params: Dict[str, Any]) -> Dict[str, Any]:
         name = params.get("name")
         if not isinstance(name, str):
             raise MCPError(INVALID_PARAMS, "tools/call requires a 'name'")
@@ -305,9 +299,7 @@ class MCPHandler:
 
     # -- top-level dispatch (transport-independent, unit-testable) --------
 
-    async def handle_message(
-        self, msg: Any
-    ) -> Optional[Dict[str, Any]]:
+    async def handle_message(self, msg: Any) -> Optional[Dict[str, Any]]:
         """Dispatch one JSON-RPC message.
 
         Returns the response object for a request, or ``None`` for a
@@ -369,11 +361,7 @@ class MCPHandler:
         accept = request.headers.get("Accept")
         # stateless mode only ever emits application/json; be lenient on a
         # missing Accept, but honor a present, incompatible one.
-        if (
-            accept
-            and "application/json" not in accept
-            and "*/*" not in accept
-        ):
+        if accept and "application/json" not in accept and "*/*" not in accept:
             return self._http_error(406, "Accept application/json", origin)
         if (
             request.content_length is not None
@@ -407,9 +395,7 @@ class MCPHandler:
         resp.headers["Allow"] = "POST, OPTIONS"
         return resp
 
-    async def handle_options(
-        self, request: web.Request
-    ) -> web.StreamResponse:
+    async def handle_options(self, request: web.Request) -> web.StreamResponse:
         origin = request.headers.get("Origin")
         if origin and origin in self._allowed_origins:
             headers = self._cors_headers(origin)
@@ -502,200 +488,333 @@ class MCPHandler:
         specs = [
             # ---- observe (read-only) ----
             (
-                "observe", False, "cron_get_status", "Job status",
+                "observe",
+                False,
+                "cron_get_status",
+                "Job status",
                 "One-line status (running/disabled/scheduled) of every job.",
                 obj({"offset": _INT, "limit": _INT}),
-                self._t_get_status, False, True,
+                self._t_get_status,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_list_jobs", "List jobs",
+                "observe",
+                False,
+                "cron_list_jobs",
+                "List jobs",
                 "List jobs with schedule, enabled/running state, next run and "
                 "last outcome. Optional name substring `filter` and `state` "
                 "(running/disabled/scheduled).",
-                obj({
-                    "filter": _STR, "state": _enum(
-                        ["running", "disabled", "scheduled"]
-                    ),
-                    "offset": _INT, "limit": _INT,
-                }),
-                self._t_list_jobs, False, True,
+                obj(
+                    {
+                        "filter": _STR,
+                        "state": _enum(["running", "disabled", "scheduled"]),
+                        "offset": _INT,
+                        "limit": _INT,
+                    }
+                ),
+                self._t_list_jobs,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_get_job", "Get one job",
+                "observe",
+                False,
+                "cron_get_job",
+                "Get one job",
                 "Full detail for one job (schedule, command, last run, live "
                 "resources, retry/slot state).",
                 obj({"name": _STR}, ["name"]),
-                self._t_get_job, False, True,
+                self._t_get_job,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_list_runs", "Run history",
+                "observe",
+                False,
+                "cron_list_runs",
+                "Run history",
                 "Retained run history + success/duration stats for one job "
                 "(most recent `limit` runs).",
                 obj({"name": _STR, "limit": _INT}, ["name"]),
-                self._t_list_runs, False, True,
+                self._t_list_runs,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_get_job_trends", "SLA trends",
+                "observe",
+                False,
+                "cron_get_job_trends",
+                "SLA trends",
                 "Per-window (1h/24h/7d/30d/all) success-rate and duration "
                 "aggregates over the durable run ledger for one job.",
                 obj({"name": _STR}, ["name"]),
-                self._t_get_job_trends, False, True,
+                self._t_get_job_trends,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_get_job_resources", "Resource usage",
+                "observe",
+                False,
+                "cron_get_job_resources",
+                "Resource usage",
                 "CPU/RSS time series for a job's live and recent runs "
                 "(monitorResources jobs).",
                 obj({"name": _STR, "runs": _INT}, ["name"]),
-                self._t_get_job_resources, False, True,
+                self._t_get_job_resources,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_get_cluster", "Cluster view",
+                "observe",
+                False,
+                "cron_get_cluster",
+                "Cluster view",
                 "This node's cluster/leadership view (peers, quorum, role, "
                 "live load). enabled:false without a cluster section.",
                 obj({}),
-                self._t_get_cluster, False, True,
+                self._t_get_cluster,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_get_fleet", "Fleet view",
+                "observe",
+                False,
+                "cron_get_fleet",
+                "Fleet view",
                 "The cluster-wide jobs x nodes run matrix (single pane of "
                 "glass). enabled:false without a cluster.",
                 obj({}),
-                self._t_get_fleet, False, True,
+                self._t_get_fleet,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_get_node", "Node resources",
+                "observe",
+                False,
+                "cron_get_node",
+                "Node resources",
                 "This node's live whole-host CPU/memory (optionally with the "
                 "retained history ring).",
                 obj({"history": _BOOL}),
-                self._t_get_node, False, True,
+                self._t_get_node,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_query_metrics", "Query metrics",
+                "observe",
+                False,
+                "cron_query_metrics",
+                "Query metrics",
                 "Parsed samples from the Prometheus /metrics exposition, "
                 "optionally filtered by a metric-name substring `match`.",
                 obj({"match": _STR, "limit": _INT}),
-                self._t_query_metrics, False, True,
+                self._t_query_metrics,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_get_version", "Version",
+                "observe",
+                False,
+                "cron_get_version",
+                "Version",
                 "Daemon version, job-set id and job count.",
                 obj({}),
-                self._t_get_version, False, True,
+                self._t_get_version,
+                False,
+                True,
             ),
             (
-                "observe", False, "cron_tail_job_logs", "Tail job logs",
+                "observe",
+                False,
+                "cron_tail_job_logs",
+                "Tail job logs",
                 "Last retained stdout/stderr lines of a job, with a `cursor` "
                 "to poll for newly appended lines (the poll form of the live "
                 "log stream).",
                 obj({"name": _STR, "tail": _INT, "cursor": _INT}, ["name"]),
-                self._t_tail_job_logs, False, True,
+                self._t_tail_job_logs,
+                False,
+                True,
             ),
             # ---- dags ----
             (
-                "dags", False, "cron_list_dags", "List DAGs",
+                "dags",
+                False,
+                "cron_list_dags",
+                "List DAGs",
                 "Configured orchestration DAGs with their tasks and "
                 "dependencies.",
                 obj({}),
-                self._t_list_dags, False, True,
+                self._t_list_dags,
+                False,
+                True,
             ),
             (
-                "dags", False, "cron_list_dag_runs", "List DAG runs",
+                "dags",
+                False,
+                "cron_list_dag_runs",
+                "List DAG runs",
                 "Recent runs of one DAG with per-state task counts.",
                 obj({"dag": _STR, "limit": _INT}, ["dag"]),
-                self._t_list_dag_runs, False, True,
+                self._t_list_dag_runs,
+                False,
+                True,
             ),
             (
-                "dags", False, "cron_get_dag_run", "Get DAG run",
+                "dags",
+                False,
+                "cron_get_dag_run",
+                "Get DAG run",
                 "One DAG run's full document: task states, timing, decisions.",
                 obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
-                self._t_get_dag_run, False, True,
+                self._t_get_dag_run,
+                False,
+                True,
             ),
             (
-                "dags", False, "cron_get_dag_xcom", "DAG XCom",
+                "dags",
+                False,
+                "cron_get_dag_xcom",
+                "DAG XCom",
                 "The XCom values a DAG run's tasks published.",
                 obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
-                self._t_get_dag_xcom, False, True,
+                self._t_get_dag_xcom,
+                False,
+                True,
             ),
             (
-                "dags", False, "cron_tail_dag_task_logs", "Tail DAG task logs",
+                "dags",
+                False,
+                "cron_tail_dag_task_logs",
+                "Tail DAG task logs",
                 "Last retained log lines of a currently-running DAG task "
                 "instance, with a `cursor` to poll for more.",
                 obj(
                     {
-                        "dag": _STR, "run_key": _STR, "taskkey": _STR,
-                        "tail": _INT, "cursor": _INT,
+                        "dag": _STR,
+                        "run_key": _STR,
+                        "taskkey": _STR,
+                        "tail": _INT,
+                        "cursor": _INT,
                     },
                     ["dag", "run_key", "taskkey"],
                 ),
-                self._t_tail_dag_task_logs, False, True,
+                self._t_tail_dag_task_logs,
+                False,
+                True,
             ),
             # ---- state (read-only inspector) ----
             (
-                "state", False, "cron_inspect_state", "Inspect state store",
+                "state",
+                False,
+                "cron_inspect_state",
+                "Inspect state store",
                 "Metadata-only view of the durable state store: overview "
                 "(default), one namespace's documents (`ns` "
                 "kv/|cursor/|idem/) or a stream's newest records (`stream`). "
                 "KV values and "
                 "secrets are redacted.",
                 obj({"ns": _STR, "stream": _STR, "limit": _INT}),
-                self._t_inspect_state, False, True,
+                self._t_inspect_state,
+                False,
+                True,
             ),
             # ---- act (mutating job control; readOnly:false to expose) ----
             (
-                "act", True, "cron_run_job", "Run job now",
+                "act",
+                True,
+                "cron_run_job",
+                "Run job now",
                 "Launch a job immediately (honours its concurrencyPolicy). "
                 "Requires confirm=true.",
                 obj({"name": _STR, "confirm": _BOOL}, ["name"]),
-                self._t_run_job, False, False,
+                self._t_run_job,
+                False,
+                False,
             ),
             (
-                "act", True, "cron_cancel_job", "Cancel job",
+                "act",
+                True,
+                "cron_cancel_job",
+                "Cancel job",
                 "Terminate a job's running instances (graceful, then kill). "
                 "Requires confirm=true.",
                 obj({"name": _STR, "confirm": _BOOL}, ["name"]),
-                self._t_cancel_job, True, True,
+                self._t_cancel_job,
+                True,
+                True,
             ),
             # ---- dag control (mutating; toolset dags + readOnly:false) ----
             (
-                "dags", True, "cron_trigger_dag", "Trigger DAG",
+                "dags",
+                True,
+                "cron_trigger_dag",
+                "Trigger DAG",
                 "Create and start a manual DAG run now. "
                 "Requires confirm=true.",
                 obj({"dag": _STR, "confirm": _BOOL}, ["dag"]),
-                self._t_trigger_dag, False, False,
+                self._t_trigger_dag,
+                False,
+                False,
             ),
             (
-                "dags", True, "cron_backfill_dag", "Backfill DAG",
+                "dags",
+                True,
+                "cron_backfill_dag",
+                "Backfill DAG",
                 "Replay a scheduled DAG across an ISO date range. dry_run "
                 "(default true) previews; a real backfill needs dry_run=false "
                 "AND confirm=true.",
                 obj(
                     {
-                        "dag": _STR, "from": _STR, "to": _STR,
-                        "dry_run": _BOOL, "confirm": _BOOL,
+                        "dag": _STR,
+                        "from": _STR,
+                        "to": _STR,
+                        "dry_run": _BOOL,
+                        "confirm": _BOOL,
                     },
                     ["dag", "from", "to"],
                 ),
-                self._t_backfill_dag, True, False,
+                self._t_backfill_dag,
+                True,
+                False,
             ),
             (
-                "dags", True, "cron_decide_gate", "Decide approval gate",
+                "dags",
+                True,
+                "cron_decide_gate",
+                "Decide approval gate",
                 "Approve or reject a DAG approval gate. "
                 "Requires confirm=true.",
                 obj(
                     {
-                        "dag": _STR, "run_key": _STR, "taskkey": _STR,
+                        "dag": _STR,
+                        "run_key": _STR,
+                        "taskkey": _STR,
                         "decision": _enum(["approve", "reject"]),
-                        "by": _STR, "confirm": _BOOL,
+                        "by": _STR,
+                        "confirm": _BOOL,
                     },
                     ["dag", "run_key", "taskkey", "decision"],
                 ),
-                self._t_decide_gate, True, False,
+                self._t_decide_gate,
+                True,
+                False,
             ),
         ]
         registry: List[Dict[str, Any]] = []
         for (
-            toolset, mutating, name, title, desc, schema, handler,
-            destructive, idempotent,
+            toolset,
+            mutating,
+            name,
+            title,
+            desc,
+            schema,
+            handler,
+            destructive,
+            idempotent,
         ) in specs:
             registry.append(
                 {
@@ -743,9 +862,7 @@ class MCPHandler:
             rows = [r for r in rows if not r.get("enabled")]
         elif state == "scheduled":
             rows = [
-                r
-                for r in rows
-                if r.get("enabled") and not r.get("running")
+                r for r in rows if r.get("enabled") and not r.get("running")
             ]
         page, meta = self._page(rows, args.get("offset"), args.get("limit"))
         return _result(
@@ -783,9 +900,7 @@ class MCPHandler:
             ),
         )
 
-    async def _t_get_job_trends(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _t_get_job_trends(self, args: Dict[str, Any]) -> Dict[str, Any]:
         name = _req_str(args, "name")
         payload = await self._cron.job_trends_payload(name)
         if payload is None:
@@ -819,9 +934,7 @@ class MCPHandler:
         payload = self._cron.node_payload(history=bool(args.get("history")))
         return _result(payload, "node {}".format(payload.get("node_name")))
 
-    async def _t_query_metrics(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _t_query_metrics(self, args: Dict[str, Any]) -> Dict[str, Any]:
         match = args.get("match")
         if match is not None and not isinstance(match, str):
             raise _ToolInputError("`match` must be a string")
@@ -848,14 +961,10 @@ class MCPHandler:
         }
         return _result(
             data,
-            "cronstable {} - {} job(s)".format(
-                data["version"], data["jobs"]
-            ),
+            "cronstable {} - {} job(s)".format(data["version"], data["jobs"]),
         )
 
-    async def _t_tail_job_logs(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _t_tail_job_logs(self, args: Dict[str, Any]) -> Dict[str, Any]:
         name = _req_str(args, "name")
         tail = self._clamp_limit(args.get("tail"))
         payload = self._cron.job_logs_tail_payload(
@@ -876,9 +985,7 @@ class MCPHandler:
         dags = await self._cron.dags_payload()
         return _result({"dags": dags}, "{} DAG(s)".format(len(dags)))
 
-    async def _t_list_dag_runs(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _t_list_dag_runs(self, args: Dict[str, Any]) -> Dict[str, Any]:
         dag = _req_str(args, "dag")
         limit = self._clamp_limit(args.get("limit"))
         runs = await self._cron._dag.list_runs(dag, limit=limit)
@@ -907,9 +1014,9 @@ class MCPHandler:
             return _tool_error(
                 "dag run not found: {!r}/{!r}".format(dag, run_key)
             )
-        return _result(result, "xcom for dag {!r} run {!r}".format(
-            dag, run_key
-        ))
+        return _result(
+            result, "xcom for dag {!r} run {!r}".format(dag, run_key)
+        )
 
     async def _t_tail_dag_task_logs(
         self, args: Dict[str, Any]
@@ -919,7 +1026,10 @@ class MCPHandler:
         taskkey = _req_str(args, "taskkey")
         tail = self._clamp_limit(args.get("tail"))
         payload = self._cron.dag_task_logs_tail_payload(
-            dag, run_key, taskkey, tail=tail,
+            dag,
+            run_key,
+            taskkey,
+            tail=tail,
             cursor=_opt_int(args.get("cursor")),
         )
         if payload is None:
@@ -933,9 +1043,7 @@ class MCPHandler:
 
     # -- state tool handler -----------------------------------------------
 
-    async def _t_inspect_state(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _t_inspect_state(self, args: Dict[str, Any]) -> Dict[str, Any]:
         ns = args.get("ns")
         stream = args.get("stream")
         if ns is not None and stream is not None:
@@ -993,7 +1101,10 @@ class MCPHandler:
         if args.get("dry_run", True):
             return _result(
                 {
-                    "dag": dag, "from": start, "to": end, "dryRun": True,
+                    "dag": dag,
+                    "from": start,
+                    "to": end,
+                    "dryRun": True,
                     "wouldExecute": False,
                 },
                 "DRY RUN: would backfill dag {!r} from {} to {}. Call again "
@@ -1026,7 +1137,6 @@ class MCPHandler:
         return _result(
             result, "{}d gate {!r} on dag {!r}".format(decision, taskkey, dag)
         )
-
 
     # -- resources (URI-addressable read-only context) --------------------
 
@@ -1129,55 +1239,107 @@ class MCPHandler:
 
         # fixed resources
         fixed = [
-            ("cronstable://status", "status", "Job status",
-             "Live status of every job.", "observe", status_data),
-            ("cronstable://cluster", "cluster", "Cluster view",
-             "This node's cluster/leadership view.", "observe",
-             _async(cron.cluster_payload)),
-            ("cronstable://fleet", "fleet", "Fleet view",
-             "The cluster-wide jobs x nodes matrix.", "observe",
-             _async(cron.fleet_payload)),
-            ("cronstable://version", "version", "Version",
-             "Daemon version, job-set id and job count.", "observe",
-             version_data),
+            (
+                "cronstable://status",
+                "status",
+                "Job status",
+                "Live status of every job.",
+                "observe",
+                status_data,
+            ),
+            (
+                "cronstable://cluster",
+                "cluster",
+                "Cluster view",
+                "This node's cluster/leadership view.",
+                "observe",
+                _async(cron.cluster_payload),
+            ),
+            (
+                "cronstable://fleet",
+                "fleet",
+                "Fleet view",
+                "The cluster-wide jobs x nodes matrix.",
+                "observe",
+                _async(cron.fleet_payload),
+            ),
+            (
+                "cronstable://version",
+                "version",
+                "Version",
+                "Daemon version, job-set id and job count.",
+                "observe",
+                version_data,
+            ),
         ]
         resources = [
             {
-                "uri": uri, "name": name, "title": title,
-                "description": desc, "toolset": toolset, "loader": loader,
+                "uri": uri,
+                "name": name,
+                "title": title,
+                "description": desc,
+                "toolset": toolset,
+                "loader": loader,
             }
             for uri, name, title, desc, toolset, loader in fixed
         ]
         # resource templates: (uriTemplate, regex, name, title, desc, toolset,
         #  loader(*groups))
         templates_spec = [
-            ("cronstable://jobs/{name}",
-             r"^cronstable://jobs/([^/]+)$",
-             "job", "Job detail", "Full detail for one job.", "observe",
-             _async1(cron.job_detail_payload)),
-            ("cronstable://jobs/{name}/runs",
-             r"^cronstable://jobs/([^/]+)/runs$",
-             "job-runs", "Job run history",
-             "Retained run history + stats for one job.", "observe",
-             _async1(cron.job_runs_payload)),
-            ("cronstable://dags/{name}",
-             r"^cronstable://dags/([^/]+)$",
-             "dag", "DAG detail", "One DAG's tasks and dependencies.",
-             "dags", dag_detail),
-            ("cronstable://dags/{name}/runs/{run_key}",
-             r"^cronstable://dags/([^/]+)/runs/([^/]+)$",
-             "dag-run", "DAG run", "One DAG run's full document.", "dags",
-             cron._dag.get_run),
-            ("cronstable://state/{ns}",
-             r"^cronstable://state/(.+)$",
-             "state-ns", "State namespace",
-             "Redacted documents of a kv/|cursor/|idem/ namespace.", "state",
-             cron.state_documents_payload),
+            (
+                "cronstable://jobs/{name}",
+                r"^cronstable://jobs/([^/]+)$",
+                "job",
+                "Job detail",
+                "Full detail for one job.",
+                "observe",
+                _async1(cron.job_detail_payload),
+            ),
+            (
+                "cronstable://jobs/{name}/runs",
+                r"^cronstable://jobs/([^/]+)/runs$",
+                "job-runs",
+                "Job run history",
+                "Retained run history + stats for one job.",
+                "observe",
+                _async1(cron.job_runs_payload),
+            ),
+            (
+                "cronstable://dags/{name}",
+                r"^cronstable://dags/([^/]+)$",
+                "dag",
+                "DAG detail",
+                "One DAG's tasks and dependencies.",
+                "dags",
+                dag_detail,
+            ),
+            (
+                "cronstable://dags/{name}/runs/{run_key}",
+                r"^cronstable://dags/([^/]+)/runs/([^/]+)$",
+                "dag-run",
+                "DAG run",
+                "One DAG run's full document.",
+                "dags",
+                cron._dag.get_run,
+            ),
+            (
+                "cronstable://state/{ns}",
+                r"^cronstable://state/(.+)$",
+                "state-ns",
+                "State namespace",
+                "Redacted documents of a kv/|cursor/|idem/ namespace.",
+                "state",
+                cron.state_documents_payload,
+            ),
         ]
         templates = [
             {
-                "uriTemplate": tmpl, "regex": re.compile(rx), "name": name,
-                "title": title, "description": desc, "toolset": toolset,
+                "uriTemplate": tmpl,
+                "regex": re.compile(rx),
+                "name": name,
+                "title": title,
+                "description": desc,
+                "toolset": toolset,
                 "loader": loader,
             }
             for tmpl, rx, name, title, desc, toolset, loader in templates_spec
@@ -1186,9 +1348,7 @@ class MCPHandler:
 
     # -- prompts (canned triage playbooks) --------------------------------
 
-    async def _m_prompts_list(
-        self, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _m_prompts_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
         prompts = [
             {
                 "name": p["name"],
@@ -1201,15 +1361,11 @@ class MCPHandler:
         ]
         return {"prompts": prompts}
 
-    async def _m_prompts_get(
-        self, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def _m_prompts_get(self, params: Dict[str, Any]) -> Dict[str, Any]:
         name = params.get("name")
         prompt = self._prompt_by_name.get(name) if name else None
         if prompt is None or not self._prompt_visible(prompt):
-            raise MCPError(
-                INVALID_PARAMS, "unknown prompt: {}".format(name)
-            )
+            raise MCPError(INVALID_PARAMS, "unknown prompt: {}".format(name))
         args = params.get("arguments") or {}
         if not isinstance(args, dict):
             args = {}
@@ -1289,25 +1445,31 @@ class MCPHandler:
 
         return [
             {
-                "name": "triage_job_failure", "title": "Triage a job failure",
+                "name": "triage_job_failure",
+                "title": "Triage a job failure",
                 "description": "Root-cause a failing job from its runs, "
                 "trends, logs and host health.",
                 "arguments": [arg("job", "the failing job's name")],
-                "toolset": "observe", "render": triage,
+                "toolset": "observe",
+                "render": triage,
             },
             {
-                "name": "blast_radius", "title": "Assess blast radius",
+                "name": "blast_radius",
+                "title": "Assess blast radius",
                 "description": "Scope what else is at risk from a broken job "
                 "or DAG.",
                 "arguments": [arg("target", "a job or dag name")],
-                "toolset": "observe", "render": blast,
+                "toolset": "observe",
+                "render": blast,
             },
             {
                 "name": "fleet_health_summary",
                 "title": "Fleet health summary",
                 "description": "A wallboard-style digest of cluster + fleet + "
                 "job health.",
-                "arguments": [], "toolset": "observe", "render": fleet,
+                "arguments": [],
+                "toolset": "observe",
+                "render": fleet,
             },
             {
                 "name": "why_did_dag_run_fail",
@@ -1318,10 +1480,12 @@ class MCPHandler:
                     arg("dag", "the DAG name"),
                     arg("run_key", "the failed run key"),
                 ],
-                "toolset": "dags", "render": dag_fail,
+                "toolset": "dags",
+                "render": dag_fail,
             },
             {
-                "name": "backfill_plan", "title": "Plan a DAG backfill",
+                "name": "backfill_plan",
+                "title": "Plan a DAG backfill",
                 "description": "Preview and reason about a DAG backfill "
                 "before proposing a real run.",
                 "arguments": [
@@ -1329,7 +1493,8 @@ class MCPHandler:
                     arg("from", "ISO start date"),
                     arg("to", "ISO end date"),
                 ],
-                "toolset": "dags", "render": backfill_plan,
+                "toolset": "dags",
+                "render": backfill_plan,
             },
         ]
 

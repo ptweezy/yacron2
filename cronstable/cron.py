@@ -290,6 +290,7 @@ def _http_for_action_error(
         return factory(text=ex.message, headers=headers)
     return factory(text=ex.message)
 
+
 # Defense-in-depth security headers for the dashboard HTML document. The
 # page is fully self-contained (one inline <script>, inline styles, no
 # external assets) and only ever talks to its own origin, so this CSP is
@@ -1676,9 +1677,7 @@ class Cron:
         (409) job.
         """
         if name not in self.cron_jobs:
-            raise ApiActionError(
-                "job {!r} not found".format(name), status=404
-            )
+            raise ApiActionError("job {!r} not found".format(name), status=404)
         running = list(self.running_jobs.get(name) or [])
         if not running:
             # nothing to cancel: report a conflict rather than a silent no-op
@@ -1713,9 +1712,7 @@ class Cron:
             raise self._action_http_error(ex) from ex
         return web.Response(headers=self.web_config.get("headers", None))
 
-    def _action_http_error(
-        self, ex: "ApiActionError"
-    ) -> web.HTTPException:
+    def _action_http_error(self, ex: "ApiActionError") -> web.HTTPException:
         # historical parity: web.headers ride the 409 conflict bodies of the
         # start/cancel routes, but NOT their 404 (unknown job).
         assert self.web_config is not None
@@ -2352,9 +2349,7 @@ class Cron:
             payload, headers=self.web_config.get("headers", None)
         )
 
-    async def job_trends_payload(
-        self, name: str
-    ) -> Optional[Dict[str, Any]]:
+    async def job_trends_payload(self, name: str) -> Optional[Dict[str, Any]]:
         """SLA trend aggregates over the durable run ledger, or ``None``.
 
         Behind ``GET /jobs/{name}/trends`` and MCP ``cron_get_job_trends``.

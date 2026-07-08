@@ -5,6 +5,117 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.13 (2026-07-08)
+
+cronstable becomes drivable by an AI agent.  A new, opt-in **MCP server**
+exposes the scheduler over the [Model Context
+Protocol](https://modelcontextprotocol.io), so Claude, Cursor, VS Code
+Copilot, or any MCP client can **observe** every job, DAG, the cluster/fleet,
+metrics, and the durable state store the way an operator reads the dashboard
+-- and, when you opt in, **act** (run or cancel a job, trigger / backfill /
+approve a DAG).  It is read-only by default, served two ways from one
+implementation -- a `POST /mcp` endpoint on the existing web listeners and a
+`cronstable mcp` stdio bridge for desktop clients -- and, like the rest of
+cronstable, hand-rolled in pure Python with **no new dependencies**.  It stays
+off unless an `mcp:` section sets `enabled: true`, so a plain install pays
+nothing and behavior is unchanged without it.
+
+- **The `mcp:` section and its two transports.** Configuration lives under a
+  new optional top-level `mcp:` block that rides the `web:` listeners -- a
+  `web` section is required, because there is nowhere else to serve it.
+  `enabled: true` turns on a **stateless Streamable-HTTP** JSON-RPC 2.0
+  endpoint at `POST /mcp`, pinned to MCP revision `2025-11-25` (no
+  `Mcp-Session-Id`; `GET /mcp` is `405`), and exposes the `cronstable mcp`
+  **stdio bridge** that desktop clients launch as a subprocess.  Both paths
+  run the same server code.
+
+- **Tools, grouped into opt-in toolsets.** The default `observe` toolset is
+  read-only -- status, jobs, per-job runs / trends / resources, cluster,
+  fleet, node load, a metrics query, version, and live log tails (twelve
+  tools).  `dags` adds DAG, run, and XCom reads plus task-log tails; `state`
+  adds a redacted durable-state inspector; `act` adds mutating job control
+  (`cron_run_job`, `cron_cancel_job`), and `dags` gains DAG control
+  (`cron_trigger_dag`, `cron_backfill_dag`, `cron_decide_gate`) once writes are
+  enabled -- 23 tools with every toolset on and `readOnly: false`.  Mutating
+  tools require an explicit `confirm: true`, carry honest `destructiveHint`
+  annotations, re-check the same authorization as the REST route, and
+  `cron_backfill_dag` previews as a dry run unless it is called with both
+  `dry_run: false` **and** `confirm: true`.
+
+- **Resources and prompts, both read-only and on by default.** Resources are
+  URI-addressable read-only snapshots a client can attach as context --
+  `cronstable://status`, `cronstable://cluster`, `cronstable://fleet`,
+  `cronstable://version`, and templates for jobs, runs, DAGs, and state
+  namespaces -- and every critical read is *also* a tool, because client
+  support for resources is uneven.  Prompts are canned triage playbooks that
+  chain the read tools: `triage_job_failure`, `why_did_dag_run_fail`,
+  `blast_radius`, `fleet_health_summary`, and `backfill_plan`.  Both are scoped
+  by the enabled toolsets (a DAG resource appears only with the `dags` toolset)
+  and can be turned off (`resources: false`, `prompts: false`) for a
+  tools-only client.
+
+- **Safe by default.** `readOnly: true` is the default and strips every
+  mutating tool regardless of toolset, so an agent gets look-but-don't-touch
+  until you opt in.  `/mcp` inherits `web.authToken` exactly like the data
+  routes and is never in the public set; enable it with no token on a routable
+  (non-loopback, non-socket) listener and cronstable **fails closed at config
+  load** (without a token the web app installs no auth middleware at all, so
+  `/mcp` would be wide open) -- restrict `web.listen` to loopback/sockets, set
+  a token, or set `mcp.allowUnauthenticated: true` when a proxy terminates
+  auth.  A present, non-allow-listed `Origin` is refused `403` (a DNS-rebinding
+  defense; browser clients go on `mcp.allowedOrigins`), an oversized body is
+  refused `413` (`maxBodyBytes`, 1 MiB default), and any list tool's `limit` is
+  capped at `maxRows` (200) with an opaque cursor for the remainder.
+  `cron_inspect_state` mirrors the dashboard's metadata-only stance: KV values
+  collapse to a size/type summary and secret *names* appear without their
+  values.
+
+- **One source of truth for REST and MCP.** The web layer's read handlers are
+  refactored so each endpoint's data is produced by a reusable `*_payload`
+  method -- `status_payload`, `jobs_payload`, `cluster_payload`,
+  `fleet_payload`, `node_payload`, the per-job runs / resources / trends
+  projections, `dags_payload`, the `state_*_payload` family, and new
+  poll/cursor log-tail projections -- and both the REST routes and the MCP
+  tools call those same methods, and the same `start_job_by_name` /
+  `cancel_job_by_name` action paths, so `GET /jobs` and `cron_list_jobs` can
+  never drift apart.  The web app now also rebuilds when only the `mcp` config
+  changes, so flipping `readOnly` or adding a toolset takes effect on the next
+  reload.
+
+- **The `cronstable mcp` stdio bridge.** A featherweight stdlib client --
+  imported lazily so it never pulls the daemon graph into CLI start-up --
+  reads newline-delimited JSON-RPC on stdin and forwards each frame to a
+  running daemon's `/mcp`, writing replies to stdout and logs to stderr.
+  `--url`, `--token` / `--token-env` (defaulting to the `CRONSTABLE_WEB_TOKEN`
+  env var), and a `--check` handshake that runs `initialize` + `tools/list`,
+  prints the negotiated protocol and tool count, and exits.  It needs a
+  reachable running daemon -- the right model for an ops tool.
+
+- **Docs, an example, and a rebuilt README.** New wiki pages (MCP and
+  MCP-Server-Design), an `mcp` row and full option table on
+  Configuration-Reference, and a `POST /mcp` section on HTTP-API.
+  `example/mcp` (with `docker-compose-mcp.yml`) boots a single node with the
+  server on and every toolset enabled -- a steady `heartbeat`, an intentionally
+  failing `flaky-export`, a long `slow-report`, and an on-demand
+  `on-demand-sync` -- and walks through wiring Claude Code / Desktop, Cursor,
+  and VS Code to it.  The README now leads with an animated dashboard reel
+  (every frame a real running fleet, WebP with a GIF fallback) and a
+  ten-theme / two-font showcase, adds a written tour of the dashboard's
+  accessibility options (interface font, UI scale, color-vision-safe palettes,
+  reduced motion), lists the MCP server among the features, moves the yacron
+  fork attribution to the foot of the page, and -- at last -- says how to
+  pronounce the name: *kraahn-stuh-bl, like constable*.
+
+- Internal: the MCP server ships with a dedicated `tests/test_mcp.py` suite --
+  the `initialize`/capability handshake, toolset and `readOnly` gating, the
+  `confirm` and dry-run write guards, `maxRows` clamping and pagination, the
+  fail-closed no-token check and the Origin / body-size / batching HTTP
+  defenses, resource and prompt scoping, and the featherweight-bridge import
+  cost -- and the release workflow's finalize job, which has no
+  `actions/checkout` (so `gh release download/upload` could not infer the
+  repository and died with "not a git repository"), now sets `GH_REPO`
+  explicitly.
+
 ## 1.2.12 (2026-07-08)
 
 The package finishes becoming **cronstable**.  Everything that was still

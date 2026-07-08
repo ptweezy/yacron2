@@ -2853,9 +2853,9 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
             "without authentication (with no token the web app installs no "
             "auth middleware at all). Set web.authToken, restrict web.listen "
             "to loopback/unix-socket addresses, or set "
-            "mcp.allowUnauthenticated: true when the endpoint is protected by "
-            "other means (an mTLS-terminating proxy, a network policy)."
-            .format(", ".join(routable))
+            "mcp.allowUnauthenticated: true when the endpoint is protected "
+            "by other means (an mTLS-terminating proxy, a network "
+            "policy).".format(", ".join(routable))
         )
 
 

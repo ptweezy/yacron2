@@ -515,10 +515,10 @@ jobs:
 # post-release change of this kind WOULD require the bump the comment above
 # demands.
 GOLDEN_JOB_SET_ID = (
-    "v1:d9b739b4e1b0a55bfa9929c00ab439b5b45ece1dec79e103f6346f8e5719bccf"
+    "v1:9e1086b120f4685e4ddd53c579b59c476b1e418ec4cdce6199c56953d13c2958"
 )
 GOLDEN_ALPHA_DIGEST = (
-    "c499a588afc43ad866589ff7194e09e571946290cd96a57d2065dc4c02c40c40"
+    "988333f6ca07051fb8546d20c34da1e1539f3bfb284ea3919a8e5ebf30836d21"
 )
 
 

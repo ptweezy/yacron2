@@ -70,13 +70,28 @@ _MACROS = {
 }
 
 _MONTH_NAMES = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
 }
 
 _DOW_NAMES = {
-    "sun": 0, "mon": 1, "tue": 2, "wed": 3,
-    "thu": 4, "fri": 5, "sat": 6,
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
 }
 
 #: next() never searches past this year: the year column's own maximum, and
@@ -372,9 +387,7 @@ class CronTab:
     def _day_matches(self, year: int, month: int, day: int) -> bool:
         """The AND of the day-of-month and day-of-week constraints."""
         month_end = calendar.monthrange(year, month)[1]
-        if day not in self._dom and not (
-            self._dom_last and day == month_end
-        ):
+        if day not in self._dom and not (self._dom_last and day == month_end):
             return False
         # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
         dow = (datetime.date(year, month, day).weekday() + 1) % 7
@@ -405,9 +418,9 @@ class CronTab:
         """
         if now is None:
             if default_utc:
-                now = datetime.datetime.now(
-                    datetime.timezone.utc
-                ).replace(tzinfo=None)
+                now = datetime.datetime.now(datetime.timezone.utc).replace(
+                    tzinfo=None
+                )
             else:
                 now = datetime.datetime.now()
         civil = now.replace(tzinfo=None)
@@ -492,9 +505,7 @@ class CronTab:
                 if minute < at_or_after.minute:
                     continue
                 if minute > at_or_after.minute:
-                    return datetime.time(
-                        hour, minute, self._seconds_sorted[0]
-                    )
+                    return datetime.time(hour, minute, self._seconds_sorted[0])
                 for second in self._seconds_sorted:
                     if second >= at_or_after.second:
                         return datetime.time(hour, minute, second)

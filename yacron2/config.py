@@ -926,9 +926,7 @@ def _merge_lists(key: str, base: list, override: list) -> list:
     return base + override
 
 
-def mergedicts(
-    dict1: Dict[str, Any], dict2: Dict[str, Any]
-) -> Dict[str, Any]:
+def mergedicts(dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
     """Merge config mapping ``dict2`` over ``dict1`` (the defaults).
 
     The override side wins for a plain value; two dicts merge recursively;

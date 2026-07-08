@@ -64,6 +64,38 @@ clipping. To refresh them after a UI change:
 6. Review the PNGs, then copy the keepers over `docs/img/` (re-saving with
    Pillow's `optimize=True` shaves a few percent).
 
+## Regenerating the animated hero reel + theme row
+
+The README's two animated loops — `docs/img/dashboard-reel.webp` (the hero
+tour) and `docs/img/dashboard-themes.webp` (the ten-theme sweep), each with a
+`.gif` twin — are built in two steps off the **same running grand-tour fleet**
+as the stills above (so boot it first, per step 1, and let it warm):
+
+```shell
+# 1. capture the source stills: each marquee screen is shot once, then
+#    re-shot under a rotation of themes AND the accessibility prefs (sans
+#    interface font, colour-vision palette, larger UI scale) by driving the
+#    dashboard's own settings <select>s live — so the frames are pixel-stable
+#    and only the palette / font / scale changes. Frames land in ./reel/.
+python docs/screenshots/capture_showcase.py                 # every scene
+python docs/screenshots/capture_showcase.py overview a11y   # just some
+
+# 2. stitch the stills into the loops (needs Pillow; no daemon):
+python docs/screenshots/build_reel.py                       # both
+python docs/screenshots/build_reel.py reel                  # just the hero
+```
+
+`build_reel.py` keeps the files small by treating each held screen as one
+long-duration frame and **cutting hard** between screens (a cut costs zero
+frames). The hero reel stays in **one style throughout** — the light carolina
+theme, terminal monospace — and gets its variety from the different screens it
+tours. The theme + font showcase is the theme row, which cuts through the
+overview under all ten themes, each in both the monospace and the readable
+sans interface font. Both loops are cut-only (no soft dissolve frames), so
+every frame is a pristine still and they run at full 1600px / q94. Tune the
+`SEGMENTS` timeline and per-asset width/quality at the top of the script and
+re-run — it writes straight to `docs/img/`.
+
 Notes:
 
 * The scripts intercept `GET /version` and substitute the next release number

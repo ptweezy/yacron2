@@ -1,0 +1,104 @@
+{
+  "boot": [
+    "carolina"
+  ],
+  "overview": [
+    "carolina",
+    "amber",
+    "green",
+    "modern",
+    "standard",
+    "carolina-light",
+    "amber-light",
+    "green-light",
+    "modern-light",
+    "standard-light"
+  ],
+  "palette": [
+    "carolina-light"
+  ],
+  "logs": [
+    "carolina-light"
+  ],
+  "history": [
+    "carolina-light"
+  ],
+  "schedule": [
+    "carolina-light"
+  ],
+  "dag-graph": [
+    "carolina-light"
+  ],
+  "cluster": [
+    "carolina-light"
+  ],
+  "fleet": [
+    "carolina-light"
+  ],
+  "incident-timeline": [
+    "carolina-light"
+  ],
+  "wallboard": [
+    "carolina-light"
+  ],
+  "a11y-sans": [
+    "carolina"
+  ],
+  "a11y-cvd": [
+    "carolina-light"
+  ],
+  "a11y-scale": [
+    "carolina-light"
+  ],
+  "settings-a11y": [
+    "carolina-light"
+  ],
+  "overview-sans": [
+    "carolina",
+    "amber",
+    "green",
+    "modern",
+    "standard",
+    "carolina-light",
+    "amber-light",
+    "green-light",
+    "modern-light",
+    "standard-light"
+  ],
+  "palette-sans": [
+    "carolina-light"
+  ],
+  "logs-sans": [
+    "carolina-light"
+  ],
+  "history-sans": [
+    "carolina-light"
+  ],
+  "schedule-sans": [
+    "carolina-light"
+  ],
+  "dag-graph-sans": [
+    "carolina-light"
+  ],
+  "cluster-sans": [
+    "carolina-light"
+  ],
+  "fleet-sans": [
+    "carolina-light"
+  ],
+  "incident-timeline-sans": [
+    "carolina-light"
+  ],
+  "wallboard-sans": [
+    "carolina-light"
+  ],
+  "a11y-cvd-sans": [
+    "carolina-light"
+  ],
+  "a11y-scale-sans": [
+    "carolina-light"
+  ],
+  "settings-a11y-sans": [
+    "carolina-light"
+  ]
+}

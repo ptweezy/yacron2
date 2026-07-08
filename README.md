@@ -15,6 +15,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 # cronstable
+kraahn-stuh-bl, like constable, cron + stable, cronstable
 
 A stability-focused, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-inlcuded, security-hardened, production-ready cron replacement.
 

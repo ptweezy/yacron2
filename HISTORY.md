@@ -5,7 +5,65 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
-## 1.2.9
+## 1.2.10 (2026-07-07)
+
+yacron2 now parses cron expressions itself.  This release retires the
+third-party `crontab` (parse-crontab) library in favor of a small,
+stdlib-only engine that lives in the tree -- so the scheduler owns the one
+piece of syntax every job depends on, the dialect is documented and tested
+where it is implemented, and the install carries one dependency fewer.
+Compatibility is not aspirational: it is pinned by golden vectors recorded
+from the old library across 180+ expressions and fixed instants (DST
+transitions, leap days, month/year boundaries, the year cap, ambiguous
+fall-back folds).  Nothing changes for existing configs -- the dialect, the
+timezone model, and the strictly-future fire semantics are all preserved
+vector-by-vector.
+
+- **`yacron2/cronexpr.py`: the built-in cron engine.** A new `CronTab` class
+  parses the crontab dialect yacron2 has always accepted (5/6/7 fields,
+  ranges, steps including bare-start `5/15`, lists, case-insensitive
+  `jan`/`mon` names, `0`-`7` weekdays with `6-0` wrap, `L`-last-day and
+  `L5`-last-Friday forms, `@`-nicknames) and answers the scheduler's two
+  questions: `next()` (strictly future, DST-correct across UTC-offset
+  changes, capped at the 2099 horizon so dead schedules drop from the index)
+  and `test()`.  A stdlib-only leaf module -- `calendar` and `datetime`, no
+  third-party imports.
+
+- **The `crontab` dependency is dropped.** Removed from `pyproject.toml` and
+  every import site (`config.py`, `cron.py`, `crontabs.py`, `dagrun.py`,
+  `prometheus.py`); classic crontab-file loading and YAML `schedule` strings
+  now share the same in-house engine, so both formats still accept identical
+  expressions.
+
+- **Golden-vector compatibility harness.** `tests/gen_cron_golden.py`
+  records `next()`/`test()` answers from the original parse-crontab library
+  into `tests/data/cron_golden.json`; `tests/test_cronexpr.py` replays them
+  against the new engine so any behavioral drift fails the suite.  This is
+  the proof that "behavior-compatible" is a fact, not a hope.
+
+- **`mergedicts` reimplemented.** The config defaults-merge helper is
+  rewritten with the identical semantics -- dicts merge recursively, an empty
+  YAML section (`None`) never wipes a populated default, `environment` and
+  `secrets` lists merge by key/name, sentry `fingerprint` replaces rather
+  than appends, and all other lists concatenate -- and now returns a `dict`
+  directly, retiring the `dict(mergedicts(...))` wrappers at every call site.
+
+- **Dashboard accessibility pass.** The web UI gains an **interface font**
+  toggle (the terminal monospace, or a proportional sans "reader mode" for
+  easier reading, with logs and cron strings kept monospace either way),
+  app-level **color-vision** palettes (deutan / tritan status-color remaps,
+  status glyphs always distinct too), whole-UI **zoom**, and a
+  **reduce-motion** switch, each reachable from Settings and the command
+  palette and persisted across sessions.
+
+- **Docs.** The "Schedules and Timezones" wiki page now documents the full
+  dialect the engine owns -- the day-of-month-AND-day-of-week rule (Friday
+  the 13th, deliberately kept over Vixie's OR), the `L` forms, the
+  1970-2099 year horizon -- and Installation, Migration-from-yacron,
+  Classic-Crontabs, Architecture-and-Internals, and the README are updated to
+  point at the built-in engine instead of the removed library.
+
+## 1.2.9 (2026-07-07)
 
 Resource monitoring grows a time axis. 1.2.8 answered "what did that run
 use?" with two numbers per run; this release records **how the run used it**

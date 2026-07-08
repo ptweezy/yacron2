@@ -1,14 +1,14 @@
 """Regenerate the cron-expression golden vectors (tests/data/cron_golden.json).
 
 yacron2's in-house cron engine (:mod:`yacron2.cronexpr`) replaced the
-LGPL-licensed ``crontab`` (parse-crontab) dependency.  The replacement was
-written clean-room -- from parse-crontab's *documented and observed* behavior,
-never its source -- and its compatibility is proven by replaying the vectors
-this script generates: for every expression in the corpus it records what the
-OLD library did (parse ok/error, ``next()`` from a grid of fixed instants,
-``test()`` over a grid of fixed datetimes), and ``tests/test_cronexpr.py``
-asserts the new engine does exactly the same.  The vectors are committed, so
-CI needs no LGPL code; this script is only for regenerating or extending them.
+third-party ``crontab`` (parse-crontab) dependency.  Its compatibility is
+proven by replaying the vectors this script generates: for every expression
+in the corpus it records what the OLD library did (parse ok/error,
+``next()`` from a grid of fixed instants, ``test()`` over a grid of fixed
+datetimes), and ``tests/test_cronexpr.py`` asserts the new engine does
+exactly the same.  The vectors are committed, so neither CI nor the install
+needs the old package; this script is only for regenerating or extending
+them.
 
 Usage (needs the old library, which is NOT a yacron2 dependency anymore)::
 
@@ -28,7 +28,7 @@ import sys
 from zoneinfo import ZoneInfo
 
 try:
-    from crontab import CronTab  # the OLD library (LGPL), dev-only
+    from crontab import CronTab  # the OLD library, dev-only
 except ImportError:
     sys.exit(
         "the old `crontab` package is required to regenerate goldens: "

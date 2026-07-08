@@ -1,11 +1,11 @@
 """The in-house cron engine matches the library it replaced, vector by vector.
 
-``tests/data/cron_golden.json`` records what the legacy LGPL ``crontab``
+``tests/data/cron_golden.json`` records what the legacy ``crontab``
 (parse-crontab) package did for every expression in the corpus: whether it
 parsed, ``next()`` from fixed naive and timezone-aware instants, ``test()``
 over fixed datetimes, and semantic-equality verdicts.  These tests replay
-every vector against :mod:`yacron2.cronexpr` -- full compatibility proof with
-no LGPL code anywhere in the repository (the vectors are program OUTPUT, not
+every vector against :mod:`yacron2.cronexpr` -- a full compatibility proof
+that needs no copy of the old package (the vectors are program OUTPUT, not
 code).  Regenerate/extend the vectors with ``tests/gen_cron_golden.py``.
 
 If the old package happens to be importable (a dev machine, never CI), a live

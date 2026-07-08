@@ -157,7 +157,7 @@ keys.
 
 | Dependency | yacron 0.19 | yacron2 |
 | --- | --- | --- |
-| `crontab` | `==0.22.8` | `>=1,<2` (major version change) |
+| `crontab` | `==0.22.8` | dropped (cron expressions parsed by yacron2's built-in engine, same dialect) |
 | `strictyaml` | (older pin) | `>=1.7,<2` |
 | `aiohttp` | (older pin) | `>=3.10,<4` |
 | `aiosmtplib` | (older pin) | `>=3,<6` (v2+ login API) |
@@ -204,9 +204,10 @@ same libraries. See [Schedules and Timezones](Schedules-and-Timezones).
   longer contains duplicate keys (the effective value of each variable is
   unchanged).
 - [ ] If you install into a shared environment, reconcile the new dependency
-  pins (`crontab>=1,<2`, `strictyaml>=1.7,<2`, `aiohttp>=3.10,<4`,
-  `aiosmtplib>=3,<6`, `sentry-sdk>=2,<3`, `tzdata>=2024.1`; `pytz` and the
-  `ruamel.yaml` pin removed).
+  pins (`strictyaml>=1.7,<2`, `aiohttp>=3.10,<4`, `aiosmtplib>=3,<6`,
+  `sentry-sdk>=2,<3`, `tzdata>=2024.1`; `pytz`, the `ruamel.yaml` pin and
+  the `crontab` package removed — cron expressions are parsed by yacron2's
+  built-in engine).
 - [ ] Validate the migrated configuration before starting the scheduler:
   `yacron2 -v -c <path>`. See [Command-Line Reference](CLI-Reference).
 

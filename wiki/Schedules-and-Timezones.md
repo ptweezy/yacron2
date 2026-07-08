@@ -21,12 +21,19 @@ Every job's `schedule` determines *when* it runs; `utc` and `timezone` determine
 
 so `schedule` is either a string or an object. `JobConfig._parse_schedule` turns that raw value into one of:
 
-- a `crontab.CronTab` instance (a parsed crontab expression), or
+- a `yacron2.cronexpr.CronTab` instance (a parsed crontab expression), or
 - the literal string `"@reboot"`.
 
 Any other value raises `ConfigError("invalid schedule: ...")`.
 
-The crontab dialect is [parse-crontab](https://github.com/josiahcarlson/parse-crontab) (`josiahcarlson/parse-crontab`), pinned as `crontab>=1,<2`. Field syntax (ranges `1-5`, steps `*/5`, lists `1,15,30`, names like `mon`/`jan`) follows that library, not the system `cron(5)` man page.
+The crontab dialect is implemented by yacron2's own built-in engine (`yacron2/cronexpr.py`, no third-party dependency). Field syntax is the dialect yacron2 has always accepted — ranges `1-5`, steps `*/5` (and `5/15`: start plus step, running to the field's end), lists `1,15,30`, case-insensitive names like `mon`/`jan` — not the system `cron(5)` man page. The notable rules:
+
+- **Day-of-week** accepts `0`–`7`, with both `0` and `7` meaning Sunday; a range ending in `0` wraps its end to Sunday-as-7, so `sat-sun` and `6-0` mean Saturday+Sunday.
+- **`L`** alone in day-of-month is the month's last day (`0 0 L * *`); `L<n>` in day-of-week is the month's *last* such weekday (`L5` = last Friday). No other field takes an `L`.
+- **Day-of-month AND day-of-week**: when both are restricted, a day must satisfy *both* (`0 0 13 * 5` fires only on Friday the 13th). Vixie cron fires when *either* matches; yacron2 deliberately keeps the AND rule its schedules have always had.
+- **`year`** accepts 1970–2099, and `next()` never searches past 2099: a schedule with no remaining occurrence (`year: "2020"`, or an impossible date like Feb 30) simply never fires.
+
+Earlier releases delegated this dialect to the third-party parse-crontab library; the built-in engine is behavior-compatible with it, vector-by-vector — see `tests/gen_cron_golden.py` and `tests/data/cron_golden.json` for the recorded compatibility corpus.
 
 Schedules do not have to live in YAML at all: yacron2 also loads whole
 classic crontab files (`*.crontab`, `*.cron`, or a file named `crontab`),
@@ -46,7 +53,7 @@ jobs:
 
 The string is passed verbatim to `CronTab(...)`. A malformed expression is caught and re-raised as `ConfigError("invalid schedule '...': ...")` at config-load time (naming the offending expression), so a bad field fails the reload cleanly rather than as an anonymous traceback. Quote the value in YAML: a bare `*/5 * * * *` is not valid YAML scalar syntax in all positions.
 
-parse-crontab reads **extra columns from the ends**, so the field count selects the dialect:
+The engine reads **extra columns from the ends**, so the field count selects the dialect:
 
 | Fields | Layout | Meaning |
 |--------|--------|---------|
@@ -86,7 +93,7 @@ jobs:
 
 Behavior comes from `Cron.job_should_run` (`yacron2/cron.py`): on the first scheduler pass the `startup` flag is `True` and a `@reboot` job returns `True`; on every subsequent pass `startup` is `False`, so `@reboot` jobs return `False`. Conversely, `CronTab`-scheduled jobs return `False` during the startup pass and are only evaluated on later passes. There is no recurring "@reboot". To keep a long-running process alive, `README.md` recommends a `@reboot` schedule combined with `onFailure.retry.maximumRetries: -1` (retry forever), so yacron2 relaunches the process whenever it exits/fails.
 
-`"@reboot"` is the only `@`-keyword recognized by yacron2 itself. Other shorthands (`@daily`, `@hourly`, etc.) are *not* intercepted by `_parse_schedule`; whether they work depends entirely on whether `parse-crontab` accepts them.
+`"@reboot"` is the only `@`-keyword recognized by yacron2 itself. Other shorthands are *not* intercepted by `_parse_schedule`; the cron engine accepts `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily` and `@hourly` (their classic five-field expansions), while `@midnight` is accepted only in [classic crontab files](Classic-Crontabs), whose loader rewrites it to `@daily`.
 
 ## Form 3: schedule object
 
@@ -114,7 +121,7 @@ jobs:
 | `dayOfWeek`  | day-of-week   | `*`                |
 | `year`       | year          | *(omitted)*        |
 
-Only the columns you actually use are emitted, matching parse-crontab's end-column rule from [Form 1](#form-1-crontab-string-5-6-or-7-fields):
+Only the columns you actually use are emitted, matching the engine's end-column rule from [Form 1](#form-1-crontab-string-5-6-or-7-fields):
 
 - neither `second` nor `year` → a five-field line (`f"{minute} {hour} {day} {month} {dow}"`), exactly as before;
 - `year` only → a six-field line with the trailing year column;
@@ -126,7 +133,7 @@ All values are typed `Str()` in the schema, so write `minute: "0"`, not `minute:
 
 ### The `year` key
 
-`year` restricts the schedule to specific years (parse-crontab's optional trailing column). For example, this runs only during 2017:
+`year` restricts the schedule to specific years (the optional trailing column, 1970–2099). For example, this runs only during 2017:
 
 ```yaml
 schedule:

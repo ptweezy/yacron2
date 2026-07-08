@@ -30,7 +30,7 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
   and Docker Hub plus self-contained binaries for Linux (glibc and musl),
   macOS (signed and notarized) and Windows, so Python on the host is optional
   (see [Installation](#installation)).
-* **Observability and durability** A live
+* **Observability and durability**: A live
   [web dashboard](#web-dashboard), native [Prometheus metrics](#metrics),
   per-job [resource monitoring](#resource-monitoring), and opt-in
   [durable state](https://github.com/ptweezy/yacron2/wiki/Durable-State),
@@ -781,7 +781,7 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The `schedule` option can be a string in a crontab format specified by <https://github.com/josiahcarlson/parse-crontab> (this module is used by yacron2).
+The `schedule` option can be a string in the classic crontab format (5, 6 or 7 fields; ranges, steps, lists and `jan`/`mon` names), parsed by yacron2's built-in cron engine — see [Schedules and Timezones](https://github.com/ptweezy/yacron2/wiki/Schedules-and-Timezones) for the full dialect.
 Additionally @reboot can be included , which will only run the job when yacron2 is initially
 executed. Further `schedule` can be an object with properties.  The following configuration
 runs a command every 5 minutes, but only on the specific date 2017-07-19, and

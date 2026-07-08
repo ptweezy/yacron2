@@ -28,7 +28,6 @@ Installing the `yacron2` distribution pulls in the following, taken from
 | Dependency | Version constraint |
 | --- | --- |
 | `strictyaml` | `>=1.7,<2` |
-| `crontab` | `>=1,<2` |
 | `aiohttp` | `>=3.10,<4` |
 | `sentry-sdk` | `>=2,<3` |
 | `aiosmtplib` | `>=3,<6` |

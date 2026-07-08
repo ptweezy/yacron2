@@ -40,9 +40,8 @@ from typing import (
     Union,
 )
 
-from crontab import CronTab
-
 import yacron2.version
+from yacron2.cronexpr import CronTab
 
 if TYPE_CHECKING:  # pragma: no cover -- import cycle guard, types only
     from yacron2.cron import Cron

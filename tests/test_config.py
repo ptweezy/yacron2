@@ -894,13 +894,13 @@ def _one_job(schedule_yaml: str):
 
 def test_schedule_object_second_builds_seven_field_crontab():
     # An explicit second: opts into second-level scheduling; the object form
-    # renders to a full 7-field parse-crontab line (year defaults to "*").
+    # renders to a full 7-field crontab line (year defaults to "*").
     job = _one_job('    schedule:\n      second: "*/15"\n      minute: "*"\n')
     assert job.has_seconds is True
-    from crontab import CronTab
+    from yacron2.cronexpr import CronTab
 
     assert isinstance(job.schedule, CronTab)
-    # fires at seconds 0,15,30,45 of the minute (parse-crontab 7-field)
+    # fires at seconds 0,15,30,45 of the minute (7-field dialect)
     assert config.schedule_object_to_crontab(job.schedule_unparsed) == (
         "*/15 * * * * * *"
     )
@@ -927,7 +927,7 @@ def test_has_seconds_string_forms(schedule, expect_seconds):
 
 def test_schedule_object_year_now_honored_six_field():
     # Regression: the object-form year: used to be silently dropped. It now
-    # maps to parse-crontab's trailing year column (6-field line), no seconds.
+    # maps to the trailing year column (6-field line), no seconds.
     job = _one_job(
         '    schedule:\n      minute: "*/5"\n'
         '      dayOfMonth: "19"\n      month: "7"\n      year: "2017"\n'

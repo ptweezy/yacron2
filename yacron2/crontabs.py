@@ -34,7 +34,7 @@ import re
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from crontab import CronTab
+from yacron2.cronexpr import CronTab
 
 #: Filename markers the config loader treats as "this is a classic
 #: crontab" without looking at the content: the two conventional
@@ -45,8 +45,8 @@ CRONTAB_EXTENSIONS = frozenset({".crontab", ".cron"})
 CRONTAB_BASENAME = "crontab"
 
 #: The ``man 5 crontab`` schedule nicknames.  All are accepted;
-#: ``@midnight`` is rewritten to its synonym ``@daily`` (the `crontab`
-#: expression library understands every nickname except that one) and
+#: ``@midnight`` is rewritten to its synonym ``@daily`` (the cron
+#: expression engine understands every nickname except that one) and
 #: ``@reboot`` passes through untouched -- the scheduler, not the
 #: cron-expression parser, gives it meaning (JobConfig._parse_schedule).
 _NICKNAMES = frozenset(

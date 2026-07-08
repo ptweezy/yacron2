@@ -2258,7 +2258,7 @@ def test_cluster_policy_conflict_logged_on_transition(caplog):
 def test_is_deferrable_reboot():
     import types
 
-    from crontab import CronTab
+    from yacron2.cronexpr import CronTab
 
     cron = yacron2.cron.Cron(None)
 
@@ -4142,7 +4142,7 @@ jobs:
 
 
 def test_compute_next_fire_is_now_plus_delay_utc(monkeypatch):
-    # The index instant is exactly now + parse-crontab's delay-to-next-match,
+    # The index instant is exactly now + the cron engine's delay-to-next-match,
     # the same formula the dashboard countdown and the Prometheus next-run
     # gauge use, so all three agree.
     holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
@@ -4437,7 +4437,7 @@ def test_reload_drops_disabled_job(tmp_path, monkeypatch):
 
 
 def _count_crontab_calls(monkeypatch):
-    import crontab as crontab_mod
+    import yacron2.cronexpr as crontab_mod
 
     counts = {"test": 0, "next": 0}
     orig_test = crontab_mod.CronTab.test

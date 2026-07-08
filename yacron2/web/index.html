@@ -253,6 +253,59 @@
     --peer-self: #0b5ed7;
   }
 
+  /* ---------- color-vision palettes (Settings → Color vision) ---------- */
+  /* Status / peer / ANSI inks remapped so every meaningful pair stays apart
+     under dichromacy (validated with Machado severity-1.0 simulation and the
+     same paper-contrast floor as the blocks above). Status glyphs already
+     differ per state; these make the colors carry too. Each -light pair MUST
+     re-ink every key its dark twin sets: these blocks follow the paper
+     palettes in source order, so an unset key would leak a phosphor-bright
+     ink onto paper. */
+  html[data-cvd="deutan"] {
+    /* red-green (deuter-/protanopia): success → teal, failure → vermillion,
+       pending → bright yellow, cancelled → pink; spread along the
+       blue↔yellow + lightness axes these deficiencies retain */
+    --ok: #26dcb2;
+    --fail: #ff6a30;
+    --pending: #ffd847;
+    --cancelled: #ee9cc8;
+    --peer-agreed: #17c39b;
+    --peer-syncing: #ecd23d;
+    --peer-bad: #ff6a30;
+    --ansi-31: #ff7040; --ansi-32: #1fbf9c; --ansi-91: #ffa075; --ansi-92: #7ceccf;
+  }
+  html[data-cvd="deutan"][data-theme$="-light"] {
+    /* paper: failure → raspberry (its blue component keeps it off the olive
+       band red and green both collapse into); ok darker + pending lighter so
+       lightness splits what hue can't */
+    --ok: #0a4f1c;
+    --fail: #ad2456;
+    --pending: #835c08;
+    --cancelled: #a92b86;
+    --disabled: #495057;
+    --peer-agreed: #0a4f1c;
+    --peer-syncing: #835c08;
+    --peer-bad: #ad2456;
+    --ansi-31: #c2185f; --ansi-32: #116329; --ansi-91: #971a4a; --ansi-92: #1a7f37;
+  }
+  html[data-cvd="tritan"] {
+    /* blue-yellow (tritanopia): red/green stay; the blue family splits by
+       lightness + redness (run pale, self lavender), warm colors by lightness */
+    --run: #abceff;
+    --pending: #ffcf87;
+    --peer-syncing: #e5c15c;
+    --peer-self: #b39dff;
+    --ansi-32: #2db85f; --ansi-36: #82e9f2;
+  }
+  html[data-cvd="tritan"][data-theme$="-light"] {
+    --run: #4c3fd6;      /* indigo, so cancelled moves off violet below */
+    --pending: #7d5300;
+    --cancelled: #96406f;
+    --peer-syncing: #7d5300;
+    --peer-self: #5a45c9;
+    --ansi-32: #0d5c25; --ansi-36: #187884;
+  }
+
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
@@ -1579,6 +1632,14 @@
           </optgroup>
         </select>
       </div>
+      <div class="setrow">
+        <span class="lab">Color vision<small>remap status colors for red-green or blue-yellow color blindness (status glyphs always differ too)</small></span>
+        <select class="mini" id="setCvd">
+          <option value="none">default</option>
+          <option value="deutan">red-green friendly</option>
+          <option value="tritan">blue-yellow friendly</option>
+        </select>
+      </div>
       <div class="setrow"><span class="lab">CRT effects<small>glow, vignette, flicker</small></span><label class="switch"><input type="checkbox" id="setFx"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Scanlines</span><label class="switch"><input type="checkbox" id="setScan"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Compact density<small>tighter rows</small></span><label class="switch"><input type="checkbox" id="setDensity"><span class="sl"></span></label></div>
@@ -1755,8 +1816,9 @@
   const prefs = {
     theme: "carolina", fx: true, scan: true, density: false, notify: false,
     // accessibility: interface font (mono/sans), whole-UI zoom %, app-level
-    // reduce-motion (ORed with the OS prefers-reduced-motion setting)
-    font: "mono", scale: 100, motion: false,
+    // reduce-motion (ORed with the OS prefers-reduced-motion setting), and
+    // color-vision remap (none/deutan/tritan)
+    font: "mono", scale: 100, motion: false, cvd: "none",
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
@@ -1973,7 +2035,7 @@
     if (low === "@reboot") return { type: "reboot", raw: expr };
     const expanded = MACROS[low] || expr;
     const f = expanded.split(/\s+/);
-    // parse-crontab field layout: [second] minute hour dom month dow [year].
+    // yacron2 cron field layout: [second] minute hour dom month dow [year].
     // 5 fields -> implicit second 0 and any year; 6 -> a trailing year column;
     // 7 -> a leading second column as well. Normalise to the 7-field shape.
     let sec = "0", yr = "*", core;
@@ -2076,7 +2138,7 @@
     const out = [];
     let guard = 0;
     while (out.length < n && guard++ < 500000) {
-      if (c.Y > 2099) break;   // parse-crontab's year ceiling; nothing matches beyond it
+      if (c.Y > 2099) break;   // the engine's year ceiling; nothing matches beyond it
       if (parsed.year.restricted && !parsed.year.has(c.Y)) { advYear(); continue; }
       if (!parsed.month.has(c.Mo)) { advMonth(); continue; }
       if (!dayMatches(parsed, c)) { advDay(); continue; }
@@ -4327,6 +4389,7 @@
       { ic: "A", lbl: "Toggle readable font", sub: "proportional sans-serif UI", run: () => setFont(fontPref() === "sans" ? "mono" : "sans") },
       { ic: "⤢", lbl: "Cycle UI scale", sub: "100 → 110 → 125 → 140%", run: cycleScale },
       { ic: "≈", lbl: "Toggle reduce motion", run: () => setMotion(!prefs.motion) },
+      { ic: "◓", lbl: "Cycle color vision mode", sub: "red-green / blue-yellow friendly status colors", run: cycleCvd },
       { ic: "⊞", lbl: "Choose table columns", run: () => toggleColsMenu(true) },
       { ic: "✦", lbl: "Toggle desktop notifications", run: () => setNotify(!prefs.notify) },
       { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
@@ -4459,11 +4522,14 @@
   function setScan(v) { prefs.scan = v; savePref("scan"); applyTheme(); syncSettings(); }
   function setDensity(v) { prefs.density = v; savePref("density"); document.body.classList.toggle("density-compact", v); syncSettings(); }
 
-  // ---- accessibility: interface font / UI scale / reduce motion ----
+  // ---- accessibility: interface font / UI scale / reduce motion / color vision ----
   const UI_SCALES = [100, 110, 125, 140];
+  const CVD_MODES = ["none", "deutan", "tritan"];
+  const CVD_LABELS = { none: "default", deutan: "red-green friendly", tritan: "blue-yellow friendly" };
   // self-heal garbage stored prefs, same contract as themeParts()
   const fontPref = () => (prefs.font === "sans" ? "sans" : "mono");
   const scalePref = () => (UI_SCALES.includes(prefs.scale) ? prefs.scale : 100);
+  const cvdPref = () => (CVD_MODES.includes(prefs.cvd) ? prefs.cvd : "none");
   // OS preference OR the app-level Settings override; every motion gate in
   // the app (CSS class below, logo cruise, zen pulses, boot POST) funnels
   // through here so the two switches can never disagree.
@@ -4475,6 +4541,9 @@
     const scale = scalePref();
     document.documentElement.style.zoom = scale === 100 ? "" : scale + "%";
     document.body.classList.toggle("reduce-motion", reduceMotion());
+    const cvd = cvdPref();
+    if (cvd === "none") document.documentElement.removeAttribute("data-cvd");
+    else document.documentElement.setAttribute("data-cvd", cvd);
   }
   function setFont(v) { prefs.font = v === "sans" ? "sans" : "mono"; savePref("font"); applyA11y(); syncSettings(); }
   function setScale(v) { prefs.scale = UI_SCALES.includes(v) ? v : 100; savePref("scale"); applyA11y(); syncSettings(); }
@@ -4484,6 +4553,11 @@
   }
   // flipping motion back on re-kicks the logo cruise (it parks while reduced)
   function setMotion(v) { prefs.motion = !!v; savePref("motion"); applyA11y(); kickMark(); syncSettings(); }
+  function setCvd(v) { prefs.cvd = CVD_MODES.includes(v) ? v : "none"; savePref("cvd"); applyA11y(); syncSettings(); }
+  function cycleCvd() {
+    setCvd(CVD_MODES[(CVD_MODES.indexOf(cvdPref()) + 1) % CVD_MODES.length]);
+    toast("info", "color vision: " + CVD_LABELS[prefs.cvd]);
+  }
   function setPoll(v) { prefs.pollMs = v; savePref("pollMs"); restartPolling(); syncSettings(); }
   function setNotify(v) {
     if (v && "Notification" in window && Notification.permission !== "granted") {
@@ -4503,6 +4577,7 @@
     $("setFont").value = fontPref();
     $("setScale").value = String(scalePref());
     $("setMotion").checked = prefs.motion;
+    $("setCvd").value = cvdPref();
     $("setNotify").checked = prefs.notify;
     $("setSound").checked = prefs.sound;
     $("setVol").value = String(prefs.volume);
@@ -5821,6 +5896,7 @@
     $("setFont").addEventListener("change", (e) => setFont(e.target.value));
     $("setScale").addEventListener("change", (e) => setScale(parseInt(e.target.value, 10)));
     $("setMotion").addEventListener("change", (e) => setMotion(e.target.checked));
+    $("setCvd").addEventListener("change", (e) => setCvd(e.target.value));
     $("setNotify").addEventListener("change", (e) => setNotify(e.target.checked));
     $("setSound").addEventListener("change", (e) => setSound(e.target.checked));
     $("setVol").addEventListener("change", (e) => setVolume(parseInt(e.target.value, 10)));
@@ -6591,7 +6667,7 @@
       html += '<p class="sbx-desc' + (impossible ? " sbx-bad" : "") + '">' + esc(impossible ? "This schedule can never occur (impossible date)." : describeCron(expr)) + "</p>";
       const low = expr.toLowerCase();
       const f = (MACROS[low] || expr).split(/\s+/);
-      // Label each present column by parse-crontab's end-column rule: 5 fields
+      // Label each present column by the engine's end-column rule: 5 fields
       // are minute..dow, a 6th adds a trailing year, a 7th adds a leading
       // second. Mislabelling these (or dropping the second/year columns) would
       // contradict the plain-English description above.

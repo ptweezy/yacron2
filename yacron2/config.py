@@ -22,7 +22,6 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import strictyaml
-from crontab import CronTab
 from strictyaml import Any as YamlAny
 from strictyaml import (
     Bool,
@@ -40,6 +39,7 @@ from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
 from yacron2 import crontabs, dag, platform
+from yacron2.cronexpr import CronTab
 from yacron2.resources import MONITOR_HISTORY_DEFAULT, SAMPLE_INTERVAL
 
 logger = logging.getLogger("yacron2.config")
@@ -894,60 +894,73 @@ def _normalize_monitor_resources(raw: Any) -> Tuple[bool, float, int]:
     return (bool(raw), SAMPLE_INTERVAL, MONITOR_HISTORY_DEFAULT)
 
 
-# Slightly modified version of https://stackoverflow.com/a/7205672/2211825
-def mergedicts(dict1, dict2):
-    for k in set(dict1.keys()).union(dict2.keys()):
-        if k in dict1 and k in dict2:
-            v1 = dict1[k]
-            v2 = dict2[k]
-            if isinstance(v1, dict) and isinstance(v2, dict):
-                yield (k, dict(mergedicts(v1, v2)))
-            elif isinstance(v1, dict) and v2 is None:  # modification
-                yield (k, dict(mergedicts(v1, {})))
-            elif isinstance(v1, list) and isinstance(v2, list):  # merge lists
-                if k == "environment":
-                    # environment is a list of {key, value}; merge by key so a
-                    # job's variable overrides the default instead of producing
-                    # a duplicate-keyed concatenation.
-                    merged = {e["key"]: e["value"] for e in v1}
-                    for e in v2:
-                        merged[e["key"]] = e["value"]
-                    yield (
-                        k,
-                        [
-                            {"key": kk, "value": vv}
-                            for kk, vv in merged.items()
-                        ],
-                    )
-                elif k == "secrets":
-                    # secrets is a list of {name, ...}; merge by name so a
-                    # job's secret overrides a same-named default rather than
-                    # staging two secrets under one name (mirrors environment).
-                    merged_secrets = {e["name"]: e for e in v1}
-                    for e in v2:
-                        merged_secrets[e["name"]] = e
-                    yield (k, list(merged_secrets.values()))
-                elif k == "fingerprint":
-                    # sentry "fingerprint" is a replace-not-append setting: a
-                    # job (or a defaults block) that supplies its own
-                    # fingerprint must override the default entirely. Plain
-                    # concatenation would silently prepend the three default
-                    # entries, making custom Sentry issue grouping impossible.
-                    yield (k, v2)
-                else:
-                    yield (k, v1 + v2)
-            else:
-                yield (k, v2)
-        elif k in dict1:
-            yield (k, dict1[k])
-        else:
-            yield (k, dict2[k])
+def _merge_lists(key: str, base: list, override: list) -> list:
+    """Combine two list values under the defaults-merge rules.
+
+    Most lists concatenate (defaults first, override appended), with three
+    key-specific exceptions:
+
+    - ``environment`` is a list of ``{key, value}``: merge by variable name
+      so a job's variable overrides the default instead of producing a
+      duplicate-keyed concatenation.
+    - ``secrets`` is a list of ``{name, ...}``: merge by secret name so a
+      job's secret overrides a same-named default rather than staging two
+      secrets under one name (mirrors ``environment``).
+    - sentry ``fingerprint`` is replace-not-append: a job (or defaults
+      block) that supplies its own fingerprint must override the default
+      entirely -- concatenation would silently prepend the three default
+      entries, making custom Sentry issue grouping impossible.
+    """
+    if key == "environment":
+        by_name = {entry["key"]: entry["value"] for entry in base}
+        for entry in override:
+            by_name[entry["key"]] = entry["value"]
+        return [{"key": k, "value": v} for k, v in by_name.items()]
+    if key == "secrets":
+        by_name = {entry["name"]: entry for entry in base}
+        for entry in override:
+            by_name[entry["name"]] = entry
+        return list(by_name.values())
+    if key == "fingerprint":
+        return override
+    return base + override
+
+
+def mergedicts(
+    dict1: Dict[str, Any], dict2: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge config mapping ``dict2`` over ``dict1`` (the defaults).
+
+    The override side wins for a plain value; two dicts merge recursively;
+    two lists combine per :func:`_merge_lists`.  A dict overridden by
+    ``None`` keeps the dict (an empty YAML section parses as ``None`` and
+    must not wipe out a populated default section).  Keys are emitted in
+    ``dict1`` order, then ``dict2``-only keys in their own order.
+    """
+    merged: Dict[str, Any] = dict(dict1)
+    for key, override in dict2.items():
+        if key not in merged:
+            merged[key] = override
+            continue
+        base = merged[key]
+        if isinstance(base, dict):
+            if isinstance(override, dict):
+                merged[key] = mergedicts(base, override)
+                continue
+            if override is None:
+                merged[key] = mergedicts(base, {})
+                continue
+        if isinstance(base, list) and isinstance(override, list):
+            merged[key] = _merge_lists(key, base, override)
+            continue
+        merged[key] = override
+    return merged
 
 
 def schedule_object_to_crontab(spec: Dict[str, Any]) -> str:
-    """Render the object form of a ``schedule`` to a parse-crontab string.
+    """Render the object form of a ``schedule`` to a crontab string.
 
-    parse-crontab's field layout is ``[second] minute hour dayOfMonth month
+    The cron engine's field layout is ``[second] minute hour dayOfMonth month
     dayOfWeek [year]``: a bare 5-field line has an implicit second of 0 and any
     year, a 6-field line adds a trailing ``year`` column, and a 7-field line
     adds a leading ``second`` column.  We emit only the columns actually
@@ -979,7 +992,7 @@ def schedule_object_to_crontab(spec: Dict[str, Any]) -> str:
             year if year is not None else "*",
         )
     if year is not None:
-        # 6-field: parse-crontab reads the trailing column as the year.
+        # 6-field: the cron engine reads the trailing column as the year.
         return "{} {} {} {} {} {}".format(minute, hour, day, month, dow, year)
     return "{} {} {} {} {}".format(minute, hour, day, month, dow)
 
@@ -998,7 +1011,7 @@ def schedule_has_seconds(
         # Derive from the ACTUAL rendered field count, not mere key presence:
         # a blank/whitespace ``second:`` value (e.g. a leftover ``second:``
         # with no value) renders a leading empty column that vanishes under
-        # parse-crontab's whitespace split, leaving a minute-granular 5-/6-
+        # the cron engine's whitespace split, leaving a minute-granular 5-/6-
         # field line. Keying off presence alone would set has_seconds True for
         # such a line and force the whole scheduler to tick per-second for a
         # job that only ever fires once a minute.
@@ -1007,7 +1020,7 @@ def schedule_has_seconds(
         stripped = schedule_unparsed.strip()
         if not stripped or stripped.startswith("@"):
             return False
-        # parse-crontab only reads a leading seconds column at 7 fields; a 5-
+        # the cron engine only reads a leading seconds column at 7 fields; a 5-
         # or 6-field line has an implicit second of 0 (6th field is the year).
         return len(stripped.split()) == 7
     return False
@@ -1158,7 +1171,7 @@ class JobConfig:
         raise ConfigError("invalid schedule: {!r}".format(schedule_unparsed))
 
     def _crontab(self, tab: str) -> CronTab:
-        # parse-crontab raises ValueError on a malformed field (a bad range, an
+        # CronTab raises ValueError on a malformed field (a bad range, an
         # out-of-range second, the wrong field count). Surface it as a
         # ConfigError naming the offending expression, so a bad schedule fails
         # the config load with a clear message the reload loop can log, rather
@@ -1412,7 +1425,7 @@ class DagTaskConfig:
     __slots__ = ("id", "type", "job_template", "spec")
 
     def __init__(self, dag_name: str, raw_task: dict) -> None:
-        merged = dict(mergedicts(_DAG_TASK_DEFAULTS, raw_task))
+        merged = mergedicts(_DAG_TASK_DEFAULTS, raw_task)
         self.id: str = merged["id"]
         self.type: str = merged["type"]
         node = {
@@ -1439,7 +1452,7 @@ class DagTaskConfig:
                 "-1 retry-forever sentinel is not supported for dag "
                 "tasks)".format(dag_name, self.id)
             )
-        job_dict = dict(mergedicts(DEFAULT_CONFIG, merged))
+        job_dict = mergedicts(DEFAULT_CONFIG, merged)
         job_dict["name"] = "{}.{}".format(dag_name, self.id)
         # never auto-fires: task templates are not in the scheduler's job set,
         # so this placeholder schedule is only there to satisfy JobConfig.
@@ -1539,7 +1552,7 @@ class DagConfig:
         ):
             if key in raw:
                 overrides[key] = raw[key]
-        job_dict = dict(mergedicts(DEFAULT_CONFIG, overrides))
+        job_dict = mergedicts(DEFAULT_CONFIG, overrides)
         try:
             job = JobConfig(job_dict)
         except ConfigError as ex:
@@ -2759,8 +2772,8 @@ def _config_from_doc(
         # retro-apply to them. Only the included files' defaults are merged
         # here, and they affect this file's inline jobs.
         inc_config = parse_config_file(inc_path, _seen, _sources)
-        inc_defaults_merged = dict(
-            mergedicts(inc_defaults_merged, inc_config.job_defaults)
+        inc_defaults_merged = mergedicts(
+            inc_defaults_merged, inc_config.job_defaults
         )
         jobs.extend(inc_config.jobs)
         dags.extend(inc_config.dags)
@@ -2780,10 +2793,10 @@ def _config_from_doc(
             if logging_conf:
                 raise ConfigError("multiple logging configs")
             logging_conf = inc_config.logging_config
-    defaults = dict(mergedicts(DEFAULT_CONFIG, inc_defaults_merged))
-    defaults = dict(mergedicts(defaults, doc.get("defaults", {})))
+    defaults = mergedicts(DEFAULT_CONFIG, inc_defaults_merged)
+    defaults = mergedicts(defaults, doc.get("defaults", {}))
     for config_job in doc.get("jobs", []):
-        job_dict = dict(mergedicts(defaults, config_job))
+        job_dict = mergedicts(defaults, config_job)
         jobs.append(JobConfig(job_dict))
     # DAGs are self-contained (tasks carry their own launch fields), so a
     # top-level `defaults:` block is not applied to them; each DAG builds its
@@ -3095,7 +3108,7 @@ def _parse_config_dir(
                     )
                 )
         job_defaults = JobDefaults(
-            dict(mergedicts(job_defaults, config.job_defaults))
+            mergedicts(job_defaults, config.job_defaults)
         )
     if config_errors:
         raise ConfigError("\n---".join(config_errors.values()))

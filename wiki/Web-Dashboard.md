@@ -429,6 +429,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 The settings panel (and the command palette) expose:
 
 - **Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor), amber and green **phosphor CRT**, plus flat **modern** and **standard** looks, each in a dark (phosphor) and a light (paper) variant — the light ones trade the glass-black glow for dark ink on tinted paper, and **standard** is the plain white-and-saturated-color look. Cycle hues with `t`; flip light/dark with `T`.
+- A **color vision** mode that remaps the status, cluster-peer, and log-ANSI colors for **red-green** (deuteranopia/protanopia) or **blue-yellow** (tritanopia) color blindness, on both the phosphor and paper palettes. The remapped pairs were chosen with a dichromacy simulation so every meaningful pair (ok/fail, fail/pending, agreed/drifted, …) stays clearly apart, and every status glyph differs by shape as well, in every mode.
 - **CRT effects** (phosphor glow, vignette, and a subtle flicker) and **scanlines**, each toggleable. They apply only to the CRT themes (much softer on the paper variants) and automatically respect `prefers-reduced-motion`.
 - **Compact density** for tighter rows.
 - An **interface font** choice: the terminal monospace (default) or a proportional sans-serif that is easier on the eyes for long reading. Log output, cron expressions, and keycaps stay monospace either way, and numerals stay tabular so the clocks don't jitter.

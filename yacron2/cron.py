@@ -35,7 +35,6 @@ if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
 
 import aiohttp
 from aiohttp import web
-from crontab import CronTab  # noqa
 
 import yacron2.version
 from yacron2 import platform
@@ -54,6 +53,7 @@ from yacron2.config import (
     parse_config_with_sources,
     schedule_object_to_crontab,
 )
+from yacron2.cronexpr import CronTab
 from yacron2.dagrun import DagScheduler
 from yacron2.fingerprint import job_digest, job_set_id
 from yacron2.job import JobOutputStream, JobRetryState, RunningJob
@@ -1468,7 +1468,10 @@ class Cron:
 
     async def _web_get_status(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        out = []
+        # the old cron library's untyped next() left this list's value type
+        # as Any; the in-house engine types it Optional[float], so spell out
+        # the mixed-shape rows explicitly.
+        out: List[Dict[str, Any]] = []
         for name, job in self.cron_jobs.items():
             running = self.running_jobs.get(name, None)
             if running:
@@ -3436,17 +3439,17 @@ class Cron:
         """The aware-UTC instant ``job`` next fires strictly after ``after``.
 
         Render ``after`` into the job's own frame (its timezone, or the
-        system-local zone when it has none) and ask parse-crontab for the delay
-        to the next match.  The frame is kept timezone-AWARE in both cases, so
-        parse-crontab computes the delay as a real duration -- correcting for
-        any utcoffset (DST) change across the interval -- and adding it back to
-        the UTC ``after`` yields the correct UTC fire instant.  A naive local
-        frame would defeat that correction: parse-crontab would return a civil
-        wall-clock delta that, added to a UTC instant, lands an hour off across
-        a spring-forward/fall-back (the same wall time the old per-tick
-        ``crontab.test`` matched correctly).  ``None`` when the schedule has no
-        further occurrence (a fixed past year), so the job drops out of the
-        index.
+        system-local zone when it has none) and ask the cron engine for the
+        delay to the next match.  The frame is kept timezone-AWARE in both
+        cases, so ``CronTab.next`` computes the delay as a real duration --
+        correcting for any utcoffset (DST) change across the interval -- and
+        adding it back to the UTC ``after`` yields the correct UTC fire
+        instant.  A naive local frame would defeat that correction: the
+        engine would return a civil wall-clock delta that, added to a UTC
+        instant, lands an hour off across a spring-forward/fall-back (the
+        same wall time the old per-tick ``crontab.test`` matched correctly).
+        ``None`` when the schedule has no further occurrence (a fixed past
+        year), so the job drops out of the index.
         """
         crontab = job.schedule
         assert isinstance(crontab, CronTab)
@@ -3454,7 +3457,7 @@ class Cron:
             frame = after.astimezone(job.timezone)  # type: datetime.datetime
         else:
             # no explicit timezone -> the system-local wall clock, but kept
-            # AWARE (not .replace(tzinfo=None)) so parse-crontab applies its
+            # AWARE (not .replace(tzinfo=None)) so the engine applies its
             # DST correction. default_utc is inert for an aware `now`.
             frame = after.astimezone()
         delay = crontab.next(now=frame, default_utc=job.utc)

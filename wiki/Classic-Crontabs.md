@@ -87,10 +87,9 @@ Specifically:
 - **Entries:** five time fields, then the rest of the line is the command.
   Ranges (`1-5`), steps (`*/5`), lists (`1,15,30`), and month/weekday names
   (`jan`, `mon-fri`) are supported; day-of-week accepts both `0` and `7` as
-  Sunday. The field dialect is the same
-  [parse-crontab](https://github.com/josiahcarlson/parse-crontab) library
-  that parses YAML `schedule` strings, so both formats accept identical
-  expressions (see [Schedules and Timezones](Schedules-and-Timezones)).
+  Sunday. The field dialect is the same built-in cron engine that parses
+  YAML `schedule` strings, so both formats accept identical expressions
+  (see [Schedules and Timezones](Schedules-and-Timezones)).
 - **Nicknames:** `@reboot`, `@yearly`, `@annually`, `@monthly`, `@weekly`,
   `@daily`, `@midnight`, `@hourly`. `@midnight` is rewritten to its synonym
   `@daily` at load time; `@reboot` behaves exactly like a YAML `@reboot`

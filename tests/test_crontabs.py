@@ -3,10 +3,10 @@
 import datetime
 
 import pytest
-from crontab import CronTab
 
 from yacron2 import config, crontabs
 from yacron2.config import ConfigError
+from yacron2.cronexpr import CronTab
 
 
 def test_basic_line_gets_standard_defaults():

@@ -34,9 +34,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from crontab import CronTab
-
 from yacron2 import _json, dag, platform
+from yacron2.cronexpr import CronTab
 from yacron2.dag import DagSpec
 from yacron2.job import RunningJob
 from yacron2.state import DOC_KEEP, Lease, StateBackend

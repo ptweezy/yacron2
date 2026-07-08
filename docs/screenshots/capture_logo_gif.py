@@ -35,8 +35,12 @@ VARIANTS = [
 ]
 
 # the page's resting spin rate, deg/s
-CRUISE = float(re.search(r"MARK_CRUISE\s*=\s*([\d.]+)",
-                         (WEB / "index.html").read_text(encoding="utf-8")).group(1))
+CRUISE = float(
+    re.search(
+        r"MARK_CRUISE\s*=\s*([\d.]+)",
+        (WEB / "index.html").read_text(encoding="utf-8"),
+    ).group(1)
+)
 # ms per frame for a true-speed replay; decoders clamp delays below ~20ms
 FRAME_MS = max(20, round(360 / CRUISE * 1000 / FRAMES / 10) * 10)
 
@@ -72,8 +76,10 @@ def capture(browser, theme, fname):
                height: Math.max(...rs.map((r) => r.bottom)) - y };
     }""")
     clip = {
-        "x": max(0, box["x"] - PAD), "y": max(0, box["y"] - PAD),
-        "width": box["width"] + 2 * PAD, "height": box["height"] + 2 * PAD,
+        "x": max(0, box["x"] - PAD),
+        "y": max(0, box["y"] - PAD),
+        "width": box["width"] + 2 * PAD,
+        "height": box["height"] + 2 * PAD,
     }
     frames = []
     for k in range(FRAMES):
@@ -85,16 +91,24 @@ def capture(browser, theme, fname):
             "})",
             k * 360 / FRAMES,
         )
-        frames.append(Image.open(BytesIO(page.screenshot(clip=clip))).convert("RGB"))
+        frames.append(
+            Image.open(BytesIO(page.screenshot(clip=clip))).convert("RGB")
+        )
     ctx.close()
     # one shared palette (no per-frame requantize -> no palette flicker), no
     # dither (a shifting dither pattern would shimmer between frames)
     base = frames[0].quantize(colors=128, method=Image.Quantize.MEDIANCUT)
-    pal = [base] + [f.quantize(palette=base, dither=Image.Dither.NONE) for f in frames[1:]]
+    pal = [base] + [
+        f.quantize(palette=base, dither=Image.Dither.NONE) for f in frames[1:]
+    ]
     OUT.mkdir(exist_ok=True)
     pal[0].save(
-        OUT / fname, save_all=True, append_images=pal[1:],
-        duration=FRAME_MS, loop=0, optimize=True,
+        OUT / fname,
+        save_all=True,
+        append_images=pal[1:],
+        duration=FRAME_MS,
+        loop=0,
+        optimize=True,
     )
     kb = (OUT / fname).stat().st_size // 1024
     print(f"[gif] {fname}: {FRAMES}f @ {FRAME_MS}ms ({theme}), {kb} KB")

@@ -68,7 +68,8 @@ DEFAULT_CLUSTER = {
     "nodeName": None,  # defaults to the system hostname at load time
     "connectTimeout": 10,  # seconds per peer request
     # When true, only the elected leader runs *scheduled* jobs (manual API
-    # triggers and retries are unaffected); see cronstable.cluster.elect_leader.
+    # triggers and retries are unaffected); see
+    # cronstable.cluster.elect_leader.
     # Off by default so a cluster section is observe-only until opted in.
     "electLeader": False,
     # How leader-gated jobs are distributed across the quorate cluster:
@@ -138,8 +139,8 @@ DEFAULT_FILESYSTEM: Dict[str, Any] = {
 
 
 # Defaults for an (optional) state block. Only applied when a `state` section
-# is present; see _build_state_config. cronstable is stateless by default, so the
-# whole section is absent unless the user opts in.
+# is present; see _build_state_config. cronstable is stateless by default, so
+# the whole section is absent unless the user opts in.
 DEFAULT_STATE: Dict[str, Any] = {
     # required: the directory the durable store lives in. A local path gives
     # single-node durability; an Amazon S3 Files / EFS mount gives durability
@@ -148,7 +149,8 @@ DEFAULT_STATE: Dict[str, Any] = {
     "path": None,
     # auto (probe the mount) | single-node | shared. Gates whether cross-node
     # coordination may be offered; auto detects a shared network mount
-    # (NFS/EFS/S3 Files) and otherwise assumes single-node. See cronstable.state.
+    # (NFS/EFS/S3 Files) and otherwise assumes single-node.
+    # See cronstable.state.
     "topology": "auto",
     # optional stable prefix so several deployments can share one store/bucket
     # without colliding or cross-reading; None -> the "default" namespace.
@@ -271,7 +273,11 @@ _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
         "body": DEFAULT_SUBJECT_TEMPLATE + "\n" + DEFAULT_BODY_TEMPLATE,
-        "fingerprint": ["cronstable", "{{ environment.HOSTNAME }}", "{{ name }}"],
+        "fingerprint": [
+            "cronstable",
+            "{{ environment.HOSTNAME }}",
+            "{{ name }}",
+        ],
         "environment": None,
         "maxStringLength": 8192,
     },
@@ -516,7 +522,8 @@ _job_defaults_common = {
     Opt("onSuccess"): Map({Opt("report"): _report_schema}),
     Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
     # run-scoped secrets: each is resolved fresh per run and served
-    # to the job over the loopback endpoint (`cronstable secret get NAME`) rather
+    # to the job over the loopback endpoint (`cronstable
+    # secret get NAME`) rather
     # than placed in the environment, so it never shows in /proc/<pid>/environ
     # or a `ps -E`. The same value/fromFile/fromEnvVar source triple every
     # other secret uses. Needs a `state` section with jobApi enabled.
@@ -558,8 +565,8 @@ _job_schema_dict.update(
         | Map(
             {
                 # An explicit second opts the job into second-level scheduling
-                # (see schedule_object_to_crontab / cronstable.cron). Omit it and
-                # the schedule stays minute-granular, exactly as before.
+                # (see schedule_object_to_crontab / cronstable.cron). Omit it
+                # and the schedule stays minute-granular, exactly as before.
                 Opt("second"): Str(),
                 Opt("minute"): Str(),
                 Opt("hour"): Str(),
@@ -807,8 +814,8 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 # With a lease backend (kubernetes/etcd/filesystem)
                 # it stands up a dedicated, election-inert gossip mesh, so it
                 # requires listen/tls/peers just like backend: gossip does. See
-                # cronstable.cron.start_stop_observability and the overlay build
-                # in _build_cluster_config.
+                # cronstable.cron.start_stop_observability and the overlay
+                # build in _build_cluster_config.
                 Opt("observability"): Map(
                     {
                         Opt("shareNodeStats"): Bool(),
@@ -1002,7 +1009,8 @@ def schedule_has_seconds(
 
     True for the object ``second:`` key and for a full 7-field crontab string;
     such jobs make the scheduler tick once per second rather than once per
-    minute (see :meth:`cronstable.cron.Cron._needs_subminute`).  A 5- or 6-field
+    minute (see :meth:`cronstable.cron.Cron._needs_subminute`).  A 5- or
+    6-field
     string, ``@reboot`` and the ``@daily``/``@hourly``/... nicknames never do.
     """
     if isinstance(schedule_unparsed, dict):
@@ -1087,7 +1095,8 @@ class JobConfig:
             self.schedule_unparsed
         )
         # True when the schedule pins specific seconds; the scheduler then
-        # ticks per-second for this job instead of per-minute (cronstable.cron).
+        # ticks per-second for this job instead of per-minute
+        # (cronstable.cron).
         self.has_seconds: bool = schedule_has_seconds(self.schedule_unparsed)
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
@@ -1300,7 +1309,9 @@ class JobConfig:
             if os.geteuid() != 0:
                 raise ConfigError(
                     "Job {} wants to change user or group, "
-                    "but cronstable is not running as superuser".format(self.name)
+                    "but cronstable is not running as superuser".format(
+                        self.name
+                    )
                 )
 
     def _validate_numeric_ranges(self) -> None:
@@ -1409,8 +1420,8 @@ _DAG_TASK_NODE_KEYS = frozenset(
 
 
 class DagTaskConfig:
-    """One DAG node: its state-machine :class:`cronstable.dag.TaskSpec` plus the
-    :class:`JobConfig` launch template the scheduler runs it from.
+    """One DAG node: its state-machine :class:`cronstable.dag.TaskSpec` plus
+    the :class:`JobConfig` launch template the scheduler runs it from.
 
     A task *is* a job invocation (the mandate), so the launch fields reuse the
     exact job machinery -- the template carries the command, shell, env,
@@ -1972,8 +1983,8 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
     # Validate every address is a well-formed host:port up front, so a typo
     # (a missing port, a non-numeric port) fails the config load pointing at
     # the offending value instead of surfacing later as an opaque per-peer
-    # connection error. Mirrors cronstable.cluster._split_host_port, plus a port
-    # range check; anything this accepts also parses at runtime.
+    # connection error. Mirrors cronstable.cluster._split_host_port, plus a
+    # port range check; anything this accepts also parses at runtime.
     def _require_host_port(addr: str, what: str) -> None:
         # Bracketed IPv6 (``[2001:db8::1]:8900``): host is inside the brackets.
         if addr.startswith("["):
@@ -2398,7 +2409,8 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
         # urlparse's .port *raises* ValueError on a non-numeric or out-of-range
         # port; guard it so a typo surfaces as a clean ConfigError (config
         # parsing must only ever raise ConfigError) instead of an opaque
-        # ValueError that __main__ / the reload loop mistake for a cronstable bug.
+        # ValueError that __main__ / the reload loop mistake for a
+        # cronstable bug.
         try:
             port = parsed.port
         except ValueError:

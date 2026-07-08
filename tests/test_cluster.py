@@ -125,11 +125,14 @@ def test_cluster_config_excludes_self_listed_peer():
 def test_cluster_config_excludes_self_listed_by_hostname_behind_wildcard():
     # the common uniform-peer-list mistake: a node bound to a wildcard listen
     # (0.0.0.0) and self-listed by its nodeName. The literal listen string
-    # ("0.0.0.0:8443") does not match "cronstable-a:8443", so a literal-only check
+    # ("0.0.0.0:8443") does not match "cronstable-a:8443", so
+    # a literal-only check
     # would let it survive config-time dedup and inflate N -- which, if the
     # self-poll never succeeds (cert SAN / loopback quirk), permanently pins
     # Leader jobs closed cluster-wide. It is recognised structurally at load.
-    y = CLUSTER_YAML + '    - host: "cronstable-a:8443"\n  nodeName: cronstable-a\n'
+    y = CLUSTER_YAML + (
+        '    - host: "cronstable-a:8443"\n  nodeName: cronstable-a\n'
+    )
     cfg = parse_config_string(y, "").cluster_config
     assert cfg is not None
     assert [p["host"] for p in cfg["peers"]] == [
@@ -4052,7 +4055,7 @@ async def test_degenerate_self_warning_survives_multihomed_dedup_lag(
             self._by_host = by_host
 
         def get(self, url, ssl=None, **kwargs):
-            host = url[len("https://"):-len("/peer")]
+            host = url[len("https://") : -len("/peer")]
             return self._by_host[host]()
 
     with caplog.at_level(logging.INFO, logger="cronstable.cluster"):
@@ -4298,9 +4301,7 @@ def test_parse_job_summaries_hostile_fields_degrade_not_poison():
                 "scheduled_in": float("inf"),
                 "last": {"outcome": "exploded", "finished_at": "t"},
             },
-            "k": {
-                "last": {"outcome": "success", "finished_at": "x" * 65}
-            },
+            "k": {"last": {"outcome": "success", "finished_at": "x" * 65}},
             "m": {
                 "last": {
                     "outcome": "success",
@@ -4387,8 +4388,7 @@ def test_parse_job_summaries_caps_cardinality():
     )
 
     raw = {
-        "job-%05d" % i: {}
-        for i in range(MAX_ADVERTISED_JOB_SUMMARIES + 50)
+        "job-%05d" % i: {} for i in range(MAX_ADVERTISED_JOB_SUMMARIES + 50)
     }
     parsed = _parse_job_summaries(raw)
     assert parsed is not None
@@ -4622,9 +4622,7 @@ def test_advertised_job_summaries_caps_deterministically(no_tls):
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
     )
-    names = [
-        "job-%05d" % i for i in range(MAX_ADVERTISED_JOB_SUMMARIES + 5)
-    ]
+    names = ["job-%05d" % i for i in range(MAX_ADVERTISED_JOB_SUMMARIES + 5)]
     overlong = "x" * (MAX_JOB_SUMMARY_NAME_LEN + 1)
     mgr.set_job_summaries_provider(
         lambda: {name: {} for name in names + [overlong]}

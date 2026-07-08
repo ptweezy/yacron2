@@ -66,8 +66,8 @@ class StatsdJobMetricWriter:
             success=0 if self.job.failed else 1,
             duration=duration,
         )
-        # When the run was resource-monitored (see cronstable.resources) ship the
-        # CPU time and peak RSS alongside the duration. resource_usage is
+        # When the run was resource-monitored (see cronstable.resources) ship
+        # the CPU time and peak RSS alongside the duration. resource_usage is
         # finalized in RunningJob._on_stop before this hook runs, so it is
         # already populated here; None when monitoring was off or unavailable.
         usage = getattr(self.job, "resource_usage", None)

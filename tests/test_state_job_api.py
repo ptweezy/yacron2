@@ -2,8 +2,8 @@
 
 Where test_state_job_primitives.py exercises the backend primitives and the
 pure logic layer, this file exercises the *server*: it starts a real
-:class:`cronstable.jobapi.JobStateAPI` (which binds an ephemeral 127.0.0.1 port)
-and drives it over real HTTP with an aiohttp client -- the same wire the
+:class:`cronstable.jobapi.JobStateAPI` (which binds an ephemeral 127.0.0.1
+port) and drives it over real HTTP with an aiohttp client -- the same wire the
 `cronstable` job CLI speaks -- covering auth, every primitive's endpoint, the
 lease-backed lock manager, and run-scoped secrets.  It then checks the cron
 wiring end to end: env injection at launch and token/lock cleanup at finish.
@@ -18,10 +18,10 @@ import sys
 
 import aiohttp
 
-from tests.test_state import _backend, _state_cfg
 from cronstable.config import parse_config_string
 from cronstable.cron import Cron
 from cronstable.jobapi import JobStateAPI, RunContext, run_environment
+from tests.test_state import _backend, _state_cfg
 
 _ONE_JOB = (
     "state:\n  path: {path}\n"
@@ -120,9 +120,7 @@ async def test_kv_http_roundtrip(tmp_path):
             assert r.status == 404
             r = await s.get(api.base_url + "/v1/kv/list")
             assert [k["key"] for k in (await r.json())["keys"]] == ["k"]
-            r = await s.post(
-                api.base_url + "/v1/kv/delete", json={"key": "k"}
-            )
+            r = await s.post(api.base_url + "/v1/kv/delete", json={"key": "k"})
             assert (await r.json())["existed"] is True
             r = await s.get(api.base_url + "/v1/kv/get?key=k")
             assert r.status == 404
@@ -491,6 +489,7 @@ async def test_lock_semaphore_two_permits(tmp_path):
         api.register_run(_ctx(token=t, job="alpha"))
     try:
         async with aiohttp.ClientSession() as s:
+
             async def acq(token):
                 r = await s.post(
                     api.base_url + "/v1/lock/acquire",
@@ -659,9 +658,7 @@ async def test_cron_starts_job_api_and_injects_env(tmp_path):
     await cron.start_stop_state(_state_cfg(_ONE_JOB.format(path=tmp_path)))
     try:
         assert cron._job_api is not None
-        job = parse_config_string(
-            _ONE_JOB.format(path=tmp_path), ""
-        ).jobs[0]
+        job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
         token, env = cron._prepare_job_api_run(job, None)
         assert token is not None
         assert env["CRONSTABLE_STATE_URL"].startswith("http://127.0.0.1:")
@@ -691,9 +688,7 @@ async def test_cron_jobapi_disabled(tmp_path):
     )
     try:
         assert cron._job_api is None
-        job = parse_config_string(
-            _ONE_JOB.format(path=tmp_path), ""
-        ).jobs[0]
+        job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
         token, env = cron._prepare_job_api_run(job, None)
         assert token is None
         assert env == {}

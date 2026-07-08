@@ -9,7 +9,6 @@ Order matters: clean-board shots come first; deliberately-staged failures
 """
 import json
 import sys
-import time
 import urllib.request
 from pathlib import Path
 
@@ -99,7 +98,8 @@ def fresh(page, theme=None, extra_prefs=None):
     if extra_prefs:
         prefs.update(extra_prefs)
     js = ";".join(
-        f"localStorage.setItem('cronstable.{k}', {json.dumps(v)})" for k, v in prefs.items()
+        f"localStorage.setItem('cronstable.{k}', {json.dumps(v)})"
+        for k, v in prefs.items()
     )
     page.evaluate(js)
     page.reload()
@@ -139,13 +139,17 @@ def main():
             # fleet matrix render without clipping under the fluid layout
             viewport={"width": 1680, "height": 1050},
             device_scale_factor=2,
-            bypass_csp=True,  # page CSP has no unsafe-eval; needed for evaluate()
-            reduced_motion="no-preference",  # headless default suppresses the boot POST
+            # page CSP has no unsafe-eval; needed for evaluate()
+            bypass_csp=True,
+            # headless default suppresses the boot POST
+            reduced_motion="no-preference",
         )
         ctx.route(
             "**/version",
             lambda route: route.fulfill(
-                status=200, content_type="text/plain; charset=utf-8", body=VERSION
+                status=200,
+                content_type="text/plain; charset=utf-8",
+                body=VERSION,
             ),
         )
         ctx.add_init_script(
@@ -170,10 +174,13 @@ def main():
                 page.evaluate(
                     "localStorage.setItem('cronstable.bootWant','1');"
                     "localStorage.setItem('cronstable.boot','true');"
-                    "localStorage.removeItem('cronstable.bootShownAt')"  # 12h replay gate
+                    # 12h replay gate
+                    "localStorage.removeItem('cronstable.bootShownAt')"
                 )
                 page.reload()
-                page.wait_for_selector("#bootScreen", state="visible", timeout=8000)
+                page.wait_for_selector(
+                    "#bootScreen", state="visible", timeout=8000
+                )
                 page.wait_for_timeout(1600)  # let a few POST lines print
                 shot(page, "dashboard-boot")
             except Exception as e:
@@ -186,9 +193,12 @@ def main():
             page.reload()
             wait_ready(page)
 
-        # ---- stage the hero: one deliberate red + a guaranteed cpu-burner ----
-        api("POST", "/jobs/alert-selftest/start")       # fails instantly, by design
-        api("POST", "/jobs/risk-model-recompute/start")  # 30s CPU burn -> live cpu%
+        # ---- stage the hero: one deliberate red + a guaranteed cpu-burner
+        # ----
+        api("POST", "/jobs/alert-selftest/start")  # fails instantly, by design
+        api(
+            "POST", "/jobs/risk-model-recompute/start"
+        )  # 30s CPU burn -> live cpu%
         page.wait_for_timeout(7000)  # let a poll land
 
         if wants("dashboard-overview"):
@@ -216,8 +226,10 @@ def main():
                 shot(page, fname)
             except Exception as e:
                 results[fname] = f"FAIL {e}"
-        if not ONLY or any(wants(f"dashboard-theme-{t}") for t in
-                           ("amber", "green", "modern", "carolina-light")):
+        if not ONLY or any(
+            wants(f"dashboard-theme-{t}")
+            for t in ("amber", "green", "modern", "carolina-light")
+        ):
             fresh(page)  # back to the default carolina
 
         # ---- job drawer: live logs on the 5s heartbeat probe ----
@@ -261,7 +273,9 @@ def main():
             try:
                 close_overlays(page)
                 page.keyboard.press("Control+k")
-                page.wait_for_selector("#paletteWrap.open, #paletteWrap.show", timeout=4000)
+                page.wait_for_selector(
+                    "#paletteWrap.open, #paletteWrap.show", timeout=4000
+                )
                 page.fill("#paletteInput", "run")
                 page.wait_for_timeout(600)
                 shot(page, "dashboard-palette")
@@ -275,7 +289,9 @@ def main():
             try:
                 close_overlays(page)
                 page.keyboard.type("?")
-                page.wait_for_selector("#helpWrap.open, #helpWrap.show", timeout=4000)
+                page.wait_for_selector(
+                    "#helpWrap.open, #helpWrap.show", timeout=4000
+                )
                 page.wait_for_timeout(400)
                 shot(page, "dashboard-shortcuts")
                 close_overlays(page)
@@ -288,7 +304,9 @@ def main():
             try:
                 close_overlays(page)
                 page.click("#settingsBtn")
-                page.wait_for_selector("#settingsWrap.open, #settingsWrap.show", timeout=4000)
+                page.wait_for_selector(
+                    "#settingsWrap.open, #settingsWrap.show", timeout=4000
+                )
                 page.wait_for_timeout(400)
                 shot(page, "dashboard-settings")
                 close_overlays(page)
@@ -318,7 +336,9 @@ def main():
                 page.wait_for_timeout(1000)
                 # open the newest run, then its graph
                 try:
-                    page.locator("#dgRuns tr[data-runkey]").first.click(timeout=3000)
+                    page.locator("#dgRuns tr[data-runkey]").first.click(
+                        timeout=3000
+                    )
                     page.wait_for_timeout(500)
                 except Exception:
                     pass
@@ -337,7 +357,8 @@ def main():
                 r = api("POST", "/dags/release-train/trigger")
                 print(f"    release-train trigger -> {r}")
                 run_key = r.get("runKey") if isinstance(r, dict) else None
-                # poll the run document until the gate parks awaiting a decision
+                # poll the run document until the gate parks awaiting a
+                # decision
                 for _ in range(45):
                     page.wait_for_timeout(2000)
                     if not run_key:
@@ -345,14 +366,19 @@ def main():
                     doc = api("GET", f"/dags/release-train/runs/{run_key}")
                     tasks = (doc or {}).get("tasks") or {}
                     vals = tasks.values() if isinstance(tasks, dict) else tasks
-                    if any(isinstance(t, dict) and t.get("awaitingApproval") for t in vals):
+                    if any(
+                        isinstance(t, dict) and t.get("awaitingApproval")
+                        for t in vals
+                    ):
                         break
                 scroll_card(page, "#dagCard")
                 page.click('[data-dagopen="release-train"]')
                 page.wait_for_selector("#dagDrawer.open", timeout=5000)
                 page.wait_for_timeout(1500)
                 try:
-                    page.locator("#dgRuns tr[data-runkey]").first.click(timeout=3000)
+                    page.locator("#dgRuns tr[data-runkey]").first.click(
+                        timeout=3000
+                    )
                     page.wait_for_timeout(1000)
                 except Exception:
                     pass
@@ -380,7 +406,9 @@ def main():
                 close_overlays(page)
                 scroll_card(page, "#clusterCard")
                 page.click("#fleetBtn")
-                page.wait_for_selector("#fleetPanel", state="visible", timeout=8000)
+                page.wait_for_selector(
+                    "#fleetPanel", state="visible", timeout=8000
+                )
                 page.wait_for_timeout(2500)
                 scroll_card(page, "#fleetPanel")
                 shot(page, "dashboard-fleet")
@@ -405,7 +433,9 @@ def main():
             try:
                 close_overlays(page)
                 page.click("#tailBtn")
-                page.wait_for_selector("#tailWrap.open, #tailWrap.show", timeout=4000)
+                page.wait_for_selector(
+                    "#tailWrap.open, #tailWrap.show", timeout=4000
+                )
                 # the console caps at 4 streams: seed the two second-level
                 # probes first (steady line flow), let +failing fill the rest
                 for j in ("pulse-liveness", "pulse-latency"):
@@ -425,7 +455,9 @@ def main():
             try:
                 close_overlays(page)
                 page.click("#heatBtn")
-                page.wait_for_selector("#heatCard", state="visible", timeout=8000)
+                page.wait_for_selector(
+                    "#heatCard", state="visible", timeout=8000
+                )
                 page.wait_for_timeout(4000)
                 scroll_card(page, "#heatCard")
                 shot(page, "dashboard-heatmap")
@@ -434,22 +466,32 @@ def main():
                 results["dashboard-heatmap"] = f"FAIL {e}"
 
         # ---- LAST: stage a correlated multi-job failure (incident tools) ----
-        if wants("dashboard-incident") or wants("dashboard-incident-timeline") \
-                or wants("dashboard-wallboard"):
+        if (
+            wants("dashboard-incident")
+            or wants("dashboard-incident-timeline")
+            or wants("dashboard-wallboard")
+        ):
             try:
-                for j in ("db-health-orders", "db-health-inventory",
-                          "db-health-payments", "db-health-warehouse"):
+                for j in (
+                    "db-health-orders",
+                    "db-health-inventory",
+                    "db-health-payments",
+                    "db-health-warehouse",
+                ):
                     api("POST", f"/jobs/{j}/start")
                 page.wait_for_timeout(9000)
                 close_overlays(page)
                 set_sort(page)
                 if wants("dashboard-incident"):
-                    page.wait_for_selector("#verdictBar", state="visible", timeout=10000)
+                    page.wait_for_selector(
+                        "#verdictBar", state="visible", timeout=10000
+                    )
                     shot(page, "dashboard-incident")
                 if wants("dashboard-incident-timeline"):
                     page.keyboard.type("i")
-                    page.wait_for_selector("#timelineWrap.open, #timelineWrap.show",
-                                           timeout=4000)
+                    page.wait_for_selector(
+                        "#timelineWrap.open, #timelineWrap.show", timeout=4000
+                    )
                     page.wait_for_timeout(600)
                     shot(page, "dashboard-incident-timeline")
                     close_overlays(page)
@@ -462,7 +504,9 @@ def main():
             try:
                 close_overlays(page)
                 page.keyboard.type("w")
-                page.wait_for_selector("#wallboard", state="visible", timeout=4000)
+                page.wait_for_selector(
+                    "#wallboard", state="visible", timeout=4000
+                )
                 page.wait_for_timeout(1500)
                 shot(page, "dashboard-wallboard")
                 page.keyboard.press("Escape")

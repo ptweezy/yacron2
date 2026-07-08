@@ -697,7 +697,8 @@ class EtcdBackend(LeaseBackend):
         rotation (same paths, new bytes from cert-manager / Vault) is otherwise
         invisible until the process restarts, and the fleet silently loses
         leadership once the old client cert expires.  Reporting the change lets
-        :meth:`cronstable.cron.Cron.start_stop_cluster` rebuild this backend with
+        :meth:`cronstable.cron.Cron.start_stop_cluster` rebuild this backend
+        with
         the fresh material.  ``False`` when nothing was tracked (plain http, or
         no client cert/CA: nothing on disk to rotate).
         """

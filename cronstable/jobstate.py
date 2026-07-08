@@ -19,8 +19,8 @@ memory) and live in :mod:`cronstable.jobapi`.
 
 Everything here is a plain ``async`` function taking the backend and a
 ``scope`` string, with no aiohttp and no CLI: the loopback server
-(:mod:`cronstable.jobapi`) and the offline CLI (:mod:`cronstable.jobcli`) are two
-thin front-ends over the identical logic, and the unit tests drive it
+(:mod:`cronstable.jobapi`) and the offline CLI (:mod:`cronstable.jobcli`) are
+two thin front-ends over the identical logic, and the unit tests drive it
 directly.  A ``scope`` is the isolation boundary -- by default a job's own
 name, so ``kv set`` in job A cannot read job B's keys; callers pass a shared
 scope (conventionally ``"global"``) to opt into cross-job sharing.
@@ -71,7 +71,8 @@ class JobStateError(Exception):
 def _now() -> float:
     """Wall-clock epoch seconds for record/document timestamps.
 
-    A separate seam from :func:`cronstable.state._now` (the store's lease clock)
+    A separate seam from :func:`cronstable.state._now` (the store's lease
+    clock)
     so tests can drive idempotency-key expiry here without touching lease
     timing; both are plain ``time.time`` in production.
     """

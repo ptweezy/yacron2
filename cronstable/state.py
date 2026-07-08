@@ -1,7 +1,8 @@
 """Optional durable state backend: one filesystem seam for local disk and
 Amazon S3 Files.
 
-cronstable is stateless by default -- run history, retry counters, the next-fire
+cronstable is stateless by default -- run history, retry counters, the
+next-fire
 index and the leadership view all live in memory and reset on restart, and that
 zero-disk story is a feature.  This module adds the *opt-in* other half: when a
 ``state`` config section is present, a :class:`StateBackend` gives cronstable a
@@ -71,7 +72,11 @@ from typing import (
 
 from cronstable import _json
 from cronstable.config import ConfigError, StateConfig
-from cronstable.platform import IS_WINDOWS, exclusive_file_lock, fsync_directory
+from cronstable.platform import (
+    IS_WINDOWS,
+    exclusive_file_lock,
+    fsync_directory,
+)
 
 _T = TypeVar("_T")
 

@@ -4,15 +4,15 @@ These are the commands a job command line reaches for -- durable KV, an ETL
 cursor, a distributed lock, the artifact store, idempotency keys, run-scoped
 secrets.  Each is a thin client of the loopback endpoint the daemon injected
 into the job's environment (:mod:`cronstable.jobapi`): it reads the injected
-``CRONSTABLE_STATE_URL`` / ``CRONSTABLE_STATE_TOKEN`` and speaks HTTP over stdlib
-``urllib`` (no aiohttp, no event loop, so the command starts instantly).
+``CRONSTABLE_STATE_URL`` / ``CRONSTABLE_STATE_TOKEN`` and speaks HTTP over
+stdlib ``urllib`` (no aiohttp, no event loop, so the command starts instantly).
 
 They coexist with the ``cronstable state`` *admin* commands (backup / restore /
 gc / check ...): the admin actions operate on the store file tree offline via
 ``-c``, while these job-facing actions (get / set / delete / keys, and the
 other verbs) act through the running daemon.  ``cronstable.__main__`` routes by
-action name, so ``cronstable state check`` and ``cronstable state get KEY`` reach the
-right handler.
+action name, so ``cronstable state check`` and ``cronstable state get KEY``
+reach the right handler.
 
 The default *scope* every KV / cursor / artifact / lock call lands in is the
 calling job's own name (the daemon fills it from the run's identity), so one
@@ -85,10 +85,10 @@ def _endpoint() -> Tuple[str, str]:
     token = os.environ.get(ENV_TOKEN)
     if not url or not token:
         raise _CliError(
-            "not running inside a cronstable job: {} is not set (these commands "
-            "reach the daemon's loopback state endpoint, which is injected "
-            "into a job's environment; is a `state` section with jobApi "
-            "enabled configured?)".format(ENV_URL)
+            "not running inside a cronstable job: {} is not set (these "
+            "commands reach the daemon's loopback state endpoint, which is "
+            "injected into a job's environment; is a `state` section with "
+            "jobApi enabled configured?)".format(ENV_URL)
         )
     return url, token
 
@@ -147,7 +147,9 @@ def _http(
         # after HTTPError/URLError on purpose: both subclass OSError, and
         # an HTTP error response must keep its status semantics.
         raise _CliError(
-            "cannot reach the cronstable state endpoint at {}: {}".format(url, ex)
+            "cannot reach the cronstable state endpoint at {}: {}".format(
+                url, ex
+            )
         ) from ex
 
 
@@ -781,7 +783,8 @@ def dispatch(args: argparse.Namespace) -> int:
     if handler is None:  # pragma: no cover - routed by __main__
         print("cronstable: unknown command", file=sys.stderr)
         return 2
-    # a bare `cronstable cursor` (no action) prints help via a missing sub-action
+    # a bare `cronstable cursor` (no action) prints help via a missing
+    # sub-action
     action_attr = {
         "cursor": "cursor_command",
         "lock": "lock_command",

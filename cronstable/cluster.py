@@ -852,8 +852,8 @@ class PeerState:
     # not surfaced in to_dict.
     job_summaries_at: Optional[datetime.datetime] = None
     # the peer's last-reported whole-node CPU/memory (see
-    # cronstable.resources.NodeResourceSampler), for the per-node load readout in
-    # both the cluster panel (to_dict below) and the fleet view. Like
+    # cronstable.resources.NodeResourceSampler), for the per-node load readout
+    # in both the cluster panel (to_dict below) and the fleet view. Like
     # job_summaries: None (a peer sharing none, or never polled) leaves any
     # previously-absorbed value in place rather than blanking, so a briefly-
     # unreachable node shows its last-known load aged by last_seen.
@@ -1221,7 +1221,8 @@ def gossip_tls_loadable(cluster_config: ClusterConfig) -> bool:
 
     A side-effect-free dry-run of what :meth:`ClusterManager.__init__` does
     (build the client + server SSL contexts from the on-disk CA/cert/key), used
-    by :meth:`cronstable.cron.Cron.start_stop_cluster` BEFORE it tears the running
+    by :meth:`cronstable.cron.Cron.start_stop_cluster` BEFORE it tears the
+    running
     manager down for a CONFIG change. It covers a config edit (peers/listen)
     that coincides with an in-flight cert rotation (cert-manager / Vault /
     Kubernetes secret refresh briefly leaves a half-written or absent file):
@@ -1270,8 +1271,8 @@ class ClusterManager(LeadershipBackend):
     """Owns the mTLS ``/peer`` listener and the periodic peer-poll loop.
 
     The default, best-effort gossip leadership backend (see
-    :class:`cronstable.leadership.LeadershipBackend`).  It defines real bodies for
-    every method on the seam -- core, defaulted, and the never-skip
+    :class:`cronstable.leadership.LeadershipBackend`).  It defines real bodies
+    for every method on the seam -- core, defaulted, and the never-skip
     ``available_*`` family -- so subclassing the ABC is purely a conformance
     declaration and leaves behaviour byte-identical.
     """
@@ -1755,8 +1756,8 @@ class ClusterManager(LeadershipBackend):
         (:func:`build_client_ssl_context` / :func:`build_server_ssl_context`)
         against the live files but *without binding the listener*, so it is a
         side-effect-free dry-run of the rebuild that
-        :meth:`cronstable.cron.Cron.start_stop_cluster` is about to attempt on a
-        cert rotation.  The built contexts are discarded -- the real swap
+        :meth:`cronstable.cron.Cron.start_stop_cluster` is about to attempt on
+        a cert rotation.  The built contexts are discarded -- the real swap
         happens by reconstructing the manager once validation passes.  Returns
         ``False`` if any file is missing, unreadable, or a half-written/invalid
         PEM (the same ``OSError`` / ``ssl.SSLError`` the real rebuild would

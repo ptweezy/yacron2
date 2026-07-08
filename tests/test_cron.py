@@ -10,10 +10,10 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import cronstable.cron
-from tests._commands import cmd_hang, cmd_print, cmd_sleep, yaml_command
 from cronstable import platform
 from cronstable.config import ConfigError, JobConfig, parse_config_string
 from cronstable.job import JobOutputStream, JobRetryState, RunningJob
+from tests._commands import cmd_hang, cmd_print, cmd_sleep, yaml_command
 
 
 async def _noop():
@@ -1093,7 +1093,9 @@ def test_run_stats_cpu_and_memory_aggregates():
 
 
 def test_run_stats_no_monitored_runs_leaves_resource_fields_none():
-    stats = cronstable.cron._run_stats([_mk_run("success"), _mk_run("failure")])
+    stats = cronstable.cron._run_stats(
+        [_mk_run("success"), _mk_run("failure")]
+    )
     assert stats["avg_cpu_seconds"] is None
     assert stats["max_rss_bytes"] is None
     assert stats["last_cpu_seconds"] is None
@@ -1834,8 +1836,8 @@ async def test_run_survives_config_error(tmp_path, monkeypatch):
         assert not task.done()
         assert set(cron.cron_jobs) == {"alpha", "beta"}  # unchanged
         # the failed reload flips the standard "config broken on disk" signal
-        # (cronstable_config_last_reload_successful) even though the parse ran off
-        # the loop, in a worker thread.
+        # (cronstable_config_last_reload_successful) even though the parse ran
+        # off the loop, in a worker thread.
         assert cron.metrics._last_reload_ok is False
     finally:
         cron.signal_shutdown()
@@ -2247,12 +2249,10 @@ def test_cluster_policy_conflict_logged_on_transition(caplog):
         cron._log_cluster_role()
     msgs = [r.message for r in caplog.records]
     assert sum("coordination-policy divergence --" in m for m in msgs) == 1
-    assert sum(
-        "coordination-policy divergence resolved" in m for m in msgs
-    ) == 1
-    assert any(
-        "distribution 'spread' != 'single-leader'" in m for m in msgs
+    assert (
+        sum("coordination-policy divergence resolved" in m for m in msgs) == 1
     )
+    assert any("distribution 'spread' != 'single-leader'" in m for m in msgs)
 
 
 def test_is_deferrable_reboot():
@@ -2273,8 +2273,10 @@ def test_is_deferrable_reboot():
     # EveryNode @reboot is meant to run on every node at boot -> not deferred
     assert cron._is_deferrable_reboot(job("EveryNode", "@reboot")) is False
     # a real cron schedule (not @reboot) is never a deferrable reboot
-    assert cron._is_deferrable_reboot(job("Leader", CronTab("* * * * *"))) \
+    assert (
+        cron._is_deferrable_reboot(job("Leader", CronTab("* * * * *")))
         is False
+    )
 
 
 def _reboot_job(name="boot", policy="Leader", enabled=True):
@@ -2327,7 +2329,8 @@ async def test_deferred_reboot_runs_on_owner(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2353,7 +2356,8 @@ async def test_deferred_reboot_disabled_on_owner_is_not_run(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job(enabled=False)  # disabled on reload while pending
@@ -2374,7 +2378,8 @@ async def test_deferred_reboot_disabled_no_manager_preferleader(monkeypatch):
     cron.cluster_manager = None
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job(policy="PreferLeader", enabled=False)
@@ -2393,7 +2398,8 @@ async def test_deferred_reboot_disabled_after_election_removed(monkeypatch):
     cron._elect_leader_configured = False  # election turned off on reload
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job(enabled=False)
@@ -2416,7 +2422,8 @@ async def test_deferred_reboot_records_before_launch(monkeypatch):
     cron._elect_leader_configured = True
     events = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: events.append("launch") or _noop(),
     )
     mgr = _reboot_mgr(leader="node-a")  # we are the owner
@@ -2448,7 +2455,8 @@ async def test_deferred_reboot_leader_runs_when_identity_differs(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
 
@@ -2490,7 +2498,8 @@ async def test_deferred_reboot_retired_on_ack_without_rerun(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2513,7 +2522,8 @@ async def test_deferred_reboot_kept_when_other_owns(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2534,7 +2544,8 @@ async def test_deferred_reboot_leader_runs_after_owner_lands_here(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2557,7 +2568,8 @@ async def test_deferred_reboot_preferleader_runs_without_quorum(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job(policy="PreferLeader")
@@ -2582,7 +2594,8 @@ async def test_deferred_reboot_preferleader_runs_when_no_manager(monkeypatch):
     cron.cluster_manager = None  # backend failed to start
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job(policy="PreferLeader")
@@ -2603,7 +2616,8 @@ async def test_deferred_reboot_leader_pending_no_manager(monkeypatch):
     cron.cluster_manager = None
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job(policy="Leader")
@@ -2624,7 +2638,8 @@ async def test_deferred_reboot_preferleader_waits_for_available_owner(
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job(policy="PreferLeader")
@@ -2642,7 +2657,8 @@ async def test_deferred_reboot_waits_without_quorum(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2660,7 +2676,8 @@ async def test_deferred_reboot_waits_on_conflict(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2680,7 +2697,8 @@ async def test_deferred_reboot_runs_when_election_disabled(monkeypatch):
     cron._elect_leader_configured = False
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2700,7 +2718,8 @@ async def test_deferred_reboot_kept_when_absent_election_disabled(monkeypatch):
     cron._elect_leader_configured = False
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job) or _noop(),
     )
     stale = _reboot_job()
@@ -2733,7 +2752,8 @@ async def test_deferred_reboot_election_disabled_skips_non_reboot_reuse(
     cron._elect_leader_configured = False
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     cron._pending_reboot_jobs["boot"] = _reboot_job()  # stale @reboot one-shot
@@ -2757,7 +2777,8 @@ async def test_deferred_reboot_kept_on_transient_absence(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2782,7 +2803,8 @@ async def test_deferred_reboot_absent_job_never_runs(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2802,7 +2824,8 @@ async def test_deferred_reboot_runs_current_config_on_name_reuse(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job) or _noop(),
     )
     stale = _reboot_job()  # captured at startup, then the name was reused
@@ -2825,11 +2848,13 @@ async def test_deferred_reboot_retired_when_name_reused_non_deferrable(
     # pending entry is retired WITHOUT running through the owner path -- the
     # new job is left to its own scheduling.
     import types
+
     cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     cron._pending_reboot_jobs["boot"] = _reboot_job()  # stale @reboot Leader
@@ -2846,7 +2871,7 @@ async def test_deferred_reboot_retired_when_name_reused_non_deferrable(
 @pytest.mark.asyncio
 async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
     config = parse_config_string(
-        'jobs:\n  - name: boot\n    command: echo hi\n'
+        "jobs:\n  - name: boot\n    command: echo hi\n"
         '    schedule: "@reboot"\n    clusterPolicy: Leader\n',
         "",
     )
@@ -2855,7 +2880,8 @@ async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "launch_scheduled_job",
+        cron,
+        "launch_scheduled_job",
         lambda job: launched.append(job.name) or _noop(),
     )
 
@@ -2909,7 +2935,8 @@ async def test_web_start_deferred_reboot_retires_pending_and_marks_ran(
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "maybe_launch_job",
+        cron,
+        "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2946,7 +2973,8 @@ async def test_web_start_deferred_reboot_without_manager(monkeypatch):
     cron.cluster_manager = None
     launched = []
     monkeypatch.setattr(
-        cron, "maybe_launch_job",
+        cron,
+        "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -2976,7 +3004,8 @@ async def test_web_start_deferred_reboot_concurrent_requests(monkeypatch):
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
-        cron, "maybe_launch_job",
+        cron,
+        "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = _reboot_job()
@@ -3619,7 +3648,9 @@ def test_sigterm_triggers_graceful_shutdown():
     # owns the signal and it does not reach the default disposition.
     loop = asyncio.new_event_loop()
     try:
-        cron = cronstable.cron.Cron(None)  # no jobs: run() idles until signalled
+        cron = cronstable.cron.Cron(
+            None
+        )  # no jobs: run() idles until signalled
         remove = platform.install_shutdown_handlers(loop, cron.signal_shutdown)
         try:
             loop.call_later(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM))
@@ -4155,7 +4186,9 @@ def test_compute_next_fire_is_now_plus_delay_utc(monkeypatch):
         seconds=delay
     )
     # strictly-future: the in-progress minute (:00) is skipped for :01
-    assert cron._compute_next_fire(job, now) == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
+    assert cron._compute_next_fire(job, now) == DT(
+        2020, 1, 1, 0, 1, tzinfo=UTC
+    )
 
 
 def test_compute_next_fire_lands_on_a_matching_slot(monkeypatch):
@@ -4182,7 +4215,9 @@ def test_sleep_interval_uses_soonest_fire(monkeypatch):
     # The loop sleeps until the soonest job's next fire, not a fixed tick.
     holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
     _set_now(monkeypatch, holder)
-    cron = cronstable.cron.Cron(None, config_yaml=_SECONDS_JOB)  # sec */15 + min
+    cron = cronstable.cron.Cron(
+        None, config_yaml=_SECONDS_JOB
+    )  # sec */15 + min
     cron._ensure_seeded(cronstable.cron.get_now(UTC))
     # soonest is the */15 job at :15 -> 15s away (the minute job is 60s away)
     assert cron._sleep_interval() == pytest.approx(15.0, abs=0.05)
@@ -4193,7 +4228,9 @@ def test_sleep_interval_capped_by_housekeeping(monkeypatch):
     # so config reload / cluster upkeep stays ~once a minute.
     holder = {"now": DT(2020, 1, 1, 3, 0, 15)}
     _set_now(monkeypatch, holder)
-    cron = cronstable.cron.Cron(None, config_yaml=_NOON_DAILY)  # next fire 12:00
+    cron = cronstable.cron.Cron(
+        None, config_yaml=_NOON_DAILY
+    )  # next fire 12:00
     cron._ensure_seeded(cronstable.cron.get_now(UTC))
     # capped at the next minute boundary (03:01:00), i.e. 45s
     assert cron._sleep_interval() == pytest.approx(45.0, abs=0.05)
@@ -4284,7 +4321,8 @@ async def test_large_forward_jump_does_not_enumerate_window(monkeypatch):
     # occurrence-by-occurrence: for a per-second job an 8h gap is ~28,800
     # occurrences (and an RTC-less 1970->now boot is billions), which would
     # block the event loop and exhaust memory. The long-gap branch resumes at
-    # the current slot with O(1) crontab work. Regression guard for the review's
+    # the current slot with O(1) crontab work. Regression guard for the
+    # review's
     # high-severity finding.
     holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
     cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
@@ -4310,7 +4348,9 @@ jobs:
 
 
 @pytest.mark.asyncio
-async def test_last_run_slot_is_aware_utc_in_both_advance_branches(monkeypatch):
+async def test_last_run_slot_is_aware_utc_in_both_advance_branches(
+    monkeypatch,
+):
     # _last_run_slot must never mix naive and aware datetimes. The normal
     # catch-up branch records the aware-UTC next-fire instant; the long-gap
     # branch records schedule_slot(), which is NAIVE local for a utc:false /
@@ -4406,8 +4446,9 @@ def test_reload_reseeds_changed_schedule(tmp_path, monkeypatch):
 
 
 def test_reload_refreshes_index(tmp_path, monkeypatch):
-    # One reload exercises all three reconciliations: an unchanged job keeps its
-    # fire, a removed job leaves the index, a new job is seeded strictly-future.
+    # One reload exercises all three reconciliations: an unchanged job keeps
+    # its fire, a removed job leaves the index, a new job is seeded
+    # strictly-future.
     holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
     _set_now(monkeypatch, holder)
     cfg = tmp_path / "c.yaml"

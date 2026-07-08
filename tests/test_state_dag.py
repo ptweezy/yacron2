@@ -266,7 +266,7 @@ def test_diamond_fan_in():
     )
     ex = _Executor(
         spec,
-        outcomes={k: True for k in ("root", "left", "right", "join")},
+        outcomes=dict.fromkeys(("root", "left", "right", "join"), True),
     )
     body = ex.run(_body(spec))
     assert body["state"] == dag.SUCCESS
@@ -801,7 +801,8 @@ def test_reconcile_claimed_but_never_launched():
 
 
 def test_reconcile_leaves_sensor_between_pokes(monkeypatch):
-    # a sensor idling between pokes has proc cleared; reconciliation (which runs
+    # a sensor idling between pokes has proc cleared;
+    # reconciliation (which runs
     # at the top of every advance) must NOT touch it, or it would re-poke every
     # pass and defeat the poke schedule.
     spec = _spec(
@@ -877,7 +878,8 @@ def test_run_key_sanitised():
 
 
 # --------------------------------------------------------------------------
-# `cronstable xcom` CLI (the HTTP seam monkeypatched, like the phase-5 CLI tests)
+# `cronstable xcom` CLI (the HTTP seam monkeypatched, like the phase-5 CLI
+# tests)
 # --------------------------------------------------------------------------
 
 
@@ -895,7 +897,9 @@ class _FakeHTTP:
             {"method": method, "path": path, "query": query, "data": data}
         )
         status, body = self.responses.get(path, (200, {}))
-        payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+        payload = (
+            body if isinstance(body, bytes) else json.dumps(body).encode()
+        )
         return status, {}, payload
 
 
@@ -1087,9 +1091,7 @@ def test_dag_unknown_dep_is_config_error():
 
 def test_dag_task_needs_command():
     with pytest.raises(ConfigError, match="needs a command"):
-        _dagcfg(
-            "dags:\n  - name: d\n    tasks:\n      - id: a\n"
-        )
+        _dagcfg("dags:\n  - name: d\n    tasks:\n      - id: a\n")
 
 
 def test_dag_approval_needs_no_command():
@@ -1208,8 +1210,12 @@ def test_sensor_repoke_clears_stale_due_instant():
     body, _ = _apply(dag.plan_and_claim(spec, 100.0, "p", "h", {}), body)
     body, _ = _apply(
         dag.mark_task_finished(
-            "s", success=False, exit_code=1, fail_reason=None,
-            now=100.0, task=task,
+            "s",
+            success=False,
+            exit_code=1,
+            fail_reason=None,
+            now=100.0,
+            task=task,
         ),
         body,
     )
@@ -1222,8 +1228,12 @@ def test_sensor_repoke_clears_stale_due_instant():
     # its completion re-sets the schedule
     body, _ = _apply(
         dag.mark_task_finished(
-            "s", success=False, exit_code=1, fail_reason=None,
-            now=112.0, task=task,
+            "s",
+            success=False,
+            exit_code=1,
+            fail_reason=None,
+            now=112.0,
+            task=task,
         ),
         body,
     )
@@ -1246,9 +1256,15 @@ def test_sensor_completion_poke_fence():
     assert [i.poke_number for i in res.launches] == [0]
     body, applied = _apply(
         dag.mark_task_finished(
-            "s", success=False, exit_code=1, fail_reason=None,
-            now=100.0, task=task,
-            expected_proc="p", expected_attempt=0, expected_poke=0,
+            "s",
+            success=False,
+            exit_code=1,
+            fail_reason=None,
+            now=100.0,
+            task=task,
+            expected_proc="p",
+            expected_attempt=0,
+            expected_poke=0,
         ),
         body,
     )
@@ -1261,9 +1277,15 @@ def test_sensor_completion_poke_fence():
     # a stale re-apply of poke 0's completion must NOT touch the live poke
     body, applied = _apply(
         dag.mark_task_finished(
-            "s", success=False, exit_code=1, fail_reason=None,
-            now=112.0, task=task,
-            expected_proc="p", expected_attempt=0, expected_poke=0,
+            "s",
+            success=False,
+            exit_code=1,
+            fail_reason=None,
+            now=112.0,
+            task=task,
+            expected_proc="p",
+            expected_attempt=0,
+            expected_poke=0,
         ),
         body,
     )
@@ -1275,9 +1297,15 @@ def test_sensor_completion_poke_fence():
     # the live poke's own completion (matching poke fence) applies
     body, applied = _apply(
         dag.mark_task_finished(
-            "s", success=True, exit_code=0, fail_reason=None,
-            now=113.0, task=task,
-            expected_proc="p", expected_attempt=0, expected_poke=1,
+            "s",
+            success=True,
+            exit_code=0,
+            fail_reason=None,
+            now=113.0,
+            task=task,
+            expected_proc="p",
+            expected_attempt=0,
+            expected_poke=1,
         ),
         body,
     )
@@ -1292,7 +1320,8 @@ def test_mapped_fanout_item_cap_fails_task_cleanly():
     spec = _spec(
         TaskSpec("gen"),
         TaskSpec(
-            "work", depends_on=("gen",),
+            "work",
+            depends_on=("gen",),
             expand=ExpandSpec(from_task="gen", key="items"),
         ),
         TaskSpec("collect", depends_on=("work",)),
@@ -1324,9 +1353,7 @@ def test_claims_are_batched_per_pass(monkeypatch):
     body, res = _apply(dag.plan_and_claim(spec, 3.0, "p", "h", {}), body)
     assert len(res.launches) == 1
     assert res.deferred is False
-    assert all(
-        _state(body, "t{}".format(i)) == dag.RUNNING for i in range(5)
-    )
+    assert all(_state(body, "t{}".format(i)) == dag.RUNNING for i in range(5))
 
 
 def test_reload_added_dependency_does_not_wedge_run():
@@ -1372,8 +1399,13 @@ def test_finished_task_records_resources():
     assert res.launches[0].task_id == "a"
     body, _ = _apply(
         dag.mark_task_finished(
-            "a", success=False, exit_code=1, fail_reason="x",
-            now=now, task=task, resources=usage1,
+            "a",
+            success=False,
+            exit_code=1,
+            fail_reason="x",
+            now=now,
+            task=task,
+            resources=usage1,
         ),
         body,
     )
@@ -1383,8 +1415,13 @@ def test_finished_task_records_resources():
     usage2 = ResourceUsage(9.0, 1.0, 4096, 8).to_dict()
     body, _ = _apply(
         dag.mark_task_finished(
-            "a", success=True, exit_code=0, fail_reason=None,
-            now=now + 2, task=task, resources=usage2,
+            "a",
+            success=True,
+            exit_code=0,
+            fail_reason=None,
+            now=now + 2,
+            task=task,
+            resources=usage2,
         ),
         body,
     )
@@ -1410,8 +1447,13 @@ def test_unmonitored_task_keeps_resources_none():
     usage = ResourceUsage(0.2, 0.1, 512, 1).to_dict()
     body, _ = _apply(
         dag.mark_task_finished(
-            "s", success=True, exit_code=0, fail_reason=None,
-            now=2.0, task=spec.by_id["s"], resources=usage,
+            "s",
+            success=True,
+            exit_code=0,
+            fail_reason=None,
+            now=2.0,
+            task=spec.by_id["s"],
+            resources=usage,
         ),
         body,
     )

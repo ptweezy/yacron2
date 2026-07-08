@@ -18,11 +18,11 @@ import os
 
 import pytest
 
-from tests.test_state import _backend
 from cronstable import jobstate, state
 from cronstable.config import ConfigError, parse_config, parse_config_string
 from cronstable.jobstate import JobStateError
 from cronstable.state import DOC_DELETE, DOC_KEEP
+from tests.test_state import _backend
 
 
 def _cfg(yaml):

@@ -18,6 +18,11 @@ import asyncio
 import datetime
 import os
 
+from cronstable import cron as cron_mod
+from cronstable.cron import Cron, JobRunInfo, _job_run_info_from_dict
+from cronstable.job import JobOutputStream, JobRetryState
+from cronstable.redact import REDACTED
+from cronstable.state import make_state_backend
 from tests.test_state import (
     _NOW,
     _UTC,
@@ -26,11 +31,6 @@ from tests.test_state import (
     _cron_with_watermark,
     _state_cfg,
 )
-from cronstable import cron as cron_mod
-from cronstable.cron import Cron, JobRunInfo, _job_run_info_from_dict
-from cronstable.job import JobOutputStream, JobRetryState
-from cronstable.redact import REDACTED
-from cronstable.state import make_state_backend
 
 _ONE_JOB = (
     "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"

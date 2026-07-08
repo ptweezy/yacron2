@@ -1,8 +1,8 @@
 """Compute a deterministic, order-independent fingerprint of a job set.
 
 The *job-set ID* is a hash over the effective configuration of every job a
-cronstable instance is running.  Two instances produce the **same** ID if and only
-if they are running the same set of jobs, regardless of:
+cronstable instance is running.  Two instances produce the **same** ID if and
+only if they are running the same set of jobs, regardless of:
 
 * the order the jobs appear in the configuration;
 * whether a setting was written inline on each job or hoisted into a
@@ -11,7 +11,8 @@ if they are running the same set of jobs, regardless of:
 * equivalent spellings of the same schedule (the ``minute:``/``hour:`` object
   form normalizes to the same five-field crontab line as the string form).
 
-This is intended for coordinating replicas: several cronstable instances deployed
+This is intended for coordinating replicas: several cronstable instances
+deployed
 from the same configuration can confirm they hold an identical job set (e.g.
 for leader election, to avoid double-running jobs) by comparing IDs.
 

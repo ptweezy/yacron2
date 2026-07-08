@@ -24,16 +24,16 @@ import types
 import pytest
 
 import cronstable.platform as platform_mod
+from cronstable.config import ConfigError, parse_config, parse_config_string
+from cronstable.cron import Cron
+from cronstable.fingerprint import job_digest
+from cronstable.job import JobRetryState
 from tests._commands import cmd_print, cmd_sleep, yaml_command
 from tests.test_state import (
     _count_launcher,
     _drain_state_writes,
     _state_cfg,
 )
-from cronstable.config import ConfigError, parse_config, parse_config_string
-from cronstable.cron import Cron
-from cronstable.fingerprint import job_digest
-from cronstable.job import JobRetryState
 
 _UTC = datetime.timezone.utc
 

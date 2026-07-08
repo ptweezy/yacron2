@@ -15,7 +15,6 @@ import os
 import stat
 import sys
 import time
-from pathlib import Path
 
 import pytest
 
@@ -318,7 +317,8 @@ async def test_migrate_schema_counts_converter_failures(
     assert result["unknown"] == 1
 
 
-# --- the `cronstable state` CLI ------------------------------------------------
+# --- the `cronstable state` CLI
+# ------------------------------------------------
 
 
 _JOB_BLOCK = """jobs:
@@ -613,13 +613,16 @@ def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
         old = datetime.datetime.now(_UTC) - datetime.timedelta(days=8)
         await backend.append_record(
             "manifests/h",
-            {"jobSetId": "v1:x", "host": "h", "jobs": [], "at": old.isoformat()},
+            {
+                "jobSetId": "v1:x",
+                "host": "h",
+                "jobs": [],
+                "at": old.isoformat(),
+            },
         )
 
     _run(seed_manifest())
-    assert (
-        _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
-    )
+    assert _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "gc would remove" in out
 

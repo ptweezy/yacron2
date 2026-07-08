@@ -30,8 +30,8 @@ def exit(num):
 
 def test_good_config(monkeypatch):
     loop = asyncio.new_event_loop()
-    # main_loop imports Cron lazily (from cronstable.cron, inside the function) so
-    # a job-facing CLI call never drags in the daemon graph; patch it at its
+    # main_loop imports Cron lazily (from cronstable.cron, inside the function)
+    # so a job-facing CLI call never drags in the daemon graph; patch it at its
     # source module, not on cronstable.__main__.
     monkeypatch.setattr("cronstable.cron.Cron", FakeCron)
     config_file = str(Path(__file__).parent / "testconfig.yaml")

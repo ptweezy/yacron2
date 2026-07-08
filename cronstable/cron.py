@@ -41,13 +41,13 @@ from cronstable import platform
 from cronstable.config import (
     ClusterConfig,
     ConfigError,
+    CronstableConfig,
     DagConfig,
     JobConfig,
     JobDefaults,
     LoggingConfig,
     StateConfig,
     WebConfig,
-    CronstableConfig,
     cluster_config_warnings,
     parse_config_string,
     parse_config_with_sources,
@@ -98,7 +98,8 @@ RUN_HISTORY_LIMIT = 50
 # history on every poll. The full history is available from /jobs/{name}/runs.
 JOBS_INLINE_HISTORY = 20
 # Prefix under which a job's finished-run records live in the durable state
-# store (cronstable.state), one stream per job. Scoped by JOB NAME (stable across
+# store (cronstable.state), one stream per job. Scoped by
+# JOB NAME (stable across
 # config edits) rather than job-set id, so restart-durable history survives an
 # ordinary reload instead of being orphaned every time the config changes.
 RUN_STREAM_PREFIX = "runs/"
@@ -1295,7 +1296,8 @@ class Cron:
     def job_set_id(self) -> str:
         """Order-independent fingerprint of the currently-loaded job set.
 
-        Two cronstable instances return the same value iff they hold the same set
+        Two cronstable instances return the same value iff they hold the same
+        set
         of jobs (same effective config, any order); see cronstable.fingerprint.
 
         Memoized: the fingerprint is a pure function of the loaded job set, so
@@ -1392,7 +1394,8 @@ class Cron:
         """This node's live CPU/memory (the dashboard's node readout).
 
         Whole-host CPU% and memory plus this daemon's own footprint, sampled
-        fresh per request from :class:`cronstable.resources.NodeResourceSampler`.
+        fresh per request from
+        :class:`cronstable.resources.NodeResourceSampler`.
         ``resources`` is ``null`` when sampling is unavailable (psutil could
         not read the host); the dashboard then hides the node meter.
         """
@@ -2455,7 +2458,8 @@ class Cron:
 
         ``shareNodeStats`` and ``observabilityMesh`` are resolved onto the
         same ClusterConfig dict (see
-        :func:`cronstable.config._attach_observability`) but are election-inert:
+        :func:`cronstable.config._attach_observability`) but are
+        election-inert:
         they feed the overlay lifecycle (:meth:`start_stop_observability`) and
         the share-flag reconciliation in :meth:`start_stop_cluster`, never the
         election manager's behavior. Restarting the manager on a difference in
@@ -2702,8 +2706,8 @@ class Cron:
         data -- per-node CPU/memory and job summaries -- since a lease backend
         has no node-to-node channel of its own.  It is built from the resolved
         ``observabilityMesh`` config (see
-        :func:`cronstable.config._attach_observability`); ``None`` there means no
-        overlay is wanted (the section is absent, or ``backend: gossip``
+        :func:`cronstable.config._attach_observability`); ``None`` there means
+        no overlay is wanted (the section is absent, or ``backend: gossip``
         already carries the data on the election mesh, handled in
         :meth:`start_stop_cluster`).
 
@@ -6056,7 +6060,8 @@ class Cron:
         """Write a finished run's captured output to the durable log store.
 
         Opt-in per job (``archiveOutput``).  What is archived is the run's
-        live-tail ring buffer -- the newest :data:`cronstable.job.LIVE_LOG_LIMIT`
+        live-tail ring buffer -- the newest
+        :data:`cronstable.job.LIVE_LOG_LIMIT`
         lines (each already bounded by ``maxLineLength``); older lines were
         evicted from the ring before archiving and are accounted for in the
         record's ``dropped_lines`` rather than silently lost.  A job with

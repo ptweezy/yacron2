@@ -1,7 +1,8 @@
 """Pluggable leadership backends behind one interface.
 
 All of cronstable's leader-gating funnels through a small, stable seam: the
-scheduler (:mod:`cronstable.cron`) only ever asks *am I allowed to run this job?*
+scheduler (:mod:`cronstable.cron`) only ever asks *am I allowed to run this
+job?*
 through a handful of methods on whatever object ``cluster.backend`` selected.
 This module defines that seam as :class:`LeadershipBackend` and the
 :func:`make_backend` factory that builds the chosen one.
@@ -9,12 +10,13 @@ This module defines that seam as :class:`LeadershipBackend` and the
 Four backends share the seam, each a different point on the CAP trade-off:
 
 * **gossip** (default) -- the original mTLS, no-shared-state, best-effort
-  quorum election in :mod:`cronstable.cluster`.  Zero new dependencies; can only
-  ever be best-effort (see that module's docstring).
+  quorum election in :mod:`cronstable.cluster`.  Zero new dependencies; can
+  only ever be best-effort (see that module's docstring).
 * **kubernetes** -- a ``coordination.k8s.io/v1`` ``Lease`` (see
   :mod:`cronstable.backends.kubernetes`).  Fenced, exactly-once while the lease
   store is reachable.
-* **etcd** -- a lease-backed key/election (see :mod:`cronstable.backends.etcd`).
+* **etcd** -- a lease-backed key/election (see
+:mod:`cronstable.backends.etcd`).
   Same fenced guarantee, against an etcd cluster.
 * **filesystem** -- a flock-guarded TTL lease on a shared POSIX mount (see
   :mod:`cronstable.backends.filesystem`).  Fenced under NTP-bounded clock skew;
@@ -99,7 +101,7 @@ def decode_reboot_ran(raw: Optional[str]) -> Tuple[Optional[str], Set[str]]:
 
 
 class LeadershipBackend(abc.ABC):
-    """The seam every leader-gating call in :mod:`cronstable.cron` goes through.
+    """The seam each leader-gating call in :mod:`cronstable.cron` goes through.
 
     A backend owns the question "may this node run leader-gated work now",
     exposed through the methods below.  Concrete subclasses must set the three

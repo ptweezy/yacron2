@@ -580,7 +580,9 @@ async def test_rearm_skips_other_hosts_pending(tmp_path):
 async def test_rearm_settles_when_retries_disabled(tmp_path):
     # maximumRetries edited to 0 since the ladder was armed: the stale
     # pending must settle now, not lurk until a later config revert.
-    no_retry_yaml = "jobs:\n  - name: j\n    command: ls\n    schedule: '0 0 * * *'\n"
+    no_retry_yaml = (
+        "jobs:\n  - name: j\n    command: ls\n    schedule: '0 0 * * *'\n"
+    )
     cron = await _stateful_cron(tmp_path, no_retry_yaml)
     try:
         await cron.state_backend.append_record(
@@ -635,9 +637,7 @@ async def test_retry_consume_settles_before_launch(tmp_path):
         launch_at = events.index("launch")
         assert "append:settled" in events[:launch_at]
         # and the pending append was ordered before the settle
-        assert events.index("append:pending") < events.index(
-            "append:settled"
-        )
+        assert events.index("append:pending") < events.index("append:settled")
     finally:
         await _stop_state(cron)
 
@@ -763,9 +763,7 @@ async def test_cancel_job_retries_swallows_dead_task_error(tmp_path, caplog):
         cron.retry_state["j"] = state
         await cron.cancel_job_retries("j", settle="superseded")
         assert "j" not in cron.retry_state
-        assert any(
-            "retry task died" in r.getMessage() for r in caplog.records
-        )
+        assert any("retry task died" in r.getMessage() for r in caplog.records)
     finally:
         await _stop_state(cron)
 
@@ -1231,7 +1229,8 @@ async def test_dropped_writes_counted_and_rendered(tmp_path):
         assert cron.metrics._state_dropped.get("run-record") == 1
         text = cron.metrics.render(cron)
         assert (
-            'cronstable_state_dropped_writes_total{kind="run-record"} 1' in text
+            'cronstable_state_dropped_writes_total{kind="run-record"} 1'
+            in text
         )
     finally:
         cron.state_backend = None
@@ -1246,17 +1245,16 @@ async def test_state_metric_families_rendered(tmp_path):
         await _drain_state_writes(cron)
         text = cron.metrics.render(cron)
         assert (
-            sample_value(
-                text, "cronstable_state_ops_total", op="append"
-            )
-            >= 1
+            sample_value(text, "cronstable_state_ops_total", op="append") >= 1
         )
         assert (
             sample_value(text, "cronstable_state_op_errors_total", op="append")
             == 0
         )
         assert (
-            sample_value(text, "cronstable_state_op_seconds_total", op="append")
+            sample_value(
+                text, "cronstable_state_op_seconds_total", op="append"
+            )
             is not None
         )
         assert (
@@ -1272,9 +1270,14 @@ async def test_state_metric_families_rendered(tmp_path):
         cron.state_backend.stats = _raise_runtime  # type: ignore[method-assign]
         text = cron.metrics.render(cron)
         assert "cronstable_state_ops_total" not in text
-        assert sample_value(text, "cronstable_job_runs_total", **{
-            "job_name": "j", "status": "success"
-        }) == 1
+        assert (
+            sample_value(
+                text,
+                "cronstable_job_runs_total",
+                **{"job_name": "j", "status": "success"},
+            )
+            == 1
+        )
     finally:
         await _stop_state(cron)
 

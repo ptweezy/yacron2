@@ -1,6 +1,7 @@
 """OS-specific behavior, isolated so the rest of cronstable stays portable.
 
-cronstable began life POSIX-only.  Everything that genuinely differs between Unix
+cronstable began life POSIX-only.  Everything that genuinely differs between
+Unix
 and Windows lives here behind a small, uniform surface, so the scheduler, the
 job runner, the config loader and the entry point read the same on every
 platform and only this module needs a per-OS branch:
@@ -12,7 +13,8 @@ platform and only this module needs a per-OS branch:
 * :func:`install_shutdown_handlers` -- wiring Ctrl-C / termination to a
   graceful-shutdown callback on whichever event loop the platform provides.
 
-Per-job ``user``/``group`` switching stays in :mod:`cronstable.config` (it needs
+Per-job ``user``/``group`` switching stays in :mod:`cronstable.config` (it
+needs
 the ``grp``/``pwd`` databases), but is likewise gated on :data:`IS_WINDOWS`.
 """
 
@@ -55,8 +57,8 @@ DEFAULT_SHELL = "" if IS_WINDOWS else "/bin/sh"
 def _default_config_path() -> str:
     if IS_WINDOWS:
         # Per-user config under roaming AppData, e.g.
-        # ``C:\Users\<you>\AppData\Roaming\cronstable``.  Falls back to the user
-        # profile if APPDATA is somehow unset (rare; e.g. a bare service
+        # ``C:\Users\<you>\AppData\Roaming\cronstable``.  Falls back to the
+        # user profile if APPDATA is somehow unset (rare; e.g. a bare service
         # account with no roaming profile).
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
         return os.path.join(base, "cronstable")
@@ -277,7 +279,8 @@ def exclusive_file_lock(
       right for HA.
 
     On POSIX this is ``fcntl.flock`` (whole-file, advisory: it does not block
-    I/O by non-cooperating processes, which is fine because cronstable owns both
+    I/O by non-cooperating processes, which is fine because cronstable owns
+    both
     sides).  On Windows it is ``msvcrt.locking`` over the first byte; Windows
     has no cross-host story, so it only ever serialises same-host processes
     (single-node), which is all the Windows target needs.  Blocking (the
@@ -289,7 +292,8 @@ def exclusive_file_lock(
     With ``blocking=False`` a contended lock raises ``OSError`` immediately
     instead of waiting (``EWOULDBLOCK``/``EAGAIN`` on POSIX, ``EACCES`` on
     Windows).  Used by the lock-fidelity probe
-    (:meth:`cronstable.state.FilesystemStateBackend.verify_locking`), whose whole
+    (:meth:`cronstable.state.FilesystemStateBackend.verify_locking`), whose
+    whole
     point is observing that a second lock attempt on an already-locked file
     *fails*: a mount whose locks are silent no-ops would grant it.
     """

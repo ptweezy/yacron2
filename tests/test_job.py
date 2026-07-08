@@ -11,6 +11,7 @@ from sentry_sdk.utils import Dsn
 import cronstable.config
 import cronstable.job
 import cronstable.statsd
+from cronstable.platform import DEFAULT_SHELL, IS_WINDOWS
 from tests._commands import (
     cmd_print,
     cmd_print_sleep_print,
@@ -18,7 +19,6 @@ from tests._commands import (
     cmd_write_env,
     yaml_command,
 )
-from cronstable.platform import DEFAULT_SHELL, IS_WINDOWS
 
 
 def _argv(*parts):
@@ -1497,8 +1497,8 @@ async def test_report_shell_full_env_contract(monkeypatch):
         monkeypatch, stdout="out", stderr="err"
     )
 
-    # exactly these CRONSTABLE_* variables are exported, no more and no fewer: a
-    # dropped, renamed, or added variable fails here.
+    # exactly these CRONSTABLE_* variables are exported, no more and no fewer:
+    # a dropped, renamed, or added variable fails here.
     assert {
         k for k in env if k.startswith("CRONSTABLE_")
     } == GOLDEN_SHELL_ENV_KEYS

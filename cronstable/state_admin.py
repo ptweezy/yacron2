@@ -639,7 +639,7 @@ def cmd_migrate_schema(config_arg: str, dry_run: bool) -> int:
 
 
 def dispatch(args: Any) -> int:
-    """Route a parsed `cronstable state <action>` invocation; return exit code."""
+    """Route a parsed `cronstable state <action>` call; return exit code."""
     action = getattr(args, "state_command", None)
     try:
         if action == "backup":

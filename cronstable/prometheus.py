@@ -382,7 +382,8 @@ class PrometheusMetrics:
     def state_write_dropped(self, kind: str) -> None:
         self._state_dropped[kind] = self._state_dropped.get(kind, 0) + 1
 
-    # -- durable counter snapshots (cronstable.cron state backend) -------------
+    # -- durable counter snapshots (cronstable.cron state backend)
+    # -------------
 
     def counters_snapshot(self) -> Dict[str, Any]:
         """A JSON-safe snapshot of the per-job counter accumulators.
@@ -691,7 +692,9 @@ class PrometheusMetrics:
 
     def _daemon_families(self, cron: "Cron") -> List[MetricFamily]:
         families = []
-        info = MetricFamily("cronstable", "info", "cronstable build information.")
+        info = MetricFamily(
+            "cronstable", "info", "cronstable build information."
+        )
         info.add({"version": cronstable.version.version}, 1)
         families.append(info)
 

@@ -3,7 +3,8 @@
 :mod:`cronstable.dag` is the pure, I/O-free state machine; this module is the
 daemon-side driver that gives it a store, a clock, leases and subprocesses.  It
 is the DAG analogue of the retry / catch-up / slot machinery on
-:class:`cronstable.cron.Cron`, kept in its own module so the (large) orchestration
+:class:`cronstable.cron.Cron`, kept in its own module so the (large)
+orchestration
 surface does not bloat cron.py; a :class:`DagScheduler` holds a back-reference
 to the owning ``Cron`` and reuses its seams (the state backend, the loopback
 job-state API, ``_compute_next_fire``, ``_cluster_allows``, ``running_jobs``,
@@ -14,8 +15,9 @@ The durable model, in one paragraph: each ``dag_run`` is a single mutable
 that holds that run's advance *lease* (``dagadvance/<dag>/<key>``).  An advance
 is one flock-guarded read-modify-write that atomically claims every ready task
 ``pending -> running``; the driver then launches a real subprocess per claimed
-task (through the same :class:`~cronstable.job.RunningJob` path a job uses, with
-the durable env injected so the task can call ``cronstable xcom`` / ``artifact`` /
+task (through the same :class:`~cronstable.job.RunningJob` path a job uses,
+with the durable env injected so the task can call ``cronstable xcom`` /
+``artifact`` /
 ``state``), and records the pid in a second RMW.  A task's completion is routed
 back here by the reaper, recorded, and triggers a fresh advance.  Because the
 lease gates who advances *and* who reconciles, and the RMW claim is atomic, the
@@ -1004,7 +1006,8 @@ class DagScheduler:
         """Register the task run with the loopback API; return its env.
 
         Mirrors ``Cron._prepare_job_api_run`` but scopes the run's default
-        namespace to the DAG run's XCom scope and injects the ``CRONSTABLE_DAG_*``
+        namespace to the DAG run's XCom scope and injects the
+        ``CRONSTABLE_DAG_*``
         vars, so ``cronstable xcom`` / ``artifact`` land in the run scope.
         """
         scope = dag.xcom_scope(dagcfg.name, run_id)

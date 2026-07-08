@@ -1,5 +1,5 @@
-"""Capture the single-job live-log-tail closeup off the local logs-demo daemon."""
-import json
+"""Capture the single-job live-log-tail closeup from the logs-demo daemon."""
+
 import urllib.request
 from pathlib import Path
 
@@ -13,7 +13,10 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch()
         ctx = browser.new_context(
-            viewport={"width": 1680, "height": 1050},  # match the main capture set
+            viewport={
+                "width": 1680,
+                "height": 1050,
+            },  # match the main capture set
             device_scale_factor=2,
             bypass_csp=True,
             reduced_motion="no-preference",
@@ -21,7 +24,9 @@ def main():
         ctx.route(
             "**/version",
             lambda route: route.fulfill(
-                status=200, content_type="text/plain; charset=utf-8", body="1.2.8"
+                status=200,
+                content_type="text/plain; charset=utf-8",
+                body="1.2.8",
             ),
         )
         ctx.add_init_script(
@@ -40,7 +45,9 @@ def main():
         )
         # start the chatty run, then open its drawer and let lines stream in
         urllib.request.urlopen(
-            urllib.request.Request(BASE + "/jobs/orders-ingest/start", method="POST"),
+            urllib.request.Request(
+                BASE + "/jobs/orders-ingest/start", method="POST"
+            ),
             timeout=5,
         )
         page.wait_for_timeout(2500)

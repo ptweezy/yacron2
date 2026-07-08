@@ -468,7 +468,9 @@ async def test_renew_once_anchors_deadline_to_presend_lower_bound(monkeypatch):
     # wins the freed key (two leaders run a Leader job). The campaign read's
     # latency must likewise be excluded.
     clock = [100.0]
-    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "cronstable.backends.etcd._monotonic", lambda: clock[0]
+    )
     b = _backend()  # ttl 15
     grant_latency = 2.0  # a slow grant RTT, larger than the 1s skew margin
     campaign_latency = 4.0
@@ -507,7 +509,9 @@ async def test_renew_once_keepalive_narrows_then_regrants(monkeypatch):
     # below the configured value must narrow the deadline; a keepalive of 0
     # (lease gone) must drop the lease, re-grant, and re-campaign.
     clock = [100.0]
-    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "cronstable.backends.etcd._monotonic", lambda: clock[0]
+    )
     b = _backend()  # ttl 15
     state = {"keepalive_ttl": 6}
 
@@ -547,7 +551,9 @@ async def test_renew_once_keepalive_anchors_fence_to_presend(monkeypatch):
     # narrows-then-regrants test pins the clock so it cannot catch that; this
     # injects keepalive latency and asserts the fence excludes it.
     clock = [100.0]
-    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "cronstable.backends.etcd._monotonic", lambda: clock[0]
+    )
     b = _backend()  # ttl 15
     keepalive_latency = 3.0  # a slow keepalive RTT, larger than the 1s skew
 
@@ -587,7 +593,9 @@ async def test_renew_once_lease_lost_then_regrant_fails_self_demotes(
     # Previously the keepalive branch cleared _is_leader directly, which made
     # _is_self_demoted_holder() False -> the PreferLeader job ran nowhere.
     clock = [100.0]
-    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "cronstable.backends.etcd._monotonic", lambda: clock[0]
+    )
     b = _backend()  # ttl 15
     fail_grant = {"on": False}
 
@@ -631,7 +639,9 @@ async def test_renew_once_recovers_collapsed_cadence_when_not_quorate(
     # reconnect POSTs run at the full timeout budget rather than the collapsed
     # ~0.2s a narrowed ttl=3 would give.
     clock = [100.0]
-    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "cronstable.backends.etcd._monotonic", lambda: clock[0]
+    )
     b = _backend()  # ttl 15
     # simulate a prior narrowing to the minimum AND lost contact (not quorate)
     b._effective_ttl = 3
@@ -671,7 +681,9 @@ async def test_cadence_widening_does_not_resurrect_quorum(monkeypatch):
     # (configured - granted) extra seconds of a store outage, while /cluster
     # falsely reports the node quorate with that stale leader.
     clock = [1000.0]
-    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "cronstable.backends.etcd._monotonic", lambda: clock[0]
+    )
     b = _backend()  # configured ttl 15
     # a successful FOLLOWER round under a server-narrowed ttl of 5 (node-b
     # holds the key): the freshness window is 5s from this contact, not 15.

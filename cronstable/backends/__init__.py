@@ -1,6 +1,7 @@
 """Optional lease-store leadership backends (kubernetes, etcd).
 
-Each module here implements :class:`cronstable.leadership.LeaseBackend` against a
+Each module here implements :class:`cronstable.leadership.LeaseBackend` against
+a
 real coordination store, over plain HTTP via the core ``aiohttp`` dependency --
 so neither adds a runtime dependency and, by avoiding grpc/protobuf wheels,
 both run on every architecture cronstable targets.
@@ -16,8 +17,8 @@ both run on every architecture cronstable targets.
   fully-portable transport, with no optional client library (the gateway is
   etcd's first-class HTTP interface, so a native grpc client buys little).
 
-The modules are imported lazily by :func:`cronstable.leadership.make_backend`, so
-they never enter the import graph unless ``cluster.backend`` selects them.
+The modules are imported lazily by :func:`cronstable.leadership.make_backend`,
+so they never enter the import graph unless ``cluster.backend`` selects them.
 """
 
 from cronstable.config import ConfigError

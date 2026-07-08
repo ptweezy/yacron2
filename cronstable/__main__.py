@@ -7,7 +7,8 @@ import sys
 import cronstable.version
 from cronstable import platform
 
-# Where -c looks when not given: /etc/cronstable.d on POSIX, %APPDATA%\cronstable on
+# Where -c looks when not given: /etc/cronstable.d on POSIX,
+# %APPDATA%\cronstable on
 # Windows (see cronstable.platform).
 CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH
 
@@ -243,7 +244,8 @@ def _new_event_loop():  # pragma: no cover
     that runs cronstable's I/O paths -- cluster gossip/lease HTTP, the web
     dashboard, the Prometheus scrape -- markedly faster. It is strictly
     optional (install the ``speedups`` extra to pull it in): it has no Windows
-    build (where cronstable also needs the Proactor loop for subprocess support)
+    build (where cronstable also needs the Proactor loop for subprocess
+    support)
     and ships no wheels for some of the leaner architectures we target, so a
     missing or unimportable uvloop silently falls back to stock asyncio with
     identical behavior. Selecting the loop directly (rather than via

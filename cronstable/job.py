@@ -587,7 +587,8 @@ class RunningJob:
         self.config = config
         # when set, this RunningJob is one DAG task instance rather
         # than a scheduled job; the reaper routes its completion to the DAG
-        # scheduler (cronstable.dagrun) instead of the normal record/retry path.
+        # scheduler (cronstable.dagrun) instead of the normal
+        # record/retry path.
         # An opaque marker carrying (dag, run_key, taskkey, ...) the scheduler
         # needs to move the graph forward.
         self.dag_ref = dag_ref
@@ -722,7 +723,8 @@ class RunningJob:
                 env[envvar["key"]] = envvar["value"]
             # The daemon-injected control-channel vars go last, so a job's own
             # environment cannot shadow the loopback URL/token it needs to
-            # reach the state API (CRONSTABLE_* is reserved for cronstable's use).
+            # reach the state API (CRONSTABLE_* is reserved for cronstable's
+            # use).
             env.update(self.extra_env)
             self.env = env
             kwargs["env"] = env

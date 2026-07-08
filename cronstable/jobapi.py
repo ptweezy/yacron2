@@ -3,7 +3,8 @@
 cronstable exposes its durable state to the *jobs it runs*, not just to
 the scheduler.  The mechanism is a small HTTP server bound to loopback that
 the daemon stands up alongside the dashboard, plus a per-run bearer token the
-daemon injects into every job's environment.  A job's ``cronstable state|cursor|
+daemon injects into every job's environment.  A job's ``cronstable
+state|cursor|
 lock|artifact|idempotent|secret`` command (see :mod:`cronstable.jobcli`) is a
 thin client of this endpoint; the identical logic is reachable offline against
 the store directly, so this server is a *front-end*, not a second source of
@@ -15,7 +16,8 @@ open the store itself?  Three of the six need the live daemon:
 * a **mutex / semaphore** is a lease that must be *renewed* for as long as the
   job holds it and *released* the instant the run ends (even on a crash) --
   the daemon already runs exactly this machinery for cluster concurrency slots
-  (:mod:`cronstable.cron`), and a short-lived ``cronstable lock`` subprocess cannot;
+  (:mod:`cronstable.cron`), and a short-lived ``cronstable lock`` subprocess
+  cannot;
 * **run-scoped secrets** are resolved fresh per run and staged *in memory*, so
   they never touch the store and vanish when the run ends -- only the daemon
   holds them;
@@ -363,7 +365,8 @@ class JobStateAPI:
     Constructed with a *getter* for the current state backend (which the
     scheduler may swap on a config reload), the host name, a base lease-holder
     string, and the resolved ``state.jobApi`` config.  Owned by
-    :class:`cronstable.cron.Cron`, which registers a run before launching it and
+    :class:`cronstable.cron.Cron`, which registers a run before launching it
+    and
     finishes it (dropping its token and secrets, releasing its locks) when it
     ends.
     """

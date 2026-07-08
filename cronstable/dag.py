@@ -7,8 +7,8 @@ which tasks are ready, which to claim (``pending -> running``), how a finished
 task moves the graph forward, how a dynamically-mapped task fans out, and when
 the whole run is terminal.  It holds **no** I/O: every function is a pure
 transform over plain dicts, so the whole state machine is unit-testable without
-a backend, a clock, or a subprocess, and the cron wiring (:mod:`cronstable.cron`)
-is a thin driver that persists the results through
+a backend, a clock, or a subprocess, and the cron wiring
+(:mod:`cronstable.cron`) is a thin driver that persists the results through
 :meth:`cronstable.state.StateBackend.mutate_document`.
 
 A ``dag_run`` is stored as a single mutable *document* (see the layout in
@@ -60,8 +60,8 @@ XCOM_SCOPE_PREFIX = "dagxcom/"
 # durable ``CRONSTABLE_STATE_*`` control-channel vars), so the task -- and the
 # ``cronstable xcom`` CLI it calls -- knows which run/task it is and where its
 # XCom scope lives.  Defined here (a dependency-free module) so both the daemon
-# (:mod:`cronstable.dagrun`) and the offline CLI (:mod:`cronstable.jobcli`) share the
-# exact names without either pulling in the other's imports.
+# (:mod:`cronstable.dagrun`) and the offline CLI (:mod:`cronstable.jobcli`)
+# share the exact names without either pulling in the other's imports.
 ENV_DAG_NAME = "CRONSTABLE_DAG_NAME"
 ENV_DAG_RUN_ID = "CRONSTABLE_DAG_RUN_ID"
 ENV_DAG_RUN_KEY = "CRONSTABLE_DAG_RUN_KEY"

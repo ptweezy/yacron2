@@ -367,7 +367,8 @@ class ResourceMonitor:
         """Current live usage of the running tree, or ``None`` if unsampled.
 
         Read by the scheduler while the job is still running (see
-        :meth:`cronstable.job.RunningJob.live_resources`) to drive the dashboard's
+        :meth:`cronstable.job.RunningJob.live_resources`) to drive the
+        dashboard's
         live per-job CPU/memory readout.  ``cpu_seconds`` is cumulative,
         ``cpu_percent`` is the usage since the previous sample (can exceed 100
         across multiple cores), and ``rss_bytes`` is the tree's current

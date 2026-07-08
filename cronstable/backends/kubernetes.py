@@ -122,7 +122,8 @@ def _utcnow() -> datetime.datetime:
 def display_holder(raw: Optional[str]) -> Optional[str]:
     """The human-readable holder name from a (possibly suffixed) identity.
 
-    cronstable writes ``spec.holderIdentity`` as ``<name>#<instance token>`` (see
+    cronstable writes ``spec.holderIdentity`` as ``<name>#<instance token>``
+    (see
     :class:`KubernetesBackend`) so that two nodes sharing a configured
     ``identity`` / ``nodeName`` still write *distinct* holder identities and
     cannot both believe they hold the ``Lease`` -- the fence is the
@@ -1468,7 +1469,8 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
                 kube_config.load_incluster_config()
         except ConfigException as ex:
             # a malformed/absent kubeconfig or missing in-cluster files is an
-            # operational misconfiguration, not a cronstable bug. ConfigException
+            # operational misconfiguration, not a cronstable bug.
+            # ConfigException
             # is NOT in start_stop_cluster's caught tuple, so without this it
             # escapes to the run loop's "please report this as a bug" handler;
             # re-raise as ConfigError so it is logged as "cluster: failed to

@@ -2,19 +2,20 @@
 
 Where test_state_dag.py exercises the pure state machine, this file drives
 :class:`cronstable.dagrun.DagScheduler` end to end: a real
-:class:`~cronstable.state.FilesystemStateBackend` in a temp dir, the real loopback
+:class:`~cronstable.state.FilesystemStateBackend` in a temp dir, the real
+loopback
 job-state API bound to an ephemeral port, and real task subprocesses (launched
 through the same :class:`~cronstable.job.RunningJob` path a job uses).  A small
 in-test pump stands in for ``Cron.run``'s reaper: it awaits each launched task,
 routes its completion through ``cron._handle_finished_job`` (which the DAG
-scheduler picks up), then flushes the spawned advances, looping until the run is
-terminal.
+scheduler picks up), then flushes the spawned advances, looping until the run
+is terminal.
 
-Style: bare ``async def`` tests, ``asyncio_mode = auto``, no frozen clock and no
-duration asserts (the drive loop is progress-driven, not time-driven).  Task
+Style: bare ``async def`` tests, ``asyncio_mode = auto``, no frozen clock and
+no duration asserts (the drive loop is progress-driven, not time-driven).  Task
 commands are ``[sys.executable, ...]`` argv lists (no shell), so they are
-cross-platform; the fan-out / XCom test uses the real ``cronstable xcom`` CLI over
-the loopback endpoint.
+cross-platform; the fan-out / XCom test uses the real ``cronstable xcom`` CLI
+over the loopback endpoint.
 """
 
 import asyncio
@@ -53,7 +54,9 @@ async def _drain_pending(cron):
 
 async def _reap_running(cron):
     """Await every currently-running task and route its completion."""
-    rjs = [rj for jobs in list(cron.running_jobs.values()) for rj in list(jobs)]
+    rjs = [
+        rj for jobs in list(cron.running_jobs.values()) for rj in list(jobs)
+    ]
     for rj in rjs:
         await rj.wait()
         await cron._handle_finished_job(rj)
@@ -216,11 +219,22 @@ async def test_e2e_fanout_and_xcom(tmp_path):
         outdir = tmp_path / "work"
         outdir.mkdir()
 
-        # gen publishes the fan-out list through the real `cronstable xcom` CLI.
+        # gen publishes the fan-out list through the real
+        # `cronstable xcom` CLI.
         _set_cmd(
-            cron, "fan", "gen",
-            [_PY, "-m", "cronstable", "xcom", "push", "--key", "items",
-             str(items_file)],
+            cron,
+            "fan",
+            "gen",
+            [
+                _PY,
+                "-m",
+                "cronstable",
+                "xcom",
+                "push",
+                "--key",
+                "items",
+                str(items_file),
+            ],
         )
         # each mapped worker writes its injected item to work/<index>.
         worker = (
@@ -231,14 +245,37 @@ async def test_e2e_fanout_and_xcom(tmp_path):
         _set_cmd(cron, "fan", "work", [_PY, "-c", worker])
         _set_cmd(cron, "fan", "collect", [_PY, "-c", "pass"])
         _set_cmd(
-            cron, "fan", "producer",
-            [_PY, "-m", "cronstable", "xcom", "push", "--key", "msg",
-             str(msg_file)],
+            cron,
+            "fan",
+            "producer",
+            [
+                _PY,
+                "-m",
+                "cronstable",
+                "xcom",
+                "push",
+                "--key",
+                "msg",
+                str(msg_file),
+            ],
         )
         _set_cmd(
-            cron, "fan", "consumer",
-            [_PY, "-m", "cronstable", "xcom", "pull", "--task", "producer",
-             "--key", "msg", "-o", str(consumed)],
+            cron,
+            "fan",
+            "consumer",
+            [
+                _PY,
+                "-m",
+                "cronstable",
+                "xcom",
+                "pull",
+                "--task",
+                "producer",
+                "--key",
+                "msg",
+                "-o",
+                str(consumed),
+            ],
         )
 
         run_key = await cron._dag.trigger_run("fan")
@@ -310,9 +347,19 @@ async def test_mapped_upstream_nonportable_value_does_not_wedge(tmp_path):
         items_file = tmp_path / "items.json"
         items_file.write_text("[100000000000000000000]")  # 10^20 > 2^64 - 1
         _set_cmd(
-            cron, "np", "gen",
-            [_PY, "-m", "cronstable", "xcom", "push", "--key", "items",
-             str(items_file)],
+            cron,
+            "np",
+            "gen",
+            [
+                _PY,
+                "-m",
+                "cronstable",
+                "xcom",
+                "push",
+                "--key",
+                "items",
+                str(items_file),
+            ],
         )
         _set_cmd(cron, "np", "work", [_PY, "-c", "pass"])
         _set_cmd(cron, "np", "after", [_PY, "-c", "pass"])
@@ -604,7 +651,9 @@ async def test_bounded_schedule_exhausts_without_crash(tmp_path):
     try:
         _set_cmd(cron, "once", "a", [_PY, "-c", "pass"])
         # force the last (only) occurrence to be due, then fire it
-        cron._dag._seeded["once"] = cron._dag._sched_sig(cron.cron_dags["once"])
+        cron._dag._seeded["once"] = cron._dag._sched_sig(
+            cron.cron_dags["once"]
+        )
         cron._dag._next_logical["once"] = datetime.datetime(
             2020, 1, 1, tzinfo=_UTC
         )
@@ -650,8 +699,13 @@ async def test_finish_removed_task_is_noop(tmp_path):
         _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
         run_key = await cron._dag.trigger_run("lin")
         await cron._dag._finish_task(
-            cron.cron_dags["lin"], ("lin", run_key), "ghost", "ghost",
-            success=True, exit_code=0, fail_reason=None,
+            cron.cron_dags["lin"],
+            ("lin", run_key),
+            "ghost",
+            "ghost",
+            success=True,
+            exit_code=0,
+            fail_reason=None,
         )  # no exception
         await _drive(cron, "lin", run_key)
     finally:
@@ -1073,6 +1127,7 @@ async def test_http_approval_decision_and_backfill(tmp_path):
         await cron.start_stop_web_app(None)
         await _teardown(cron)
 
+
 # --------------------------------------------------------------------------
 # Retention / removed-dag GC and XCom blob reclamation
 # --------------------------------------------------------------------------
@@ -1154,6 +1209,7 @@ async def test_gc_removed_dags_grace_and_active_run_protection(tmp_path):
             return cur, None
 
         await backend.mutate_document("dagrun/lin", run_key, _age)
+
         # an ACTIVE (non-terminal) aged run of the removed dag: kept too.
         def _activate(cur):
             cur["state"] = dag.RUNNING
@@ -1162,6 +1218,7 @@ async def test_gc_removed_dags_grace_and_active_run_protection(tmp_path):
         await backend.mutate_document("dagrun/lin", run_key, _activate)
         await cron._dag.gc_removed_dags(backend, {"lin"}, 3600.0)
         assert len(await backend.list_documents("dagrun/lin")) == 1
+
         # terminal AND aged past the grace: collected.
         def _finish(cur):
             cur["state"] = dag.SUCCESS
@@ -1174,8 +1231,9 @@ async def test_gc_removed_dags_grace_and_active_run_protection(tmp_path):
         await _teardown(cron)
 
 
-async def test_removed_dag_history_collected_by_daemon_gc_pass(tmp_path,
-                                                               monkeypatch):
+async def test_removed_dag_history_collected_by_daemon_gc_pass(
+    tmp_path, monkeypatch
+):
     # end to end through cron._collect_state_garbage: a dag removed from
     # config has its aged terminal run document deleted, its XCom stream
     # pruned, and the pruned records' payload blob swept -- while an active
@@ -1220,9 +1278,7 @@ async def test_removed_dag_history_collected_by_daemon_gc_pass(tmp_path,
                 "jobSetId": "v1:old",
                 "host": "old-host",
                 "jobs": [],
-                "at": (
-                    now - datetime.timedelta(seconds=7200)
-                ).isoformat(),
+                "at": (now - datetime.timedelta(seconds=7200)).isoformat(),
             },
         )
         await backend.append_record(

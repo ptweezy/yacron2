@@ -1,10 +1,10 @@
 # Installation
 
-This page covers every way to install yacron2: the published container image,
+This page covers every way to install cronstable: the published container image,
 `pip`, `pipx`, and the self-contained PyInstaller binaries. It documents the
 Python and platform requirements, the runtime dependencies, the exact binary
 release assets, and the writable-and-executable temp-directory requirement that
-applies to the standalone binary only. yacron2 runs natively on
+applies to the standalone binary only. cronstable runs natively on
 Windows in addition to Linux and macOS; see [Running on Windows](Running-on-Windows)
 for the Windows-specific details.
 
@@ -13,7 +13,7 @@ for the Windows-specific details.
 | Requirement | Value |
 | --- | --- |
 | Python (pip/pipx) | `>= 3.10`; 3.10, 3.11, 3.12, 3.13 and 3.14 are supported and tested (`requires-python = ">=3.10"`). For an older Python, use the standalone binary instead. |
-| Operating system | Linux, macOS, and Windows. OS-specific behavior is isolated in `yacron2/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows; see [Running on Windows](Running-on-Windows). |
+| Operating system | Linux, macOS, and Windows. OS-specific behavior is isolated in `cronstable/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows; see [Running on Windows](Running-on-Windows). |
 | CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), both the container image and the prebuilt binaries; the prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
@@ -22,7 +22,7 @@ neither needs Python on the target host.
 
 ### Runtime dependencies (pip/pipx)
 
-Installing the `yacron2` distribution pulls in the following, taken from
+Installing the `cronstable` distribution pulls in the following, taken from
 `pyproject.toml`:
 
 | Dependency | Version constraint |
@@ -42,15 +42,15 @@ minimal/slim images that do not include the system tz data. See
 
 | Method | Source | Embeds Python? | Self-extracts at startup? |
 | --- | --- | --- | --- |
-| Container image | `ghcr.io/ptweezy/yacron2` | Yes (in-image interpreter) | No |
-| pip | PyPI (`yacron2`) | No (uses your interpreter) | No |
-| pipx | PyPI (`yacron2`) | No (uses your interpreter) | No |
+| Container image | `ghcr.io/ptweezy/cronstable` | Yes (in-image interpreter) | No |
+| pip | PyPI (`cronstable`) | No (uses your interpreter) | No |
+| pipx | PyPI (`cronstable`) | No (uses your interpreter) | No |
 | Standalone binary | GitHub Releases | Yes (embedded) | **Yes** |
 
 Only the standalone binary self-extracts at startup and therefore needs a
 writable and executable temp directory (see
 [Standalone binary temp-directory requirement](#standalone-binary-temp-directory-requirement)).
-The image and the `pip`/`pipx` installs run yacron2 as a normal Python package
+The image and the `pip`/`pipx` installs run cronstable as a normal Python package
 with the interpreter on disk and never self-extract.
 
 ## Run with Docker
@@ -58,28 +58,28 @@ with the interpreter on disk and never self-extract.
 Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
 `linux/arm/v7`, `linux/ppc64le`, `linux/s390x` and `linux/riscv64`) images are
 published on every release to two registries: the GitHub Container Registry
-(`ghcr.io/ptweezy/yacron2`) and Docker Hub (`docker.io/ptweezy/yacron2`). The
+(`ghcr.io/ptweezy/cronstable`) and Docker Hub (`docker.io/ptweezy/cronstable`). The
 images are identical; pull from whichever you prefer. Mount your crontab
 and run:
 
 ```shell
 docker run --rm \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  ghcr.io/ptweezy/yacron2:latest
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  ghcr.io/ptweezy/cronstable:latest
 ```
 
 The image runs as the non-root user `65534:65534` and its entrypoint is
-`yacron2` with default arguments `-c /etc/yacron2.d`, so it reads configuration
-from `/etc/yacron2.d` unless you override the arguments. For production, pin a
-specific version instead of `latest` (e.g. `ghcr.io/ptweezy/yacron2:1.0.4`).
+`cronstable` with default arguments `-c /etc/cronstable.d`, so it reads configuration
+from `/etc/cronstable.d` unless you override the arguments. For production, pin a
+specific version instead of `latest` (e.g. `ghcr.io/ptweezy/cronstable:1.0.4`).
 
 To bake configuration into your own image, base it on the published image:
 
 ```dockerfile
-FROM ghcr.io/ptweezy/yacron2:latest
+FROM ghcr.io/ptweezy/cronstable:latest
 
 # The base image already runs as the non-root user 65534.
-COPY yacron2tab.yaml /etc/yacron2.d/yacron2tab.yaml
+COPY cronstable.yaml /etc/cronstable.d/cronstable.yaml
 ```
 
 The image is built from `python:3.14-slim` (a multi-stage build that copies a
@@ -112,11 +112,11 @@ also available explicitly as `-debian`):
 ```shell
 # e.g. the Alpine variant, pinned to a version:
 docker run --rm \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  ghcr.io/ptweezy/yacron2:1.0.14-alpine
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  ghcr.io/ptweezy/cronstable:1.0.14-alpine
 ```
 
-yacron2 is a pure-Python app that supports any Python >= 3.10, so behavior is
+cronstable is a pure-Python app that supports any Python >= 3.10, so behavior is
 identical across variants. Pick the base, not the interpreter version. The
 Debian default covers the most architectures; each variant covers the arches
 its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
@@ -126,21 +126,21 @@ read-only-friendly hardening as the default image.
 
 ## Install using pip
 
-yacron2 requires Python >= 3.10. Install it in a virtual environment:
+cronstable requires Python >= 3.10. Install it in a virtual environment:
 
 ```shell
-python3 -m venv yacron2env
-. yacron2env/bin/activate
-pip install yacron2
+python3 -m venv cronstableenv
+. cronstableenv/bin/activate
+pip install cronstable
 ```
 
-This installs the `yacron2` console script (entry point
-`yacron2.__main__:main`). For systems with an older Python, use the standalone
+This installs the `cronstable` console script (entry point
+`cronstable.__main__:main`). For systems with an older Python, use the standalone
 binary instead.
 
 If you plan to use the Kubernetes leadership backend with the optional native
 client library (`cluster.kubernetes.clientLibrary: native`), install the extra:
-`pip install "yacron2[kubernetes]"`. The default HTTP transport needs no extra
+`pip install "cronstable[kubernetes]"`. The default HTTP transport needs no extra
 dependency; see
 [Clustering and Leader Election](Clustering-and-Leader-Election).
 
@@ -150,7 +150,7 @@ dependency; see
 the program into it:
 
 ```shell
-pipx install yacron2
+pipx install cronstable
 ```
 
 pipx still requires a supported Python (3.10 or newer) available to build the
@@ -159,31 +159,31 @@ isolated environment.
 ## Install using a binary
 
 A self-contained binary can be downloaded from
-<https://github.com/ptweezy/yacron2/releases>. Python is not required on the
+<https://github.com/ptweezy/cronstable/releases>. Python is not required on the
 target system; it is embedded in the executable. Every release attaches the
 following assets, built natively on a matching runner:
 
 | Asset | Platform | libc / arch | Notes |
 | --- | --- | --- | --- |
-| `yacron2-linux-amd64` | Linux | glibc, x86_64 | Runs on any Linux with glibc 2.39 or newer (e.g. Ubuntu 24.04). |
-| `yacron2-linux-arm64` | Linux | glibc, arm64 | Runs on any Linux with glibc 2.39 or newer on arm64. |
-| `yacron2-linux-i686` | Linux | glibc, 32-bit x86 | 32-bit x86 (i686) for glibc-based systems. |
-| `yacron2-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7, e.g. older Raspberry Pi) for glibc-based systems. |
-| `yacron2-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER) for glibc-based systems. |
-| `yacron2-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian) for glibc-based systems. |
-| `yacron2-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V for glibc-based systems. |
-| `yacron2-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl-based systems. |
-| `yacron2-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl-based systems. |
-| `yacron2-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl-based systems. |
-| `yacron2-linux-armv7-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv7) for Alpine and other musl-based systems. |
-| `yacron2-linux-ppc64le-musl` | Linux | musl, ppc64le | 64-bit little-endian POWER for Alpine and other musl-based systems. |
-| `yacron2-linux-s390x-musl` | Linux | musl, s390x | IBM Z (s390x) for Alpine and other musl-based systems. |
-| `yacron2-linux-riscv64-musl` | Linux | musl, riscv64 | 64-bit RISC-V for Alpine and other musl-based systems. |
-| `yacron2-linux-armv6-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv6, e.g. Raspberry Pi 1/Zero); musl-only, no glibc build. |
-| `yacron2-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
-| `yacron2-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
-| `yacron2-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`; Python not required on the target. |
-| `yacron2-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`; Python not required on the target. |
+| `cronstable-linux-amd64` | Linux | glibc, x86_64 | Runs on any Linux with glibc 2.39 or newer (e.g. Ubuntu 24.04). |
+| `cronstable-linux-arm64` | Linux | glibc, arm64 | Runs on any Linux with glibc 2.39 or newer on arm64. |
+| `cronstable-linux-i686` | Linux | glibc, 32-bit x86 | 32-bit x86 (i686) for glibc-based systems. |
+| `cronstable-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7, e.g. older Raspberry Pi) for glibc-based systems. |
+| `cronstable-linux-ppc64le` | Linux | glibc, ppc64le | 64-bit little-endian POWER (IBM POWER) for glibc-based systems. |
+| `cronstable-linux-s390x` | Linux | glibc, s390x | IBM Z (s390x, big-endian) for glibc-based systems. |
+| `cronstable-linux-riscv64` | Linux | glibc, riscv64 | 64-bit RISC-V for glibc-based systems. |
+| `cronstable-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl-based systems. |
+| `cronstable-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl-based systems. |
+| `cronstable-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl-based systems. |
+| `cronstable-linux-armv7-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv7) for Alpine and other musl-based systems. |
+| `cronstable-linux-ppc64le-musl` | Linux | musl, ppc64le | 64-bit little-endian POWER for Alpine and other musl-based systems. |
+| `cronstable-linux-s390x-musl` | Linux | musl, s390x | IBM Z (s390x) for Alpine and other musl-based systems. |
+| `cronstable-linux-riscv64-musl` | Linux | musl, riscv64 | 64-bit RISC-V for Alpine and other musl-based systems. |
+| `cronstable-linux-armv6-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv6, e.g. Raspberry Pi 1/Zero); musl-only, no glibc build. |
+| `cronstable-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
+| `cronstable-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
+| `cronstable-windows-amd64.exe` | Windows | x64 (amd64) | Self-contained `.exe`; Python not required on the target. |
+| `cronstable-windows-arm64.exe` | Windows | ARM64 | Self-contained `.exe`; Python not required on the target. |
 
 The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
@@ -200,20 +200,20 @@ self-contained `.exe` files for x64 (`amd64`) and ARM64; like the other
 binaries they embed Python, so Python is not required on the target.
 
 Download and run (glibc amd64 Linux shown; append `-musl` on Alpine, or use
-`yacron2-macos-<arch>` on a Mac):
+`cronstable-macos-<arch>` on a Mac):
 
 ```shell
-curl -fsSL -o yacron2 \
-  https://github.com/ptweezy/yacron2/releases/latest/download/yacron2-linux-amd64
-chmod +x yacron2
-./yacron2 --version
+curl -fsSL -o cronstable \
+  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64
+chmod +x cronstable
+./cronstable --version
 ```
 
-On Windows, download `yacron2-windows-amd64.exe` (or `yacron2-windows-arm64.exe`
+On Windows, download `cronstable-windows-amd64.exe` (or `cronstable-windows-arm64.exe`
 on ARM64) and run it directly; no `chmod` is needed:
 
 ```powershell
-.\yacron2-windows-amd64.exe --version
+.\cronstable-windows-amd64.exe --version
 ```
 
 ### macOS signing and notarization
@@ -242,8 +242,8 @@ it a small writable *and executable* temp mount and it runs:
 # able to execute the libraries it unpacks.
 docker run --rm --read-only \
   --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  your-image-with-the-binary -c /etc/yacron2.d
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  your-image-with-the-binary -c /etc/cronstable.d
 ```
 
 Remedies:
@@ -256,7 +256,7 @@ Remedies:
   with `TMPDIR=/path`.
 
 This requirement is unique to the standalone binary. The published container
-image and the `pip`/`pipx` installs run yacron2 as a normal Python package with
+image and the `pip`/`pipx` installs run cronstable as a normal Python package with
 the interpreter on disk, so they never self-extract and need no writable temp
 directory. See [Production and Container Deployment](Production-Deployment).
 
@@ -266,19 +266,19 @@ On Windows the self-extracting `.exe` uses the standard Windows temp directory
 
 ## After installation
 
-Start yacron2 by giving it a configuration file or directory with `-c`; it
+Start cronstable by giving it a configuration file or directory with `-c`; it
 always runs in the foreground:
 
 ```shell
-yacron2 -c /etc/yacron2.d
+cronstable -c /etc/cronstable.d
 ```
 
-The `-c` default is platform-specific: `/etc/yacron2.d` on POSIX, and
-`%APPDATA%\yacron2` on Windows (e.g. `C:\Users\<you>\AppData\Roaming\yacron2`,
+The `-c` default is platform-specific: `/etc/cronstable.d` on POSIX, and
+`%APPDATA%\cronstable` on Windows (e.g. `C:\Users\<you>\AppData\Roaming\cronstable`,
 falling back to the user profile `~` if `APPDATA` is unset). The default `shell`
 also differs: `/bin/sh` on POSIX, and on Windows an empty default that runs a
 string `command` through `%ComSpec%` (`cmd.exe`). On Windows, press Ctrl-C (or
-Ctrl-Break) to stop yacron2 gracefully; it finishes running jobs first, just as
+Ctrl-Break) to stop cronstable gracefully; it finishes running jobs first, just as
 SIGTERM does on POSIX. Note that per-job `user`/`group` switching and `unix://`
 web listeners are not available on Windows; see
 [Running on Windows](Running-on-Windows) for the full details.

@@ -19,8 +19,8 @@ defaults:
   # Sample every run's CPU time and peak resident memory. This set exists to
   # show load spreading across the cluster, so per-job CPU/RSS numbers are the
   # natural companion to `docker stats`: watch them in the dashboard run
-  # history, at GET /metrics (yacron2_job_cpu_seconds_total,
-  # yacron2_job_last_run_max_rss_bytes), or over statsd. Observability only.
+  # history, at GET /metrics (cronstable_job_cpu_seconds_total,
+  # cronstable_job_last_run_max_rss_bytes), or over statsd. Observability only.
   # The map form samples the tree every `interval` seconds and keeps up to
   # `history` chart points per run, powering the CPU/memory charts in the
   # dashboard drawer's Resources tab (a bare `monitorResources: true` uses

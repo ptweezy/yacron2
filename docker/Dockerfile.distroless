@@ -1,15 +1,15 @@
 # syntax=docker/dockerfile:1
 #
-# yacron2 — distroless variant. The most locked-down image: Google's
+# cronstable — distroless variant. The most locked-down image: Google's
 # "distroless" base ships only the Python runtime and its libraries — no shell,
 # no package manager, no busybox — which minimizes the attack surface and pairs
-# naturally with yacron2's hardened, read-only, non-root deployment model.
+# naturally with cronstable's hardened, read-only, non-root deployment model.
 #
 # The base provides Python 3.13 (Debian 13 lineage); the venv is built in a
 # matching debian:13 builder so its interpreter path stays valid after the copy.
 #
 # Build locally:
-#   docker build -f docker/Dockerfile.distroless -t yacron2:distroless .
+#   docker build -f docker/Dockerfile.distroless -t cronstable:distroless .
 # CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
 # reads it from .git (kept in the context by .dockerignore).
 
@@ -44,7 +44,7 @@ RUN set -eux; \
 
 # Best-effort orjson (the `speedups` extra) for the durable-state / cluster JSON
 # paths. This image publishes only amd64/arm64, which have orjson wheels, so no
-# Rust toolchain is needed. yacron2/_json falls back to stdlib json if the wheel
+# Rust toolchain is needed. cronstable/_json falls back to stdlib json if the wheel
 # is unavailable, and orjson_ok drops a broken install so it is never shipped.
 # Runs in this debian:13-slim builder; only the venv reaches the distroless base.
 RUN set -eux; \
@@ -61,9 +61,9 @@ RUN set -eux; \
 # ---- runtime stage ------------------------------------------------------
 FROM gcr.io/distroless/python3-debian13
 
-LABEL org.opencontainers.image.title="yacron2" \
+LABEL org.opencontainers.image.title="cronstable" \
       org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (distroless)." \
-      org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
+      org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONUNBUFFERED=1 \
@@ -79,5 +79,5 @@ COPY --from=builder /opt/venv /opt/venv
 # PATH lookup.
 USER 65534:65534
 
-ENTRYPOINT ["/opt/venv/bin/yacron2"]
-CMD ["-c", "/etc/yacron2.d"]
+ENTRYPOINT ["/opt/venv/bin/cronstable"]
+CMD ["-c", "/etc/cronstable.d"]

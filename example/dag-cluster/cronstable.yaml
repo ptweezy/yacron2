@@ -1,0 +1,107 @@
+# A clustered cronstable DAG deployment: three nodes share one state store and
+# elect a leader over it, so each dag_run is advanced by exactly one node and a
+# task never double-launches -- even though all three nodes run this identical
+# config. See the "Orchestration and DAGs" and "Durable State" wiki pages.
+#
+#   docker compose -f example/dag-cluster/docker-compose.yml up --build
+#
+# Then open http://localhost:8080/, :8081/ and :8082/ and watch the cluster
+# panel (one leader) and the scheduled `shard-etl` DAG run every 2 minutes.
+#
+# How the coordination works with no extra service:
+#   * `state` is a shared POSIX mount (here a Docker volume shared by all three
+#     nodes). Every dag_run is one document on it, per-task state and XCom ride
+#     the durable store, and each run is advanced only by the node holding
+#     that run's advance lease -- so a task is launched exactly once.
+#   * `cluster.backend: filesystem` elects a leader using the SAME shared mount
+#     (a flock-guarded TTL lease), so only the leader CREATES the scheduled
+#     runs. Kill the leader and another node adopts its in-flight runs within a
+#     lease TTL and resumes them from durable state (crash-resume).
+
+state:
+  # The shared store. `topology: shared` tells the backend this mount is shared
+  # across nodes, so its leases exclude fleet-wide (the Docker volume below is a
+  # genuine shared mount with working flock on a single host).
+  path: /var/lib/cronstable/state
+  topology: shared
+  jobApi:
+    enabled: true          # the loopback endpoint the tasks reach `cronstable
+                           # xcom` through (required for DAGs)
+
+cluster:
+  backend: filesystem      # leader election over the shared state mount --
+                           # no gossip certs, no etcd, no Kubernetes
+  electLeader: true        # only the leader schedules the DAGs
+  filesystem:
+    # Point election at the same mount as `state` (disjoint namespaces). The
+    # nodeName defaults to the container hostname (set per-node in compose), and
+    # that name is what the dashboard shows as the leader.
+    path: /var/lib/cronstable/state
+    electionName: cluster/leader
+    ttl: 15                # lease TTL; failover happens within ~this many s
+
+dags:
+  # A scheduled fan-out ETL: discover a set of shards, process them in parallel
+  # (one mapped task instance per shard, each with its own state/retries/XCom),
+  # then verify. Every task prints its node so you can see that a single run is
+  # executed end to end by one leader node.
+  - name: shard-etl
+    schedule: "*/2 * * * *"
+    retainRuns: 20
+    tasks:
+      - id: discover
+        command: |
+          set -eu
+          echo "[discover] running on $(hostname)"
+          echo '["orders", "users", "events"]' | cronstable xcom push --key shards
+      - id: load
+        dependsOn:
+          - discover
+        expand:                 # fan out: one `load` instance per shard
+          fromTask: discover
+          key: shards
+        retries: 1
+        command: |
+          set -eu
+          echo "[load shard=$CRONSTABLE_DAG_MAP_ITEM idx=$CRONSTABLE_DAG_MAP_INDEX] on $(hostname)"
+      - id: verify
+        dependsOn:
+          - load                # fan-in: waits for every mapped `load` instance
+        command: |
+          set -eu
+          shards=$(cronstable xcom pull --task discover --key shards)
+          echo "[verify] on $(hostname); loaded shards were: $shards"
+
+  # A manual, human-gated release workflow. Trigger it on demand and approve
+  # (or reject) the gate over the control API from ANY node -- the decision is a
+  # compare-and-set on the shared run document, so it coordinates fleet-wide:
+  #
+  #   curl -X POST http://localhost:8080/dags/release/trigger
+  #   # note the returned runKey, then:
+  #   curl -X POST \
+  #     http://localhost:8080/dags/release/runs/<runKey>/tasks/gate/decision \
+  #     -H 'Content-Type: application/json' \
+  #     -d '{"decision": "approve", "by": "you"}'
+  - name: release
+    tasks:
+      - id: build
+        command: |
+          set -eu
+          echo "[build] on $(hostname)"
+          echo "build-$(date +%s)" | cronstable xcom push --key artifact
+      - id: gate
+        type: approval
+        dependsOn:
+          - build
+        onReject: skip          # a rejected release skips `publish`, not fails
+      - id: publish
+        dependsOn:
+          - gate
+        command: |
+          set -eu
+          artifact=$(cronstable xcom pull --task build --key artifact)
+          echo "[publish] $artifact on $(hostname)"
+
+web:
+  listen:
+    - http://0.0.0.0:8080

@@ -1,6 +1,6 @@
 # Reporting (Mail, Sentry, Shell, Webhook)
 
-yacron2 can report a job's outcome through four reporters - Sentry, e-mail
+cronstable can report a job's outcome through four reporters - Sentry, e-mail
 (SMTP), an arbitrary shell command, and an HTTP webhook (Slack-compatible out
 of the box) - configured under the `report` block of the `onFailure`,
 `onPermanentFailure`, and `onSuccess` hooks. This page documents every reporter
@@ -29,7 +29,7 @@ reported nor retried. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
 ### All four reporters always run
 
-For any given hook, yacron2 always invokes all four reporters concurrently
+For any given hook, cronstable always invokes all four reporters concurrently
 (`asyncio.gather` with `return_exceptions=True`). A reporter that is not
 configured returns early and does nothing:
 
@@ -199,9 +199,9 @@ returns early.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `dsn` | secret block (Opt) | all sources `None` | Sentry DSN; see [Secrets](#secrets). No DSN means Sentry reporting is disabled. |
-| `fingerprint` | list of str (Opt) | `["yacron2", "{{ environment.HOSTNAME }}", "{{ name }}"]` | jinja2-templated fingerprint lines controlling Sentry issue grouping. **Replaces, not appends, on merge** - see note. |
+| `fingerprint` | list of str (Opt) | `["cronstable", "{{ environment.HOSTNAME }}", "{{ name }}"]` | jinja2-templated fingerprint lines controlling Sentry issue grouping. **Replaces, not appends, on merge** - see note. |
 | `level` | str (Opt) | unset (effective `error`) | Sentry severity level (e.g. `error`, `warning`, `info`). When unset, `sentry_sdk.capture_message` is called with `level="error"`. |
-| `extra` | map of str to (str/int/bool) (Opt) | unset | Additional key/value context attached to the event. Your map is merged on top of yacron2's always-attached `job`/`exit_code`/`command`/`shell`/`success` context. |
+| `extra` | map of str to (str/int/bool) (Opt) | unset | Additional key/value context attached to the event. Your map is merged on top of cronstable's always-attached `job`/`exit_code`/`command`/`shell`/`success` context. |
 | `body` | str (Opt) | default subject + body template | jinja2 template for the captured message text. |
 | `environment` | str (Opt) | `None` | Sentry environment tag. |
 | `maxStringLength` | int (Opt) | `8192` | Sets `sentry_sdk.utils.MAX_STRING_LENGTH` (max length before Sentry truncates strings). |
@@ -212,7 +212,7 @@ Notes on behavior:
   it is rebuilt only when one of those changes, not on every report.
 - `maxStringLength` mutates the process-global `sentry_sdk.utils.MAX_STRING_LENGTH`
   when set (and truthy).
-- In addition to any `extra` you supply, yacron2 always attaches `job`,
+- In addition to any `extra` you supply, cronstable always attaches `job`,
   `exit_code`, `command`, `shell`, and `success` to the event's extra context.
   Your `extra` map is merged on top of these.
 - Capture uses an isolated scope (`sentry_sdk.new_scope()`); the configured
@@ -251,7 +251,7 @@ jobs:
 
 ## Shell reporter
 
-Runs a user-supplied command, passing job state through `YACRON2_*` environment
+Runs a user-supplied command, passing job state through `CRONSTABLE_*` environment
 variables.
 
 | Option | Type | Default | Description |
@@ -279,28 +279,28 @@ Execution model:
 
 ### Environment variables
 
-The shell command inherits the full environment of the yacron2 process, plus the
+The shell command inherits the full environment of the cronstable process, plus the
 following variables describing the job outcome:
 
 | Variable | Value |
 | --- | --- |
-| `YACRON2_FAIL_REASON` | The fail reason string, or empty string on success. |
-| `YACRON2_FAILED` | `"1"` if the job failed, `"0"` otherwise. |
-| `YACRON2_JOB_NAME` | The job name. |
-| `YACRON2_JOB_COMMAND` | The job command; a list command is joined with spaces. |
-| `YACRON2_JOB_SCHEDULE` | The job's unparsed schedule string. |
-| `YACRON2_RETCODE` | The process exit code, as a string. |
-| `YACRON2_STDERR` | Captured stderr (possibly truncated; see below). |
-| `YACRON2_STDOUT` | Captured stdout (possibly truncated; see below). |
-| `YACRON2_STDERR_TRUNCATED` | `"1"` if `YACRON2_STDERR` was truncated, `"0"` otherwise. |
-| `YACRON2_STDOUT_TRUNCATED` | `"1"` if `YACRON2_STDOUT` was truncated, `"0"` otherwise. |
-| `YACRON2_CPU_SECONDS` | Total CPU seconds of the run's process tree, or empty string when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored. |
-| `YACRON2_MAX_RSS_BYTES` | Peak resident-set size in bytes, or empty string when unmonitored. |
+| `CRONSTABLE_FAIL_REASON` | The fail reason string, or empty string on success. |
+| `CRONSTABLE_FAILED` | `"1"` if the job failed, `"0"` otherwise. |
+| `CRONSTABLE_JOB_NAME` | The job name. |
+| `CRONSTABLE_JOB_COMMAND` | The job command; a list command is joined with spaces. |
+| `CRONSTABLE_JOB_SCHEDULE` | The job's unparsed schedule string. |
+| `CRONSTABLE_RETCODE` | The process exit code, as a string. |
+| `CRONSTABLE_STDERR` | Captured stderr (possibly truncated; see below). |
+| `CRONSTABLE_STDOUT` | Captured stdout (possibly truncated; see below). |
+| `CRONSTABLE_STDERR_TRUNCATED` | `"1"` if `CRONSTABLE_STDERR` was truncated, `"0"` otherwise. |
+| `CRONSTABLE_STDOUT_TRUNCATED` | `"1"` if `CRONSTABLE_STDOUT` was truncated, `"0"` otherwise. |
+| `CRONSTABLE_CPU_SECONDS` | Total CPU seconds of the run's process tree, or empty string when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored. |
+| `CRONSTABLE_MAX_RSS_BYTES` | Peak resident-set size in bytes, or empty string when unmonitored. |
 
 **Truncation:** stdout and stderr can be large, and there are OS limits on
-argument/environment sizes. yacron2 truncates each stream to a maximum of
+argument/environment sizes. cronstable truncates each stream to a maximum of
 **16 KiB** (`1024 * 16`) when either stream individually, or the two combined,
-exceeds that limit. `YACRON2_STDERR_TRUNCATED` / `YACRON2_STDOUT_TRUNCATED`
+exceeds that limit. `CRONSTABLE_STDERR_TRUNCATED` / `CRONSTABLE_STDOUT_TRUNCATED`
 indicate per-stream whether truncation occurred. The README lists the first eight
 variables but omits the `*_TRUNCATED` pair; both are set by the code.
 
@@ -316,7 +316,7 @@ jobs:
       report:
         shell:
           shell: /bin/bash
-          command: echo "job $YACRON2_JOB_NAME failed with code $YACRON2_RETCODE"
+          command: echo "job $CRONSTABLE_JOB_NAME failed with code $CRONSTABLE_RETCODE"
 ```
 
 This POSIX-shaped example (a `/bin/bash` shell and `$VAR` syntax) won't run as
@@ -408,7 +408,7 @@ ntfy (plain-text body, priority via header):
             value: https://ntfy.sh/my-alerts
           contentType: text/plain
           headers:
-            Title: yacron2 job failure
+            Title: cronstable job failure
             Priority: high
           body: "Cron job '{{ name }}' failed: {{ fail_reason }}"
 ```
@@ -432,7 +432,7 @@ non-empty source wins. If none is set, the reporter treats the secret as absent
 (Sentry: disabled; mail: no login).
 
 If `fromEnvVar` is set but the named environment variable is unset/empty, the
-report is **skipped** and an error is logged - yacron2 no longer raises
+report is **skipped** and an error is logged - cronstable no longer raises
 `KeyError` in this case. For mail, the password env-var *name* is not echoed to
 the logs (it is tied to a secret); for sentry, the DSN env-var name is logged.
 

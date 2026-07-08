@@ -1,0 +1,16 @@
+web:
+  listen:
+     - http://127.0.0.1:8080
+     - unix:///tmp/cronstable.sock
+  headers:
+    x-foobar: zbr
+
+defaults:
+  shell: /bin/bash
+  utc: false
+
+jobs:
+  - name: test-01
+    command: echo "heállo€"
+    schedule: "* * * * *"
+    captureStdout: true

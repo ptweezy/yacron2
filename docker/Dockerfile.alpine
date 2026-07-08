@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 #
-# yacron2 — Alpine variant (musl libc). The smallest image; built on the
+# cronstable — Alpine variant (musl libc). The smallest image; built on the
 # official python:alpine images, so it uses the same Python 3.14 as the default
 # (Debian) image.
 #
 # Build locally:
-#   docker build -f docker/Dockerfile.alpine -t yacron2:alpine .
+#   docker build -f docker/Dockerfile.alpine -t cronstable:alpine .
 # CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
 # reads it from .git (kept in the context by .dockerignore).
 
@@ -38,7 +38,7 @@ RUN set -eux; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
 # Best-effort orjson (the `speedups` extra) for the durable-state / cluster JSON
-# paths; yacron2/_json falls back to stdlib json when it is absent, so this never
+# paths; cronstable/_json falls back to stdlib json when it is absent, so this never
 # fails the build. Almost every published arch installs a wheel; only riscv64
 # has none, so a CURRENT Rust is installed via rustup (distro rustc is older
 # than orjson's MSRV) and orjson is source-built. A
@@ -63,12 +63,12 @@ RUN set -eux; \
 # ---- runtime stage ------------------------------------------------------
 FROM python:${PYTHON_VERSION}-alpine
 
-LABEL org.opencontainers.image.title="yacron2" \
+LABEL org.opencontainers.image.title="cronstable" \
       org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (Alpine)." \
-      org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
+      org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.licenses="MIT"
 
-# Flush stdout/stderr immediately (yacron2 logs to them) and never write .pyc
+# Flush stdout/stderr immediately (cronstable logs to them) and never write .pyc
 # files — because remember....the read-only root filesystem.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -81,5 +81,5 @@ COPY --from=builder /opt/venv /opt/venv
 # Run as an unprivileged, non-root user (65534 = "nobody").
 USER 65534:65534
 
-ENTRYPOINT ["yacron2"]
-CMD ["-c", "/etc/yacron2.d"]
+ENTRYPOINT ["cronstable"]
+CMD ["-c", "/etc/cronstable.d"]

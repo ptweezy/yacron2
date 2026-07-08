@@ -1,5 +1,5 @@
 # =====================================================================
-#  Meridian — the yacron2 GRAND TOUR.  Every feature, at once, coordinated.
+#  Meridian — the cronstable GRAND TOUR.  Every feature, at once, coordinated.
 #
 #  A NINE-node mutual-TLS, leader-electing cluster (distribution: spread) that
 #  shares ONE durable state store, running the entire scheduled back-office of
@@ -60,7 +60,7 @@ x-node-env: &node-env
   INTERVAL: "10"
   DRIFT_AFTER: "2"
   # Run-scoped secret served to build-daily-report over the loopback endpoint
-  # (yacron2 secret get REPORT_TOKEN). Demo value; never written to the store.
+  # (cronstable secret get REPORT_TOKEN). Demo value; never written to the store.
   REPORT_API_TOKEN: "rpt-demo-9f83a1c0-token"
   # Password for cert-expiry-check's authenticated SMTP mail report (Mailpit
   # below accepts any credentials). Demo value.
@@ -68,7 +68,7 @@ x-node-env: &node-env
   # Bearer token for the web API; empty by default (web.authToken stays off).
   # Set WEB_TOKEN and uncomment web.authToken in platform.yaml to turn auth on;
   # the pulse-* probes and the release DAG canary read this same variable.
-  YACRON2_WEB_TOKEN: ${WEB_TOKEN:-}
+  CRONSTABLE_WEB_TOKEN: ${WEB_TOKEN:-}
   # Leave empty to keep the sentry reporter a no-op; set a real DSN to light up
   # fraud-model-refresh's Sentry report.
   SENTRY_DSN: ""
@@ -77,7 +77,7 @@ x-node: &node
   build:
     context: .
     dockerfile: Dockerfile
-  image: yacron2-grand-tour:local        # built once, reused by all nine nodes
+  image: cronstable-grand-tour:local        # built once, reused by all nine nodes
   entrypoint: ["sh", "/node-entrypoint.sh"]
   restart: unless-stopped
   depends_on:
@@ -99,7 +99,7 @@ x-node: &node
     - ./example/grand-tour/secrets:/config/secrets:ro
     - ./example/grand-tour/node-entrypoint.sh:/node-entrypoint.sh:ro
     - gt-certs:/certs:ro
-    - gt-state:/var/lib/yacron2/state       # the shared, durable state store
+    - gt-state:/var/lib/cronstable/state       # the shared, durable state store
 
 services:
   # Mints a throwaway cluster CA + one leaf cert per node into the shared certs
@@ -114,7 +114,7 @@ services:
       - gt-certs:/certs
       - ./example/grand-tour/gen-certs.sh:/gen-certs.sh:ro
 
-  # A Docker named volume is created root-owned, but the yacron2 image runs as
+  # A Docker named volume is created root-owned, but the cronstable image runs as
   # an unprivileged user (uid 65534). This one-shot makes the shared state store
   # writable by that user before the nodes start; the nodes wait for it.
   init-state:

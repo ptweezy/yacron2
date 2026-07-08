@@ -1,15 +1,15 @@
 # Production and Container Deployment
 
-This page covers running yacron2 in hardened Linux container and Kubernetes
+This page covers running cronstable in hardened Linux container and Kubernetes
 environments (the published Docker image is Linux-only): the published image, the
 security context it is built to satisfy, the Kubernetes `Deployment` manifest, the
 FROM-the-published-image build pattern, and the few cases that require a writable
 path. See [Installation](Installation) for the package/binary install methods and
 [HTTP Control API](HTTP-API) for the optional web interface. For native Windows
-deployment with the `yacron2-windows-amd64.exe` / `yacron2-windows-arm64.exe`
+deployment with the `cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe`
 binaries, see [Running on Windows](Running-on-Windows).
 
-## Why yacron2 fits a locked-down pod
+## Why cronstable fits a locked-down pod
 
 At runtime the daemon only *reads* its configuration and secrets and writes its
 output to stdout/stderr. It needs no writable working directory, no temp files,
@@ -19,7 +19,7 @@ Kubernetes/container security context with no writable paths or elevated
 privileges required.
 
 The single exception is the optional per-job `user`/`group` switching feature,
-which calls `os.initgroups`/`os.setgid`/`os.setuid` (`yacron2/job.py`) and so
+which calls `os.initgroups`/`os.setgid`/`os.setuid` (`cronstable/job.py`) and so
 requires the daemon to run as root. It is **unavailable** in the non-root
 published image. If you do not use that feature, drop root entirely. See
 [Commands and Environment](Commands-and-Environment) for the feature itself.
@@ -32,21 +32,21 @@ GitHub Container Registry on every release.
 
 | Property | Value |
 | --- | --- |
-| Registry/image | `ghcr.io/ptweezy/yacron2` |
+| Registry/image | `ghcr.io/ptweezy/cronstable` |
 | Tags | the release version (e.g. `1.0.4`), plus `latest` |
 | Base | `python:3.14-slim` (multi-stage; runtime stage copies a self-contained venv) |
 | User | `65534:65534` (`nobody`), set via `USER` in the `Dockerfile` |
-| Entrypoint | `yacron2` |
-| Default command | `-c /etc/yacron2.d` |
-| Config path | `/etc/yacron2.d` (a file or a directory of `*.yaml`/`*.yml` files) |
+| Entrypoint | `cronstable` |
+| Default command | `-c /etc/cronstable.d` |
+| Config path | `/etc/cronstable.d` (a file or a directory of `*.yaml`/`*.yml` files) |
 | Env | `PYTHONUNBUFFERED=1`, `PYTHONDONTWRITEBYTECODE=1`, `PATH=/opt/venv/bin:$PATH` |
 
-`PYTHONUNBUFFERED` flushes stdout/stderr immediately (where yacron2 logs) and
+`PYTHONUNBUFFERED` flushes stdout/stderr immediately (where cronstable logs) and
 `PYTHONDONTWRITEBYTECODE` prevents `.pyc` writes; both matter under a read-only
 root filesystem.
 
 > A second `python:3.14-slim`-based Dockerfile under `example/docker/` exists for
-> demonstration; it `pip install`s yacron2 and is **not** non-root. For production
+> demonstration; it `pip install`s cronstable and is **not** non-root. For production
 > use the published GHCR image (or base your own image on it, below), not the
 > example.
 
@@ -56,12 +56,12 @@ Mount a crontab read-only and run:
 
 ```shell
 docker run --rm \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  ghcr.io/ptweezy/yacron2:latest
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  ghcr.io/ptweezy/cronstable:latest
 ```
 
 For production, pin a specific version instead of `latest`
-(e.g. `ghcr.io/ptweezy/yacron2:1.0.4`).
+(e.g. `ghcr.io/ptweezy/cronstable:1.0.4`).
 
 ### Baking config into your own image
 
@@ -69,10 +69,10 @@ If you would rather bake the configuration into an image, base it on the
 published image. The non-root user, entrypoint, and config path are inherited:
 
 ```dockerfile
-FROM ghcr.io/ptweezy/yacron2:latest
+FROM ghcr.io/ptweezy/cronstable:latest
 
 # The base image already runs as the non-root user 65534.
-COPY yacron2tab.yaml /etc/yacron2.d/yacron2tab.yaml
+COPY cronstable.yaml /etc/cronstable.d/cronstable.yaml
 ```
 
 ## Hardened security context
@@ -83,7 +83,7 @@ box:
 * **`runAsNonRoot` / non-root UID**: the daemon needs no privileges, so it runs
   as an unprivileged UID (`65534`). Only per-job `user`/`group` switching needs
   root, and that feature is not available here.
-* **`RuntimeDefault` seccomp**: yacron2 makes no exotic syscalls, so the default
+* **`RuntimeDefault` seccomp**: cronstable makes no exotic syscalls, so the default
   seccomp profile (or an equivalently strict custom one) works.
 * **`readOnlyRootFilesystem`**: no runtime writes are required by the image (or a
   `pip`/`pipx` install). Mount the crontab read-only. See [Writable-path
@@ -93,7 +93,7 @@ box:
   of the image).
 * **`fsGroup`-mounted config/secrets**: mount config and secret volumes with an
   `fsGroup` (e.g. `65534`) so the non-root process can read them.
-* **`drop: [ALL]` capabilities and `allowPrivilegeEscalation: false`**: yacron2
+* **`drop: [ALL]` capabilities and `allowPrivilegeEscalation: false`**: cronstable
   needs no Linux capabilities and never escalates privileges.
 
 ## Kubernetes Deployment
@@ -105,16 +105,16 @@ restricted security context:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: yacron2
+  name: cronstable
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: yacron2
+      app: cronstable
   template:
     metadata:
       labels:
-        app: yacron2
+        app: cronstable
     spec:
       securityContext:           # pod-level
         runAsNonRoot: true
@@ -124,9 +124,9 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: yacron2
-          image: ghcr.io/ptweezy/yacron2:latest
-          args: ["-c", "/etc/yacron2.d"]
+        - name: cronstable
+          image: ghcr.io/ptweezy/cronstable:latest
+          args: ["-c", "/etc/cronstable.d"]
           securityContext:       # container-level
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -142,15 +142,15 @@ spec:
               memory: 64Mi
           volumeMounts:
             - name: crontab
-              mountPath: /etc/yacron2.d
+              mountPath: /etc/cronstable.d
               readOnly: true
       volumes:
         - name: crontab
           configMap:
-            name: yacron2tab
+            name: cronstable
 ```
 
-`replicas: 1` is the safe default: yacron2 holds the schedule in-process, so
+`replicas: 1` is the safe default: cronstable holds the schedule in-process, so
 two replicas with no coordination each run every job independently.
 
 To run more than one replica without double-running jobs, enable
@@ -164,12 +164,12 @@ Pick a backend by whether you already run a coordination store:
   `Lease` RBAC (`get`/`create`/`update`). Likewise `backend: etcd` if you run
   etcd. See
   [Operating the lease backends](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)
-  and [`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes).
+  and [`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/develop/example/kubernetes).
 * **`backend: gossip` (the default, no coordination store).** A quorum-gated,
   mutual-TLS election that keeps no shared state, so:
   * **Use an odd replica count.** 3 replicas tolerate one failure, 5 tolerate
     two; even counts buy no extra fault tolerance, and `replicas: 2` is worse
-    than 1 (a majority of 2 is 2, so both must be up to run anything); yacron2
+    than 1 (a majority of 2 is 2, so both must be up to run anything); cronstable
     refuses to start with `electLeader` and a 2-node cluster, and warns on even
     sizes. Spread replicas across nodes/zones with `topologySpreadConstraints`;
     correlated failures defeat quorum regardless of count.
@@ -202,13 +202,13 @@ separate from the optional web API port, so plan the pod network for it:
   port shows up as `unreachable` peers and a lost quorum, not a clear error.
 * **Use a headless `Service` for peer DNS.** Pair a gossip StatefulSet with a
   headless `Service` (`clusterIP: None`) so each pod is addressable at a stable
-  per-ordinal DNS name (`yacron2-0.<svc>.<ns>.svc`, `yacron2-1.<svc>…`). Those
+  per-ordinal DNS name (`cronstable-0.<svc>.<ns>.svc`, `cronstable-1.<svc>…`). Those
   names are what you list under `cluster.peers` and what the certificate SANs
   must match. A lease backend needs none of this: it has no peer listener.
 
 ### Health checks
 
-yacron2 serves a `GET /version` on the [web API](HTTP-API) that returns `200`
+cronstable serves a `GET /version` on the [web API](HTTP-API) that returns `200`
 once the daemon is up, which makes a cheap liveness probe. Enable an
 `http://` [web listener](HTTP-API) (for example `web.listen: ["http://0.0.0.0:8080"]`)
 and point the probe at it:
@@ -242,7 +242,7 @@ table for the full signal set.
 ### Cluster certificate operations
 
 This applies to the `gossip` backend only (the lease backends use no per-node
-mTLS certs). The day-2 story is mostly hands-off, because yacron2 reloads its
+mTLS certs). The day-2 story is mostly hands-off, because cronstable reloads its
 mTLS contexts **in place**: on each config-reload pass it compares the on-disk
 `ca`/`cert`/`key` against what it loaded and, if any changed, rebuilds the TLS
 contexts (dry-running the new material first so a half-written file is retried,
@@ -252,13 +252,13 @@ bytes) are picked up automatically. The full mechanism is on the Clustering page
 under [Certificate rotation](Clustering-and-Leader-Election#certificate-rotation);
 the operational cases:
 
-* **The cluster `ca` is the membership allowlist.** yacron2 trusts *any* cert
+* **The cluster `ca` is the membership allowlist.** cronstable trusts *any* cert
   the configured `ca` signs to assert a node identity and gossip state, so the
-  `ca` **must** be a dedicated, single-purpose CA issued only to yacron2 nodes,
+  `ca` **must** be a dedicated, single-purpose CA issued only to cronstable nodes,
   **not** a shared service-mesh or organisation-wide CA. Any cert the CA admits
   could otherwise fabricate the `/peer` payload (fake agreement, trip the
   conflict gate, or suppress an `@reboot` job). Provision leaf certs from that
-  dedicated PKI (a private cert-manager issuer, an internal CA); yacron2 only
+  dedicated PKI (a private cert-manager issuer, an internal CA); cronstable only
   consumes them.
 * **Rotating a single node's cert.** A leaf renewed by your PKI needs no
   coordination as long as it still chains to the same `ca`: write the new
@@ -304,11 +304,11 @@ the authoritative section on the Clustering page.
 | Trust / auth ([gossip mTLS](Clustering-and-Leader-Election#cluster-peer-attestation) / [lease store](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)) | per-node certs from a **dedicated** cluster CA; open the `cluster.listen` mTLS port | apiserver `Lease` RBAC (`get`/`create`/`update`) or reachable etcd endpoints; no mTLS |
 | Node identity ([gossip](Clustering-and-Leader-Election#unique-node-names) / [lease](Clustering-and-Leader-Election#node-identity-for-the-lease-backends)) | stable, **unique** `nodeName` (distinct cert SANs / stable hostnames) | stable name too, but the **lease** is the fence, so a duplicate name cannot double-lead |
 | Listener / port ([attestation](Clustering-and-Leader-Election#cluster-peer-attestation)) | `cluster.listen` reachable pod-to-pod; headless `Service` for peer DNS | none (no peer listener) |
-| Replica count ([sizing](Clustering-and-Leader-Election#sizing-the-cluster)) | **odd** (3/5/7); yacron2 rejects an `electLeader` 2-node cluster and warns on even sizes | **any** count; the store fences, not a quorum |
+| Replica count ([sizing](Clustering-and-Leader-Election#sizing-the-cluster)) | **odd** (3/5/7); cronstable rejects an `electLeader` 2-node cluster and warns on even sizes | **any** count; the store fences, not a quorum |
 | Rotation ([cert rotation](Clustering-and-Leader-Election#certificate-rotation)) | in-place cert/CA reload (above); roll the CA with an overlap | n/a (no per-node mTLS certs) |
-| Preflight | `yacron2 -c <path> --validate-config` (catches lease ordering, CA/cert paths, an `electLeader` 2-node cluster) | `yacron2 -c <path> --validate-config` (same) |
+| Preflight | `cronstable -c <path> --validate-config` (catches lease ordering, CA/cert paths, an `electLeader` 2-node cluster) | `cronstable -c <path> --validate-config` (same) |
 
-`yacron2 -c <path> --validate-config` parses the config and exits non-zero on any
+`cronstable -c <path> --validate-config` parses the config and exits non-zero on any
 error, so it belongs in CI before a cluster deploy: it enforces the lease timing
 ordering (`leaseDurationSeconds > renewDeadlineSeconds`, `retryPeriodSeconds <
 renewDeadlineSeconds`, and the like), the RFC1123 `leaseName`/`leaseNamespace`
@@ -323,26 +323,26 @@ case. Two features need a small writable mount.
 ### 1. Unix-socket web interface
 
 If you enable the optional [HTTP Control API](HTTP-API) on a Unix socket
-(`web.listen: [unix:///path/yacron2.sock]`), yacron2 binds a `UnixSite` and
+(`web.listen: [unix:///path/cronstable.sock]`), cronstable binds a `UnixSite` and
 creates the socket file at that path, a write. Point the socket at a small
 writable volume (a Kubernetes `emptyDir`) rather than the root filesystem:
 
 ```yaml
           volumeMounts:
             - name: crontab
-              mountPath: /etc/yacron2.d
+              mountPath: /etc/cronstable.d
               readOnly: true
             - name: run
-              mountPath: /run/yacron2
+              mountPath: /run/cronstable
       volumes:
         - name: crontab
           configMap:
-            name: yacron2tab
+            name: cronstable
         - name: run
           emptyDir: {}
 ```
 
-with `web.listen: [unix:///run/yacron2/yacron2.sock]` in your config. (TCP
+with `web.listen: [unix:///run/cronstable/cronstable.sock]` in your config. (TCP
 listeners such as `http://0.0.0.0:8080` need no writable path.) The optional
 `web.socketMode` config key, if set, `chmod`s the socket after bind.
 
@@ -374,8 +374,8 @@ executable temp mount:
   ```shell
   docker run --rm --read-only \
     --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m \
-    -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-    your-image-with-the-binary -c /etc/yacron2.d
+    -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+    your-image-with-the-binary -c /etc/cronstable.d
   ```
 
 * **Kubernetes**: mount an `emptyDir` at `/tmp` (writable and executable by
@@ -384,28 +384,28 @@ executable temp mount:
   `TMPDIR=/path`.
 
 This requirement is unique to the standalone binary. The published image and
-`pip`/`pipx` installs run yacron2 as a normal Python package with the interpreter
+`pip`/`pipx` installs run cronstable as a normal Python package with the interpreter
 on disk; they never self-extract and need no writable temp directory. See
 [Installation](Installation) for the binary download.
 
 ## Operational notes
 
-* **Logging**: yacron2 logs to stdout/stderr; collect logs at the platform
+* **Logging**: cronstable logs to stdout/stderr; collect logs at the platform
   level (`kubectl logs`, the container runtime's log driver). Adjust verbosity
   with `-l/--log-level` (default `INFO`) or a `logging:` config section.
-* **Shutdown**: on POSIX, yacron2 installs handlers for `SIGINT` and `SIGTERM`
+* **Shutdown**: on POSIX, cronstable installs handlers for `SIGINT` and `SIGTERM`
   and shuts down gracefully, so the default pod termination path works without
   extra configuration. On Windows (where the Proactor loop has no
   `add_signal_handler`) it instead handles `SIGINT`/`SIGBREAK` via
   `signal.signal` plus a heartbeat timer, so pressing Ctrl-C or Ctrl-Break stops
   it; either way it finishes the currently-running jobs first. See
   [Running on Windows](Running-on-Windows).
-* **Validate before deploy**: `yacron2 -c <path> --validate-config` parses the
+* **Validate before deploy**: `cronstable -c <path> --validate-config` parses the
   config and exits, useful as a CI/pre-deploy gate. See [Command-Line
   Reference](CLI-Reference).
 * **Config not found**: the default config path is platform-specific:
-  `/etc/yacron2.d` on POSIX, `%APPDATA%\yacron2` on Windows (falling back to the
+  `/etc/cronstable.d` on POSIX, `%APPDATA%\cronstable` on Windows (falling back to the
   user profile `~` if `APPDATA` is unset). When `-c` is left at whichever is the
-  platform default and that path does not exist, yacron2 prints an error and exits
+  platform default and that path does not exist, cronstable prints an error and exits
   non-zero. In the container, ensure the config volume is mounted at
-  `/etc/yacron2.d`.
+  `/etc/cronstable.d`.

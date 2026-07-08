@@ -38,9 +38,9 @@ jobs:
     clusterPolicy: EveryNode
 
   # Leader (the default): runs on the elected leader ONLY, and only while a
-  # quorum is up. With all three nodes healthy the leader is "yacron-a" (the
+  # quorum is up. With all three nodes healthy the leader is "cronstable-a" (the
   # lowest node name), so this job's history advances on 8080 alone. Stop
-  # yacron-a and watch it move to yacron-b. Stop a second node (no quorum) and
+  # cronstable-a and watch it move to cronstable-b. Stop a second node (no quorum) and
   # it stops running anywhere — at-most-once, may skip.
   - name: tick-leader-only
     command: echo "[Leader] $HOSTNAME is the leader and ran at $(date -u +%H:%M:%S) UTC"
@@ -48,7 +48,7 @@ jobs:
     clusterPolicy: Leader
 
   # PreferLeader: the lowest *reachable* agreeing node runs it, ignoring quorum.
-  # Healthy, it behaves like Leader (runs on yacron-a). But if a node is
+  # Healthy, it behaves like Leader (runs on cronstable-a). But if a node is
   # partitioned off on its own it will STILL run there — never skips, may
   # double-run across a partition. Good for important-but-idempotent work.
   - name: tick-prefer-leader

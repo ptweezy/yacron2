@@ -64,7 +64,7 @@ target/
 /.mypy_cache/
 
 /pyoxidizer/venv/
-/yacron2/version.py
+/cronstable/version.py
 
 # Local-only changelog tooling
 /scripts/*

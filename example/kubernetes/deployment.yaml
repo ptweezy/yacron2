@@ -1,35 +1,35 @@
 # Minimal RBAC + Deployment for the Kubernetes Lease leadership backend.
 #
 # The Role grants exactly the verbs the backend needs on the single Lease
-# object "yacron2-leader": get (observe) and update (renew / replace / release)
+# object "cronstable-leader": get (observe) and update (renew / replace / release)
 # are pinned to that one Lease by resourceNames; create is a separate rule
 # because RBAC does not honor resourceNames on create (the object does not yet
 # exist when create is authorized). Apply with:
 #
 #     kubectl apply -f deployment.yaml
 #
-# The yacron2 config (yacron2tab.yaml in this directory) is mounted from a
+# The cronstable config (cronstable.yaml in this directory) is mounted from a
 # ConfigMap; create it with:
 #
-#     kubectl create configmap yacron2tab --from-file=yacron2tab.yaml
+#     kubectl create configmap cronstable --from-file=cronstable.yaml
 #
 # Then watch leadership move by deleting the holder pod:
 #
-#     kubectl get lease yacron2-leader -o jsonpath='{.spec.holderIdentity}{"\n"}'
+#     kubectl get lease cronstable-leader -o jsonpath='{.spec.holderIdentity}{"\n"}'
 #     kubectl delete pod <that-pod>     # a survivor takes the lease within ~leaseDurationSeconds
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: yacron2
+  name: cronstable
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: yacron2-lease
+  name: cronstable-lease
   # A Role is namespaced: it only grants access to Leases in its OWN namespace
   # (the one you apply it to). If you point the backend at a Lease in a
-  # different namespace (cluster.kubernetes.leaseNamespace, see yacron2tab.yaml),
+  # different namespace (cluster.kubernetes.leaseNamespace, see cronstable.yaml),
   # the ServiceAccount has no rights there: every lease call 403s, the node
   # never becomes quorate, and Leader jobs never run (mislogged as "apiserver
   # unreachable"). Put this Role + RoleBinding in THAT namespace (metadata.
@@ -39,10 +39,10 @@ rules:
   # and release on shutdown. Both are restricted to the one Lease the backend
   # uses, so a compromised pod cannot read or hijack any other Lease in the
   # namespace. Keep resourceNames in sync with the lease name (default
-  # "yacron2-leader"; set via cluster.kubernetes.leaseName if you change it).
+  # "cronstable-leader"; set via cluster.kubernetes.leaseName if you change it).
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    resourceNames: ["yacron2-leader"]
+    resourceNames: ["cronstable-leader"]
     verbs: ["get", "update"]
   # create: first acquire. RBAC cannot scope create by resourceNames (the Lease
   # does not exist yet), so this is its own rule. It only authorizes creating a
@@ -54,19 +54,19 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: yacron2-lease
+  name: cronstable-lease
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: yacron2-lease
+  name: cronstable-lease
 subjects:
   - kind: ServiceAccount
-    name: yacron2
+    name: cronstable
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: yacron2
+  name: cronstable
 spec:
   # An odd replica count is not required for a lease backend (the store is the
   # authority, not a quorum), but spreading replicas across nodes still helps
@@ -74,14 +74,14 @@ spec:
   replicas: 3
   selector:
     matchLabels:
-      app: yacron2
+      app: cronstable
   template:
     metadata:
       labels:
-        app: yacron2
+        app: cronstable
     spec:
-      serviceAccountName: yacron2
-      # On a graceful stop yacron2 clears its holderIdentity (releases the
+      serviceAccountName: cronstable
+      # On a graceful stop cronstable clears its holderIdentity (releases the
       # Lease) so a survivor takes over at once instead of waiting out
       # leaseDurationSeconds. That release is a live apiserver call, so the pod
       # needs time to make it during termination: keep terminationGracePeriod-
@@ -90,20 +90,20 @@ spec:
       # SIGKILLed mid-release and the peer waits out the full lease instead.
       terminationGracePeriodSeconds: 30
       containers:
-        - name: yacron2
-          image: ghcr.io/ptweezy/yacron2:latest
-          args: ["-c", "/etc/yacron2/yacron2tab.yaml"]
+        - name: cronstable
+          image: ghcr.io/ptweezy/cronstable:latest
+          args: ["-c", "/etc/cronstable/cronstable.yaml"]
           # cluster.nodeName (and so the lease identity) defaults to the
           # container hostname, which Kubernetes sets to the pod name -- already
-          # unique per replica. yacron2 also appends a per-process token to the
-          # holderIdentity it writes (e.g. "yacron2-0#a1b2c3d4e5f6"), so even a
+          # unique per replica. cronstable also appends a per-process token to the
+          # holderIdentity it writes (e.g. "cronstable-0#a1b2c3d4e5f6"), so even a
           # duplicate identity cannot make two pods both hold the Lease; the
           # dashboard / GET /cluster show the readable name without the suffix.
           volumeMounts:
-            - name: yacron2tab
-              mountPath: /etc/yacron2
+            - name: cronstable
+              mountPath: /etc/cronstable
               readOnly: true
       volumes:
-        - name: yacron2tab
+        - name: cronstable
           configMap:
-            name: yacron2tab
+            name: cronstable

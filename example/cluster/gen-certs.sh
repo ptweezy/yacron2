@@ -6,15 +6,15 @@
 # THESE CERTS ARE FOR LOCAL EXPERIMENTATION ONLY — a single CA key sitting in a
 # volume, 10-year validity, world-readable keys. For real deployments provision
 # per-node certificates from your own PKI (cert-manager, a service mesh, an
-# internal CA); yacron2 only consumes them.
+# internal CA); cronstable only consumes them.
 #
 # Each node's cert carries its service name as a Subject Alternative Name, which
 # is what the mutual-TLS hostname check pins against when a peer connects to
-# e.g. https://yacron-b:8443/peer.
+# e.g. https://cronstable-b:8443/peer.
 set -eu
 
 CERTS=/certs
-NODES="yacron-a yacron-b yacron-c"
+NODES="cronstable-a cronstable-b cronstable-c"
 
 if [ -f "$CERTS/ca.pem" ]; then
   echo "certs already present in $CERTS — leaving them in place."
@@ -33,7 +33,7 @@ echo "generating cluster CA..."
 # rejects a CA cert that lacks the keyCertSign key-usage extension.
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout "$CERTS/ca.key" -out "$CERTS/ca.pem" \
-  -subj "/CN=yacron2-cluster-ca" \
+  -subj "/CN=cronstable-cluster-ca" \
   -addext "basicConstraints=critical,CA:TRUE" \
   -addext "keyUsage=critical,keyCertSign,cRLSign"
 
@@ -55,7 +55,7 @@ EOF
     -out "$CERTS/$n.pem" -days 3650 -extfile "/tmp/$n.ext"
 done
 
-# Lock down permissions. The yacron2 containers run as uid 65534 (nobody) and
+# Lock down permissions. The cronstable containers run as uid 65534 (nobody) and
 # must read their own leaf key, so we hand the private keys to that uid and keep
 # them owner-only (0600) instead of world-readable.
 #

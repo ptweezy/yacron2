@@ -3,11 +3,11 @@
 The release binary jobs and the container image builds let orjson (a Rust
 extension) compile from sdist on the arches that have no prebuilt wheel. A
 source build -- especially under QEMU emulation -- can succeed yet be subtly
-miscompiled, and yacron2 routes every durable-state and cluster-gossip
-read/write through orjson whenever it is merely importable (yacron2/_json), so
+miscompiled, and cronstable routes every durable-state and cluster-gossip
+read/write through orjson whenever it is merely importable (cronstable/_json), so
 an unusable orjson would corrupt the state store instead of falling back.
 Round-tripping a small document here catches that: the caller uninstalls orjson
-on a nonzero exit, so it is never frozen/shipped and yacron2 cleanly uses the
+on a nonzero exit, so it is never frozen/shipped and cronstable cleanly uses the
 stdlib json.
 
 Exit 0 (nothing to verify) when orjson is not installed at all -- the arch had
@@ -23,7 +23,7 @@ if importlib.util.find_spec("orjson") is None:
 
 import orjson
 
-# Exercise exactly what yacron2._json.dumps_bytes/loads depend on: compact
+# Exercise exactly what cronstable._json.dumps_bytes/loads depend on: compact
 # bytes output, the OPT_SORT_KEYS path, and a lossless round-trip including
 # non-ASCII (orjson emits raw UTF-8). A miscompiled build typically fails here.
 sample = {

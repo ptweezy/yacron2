@@ -2,9 +2,9 @@
 
 Where test_state_job_primitives.py exercises the backend primitives and the
 pure logic layer, this file exercises the *server*: it starts a real
-:class:`yacron2.jobapi.JobStateAPI` (which binds an ephemeral 127.0.0.1 port)
+:class:`cronstable.jobapi.JobStateAPI` (which binds an ephemeral 127.0.0.1 port)
 and drives it over real HTTP with an aiohttp client -- the same wire the
-`yacron2` job CLI speaks -- covering auth, every primitive's endpoint, the
+`cronstable` job CLI speaks -- covering auth, every primitive's endpoint, the
 lease-backed lock manager, and run-scoped secrets.  It then checks the cron
 wiring end to end: env injection at launch and token/lock cleanup at finish.
 
@@ -19,9 +19,9 @@ import sys
 import aiohttp
 
 from tests.test_state import _backend, _state_cfg
-from yacron2.config import parse_config_string
-from yacron2.cron import Cron
-from yacron2.jobapi import JobStateAPI, RunContext, run_environment
+from cronstable.config import parse_config_string
+from cronstable.cron import Cron
+from cronstable.jobapi import JobStateAPI, RunContext, run_environment
 
 _ONE_JOB = (
     "state:\n  path: {path}\n"
@@ -140,7 +140,7 @@ async def test_kv_default_scope_is_job_name(tmp_path):
                 api.base_url + "/v1/kv/set", json={"key": "k", "value": "v"}
             )
         # landed in the job's own scope, not some global default.
-        from yacron2 import jobstate
+        from cronstable import jobstate
 
         assert (await jobstate.kv_get(backend, "alpha", "k"))["value"] == "v"
         assert await jobstate.kv_get(backend, "global", "k") is None
@@ -173,7 +173,7 @@ async def test_kv_explicit_scope_shared(tmp_path):
 async def test_kv_scope_naming_another_jobs_scope_is_forbidden(tmp_path):
     # "beta" is job alpha's own private default scope: without an explicit
     # allowlist entry, alpha may not name it (would let one job read/write/
-    # destroy an unrelated job's state -- see yacron2.jobapi._scope).
+    # destroy an unrelated job's state -- see cronstable.jobapi._scope).
     api, backend = await _make_api(tmp_path)
     api.register_run(_ctx(token="a", job="alpha"))
     api.register_run(_ctx(token="b", job="beta"))
@@ -196,7 +196,7 @@ async def test_kv_scope_naming_another_jobs_scope_is_forbidden(tmp_path):
             )
             assert r.status == 403
         # beta's value survived the attempted cross-job reach-in.
-        from yacron2 import jobstate
+        from cronstable import jobstate
 
         got = await jobstate.kv_get(backend, "beta", "k")
         assert got["value"] == "secret"
@@ -309,7 +309,7 @@ async def test_artifact_http(tmp_path):
             assert (await r.json())["size"] == 6
             r = await s.get(api.base_url + "/v1/artifact/get?name=report.csv")
             assert await r.read() == b"a,b,c\n"
-            assert r.headers["X-Yacron2-Size"] == "6"
+            assert r.headers["X-Cronstable-Size"] == "6"
             r = await s.get(api.base_url + "/v1/artifact/list")
             assert [a["name"] for a in (await r.json())["artifacts"]] == [
                 "report.csv"
@@ -640,12 +640,12 @@ async def test_finish_run_revokes_token(tmp_path):
 def test_run_environment_keys():
     ctx = _ctx()
     env = run_environment(ctx, "http://127.0.0.1:9999")
-    assert env["YACRON2_STATE_URL"] == "http://127.0.0.1:9999"
-    assert env["YACRON2_STATE_TOKEN"] == "tok"
-    assert env["YACRON2_JOB_NAME"] == "job"
-    assert env["YACRON2_ATTEMPT"] == "0"
+    assert env["CRONSTABLE_STATE_URL"] == "http://127.0.0.1:9999"
+    assert env["CRONSTABLE_STATE_TOKEN"] == "tok"
+    assert env["CRONSTABLE_JOB_NAME"] == "job"
+    assert env["CRONSTABLE_ATTEMPT"] == "0"
     # None scheduled time -> empty string, not absent
-    assert env["YACRON2_SCHEDULED_AT"] == ""
+    assert env["CRONSTABLE_SCHEDULED_AT"] == ""
     assert all(isinstance(v, str) for v in env.values())
 
 
@@ -664,14 +664,14 @@ async def test_cron_starts_job_api_and_injects_env(tmp_path):
         ).jobs[0]
         token, env = cron._prepare_job_api_run(job, None)
         assert token is not None
-        assert env["YACRON2_STATE_URL"].startswith("http://127.0.0.1:")
-        assert env["YACRON2_STATE_TOKEN"] == token
-        assert env["YACRON2_JOB_NAME"] == "j"
+        assert env["CRONSTABLE_STATE_URL"].startswith("http://127.0.0.1:")
+        assert env["CRONSTABLE_STATE_TOKEN"] == token
+        assert env["CRONSTABLE_JOB_NAME"] == "j"
         # the run is registered and reachable; finish revokes it.
         async with aiohttp.ClientSession(
             headers={"Authorization": "Bearer " + token}
         ) as s:
-            r = await s.get(env["YACRON2_STATE_URL"] + "/v1/run")
+            r = await s.get(env["CRONSTABLE_STATE_URL"] + "/v1/run")
             assert r.status == 200
         await cron._job_api.finish_run(token)
     finally:
@@ -718,7 +718,7 @@ async def test_end_to_end_real_subprocess(tmp_path):
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
-            "yacron2",
+            "cronstable",
             "state",
             "set",
             "greeting",
@@ -730,8 +730,8 @@ async def test_end_to_end_real_subprocess(tmp_path):
         _out, err = await proc.communicate()
         assert proc.returncode == 0, err.decode(errors="replace")
         # it landed in the job's own default scope (the job name), through the
-        # endpoint the child reached over the injected YACRON2_STATE_URL.
-        from yacron2 import jobstate
+        # endpoint the child reached over the injected CRONSTABLE_STATE_URL.
+        from cronstable import jobstate
 
         body = await jobstate.kv_get(cron.state_backend, "j", "greeting")
         assert body is not None and body["value"] == "hi"
@@ -769,7 +769,7 @@ async def test_cli_subprocess_ignores_proxy_env(tmp_path):
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
-            "yacron2",
+            "cronstable",
             "state",
             "set",
             "via",
@@ -780,7 +780,7 @@ async def test_cli_subprocess_ignores_proxy_env(tmp_path):
         )
         _out, err = await proc.communicate()
         assert proc.returncode == 0, err.decode(errors="replace")
-        from yacron2 import jobstate
+        from cronstable import jobstate
 
         body = await jobstate.kv_get(cron.state_backend, "j", "via")
         assert body is not None and body["value"] == "loopback"
@@ -806,7 +806,7 @@ async def test_cron_stages_secrets(tmp_path):
         async with aiohttp.ClientSession(
             headers={"Authorization": "Bearer " + token}
         ) as s:
-            url = env["YACRON2_STATE_URL"] + "/v1/secret/get?name=TOKEN"
+            url = env["CRONSTABLE_STATE_URL"] + "/v1/secret/get?name=TOKEN"
             r = await s.get(url)
             assert (await r.json())["value"] == "s3cr3t"
         await cron._job_api.finish_run(token)

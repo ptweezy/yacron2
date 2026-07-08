@@ -1,7 +1,7 @@
 """Regression tests for the hardened durable-state plumbing in cron.py.
 
 Each test pins a bug confirmed by the adversarial review of the
-scheduler-side state integration (:mod:`yacron2.cron`); if one of those
+scheduler-side state integration (:mod:`cronstable.cron`); if one of those
 fixes regresses, the matching test here must fail.  Covered:
 
 * store errors and hung reads must degrade the stateful features, never
@@ -26,11 +26,11 @@ from tests.test_state import (
     _cron_with_watermark,
     _state_cfg,
 )
-from yacron2 import cron as cron_mod
-from yacron2.cron import Cron, JobRunInfo, _job_run_info_from_dict
-from yacron2.job import JobOutputStream, JobRetryState
-from yacron2.redact import REDACTED
-from yacron2.state import make_state_backend
+from cronstable import cron as cron_mod
+from cronstable.cron import Cron, JobRunInfo, _job_run_info_from_dict
+from cronstable.job import JobOutputStream, JobRetryState
+from cronstable.redact import REDACTED
+from cronstable.state import make_state_backend
 
 _ONE_JOB = (
     "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
@@ -677,7 +677,7 @@ async def test_backfill_idle_wait_is_bounded_for_allow_policy(
     # launches is pacing there, not correctness, so it must give up and
     # launch rather than starve the backfill and hold the checkpoint open.
     monkeypatch.setattr(
-        "yacron2.cron.CATCHUP_IDLE_WAIT_LIMIT", 0.0
+        "cronstable.cron.CATCHUP_IDLE_WAIT_LIMIT", 0.0
     )  # give up immediately: no wall-clock waiting in the test
     cron = await _cron_with_watermark(
         tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
@@ -757,8 +757,8 @@ async def test_gc_reclaims_removed_scope_artifacts_and_orphan_blobs(
     # must age out a removed scope's stream and sweep its blob, while a
     # config job's scope, the shared scope, a referenced blob, and a
     # just-written (not-yet-recorded) blob all survive.
-    import yacron2.state as state_mod
-    from yacron2 import jobstate
+    import cronstable.state as state_mod
+    from cronstable import jobstate
 
     cron = Cron(None, config_yaml=_ONE_JOB)
     await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
@@ -806,8 +806,8 @@ async def test_gc_blob_sweep_skipped_when_artifact_stream_hidden(
     # references inside them -- are invisible.  The sweep must then not run
     # at all this pass (the hidden stream's blob would otherwise read as an
     # orphan and a LIVE payload would be deleted).
-    import yacron2.state as state_mod
-    from yacron2 import jobstate
+    import cronstable.state as state_mod
+    from cronstable import jobstate
 
     cron = Cron(None, config_yaml=_ONE_JOB)
     await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
@@ -847,8 +847,8 @@ async def test_gc_leaves_artifacts_unmanaged_without_scope_manifests(
     # advertising, its node's shared artifact scopes are unknowable, so
     # artifact streams must stay wholly unmanaged (kept) -- even an aged,
     # unreferenced scope -- while ordinary job streams still collect.
-    import yacron2.state as state_mod
-    from yacron2 import jobstate
+    import cronstable.state as state_mod
+    from cronstable import jobstate
 
     cron = Cron(None, config_yaml=_ONE_JOB)
     await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
@@ -883,7 +883,7 @@ async def test_gc_pass_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
     # on in durable Replace-cancel records (cron._request_replace /
     # _slot_renewer), so no grace window ever makes a slot fence reset
     # safe.
-    import yacron2.state as state_mod
+    import cronstable.state as state_mod
 
     cron = Cron(None, config_yaml=_ONE_JOB)
     await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))

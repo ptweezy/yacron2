@@ -11,7 +11,7 @@ import time
 import aiohttp
 import pytest
 
-from yacron2.backends.etcd import (
+from cronstable.backends.etcd import (
     _MIN_USABLE_TTL,
     EtcdBackend,
     _b64,
@@ -24,7 +24,7 @@ from yacron2.backends.etcd import (
     lease_ttl_from_grant,
     lease_ttl_from_keepalive,
 )
-from yacron2.config import parse_config_string
+from cronstable.config import parse_config_string
 
 NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
@@ -38,7 +38,7 @@ def _backend(extra="", endpoint="http://127.0.0.1:2379"):
         "  etcd:\n"
         "    endpoints:\n"
         "      - " + endpoint + "\n"
-        "    electionName: yacron2/leader\n"
+        "    electionName: cronstable/leader\n"
         "    ttl: 15\n" + extra
     )
     cfg = parse_config_string(yaml, "").cluster_config
@@ -55,8 +55,8 @@ def _utc_now_plus(seconds):
 
 
 def test_b64_roundtrip():
-    assert _b64("yacron2/leader") == base64.b64encode(
-        b"yacron2/leader"
+    assert _b64("cronstable/leader") == base64.b64encode(
+        b"cronstable/leader"
     ).decode("ascii")
     assert _b64decode(_b64("node-a")) == "node-a"
 
@@ -65,8 +65,8 @@ def test_b64_roundtrip():
 
 
 def test_build_campaign_txn_structure():
-    txn = build_campaign_txn("yacron2/leader", "node-a", "777")
-    key = _b64("yacron2/leader")
+    txn = build_campaign_txn("cronstable/leader", "node-a", "777")
+    key = _b64("cronstable/leader")
     compare = txn["compare"][0]
     assert compare == {
         "key": key,
@@ -217,7 +217,7 @@ def test_construction_defaults():
     b = _backend()
     assert b.backend_name == "etcd"
     assert b.identity == "node-a"
-    assert b.election_name == "yacron2/leader"
+    assert b.election_name == "cronstable/leader"
     assert b.ttl == 15
     assert b.renew_period == 5.0
     assert b.endpoints == ["http://127.0.0.1:2379"]
@@ -423,7 +423,7 @@ def test_view_dict_and_lease_detail():
     view = b.view_dict()
     assert view["backend"] == "etcd"
     assert view["is_leader"] is True
-    assert view["lease"]["electionName"] == "yacron2/leader"
+    assert view["lease"]["electionName"] == "cronstable/leader"
     assert view["lease"]["identity"] == "node-a"
     assert view["lease"]["holder"] == "node-a"
     assert view["lease"]["leaseId"] == "777"
@@ -468,7 +468,7 @@ async def test_renew_once_anchors_deadline_to_presend_lower_bound(monkeypatch):
     # wins the freed key (two leaders run a Leader job). The campaign read's
     # latency must likewise be excluded.
     clock = [100.0]
-    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
     b = _backend()  # ttl 15
     grant_latency = 2.0  # a slow grant RTT, larger than the 1s skew margin
     campaign_latency = 4.0
@@ -507,7 +507,7 @@ async def test_renew_once_keepalive_narrows_then_regrants(monkeypatch):
     # below the configured value must narrow the deadline; a keepalive of 0
     # (lease gone) must drop the lease, re-grant, and re-campaign.
     clock = [100.0]
-    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
     b = _backend()  # ttl 15
     state = {"keepalive_ttl": 6}
 
@@ -547,7 +547,7 @@ async def test_renew_once_keepalive_anchors_fence_to_presend(monkeypatch):
     # narrows-then-regrants test pins the clock so it cannot catch that; this
     # injects keepalive latency and asserts the fence excludes it.
     clock = [100.0]
-    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
     b = _backend()  # ttl 15
     keepalive_latency = 3.0  # a slow keepalive RTT, larger than the 1s skew
 
@@ -587,7 +587,7 @@ async def test_renew_once_lease_lost_then_regrant_fails_self_demotes(
     # Previously the keepalive branch cleared _is_leader directly, which made
     # _is_self_demoted_holder() False -> the PreferLeader job ran nowhere.
     clock = [100.0]
-    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
     b = _backend()  # ttl 15
     fail_grant = {"on": False}
 
@@ -631,7 +631,7 @@ async def test_renew_once_recovers_collapsed_cadence_when_not_quorate(
     # reconnect POSTs run at the full timeout budget rather than the collapsed
     # ~0.2s a narrowed ttl=3 would give.
     clock = [100.0]
-    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
     b = _backend()  # ttl 15
     # simulate a prior narrowing to the minimum AND lost contact (not quorate)
     b._effective_ttl = 3
@@ -671,7 +671,7 @@ async def test_cadence_widening_does_not_resurrect_quorum(monkeypatch):
     # (configured - granted) extra seconds of a store outage, while /cluster
     # falsely reports the node quorate with that stale leader.
     clock = [1000.0]
-    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    monkeypatch.setattr("cronstable.backends.etcd._monotonic", lambda: clock[0])
     b = _backend()  # configured ttl 15
     # a successful FOLLOWER round under a server-narrowed ttl of 5 (node-b
     # holds the key): the freshness window is 5s from this contact, not 15.
@@ -765,7 +765,7 @@ def test_narrow_effective_ttl_below_min_is_honoured_not_inflated(caplog):
     import logging
 
     b = _backend()
-    with caplog.at_level(logging.WARNING, logger="yacron2.backends.etcd"):
+    with caplog.at_level(logging.WARNING, logger="cronstable.backends.etcd"):
         b._narrow_effective_ttl(1)
     assert b._effective_ttl == 1  # honoured, NOT inflated to _MIN_USABLE_TTL
     assert b._effective_ttl < _MIN_USABLE_TTL
@@ -781,7 +781,7 @@ def test_narrow_effective_ttl_warns_once_then_recovers(caplog):
     import logging
 
     b = _backend()
-    with caplog.at_level(logging.WARNING, logger="yacron2.backends.etcd"):
+    with caplog.at_level(logging.WARNING, logger="cronstable.backends.etcd"):
         b._narrow_effective_ttl(1)
         b._narrow_effective_ttl(2)  # still collapsed -> no second warning
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -815,9 +815,9 @@ def test_build_reboot_ran_cas_txn_structure():
     # this round and PUTs the merged value on success; the re-read on a lost
     # CAS is done by the caller's loop, so the txn's failure branch is empty.
     txn = build_reboot_ran_cas_txn(
-        "yacron2/leader/reboot-ran", "payload", "42"
+        "cronstable/leader/reboot-ran", "payload", "42"
     )
-    key = _b64("yacron2/leader/reboot-ran")
+    key = _b64("cronstable/leader/reboot-ran")
     assert txn["compare"][0] == {
         "key": key,
         "result": "EQUAL",
@@ -842,7 +842,7 @@ async def test_cas_write_reboot_ran_unions_on_contention(monkeypatch):
     # and persist nothing (re-running a deferred one-shot on failover).
     # The previous version of this test let the txn succeed purely on attempt
     # count and returned a static revision, so it passed under that bug.
-    from yacron2.leadership import decode_reboot_ran, encode_reboot_ran
+    from cronstable.leadership import decode_reboot_ran, encode_reboot_ran
 
     b = _backend()  # get_job_set_id -> "v1:job"
     b._reboot_ran_local = {"mine"}
@@ -906,7 +906,7 @@ async def test_cas_write_reboot_ran_reads_camelcase_mod_revision(monkeypatch):
     # only snake_case would fall back to "0", and the MOD==0 compare against an
     # EXISTING key never succeeds -> the mark is never persisted -> a deferred
     # one-shot re-runs after failover.
-    from yacron2.leadership import encode_reboot_ran
+    from cronstable.leadership import encode_reboot_ran
 
     b = _backend()
     b._reboot_ran_local = {"mine"}

@@ -23,17 +23,17 @@ import types
 
 import pytest
 
-import yacron2.platform as platform_mod
+import cronstable.platform as platform_mod
 from tests._commands import cmd_print, cmd_sleep, yaml_command
 from tests.test_state import (
     _count_launcher,
     _drain_state_writes,
     _state_cfg,
 )
-from yacron2.config import ConfigError, parse_config, parse_config_string
-from yacron2.cron import Cron
-from yacron2.fingerprint import job_digest
-from yacron2.job import JobRetryState
+from cronstable.config import ConfigError, parse_config, parse_config_string
+from cronstable.cron import Cron
+from cronstable.fingerprint import job_digest
+from cronstable.job import JobRetryState
 
 _UTC = datetime.timezone.utc
 
@@ -258,7 +258,7 @@ def test_fingerprint_stable_for_node_scope_only():
     # keys persisted retry invalidation and @reboot markers), so the new
     # field is included only when set to "cluster".
     plain = parse_config_string(_PLAIN_JOB, "").jobs[0]
-    from yacron2.fingerprint import canonical_job
+    from cronstable.fingerprint import canonical_job
 
     assert "concurrencyScope" not in canonical_job(plain)
     clustered = parse_config_string(_FORBID_JOB, "").jobs[0]
@@ -1009,7 +1009,7 @@ async def test_abandoned_claim_write_does_not_orphan_own_host_pending(
     # node's scans skip and rehydration never re-arms -- an unreclaimable
     # orphan. The timeout cancels the shielded write so the foreign record
     # stays newest and re-claimable.
-    import yacron2.cron as cron_mod
+    import cronstable.cron as cron_mod
 
     taker = await _resume_cron(tmp_path, _RETRY_JOB, "node-b")
     try:

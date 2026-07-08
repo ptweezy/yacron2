@@ -25,8 +25,8 @@ def main():
             ),
         )
         ctx.add_init_script(
-            "try{localStorage.setItem('yacron2.boot','false');"
-            "localStorage.setItem('yacron2.zen','false');}catch(e){}"
+            "try{localStorage.setItem('cronstable.boot','false');"
+            "localStorage.setItem('cronstable.zen','false');}catch(e){}"
             # pin the idle-cruising logo upright (see capture_dashboard.py)
             "document.addEventListener('DOMContentLoaded',()=>{"
             "const s=document.createElement('style');"

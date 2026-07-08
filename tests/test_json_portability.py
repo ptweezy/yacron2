@@ -1,4 +1,4 @@
-"""Fleet-portable value contract for the durable-JSON seam (yacron2._json).
+"""Fleet-portable value contract for the durable-JSON seam (cronstable._json).
 
 orjson (the optional ``speedups`` extra) and the stdlib disagree at the edges:
 orjson silently rewrites NaN/Infinity to ``null`` and rejects >64-bit ints,
@@ -13,7 +13,7 @@ import json as stdlib_json
 
 import pytest
 
-from yacron2 import _json
+from cronstable import _json
 
 
 @pytest.mark.parametrize(

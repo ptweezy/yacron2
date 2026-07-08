@@ -4,9 +4,9 @@ import os
 import pytest
 from aiohttp import web
 
-import yacron2.config
-import yacron2.cron
-from yacron2 import platform
+import cronstable.config
+import cronstable.cron
+from cronstable import platform
 
 
 def test_encode_argv_matches_platform():
@@ -32,10 +32,10 @@ def test_default_shell_matches_platform():
 
 def test_default_config_path_matches_platform():
     if platform.IS_WINDOWS:
-        assert platform.DEFAULT_CONFIG_PATH.endswith("yacron2")
-        assert platform.DEFAULT_CONFIG_PATH != "yacron2"  # has a parent dir
+        assert platform.DEFAULT_CONFIG_PATH.endswith("cronstable")
+        assert platform.DEFAULT_CONFIG_PATH != "cronstable"  # has a parent dir
     else:
-        assert platform.DEFAULT_CONFIG_PATH == "/etc/yacron2.d"
+        assert platform.DEFAULT_CONFIG_PATH == "/etc/cronstable.d"
 
 
 def test_supports_unix_sockets_matches_platform():
@@ -43,7 +43,7 @@ def test_supports_unix_sockets_matches_platform():
 
 
 def test_config_uses_platform_default_shell():
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         """
 jobs:
   - name: t
@@ -59,8 +59,8 @@ jobs:
     not platform.IS_WINDOWS, reason="user/group rejection is Windows-specific"
 )
 def test_user_group_rejected_on_windows():
-    with pytest.raises(yacron2.config.ConfigError) as exc:
-        yacron2.config.parse_config_string(
+    with pytest.raises(cronstable.config.ConfigError) as exc:
+        cronstable.config.parse_config_string(
             """
 jobs:
   - name: t
@@ -74,19 +74,19 @@ jobs:
 
 
 def test_web_site_from_url_unix_socket():
-    url = "unix:///tmp/yacron2.sock"
+    url = "unix:///tmp/cronstable.sock"
     if platform.IS_WINDOWS:
         # asyncio can't serve a unix socket on Windows: skipped as a bad entry
         # (raises before the runner is ever touched).
         with pytest.raises(ValueError):
-            yacron2.cron.web_site_from_url(None, url)
+            cronstable.cron.web_site_from_url(None, url)
     else:
         # POSIX: a unix listener is accepted. UnixSite.__init__ dereferences
         # runner.server, so pass a minimal stand-in instead of None.
         class _FakeRunner:
             server = object()
 
-        site = yacron2.cron.web_site_from_url(_FakeRunner(), url)
+        site = cronstable.cron.web_site_from_url(_FakeRunner(), url)
         assert isinstance(site, web.UnixSite)
 
 

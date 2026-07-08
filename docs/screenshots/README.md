@@ -8,7 +8,7 @@ grows an Owner column and flips the page into its fluid (wide) layout, and
 clipping. To refresh them after a UI change:
 
 1. **Boot the grand tour** (builds the image from the working tree, so your
-   local `yacron2/web/index.html` is what gets photographed), then give it
+   local `cronstable/web/index.html` is what gets photographed), then give it
    10-15 minutes of uptime so sparklines and history fill in:
 
    ```shell
@@ -33,7 +33,7 @@ clipping. To refresh them after a UI change:
    one-liners). Run it locally, then capture:
 
    ```shell
-   yacron2 -c docs/screenshots/logs-demo.yaml &
+   cronstable -c docs/screenshots/logs-demo.yaml &
    python docs/screenshots/capture_logs_closeup.py
    ```
 
@@ -71,8 +71,8 @@ Notes:
 * Prefer capturing at a "quiet minute" of the grand tour's deterministic
   failure calendar (see `example/grand-tour/README.md`) unless you *want* the
   incident chrome in frame.
-* Screenshot prefs are seeded through `localStorage` (`yacron2.boot`,
-  `yacron2.zen`, `yacron2.theme`, ...); the context needs `bypass_csp: true`
+* Screenshot prefs are seeded through `localStorage` (`cronstable.boot`,
+  `cronstable.zen`, `cronstable.theme`, ...); the context needs `bypass_csp: true`
   (the page CSP has no `unsafe-eval`) and `reduced_motion: "no-preference"`
   (headless Chromium otherwise suppresses the boot POST screen and CRT
   animation).

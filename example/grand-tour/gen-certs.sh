@@ -5,7 +5,7 @@
 # other cluster demos' gen-certs.sh, with the nine Meridian node names.
 #
 # FOR LOCAL EXPERIMENTATION ONLY. Real deployments provision per-node certs from
-# their own PKI; yacron2 only consumes them.
+# their own PKI; cronstable only consumes them.
 set -eu
 
 CERTS=/certs
@@ -44,7 +44,7 @@ EOF
     -out "$CERTS/$n.pem" -days 3650 -extfile "/tmp/$n.ext"
 done
 
-# yacron2 runs as uid 65534 (nobody) and must read its own leaf key, so hand the
+# cronstable runs as uid 65534 (nobody) and must read its own leaf key, so hand the
 # private keys to that uid and keep them owner-only (0600). Public material
 # (ca.pem, node *.pem) is meant to be shared and stays 0644.
 #

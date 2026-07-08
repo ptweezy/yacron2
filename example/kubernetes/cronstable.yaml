@@ -1,0 +1,50 @@
+# cronstable with the Kubernetes Lease leadership backend.
+#
+# Several replicas run from this same config; only the holder of the
+# coordination.k8s.io/v1 Lease named below runs the Leader-gated jobs. This is
+# a fenced, exactly-once election (as long as the apiserver is reachable),
+# unlike the best-effort gossip backend.
+#
+# The backend reaches the apiserver over its in-cluster service-account
+# credentials. By default it uses the official `kubernetes` client when that is
+# installed in the image and otherwise falls back to a hand-rolled apiserver
+# REST transport over the core aiohttp dependency -- so it needs no extra
+# dependency. Set clientLibrary: library to require the native client, or
+# clientLibrary: http to force the hand-rolled transport.
+cluster:
+  backend: kubernetes
+  # nodeName (and so the lease holderIdentity) defaults to the container
+  # hostname, which Kubernetes sets to the pod name -- already unique per
+  # replica, so each pod's identity names a real pod with no extra config.
+  kubernetes:
+    leaseName: cronstable-leader
+    # leaseNamespace defaults to the pod's own namespace (the service-account
+    # namespace file); set it only to use a Lease in a different namespace.
+    # A non-default namespace also needs the RBAC (Role + RoleBinding in
+    # deployment.yaml) to live in THAT namespace, or a ClusterRole +
+    # ClusterRoleBinding; a namespaced Role only covers its own namespace, so
+    # otherwise every lease call 403s and Leader jobs never run.
+    leaseDurationSeconds: 15
+    renewDeadlineSeconds: 10
+    retryPeriodSeconds: 2
+    # clientLibrary: auto   # auto (default) | library | http
+
+jobs:
+  - name: charge-cards            # exactly-once-ish: skip-tolerant, must not double-run
+    command: echo "charging cards on $(hostname)"
+    schedule: "*/2 * * * *"
+    clusterPolicy: Leader         # the default; only the lease holder runs it
+
+  - name: refresh-cache           # idempotent, must not be skipped
+    command: echo "refreshing cache on $(hostname)"
+    schedule: "*/1 * * * *"
+    clusterPolicy: PreferLeader   # holder runs it; if the apiserver is unreachable, runs anyway
+
+  - name: rotate-local-logs       # genuinely per-node work
+    command: echo "rotating logs on $(hostname)"
+    schedule: "*/5 * * * *"
+    clusterPolicy: EveryNode      # runs on every replica, independent of the lease
+
+web:
+  listen:
+    - http://0.0.0.0:8080

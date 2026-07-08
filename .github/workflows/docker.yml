@@ -20,7 +20,7 @@ name: docker
 #
 # The Debian image is the default: it gets the bare `latest`/`<version>` tags
 # (no suffix). The variants get `latest-<distro>` and `<version>-<distro>`.
-# yacron2 is a pure-Python app that supports any Python >= 3.10, so the per-distro
+# cronstable is a pure-Python app that supports any Python >= 3.10, so the per-distro
 # interpreter version is functionally invisible; each distro uses its own native
 # Python rather than source-building a single version everywhere.
 #
@@ -195,7 +195,7 @@ jobs:
           # required") and aborts the whole job, taking the otherwise-safe GHCR
           # push down with it. Demanding both degrades cleanly to GHCR-only.
           if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
-            images="${images}"$'\n'"docker.io/${DOCKERHUB_USERNAME}/yacron2"
+            images="${images}"$'\n'"docker.io/${DOCKERHUB_USERNAME}/cronstable"
             dockerhub=true
           fi
           {

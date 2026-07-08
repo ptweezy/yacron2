@@ -1,10 +1,10 @@
-"""Backend maintenance mechanics + the `yacron2 state` admin CLI.
+"""Backend maintenance mechanics + the `cronstable state` admin CLI.
 
 Backend half (FilesystemStateBackend): the self-observability stats
 (op counts/errors/latency, lock waits), the maxOpsPerSecond token bucket,
 the store version stamp, collect_garbage's deletion rules, and
-migrate_schema's converter walk.  CLI half (yacron2.state_admin via
-yacron2.__main__): backup/restore/migrate/gc/check/migrate-schema driven
+migrate_schema's converter walk.  CLI half (cronstable.state_admin via
+cronstable.__main__): backup/restore/migrate/gc/check/migrate-schema driven
 through main_loop with the test_main.py argv/exit pattern.
 """
 
@@ -19,10 +19,10 @@ from pathlib import Path
 
 import pytest
 
-import yacron2.__main__
-import yacron2.state as state_mod
-from yacron2.platform import IS_WINDOWS
-from yacron2.state import _TokenBucket
+import cronstable.__main__
+import cronstable.state as state_mod
+from cronstable.platform import IS_WINDOWS
+from cronstable.state import _TokenBucket
 from tests.test_state import _backend
 
 _UTC = datetime.timezone.utc
@@ -92,7 +92,7 @@ async def test_token_bucket_burst_then_wait():
 
 
 def test_gc_grace_config_floor(tmp_path):
-    from yacron2.config import ConfigError, parse_config_string
+    from cronstable.config import ConfigError, parse_config_string
 
     with pytest.raises(ConfigError, match="gcGraceSeconds"):
         parse_config_string(
@@ -156,7 +156,7 @@ async def test_meta_stamp_newer_scheme_warns(tmp_path, caplog):
                 ).encode()
             )
     backend2 = _backend(tmp_path)
-    with caplog.at_level("WARNING", logger="yacron2.state"):
+    with caplog.at_level("WARNING", logger="cronstable.state"):
         await backend2.start()
     assert any(
         "record scheme 'v9'" in r.getMessage() for r in caplog.records
@@ -318,7 +318,7 @@ async def test_migrate_schema_counts_converter_failures(
     assert result["unknown"] == 1
 
 
-# --- the `yacron2 state` CLI ------------------------------------------------
+# --- the `cronstable state` CLI ------------------------------------------------
 
 
 _JOB_BLOCK = """jobs:
@@ -359,10 +359,10 @@ def _read_store(store, stream):
 def _cli(monkeypatch, argv):
     loop = asyncio.new_event_loop()
     try:
-        monkeypatch.setattr(sys, "argv", ["yacron2"] + argv)
+        monkeypatch.setattr(sys, "argv", ["cronstable"] + argv)
         monkeypatch.setattr(sys, "exit", _exit)
         with pytest.raises(ExitError) as excinfo:
-            yacron2.__main__.main_loop(loop)
+            cronstable.__main__.main_loop(loop)
         return excinfo.value.args[0]
     finally:
         loop.close()
@@ -625,7 +625,7 @@ def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_gc_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
-    # `yacron2 state gc` must pass the ephemeral-lease prefix through like
+    # `cronstable state gc` must pass the ephemeral-lease prefix through like
     # the daemon's pass: a dead-past-grace dagadvance/ per-run lease is
     # reclaimed while a slots/ lease of the same age survives (its fence
     # can live on in durable Replace-cancel records, so no grace window
@@ -691,14 +691,14 @@ def _seed_gc_manifests(backend_coro_store):
 
 
 def test_cli_gc_reclaims_artifacts_and_blobs(tmp_path, monkeypatch, capsys):
-    # `yacron2 state gc` must reclaim what the daemon pass reclaims: a
+    # `cronstable state gc` must reclaim what the daemon pass reclaims: a
     # removed scope's artifact stream ages out and the orphaned payload
     # blob is swept -- with --dry-run reporting both without deleting.
     store = tmp_path / "store"
     config = _write_config(tmp_path, store)
 
     async def seed():
-        from yacron2 import jobstate
+        from cronstable import jobstate
 
         backend = _backend(store)
         await backend.start()
@@ -757,7 +757,7 @@ def test_cli_gc_sweep_skipped_on_hidden_artifact_stream(
     config = _write_config(tmp_path, store)
 
     async def seed():
-        from yacron2 import jobstate
+        from cronstable import jobstate
 
         backend = _backend(store)
         await backend.start()
@@ -813,7 +813,7 @@ def test_cli_state_without_action(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_root_config_position_also_works(tmp_path, monkeypatch, capsys):
-    # `yacron2 -c X state check` (root -c before the subcommand)
+    # `cronstable -c X state check` (root -c before the subcommand)
     store = tmp_path / "store"
     config = _write_config(tmp_path, store)
     _seed_store(store)

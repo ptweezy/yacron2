@@ -1,28 +1,28 @@
-A simple example of how to add yacron2 to a docker image.  To try it out,
+A simple example of how to add cronstable to a docker image.  To try it out,
 run for instance:
 
-	$ docker build -t yacron2demo .
-	$ docker run -ti yacron2demo -l DEBUG  # Ctrl-C to stop
+	$ docker build -t cronstabledemo .
+	$ docker run -ti cronstabledemo -l DEBUG  # Ctrl-C to stop
 
 Moreover, you can find an example of deploying to Kubernetes in the
 ``k8s-deploy.yaml`` file.  To test:
 
 	$ kubectl apply -f k8s-deploy.yaml
-	deployment "yacron2demo" created
+	deployment "cronstabledemo" created
 
 Check that the pod was created:
 
-	$ kubectl get pods -l app=yacron2demo
+	$ kubectl get pods -l app=cronstabledemo
 	NAME                         READY     STATUS    RESTARTS   AGE
-	yacron2demo-cffff957f-9dt5r   1/1       Running   0          1m
+	cronstabledemo-cffff957f-9dt5r   1/1       Running   0          1m
 
 Follow the logs from the pod:
 
-	$ kubectl logs --timestamps -f yacron2demo-cffff957f-9dt5r
+	$ kubectl logs --timestamps -f cronstabledemo-cffff957f-9dt5r
 
 (hit Ctrl-C to stop following logs)
 
 To undo the changes and stop the pod:
 
-	$ kubectl delete deployment yacron2demo
-	deployment "yacron2demo" deleted
+	$ kubectl delete deployment cronstabledemo
+	deployment "cronstabledemo" deleted

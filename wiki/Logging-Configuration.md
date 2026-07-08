@@ -1,6 +1,6 @@
 # Logging Configuration
 
-This page documents how yacron2 produces its own diagnostic log output: the
+This page documents how cronstable produces its own diagnostic log output: the
 default behavior driven by `-l/--log-level`, and the optional `logging:` config
 section that applies a full Python `logging.config` dictionary schema. It does
 not cover capturing a job's stdout/stderr (see
@@ -9,7 +9,7 @@ job success/failure (see [Reporting](Reporting)).
 
 ## Default logging (no `logging:` section)
 
-When the configuration contains no `logging:` section, yacron2's log output is
+When the configuration contains no `logging:` section, cronstable's log output is
 governed entirely by the CLI. At startup, `__main__.py` calls:
 
 ```python
@@ -33,7 +33,7 @@ afterwards during the scheduler loop, overriding it.
 ## The `logging:` section
 
 The `logging:` section is a Python `logging.config` *dictionary schema*
-(the same structure accepted by `logging.config.dictConfig`). yacron2 validates
+(the same structure accepted by `logging.config.dictConfig`). cronstable validates
 its top-level shape with strictyaml and then hands the whole dictionary to
 `logging.config.dictConfig`.
 
@@ -79,7 +79,7 @@ caught at config-parse time; it surfaces when `dictConfig` runs (see
 | --- | --- | --- | --- |
 | `version` | int | (required) | dictConfig schema version. Must be present. The only value `logging.config.dictConfig` currently accepts is `1`. |
 | `incremental` | bool | optional (dictConfig default `false`) | If `true`, the configuration is interpreted incrementally: existing loggers/handlers are kept and only handler/logger *levels* and `propagate` flags are adjusted; `formatters`/`filters` and handler creation are ignored. See the dictConfig docs. |
-| `disable_existing_loggers` | bool | optional (dictConfig default `true`) | If `true` (the dictConfig default), loggers that exist at the time `dictConfig` runs but are not named in this config are disabled. The README example sets this to `false` so previously-created loggers (e.g. `yacron2`) keep working. Ignored when `incremental` is `true`. |
+| `disable_existing_loggers` | bool | optional (dictConfig default `true`) | If `true` (the dictConfig default), loggers that exist at the time `dictConfig` runs but are not named in this config are disabled. The README example sets this to `false` so previously-created loggers (e.g. `cronstable`) keep working. Ignored when `incremental` is `true`. |
 | `formatters` | mapping | optional | Named formatter definitions (`format`, `datefmt`, etc.), as in dictConfig. Contents unvalidated by strictyaml. |
 | `filters` | mapping | optional | Named filter definitions, as in dictConfig. Contents unvalidated by strictyaml. |
 | `handlers` | mapping | optional | Named handler definitions (`class`, `level`, `formatter`, `stream`, etc.). Contents unvalidated by strictyaml. |
@@ -88,29 +88,29 @@ caught at config-parse time; it surfaces when `dictConfig` runs (see
 
 The defaults shown for `incremental` and `disable_existing_loggers` are the
 defaults of `logging.config.dictConfig` itself; they are *not* defined in
-yacron2's `DEFAULT_CONFIG`. yacron2 supplies no values for any logging key; what
+cronstable's `DEFAULT_CONFIG`. cronstable supplies no values for any logging key; what
 you write is passed through verbatim. Only `version` is required by the schema;
 all other keys are optional (strictyaml `Opt(...)`).
 
-### Logger names used by yacron2
+### Logger names used by cronstable
 
-yacron2 emits log records under these logger names. Target them in `loggers:` to
+cronstable emits log records under these logger names. Target them in `loggers:` to
 tune their levels independently, or rely on `root:` to catch them all:
 
 | Logger | Source module | Emits |
 | --- | --- | --- |
-| `yacron2` | `cron.py`, `job.py` | Scheduler lifecycle, job start/spawn/exit, retries, web server start/stop, shutdown, and most operational messages. |
-| `yacron2.config` | `config.py` | Configuration parsing diagnostics (e.g. the converted schedule string at `DEBUG`). |
+| `cronstable` | `cron.py`, `job.py` | Scheduler lifecycle, job start/spawn/exit, retries, web server start/stop, shutdown, and most operational messages. |
+| `cronstable.config` | `config.py` | Configuration parsing diagnostics (e.g. the converted schedule string at `DEBUG`). |
 | `statsd` | `statsd.py` | statsd metric-writer diagnostics. See [Metrics with statsd](Metrics-with-Statsd). |
 | `prometheus` | `prometheus.py` | Prometheus `/metrics` endpoint diagnostics (e.g. a cluster-backend read failing during a scrape). See [Metrics with Prometheus](Metrics-with-Prometheus). |
 
-Because `yacron2.config` is a child of `yacron2`, configuring the `yacron2`
+Because `cronstable.config` is a child of `cronstable`, configuring the `cronstable`
 logger affects it too (subject to `propagate`). The `statsd` logger is a
 separate top-level logger.
 
 ## Reload and error handling
 
-yacron2 re-reads its configuration on every scheduler tick (roughly once per
+cronstable re-reads its configuration on every scheduler tick (roughly once per
 minute; see [Architecture and Internals](Architecture-and-Internals)). The
 `logging:` section participates in this reload with specific rules, implemented
 in `cron.py`:
@@ -124,7 +124,7 @@ in `cron.py`:
   the dictConfig schema documentation, and including the offending config) and
   does **not** record it as applied.
 - Consequently, a `logging:` section that was **broken and then fixed** is
-  picked up on the next reload **without restarting yacron2**, because the
+  picked up on the next reload **without restarting cronstable**, because the
   broken version was never marked applied, the corrected version still counts as
   "changed" and is retried.
 
@@ -153,7 +153,7 @@ files in a directory are aggregated and for the matching rule that applies to th
 
 ## Notes
 
-- The `logging:` section configures **yacron2's own** logging only. It has no
+- The `logging:` section configures **cronstable's own** logging only. It has no
   effect on how a job's captured output is stored or reported.
 - Validating the configuration with `-v/--validate-config` checks the top-level
   schema of the `logging:` section but does **not** call `dictConfig`, so a

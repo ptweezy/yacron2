@@ -1,9 +1,9 @@
-# The yacron2 Grand Tour — "Meridian"
+# The cronstable Grand Tour — "Meridian"
 
-**Every yacron2 feature, at once, in one coherent deployment.**
+**Every cronstable feature, at once, in one coherent deployment.**
 
 Meridian is a fictional global commerce platform. Its entire scheduled
-back-office runs on a **nine-node, mutual-TLS, leader-electing yacron2 cluster**
+back-office runs on a **nine-node, mutual-TLS, leader-electing cronstable cluster**
 (`distribution: spread`) that shares **one durable state store**. On top of that
 fleet it runs, all together:
 
@@ -207,10 +207,10 @@ their own:
 
     ```console
     dc="docker compose -f docker-compose-grand-tour.yml"
-    $dc exec meridian-a yacron2 -c /tmp/yacron2.d state check         # inventory: record counts per prefix
-    $dc exec meridian-a yacron2 -c /tmp/yacron2.d state gc --dry-run  # preview reclaimable state
-    $dc exec meridian-a yacron2 -c /tmp/yacron2.d state backup -o /tmp/meridian-state.tar.gz
-    $dc exec meridian-a yacron2 -c /tmp/yacron2.d -v                  # --validate-config: "Configuration is valid."
+    $dc exec meridian-a cronstable -c /tmp/cronstable.d state check         # inventory: record counts per prefix
+    $dc exec meridian-a cronstable -c /tmp/cronstable.d state gc --dry-run  # preview reclaimable state
+    $dc exec meridian-a cronstable -c /tmp/cronstable.d state backup -o /tmp/meridian-state.tar.gz
+    $dc exec meridian-a cronstable -c /tmp/cronstable.d -v                  # --validate-config: "Configuration is valid."
     ```
 
     `check`, `gc --dry-run` and `backup` are safe while the daemon runs;
@@ -221,7 +221,7 @@ their own:
 
 ## Alternate leadership backends (config only)
 
-Beyond `gossip` and `filesystem`, yacron2 can elect over **etcd** or a
+Beyond `gossip` and `filesystem`, cronstable can elect over **etcd** or a
 **Kubernetes** Lease. They need an external service / control plane, so they are
 not wired into this compose file, but the `cluster:` config is a one-liner swap.
 etcd (HTTP-only, no extra Python deps):
@@ -232,7 +232,7 @@ cluster:
   nodeName: meridian-a
   etcd:
     endpoints: [http://etcd:2379]
-    electionName: yacron2/leader
+    electionName: cronstable/leader
     ttl: 15
 ```
 
@@ -244,7 +244,7 @@ cluster:
   backend: kubernetes
   nodeName: meridian-a          # usually the pod name (downward API)
   kubernetes:
-    leaseName: yacron2-leader
+    leaseName: cronstable-leader
     leaseNamespace: meridian
     clientLibrary: http         # hand-rolled HTTP client, no `kubernetes` dep
 ```

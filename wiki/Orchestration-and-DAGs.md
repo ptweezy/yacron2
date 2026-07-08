@@ -1,6 +1,6 @@
 # Orchestration and DAGs
 
-yacron2 schedules independent jobs. A **DAG** (the optional `dags:` section)
+cronstable schedules independent jobs. A **DAG** (the optional `dags:` section)
 adds the other axis: a durable, dependency-ordered **workflow** of tasks, run
 on a schedule, that survives restarts and coordinates across a fleet exactly
 the way the rest of [Durable State](Durable-State) does. It is a small
@@ -12,7 +12,7 @@ is **no new coordination service, no new backend, no client library**:
 - a **task** is an ordinary job invocation -- the same command/shell/env/
   timeout machinery, launched the same way, with the same
   [loopback state endpoint](Durable-State#state-as-a-job-primitive) injected,
-  so a task can call `yacron2 xcom|artifact|state|lock|...`;
+  so a task can call `cronstable xcom|artifact|state|lock|...`;
 - **cross-task data** (XCom) rides the artifact store, scoped per dag_run;
 - the scheduler advances each run under a single **lease**, so across a fleet a
   task is never launched twice and a run is never double-advanced.
@@ -36,16 +36,16 @@ is **no new coordination service, no new backend, no client library**:
 
 ```yaml
 state:
-  path: /var/lib/yacron2/state      # DAGs need a state store + jobApi
+  path: /var/lib/cronstable/state      # DAGs need a state store + jobApi
 dags:
   - name: nightly-etl
     schedule: "0 2 * * *"
     tasks:
       - id: extract
-        command: "echo '[1,2,3]' | yacron2 xcom push --key ids"
+        command: "echo '[1,2,3]' | cronstable xcom push --key ids"
       - id: transform
         dependsOn: [extract]
-        command: "yacron2 xcom pull --task extract --key ids"
+        command: "cronstable xcom pull --task extract --key ids"
       - id: load
         dependsOn: [transform]
         command: "echo loading"
@@ -105,25 +105,25 @@ if any task ended `failed` or `upstream_failed`. `skipped` is not a failure.
 
 A task publishes a small output under a key; a downstream task reads it. XCom
 is a thin, task-keyed convention over the [artifact store](Durable-State),
-scoped to the dag_run, driven by the `yacron2 xcom` CLI the daemon makes
+scoped to the dag_run, driven by the `cronstable xcom` CLI the daemon makes
 reachable in every task:
 
 ```bash
 # in an upstream task:
-echo '{"rows": 42}' | yacron2 xcom push --key summary
-yacron2 xcom push --key summary producer_output_file.json    # or from a file
+echo '{"rows": 42}' | cronstable xcom push --key summary
+cronstable xcom push --key summary producer_output_file.json    # or from a file
 
 # in a downstream task:
-yacron2 xcom pull --task upstream_id --key summary            # -> stdout
-yacron2 xcom pull --task upstream_id --key summary -o out.json
-yacron2 xcom list                                            # keys in this run
+cronstable xcom pull --task upstream_id --key summary            # -> stdout
+cronstable xcom pull --task upstream_id --key summary -o out.json
+cronstable xcom list                                            # keys in this run
 ```
 
 Outputs are content-addressed and versioned (newest wins by key). The daemon
 injects the run's identity so the CLI needs no arguments beyond the key:
-`YACRON2_DAG_NAME`, `YACRON2_DAG_RUN_ID`, `YACRON2_DAG_TASK`,
-`YACRON2_DAG_TASKKEY`, `YACRON2_DAG_MAP_INDEX`, `YACRON2_DAG_MAP_ITEM`,
-`YACRON2_DAG_XCOM_SCOPE`.
+`CRONSTABLE_DAG_NAME`, `CRONSTABLE_DAG_RUN_ID`, `CRONSTABLE_DAG_TASK`,
+`CRONSTABLE_DAG_TASKKEY`, `CRONSTABLE_DAG_MAP_INDEX`, `CRONSTABLE_DAG_MAP_ITEM`,
+`CRONSTABLE_DAG_XCOM_SCOPE`.
 
 ## Fan-out: dynamic mapping
 
@@ -132,18 +132,18 @@ XCom list (Airflow's `.expand()`):
 
 ```yaml
       - id: list-work
-        command: "echo '[\"a\",\"b\",\"c\"]' | yacron2 xcom push --key items"
+        command: "echo '[\"a\",\"b\",\"c\"]' | cronstable xcom push --key items"
       - id: process
         dependsOn: [list-work]
         expand:
           fromTask: list-work      # a direct, non-mapped dependency
           key: items               # its XCom list
-        command: "echo processing $YACRON2_DAG_MAP_ITEM (#$YACRON2_DAG_MAP_INDEX)"
+        command: "echo processing $CRONSTABLE_DAG_MAP_ITEM (#$CRONSTABLE_DAG_MAP_INDEX)"
 ```
 
 When `list-work` succeeds, the scheduler reads its `items` list and materialises
 `process#0`, `process#1`, `process#2`, each with its own state, retries and
-XCom, and its item in `$YACRON2_DAG_MAP_ITEM`. A downstream task that
+XCom, and its item in `$CRONSTABLE_DAG_MAP_ITEM`. A downstream task that
 `dependsOn: [process]` waits for **all** the mapped instances (fan-in). An
 empty list resolves the mapped task to `success` immediately.
 
@@ -230,7 +230,7 @@ or a foreign owner proven dead by the lease lapse) is retried if attempts
 remain, else failed; a sensor mid-poke is re-poked; an approval gate keeps
 waiting. This mirrors the job-level
 [crash reconciliation](Durable-State#crash-reconciliation) seam. Like every
-yacron2 coordination primitive it is **at-least-once**, not exactly-once: a
+cronstable coordination primitive it is **at-least-once**, not exactly-once: a
 task whose process outlives a crashed daemon may run again on resume, so a task
 that must be exactly-once should guard its side effect with an
 [idempotency key](Durable-State#idempotency-keys).
@@ -261,5 +261,5 @@ Over the [HTTP control API](HTTP-API#dag-endpoints):
 - `POST /dags/{name}/backfill` — replay a date range
 - `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision` — approve/reject a gate
 
-See [example/dag/](https://github.com/ptweezy/yacron2/tree/develop/example/dag)
+See [example/dag/](https://github.com/ptweezy/cronstable/tree/develop/example/dag)
 for a complete configuration exercising every node type.

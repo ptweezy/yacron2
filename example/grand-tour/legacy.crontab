@@ -1,12 +1,12 @@
 # Meridian grand tour — a CLASSIC Vixie crontab, run as-is.  [feature: classic crontab]
 #
-# yacron2 loads a *.crontab / *.cron / "crontab" file in the same config
+# cronstable loads a *.crontab / *.cron / "crontab" file in the same config
 # directory next to the YAML, in the classic five-field format. Each entry
-# below becomes an ordinary yacron2 job named "legacy:<line>", with yacron2's
+# below becomes an ordinary cronstable job named "legacy:<line>", with cronstable's
 # standard defaults (UTC; failure = non-zero exit or stderr). NAME=value lines,
 # the @daily nickname, and \% escapes all work as in `man 5 crontab`.
 #
-# This proves the migration story: point yacron2 at your existing crontab and
+# This proves the migration story: point cronstable at your existing crontab and
 # it runs unchanged; move an entry to YAML only when it needs retries,
 # reporting, timeouts, or the other per-job options above.
 

@@ -1,6 +1,6 @@
 # HTTP Control API
 
-yacron2 exposes an optional [aiohttp](https://docs.aiohttp.org/) REST control API,
+cronstable exposes an optional [aiohttp](https://docs.aiohttp.org/) REST control API,
 enabled by adding a top-level `web` section to the configuration. It serves
 endpoints for querying the daemon version, inspecting job status, starting and
 cancelling jobs on demand, reading per-job run history, tailing captured job
@@ -9,7 +9,7 @@ a `cluster` section is configured) reporting the cluster and fleet views. This p
 bearer-token authentication, Unix-socket permissions, and lifecycle behavior.
 
 The interface is inherited from upstream yacron; `web.authToken` and
-`web.socketMode` are yacron2 additions.
+`web.socketMode` are cronstable additions.
 
 > **Looking for the browser UI?** The same HTTP interface also serves the
 > built-in **[Web Dashboard](Web-Dashboard)** at `/` on every `http://` listener
@@ -24,7 +24,7 @@ Add a `web` section with at least one `listen` URL:
 web:
   listen:
     - http://127.0.0.1:8080
-    - unix:///tmp/yacron2.sock
+    - unix:///tmp/cronstable.sock
 ```
 
 > **Windows:** `unix://` listeners are not supported on Windows. On Windows
@@ -42,7 +42,7 @@ or a second file in a config directory raises a `ConfigError`. See
 
 ## Configuration reference
 
-The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `yacron2/config.py`.
+The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `cronstable/config.py`.
 `listen` is required; the rest are optional (strictyaml `Opt(...)`).
 
 | Option | Type | Default | Description |
@@ -61,7 +61,7 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `yacron2/config
 
 Any other scheme is logged (`scheme ... not supported`) and skipped. Binding maps to
 `web.TCPSite` for `http` and `web.UnixSite` for `unix` (`web_site_from_url` in
-`yacron2/cron.py`).
+`cronstable/cron.py`).
 
 `https` is not a recognized scheme. To serve the API over TLS, bind to a loopback
 `http` address or a `unix` socket (POSIX-only; on Windows use a loopback `http`
@@ -115,7 +115,7 @@ job) and `401` (authentication failure) responses are raised without it.
 
 ### `GET /version`
 
-Returns the yacron2 version as `text/plain` (the value of `yacron2.version.version`).
+Returns the cronstable version as `text/plain` (the value of `cronstable.version.version`).
 
 ```shell
 $ http get http://127.0.0.1:8080/version
@@ -260,7 +260,7 @@ Content-Type: application/json; charset=utf-8
     "leader": "node-a",
     "is_leader": true,
     "peers": [
-        {"host": "yacron-b.internal:8443", "status": "agreed", "node_name": "node-b", "job_set_id": "v1:…", "last_seen": "2026-06-23T19:00:00+00:00", "last_error": null, "mismatch_streak": 0}
+        {"host": "cronstable-b.internal:8443", "status": "agreed", "node_name": "node-b", "job_set_id": "v1:…", "last_seen": "2026-06-23T19:00:00+00:00", "last_error": null, "mismatch_streak": 0}
     ]
 }
 ```
@@ -271,7 +271,7 @@ A lease backend (here `kubernetes`) returns the lease-shaped view instead:
 {
     "enabled": true,
     "backend": "kubernetes",
-    "node_name": "yacron2-0",
+    "node_name": "cronstable-0",
     "job_set_id": "v1:…",
     "cluster_size": 1,
     "quorum": 1,
@@ -281,11 +281,11 @@ A lease backend (here `kubernetes`) returns the lease-shaped view instead:
     "size_conflict": false, "conflicting_sizes": [],
     "policy_conflict": false, "conflicting_policies": [],
     "quorate": true,
-    "leader": "yacron2-0",
+    "leader": "cronstable-0",
     "is_leader": true,
     "peers": [],
-    "lease": {"name": "yacron2-leader", "namespace": "default",
-              "identity": "yacron2-0", "holder": "yacron2-0",
+    "lease": {"name": "cronstable-leader", "namespace": "default",
+              "identity": "cronstable-0", "holder": "cronstable-0",
               "expiry": "2026-06-24T19:00:14.000000Z"}
 }
 ```
@@ -298,7 +298,7 @@ The per-peer `status` values (`agreed`, `syncing`, `drifted`, `unreachable`,
 > It is served only on the cluster's own mutual-TLS `listen` address (default
 > port `8443`), never on the public `web` listeners. When node stats are
 > shared, each `/peer` response carries the node's live load as an
-> `X-Yacron2-Node-Stats` response header (on `200` and `304` responses alike,
+> `X-Cronstable-Node-Stats` response header (on `200` and `304` responses alike,
 > never in the body), so sharing preserves that exchange's conditional `304`
 > optimisation. See
 > [Clustering and Leader Election](Clustering-and-Leader-Election).
@@ -362,7 +362,7 @@ Content-Type: application/json; charset=utf-8
          "jobs": {"backup": {"running": false, "enabled": true, "scheduled_in": 1042.5,
                              "last": {"outcome": "success", "finished_at": "2026-06-23T18:00:01+00:00",
                                       "duration": 12.4, "exit_code": 0}}}},
-        {"node_name": "node-b", "host": "yacron-b.internal:8443", "self": false, "status": "agreed",
+        {"node_name": "node-b", "host": "cronstable-b.internal:8443", "self": false, "status": "agreed",
          "as_of": "2026-06-23T18:59:45+00:00", "truncated": false,
          "jobs": {"backup": {"running": true, "enabled": true, "scheduled_in": null, "last": null}}}
     ]
@@ -400,7 +400,7 @@ Content-Type: application/json; charset=utf-8
 
 `node_name` is the cluster node name when clustered, else the hostname.
 `cpu_percent` / `mem_percent` are whole-host utilisation; `proc_rss_bytes` /
-`proc_cpu_percent` are the yacron2 daemon's own footprint (best-effort, may be
+`proc_cpu_percent` are the cronstable daemon's own footprint (best-effort, may be
 absent if the platform denies the per-process read). `resources` is `null` when
 host sampling is unavailable (psutil could not read the host), and the
 dashboard then hides the meter. CPU percentages are measured since the previous
@@ -445,7 +445,7 @@ Content-Length: 0
 ### `POST /jobs/{name}/cancel`
 
 Terminates every currently-running instance of the named job, using the same
-graceful terminate-then-kill sequence yacron2 uses elsewhere (honoring the
+graceful terminate-then-kill sequence cronstable uses elsewhere (honoring the
 job's `killTimeout`; see [Concurrency and Timeouts](Concurrency-and-Timeouts)).
 Instances are cancelled concurrently, so a job with several running instances
 costs at most one `killTimeout`, not one per instance.
@@ -841,10 +841,10 @@ $ http get http://127.0.0.1:8080/job-set-id Accept:application/json
 
 ### `GET /metrics`
 
-Exposes yacron2's native [Prometheus](Metrics-with-Prometheus) metrics: daemon
+Exposes cronstable's native [Prometheus](Metrics-with-Prometheus) metrics: daemon
 info, per-job run counters and duration histograms, live per-job gauges, and
 (when a `cluster` section is configured) the cluster health series that mirror
-`GET /cluster`. The exposition is generated by yacron2 itself, with no
+`GET /cluster`. The exposition is generated by cronstable itself, with no
 exporter sidecar and no extra dependency. This section covers the endpoint
 mechanics; the full metric reference lives in
 [Metrics with Prometheus](Metrics-with-Prometheus).
@@ -869,7 +869,7 @@ shorthand (`metrics: false` disables the endpoint) or a map:
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Serve `GET /metrics`. |
 | `public` | bool | `false` | Exempt `/metrics` (and only `/metrics`) from `web.authToken` bearer-token authentication (see [Authentication](#authentication)). |
-| `durationBuckets` | sequence of floats | `0.1, 0.5, 1, 5, 15, 60, 300, 900, 3600` | Upper bounds (seconds) of the `yacron2_job_duration_seconds` histogram. Bounds must be finite, positive, and strictly increasing; anything else raises a `ConfigError`. |
+| `durationBuckets` | sequence of floats | `0.1, 0.5, 1, 5, 15, 60, 300, 900, 3600` | Upper bounds (seconds) of the `cronstable_job_duration_seconds` histogram. Bounds must be finite, positive, and strictly increasing; anything else raises a `ConfigError`. |
 
 The metric registry is owned by the daemon rather than the web app, so
 counters survive config reloads (including ones that restart the web server)
@@ -878,18 +878,18 @@ are pruned.
 
 ```shell
 $ curl http://127.0.0.1:8080/metrics
-# HELP yacron2_info yacron2 build information.
-# TYPE yacron2_info gauge
-yacron2_info{version="1.0.13"} 1
-# HELP yacron2_jobs Number of configured jobs by enablement state.
-# TYPE yacron2_jobs gauge
-yacron2_jobs{state="enabled"} 2
-yacron2_jobs{state="disabled"} 1
-# HELP yacron2_job_runs_total Finished job runs by outcome, as recorded in the run history.
-# TYPE yacron2_job_runs_total counter
-yacron2_job_runs_total{job_name="test-01",status="success"} 12
-yacron2_job_runs_total{job_name="test-01",status="failure"} 1
-yacron2_job_runs_total{job_name="test-01",status="cancelled"} 0
+# HELP cronstable_info cronstable build information.
+# TYPE cronstable_info gauge
+cronstable_info{version="1.0.13"} 1
+# HELP cronstable_jobs Number of configured jobs by enablement state.
+# TYPE cronstable_jobs gauge
+cronstable_jobs{state="enabled"} 2
+cronstable_jobs{state="disabled"} 1
+# HELP cronstable_job_runs_total Finished job runs by outcome, as recorded in the run history.
+# TYPE cronstable_job_runs_total counter
+cronstable_job_runs_total{job_name="test-01",status="success"} 12
+cronstable_job_runs_total{job_name="test-01",status="failure"} 1
+cronstable_job_runs_total{job_name="test-01",status="cancelled"} 0
 ...
 ```
 
@@ -958,7 +958,7 @@ web:
   listen:
     - http://127.0.0.1:8080
   authToken:
-    fromEnvVar: YACRON2_WEB_TOKEN
+    fromEnvVar: CRONSTABLE_WEB_TOKEN
 ```
 
 ```shell
@@ -968,7 +968,7 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 
 ### Fail-closed behavior
 
-If `authToken` is configured but resolves to an empty token, yacron2 raises a
+If `authToken` is configured but resolves to an empty token, cronstable raises a
 `ConfigError` and refuses to start the web server, rather than silently serving
 the control API with no authentication. This happens when:
 
@@ -976,7 +976,7 @@ the control API with no authentication. This happens when:
 - `fromEnvVar` names a variable that is unset (resolves to `""`);
 - `fromFile` points to a file that is empty or contains only whitespace.
 
-If `fromFile` cannot be read (`OSError`), yacron2 also raises a `ConfigError`
+If `fromFile` cannot be read (`OSError`), cronstable also raises a `ConfigError`
 (`web.authToken.fromFile could not be read: ...`).
 
 ## Unix socket permissions
@@ -992,7 +992,7 @@ to each `unix://` listen socket after it starts (`_apply_socket_mode`):
 ```yaml
 web:
   listen:
-    - unix:///run/yacron2/yacron2.sock
+    - unix:///run/cronstable/cronstable.sock
   socketMode: "0660"
 ```
 
@@ -1025,7 +1025,7 @@ reload from the scheduler loop:
   succeeds.
 - On shutdown, the running server is stopped after currently running jobs finish.
   On Windows, graceful shutdown is triggered with Ctrl-C or Ctrl-Break (rather
-  than `SIGTERM` as on POSIX); yacron2 still finishes currently-running jobs
+  than `SIGTERM` as on POSIX); cronstable still finishes currently-running jobs
   before stopping the server, identical to POSIX behavior. See
   [Running on Windows](Running-on-Windows).
 
@@ -1040,18 +1040,18 @@ open and run every `Leader` job on every node).
 
 ## Job-facing state endpoints (loopback)
 
-Separate from the `web` control API above, yacron2 can run a second,
+Separate from the `web` control API above, cronstable can run a second,
 **loopback-only** HTTP server that hands its [durable state store](Durable-State)
 to the *jobs it runs*. It binds `127.0.0.1` on an OS-assigned ephemeral port (or
 the address in `state.jobApi.listen`), and the daemon injects its base URL and a
 per-run bearer token into every job's environment, so a job's command line can
 read and write durable state, coordinate through a fleet-wide lock, or fetch a
-run-scoped secret. The `yacron2 state|cursor|lock|artifact|idempotent|secret`
+run-scoped secret. The `cronstable state|cursor|lock|artifact|idempotent|secret`
 [CLI commands](CLI-Reference#job-facing-state-commands) are thin clients of this
 endpoint; the same primitives are also reachable offline against the store
 directly, so this server is a front-end, not a second source of truth. The
-surface is served by `yacron2/jobapi.py`; the primitives themselves live in
-`yacron2/jobstate.py`.
+surface is served by `cronstable/jobapi.py`; the primitives themselves live in
+`cronstable/jobstate.py`.
 
 ### Enabling the endpoint
 
@@ -1061,7 +1061,7 @@ section but `jobApi.enabled: false`, never starts it and injects nothing.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enabled` | bool | `true` | Serve the loopback endpoint and inject the `YACRON2_*` environment into every job. |
+| `enabled` | bool | `true` | Serve the loopback endpoint and inject the `CRONSTABLE_*` environment into every job. |
 | `listen` | string | (ephemeral) | Address to bind, as `host:port` or `http://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; an explicit port must be in `0`-`65535` (`0` = OS-assigned), and a non-loopback host needs `allowNonLoopbackBind`. |
 | `maxValueBytes` | int | `1048576` (1 MiB) | Reject a KV or cursor value larger than this many bytes (JSON-encoded) with `413`. `0` means no limit. |
 | `maxArtifactBytes` | int | `67108864` (64 MiB) | Reject an artifact payload larger than this many bytes with `413`. `0` means no limit. |
@@ -1081,17 +1081,17 @@ job can test the variable instead of guessing whether it was set.
 
 | Variable | Meaning |
 | --- | --- |
-| `YACRON2_STATE_URL` | The loopback base URL, e.g. `http://127.0.0.1:54321`. |
-| `YACRON2_STATE_TOKEN` | A per-run bearer token, revoked the instant the run ends. |
-| `YACRON2_RUN_ID` | A unique id for this run. |
-| `YACRON2_JOB_NAME` | The job's name (also its default scope). |
-| `YACRON2_ATTEMPT` | The retry attempt number (`0` on the first fire). |
-| `YACRON2_SCHEDULED_AT` | The scheduled fire time (ISO-8601), or empty. |
-| `YACRON2_HOST` | The host name. |
+| `CRONSTABLE_STATE_URL` | The loopback base URL, e.g. `http://127.0.0.1:54321`. |
+| `CRONSTABLE_STATE_TOKEN` | A per-run bearer token, revoked the instant the run ends. |
+| `CRONSTABLE_RUN_ID` | A unique id for this run. |
+| `CRONSTABLE_JOB_NAME` | The job's name (also its default scope). |
+| `CRONSTABLE_ATTEMPT` | The retry attempt number (`0` on the first fire). |
+| `CRONSTABLE_SCHEDULED_AT` | The scheduled fire time (ISO-8601), or empty. |
+| `CRONSTABLE_HOST` | The host name. |
 
 ### Authentication and errors
 
-Every request must carry `Authorization: Bearer $YACRON2_STATE_TOKEN`. The token
+Every request must carry `Authorization: Bearer $CRONSTABLE_STATE_TOKEN`. The token
 is matched in constant time against the live run set, so a missing, malformed,
 forged, or stale token returns `401 Unauthorized` before any state is touched.
 Other outcomes:
@@ -1129,7 +1129,7 @@ All routes are under `/v1/` and registered in `JobStateAPI._routes`:
 | `POST` | `/v1/idempotency/claim` | `{scope?, key, ttl?}` | `{fresh, claimedAt}` |
 | `POST` | `/v1/idempotency/release` | `{scope?, key}` | `{released}` |
 | `POST` | `/v1/artifact/put` | `?scope=&name=`, raw body | `{sha256, size}` |
-| `GET` | `/v1/artifact/get` | `?scope=&name=` | raw bytes plus `X-Yacron2-Sha256` / `X-Yacron2-Size`, or `404` |
+| `GET` | `/v1/artifact/get` | `?scope=&name=` | raw bytes plus `X-Cronstable-Sha256` / `X-Cronstable-Size`, or `404` |
 | `GET` | `/v1/artifact/list` | `?scope=` | `{scope, artifacts: [{name, sha256, size, at}]}` |
 | `POST` | `/v1/lock/acquire` | `{scope?, name, permits?, ttl?, wait?, blockSeconds?}` | `{acquired, token?, slot?, fence?, ttl?}` |
 | `POST` | `/v1/lock/release` | `{token}` | `{released}` |
@@ -1151,7 +1151,7 @@ lease that the daemon renews for as long as the job holds it and releases the
 instant the job releases it or the run ends -- so a job that crashes or forgets
 to unlock never leaks a lock. `wait: true` retries for up to `blockSeconds`
 before giving up; without it the call makes a single pass over the permits and
-returns `{acquired: false}` when they are all taken. Like every yacron2
+returns `{acquired: false}` when they are all taken. Like every cronstable
 coordination primitive the lock is at-least-once, not exactly-once (the `fence`
 token in the reply is there for a job that needs true fencing). Run-scoped
 **secrets** are staged in memory by the daemon per run and vanish when the run
@@ -1160,15 +1160,15 @@ scope on the secret routes -- a run sees only its own.
 
 ```shell
 # Inside a job, using the injected env directly.
-$ curl -s -H "Authorization: Bearer $YACRON2_STATE_TOKEN" \
-    "$YACRON2_STATE_URL/v1/run"
+$ curl -s -H "Authorization: Bearer $CRONSTABLE_STATE_TOKEN" \
+    "$CRONSTABLE_STATE_URL/v1/run"
 {"runId": "…", "job": "nightly-etl", "attempt": 0, "scheduledAt": "2026-07-04T02:00:00+00:00", "host": "node-a", "defaultScope": "nightly-etl"}
 
 # Advance the job's private ETL cursor to the last row processed.
-$ curl -s -H "Authorization: Bearer $YACRON2_STATE_TOKEN" \
+$ curl -s -H "Authorization: Bearer $CRONSTABLE_STATE_TOKEN" \
     -H 'Content-Type: application/json' \
     -d '{"name": "rows", "value": 20482}' \
-    "$YACRON2_STATE_URL/v1/cursor/advance"
+    "$CRONSTABLE_STATE_URL/v1/cursor/advance"
 {"value": 20482, "advanced": true}
 ```
 

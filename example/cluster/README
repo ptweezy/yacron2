@@ -1,7 +1,7 @@
-yacron2 clustering demo
+cronstable clustering demo
 =======================
 
-A ready-to-run three-node yacron2 cluster with mutual-TLS peer attestation and
+A ready-to-run three-node cronstable cluster with mutual-TLS peer attestation and
 leader election. Brought up by ../../docker-compose-cluster.yml:
 
     docker compose -f docker-compose-cluster.yml up --build
@@ -18,7 +18,7 @@ Files
   gen-certs.sh   Generates a throwaway cluster CA + per-node certs (SAN = service
                  name) into the shared `cluster-certs` volume on first start.
 
-Dashboards: yacron-a http://localhost:8080/ , yacron-b :8081 , yacron-c :8082 .
+Dashboards: cronstable-a http://localhost:8080/ , cronstable-b :8081 , cronstable-c :8082 .
 Scroll to the "cluster" panel on any dashboard to watch attestation and
 leadership. The compose file's header comments list the things to try (failing
 the leader, losing quorum, drift, per-policy behaviour, and the opt-in

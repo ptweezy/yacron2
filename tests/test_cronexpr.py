@@ -4,7 +4,7 @@
 (parse-crontab) package did for every expression in the corpus: whether it
 parsed, ``next()`` from fixed naive and timezone-aware instants, ``test()``
 over fixed datetimes, and semantic-equality verdicts.  These tests replay
-every vector against :mod:`yacron2.cronexpr` -- a full compatibility proof
+every vector against :mod:`cronstable.cronexpr` -- a full compatibility proof
 that needs no copy of the old package (the vectors are program OUTPUT, not
 code).  Regenerate/extend the vectors with ``tests/gen_cron_golden.py``.
 
@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from yacron2.cronexpr import CronTab
+from cronstable.cronexpr import CronTab
 
 # next() deltas are compared to a nanosecond: the legacy library computed
 # its float seconds along a different arithmetic path, so a microsecond

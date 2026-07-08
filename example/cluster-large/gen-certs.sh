@@ -5,12 +5,12 @@
 # just with ten node names.
 #
 # FOR LOCAL EXPERIMENTATION ONLY. Real deployments provision per-node certs from
-# their own PKI; yacron2 only consumes them.
+# their own PKI; cronstable only consumes them.
 set -eu
 
 CERTS=/certs
-NODES="yacron-a yacron-b yacron-c yacron-d yacron-e \
-       yacron-f yacron-g yacron-h yacron-i yacron-j"
+NODES="cronstable-a cronstable-b cronstable-c cronstable-d cronstable-e \
+       cronstable-f cronstable-g cronstable-h cronstable-i cronstable-j"
 
 if [ -f "$CERTS/ca.pem" ]; then
   echo "certs already present in $CERTS — leaving them in place."
@@ -26,7 +26,7 @@ fi
 echo "generating cluster CA..."
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout "$CERTS/ca.key" -out "$CERTS/ca.pem" \
-  -subj "/CN=yacron2-cluster-ca" \
+  -subj "/CN=cronstable-cluster-ca" \
   -addext "basicConstraints=critical,CA:TRUE" \
   -addext "keyUsage=critical,keyCertSign,cRLSign"
 
@@ -45,7 +45,7 @@ EOF
     -out "$CERTS/$n.pem" -days 3650 -extfile "/tmp/$n.ext"
 done
 
-# Lock down permissions. yacron2 runs as uid 65534 (nobody) and must read its
+# Lock down permissions. cronstable runs as uid 65534 (nobody) and must read its
 # own leaf key, so hand the private keys to that uid and keep them owner-only
 # (0600) instead of world-readable.
 #

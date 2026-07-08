@@ -1,21 +1,21 @@
-# Contributing to yacron2
+# Contributing to cronstable
 
-Thanks for working on yacron2! This document covers local development and,
+Thanks for working on cronstable! This document covers local development and,
 importantly, how releases are cut.
 
 ## Development setup
 
-yacron2 targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13 and 3.14 are tested)
+cronstable targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13 and 3.14 are tested)
 and runs on **Linux, macOS and Windows** (the test suite runs on all three in
 CI, including Windows ARM64).
 
-yacron2 uses [uv](https://docs.astral.sh/uv/) for a fast dev loop (`tox` also
+cronstable uses [uv](https://docs.astral.sh/uv/) for a fast dev loop (`tox` also
 runs through uv via `tox-uv`, and uv can fetch the 3.10–3.14 interpreters the
 test matrix needs). With uv installed:
 
 ```sh
-git clone https://github.com/ptweezy/yacron2
-cd yacron2
+git clone https://github.com/ptweezy/cronstable
+cd cronstable
 uv venv                                         # create .venv (uv picks a suitable Python)
 uv pip install -e ".[dev]"                      # editable install with the dev extra
 ```
@@ -28,7 +28,7 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 ```
 
 > **Note:** all OS-specific behavior lives in
-> [`yacron2/platform.py`](yacron2/platform.py) (default shell, default config
+> [`cronstable/platform.py`](cronstable/platform.py) (default shell, default config
 > location, unix-socket support, and shutdown-signal wiring). The POSIX-only
 > `user`/`group` feature imports `grp`/`pwd` lazily and is rejected on Windows.
 > mypy is pinned to the `linux` platform (it type-checks the POSIX API surface;
@@ -120,9 +120,9 @@ On a release the workflow, in order:
    manage or leak;
 6. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
    GitHub Release with the wheel, sdist, and all the binaries
-   (`yacron2-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}`, their
-   `-musl` variants plus `yacron2-linux-armv6-musl`, `yacron2-macos-{arm64,amd64}`,
-   and `yacron2-windows-{amd64,arm64}.exe`) attached.
+   (`cronstable-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}`, their
+   `-musl` variants plus `cronstable-linux-armv6-musl`, `cronstable-macos-{arm64,amd64}`,
+   and `cronstable-windows-{amd64,arm64}.exe`) attached.
 
 Because no file is committed back to the repo, a release never re-triggers the
 workflow. Because the tag is created *after* publishing, a failed publish leaves
@@ -137,7 +137,7 @@ The official image is built and published by the
 - **On each published release** it builds one multi-arch (`linux/amd64`,
   `linux/arm64`, `linux/386`, `linux/arm/v7`, `linux/ppc64le` and `linux/s390x`)
   image and pushes it, tagged `<version>` and `:latest`, to both
-  `ghcr.io/ptweezy/yacron2` and `docker.io/ptweezy/yacron2`. GHCR authenticates
+  `ghcr.io/ptweezy/cronstable` and `docker.io/ptweezy/cronstable`. GHCR authenticates
   with the built-in `GITHUB_TOKEN`; Docker Hub uses the `DOCKERHUB_USERNAME` and
   `DOCKERHUB_TOKEN` repository secrets.
 - **On pull requests / `main` pushes** that touch the `Dockerfile`, the package,
@@ -151,6 +151,6 @@ Build it locally the same way CI does (the version is read from git, or pass
 `--build-arg VERSION=X.Y.Z`):
 
 ```sh
-docker build -t yacron2 .
-docker run --rm -v "$PWD/example/docker/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" yacron2
+docker build -t cronstable .
+docker run --rm -v "$PWD/example/docker/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" cronstable
 ```

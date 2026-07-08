@@ -1,15 +1,15 @@
 # Includes, Defaults, and Multi-File Config
 
-This page documents how yacron2 loads configuration: the `-c` argument as a
+This page documents how cronstable loads configuration: the `-c` argument as a
 single file or a directory, the `defaults` section and its merge precedence, the
 `include` directive, and the special list-merge rules that govern how job
 settings inherit from defaults. All behavior here is implemented in
-`yacron2/config.py`.
+`cronstable/config.py`.
 
 ## Config loading entry points
 
-yacron2 resolves the `-c`/`--config` argument (default `/etc/yacron2.d` on
-POSIX, `%APPDATA%\yacron2` on Windows, falling back to `~` if APPDATA is
+cronstable resolves the `-c`/`--config` argument (default `/etc/cronstable.d` on
+POSIX, `%APPDATA%\cronstable` on Windows, falling back to `~` if APPDATA is
 unset; see [CLI Reference](CLI-Reference) and [Running on Windows](Running-on-Windows))
 through `parse_config(config_arg)`:
 
@@ -57,7 +57,7 @@ results are **aggregated** across the directory:
 Per-file parse errors are collected (keyed by path) and, if any occurred,
 raised together as a single `ConfigError` whose message joins the individual
 errors with `\n---`. An empty directory, or one where every entry is skipped,
-yields an empty `Yacron2Config` (empty `jobs`, no `web`, empty `job_defaults`,
+yields an empty `CronstableConfig` (empty `jobs`, no `web`, empty `job_defaults`,
 no `logging`) rather than an error.
 
 ### Defaults are scoped per YAML file in directory mode
@@ -174,7 +174,7 @@ The job above runs with `FOO=xpto`, `BAR=bar`, `ZBR=blah`.
 ### `fingerprint` replaces, does not append
 
 The Sentry `fingerprint` (a list of strings, default
-`["yacron2", "{{ environment.HOSTNAME }}", "{{ name }}"]`) is a
+`["cronstable", "{{ environment.HOSTNAME }}", "{{ name }}"]`) is a
 replace-not-append setting: a job or `defaults` block that supplies its own
 `fingerprint` overrides the default list entirely. Plain list concatenation
 would silently prepend the three default entries, making custom Sentry issue
@@ -210,7 +210,7 @@ and their results are merged into the including file as follows:
 The intended use is to put common definitions (reporting defaults, shell,
 environment, etc.) in a fragment named so directory mode skips it (e.g. with a
 leading underscore), and `include` it from each real config file. This mirrors
-`example/adhoc.yacron2.d`:
+`example/adhoc.cronstable.d`:
 
 `_inc.yaml` (skipped by directory mode; provides shared `defaults`, `web`, and
 `logging`):

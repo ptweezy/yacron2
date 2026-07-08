@@ -1,6 +1,6 @@
 # Pulse — a real-time uptime / SLA monitor (second-level scheduling)
 
-A small, self-contained yacron2 project that shows why **second-level
+A small, self-contained cronstable project that shows why **second-level
 scheduling** matters: it watches a latency-critical HTTP service and catches an
 outage within **seconds**, not minutes.
 
@@ -12,20 +12,20 @@ short outage, blow an availability SLO, or page late. For anything user-facing
 and latency-critical (a payment API, an auth gateway, an edge cache) you want to
 know in a few seconds.
 
-yacron2 can schedule at second granularity, so one small daemon can probe every
+cronstable can schedule at second granularity, so one small daemon can probe every
 2–5 seconds, heartbeat every 10, and still roll up a summary once a minute.
 
 ## Run it
 
-The "service under test" is yacron2's **own web API** (`GET /status`), so there
+The "service under test" is cronstable's **own web API** (`GET /status`), so there
 is nothing else to start — the monitor watches its own liveness endpoint.
 
 ```console
 # in a container (publishes the dashboard on :8080)
 docker compose -f docker-compose-pulse.yml up --build
 
-# …or locally, from a checkout (needs python3, which the yacron2 image has)
-yacron2 -c example/pulse-monitor/yacron2tab.yaml
+# …or locally, from a checkout (needs python3, which the cronstable image has)
+cronstable -c example/pulse-monitor/cronstable.yaml
 ```
 
 Open <http://localhost:8080/> and watch the `liveness-probe` and `latency-slo`
@@ -62,10 +62,10 @@ schedule:                     # …or the object form
   seconds. A plain cron dashboard can only ever count down in whole minutes.
 - **Mixed cadence, no double-runs.** Because a second-level job makes the whole
   scheduler tick every second, a minute-level job *could* be tested 60 times a
-  minute — but yacron2 de-duplicates each job per scheduling slot, so
+  minute — but cronstable de-duplicates each job per scheduling slot, so
   `sla-rollup` still fires exactly once per minute. Sub-minute and per-minute
   jobs mix freely.
-- **No cost when unused.** Delete the second-level jobs and yacron2 goes back to
+- **No cost when unused.** Delete the second-level jobs and cronstable goes back to
   waking once a minute; the per-second cadence only turns on while some enabled
   job actually needs it.
 
@@ -77,10 +77,10 @@ the on-call "PAGE" line appear in `liveness-probe`'s report output:
 ```console
 # container
 docker compose -f docker-compose-pulse.yml run --rm \
-  -e PULSE_TARGET=http://127.0.0.1:9/nope yacron2-pulse
+  -e PULSE_TARGET=http://127.0.0.1:9/nope cronstable-pulse
 
 # local
-PULSE_TARGET=http://127.0.0.1:9/nope yacron2 -c example/pulse-monitor/yacron2tab.yaml
+PULSE_TARGET=http://127.0.0.1:9/nope cronstable -c example/pulse-monitor/cronstable.yaml
 ```
 
 To exercise the **latency** path instead, tighten the budget so normal

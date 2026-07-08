@@ -1,26 +1,26 @@
-# ![The yacron2 mark, spinning the way it does in the live dashboard](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/logo-spin.gif)
+# ![The cronstable mark, spinning the way it does in the live dashboard](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/logo-spin.gif)
 
-[![PyPI version](https://img.shields.io/pypi/v/yacron2.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/yacron2/)
-[![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/yacron2/)
-[![PyPI status](https://img.shields.io/pypi/status/yacron2.svg?color=2ea44f)](https://pypi.org/project/yacron2/)
-[![GitHub release](https://img.shields.io/github/v/release/ptweezy/yacron2?logo=github&color=8a2be2)](https://github.com/ptweezy/yacron2/releases/latest)
-[![Release downloads](https://img.shields.io/github/downloads/ptweezy/yacron2/total?logo=github&label=binary%20downloads&color=fb8c00)](https://github.com/ptweezy/yacron2/releases)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-00bcd4)](https://github.com/ptweezy/yacron2/releases/latest)
-[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64-c2185b)](https://github.com/ptweezy/yacron2/releases/latest)
-[![CI](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml)
-[![Coverage](https://img.shields.io/codecov/c/github/ptweezy/yacron2?logo=codecov&logoColor=white&color=f01f7a)](https://codecov.io/gh/ptweezy/yacron2)
-[![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/yacron2/pkgs/container/yacron2)
-[![Docker Hub](https://img.shields.io/badge/docker.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/ptweezy/yacron2)
+[![PyPI version](https://img.shields.io/pypi/v/cronstable.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/cronstable/)
+[![Python versions](https://img.shields.io/pypi/pyversions/cronstable.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/cronstable/)
+[![PyPI status](https://img.shields.io/pypi/status/cronstable.svg?color=2ea44f)](https://pypi.org/project/cronstable/)
+[![GitHub release](https://img.shields.io/github/v/release/ptweezy/cronstable?logo=github&color=8a2be2)](https://github.com/ptweezy/cronstable/releases/latest)
+[![Release downloads](https://img.shields.io/github/downloads/ptweezy/cronstable/total?logo=github&label=binary%20downloads&color=fb8c00)](https://github.com/ptweezy/cronstable/releases)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-00bcd4)](https://github.com/ptweezy/cronstable/releases/latest)
+[![Architectures](https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7%20%7C%20armv6%20%7C%20i686%20%7C%20ppc64le%20%7C%20s390x%20%7C%20riscv64-c2185b)](https://github.com/ptweezy/cronstable/releases/latest)
+[![CI](https://github.com/ptweezy/cronstable/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/cronstable/actions/workflows/tox.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/ptweezy/cronstable?logo=codecov&logoColor=white&color=f01f7a)](https://codecov.io/gh/ptweezy/cronstable)
+[![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/cronstable/pkgs/container/cronstable)
+[![Docker Hub](https://img.shields.io/badge/docker.io-ptweezy%2Fcronstable-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/ptweezy/cronstable)
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-# yacron2
+# cronstable
 
 A modern, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-inlcuded, security-hardened, production-ready cron replacement.
 
-yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
+cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
-## Why yacron2?
+## Why cronstable?
 
 * **Built for locked-down containers.** Runs unmodified under restricted
   Kubernetes PodSecurity: non-root, read-only root filesystem,
@@ -33,8 +33,8 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * **Observability and durability**: A live
   [web dashboard](#web-dashboard), native [Prometheus metrics](#metrics),
   per-job [resource monitoring](#resource-monitoring), and opt-in
-  [durable state](https://github.com/ptweezy/yacron2/wiki/Durable-State),
-  [orchestration DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs)
+  [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State),
+  [orchestration DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
   and [leader-elected clustering](#clustering-and-leader-election), all in one
   daemon.
 
@@ -61,16 +61,16 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
   themselves over a loopback endpoint, so a job command can reach for durable
   key/value, an ETL cursor/watermark, a fleet-wide mutex or semaphore,
   idempotency keys, a shared artifact store and run-scoped secrets with
-  `yacron2 state|cursor|lock|artifact|idempotent|secret` (see the
-  [Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State) wiki
-  page); without it, yacron2 stays stateless as before
+  `cronstable state|cursor|lock|artifact|idempotent|secret` (see the
+  [Durable State](https://github.com/ptweezy/cronstable/wiki/Durable-State) wiki
+  page); without it, cronstable stays stateless as before
 * **Opt-in orchestration DAGs**: a `dags:` block turns the scheduler into a
   small, durable workflow engine -- tasks with `dependsOn` edges, cross-task
   data hand-off (XCom), dynamic fan-out/mapping, sensors, human approval gates,
   whole-DAG backfill, and crash-resume of a partial graph, all on the same
   state store and coordinated across a fleet under a single lease so a task
   never double-launches (see the
-  [Orchestration and DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs)
+  [Orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
   wiki page)
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
@@ -96,7 +96,7 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
   cluster, from one self-contained page with ten themes and a shortcut for
   everything
 
-[![yacron2 web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](#web-dashboard)
+[![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)](#web-dashboard)
 
 ## Quick start
 
@@ -105,15 +105,15 @@ Sixty seconds to a running scheduler with a live dashboard. Install it (see
 options):
 
 ```shell
-pip install yacron2
+pip install cronstable
 ```
 
-Describe your first job in a `yacron2tab.yaml`:
+Describe your first job in a `cronstable.yaml`:
 
 ```yaml
 jobs:
   - name: hello
-    command: echo "hello from yacron2 on $(hostname)"
+    command: echo "hello from cronstable on $(hostname)"
     schedule: "* * * * *"        # every minute
     captureStdout: true
 
@@ -125,7 +125,7 @@ web:
 Run it (always in the foreground, in true 12-factor spirit):
 
 ```shell
-yacron2 -c yacron2tab.yaml
+cronstable -c cronstable.yaml
 ```
 
 That's it. Open <http://127.0.0.1:8080/> and watch `hello` fire once a minute,
@@ -145,7 +145,7 @@ each of these is a few lines away:
   ([example gallery](#example-gallery)).
 
 Already have a crontab? You don't have to translate it:
-`yacron2 -c /etc/crontab` runs the classic format as-is (see
+`cronstable -c /etc/crontab` runs the classic format as-is (see
 [Classic crontab files](#classic-crontab-files)).
 
 ## Installation
@@ -163,18 +163,18 @@ published from the same release too. Mount your crontab and go:
 ```shell
 # GitHub Container Registry
 docker run --rm \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  ghcr.io/ptweezy/yacron2:latest
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  ghcr.io/ptweezy/cronstable:latest
 
 # Docker Hub
 docker run --rm \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  ptweezy/yacron2:latest
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  ptweezy/cronstable:latest
 ```
 
 The image runs as a non-root user and reads its configuration from
-`/etc/yacron2.d` by default. For production, pin a specific version instead of
-`latest` (e.g. `ghcr.io/ptweezy/yacron2:1.0.14` or `ptweezy/yacron2:1.0.14`) and
+`/etc/cronstable.d` by default. For production, pin a specific version instead of
+`latest` (e.g. `ghcr.io/ptweezy/cronstable:1.0.14` or `ptweezy/cronstable:1.0.14`) and
 see [Production container deployment](#production-container-deployment) for the
 hardened Kubernetes/Docker setup.
 
@@ -201,11 +201,11 @@ also available explicitly as `-debian`):
 ```shell
 # e.g. the Alpine variant, pinned to a version:
 docker run --rm \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  ghcr.io/ptweezy/yacron2:1.0.14-alpine
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  ghcr.io/ptweezy/cronstable:1.0.14-alpine
 ```
 
-yacron2 is a pure-Python app that supports any Python >= 3.10, so behavior is
+cronstable is a pure-Python app that supports any Python >= 3.10, so behavior is
 identical across variants. The Debian default covers the most architectures; each variant covers the arches
 its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
 openSUSE and distroless cover `amd64`, `arm64`, `ppc64le` and `s390x`; Amazon
@@ -214,13 +214,13 @@ read-only-friendly hardening as the default image.
 
 ### Install using pip
 
-yacron2 requires Python >= 3.10 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
+cronstable requires Python >= 3.10 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
 virtual environment, for example:
 
 ```shell
-python3 -m venv yacron2env
-. yacron2env/bin/activate
-pip install yacron2
+python3 -m venv cronstableenv
+. cronstableenv/bin/activate
+pip install cronstable
 ```
 
 ### Install using pipx
@@ -229,50 +229,50 @@ pip install yacron2
 newly created virtualenv.  It is as simple as:
 
 ```shell
-pipx install yacron2
+pipx install cronstable
 ```
 
 ### Install using Homebrew
 
-On macOS or Linux, install from the yacron2
+On macOS or Linux, install from the cronstable
 [Homebrew tap](https://github.com/ptweezy/homebrew-tap):
 
 ```shell
-brew install ptweezy/tap/yacron2
+brew install ptweezy/tap/cronstable
 ```
 
 This installs the self-contained release binary for your platform (signed and
 notarized on macOS; glibc `amd64`/`arm64` on Linux via Homebrew on Linux), so no
-Python is required. Upgrade later with `brew upgrade yacron2`.
+Python is required. Upgrade later with `brew upgrade cronstable`.
 
 ### Install using binary
 
 Alternatively, a self-contained binary can be downloaded
-from github: <https://github.com/ptweezy/yacron2/releases>. Every release
+from github: <https://github.com/ptweezy/cronstable/releases>. Every release
 automatically attaches binaries for Linux (amd64, arm64, i686, armv7, armv6,
 ppc64le, s390x and riscv64), macOS (amd64 and arm64) and Windows (amd64 and
 arm64):
 
-* **Linux**: glibc builds (`yacron2-linux-<arch>`) for the mainstream distros,
+* **Linux**: glibc builds (`cronstable-linux-<arch>`) for the mainstream distros,
   working on any system post glibc 2.39 (e.g. Ubuntu 24.04) on the matching CPU,
-  plus musl builds (`yacron2-linux-<arch>-musl`) for Alpine and other musl-based
+  plus musl builds (`cronstable-linux-<arch>-musl`) for Alpine and other musl-based
   systems. `<arch>` is one of `amd64`, `arm64`, `i686` (32-bit x86), `armv7`
   (32-bit ARM, e.g. older Raspberry Pi), `armv6` (musl only), `ppc64le` (POWER),
   `s390x` (IBM Z) or `riscv64` (64-bit RISC-V).
-* **macOS**: `yacron2-macos-arm64` (Apple Silicon) / `yacron2-macos-amd64`
+* **macOS**: `cronstable-macos-arm64` (Apple Silicon) / `cronstable-macos-amd64`
   (Intel).
-* **Windows**: `yacron2-windows-amd64.exe` (x64) / `yacron2-windows-arm64.exe`
+* **Windows**: `cronstable-windows-amd64.exe` (x64) / `cronstable-windows-arm64.exe`
   (ARM64).
 
 Python is not required on the target system (it is embedded in the executable):
 
 ```shell
 # pick the asset for your OS and architecture (glibc amd64 Linux shown; append
-# -musl on Alpine, or use yacron2-macos-<arch> on a Mac)
-curl -fsSL -o yacron2 \
-  https://github.com/ptweezy/yacron2/releases/latest/download/yacron2-linux-amd64
-chmod +x yacron2
-./yacron2 --version
+# -musl on Alpine, or use cronstable-macos-<arch> on a Mac)
+curl -fsSL -o cronstable \
+  https://github.com/ptweezy/cronstable/releases/latest/download/cronstable-linux-amd64
+chmod +x cronstable
+./cronstable --version
 ```
 
 The macOS binaries are signed and notarized by Apple.
@@ -294,8 +294,8 @@ it a small writable *and executable* temp mount and it runs fine:
 # able to execute the libraries it unpacks.
 docker run --rm --read-only \
   --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  your-image-with-the-binary -c /etc/yacron2.d
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  your-image-with-the-binary -c /etc/cronstable.d
 ```
 
 On Kubernetes, mount an `emptyDir` at `/tmp` (an `emptyDir` is writable and
@@ -303,26 +303,26 @@ executable by default; use `medium: Memory` for a tmpfs).  Alternatively, point
 the binary at another writable, executable directory with `TMPDIR=/path`.
 
 This requirement is unique to the standalone binary.  The published container
-image (and `pip`/`pipx` installs) run yacron2 as a normal Python package with
+image (and `pip`/`pipx` installs) run cronstable as a normal Python package with
 the interpreter on disk, so they never self-extract and need no writable temp
 directory. See [Production container deployment](#production-container-deployment).
 
 ## Running on Windows
 
-yacron2 runs natively on Windows (x64 and ARM64), in addition to Linux and
-macOS. Install it with `pip install yacron2`, or download the self-contained
-`yacron2-windows-amd64.exe` / `yacron2-windows-arm64.exe` from the
-[releases page](https://github.com/ptweezy/yacron2/releases) (no Python
+cronstable runs natively on Windows (x64 and ARM64), in addition to Linux and
+macOS. Install it with `pip install cronstable`, or download the self-contained
+`cronstable-windows-amd64.exe` / `cronstable-windows-arm64.exe` from the
+[releases page](https://github.com/ptweezy/cronstable/releases) (no Python
 required). Everything else, like the YAML crontab, scheduling, reporting, retries,
 the HTTP API and the [web dashboard](#web-dashboard), works the same as on
 POSIX. A few platform details differ:
 
-* **Default config location.** When `-c` is omitted, yacron2 looks in
-  `%APPDATA%\yacron2` (e.g. `C:\Users\you\AppData\Roaming\yacron2`), the
-  Windows analog of `/etc/yacron2.d`. Point it anywhere with `-c`:
+* **Default config location.** When `-c` is omitted, cronstable looks in
+  `%APPDATA%\cronstable` (e.g. `C:\Users\you\AppData\Roaming\cronstable`), the
+  Windows analog of `/etc/cronstable.d`. Point it anywhere with `-c`:
 
   ```shell
-  yacron2 -c C:\path\to\yacron2tab.yaml
+  cronstable -c C:\path\to\cronstable.yaml
   ```
 
 * **Default shell.** A string `command` with no explicit `shell` runs through
@@ -341,7 +341,7 @@ POSIX. A few platform details differ:
       captureStdout: true
   ```
 
-* **Graceful shutdown.** Press `Ctrl-C` (or `Ctrl-Break`) to stop yacron2; it
+* **Graceful shutdown.** Press `Ctrl-C` (or `Ctrl-Break`) to stop cronstable; it
   shuts down after the currently running jobs finish, just as `SIGTERM` does on
   POSIX.
 
@@ -352,18 +352,18 @@ POSIX. A few platform details differ:
 
 ## Production container deployment
 
-yacron2 is built to run unmodified under the hardened security contexts that
+cronstable is built to run unmodified under the hardened security contexts that
 corporate and enterprise Kubernetes / container platforms enforce.  At runtime
 the daemon only *reads* its configuration and secrets and writes its output to
 stdout/stderr. It never needs a writable working directory, temp files, or log
 files, so it slots cleanly into a locked-down pod:
 
-* **Non-root user**: yacron2 needs no special privileges to run, so the whole
+* **Non-root user**: cronstable needs no special privileges to run, so the whole
   daemon can run as an unprivileged UID.  Only the optional per-job
   `user`/`group` switching (see [Change to another
   user/group](#change-to-another-usergroup)) requires running as root; if you
   don't use that feature, drop root entirely.
-* **Seccomp profile**: yacron2 makes no exotic syscalls, so the
+* **Seccomp profile**: cronstable makes no exotic syscalls, so the
   `RuntimeDefault` seccomp profile (or an equivalently strict custom profile)
   works out of the box.
 * **Read-only root filesystem**: no runtime writes are required by the
@@ -378,17 +378,17 @@ files, so it slots cleanly into a locked-down pod:
   mounted with an `fsGroup` so the non-root process can read them, and you can
   drop *all* Linux capabilities and forbid privilege escalation.
 
-The published image (`ghcr.io/ptweezy/yacron2` and `docker.io/ptweezy/yacron2`)
-is already built this way (non-root, with `yacron2 -c /etc/yacron2.d` as its
+The published image (`ghcr.io/ptweezy/cronstable` and `docker.io/ptweezy/cronstable`)
+is already built this way (non-root, with `cronstable -c /etc/cronstable.d` as its
 entrypoint and no writable paths required), so for most deployments you can use
 it directly and mount your crontab read-only. If you would rather bake the
 configuration into your own image, base it on the published image:
 
 ```dockerfile
-FROM ghcr.io/ptweezy/yacron2:latest
+FROM ghcr.io/ptweezy/cronstable:latest
 
 # The base image already runs as the non-root user 65534.
-COPY yacron2tab.yaml /etc/yacron2.d/yacron2tab.yaml
+COPY cronstable.yaml /etc/cronstable.d/cronstable.yaml
 ```
 
 And a corresponding Kubernetes `Deployment` with a fully restricted security
@@ -398,16 +398,16 @@ context:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: yacron2
+  name: cronstable
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: yacron2
+      app: cronstable
   template:
     metadata:
       labels:
-        app: yacron2
+        app: cronstable
     spec:
       securityContext:           # pod-level
         runAsNonRoot: true
@@ -417,9 +417,9 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: yacron2
-          image: ghcr.io/ptweezy/yacron2:latest
-          args: ["-c", "/etc/yacron2.d"]
+        - name: cronstable
+          image: ghcr.io/ptweezy/cronstable:latest
+          args: ["-c", "/etc/cronstable.d"]
           securityContext:       # container-level
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -435,23 +435,23 @@ spec:
               memory: 64Mi
           volumeMounts:
             - name: crontab
-              mountPath: /etc/yacron2.d
+              mountPath: /etc/cronstable.d
               readOnly: true
       volumes:
         - name: crontab
           configMap:
-            name: yacron2tab
+            name: cronstable
 ```
 
 ## Web dashboard
 
-yacron2 ships with a **built-in web dashboard**: one self-contained page (no
+cronstable ships with a **built-in web dashboard**: one self-contained page (no
 build step, no external assets, no database) served straight from the daemon.
 Point a browser at the HTTP listener and you have a keyboard-driven control
 room for every job, and, when you use them, for the cluster, the DAGs, and the
 durable state store too.
 
-[![yacron2 web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
+[![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)
 
 The overview shows every job with its **live status**, a **countdown to its
 next run**, the last run's duration and exit-code badge, and a **sparkline of
@@ -464,7 +464,7 @@ headline ("4 share exit=69, likely one cause"). Click any job (or press
 
 | Live log tail | Run history | Schedule, explained |
 | :---: | :---: | :---: |
-| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png) |
+| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png) |
 | Follow a running job's output **live** over Server-Sent Events, with ANSI color, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a color-coded per-run chart; with [resource monitoring](#resource-monitoring) on, **CPU time and peak memory** per run and in the stats. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
 
 **Everything is one keypress away**: a fuzzy command palette (`Ctrl-K` / `⌘K`)
@@ -474,18 +474,18 @@ runs any action or jumps to any job, `?` lists every shortcut, `/` filters,
 
 | Fuzzy command palette | Keyboard-first, with a shortcut for everything |
 | :---: | :---: |
-| [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png) |
+| [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-shortcuts.png) |
 
 ### Orchestration, live
 
-[DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs) get
+[DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs) get
 their own card and drawer: trigger or backfill a run, watch the **task graph**
 advance node by node, inspect per-task attempts, XCom values and logs, and
 decide **approval gates** with a click, from any node in the fleet.
 
 | The task graph | A human approval gate |
 | :---: | :---: |
-| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-dag-approval.png) |
+| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-dag-approval.png) |
 | A `data-quality-gate` diamond: fan-out checks that reconverge on a `certify` task, colored by state as the run advances. | A release train **parked on a human**: the build succeeded, the approval gate is `awaiting`, and the sensor and publish tasks queue behind your decision. |
 
 ### The whole fleet on one page
@@ -499,7 +499,7 @@ so any node can serve the single pane of glass.
 
 | Cluster panel | Fleet view |
 | :---: | :---: |
-| [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-fleet.png) |
+| [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png) |
 | Nine nodes, `8/8 agreed`, quorum met, per-node **load meters** and per-node **owns** counts under `distribution: spread`. | Every node's state for every job, one glance: ok / failing / running cells with ages, per-column node health, and a **failing only** filter. |
 
 ### Built for the 3 a.m. incident
@@ -513,7 +513,7 @@ pane, like tailing a set of pods.
 
 | Incident timeline | Merged multi-tail |
 | :---: | :---: |
-| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-multitail.png) |
+| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-multitail.png) |
 | "What happened, in what order": relative times, outcome glyphs, failure reasons, exit codes, durations, and a **failing only** filter. | Four streams, one pane: identity-colored prefixes, `end of run output` markers, auto re-attach on each job's next run. |
 
 ### Wallboards, heatmaps, and the state store
@@ -523,13 +523,13 @@ an incident stamp when something is failing, a `NO SIGNAL` banner when the
 data goes stale (never a stale all-green), and a zen **screensaver** that
 takes over when everything is healthy. The **activity heatmap** turns run
 history into a punchcard (worst outcome per bucket, shaded by volume), and the
-opt-in **state inspector** shows the [durable state store](https://github.com/ptweezy/yacron2/wiki/Durable-State)'s
+opt-in **state inspector** shows the [durable state store](https://github.com/ptweezy/cronstable/wiki/Durable-State)'s
 health: record counts by kind, op latencies and errors, locks, cursors,
 counters, artifacts, and quarantine.
 
 | Wallboard / TV mode | Activity heatmap | Durable-state inspector |
 | :---: | :---: | :---: |
-| [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-state.png) |
+| [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-state.png) |
 
 ### Make it yours
 
@@ -542,11 +542,11 @@ remembered per browser, and the CRT effects honor `prefers-reduced-motion`:
 
 | Amber phosphor CRT | Green phosphor CRT |
 | :---: | :---: |
-| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) |
+| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png) |
 
 | Flat modern theme | Carolina, on paper (light) |
 | :---: | :---: |
-| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-carolina-light.png) |
+| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png) |
 
 And because a control room deserves a proper power-on: an optional (on by
 default, once per 12 hours) **BIOS-style boot self-test** that checks the
@@ -554,17 +554,17 @@ daemon, job set, cluster, and schedules for real while it types:
 
 | Settings | Startup self-test |
 | :---: | :---: |
-| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-boot.png) |
+| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png) |
 
 Run history and live logs are kept **in memory only** (unless you opt into the
 durable state store), and the page is served with a strict
 Content-Security-Policy. Turn it on with a one-line `web:` block: the
-[**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard)
+[**web dashboard tour**](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard)
 in the wiki is the full walkthrough, and
 [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to
 enable it.
 
-**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f docker-compose-grand-tour.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
+**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f docker-compose-grand-tour.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
 
 ## Tutorials
 
@@ -600,8 +600,8 @@ stderr; tune that per job with [`failsWhen`](#handling-failure). The webhook's
 default body is Slack-compatible (Mattermost and Teams work as-is), and mail,
 Sentry, and a shell command are equally one block away, with jinja2 templating
 over the run's name, output, and exit code. Deeper:
-[Failure Detection and Retries](https://github.com/ptweezy/yacron2/wiki/Failure-Detection-and-Retries)
-and [Reporting](https://github.com/ptweezy/yacron2/wiki/Reporting) in the wiki.
+[Failure Detection and Retries](https://github.com/ptweezy/cronstable/wiki/Failure-Detection-and-Retries)
+and [Reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) in the wiki.
 
 ### Tutorial 2: Survive restarts, catch up what was missed
 
@@ -610,7 +610,7 @@ mid-schedule, one `state:` block gives jobs a memory:
 
 ```yaml
 state:
-  path: /var/lib/yacron2           # a local dir, or a shared mount for a fleet
+  path: /var/lib/cronstable           # a local dir, or a shared mount for a fleet
 
 jobs:
   - name: hourly-invoice-emit
@@ -634,8 +634,8 @@ coalesces any number of missed slots into one launch, `run-all` replays each
 one, bounded by `startingDeadlineSeconds`. The same store also hands your job
 *commands* durable primitives (key/value, cursors, fleet-wide locks,
 idempotency keys, artifacts, run-scoped secrets) over a loopback endpoint:
-`yacron2 state|cursor|lock|idempotent|artifact|secret`. Deeper:
-[Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State).
+`cronstable state|cursor|lock|idempotent|artifact|secret`. Deeper:
+[Durable State](https://github.com/ptweezy/cronstable/wiki/Durable-State).
 
 ### Tutorial 3: Your first DAG, a durable pipeline
 
@@ -644,7 +644,7 @@ This one builds, waits for a human, then publishes:
 
 ```yaml
 state:
-  path: /var/lib/yacron2           # DAGs live on the state store
+  path: /var/lib/cronstable           # DAGs live on the state store
 
 dags:
   - name: release-train            # no schedule: manual-only
@@ -674,10 +674,10 @@ curl -X POST http://127.0.0.1:8080/dags/release-train/runs/<runKey>/tasks/approv
 Every transition is durable: restart the daemon mid-run and the run resumes
 exactly where it was, and across a fleet the run advances under a lease so a
 task never launches twice. Scheduled DAGs add catch-up and `backfill` over a
-date range; tasks can pass data with `yacron2 xcom push/pull`, fan out
+date range; tasks can pass data with `cronstable xcom push/pull`, fan out
 dynamically over a list an upstream task produced, and poll for conditions
 with `type: sensor`. Deeper:
-[Orchestration and DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs).
+[Orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs).
 
 ### Tutorial 4: Two replicas, zero double-runs
 
@@ -687,12 +687,12 @@ coordination service:
 
 ```yaml
 state:
-  path: /mnt/shared/yacron2/state  # shared durable state (optional but natural here)
+  path: /mnt/shared/cronstable/state  # shared durable state (optional but natural here)
 
 cluster:
   backend: filesystem
   filesystem:
-    path: /mnt/shared/yacron2      # the mount is the election store
+    path: /mnt/shared/cronstable      # the mount is the election store
   nodeName: node-a                 # unique and stable per replica!
   electLeader: true
 
@@ -711,7 +711,7 @@ per-node work). No shared mount? The `gossip` backend elects over mutual TLS
 with no shared store at all, `kubernetes` uses a `coordination.k8s.io` Lease,
 and `etcd` a lease-bound key; `distribution: spread` load-balances job
 ownership across the fleet instead of concentrating it on one leader. Deeper:
-[Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election).
+[Clustering and Leader Election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election).
 
 ## Example gallery
 
@@ -724,28 +724,28 @@ runnable project; the compose files live in the repo root. Highlights:
 | [`grand-tour`](example/grand-tour) | `docker compose -f docker-compose-grand-tour.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all four reporters wired to live sinks. |
 | [`cluster`](example/cluster) | `docker compose -f docker-compose-cluster.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, live failover. |
 | [`cluster-large`](example/cluster-large) | `docker compose -f docker-compose-cluster-large.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
-| [`dag`](example/dag) | `yacron2 -c example/dag` | Orchestration alone, single node: dependencies, XCom, fan-out, a sensor, an approval gate. |
+| [`dag`](example/dag) | `cronstable -c example/dag` | Orchestration alone, single node: dependencies, XCom, fan-out, a sensor, an approval gate. |
 | [`dag-cluster`](example/dag-cluster) | `docker compose -f example/dag-cluster/docker-compose.yml up` | DAGs coordinating across three nodes on one shared store: crash-resume, exactly-once tasks. |
-| [`job-state`](example/job-state) | `yacron2 -c example/job-state` | The job-facing state primitives: KV, cursors, locks, idempotency keys, artifacts, secrets. |
+| [`job-state`](example/job-state) | `cronstable -c example/job-state` | The job-facing state primitives: KV, cursors, locks, idempotency keys, artifacts, secrets. |
 | [`pulse-monitor`](example/pulse-monitor) | `docker compose -f docker-compose-pulse.yml up` | Second-level scheduling as a real-time uptime / SLA monitor. |
 | [`pulse-cluster`](example/pulse-cluster) | `docker compose -f docker-compose-pulse-cluster.yml up` | The same probes fanned across a 3-node leader-electing cluster. |
 | [`acme-platform`](example/acme-platform) | `docker compose -f docker-compose-acme.yml up` | A realistic 5-node "data platform back-office" showcase. |
 | [`zen-demo`](example/zen-demo) | `docker compose -f docker-compose-zen.yml up` | A deliberately calm board, for the wallboard's zen screensaver. |
-| [`crontab`](example/crontab) | `yacron2 -c example/crontab` | Classic Vixie crontabs running as-is next to YAML jobs. |
+| [`crontab`](example/crontab) | `cronstable -c example/crontab` | Classic Vixie crontabs running as-is next to YAML jobs. |
 | [`kubernetes`](example/kubernetes) | `kubectl apply -f example/kubernetes/deployment.yaml` | Leader election through a `coordination.k8s.io/v1` Lease. |
 | [`etcd`](example/etcd) | `docker compose -f example/etcd/docker-compose.yml up` | Leader election through an etcd lease, over plain HTTP. |
-| [`docker`](example/docker) | `docker build` | The minimal "add yacron2 to your own image" recipe. |
+| [`docker`](example/docker) | `docker build` | The minimal "add cronstable to your own image" recipe. |
 
 ## Usage
 
-Configuration is in YAML format.  To start yacron2, give it a configuration file
+Configuration is in YAML format.  To start cronstable, give it a configuration file
 or directory path as the `-c` argument.  For example:
 
 ```shell
-yacron2 -c /tmp/my-crontab.yaml
+cronstable -c /tmp/my-crontab.yaml
 ```
 
-This starts yacron2 (always in the foreground!), reading
+This starts cronstable (always in the foreground!), reading
 `/tmp/my-crontab.yaml` as configuration file.  If the path is a directory,
 any `*.yaml` or `*.yml` files inside this directory are taken as
 configuration files, along with any classic crontabs (`*.crontab`, `*.cron`,
@@ -765,7 +765,7 @@ jobs:
 ```
 
 The command can be a string or a list of strings.  If command is a string,
-yacron2 runs it through a shell, which is `/bin/bash` in the above example, but
+cronstable runs it through a shell, which is `/bin/bash` in the above example, but
 is `/bin/sh` by default.
 
 If the command is a list of strings, the command is executed directly, without a
@@ -781,8 +781,8 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The `schedule` option can be a string in the classic crontab format (5, 6 or 7 fields; ranges, steps, lists and `jan`/`mon` names), parsed by yacron2's built-in cron engine — see [Schedules and Timezones](https://github.com/ptweezy/yacron2/wiki/Schedules-and-Timezones) for the full dialect.
-Additionally @reboot can be included , which will only run the job when yacron2 is initially
+The `schedule` option can be a string in the classic crontab format (5, 6 or 7 fields; ranges, steps, lists and `jan`/`mon` names), parsed by cronstable's built-in cron engine — see [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) for the full dialect.
+Additionally @reboot can be included , which will only run the job when cronstable is initially
 executed. Further `schedule` can be an object with properties.  The following configuration
 runs a command every 5 minutes, but only on the specific date 2017-07-19, and
 doesn't run it in any other date:
@@ -801,7 +801,7 @@ jobs:
 
 #### Second-level schedules
 
-Schedules are minute-granular by default, but yacron2 can also run jobs at
+Schedules are minute-granular by default, but cronstable can also run jobs at
 **second granularity**. There are two equivalent spellings:
 
 * a full **seven-field** crontab string, where the first field is the second
@@ -827,7 +827,7 @@ The second field accepts the same syntax as the others (`*`, `*/5`, `0,30`,
 
 While any enabled job specifies seconds, the scheduler wakes once per second
 instead of once per minute; minute-granular jobs are unaffected and still fire
-exactly once in their scheduled minute. If no job uses seconds, yacron2 keeps
+exactly once in their scheduled minute. If no job uses seconds, cronstable keeps
 its original once-a-minute cadence, so there is no overhead for the common case.
 
 Second-level scheduling is a YAML feature: [classic crontab files](#classic-crontab-files)
@@ -898,7 +898,7 @@ Variables declared in the `environment` option will override those found in the 
 
 ### Classic crontab files
 
-Already have a crontab?  yacron2 runs it as-is.  A file named `*.crontab`,
+Already have a crontab?  cronstable runs it as-is.  A file named `*.crontab`,
 `*.cron`, or just `crontab` (so `-c /etc/crontab` works) is read in the
 classic Vixie format, whether passed directly to `-c`, dropped into a config
 directory next to YAML files, or pulled in with `include:`:
@@ -916,15 +916,15 @@ PATH=/usr/local/bin:/usr/bin:/bin
 
 Comments, `NAME=value` environment lines (position-sensitive, `SHELL` and
 `CRON_TZ` honored), the `@reboot`/`@daily`/... nicknames, and `\%` escapes
-all work as in `man 5 crontab`.  Each entry becomes an ordinary yacron2 job
-named `<file>:<line>`, configured to yacron2's standard defaults rather than
+all work as in `man 5 crontab`.  Each entry becomes an ordinary cronstable job
+named `<file>:<line>`, configured to cronstable's standard defaults rather than
 an emulation of cron's environment: schedules run in **UTC** unless the
 crontab sets `CRON_TZ`, failure means a non-zero exit or stderr output (no
 `MAILTO` mail), and the `%`-as-stdin feature is a load-time error instead of
 a silent surprise (`\%` still gives a literal `%`).  When an entry needs
 retries, reporting, timeouts, or any other per-job option, move it to YAML.
 The full mapping and every deviation are documented in the
-[Classic Crontabs](https://github.com/ptweezy/yacron2/wiki/Classic-Crontabs)
+[Classic Crontabs](https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs)
 wiki page, and a runnable example (a config directory mixing a crontab with
 YAML and the dashboard) lives in [example/crontab](example/crontab).
 
@@ -955,7 +955,7 @@ Note: if the configuration option is a directory and there are multiple configur
 
 ### Reporting
 
-Yacron2 has builtin support for reporting jobs failure (more on that below) by
+Cronstable has builtin support for reporting jobs failure (more on that below) by
 email, Sentry, shell command, and HTTP webhook (Slack-compatible out of the
 box):
 
@@ -977,7 +977,7 @@ box):
           # fromFile: /etc/secrets/my-secret-dsn
           # fromEnvVar: SENTRY_DSN
         fingerprint:  # optional
-          - yacron2
+          - cronstable
           - "{{ environment.HOSTNAME }}"
           - "{{ name }}"
         extra:
@@ -1010,12 +1010,12 @@ Here, the `onFailure` object indicates that what to do when a job failure
 is detected.  In this case we ask for it to be reported both to sentry and by
 sending an email.
 
-The `captureStderr: true` part instructs yacron2 to capture output from the the
+The `captureStderr: true` part instructs cronstable to capture output from the the
 program's *standard error*, so that it can be included in the report.  We could
 also turn on *standard output* capturing via the `captureStdout: true` option.
-By default, yacron2 captures only standard error.  If a cron job's standard error
+By default, cronstable captures only standard error.  If a cron job's standard error
 or standard output capturing is not enabled, these streams will simply write to
-the same standard output and standard error as yacron2 itself.
+the same standard output and standard error as cronstable itself.
 
 Both *stdout* and *stderr* stream lines are by default prefixed with
 `[{job_name} {stream_name}]`, i.e. `[test-01 stdout]`, if for any reason you
@@ -1104,14 +1104,14 @@ the specified shell. It passes all environment variables from the python
 executable and specifies some additional ones to inform about the state of the
 job:
 
-* YACRON2_FAIL_REASON (str)
-* YACRON2_FAILED ("1" or "0")
-* YACRON2_JOB_NAME (str)
-* YACRON2_JOB_COMMAND (str)
-* YACRON2_JOB_SCHEDULE (str)
-* YACRON2_RETCODE (str)
-* YACRON2_STDERR (str)
-* YACRON2_STDOUT (str)
+* CRONSTABLE_FAIL_REASON (str)
+* CRONSTABLE_FAILED ("1" or "0")
+* CRONSTABLE_JOB_NAME (str)
+* CRONSTABLE_JOB_COMMAND (str)
+* CRONSTABLE_JOB_SCHEDULE (str)
+* CRONSTABLE_RETCODE (str)
+* CRONSTABLE_STDERR (str)
+* CRONSTABLE_STDOUT (str)
 
 A simple example configuration:
 
@@ -1124,7 +1124,7 @@ A simple example configuration:
     report:
       shell:
         shell: /bin/bash
-        command: echo "Error code $YACRON2_RETCODE"
+        command: echo "Error code $CRONSTABLE_RETCODE"
 ```
 
 The webhook reporter sends an HTTP POST to a URL of your choice. The default
@@ -1146,7 +1146,7 @@ your own endpoint). Like the other secrets, the URL can come from `value`,
           fromEnvVar: SLACK_WEBHOOK_URL
 ```
 
-See [Reporting](https://github.com/ptweezy/yacron2/wiki/Reporting) in the wiki
+See [Reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) in the wiki
 for all webhook options and per-service examples.
 
 It is possible to send emails formatted as html, by adding
@@ -1171,8 +1171,8 @@ command is captured and interpreted as html and placed in the email message:
 
 ### Metrics
 
-Yacron2 natively exposes Prometheus metrics whenever the
-[HTTP REST API](https://github.com/ptweezy/yacron2/wiki/HTTP-API) is enabled --
+Cronstable natively exposes Prometheus metrics whenever the
+[HTTP REST API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) is enabled --
 no exporter sidecar needed:
 
 ```yaml
@@ -1184,10 +1184,10 @@ web:
 `GET /metrics` then serves job run outcomes, duration histograms, retries,
 next-run times, config-reload health, and cluster/leader-election state, in
 both the Prometheus text format and OpenMetrics. See
-[Metrics with Prometheus](https://github.com/ptweezy/yacron2/wiki/Metrics-with-Prometheus)
+[Metrics with Prometheus](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Prometheus)
 for the full metric reference, scrape configuration, and example alert rules.
 
-Yacron2 also has builtin support for pushing per-job metrics to
+Cronstable also has builtin support for pushing per-job metrics to
 [Statsd](https://github.com/etsy/statsd):
 
 ```yaml
@@ -1201,7 +1201,7 @@ jobs:
       prefix: my.cron.jobs.prefix.test01
 ```
 
-With this config Yacron2 will write the following metrics over UDP
+With this config Cronstable will write the following metrics over UDP
 to the Statsd listening on `my-statsd.example.com:8125`:
 
 ```text
@@ -1224,7 +1224,7 @@ jobs:
     monitorResources: true
 ```
 
-While the job runs, yacron2 samples its **whole process tree** (children and
+While the job runs, cronstable samples its **whole process tree** (children and
 shell-outs included) with [psutil](https://github.com/giampaolo/psutil), and
 the run ends with its **total CPU time (user + system)** and **peak resident
 memory**. The numbers surface everywhere the run does:
@@ -1237,13 +1237,13 @@ memory**. The numbers surface everywhere the run does:
   per-run trend strips — plus a node-wide history chart behind the header
   meter (`GET /jobs/{name}/resources`, `GET /node/history`);
 * as Prometheus families on `GET /metrics`
-  (`yacron2_job_cpu_seconds_total`, `yacron2_job_last_run_max_rss_bytes`, ...)
+  (`cronstable_job_cpu_seconds_total`, `cronstable_job_last_run_max_rss_bytes`, ...)
   and over [statsd](#metrics) when the job has a sink;
 * in the durable run record's `resources` object when a
-  [state store](https://github.com/ptweezy/yacron2/wiki/Durable-State) is
+  [state store](https://github.com/ptweezy/cronstable/wiki/Durable-State) is
   configured, so it survives restarts;
 * in report templates (`cpu_seconds` / `max_rss_bytes`) and the shell
-  reporter's environment (`YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES`),
+  reporter's environment (`CRONSTABLE_CPU_SECONDS` / `CRONSTABLE_MAX_RSS_BYTES`),
   so a failure page can say how big the run was when it died.
 
 It is observability only (it never changes a run's verdict), it is off by
@@ -1257,15 +1257,15 @@ task record of the `dag_run` document. On a cluster,
 `cluster.observability` additionally shares each node's **whole-host**
 CPU/memory so the dashboard's cluster panel and fleet view show where the
 load actually is. The full semantics live in the
-[Configuration Reference](https://github.com/ptweezy/yacron2/wiki/Configuration-Reference).
+[Configuration Reference](https://github.com/ptweezy/cronstable/wiki/Configuration-Reference).
 
 ### Handling failure
 
-By default, yacron2 considers that a job has *failed* if either the process
+By default, cronstable considers that a job has *failed* if either the process
 returns a non-zero code or if it generates output to *standard error* (and
 standard error capturing is enabled, of course).
 
-You can instruct yacron2 how to determine if a job has failed or not via the
+You can instruct cronstable how to determine if a job has failed or not via the
 `failsWhen` option:
 
 ```yaml
@@ -1277,22 +1277,22 @@ failsWhen:
 ```
 
 producesStdout
-: If true, any captured standard output causes yacron2 to consider the job
+: If true, any captured standard output causes cronstable to consider the job
 as failed.  This is false by default.
 
 producesStderr
-: If true, any captured standard error causes yacron2 to consider the job
+: If true, any captured standard error causes cronstable to consider the job
 as failed.  This is true by default.
 
 nonzeroReturn
-: If true, if the job process returns a code other than zero causes yacron2
+: If true, if the job process returns a code other than zero causes cronstable
 to consider the job as failed.  This is true by default.
 
 always
-: If true, if the job process exits that causes yacron2 to consider the job as
+: If true, if the job process exits that causes cronstable to consider the job as
 failed.  This is false by default.
 
-It is possible to instruct yacron2 to retry failing cron jobs by adding a
+It is possible to instruct cronstable to retry failing cron jobs by adding a
 `retry` option inside `onFailure`:
 
 ```yaml
@@ -1317,16 +1317,16 @@ It is possible to instruct yacron2 to retry failing cron jobs by adding a
       backoffMultiplier: 2
 ```
 
-The above settings tell yacron2 to retry the job up to 10 times, with the delay
+The above settings tell cronstable to retry the job up to 10 times, with the delay
 between retries defined by an exponential backoff process: initially 1 second,
 doubling for every retry up to a maximum of 30 seconds. A value of -1 for
-maximumRetries will mean yacron2 will keep retrying forever, this is mostly
+maximumRetries will mean cronstable will keep retrying forever, this is mostly
 useful with a schedule of "@reboot" to restart a long running process when it
 has failed.
 
 Retries are in-memory by default: a daemon restart forgets an armed retry. With
 a `state:` section configured, armed retries survive restarts and resume where
-they left off; see [Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State)
+they left off; see [Durable State](https://github.com/ptweezy/cronstable/wiki/Durable-State)
 in the wiki.
 
 If the cron job is expected to fail sometimes, you may wish to report only in
@@ -1358,7 +1358,7 @@ For that situation, you can use the `onPermanentFailure` option:
 
 ### Concurrency
 
-Sometimes it may happen that a cron job takes so long to execute that when the moment its next scheduled execution is reached a previous instance may still be running.  How yacron2 handles this situation is controlled by the option `concurrencyPolicy`, which takes one of the following values:
+Sometimes it may happen that a cron job takes so long to execute that when the moment its next scheduled execution is reached a previous instance may still be running.  How cronstable handles this situation is controlled by the option `concurrencyPolicy`, which takes one of the following values:
 
 Allow
 : allows concurrently running jobs (default)
@@ -1371,10 +1371,10 @@ Replace
 
 ### Execution timeout
 
-If you have a cron job that may possibly hang sometimes, you can instruct yacron2
+If you have a cron job that may possibly hang sometimes, you can instruct cronstable
 to terminate the process after N seconds if it's still running by then, via the
 `executionTimeout` option.  For example, the following cron job takes 2
-seconds to complete, yacron2 will terminate it after 1 second:
+seconds to complete, cronstable will terminate it after 1 second:
 
 ```yaml
 - name: test-03
@@ -1394,13 +1394,13 @@ you tell it to shutdown, the process may need a few seconds to flush buffers and
 avoid losing data.
 
 On the other hand, there are times when programs are buggy and simply get stuck,
-refusing to terminate nicely no matter what.  For this reason, yacron2 always
+refusing to terminate nicely no matter what.  For this reason, cronstable always
 checks if a process exited some time after being asked to do so. If it hasn't,
 it tries to forcefully kill the process.  The option `killTimeout` option
 indicates how many seconds to wait for the process to gracefully terminate
 before killing it more forcefully.  In Unix systems, we first send a SIGTERM,
 but if the process doesn't exit after `killTimeout` seconds (30 by default)
-then we send SIGKILL.  For example, this cron job ignores SIGTERM, and so yacron2
+then we send SIGKILL.  For example, this cron job ignores SIGTERM, and so cronstable
 will send it a SIGKILL after half a second:
 
 ```yaml
@@ -1419,7 +1419,7 @@ will send it a SIGKILL after half a second:
 
 ### Change to another user/group
 
-You can request that Yacron2 change to another user and/or group for a specific
+You can request that Cronstable change to another user and/or group for a specific
 cron job.  The field `user` indicates the user (uid or userame) under which
 the subprocess must be executed.  The field `group` (gid or group name)
 indicates the group id.  If only `user` is given, the group defaults to the
@@ -1434,7 +1434,7 @@ main group of that user.  Example:
   user: www-data
 ```
 
-Naturally, yacron2 must be running as root in order to have permissions to
+Naturally, cronstable must be running as root in order to have permissions to
 change to another user.
 
 This feature is POSIX-only (it relies on `setuid`/`setgid`). On Windows, a job
@@ -1443,22 +1443,22 @@ with `user` or `group` set is rejected with a configuration error; see
 
 ### Remote web/HTTP interface
 
-If you wish to remotely control yacron2, you can optionally enable an HTTP REST
+If you wish to remotely control cronstable, you can optionally enable an HTTP REST
 interface, with the following configuration (example):
 
 ```yaml
 web:
   listen:
      - http://127.0.0.1:8080
-     - unix:///tmp/yacron2.sock
+     - unix:///tmp/cronstable.sock
 ```
 
 #### Enabling the web dashboard
 
-With the web interface enabled, yacron2 also serves the **[web dashboard](#web-dashboard)**
+With the web interface enabled, cronstable also serves the **[web dashboard](#web-dashboard)**
 (showcased near the top of this README) at the root path (`/`) of any `http://`
 listener. Open <http://127.0.0.1:8080/> in the example above, and see the
-[full dashboard tour](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in
+[full dashboard tour](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard) in
 the wiki. It is a single self-contained page (no build step or external assets)
 that watches every job's status, tails its logs live, runs or cancels jobs on
 demand, and shows run history and a plain-English schedule preview. Logs are
@@ -1466,8 +1466,8 @@ shown for the streams a job captures, so enable `captureStdout` /
 `captureStderr` on jobs whose output you want to watch here.
 
 The run history and logs are kept **in memory only**. Nothing is written to
-disk, so the dashboard does not change yacron2's read-only-filesystem
-deployment story. History resets when yacron2 restarts.
+disk, so the dashboard does not change cronstable's read-only-filesystem
+deployment story. History resets when cronstable restarts.
 
 If you have enabled bearer-token authentication for the web API (the
 `web.authToken` option), the dashboard page itself loads without a token, then
@@ -1485,7 +1485,7 @@ web:
 
 Now you have the following options to control it (using HTTPie as example):
 
-#### Get the version of yacron2
+#### Get the version of cronstable
 
 ```shell
 $ http get http://127.0.0.1:8080/version
@@ -1560,7 +1560,7 @@ Server: Python/3.7 aiohttp/3.6.2
 
 `POST /jobs/{name}/cancel` terminates any currently-running instances of a job
 (the same graceful SIGTERM-then-SIGKILL sequence, honoring the job's
-`killTimeout`, that yacron2 uses elsewhere). A job cancelled this way is recorded
+`killTimeout`, that cronstable uses elsewhere). A job cancelled this way is recorded
 in its history with the outcome `cancelled`; unlike a failure it is **not**
 reported and does **not** trigger retries. It returns `409 Conflict` if the job
 is not currently running, and `404 Not Found` for an unknown job.
@@ -1668,7 +1668,7 @@ data: {}
 ### Job-set id
 
 The **job-set id** is an order-independent fingerprint of the set of jobs a
-yacron2 instance is running. Two instances produce the *same* id if and only if
+cronstable instance is running. Two instances produce the *same* id if and only if
 they hold the same set of jobs, which lets several replicas deployed from the
 same configuration confirm they are running the same thing, or detect that one
 has drifted from the others.
@@ -1705,7 +1705,7 @@ It is available three ways:
 * **CLI**: print it and exit (handy in scripts / health checks):
 
   ```shell
-  $ yacron2 -c /etc/yacron2.d --job-set-id
+  $ cronstable -c /etc/cronstable.d --job-set-id
   v1:b834d7565aee0da50cd017f666651a5ba3b2e6b161daf0cb6e430f23f51ce90b
   ```
 
@@ -1725,7 +1725,7 @@ It is available three ways:
 
 ### Clustering and leader election
 
-By default yacron2 runs as a single instance and every replica runs every job.
+By default cronstable runs as a single instance and every replica runs every job.
 An optional `cluster` section lets several replicas coordinate: each node serves
 a small `GET /peer` endpoint over **mutual TLS** and periodically polls its
 configured peers, comparing [job-set ids](#job-set-id) so they can confirm they
@@ -1738,13 +1738,13 @@ double-running scheduled jobs:
 cluster:
   listen: "0.0.0.0:8443"          # the mTLS listener for this node
   tls:
-    ca:   /etc/yacron2/cluster-ca.pem   # trust anchor for peer certificates
-    cert: /etc/yacron2/this-node.pem    # this node's certificate
-    key:  /etc/yacron2/this-node.key
+    ca:   /etc/cronstable/cluster-ca.pem   # trust anchor for peer certificates
+    cert: /etc/cronstable/this-node.pem    # this node's certificate
+    key:  /etc/cronstable/this-node.key
   peers:
-    - host: yacron-b.internal:8443
-    - host: yacron-c.internal:8443
-  nodeName: yacron-a              # optional; defaults to the system hostname
+    - host: cronstable-b.internal:8443
+    - host: cronstable-c.internal:8443
+  nodeName: cronstable-a              # optional; defaults to the system hostname
   interval: 30                    # optional; seconds per round (default 30)
   connectTimeout: 10              # optional; per-peer connect timeout (default 10)
   driftAfter: 3                   # optional; rounds before "drifted" (default 3)
@@ -1774,7 +1774,7 @@ available at `GET /cluster` and shown as a panel in the dashboard. This is a
 teaser: the full trust model, per-peer status table, quorum math, sizing
 guidance, `distribution: spread` load-balancing, and the fenced lease backends
 are all covered in depth in the
-[Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election)
+[Clustering and Leader Election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election)
 guide in the wiki. To watch it live, see [Try it](#web-dashboard) below.
 
 ### Includes
@@ -1858,41 +1858,41 @@ jobs:
 
 ## Documentation map
 
-The [wiki](https://github.com/ptweezy/yacron2/wiki):
+The [wiki](https://github.com/ptweezy/cronstable/wiki):
 
 * **Run it**:
-  [Installation](https://github.com/ptweezy/yacron2/wiki/Installation) ·
-  [Production and Container Deployment](https://github.com/ptweezy/yacron2/wiki/Production-Deployment) ·
-  [Running on Windows](https://github.com/ptweezy/yacron2/wiki/Running-on-Windows) ·
-  [Migration from yacron](https://github.com/ptweezy/yacron2/wiki/Migration-from-yacron)
+  [Installation](https://github.com/ptweezy/cronstable/wiki/Installation) ·
+  [Production and Container Deployment](https://github.com/ptweezy/cronstable/wiki/Production-Deployment) ·
+  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows) ·
+  [Migration from yacron](https://github.com/ptweezy/cronstable/wiki/Migration-from-yacron)
 * **Configure it**:
-  [Configuration Reference](https://github.com/ptweezy/yacron2/wiki/Configuration-Reference) ·
-  [Schedules and Timezones](https://github.com/ptweezy/yacron2/wiki/Schedules-and-Timezones) ·
-  [Classic Crontabs](https://github.com/ptweezy/yacron2/wiki/Classic-Crontabs) ·
-  [Includes and Defaults](https://github.com/ptweezy/yacron2/wiki/Includes-and-Defaults) ·
-  [Commands and Environment](https://github.com/ptweezy/yacron2/wiki/Commands-and-Environment) ·
-  [Output Capturing](https://github.com/ptweezy/yacron2/wiki/Output-Capturing) ·
-  [Logging](https://github.com/ptweezy/yacron2/wiki/Logging-Configuration)
+  [Configuration Reference](https://github.com/ptweezy/cronstable/wiki/Configuration-Reference) ·
+  [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) ·
+  [Classic Crontabs](https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs) ·
+  [Includes and Defaults](https://github.com/ptweezy/cronstable/wiki/Includes-and-Defaults) ·
+  [Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment) ·
+  [Output Capturing](https://github.com/ptweezy/cronstable/wiki/Output-Capturing) ·
+  [Logging](https://github.com/ptweezy/cronstable/wiki/Logging-Configuration)
 * **Trust it**:
-  [Failure Detection and Retries](https://github.com/ptweezy/yacron2/wiki/Failure-Detection-and-Retries) ·
-  [Reporting](https://github.com/ptweezy/yacron2/wiki/Reporting) ·
-  [Concurrency and Timeouts](https://github.com/ptweezy/yacron2/wiki/Concurrency-and-Timeouts) ·
-  [Troubleshooting](https://github.com/ptweezy/yacron2/wiki/Troubleshooting)
+  [Failure Detection and Retries](https://github.com/ptweezy/cronstable/wiki/Failure-Detection-and-Retries) ·
+  [Reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) ·
+  [Concurrency and Timeouts](https://github.com/ptweezy/cronstable/wiki/Concurrency-and-Timeouts) ·
+  [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting)
 * **Watch it**:
-  [Web Dashboard](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) ·
-  [HTTP API](https://github.com/ptweezy/yacron2/wiki/HTTP-API) ·
-  [Metrics with Prometheus](https://github.com/ptweezy/yacron2/wiki/Metrics-with-Prometheus) ·
-  [Metrics with Statsd](https://github.com/ptweezy/yacron2/wiki/Metrics-with-Statsd) ·
-  [CLI Reference](https://github.com/ptweezy/yacron2/wiki/CLI-Reference)
+  [Web Dashboard](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard) ·
+  [HTTP API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) ·
+  [Metrics with Prometheus](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Prometheus) ·
+  [Metrics with Statsd](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Statsd) ·
+  [CLI Reference](https://github.com/ptweezy/cronstable/wiki/CLI-Reference)
 * **Scale it**:
-  [Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State) ·
-  [Orchestration and DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs) ·
-  [Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election) ·
-  [Architecture and Internals](https://github.com/ptweezy/yacron2/wiki/Architecture-and-Internals)
+  [Durable State](https://github.com/ptweezy/cronstable/wiki/Durable-State) ·
+  [Orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs) ·
+  [Clustering and Leader Election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election) ·
+  [Architecture and Internals](https://github.com/ptweezy/cronstable/wiki/Architecture-and-Internals)
 
 ## Contributing and license
 
 Bug reports, feature ideas, and pull requests are welcome; see
 [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and
-[Contributing and Releasing](https://github.com/ptweezy/yacron2/wiki/Contributing-and-Releasing)
-for how releases work. yacron2 is [MIT-licensed](LICENSE).
+[Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing)
+for how releases work. cronstable is [MIT-licensed](LICENSE).

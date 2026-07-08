@@ -8,9 +8,9 @@ import aiosmtplib
 import pytest
 from sentry_sdk.utils import Dsn
 
-import yacron2.config
-import yacron2.job
-import yacron2.statsd
+import cronstable.config
+import cronstable.job
+import cronstable.statsd
 from tests._commands import (
     cmd_print,
     cmd_print_sleep_print,
@@ -18,12 +18,12 @@ from tests._commands import (
     cmd_write_env,
     yaml_command,
 )
-from yacron2.platform import DEFAULT_SHELL, IS_WINDOWS
+from cronstable.platform import DEFAULT_SHELL, IS_WINDOWS
 
 
 def _argv(*parts):
     """Expected subprocess argv for this platform (str on Windows, bytes on
-    POSIX) -- mirrors yacron2.platform.encode_argv."""
+    POSIX) -- mirrors cronstable.platform.encode_argv."""
     return tuple(parts) if IS_WINDOWS else tuple(p.encode() for p in parts)
 
 
@@ -57,11 +57,11 @@ async def test_stream_reader(
     save_limit, input_lines, output, expected_failure
 ):
     fake_stream = asyncio.StreamReader()
-    reader = yacron2.job.StreamReader(
+    reader = cronstable.job.StreamReader(
         "cronjob-1", "stderr", fake_stream, "", save_limit
     )
 
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -72,7 +72,7 @@ jobs:
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron2.job.RunningJob(job_config, None)
+    job = cronstable.job.RunningJob(job_config, None)
 
     async def producer(fake_stream):
         fake_stream.feed_data(input_lines)
@@ -91,11 +91,11 @@ jobs:
 @pytest.mark.asyncio
 async def test_stream_reader_long_line():
     fake_stream = asyncio.StreamReader()
-    reader = yacron2.job.StreamReader(
+    reader = cronstable.job.StreamReader(
         "cronjob-1", "stderr", fake_stream, "", 500
     )
 
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -106,7 +106,7 @@ jobs:
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron2.job.RunningJob(job_config, None)
+    job = cronstable.job.RunningJob(job_config, None)
 
     async def producer(fake_stream):
         fake_stream.feed_data(b"one line\n")
@@ -126,7 +126,7 @@ jobs:
 
 @pytest.mark.asyncio
 async def test_job_output_stream_subscribe_then_publish():
-    out = yacron2.job.JobOutputStream()
+    out = cronstable.job.JobOutputStream()
     queue = out.subscribe()
     out.publish("stdout", "hello\n")
     out.publish("stderr", "oops\n")
@@ -138,7 +138,7 @@ async def test_job_output_stream_subscribe_then_publish():
 
 @pytest.mark.asyncio
 async def test_job_output_stream_close_delivers_sentinel():
-    out = yacron2.job.JobOutputStream()
+    out = cronstable.job.JobOutputStream()
     queue = out.subscribe()
     out.publish("stdout", "line\n")
     out.close()
@@ -150,7 +150,7 @@ async def test_job_output_stream_close_delivers_sentinel():
 async def test_job_output_stream_late_subscriber_gets_sentinel():
     # subscribing after the run finished must not block forever: the new
     # subscriber receives the end sentinel immediately, after the buffer.
-    out = yacron2.job.JobOutputStream()
+    out = cronstable.job.JobOutputStream()
     out.publish("stdout", "done\n")
     out.close()
     queue = out.subscribe()
@@ -160,7 +160,7 @@ async def test_job_output_stream_late_subscriber_gets_sentinel():
 
 @pytest.mark.asyncio
 async def test_job_output_stream_ring_buffer_bounds():
-    out = yacron2.job.JobOutputStream(limit=3)
+    out = cronstable.job.JobOutputStream(limit=3)
     for i in range(5):
         out.publish("stdout", f"line {i}\n")
     # only the most recent `limit` lines are retained
@@ -175,9 +175,9 @@ async def test_job_output_stream_ring_buffer_bounds():
 async def test_stream_reader_publishes_to_output():
     # the on_line hook wires StreamReader output into a JobOutputStream so the
     # web UI can tail lines live as the job produces them.
-    out = yacron2.job.JobOutputStream()
+    out = cronstable.job.JobOutputStream()
     fake_stream = asyncio.StreamReader()
-    reader = yacron2.job.StreamReader(
+    reader = cronstable.job.StreamReader(
         "cronjob-1", "stdout", fake_stream, "", 100, on_line=out.publish
     )
     fake_stream.feed_data(b"first\n")
@@ -255,7 +255,7 @@ jobs:
 )
 @pytest.mark.asyncio
 async def test_report_mail(success, stdout, stderr, subject, body):
-    conf = yacron2.config.parse_config_string(A_JOB, "")
+    conf = cronstable.config.parse_config_string(A_JOB, "")
     job_config = conf.jobs[0]
     print(job_config.onSuccess["report"])
     job = Mock(
@@ -270,7 +270,7 @@ async def test_report_mail(success, stdout, stderr, subject, body):
         },
     )
 
-    mail = yacron2.job.MailReporter()
+    mail = cronstable.job.MailReporter()
 
     connect_calls = []
     start_tls_calls = []
@@ -396,7 +396,7 @@ async def test_report_sentry(  # noqa: C901
     tmpdir,
     monkeypatch,
 ):
-    conf = yacron2.config.parse_config_string(A_JOB, "")
+    conf = cronstable.config.parse_config_string(A_JOB, "")
     job_config = conf.jobs[0]
 
     p = tmpdir.join("sentry-secret-dsn")
@@ -428,7 +428,7 @@ async def test_report_sentry(  # noqa: C901
         raise AssertionError
 
     job_config.onSuccess["report"]["sentry"]["body"] = (
-        yacron2.config.DEFAULT_CONFIG["onFailure"]["report"]["sentry"]["body"]
+        cronstable.config.DEFAULT_CONFIG["onFailure"]["report"]["sentry"]["body"]
     )
 
     job_config.onSuccess["report"]["sentry"]["fingerprint"] = ["{{ name }}"]
@@ -491,7 +491,7 @@ async def test_report_sentry(  # noqa: C901
 
     monkeypatch.setattr("sentry_sdk.client.make_transport", make_transport)
 
-    sentry = yacron2.job.SentryReporter()
+    sentry = cronstable.job.SentryReporter()
     await sentry.report(success, job, job_config.onSuccess["report"])
     for transport in transports:
         assert transport.args[0].get("dsn") == expected_dsn
@@ -535,7 +535,7 @@ async def test_report_shell(command, expected_output):
         out_file_path = os.path.join(tmp, "unit_test_file")
         reporter = yaml_command(cmd_write_env(out_file_path), indent=10)
 
-        conf = yacron2.config.parse_config_string(
+        conf = cronstable.config.parse_config_string(
             f"""
 jobs:
   - name: test
@@ -565,7 +565,7 @@ jobs:
             failed=True,
         )
 
-        shell_reporter = yacron2.job.ShellReporter()
+        shell_reporter = cronstable.job.ShellReporter()
 
         await shell_reporter.report(False, job, job_config.onFailure["report"])
 
@@ -659,7 +659,7 @@ async def test_report_webhook(success, expected_subject):
 
     server = _WebhookServer()
     async with server as url:
-        conf = yacron2.config.parse_config_string(
+        conf = cronstable.config.parse_config_string(
             _webhook_job_config(
                 f"            value: {url}",
                 extra=(
@@ -672,7 +672,7 @@ async def test_report_webhook(success, expected_subject):
         job_config = conf.jobs[0]
         job = _webhook_job(job_config, success=success)
 
-        reporter = yacron2.job.WebhookReporter()
+        reporter = cronstable.job.WebhookReporter()
         await reporter.report(success, job, job_config.onFailure["report"])
 
     (request,) = server.requests
@@ -702,13 +702,13 @@ async def test_report_webhook_url_sources(url_source, monkeypatch, tmp_path):
         else:
             monkeypatch.setenv("TEST_WEBHOOK_URL", url)
             url_yaml = "            fromEnvVar: TEST_WEBHOOK_URL"
-        conf = yacron2.config.parse_config_string(
+        conf = cronstable.config.parse_config_string(
             _webhook_job_config(url_yaml), ""
         )
         job_config = conf.jobs[0]
         job = _webhook_job(job_config)
 
-        await yacron2.job.WebhookReporter().report(
+        await cronstable.job.WebhookReporter().report(
             False, job, job_config.onFailure["report"]
         )
 
@@ -719,7 +719,7 @@ async def test_report_webhook_url_sources(url_source, monkeypatch, tmp_path):
 async def test_report_webhook_disabled():
     # with no url source configured (the default), the reporter must return
     # early without opening any HTTP session
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -735,7 +735,7 @@ jobs:
         raise AssertionError("ClientSession must not be created")
 
     with patch("aiohttp.ClientSession", no_session):
-        await yacron2.job.WebhookReporter().report(
+        await cronstable.job.WebhookReporter().report(
             False, job, job_config.onFailure["report"]
         )
 
@@ -743,7 +743,7 @@ jobs:
 @pytest.mark.asyncio
 async def test_report_webhook_env_var_not_set(monkeypatch, caplog):
     monkeypatch.delenv("TEST_WEBHOOK_URL", raising=False)
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         _webhook_job_config("            fromEnvVar: TEST_WEBHOOK_URL"), ""
     )
     job_config = conf.jobs[0]
@@ -753,8 +753,8 @@ async def test_report_webhook_env_var_not_set(monkeypatch, caplog):
         raise AssertionError("ClientSession must not be created")
 
     with patch("aiohttp.ClientSession", no_session):
-        with caplog.at_level(logging.ERROR, logger="yacron2"):
-            await yacron2.job.WebhookReporter().report(
+        with caplog.at_level(logging.ERROR, logger="cronstable"):
+            await cronstable.job.WebhookReporter().report(
                 False, job, job_config.onFailure["report"]
             )
     assert any(
@@ -768,14 +768,14 @@ async def test_report_webhook_http_error(caplog):
     # not raise out of the reporter
     server = _WebhookServer(status=500)
     async with server as url:
-        conf = yacron2.config.parse_config_string(
+        conf = cronstable.config.parse_config_string(
             _webhook_job_config(f"            value: {url}"), ""
         )
         job_config = conf.jobs[0]
         job = _webhook_job(job_config)
 
-        with caplog.at_level(logging.ERROR, logger="yacron2"):
-            await yacron2.job.WebhookReporter().report(
+        with caplog.at_level(logging.ERROR, logger="cronstable"):
+            await cronstable.job.WebhookReporter().report(
                 False, job, job_config.onFailure["report"]
             )
 
@@ -791,7 +791,7 @@ async def test_report_webhook_http_error(caplog):
 async def test_report_webhook_custom_method_and_body():
     server = _WebhookServer()
     async with server as url:
-        conf = yacron2.config.parse_config_string(
+        conf = cronstable.config.parse_config_string(
             _webhook_job_config(
                 f"            value: {url}",
                 extra=(
@@ -805,7 +805,7 @@ async def test_report_webhook_custom_method_and_body():
         job_config = conf.jobs[0]
         job = _webhook_job(job_config)
 
-        await yacron2.job.WebhookReporter().report(
+        await cronstable.job.WebhookReporter().report(
             False, job, job_config.onFailure["report"]
         )
 
@@ -867,7 +867,7 @@ async def test_job_run(
     else:
         command_snippet = "    command: " + command
 
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -884,7 +884,7 @@ jobs:
     )
     job_config = conf.jobs[0]
 
-    job = yacron2.job.RunningJob(job_config, None)
+    job = cronstable.job.RunningJob(job_config, None)
 
     await job.start()
     await job.wait()
@@ -909,7 +909,7 @@ jobs:
 async def test_monitor_resources_populates_usage():
     # a monitored job records CPU time + peak RSS on the RunningJob, which the
     # reaper then folds into the run record / metrics.
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(0.4))
         + """
@@ -918,7 +918,7 @@ async def test_monitor_resources_populates_usage():
 """,
         "",
     )
-    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
     # the monitor takes an immediate first sample when its task first runs
     # (during the wait below), so even this sub-second run is measured once.
     await job.start()
@@ -935,7 +935,7 @@ async def test_monitor_resources_populates_usage():
 
 @pytest.mark.asyncio
 async def test_monitor_resources_off_by_default():
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_print(out="hi"))
         + """
@@ -943,7 +943,7 @@ async def test_monitor_resources_off_by_default():
 """,
         "",
     )
-    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
     assert job.config.monitorResources is False
     await job.start()
     await job.wait()
@@ -953,7 +953,7 @@ async def test_monitor_resources_off_by_default():
 
 @pytest.mark.asyncio
 async def test_execution_timeout():
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_print_sleep_print("hello", 1, "world"))
         + """
@@ -965,7 +965,7 @@ async def test_execution_timeout():
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron2.job.RunningJob(job_config, None)
+    job = cronstable.job.RunningJob(job_config, None)
     await job.start()
     await job.wait()
     assert job.stdout == "hello\n"
@@ -973,14 +973,14 @@ async def test_execution_timeout():
 
 @pytest.mark.asyncio
 async def test_error1():
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(5))
         + '\n    schedule: "* * * * *"\n',
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron2.job.RunningJob(job_config, None)
+    job = cronstable.job.RunningJob(job_config, None)
 
     await job.start()
     with pytest.raises(RuntimeError):
@@ -990,14 +990,14 @@ async def test_error1():
 
 @pytest.mark.asyncio
 async def test_error2():
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(5))
         + '\n    schedule: "* * * * *"\n',
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron2.job.RunningJob(job_config, None)
+    job = cronstable.job.RunningJob(job_config, None)
 
     with pytest.raises(RuntimeError):
         await job.wait()
@@ -1005,14 +1005,14 @@ async def test_error2():
 
 @pytest.mark.asyncio
 async def test_error3():
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(5))
         + '\n    schedule: "* * * * *"\n',
         "",
     )
     job_config = conf.jobs[0]
-    job = yacron2.job.RunningJob(job_config, None)
+    job = cronstable.job.RunningJob(job_config, None)
 
     with pytest.raises(RuntimeError):
         await job.cancel()
@@ -1047,7 +1047,7 @@ async def test_statsd(command):
         host, port = transport.get_extra_info("sockname")
         print("Listening UDP on %s:%s" % (host, port))
 
-        conf = yacron2.config.parse_config_string(
+        conf = cronstable.config.parse_config_string(
             "jobs:\n  - name: test\n"
             + yaml_command(command)
             + """
@@ -1061,7 +1061,7 @@ async def test_statsd(command):
         )
         job_config = conf.jobs[0]
 
-        job = yacron2.job.RunningJob(job_config, None)
+        job = cronstable.job.RunningJob(job_config, None)
 
         await job.start()
         await job.wait()
@@ -1101,7 +1101,7 @@ async def test_statsd_resource_metrics():
         UDPServerProtocol, local_addr=("127.0.0.1", 0)
     )
     _host, port = transport.get_extra_info("sockname")
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(0.3))
         + """
@@ -1114,7 +1114,7 @@ async def test_statsd_resource_metrics():
 """.format(port=port),
         "",
     )
-    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
     await job.start()
     await job.wait()
     await asyncio.sleep(0.05)
@@ -1131,7 +1131,7 @@ async def test_start_failure_reported_not_raised():
     # A command that cannot be launched (e.g. it does not exist) must be
     # treated as a normal job failure with exit code 127, not raise
     # RuntimeError (which the reaper logs as "please report this as a bug").
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -1141,7 +1141,7 @@ jobs:
 """,
         "",
     )
-    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
 
     await job.start()
     assert job.proc is None
@@ -1161,7 +1161,7 @@ async def test_start_failure_bare_oserror_reported_not_raised(monkeypatch):
     # broadened it propagated out of the unguarded spawn_jobs /
     # _process_pending_reboots path and killed the whole scheduler. It must now
     # be treated as a normal start failure (start_failed set), not raised.
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         """
 jobs:
   - name: test
@@ -1176,7 +1176,7 @@ jobs:
         raise OSError(24, "Too many open files")
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
-    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
 
     await job.start()  # must NOT raise
     assert job.proc is None
@@ -1194,9 +1194,9 @@ async def test_statsd_failure_does_not_crash(monkeypatch):
     async def boom(*args, **kwargs):
         raise OSError("statsd unreachable")
 
-    monkeypatch.setattr(yacron2.statsd, "send_to_statsd", boom)
+    monkeypatch.setattr(cronstable.statsd, "send_to_statsd", boom)
 
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_print())
         + """
@@ -1208,7 +1208,7 @@ async def test_statsd_failure_does_not_crash(monkeypatch):
 """,
         "",
     )
-    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
 
     await job.start()  # _on_start must swallow the OSError
     await job.wait()  # _on_stop must swallow the OSError
@@ -1218,7 +1218,7 @@ async def test_statsd_failure_does_not_crash(monkeypatch):
 @pytest.mark.asyncio
 async def test_report_mail_closes_connection_on_error():
     # if sending fails, the SMTP connection must still be closed (no leak).
-    conf = yacron2.config.parse_config_string(A_JOB, "")
+    conf = cronstable.config.parse_config_string(A_JOB, "")
     job_config = conf.jobs[0]
     job = Mock(
         config=job_config,
@@ -1232,7 +1232,7 @@ async def test_report_mail_closes_connection_on_error():
         },
     )
 
-    mail = yacron2.job.MailReporter()
+    mail = cronstable.job.MailReporter()
     close_calls = []
 
     async def connect(self):
@@ -1284,8 +1284,8 @@ jobs:
 
 
 def _make_job_with_ids(uid=None, gid=None, username=None):
-    conf = yacron2.config.parse_config_string(_SIMPLE_JOB, "")
-    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    conf = cronstable.config.parse_config_string(_SIMPLE_JOB, "")
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
     job.config.uid = uid
     job.config.gid = gid
     job.config.username = username
@@ -1350,7 +1350,7 @@ def test_demote_clears_groups_when_no_username(monkeypatch):
 def test_demote_wraps_oserror(monkeypatch, failing_call, prefix):
     # every privilege-drop syscall that fails must surface as a RuntimeError
     # with a clear prefix, not a bare OSError the reaper would mislabel as an
-    # internal yacron2 bug.
+    # internal cronstable bug.
     calls = []
     _record_priv_syscalls(monkeypatch, calls, failing=failing_call)
 
@@ -1377,7 +1377,7 @@ async def test_start_wires_preexec_fn_only_when_demoting(monkeypatch):
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
 
-    conf = yacron2.config.parse_config_string(
+    conf = cronstable.config.parse_config_string(
         """
 jobs:
   - name: t
@@ -1393,14 +1393,14 @@ jobs:
 
     # with a uid to drop to, start() must wire preexec_fn -> _demote (bound
     # methods compare equal, not identical, so use ==).
-    job = yacron2.job.RunningJob(conf.jobs[0], None)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
     job.config.uid = 1000
     await job.start()
     assert captured[-1].get("preexec_fn") == job._demote
 
     # with neither uid nor gid, preexec_fn must NOT be passed: it is needless
     # overhead on every spawn and an outright error on some platforms.
-    job2 = yacron2.job.RunningJob(conf.jobs[0], None)
+    job2 = cronstable.job.RunningJob(conf.jobs[0], None)
     job2.config.uid = None
     job2.config.gid = None
     await job2.start()
@@ -1408,7 +1408,7 @@ jobs:
 
 
 # ---------------------------------------------------------------------------
-# Shell-reporter YACRON2_* env contract.
+# Shell-reporter CRONSTABLE_* env contract.
 #
 # Users' alerting scripts read these exact variable names; a rename or typo,
 # or an inverted truncation flag, breaks them silently with the suite green.
@@ -1419,20 +1419,20 @@ jobs:
 
 GOLDEN_SHELL_ENV_KEYS = frozenset(
     {
-        "YACRON2_FAIL_REASON",
-        "YACRON2_JOB_NAME",
-        "YACRON2_JOB_COMMAND",
-        "YACRON2_JOB_SCHEDULE",
-        "YACRON2_FAILED",
-        "YACRON2_RETCODE",
-        "YACRON2_STDERR",
-        "YACRON2_STDOUT",
-        "YACRON2_STDERR_TRUNCATED",
-        "YACRON2_STDOUT_TRUNCATED",
+        "CRONSTABLE_FAIL_REASON",
+        "CRONSTABLE_JOB_NAME",
+        "CRONSTABLE_JOB_COMMAND",
+        "CRONSTABLE_JOB_SCHEDULE",
+        "CRONSTABLE_FAILED",
+        "CRONSTABLE_RETCODE",
+        "CRONSTABLE_STDERR",
+        "CRONSTABLE_STDOUT",
+        "CRONSTABLE_STDERR_TRUNCATED",
+        "CRONSTABLE_STDOUT_TRUNCATED",
         # resource accounting: always exported (empty when the run was not
-        # monitored), see ShellReporter.report / yacron2.resources.
-        "YACRON2_CPU_SECONDS",
-        "YACRON2_MAX_RSS_BYTES",
+        # monitored), see ShellReporter.report / cronstable.resources.
+        "CRONSTABLE_CPU_SECONDS",
+        "CRONSTABLE_MAX_RSS_BYTES",
     }
 )
 
@@ -1453,9 +1453,9 @@ jobs:
 async def _capture_shell_reporter_env(
     monkeypatch, *, stdout, stderr, retcode=7, fail_reason="boom", failed=True
 ):
-    # Drop any ambient YACRON2_* so the exact-set assertion is deterministic
+    # Drop any ambient CRONSTABLE_* so the exact-set assertion is deterministic
     # regardless of how the suite was launched.
-    for key in [k for k in os.environ if k.startswith("YACRON2_")]:
+    for key in [k for k in os.environ if k.startswith("CRONSTABLE_")]:
         monkeypatch.delenv(key, raising=False)
 
     captured = {}
@@ -1474,7 +1474,7 @@ async def _capture_shell_reporter_env(
     monkeypatch.setattr("asyncio.create_subprocess_shell", fake_create)
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake_create)
 
-    conf = yacron2.config.parse_config_string(_SHELL_REPORTER_JOB, "")
+    conf = cronstable.config.parse_config_string(_SHELL_REPORTER_JOB, "")
     job_config = conf.jobs[0]
     job = Mock(
         config=job_config,
@@ -1485,7 +1485,7 @@ async def _capture_shell_reporter_env(
         failed=failed,
         resource_usage=None,
     )
-    await yacron2.job.ShellReporter().report(
+    await cronstable.job.ShellReporter().report(
         False, job, job_config.onFailure["report"]
     )
     return captured["env"]
@@ -1497,25 +1497,25 @@ async def test_report_shell_full_env_contract(monkeypatch):
         monkeypatch, stdout="out", stderr="err"
     )
 
-    # exactly these YACRON2_* variables are exported, no more and no fewer: a
+    # exactly these CRONSTABLE_* variables are exported, no more and no fewer: a
     # dropped, renamed, or added variable fails here.
     assert {
-        k for k in env if k.startswith("YACRON2_")
+        k for k in env if k.startswith("CRONSTABLE_")
     } == GOLDEN_SHELL_ENV_KEYS
 
-    assert env["YACRON2_JOB_NAME"] == "test"
-    assert env["YACRON2_JOB_COMMAND"] == "echo the-command"
-    assert env["YACRON2_JOB_SCHEDULE"] == "*/5 * * * *"
-    assert env["YACRON2_FAILED"] == "1"
-    assert env["YACRON2_RETCODE"] == "7"
+    assert env["CRONSTABLE_JOB_NAME"] == "test"
+    assert env["CRONSTABLE_JOB_COMMAND"] == "echo the-command"
+    assert env["CRONSTABLE_JOB_SCHEDULE"] == "*/5 * * * *"
+    assert env["CRONSTABLE_FAILED"] == "1"
+    assert env["CRONSTABLE_RETCODE"] == "7"
     # unmonitored run: resource vars present but empty
-    assert env["YACRON2_CPU_SECONDS"] == ""
-    assert env["YACRON2_MAX_RSS_BYTES"] == ""
-    assert env["YACRON2_FAIL_REASON"] == "boom"
-    assert env["YACRON2_STDOUT"] == "out"
-    assert env["YACRON2_STDERR"] == "err"
-    assert env["YACRON2_STDOUT_TRUNCATED"] == "0"
-    assert env["YACRON2_STDERR_TRUNCATED"] == "0"
+    assert env["CRONSTABLE_CPU_SECONDS"] == ""
+    assert env["CRONSTABLE_MAX_RSS_BYTES"] == ""
+    assert env["CRONSTABLE_FAIL_REASON"] == "boom"
+    assert env["CRONSTABLE_STDOUT"] == "out"
+    assert env["CRONSTABLE_STDERR"] == "err"
+    assert env["CRONSTABLE_STDOUT_TRUNCATED"] == "0"
+    assert env["CRONSTABLE_STDERR_TRUNCATED"] == "0"
 
 
 @pytest.mark.asyncio
@@ -1530,11 +1530,11 @@ async def test_report_shell_env_when_succeeded(monkeypatch):
         fail_reason=None,
         failed=False,
     )
-    assert env["YACRON2_FAILED"] == "0"
-    assert env["YACRON2_RETCODE"] == "0"
-    assert env["YACRON2_FAIL_REASON"] == ""
-    assert env["YACRON2_STDOUT"] == ""
-    assert env["YACRON2_STDERR"] == ""
+    assert env["CRONSTABLE_FAILED"] == "0"
+    assert env["CRONSTABLE_RETCODE"] == "0"
+    assert env["CRONSTABLE_FAIL_REASON"] == ""
+    assert env["CRONSTABLE_STDOUT"] == ""
+    assert env["CRONSTABLE_STDERR"] == ""
 
 
 @pytest.mark.asyncio
@@ -1561,10 +1561,10 @@ async def test_report_shell_truncates_large_output(
     env = await _capture_shell_reporter_env(
         monkeypatch, stdout="o" * out_len, stderr="e" * err_len
     )
-    assert env["YACRON2_STDOUT_TRUNCATED"] == exp_out_trunc
-    assert env["YACRON2_STDERR_TRUNCATED"] == exp_err_trunc
-    assert len(env["YACRON2_STDOUT"]) == exp_out_len
-    assert len(env["YACRON2_STDERR"]) == exp_err_len
+    assert env["CRONSTABLE_STDOUT_TRUNCATED"] == exp_out_trunc
+    assert env["CRONSTABLE_STDERR_TRUNCATED"] == exp_err_trunc
+    assert len(env["CRONSTABLE_STDOUT"]) == exp_out_len
+    assert len(env["CRONSTABLE_STDERR"]) == exp_err_len
 
 
 @pytest.mark.asyncio
@@ -1579,7 +1579,7 @@ async def test_report_shell_combined_over_limit_is_not_truncated(monkeypatch):
     env = await _capture_shell_reporter_env(
         monkeypatch, stdout="o" * each, stderr="e" * each
     )
-    assert env["YACRON2_STDOUT_TRUNCATED"] == "0"
-    assert env["YACRON2_STDERR_TRUNCATED"] == "0"
-    assert len(env["YACRON2_STDOUT"]) == each
-    assert len(env["YACRON2_STDERR"]) == each
+    assert env["CRONSTABLE_STDOUT_TRUNCATED"] == "0"
+    assert env["CRONSTABLE_STDERR_TRUNCATED"] == "0"
+    assert len(env["CRONSTABLE_STDOUT"]) == each
+    assert len(env["CRONSTABLE_STDERR"]) == each

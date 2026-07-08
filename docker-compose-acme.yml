@@ -1,8 +1,8 @@
-# "ACME Orders" — a full-fledged yacron2 showcase.
+# "ACME Orders" — a full-fledged cronstable showcase.
 #
 # A FIVE-node mutual-TLS cluster (leader election + distribution: spread)
 # running a realistic mini data & ops platform whose job set is built to
-# exercise everything yacron2 can do AND make every web-dashboard feature demo
+# exercise everything cronstable can do AND make every web-dashboard feature demo
 # itself. Two small sinks make the failure-reporting features real: Mailpit
 # (SMTP) catches the on-call mail, and a statsd exporter receives job metrics.
 #
@@ -10,7 +10,7 @@
 #   docker compose -f docker-compose-acme.yml logs -f         # watch job output
 #   docker compose -f docker-compose-acme.yml down -v         # stop + wipe (incl. certs)
 #
-# Open a node dashboard:   http://localhost:8080/   (yacron-a; b..e on 8081..8084)
+# Open a node dashboard:   http://localhost:8080/   (cronstable-a; b..e on 8081..8084)
 # Watch the on-call mail:  http://localhost:8025/   (Mailpit inbox)
 # Scrape job metrics:      http://localhost:9102/metrics   (statsd exporter)
 #
@@ -38,7 +38,7 @@
 # Stop 3+ nodes and the cluster loses quorum: Leader jobs stand down while
 # PreferLeader jobs keep running.
 
-x-cluster-hosts: &cluster_hosts "yacron-a:8443,yacron-b:8443,yacron-c:8443,yacron-d:8443,yacron-e:8443"
+x-cluster-hosts: &cluster_hosts "cronstable-a:8443,cronstable-b:8443,cronstable-c:8443,cronstable-d:8443,cronstable-e:8443"
 
 x-node-env: &node-env
   CLUSTER_HOSTS: *cluster_hosts
@@ -50,7 +50,7 @@ x-node-env: &node-env
 x-node: &node
   build:
     context: .
-  image: yacron2-acme:local          # built once, reused by all five nodes
+  image: cronstable-acme:local          # built once, reused by all five nodes
   entrypoint: ["sh", "/node-entrypoint.sh"]
   restart: unless-stopped
   depends_on:
@@ -94,11 +94,11 @@ services:
       - "9102:9102"     # prometheus metrics
       # 9125/udp (statsd) stays internal; the nodes reach it as statsd:9125
 
-  yacron-a: { <<: *node, hostname: yacron-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: yacron-a } }
-  yacron-b: { <<: *node, hostname: yacron-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: yacron-b } }
-  yacron-c: { <<: *node, hostname: yacron-c, ports: ["8082:8080"], environment: { <<: *node-env, NODE_NAME: yacron-c } }
-  yacron-d: { <<: *node, hostname: yacron-d, ports: ["8083:8080"], environment: { <<: *node-env, NODE_NAME: yacron-d } }
-  yacron-e: { <<: *node, hostname: yacron-e, ports: ["8084:8080"], environment: { <<: *node-env, NODE_NAME: yacron-e } }
+  cronstable-a: { <<: *node, hostname: cronstable-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-a } }
+  cronstable-b: { <<: *node, hostname: cronstable-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-b } }
+  cronstable-c: { <<: *node, hostname: cronstable-c, ports: ["8082:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-c } }
+  cronstable-d: { <<: *node, hostname: cronstable-d, ports: ["8083:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-d } }
+  cronstable-e: { <<: *node, hostname: cronstable-e, ports: ["8084:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-e } }
 
 volumes:
   acme-certs:

@@ -21,23 +21,23 @@ RUN pyenv global 3.13.14
 # CI setup-uv version.
 COPY --from=ghcr.io/astral-sh/uv:0.11.26 /uv /uvx /bin/
 
-RUN /root/.pyenv/versions/3.13.14/bin/python -m venv /yacron2
+RUN /root/.pyenv/versions/3.13.14/bin/python -m venv /cronstable
 # Point uv at that venv (VIRTUAL_ENV) and never let it fetch a managed Python --
 # the pyenv-built 3.13.14 (--enable-shared, above) is what must be baked in.
-ENV PATH=/yacron2/bin:$PATH \
-    VIRTUAL_ENV=/yacron2 \
+ENV PATH=/cronstable/bin:$PATH \
+    VIRTUAL_ENV=/cronstable \
     UV_PYTHON_DOWNLOADS=never
 RUN uv pip install setuptools pyinstaller==6.21.0
 
-COPY . /root/yacron2
-WORKDIR /root/yacron2
+COPY . /root/cronstable
+WORKDIR /root/cronstable
 RUN git status
 RUN uv pip install .
 # Best-effort, wheel-only: bundle uvloop so this (x86_64 glibc) local build gets
 # the faster event loop too, mirroring the CI binary jobs. Falls back to asyncio
-# if no wheel is available (yacron2/__main__._new_event_loop).
+# if no wheel is available (cronstable/__main__._new_event_loop).
 RUN uv pip install --only-binary=:all: "uvloop>=0.19" || echo "no uvloop wheel; using asyncio"
-RUN python pyinstaller/yacron2 --version
-RUN pyinstaller pyinstaller/yacron2.spec
-RUN ls -sFh dist/yacron2
-RUN dist/yacron2 --version
+RUN python pyinstaller/cronstable --version
+RUN pyinstaller pyinstaller/cronstable.spec
+RUN ls -sFh dist/cronstable
+RUN dist/cronstable --version

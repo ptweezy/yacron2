@@ -1,0 +1,100 @@
+# Demo crontab for playing with the cronstable web dashboard.
+#
+# Brought up by ../../docker-compose.yml. The `web` section below turns on the
+# built-in dashboard; the jobs are deliberately varied so every part of the UI
+# has something to show: live log tailing, success/failure status, retries,
+# a long-running job you can catch "running", a manual "Run now" job, and a
+# disabled job.
+#
+# Open http://localhost:8080/ once the container is up.
+
+defaults:
+  shell: /bin/bash
+  # Capture both streams so their output shows up in the dashboard's log tail.
+  captureStdout: true
+  captureStderr: true
+  environment:
+    - key: PYTHONIOENCODING
+      value: utf-8
+
+web:
+  # 0.0.0.0 so the dashboard is reachable through the published Docker port.
+  listen:
+    - http://0.0.0.0:8080
+
+jobs:
+  # Prints once the moment cronstable starts — gives the dashboard a first run to
+  # show immediately instead of an empty history.
+  - name: welcome
+    command: echo "👋 Welcome! cronstable demo started on $HOSTNAME at $(date -u +'%Y-%m-%d %H:%M:%S') UTC."
+    schedule: "@reboot"
+
+  # Fires every minute and always succeeds — watch the live countdown to the
+  # next run reset, and the green "last run: success".
+  - name: heartbeat
+    command: echo "♥ heartbeat at $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+
+  # Streams 10 lines slowly. Open its logs and hit "Run now" to watch lines
+  # arrive live, one per second.
+  - name: chatty-logger
+    command: |
+      echo "Starting a chatty run..."
+      for i in $(seq 1 10); do
+        echo "log line $i / 10 at $(date -u +%T)"
+        sleep 1
+      done
+      echo "All done — goodbye!"
+    schedule: "*/2 * * * *"
+
+  # Randomly succeeds or fails, so the dashboard flips between green and red
+  # over time. Failure writes to stderr and exits non-zero.
+  - name: coin-flip
+    command: |
+      if (( RANDOM % 2 )); then
+        echo "Heads — all good ✅"
+      else
+        echo "Tails — simulated failure ❌" 1>&2
+        exit 1
+      fi
+    schedule: "*/2 * * * *"
+
+  # Always fails, then retries with exponential backoff (2s, 4s, 8s). Good for
+  # watching the retry/backoff behavior and the eventual failed status.
+  - name: flaky-with-retry
+    command: |
+      echo "Trying the flaky operation at $(date -u +%T)..."
+      echo "transient error, will retry" 1>&2
+      exit 7
+    schedule: "*/5 * * * *"
+    onFailure:
+      retry:
+        maximumRetries: 3
+        initialDelay: 2
+        maximumDelay: 10
+        backoffMultiplier: 2
+
+  # Runs for ~30 seconds with a progress bar. Trigger it with "Run now", then
+  # refresh to catch it in the "running" state and tail its progress live.
+  - name: long-runner
+    command: |
+      echo "Working hard for ~30 seconds..."
+      for i in $(seq 1 30); do
+        echo "progress: $i/30"
+        sleep 1
+      done
+      echo "Finished!"
+    schedule: "*/10 * * * *"
+    concurrencyPolicy: Forbid
+
+  # Scheduled effectively never (once a year), so in practice it only ever runs
+  # when you press "Run now" — the on-demand button demo.
+  - name: on-demand-task
+    command: echo "🚀 You launched me on demand at $(date -u +%T) UTC."
+    schedule: "0 0 1 1 *"
+
+  # Shows the "disabled" state — present in the config but never scheduled.
+  - name: disabled-example
+    enabled: false
+    command: echo "I am disabled; flip enabled to true to schedule me."
+    schedule: "* * * * *"

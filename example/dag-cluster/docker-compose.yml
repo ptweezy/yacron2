@@ -1,4 +1,4 @@
-# Three yacron2 nodes sharing one state store, running the same DAG config and
+# Three cronstable nodes sharing one state store, running the same DAG config and
 # electing a leader over the store (backend: filesystem) -- no etcd, no gossip
 # certs, no Kubernetes. Each dag_run is advanced by exactly one node under its
 # advance lease, so a task launches exactly once across the fleet.
@@ -17,17 +17,17 @@
 #         -H 'Content-Type: application/json' -d '{"decision":"approve","by":"me"}'
 #   * demonstrate failover / crash-resume -- stop the current leader mid-run and
 #     watch another node adopt its runs within a lease TTL and finish them:
-#       docker compose -f example/dag-cluster/docker-compose.yml stop yacron2-a
+#       docker compose -f example/dag-cluster/docker-compose.yml stop cronstable-a
 #
 # All coordination is on the single `state` volume below; there is no other
 # shared service.
 #
-# The three nodes build the yacron2 image from this repo (so the example works
+# The three nodes build the cronstable image from this repo (so the example works
 # before the DAG feature ships in a published release). Once it is released you
-# can drop the `build:` blocks and use `image: ghcr.io/ptweezy/yacron2:latest`
+# can drop the `build:` blocks and use `image: ghcr.io/ptweezy/cronstable:latest`
 # on each node, exactly like the other cluster examples.
 services:
-  # A Docker named volume is created root-owned, but the yacron2 image runs as
+  # A Docker named volume is created root-owned, but the cronstable image runs as
   # an unprivileged user (uid 65534). This one-shot init makes the shared store
   # writable by that user before the nodes start; the nodes wait for it.
   init-state:
@@ -36,53 +36,53 @@ services:
     volumes:
       - state:/state
 
-  yacron2-a:
+  cronstable-a:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: yacron2:dag-cluster-local
-    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
-    hostname: yacron2-a          # becomes cluster.nodeName / the lease identity
+    image: cronstable:dag-cluster-local
+    command: ["-c", "/etc/cronstable/cronstable.yaml"]
+    hostname: cronstable-a          # becomes cluster.nodeName / the lease identity
     depends_on:
       init-state:
         condition: service_completed_successfully
     ports:
       - "8080:8080"
     volumes:
-      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
-      - state:/var/lib/yacron2/state
+      - ./cronstable.yaml:/etc/cronstable/cronstable.yaml:ro
+      - state:/var/lib/cronstable/state
 
-  yacron2-b:
+  cronstable-b:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: yacron2:dag-cluster-local
-    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
-    hostname: yacron2-b
+    image: cronstable:dag-cluster-local
+    command: ["-c", "/etc/cronstable/cronstable.yaml"]
+    hostname: cronstable-b
     depends_on:
       init-state:
         condition: service_completed_successfully
     ports:
       - "8081:8080"
     volumes:
-      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
-      - state:/var/lib/yacron2/state
+      - ./cronstable.yaml:/etc/cronstable/cronstable.yaml:ro
+      - state:/var/lib/cronstable/state
 
-  yacron2-c:
+  cronstable-c:
     build:
       context: ../..
       dockerfile: Dockerfile
-    image: yacron2:dag-cluster-local
-    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
-    hostname: yacron2-c
+    image: cronstable:dag-cluster-local
+    command: ["-c", "/etc/cronstable/cronstable.yaml"]
+    hostname: cronstable-c
     depends_on:
       init-state:
         condition: service_completed_successfully
     ports:
       - "8082:8080"
     volumes:
-      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
-      - state:/var/lib/yacron2/state
+      - ./cronstable.yaml:/etc/cronstable/cronstable.yaml:ro
+      - state:/var/lib/cronstable/state
 
 volumes:
   # The one shared coordination surface: the durable state store AND the leader

@@ -1,9 +1,9 @@
-# ACME Orders — a full-fledged yacron2 showcase
+# ACME Orders — a full-fledged cronstable showcase
 
 A **five-node mutual-TLS cluster** (leader election + `distribution: spread`)
 running a realistic mini **data & ops platform** (ingest → transform → load →
 report, plus monitoring and housekeeping). It is deliberately built to exercise
-**everything yacron2 can do** and to make every
+**everything cronstable can do** and to make every
 [web dashboard](../../wiki/Web-Dashboard.md) feature demo itself. Two small
 sinks make the reporting features real: **Mailpit** (SMTP) catches the on-call
 mail, and a **statsd exporter** receives job metrics.
@@ -19,7 +19,7 @@ This is the deep end. For a gentler start, try a single node
 docker compose -f docker-compose-acme.yml up --build
 ```
 
-- Node dashboards: <http://localhost:8080/> (yacron-a), …8081–8084 (b–e)
+- Node dashboards: <http://localhost:8080/> (cronstable-a), …8081–8084 (b–e)
 - On-call inbox (Mailpit): <http://localhost:8025/>
 - Native Prometheus metrics (per node): <http://localhost:8080/metrics>
 - Job metrics (statsd, re-exported as Prometheus): <http://localhost:9102/metrics>
@@ -30,7 +30,7 @@ Stop and wipe (including the throwaway certs):
 docker compose -f docker-compose-acme.yml down -v
 ```
 
-## yacron2 features exercised
+## cronstable features exercised
 
 | Feature | Where |
 | --- | --- |
@@ -73,7 +73,7 @@ PreferLeader and fan out under spread.
 ## Things to try
 
 1. **Watch the spread**: open two dashboards side by side and compare each job's
-   Owner; stop a node (`docker compose -f docker-compose-acme.yml stop yacron-a`)
+   Owner; stop a node (`docker compose -f docker-compose-acme.yml stop cronstable-a`)
    and watch its owned jobs re-home to survivors.
 2. **Lose quorum**: stop 3 of the 5 nodes; Leader jobs stand down (dashboard
    shows *no quorum*), while PreferLeader jobs keep running.

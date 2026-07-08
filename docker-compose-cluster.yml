@@ -1,4 +1,4 @@
-# A three-node yacron2 cluster with mutual-TLS peer attestation and leader
+# A three-node cronstable cluster with mutual-TLS peer attestation and leader
 # election — a playground for the clustering features.
 #
 #   docker compose -f docker-compose-cluster.yml up --build      # start
@@ -6,16 +6,16 @@
 #   docker compose -f docker-compose-cluster.yml down            # stop
 #   docker compose -f docker-compose-cluster.yml down -v         # stop + wipe certs
 #
-# Three nodes (yacron-a, -b, -c) are deployed from one identical job set
+# Three nodes (cronstable-a, -b, -c) are deployed from one identical job set
 # (example/cluster/jobs.yaml) plus a per-node cluster section that gives each
 # its TLS identity and peer list. A one-shot `certgen` service mints a throwaway
 # cluster CA and one cert per node (SAN = service name) into a shared volume
 # before the nodes start.
 #
 # Each node serves its own dashboard:
-#   - yacron-a -> http://localhost:8080/
-#   - yacron-b -> http://localhost:8081/
-#   - yacron-c -> http://localhost:8082/
+#   - cronstable-a -> http://localhost:8080/
+#   - cronstable-b -> http://localhost:8081/
+#   - cronstable-c -> http://localhost:8082/
 # Scroll to the "cluster" panel at the bottom of any dashboard to see the peer
 # table, the agreement tally, the quorum, and which node is the leader.
 #
@@ -24,24 +24,24 @@
 # 1. Watch it converge. On startup each node reports its peers "unknown" (not
 #    yet polled; "unreachable" if a poll fails while a container is still
 #    starting), then "agreed" within ~10s (the poll interval). The leader is
-#    "yacron-a" (the lowest node name). Confirm with:
+#    "cronstable-a" (the lowest node name). Confirm with:
 #        curl -s localhost:8080/cluster | jq        # is_leader: true
-#        curl -s localhost:8081/cluster | jq        # leader: "yacron-a"
+#        curl -s localhost:8081/cluster | jq        # leader: "cronstable-a"
 #
 # 2. Compare the policies. Open the job drawers / history on all three:
 #        - tick-every-node   (EveryNode)   -> runs on ALL three nodes
-#        - tick-leader-only  (Leader)      -> runs ONLY on the leader (yacron-a)
+#        - tick-leader-only  (Leader)      -> runs ONLY on the leader (cronstable-a)
 #        - tick-prefer-leader(PreferLeader)-> runs on the lowest reachable node
 #
-# 3. Fail the leader.   docker compose -f docker-compose-cluster.yml stop yacron-a
-#    yacron-b and yacron-c still see each other -> quorum holds (2 of 3), and
-#    leadership moves to yacron-b. tick-leader-only now advances on 8081.
+# 3. Fail the leader.   docker compose -f docker-compose-cluster.yml stop cronstable-a
+#    cronstable-b and cronstable-c still see each other -> quorum holds (2 of 3), and
+#    leadership moves to cronstable-b. tick-leader-only now advances on 8081.
 #
-# 4. Lose quorum.       docker compose -f docker-compose-cluster.yml stop yacron-a yacron-b
-#    The lone survivor (yacron-c) can see only itself: 1 of 3 is below quorum, so
+# 4. Lose quorum.       docker compose -f docker-compose-cluster.yml stop cronstable-a cronstable-b
+#    The lone survivor (cronstable-c) can see only itself: 1 of 3 is below quorum, so
 #    it STANDS DOWN — tick-leader-only stops running anywhere (the safety/
-#    liveness trade). tick-every-node keeps running on yacron-c regardless.
-#    Bring them back:   docker compose -f docker-compose-cluster.yml start yacron-a yacron-b
+#    liveness trade). tick-every-node keeps running on cronstable-c regardless.
+#    Bring them back:   docker compose -f docker-compose-cluster.yml start cronstable-a cronstable-b
 #
 # 5. Manual triggers ignore the leader. Hit "Run now" on `run-me-anywhere` from
 #    a follower's dashboard (8081/8082) — it runs there. Manual triggers and
@@ -51,22 +51,22 @@
 #    per-node cluster section, so give ONE node a different jobs.yaml:
 #        cp example/cluster/jobs.yaml example/cluster/jobs-drift.yaml
 #        # edit jobs-drift.yaml: change any job (e.g. its command or schedule)
-#    then point yacron-c at it by editing this file's yacron-c jobs bind mount:
-#        ./example/cluster/jobs-drift.yaml:/etc/yacron2.d/jobs.yaml:ro
+#    then point cronstable-c at it by editing this file's cronstable-c jobs bind mount:
+#        ./example/cluster/jobs-drift.yaml:/etc/cronstable.d/jobs.yaml:ro
 #    and recreate just that node:
-#        docker compose -f docker-compose-cluster.yml up -d yacron-c
-#    yacron-c's job-set id now differs, so yacron-a and yacron-b report it
+#        docker compose -f docker-compose-cluster.yml up -d cronstable-c
+#    cronstable-c's job-set id now differs, so cronstable-a and cronstable-b report it
 #    "drifted" (after driftAfter=2 rounds) on their cluster panels.
 #
-# 7. Spread the load. By default ONE leader (yacron-a) runs every Leader job.
+# 7. Spread the load. By default ONE leader (cronstable-a) runs every Leader job.
 #    Uncomment `distribution: spread` in ALL THREE example/cluster/node-*.yaml
 #    files and recreate (`docker compose -f docker-compose-cluster.yml up -d`).
 #    Now each leader-gated job is owned by a (possibly different) node via
 #    rendezvous hashing, so the work fans out instead of piling on the leader.
 #    With these job names and all three nodes healthy you will see:
-#        tick-leader-only    -> runs on yacron-c
-#        tick-prefer-leader  -> runs on yacron-b
-#    (vs both on yacron-a under the default single-leader mode). The cluster
+#        tick-leader-only    -> runs on cronstable-c
+#        tick-prefer-leader  -> runs on cronstable-b
+#    (vs both on cronstable-a under the default single-leader mode). The cluster
 #    panel shows the role as "spread (per-job owner)" and each job's drawer /
 #    `curl -s localhost:8080/jobs` shows its "clusterOwner". Same quorum gate,
 #    same guarantee — purely a load optimization.
@@ -75,10 +75,10 @@
 #    by default so you can watch the load fan out in `docker stats`), see
 #    docker-compose-cluster-large.yml.
 
-x-yacron-node: &yacron-node
+x-cronstable-node: &cronstable-node
   build:
     context: .
-  image: yacron2-cluster:local      # built once, reused by all three nodes
+  image: cronstable-cluster:local      # built once, reused by all three nodes
   restart: unless-stopped
   depends_on:
     certgen:
@@ -101,37 +101,37 @@ services:
       - cluster-certs:/certs
       - ./example/cluster/gen-certs.sh:/gen-certs.sh:ro
 
-  yacron-a:
-    <<: *yacron-node
-    container_name: yacron-a
-    hostname: yacron-a              # also sets $HOSTNAME, used in the job output
+  cronstable-a:
+    <<: *cronstable-node
+    container_name: cronstable-a
+    hostname: cronstable-a              # also sets $HOSTNAME, used in the job output
     ports:
       - "8080:8080"                 # dashboard; 8443 (cluster mTLS) stays internal
     volumes:
-      - ./example/cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
-      - ./example/cluster/node-a.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - ./example/cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./example/cluster/node-a.yaml:/etc/cronstable.d/cluster.yaml:ro
       - cluster-certs:/certs:ro
 
-  yacron-b:
-    <<: *yacron-node
-    container_name: yacron-b
-    hostname: yacron-b
+  cronstable-b:
+    <<: *cronstable-node
+    container_name: cronstable-b
+    hostname: cronstable-b
     ports:
       - "8081:8080"
     volumes:
-      - ./example/cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
-      - ./example/cluster/node-b.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - ./example/cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./example/cluster/node-b.yaml:/etc/cronstable.d/cluster.yaml:ro
       - cluster-certs:/certs:ro
 
-  yacron-c:
-    <<: *yacron-node
-    container_name: yacron-c
-    hostname: yacron-c
+  cronstable-c:
+    <<: *cronstable-node
+    container_name: cronstable-c
+    hostname: cronstable-c
     ports:
       - "8082:8080"
     volumes:
-      - ./example/cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
-      - ./example/cluster/node-c.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - ./example/cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./example/cluster/node-c.yaml:/etc/cronstable.d/cluster.yaml:ro
       - cluster-certs:/certs:ro
 
 volumes:

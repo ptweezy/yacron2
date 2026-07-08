@@ -22,7 +22,7 @@ Types and defaults are taken from the strictyaml schema and `DEFAULT_CONFIG`.
 
 `command` is required on every job. `shell` has a platform-specific
 schema/`DEFAULT_CONFIG` default: `/bin/sh` on POSIX and an empty string on
-Windows (`DEFAULT_SHELL` in `yacron2/platform.py`), which makes a string command
+Windows (`DEFAULT_SHELL` in `cronstable/platform.py`), which makes a string command
 run via `cmd.exe`. `environment` defaults to an empty list. `env_file`,
 `user`, and `group` are optional (`Opt(...)` in the schema) and unset by default;
 `environment` and `env_file` are also inheritable via `defaults`, but `user` and
@@ -33,16 +33,16 @@ root-required check happen per job).
 ## command and shell
 
 `command` may be either a string or a list of strings, and the form determines
-how the process is launched (`RunningJob.start` in `yacron2/job.py`):
+how the process is launched (`RunningJob.start` in `cronstable/job.py`):
 
 - **String**: run through a shell.
-  - If `shell` is set, yacron2 launches `asyncio.create_subprocess_exec` with
+  - If `shell` is set, cronstable launches `asyncio.create_subprocess_exec` with
     argv `[shell, "-c", command]`. With the default `shell` on POSIX, that is
     `["/bin/sh", "-c", command]`.
-  - If `shell` is falsy, yacron2 instead uses `asyncio.create_subprocess_shell`
+  - If `shell` is falsy, cronstable instead uses `asyncio.create_subprocess_shell`
     with the bare command string. On POSIX the default `/bin/sh` makes the
     `exec`-with-`-c` path the one that runs; on Windows the default `shell` is
-    empty (`DEFAULT_SHELL` in `yacron2/platform.py`), so the
+    empty (`DEFAULT_SHELL` in `cronstable/platform.py`), so the
     `create_subprocess_shell` path is the default: the command is handed to the
     native command processor `cmd.exe` via `%ComSpec%`. Setting `shell:`
     explicitly on Windows takes the `exec`-with-`-c` path with that interpreter.
@@ -95,7 +95,7 @@ for envvar in self.config.environment:
 ```
 
 If `environment` is empty (the default) **and** there is no `env_file`, no `env`
-is passed to the subprocess, so it inherits yacron2's environment unchanged.
+is passed to the subprocess, so it inherits cronstable's environment unchanged.
 
 ```yaml
 jobs:
@@ -109,7 +109,7 @@ jobs:
 
 ### HOSTNAME injection
 
-When the `yacron2.job` module is imported, if `HOSTNAME` is not already present
+When the `cronstable.job` module is imported, if `HOSTNAME` is not already present
 in `os.environ`, it is set to `socket.gethostname()`:
 
 ```python
@@ -128,7 +128,7 @@ which is only populated when the job has a non-empty `environment` or an
 ## env_file
 
 `env_file` names a file of `KEY=VALUE` lines. Parsing is done by
-`parse_environment_file` in `yacron2/config.py`:
+`parse_environment_file` in `cronstable/config.py`:
 
 - The file is opened as **UTF-8**.
 - Each line is stripped of surrounding spaces and a trailing newline.
@@ -156,7 +156,7 @@ jobs:
   - name: with-env-file
     command: printenv
     schedule: "*/5 * * * *"
-    env_file: /etc/yacron2/job.env
+    env_file: /etc/cronstable/job.env
     environment:
       - key: LOG_LEVEL
         value: debug   # overrides LOG_LEVEL from job.env, if present
@@ -174,7 +174,7 @@ LOG_LEVEL=info
 ## defaults.environment merge semantics
 
 `environment` set in a `defaults` block merges into each job by key, not by list
-concatenation. In `mergedicts` (`yacron2/config.py`), the `environment` list is
+concatenation. In `mergedicts` (`cronstable/config.py`), the `environment` list is
 special-cased: the default's entries and the job's entries are folded into a
 single key-to-value mapping, with the job's value winning on conflict, then
 re-expanded to a `{key, value}` list. The result has **no duplicate keys**: a
@@ -206,7 +206,7 @@ process environment (including injected `HOSTNAME`) < `env_file` < merged
 ## user and group (privilege switching)
 
 `user` and `group` request that the subprocess run under a different identity.
-Resolution happens in `JobConfig._resolve_user_group` (`yacron2/config.py`):
+Resolution happens in `JobConfig._resolve_user_group` (`cronstable/config.py`):
 
 > **Windows:** this whole feature is POSIX-only. Windows has no setuid/setgid
 > model, so a job with `user` or `group` set raises the configuration error
@@ -220,10 +220,10 @@ Resolution happens in `JobConfig._resolve_user_group` (`yacron2/config.py`):
 - **`user` as a name (`Str`)**: looked up with `getpwnam`. Sets `uid` from
   `pw_uid`, `gid` from `pw_gid` (the user's primary group), and the resolved
   login name (`pw_name`). A missing user raises `ConfigError("User not found: ...")`.
-- **`user` as a number (`Int`)**: `uid` is set to the number directly. yacron2
+- **`user` as a number (`Int`)**: `uid` is set to the number directly. cronstable
   additionally looks the uid up with `getpwuid` to derive the user's **primary
   gid** and **login name**; if `group` was not given, the derived primary gid is
-  used (so a numeric `user` without `group` does not silently keep yacron2's
+  used (so a numeric `user` without `group` does not silently keep cronstable's
   gid 0). If the uid is not in the passwd database, no login name or derived gid
   is available (and that is not an error here).
 - **`group` as a name (`Str`)**: looked up with `getgrnam`; `gid` set from
@@ -237,15 +237,15 @@ The resolved login name (`username`) matters for supplementary-group handling in
 
 ### Root requirement
 
-If, after resolution, either `uid` or `gid` is set and the yacron2 process is not
+If, after resolution, either `uid` or `gid` is set and the cronstable process is not
 running as root (`os.geteuid() != 0`), config parsing fails with:
 
 ```
-Job <name> wants to change user or group, but yacron2 is not running as superuser
+Job <name> wants to change user or group, but cronstable is not running as superuser
 ```
 
-On POSIX, any use of `user` **or** `group` therefore requires yacron2 to run as
-root. yacron2 needs no special privileges otherwise; `user`/`group` switching is
+On POSIX, any use of `user` **or** `group` therefore requires cronstable to run as
+root. cronstable needs no special privileges otherwise; `user`/`group` switching is
 the only feature that requires root. (On Windows `user`/`group` are rejected
 outright with a configuration error, so this root requirement is a POSIX-only
 statement; see the Windows note above.)

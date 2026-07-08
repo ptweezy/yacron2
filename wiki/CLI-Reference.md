@@ -1,22 +1,22 @@
 # Command-Line Reference
 
-This page documents the `yacron2` command and every argument it accepts, the
-`yacron2 state` administration subcommands, the job-facing state commands a
+This page documents the `cronstable` command and every argument it accepts, the
+`cronstable state` administration subcommands, the job-facing state commands a
 running job uses (`state get|set|delete|keys`, `cursor`, `lock`, `artifact`,
 `idempotent`, `secret`), the runtime model (foreground execution, signal
 handling, exit codes), and common invocations. Behavior is taken from
-`yacron2/__main__.py`, `yacron2/state_admin.py`, and `yacron2/jobcli.py`.
+`cronstable/__main__.py`, `cronstable/state_admin.py`, and `cronstable/jobcli.py`.
 
 ## Synopsis
 
 ```
-yacron2 [-c FILE-OR-DIR] [-l LOG_LEVEL] [-v] [--job-set-id] [--version]
-yacron2 state ACTION [options] [-c FILE-OR-DIR]
-yacron2 state get|set|delete|keys ...  [--scope NAME | --global]
-yacron2 cursor|lock|artifact|idempotent|secret ...  [--scope NAME | --global]
+cronstable [-c FILE-OR-DIR] [-l LOG_LEVEL] [-v] [--job-set-id] [--version]
+cronstable state ACTION [options] [-c FILE-OR-DIR]
+cronstable state get|set|delete|keys ...  [--scope NAME | --global]
+cronstable cursor|lock|artifact|idempotent|secret ...  [--scope NAME | --global]
 ```
 
-Without a subcommand, `yacron2` is the scheduler daemon described below. With
+Without a subcommand, `cronstable` is the scheduler daemon described below. With
 the `state` subcommand it is an offline administration tool for the durable
 state store; see [The `state` subcommand](#the-state-subcommand). The
 `state get|set|delete|keys`, `cursor`, `lock`, `artifact`, `idempotent`, and
@@ -24,7 +24,7 @@ state store; see [The `state` subcommand](#the-state-subcommand). The
 daemon's store through its loopback endpoint; see
 [Job-facing state commands](#job-facing-state-commands).
 
-`yacron2` runs as a single foreground process. It does not daemonize, does not
+`cronstable` runs as a single foreground process. It does not daemonize, does not
 fork, and does not write a PID file. Diagnostics go to stdout/stderr via the
 standard library `logging` module. To run it as a service, place it under a
 process supervisor (systemd, a container runtime, etc.); see
@@ -38,7 +38,7 @@ process supervisor (systemd, a container runtime, etc.); see
 | `-l`, `--log-level` | string | `INFO` | Root log level. Passed to `logging.basicConfig(level=getattr(logging, LOG_LEVEL))`, so the value must name an attribute of the `logging` module (e.g. `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). |
 | `-v`, `--validate-config` | flag | off | Parse and validate the configuration, then exit. Exits `0` if valid, `1` on a configuration error. Does not start the scheduler or web server. |
 | `--job-set-id` | flag | off | Parse the configuration, print the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation) (an order-independent hash of every job's effective configuration) to stdout, and exit `0`. Identical across instances running the same set of jobs. Exits `1` on a configuration error. |
-| `--version` | flag | off | Print the yacron2 version to stdout and exit `0`. |
+| `--version` | flag | off | Print the cronstable version to stdout and exit `0`. |
 | `-h`, `--help` | flag | — | Print usage (argparse builtin) and exit `0`. |
 
 The only other command-line surface is the `state` subcommand,
@@ -48,8 +48,8 @@ configured entirely in YAML, not on the command line; see the
 [Configuration Reference](Configuration-Reference).
 
 [^cfgdefault]: The default config path is platform-specific (`DEFAULT_CONFIG_PATH`
-    in `yacron2/platform.py`): `/etc/yacron2.d` on POSIX, and `%APPDATA%\yacron2`
-    (e.g. `C:\Users\<you>\AppData\Roaming\yacron2`, falling back to the user
+    in `cronstable/platform.py`): `/etc/cronstable.d` on POSIX, and `%APPDATA%\cronstable`
+    (e.g. `C:\Users\<you>\AppData\Roaming\cronstable`, falling back to the user
     profile `~` if `APPDATA` is unset) on Windows. See
     [Running on Windows](Running-on-Windows).
 
@@ -71,19 +71,19 @@ The argument may be a single file or a directory:
 #### Default-path special case
 
 The default is the platform default config path (`DEFAULT_CONFIG_PATH` from
-`yacron2/platform.py`): `/etc/yacron2.d` on POSIX, `%APPDATA%\yacron2` on
+`cronstable/platform.py`): `/etc/cronstable.d` on POSIX, `%APPDATA%\cronstable` on
 Windows. The special case is triggered by the condition
 `args.config == DEFAULT_CONFIG_PATH and not os.path.exists(args.config)`: if the
 config argument equals the platform default and that path does not exist,
-yacron2 prints the following to stderr, prints the usage help, and exits `1`:
+cronstable prints the following to stderr, prints the usage help, and exits `1`:
 
 ```
-yacron2 error: configuration file not found, please provide one with the --config option
+cronstable error: configuration file not found, please provide one with the --config option
 ```
 
 Because the check compares the argument value (not whether `-c` was supplied),
 it fires both when `-c` is omitted and when you pass `-c` set to the platform
-default explicitly (`-c /etc/yacron2.d` on POSIX, `-c %APPDATA%\yacron2` on
+default explicitly (`-c /etc/cronstable.d` on POSIX, `-c %APPDATA%\cronstable` on
 Windows). For any other non-existent path passed with `-c`, you instead get the
 generic configuration-error path (a logged `Configuration error: ...` and exit
 `1`).
@@ -91,7 +91,7 @@ generic configuration-error path (a logged `Configuration error: ...` and exit
 ### `-l` / `--log-level`
 
 The log level is applied with `logging.basicConfig` before the configuration is
-loaded, so it governs yacron2's own startup and runtime logging. The value is
+loaded, so it governs cronstable's own startup and runtime logging. The value is
 resolved with `getattr(logging, args.log_level)`; an unknown name (e.g. a
 lowercase or misspelled level) raises `AttributeError` and the process aborts
 with a traceback rather than a clean error. Use a canonical level name such as
@@ -137,10 +137,10 @@ configuration exists.
 ## The `state` subcommand
 
 ```
-yacron2 state ACTION [options] [-c FILE-OR-DIR]
+cronstable state ACTION [options] [-c FILE-OR-DIR]
 ```
 
-`yacron2 state` administers the durable state store defined by the
+`cronstable state` administers the durable state store defined by the
 configuration's `state:` section (the daemon-side store on disk or on a shared
 mount -- not the [Web Dashboard](Web-Dashboard)'s browser-side IndexedDB run
 ledger, which is a separate, purely client-side feature). Every action works
@@ -153,11 +153,11 @@ Restoring or migrating *into* a store a daemon is actively using is **not**
 safe (see [`state restore`](#state-restore) / [`state migrate`](#state-migrate)).
 
 Each action accepts its own `-c`/`--config`, with the same meaning and default
-as the daemon flag, so both positions work: `yacron2 -c /etc/yacron2.d state gc`
-and `yacron2 state gc -c /etc/yacron2.d` are equivalent. (`-c` between `state`
+as the daemon flag, so both positions work: `cronstable -c /etc/cronstable.d state gc`
+and `cronstable state gc -c /etc/cronstable.d` are equivalent. (`-c` between `state`
 and the action name is not accepted.) If the resolved configuration has no
 `state:` section, or cannot be read, the action prints
-`yacron2 state error: <detail>` to stdout and exits `1`; the
+`cronstable state error: <detail>` to stdout and exits `1`; the
 [default-path special case](#default-path-special-case) does not apply here.
 
 | Action | Description |
@@ -172,7 +172,7 @@ and the action name is not accepted.) If the resolved configuration has no
 ### `state backup`
 
 ```
-yacron2 state backup -o FILE.tar.gz [-c FILE-OR-DIR]
+cronstable state backup -o FILE.tar.gz [-c FILE-OR-DIR]
 ```
 
 Writes a gzipped tar of the store's namespace to `-o`/`--output` (required).
@@ -191,7 +191,7 @@ the store directory does not exist (`nothing to back up`).
 ### `state restore`
 
 ```
-yacron2 state restore FILE.tar.gz [--force] [-c FILE-OR-DIR]
+cronstable state restore FILE.tar.gz [--force] [-c FILE-OR-DIR]
 ```
 
 Extracts a backup archive into the configured store. It refuses to restore
@@ -210,7 +210,7 @@ fence values already handed out. The kept-lease count is reported.
 ### `state migrate`
 
 ```
-yacron2 state migrate --dest PATH [--dest-deployment-id ID] [--force]
+cronstable state migrate --dest PATH [--dest-deployment-id ID] [--force]
                       [-c FILE-OR-DIR]
 ```
 
@@ -231,7 +231,7 @@ changed it) at the new location to cut over.
 ### `state gc`
 
 ```
-yacron2 state gc [--dry-run] [-c FILE-OR-DIR]
+cronstable state gc [--dry-run] [-c FILE-OR-DIR]
 ```
 
 Runs one manual garbage-collection pass with the same rules as the daemon's
@@ -256,7 +256,7 @@ and exits `1`.
 ### `state check`
 
 ```
-yacron2 state check [-c FILE-OR-DIR]
+cronstable state check [-c FILE-OR-DIR]
 ```
 
 Verifies the store is usable -- starting the backend probes writability --
@@ -268,7 +268,7 @@ store that cannot be started or probed exits `1`.
 ### `state migrate-schema`
 
 ```
-yacron2 state migrate-schema [--dry-run] [-c FILE-OR-DIR]
+cronstable state migrate-schema [--dry-run] [-c FILE-OR-DIR]
 ```
 
 Rewrites records written under *older known* record-scheme versions to the
@@ -283,33 +283,33 @@ quarantine-on-read handling. `--dry-run` counts without rewriting.
 Every action exits `0` on success and `1` on any error: a missing or invalid
 configuration, no `state:` section, an I/O failure, or a refusal (restoring
 into a non-empty store without `--force`, migrating a store onto itself, GC
-with `gcGraceSeconds` disabled). Errors print `yacron2 state error: <detail>`.
-`yacron2 state` with no action prints a pointer to `yacron2 state --help` and
+with `gcGraceSeconds` disabled). Errors print `cronstable state error: <detail>`.
+`cronstable state` with no action prints a pointer to `cronstable state --help` and
 exits `2`, the same code argparse itself uses for usage errors (an unknown
 option, or a missing required one such as `backup` without `-o`).
 
 ## Job-facing state commands
 
-Alongside the offline `state` admin actions above, yacron2 ships a family of
+Alongside the offline `state` admin actions above, cronstable ships a family of
 **job-facing** state commands -- `state get|set|delete|keys`, `cursor`, `lock`,
 `artifact`, `idempotent`, and `secret` -- that a *running job's* command line
 uses to reach the daemon's durable store. They are thin clients of the
 [loopback state endpoint](HTTP-API#job-facing-state-endpoints-loopback) the
 daemon injects into every job's environment: each reads the injected
-`YACRON2_STATE_URL` / `YACRON2_STATE_TOKEN` and speaks HTTP over the standard
+`CRONSTABLE_STATE_URL` / `CRONSTABLE_STATE_TOKEN` and speaks HTTP over the standard
 library (no aiohttp, no event loop), so it starts instantly and needs no config
-file. Behavior is taken from `yacron2/jobcli.py`.
+file. Behavior is taken from `cronstable/jobcli.py`.
 
 These are meant to run **inside a job**, not from an operator shell: outside a
 job the injected environment is absent and every command exits `1` with `not
-running inside a yacron2 job: YACRON2_STATE_URL is not set`. They require a
+running inside a cronstable job: CRONSTABLE_STATE_URL is not set`. They require a
 `state:` section with `jobApi.enabled` (the default); see the
 [endpoint reference](HTTP-API#job-facing-state-endpoints-loopback) and
 [Durable State](Durable-State).
 
 > The `state get|set|delete|keys` job actions **coexist** with the offline
 > `state backup|restore|migrate|gc|check|migrate-schema`
-> [admin actions](#the-state-subcommand) under the one `yacron2 state` command;
+> [admin actions](#the-state-subcommand) under the one `cronstable state` command;
 > the action name selects which handler runs. The admin actions operate offline
 > from `-c`; these job actions act through the running daemon and take no `-c`.
 
@@ -340,10 +340,10 @@ The commands share one exit-code convention, made for shell branching:
 ### `state get|set|delete|keys` (durable key/value)
 
 ```
-yacron2 state get KEY [--scope NAME | --global]
-yacron2 state set KEY VALUE [--json] [--scope NAME | --global]
-yacron2 state delete KEY [--scope NAME | --global]
-yacron2 state keys [--scope NAME | --global]
+cronstable state get KEY [--scope NAME | --global]
+cronstable state set KEY VALUE [--json] [--scope NAME | --global]
+cronstable state delete KEY [--scope NAME | --global]
+cronstable state keys [--scope NAME | --global]
 ```
 
 Durable, restart-surviving key/value storage. `get` prints the value (exit `4`
@@ -354,8 +354,8 @@ JSON document with `--json`); `delete` removes it (exit `4` if it did not exist)
 ### `cursor get|advance` (ETL watermark)
 
 ```
-yacron2 cursor get NAME [--scope NAME | --global]
-yacron2 cursor advance NAME VALUE [--force] [--scope NAME | --global]
+cronstable cursor get NAME [--scope NAME | --global]
+cronstable cursor advance NAME VALUE [--force] [--scope NAME | --global]
 ```
 
 A monotonic marker an incremental job advances and never sees regress. `advance`
@@ -368,9 +368,9 @@ if the cursor is unset). Both print the resulting value.
 ### `lock acquire|release|run` (distributed mutex/semaphore)
 
 ```
-yacron2 lock acquire NAME [--permits N] [--wait --timeout S] [--ttl S] [--scope NAME | --global]
-yacron2 lock run NAME [--permits N] [--wait --timeout S] [--ttl S] [--scope NAME | --global] -- COMMAND...
-yacron2 lock release TOKEN
+cronstable lock acquire NAME [--permits N] [--wait --timeout S] [--ttl S] [--scope NAME | --global]
+cronstable lock run NAME [--permits N] [--wait --timeout S] [--ttl S] [--scope NAME | --global] -- COMMAND...
+cronstable lock release TOKEN
 ```
 
 A fleet-wide mutex (or a semaphore, with `--permits N`) held as a daemon-renewed
@@ -387,9 +387,9 @@ never leaks one.
 ### `artifact put|get|list` (named blob store)
 
 ```
-yacron2 artifact put NAME [FILE] [--scope NAME | --global]
-yacron2 artifact get NAME [-o FILE] [--scope NAME | --global]
-yacron2 artifact list [--scope NAME | --global]
+cronstable artifact put NAME [FILE] [--scope NAME | --global]
+cronstable artifact get NAME [-o FILE] [--scope NAME | --global]
+cronstable artifact list [--scope NAME | --global]
 ```
 
 Small named blobs published by one run and read back by a later run or a peer
@@ -401,7 +401,7 @@ published); `list` prints one artifact name per line.
 ### `idempotent` (run-once guard)
 
 ```
-yacron2 idempotent KEY [--ttl S] [--release] [--scope NAME | --global]
+cronstable idempotent KEY [--ttl S] [--release] [--scope NAME | --global]
 ```
 
 A fleet-wide create-if-absent claim: the first caller to claim `KEY` exits `0`
@@ -415,8 +415,8 @@ drops the claim instead of making it, so `KEY` can be claimed fresh again.
 ### `secret get|list` (run-scoped secrets)
 
 ```
-yacron2 secret get NAME
-yacron2 secret list
+cronstable secret get NAME
+cronstable secret list
 ```
 
 Read a secret the daemon staged in memory for this run (resolved fresh per run,
@@ -427,9 +427,9 @@ per line. There are no scope flags: a run sees only its own secrets.
 ### `xcom push|pull|list` (DAG cross-task data)
 
 ```
-yacron2 xcom push --key KEY [FILE]
-yacron2 xcom pull --task TASK --key KEY [--map-index I] [-o FILE]
-yacron2 xcom list
+cronstable xcom push --key KEY [FILE]
+cronstable xcom pull --task TASK --key KEY [--map-index I] [-o FILE]
+cronstable xcom list
 ```
 
 Pass data between the tasks of a [DAG run](Orchestration-and-DAGs#xcom-passing-data-between-tasks).
@@ -445,30 +445,30 @@ error and exit non-zero.
 
 ### Job command examples
 
-These run inside a job, where the daemon has injected `YACRON2_STATE_URL` and
-`YACRON2_STATE_TOKEN`.
+These run inside a job, where the daemon has injected `CRONSTABLE_STATE_URL` and
+`CRONSTABLE_STATE_TOKEN`.
 
 Advance an ETL watermark from the highest id this run processed, so the next run
 resumes from where it stopped:
 
 ```shell
-last=$(yacron2 cursor get rows 2>/dev/null || echo 0)
+last=$(cronstable cursor get rows 2>/dev/null || echo 0)
 process-rows --since "$last" --emit-max-id > max_id
-yacron2 cursor advance rows "$(cat max_id)"
+cronstable cursor advance rows "$(cat max_id)"
 ```
 
 Hold a fleet-wide mutex while a critical section runs, releasing it
 automatically when the command finishes (or crashes):
 
 ```shell
-yacron2 lock run db-migrate --wait --timeout 300 -- ./apply-migrations.sh
+cronstable lock run db-migrate --wait --timeout 300 -- ./apply-migrations.sh
 ```
 
 Guard an at-most-once side effect so a retried or duplicated run sends today's
 invoices only once, fleet-wide:
 
 ```shell
-if yacron2 idempotent "invoice-$(date +%F)"; then
+if cronstable idempotent "invoice-$(date +%F)"; then
     send-invoices
 else
     echo "invoices already sent for today; skipping"
@@ -478,20 +478,20 @@ fi
 Hand a build artifact from one job to a shared scope another job reads:
 
 ```shell
-yacron2 artifact put report.pdf ./out/report.pdf --global
+cronstable artifact put report.pdf ./out/report.pdf --global
 # ...then, in a later job:
-yacron2 artifact get report.pdf -o ./report.pdf --global
+cronstable artifact get report.pdf -o ./report.pdf --global
 ```
 
 ## Runtime model
 
 When started normally (no `--version`, no `--validate-config`, no
-`--job-set-id`, no `state` subcommand, with a usable config), yacron2:
+`--job-set-id`, no `state` subcommand, with a usable config), cronstable:
 
 1. Configures logging from `-l`.
 2. Resolves and parses the configuration (`-c`), exiting `1` on error.
 3. Installs shutdown handlers. On POSIX these are bound to `SIGINT` and
-   `SIGTERM` on the event loop; on Windows yacron2 instead uses `signal.signal`
+   `SIGTERM` on the event loop; on Windows cronstable instead uses `signal.signal`
    for `SIGINT` (Ctrl-C) and `SIGBREAK` (Ctrl-Break) plus a heartbeat timer,
    because the Proactor loop has no `add_signal_handler`.
 4. Runs the asyncio scheduler loop in the foreground until shutdown.
@@ -506,14 +506,14 @@ jobs keep running. See [Architecture and Internals](Architecture-and-Internals).
 `SIGINT` (Ctrl-C) and `SIGTERM` are both bound to the same graceful-shutdown
 path: they set an internal stop event. The scheduler loop notices the event,
 stops scheduling new job runs, logs `Shutting down (after currently running
-jobs finish)...`, and then yacron2:
+jobs finish)...`, and then cronstable:
 
 1. Cancels all pending retry timers.
 2. Waits for currently running jobs to finish.
 3. Stops the HTTP control server if it is running (logged as
    `Stopping http server`).
 
-yacron2 does not force-kill its own running jobs on shutdown. Individual jobs
+cronstable does not force-kill its own running jobs on shutdown. Individual jobs
 have their own kill behavior (`killTimeout`) when they are stopped; see
 [Concurrency and Timeouts](Concurrency-and-Timeouts). Sending a second signal
 does not change the shutdown sequence; if you need an immediate stop, kill the
@@ -531,8 +531,8 @@ See [Running on Windows](Running-on-Windows).
 | Code | Condition |
 | --- | --- |
 | `0` | `--version` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
-| `1` | Configuration error (parse/schema/validation failure or unreadable config); the default `-c` path (platform-specific: `/etc/yacron2.d` on POSIX, `%APPDATA%\yacron2` on Windows) does not exist and no `-c` was given; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
-| `2` | Usage error (argparse builtin): unknown option or missing required option (e.g. `state backup` without `-o`); or `yacron2 state` invoked with no action. |
+| `1` | Configuration error (parse/schema/validation failure or unreadable config); the default `-c` path (platform-specific: `/etc/cronstable.d` on POSIX, `%APPDATA%\cronstable` on Windows) does not exist and no `-c` was given; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
+| `2` | Usage error (argparse builtin): unknown option or missing required option (e.g. `state backup` without `-o`); or `cronstable state` invoked with no action. |
 
 A traceback (non-zero, not the clean `1` path) results from an invalid
 `--log-level` value, since the level is resolved before error handling is in
@@ -543,20 +543,20 @@ place.
 Run with a single config file in the foreground:
 
 ```shell
-yacron2 -c /tmp/my-crontab.yaml
+cronstable -c /tmp/my-crontab.yaml
 ```
 
 Run against a config directory (the conventional container entrypoint):
 
 ```shell
-yacron2 -c /etc/yacron2.d
+cronstable -c /etc/cronstable.d
 ```
 
 On Windows the config path uses Windows paths and the default is
-`%APPDATA%\yacron2` rather than `/etc/yacron2.d`:
+`%APPDATA%\cronstable` rather than `/etc/cronstable.d`:
 
 ```bat
-yacron2.exe -c %APPDATA%\yacron2
+cronstable.exe -c %APPDATA%\cronstable
 ```
 
 See [Running on Windows](Running-on-Windows) for Windows-specific CLI behavior
@@ -565,30 +565,30 @@ See [Running on Windows](Running-on-Windows) for Windows-specific CLI behavior
 Validate a config and exit (suitable for CI or a container healthcheck/preflight):
 
 ```shell
-yacron2 -v -c /etc/yacron2.d
+cronstable -v -c /etc/cronstable.d
 ```
 
 Increase log verbosity:
 
 ```shell
-yacron2 -l DEBUG -c /tmp/my-crontab.yaml
+cronstable -l DEBUG -c /tmp/my-crontab.yaml
 ```
 
 Print the version:
 
 ```shell
-yacron2 --version
+cronstable --version
 ```
 
 Back up the durable state store defined by a config (the `-c` may equally go
 before `state`):
 
 ```shell
-yacron2 state backup -o /backups/yacron2-state.tar.gz -c /etc/yacron2.d
+cronstable state backup -o /backups/cronstable-state.tar.gz -c /etc/cronstable.d
 ```
 
 For installation and packaging details (pip, PyInstaller binary, Docker), see
-[Installation](Installation). For deploying yacron2 as a long-running service,
+[Installation](Installation). For deploying cronstable as a long-running service,
 see [Production and Container Deployment](Production-Deployment). For
 Windows-specific CLI behavior (default config path, default shell, Ctrl-C /
 Ctrl-Break shutdown), see [Running on Windows](Running-on-Windows).

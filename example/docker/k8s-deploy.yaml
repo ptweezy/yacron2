@@ -2,20 +2,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: yacron2demo
+  name: cronstabledemo
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: yacron2demo
+      app: cronstabledemo
   template:
     metadata:
       labels:
-        app: yacron2demo
+        app: cronstabledemo
     spec:
       containers:
-      - name: yacron2demo
-        image: yacron2demo
+      - name: cronstabledemo
+        image: cronstabledemo
         imagePullPolicy: Never
         resources:
           limits:

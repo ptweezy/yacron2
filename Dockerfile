@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 #
-# Official yacron2 image: a minimal, non-root, multi-arch build
+# Official cronstable image: a minimal, non-root, multi-arch build
 #
 # Build locally:
-#   docker build -t yacron2 .
+#   docker build -t cronstable .
 # The version is read from git during the build; CI passes the released version
 # explicitly via --build-arg VERSION=X.Y.Z.
 
@@ -50,7 +50,7 @@ RUN set -eux; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
 # Best-effort orjson (the `speedups` extra) to accelerate the durable-state and
-# cluster-gossip JSON paths; yacron2/_json falls back to the stdlib json when it
+# cluster-gossip JSON paths; cronstable/_json falls back to the stdlib json when it
 # is absent, so this never fails the build -- it just logs, per arch, which way
 # this image went. Almost every arch (amd64/arm64/386/armv7/ppc64le/s390x)
 # installs a manylinux wheel and needs no toolchain; only riscv64 has no orjson
@@ -80,12 +80,12 @@ RUN set -eux; \
 # ---- runtime stage ------------------------------------------------------
 FROM python:3.14-slim
 
-LABEL org.opencontainers.image.title="yacron2" \
+LABEL org.opencontainers.image.title="cronstable" \
       org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement." \
-      org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
+      org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.licenses="MIT"
 
-# Flush stdout/stderr immediately (yacron2 logs to them) and never write .pyc
+# Flush stdout/stderr immediately (cronstable logs to them) and never write .pyc
 # files — because remember....the read-only root filesystem.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -98,5 +98,5 @@ COPY --from=builder /opt/venv /opt/venv
 # locked-down container.
 USER 65534:65534
 
-ENTRYPOINT ["yacron2"]
-CMD ["-c", "/etc/yacron2.d"]
+ENTRYPOINT ["cronstable"]
+CMD ["-c", "/etc/cronstable.d"]

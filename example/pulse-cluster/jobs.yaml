@@ -30,12 +30,12 @@ defaults:
   environment:
     - key: PYTHONIOENCODING
       value: utf-8
-    # The upstream under test. It defaults to node yacron-c's dashboard so the
+    # The upstream under test. It defaults to node cronstable-c's dashboard so the
     # demo is self-contained AND the target is a FOLLOWER (never the leader):
     # that keeps the "fail the leader" and "outage" experiments independent
     # (see the README). Point it at your real service in production.
     - key: PULSE_TARGET
-      value: http://yacron-c:8080/status
+      value: http://cronstable-c:8080/status
     - key: PULSE_BUDGET_MS
       value: "250"
 
@@ -82,7 +82,7 @@ jobs:
       report:
         shell:
           # stand-in pager — swap for a webhook/mail reporter in production
-          command: echo "🚨 PAGE on-call — $YACRON2_JOB_NAME on $HOSTNAME failed ($YACRON2_FAIL_REASON)"
+          command: echo "🚨 PAGE on-call — $CRONSTABLE_JOB_NAME on $HOSTNAME failed ($CRONSTABLE_FAIL_REASON)"
 
   # -- latency SLO probe: Leader only, every 2 seconds -----------------------
   # Only the elected leader samples latency, so the upstream is not hammered by

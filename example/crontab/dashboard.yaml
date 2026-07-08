@@ -3,7 +3,7 @@
 # entries appear under their legacy.crontab:<line> names) and adds one
 # native job.
 #
-# Crontab entries always carry yacron2's standard defaults; anything richer
+# Crontab entries always carry cronstable's standard defaults; anything richer
 # -- captureStdout below, retries, reporting, timeouts -- is what YAML is
 # for.
 

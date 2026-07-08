@@ -1,10 +1,10 @@
-"""The job-facing CLI (`yacron2 state|cursor|lock|artifact|...`).
+"""The job-facing CLI (`cronstable state|cursor|lock|artifact|...`).
 
 Drives the commands the way a shell in a job would: through
-``yacron2.__main__.main_loop`` with a fake ``sys.argv`` and the injected
-``YACRON2_STATE_*`` environment, so it exercises the real argument parsing and
+``cronstable.__main__.main_loop`` with a fake ``sys.argv`` and the injected
+``CRONSTABLE_STATE_*`` environment, so it exercises the real argument parsing and
 the __main__ routing that tells a job-facing ``state get`` from an admin
-``state gc``.  The one HTTP seam (``yacron2.jobcli._http``) is monkeypatched
+``state gc``.  The one HTTP seam (``cronstable.jobcli._http``) is monkeypatched
 with a recorder, so every verb's request-building, output, and exit code are
 asserted deterministically without a live server (the real wire is covered in
 test_state_job_api.py).
@@ -17,8 +17,8 @@ import urllib.request
 
 import pytest
 
-import yacron2.__main__
-from yacron2 import jobcli
+import cronstable.__main__
+from cronstable import jobcli
 
 
 class ExitError(Exception):
@@ -64,16 +64,16 @@ class _FakeHTTP:
 
 
 def _cli(monkeypatch, argv, http=None, stdin=b"", url="http://127.0.0.1:1"):
-    monkeypatch.setenv("YACRON2_STATE_URL", url)
-    monkeypatch.setenv("YACRON2_STATE_TOKEN", "tok")
+    monkeypatch.setenv("CRONSTABLE_STATE_URL", url)
+    monkeypatch.setenv("CRONSTABLE_STATE_TOKEN", "tok")
     if http is not None:
         monkeypatch.setattr(jobcli, "_http", http)
     loop = asyncio.new_event_loop()
     try:
-        monkeypatch.setattr(sys, "argv", ["yacron2"] + argv)
+        monkeypatch.setattr(sys, "argv", ["cronstable"] + argv)
         monkeypatch.setattr(sys, "exit", _exit)
         with pytest.raises(ExitError) as excinfo:
-            yacron2.__main__.main_loop(loop)
+            cronstable.__main__.main_loop(loop)
         return excinfo.value.args[0]
     finally:
         loop.close()
@@ -192,7 +192,7 @@ def test_idempotent_duplicate_exit_5(monkeypatch):
 
 def test_idempotent_store_error_exit_1(monkeypatch, capsys):
     # a state endpoint failure is a real error (1), distinct from the
-    # duplicate skip (5), so `if yacron2 idempotent K; then ...` cannot
+    # duplicate skip (5), so `if cronstable idempotent K; then ...` cannot
     # silently drop the side effect for the length of a store outage.
     http = _FakeHTTP(
         {"/v1/idempotency/claim": (503, {"error": "store down"})}
@@ -346,16 +346,16 @@ def test_secret_get_missing_exit_4(monkeypatch):
 
 
 def test_no_env_errors(monkeypatch, capsys):
-    monkeypatch.delenv("YACRON2_STATE_URL", raising=False)
-    monkeypatch.delenv("YACRON2_STATE_TOKEN", raising=False)
+    monkeypatch.delenv("CRONSTABLE_STATE_URL", raising=False)
+    monkeypatch.delenv("CRONSTABLE_STATE_TOKEN", raising=False)
     loop = asyncio.new_event_loop()
     try:
-        monkeypatch.setattr(sys, "argv", ["yacron2", "state", "get", "k"])
+        monkeypatch.setattr(sys, "argv", ["cronstable", "state", "get", "k"])
         monkeypatch.setattr(sys, "exit", _exit)
         with pytest.raises(ExitError) as ei:
-            yacron2.__main__.main_loop(loop)
+            cronstable.__main__.main_loop(loop)
         assert ei.value.args[0] == 1
-        assert "not running inside a yacron2 job" in capsys.readouterr().err
+        assert "not running inside a cronstable job" in capsys.readouterr().err
     finally:
         loop.close()
 
@@ -455,5 +455,5 @@ def test_response_timeout_clean_error(monkeypatch, capsys):
         srv.close()
     assert code == 1  # the transport-error exit code, not a crash
     err = capsys.readouterr().err
-    assert "cannot reach the yacron2 state endpoint" in err
+    assert "cannot reach the cronstable state endpoint" in err
     assert "Traceback" not in err

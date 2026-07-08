@@ -1,4 +1,4 @@
-# Zen screensaver demo — a single, deliberately CALM yacron2 node.
+# Zen screensaver demo — a single, deliberately CALM cronstable node.
 #
 # The zen all-clear screensaver only appears when a wallboard is idle AND healthy
 # (nothing Running, nothing Failing). This config keeps the board calm so you can
@@ -12,15 +12,15 @@
 #
 # Then open http://localhost:8080/ , optionally set Settings -> "Zen idle" -> 10s,
 # press  w  to enter the wallboard, and wait. See
-# example/zen-demo/yacron2tab.yaml for the walkthrough.
+# example/zen-demo/cronstable.yaml for the walkthrough.
 
 services:
-  yacron2-zen:
+  cronstable-zen:
     build:
       context: .
-    container_name: yacron2-zen
+    container_name: cronstable-zen
     ports:
       - "8080:8080"
     volumes:
-      - ./example/zen-demo/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro
+      - ./example/zen-demo/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
     restart: unless-stopped

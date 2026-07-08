@@ -1,6 +1,6 @@
 # Clustering and Leader Election
 
-By default yacron2 holds its schedule in-process and keeps no shared state, so
+By default cronstable holds its schedule in-process and keeps no shared state, so
 two instances started from the same configuration each run **every** job
 independently. That is the safe single-instance model, but it means you cannot
 simply scale to two replicas for availability without double-running every job.
@@ -11,7 +11,7 @@ when you opt in, turns that attestation into a **quorum-gated leader
 election** so that several replicas deployed from one config run with only the
 elected leader firing scheduled jobs. It builds directly on the
 [job-set id](#the-job-set-id-foundation) and is implemented in
-`yacron2/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
+`cronstable/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
 `elect_leader`/`quorum_size` functions).
 
 > **The default `gossip` backend is best-effort coordination, not fenced
@@ -70,24 +70,24 @@ See [Trying it locally](#trying-it-locally) for the fuller walkthrough (failing
 the leader, losing quorum, drift, per-policy behaviour).
 
 To build one by hand, each node gets the same job set plus a per-node `cluster`
-block. This is a complete leader-electing gossip node (`yacron-a` of three):
+block. This is a complete leader-electing gossip node (`cronstable-a` of three):
 
 ```yaml
 cluster:
   listen: "0.0.0.0:8443"                  # this node's mTLS /peer listener
   tls:
-    ca:   /etc/yacron2/cluster-ca.pem     # shared cluster CA (trust anchor)
-    cert: /etc/yacron2/yacron-a.pem       # this node's cert (SAN = yacron-a)
-    key:  /etc/yacron2/yacron-a.key
+    ca:   /etc/cronstable/cluster-ca.pem     # shared cluster CA (trust anchor)
+    cert: /etc/cronstable/cronstable-a.pem       # this node's cert (SAN = cronstable-a)
+    key:  /etc/cronstable/cronstable-a.key
   peers:                                  # every OTHER member -> size = 3
-    - host: yacron-b.internal:8443
-    - host: yacron-c.internal:8443
-  nodeName: yacron-a                      # unique, stable per node
+    - host: cronstable-b.internal:8443
+    - host: cronstable-c.internal:8443
+  nodeName: cronstable-a                      # unique, stable per node
   electLeader: true                       # only the elected leader runs jobs
 ```
 
 (The certificate paths are yours to choose; the bundled compose demo, for
-example, mounts its generated certs at `/certs/ca.pem` / `/certs/yacron-a.pem`.)
+example, mounts its generated certs at `/certs/ca.pem` / `/certs/cronstable-a.pem`.)
 
 **The quorum rule in one paragraph.** List every *other* node in `peers` (never
 this node itself), so the cluster size is `len(peers) + 1` and every node
@@ -124,7 +124,7 @@ attestation first, verify it is healthy, then turn on election:
    only). Every replica still runs every job, so nothing changes operationally,
    and you can confirm the peers reach `agreed` on `GET /cluster` before trusting
    the topology.
-4. **Run `yacron2 --validate-config`** to catch a bad peer list, TLS paths, or
+4. **Run `cronstable --validate-config`** to catch a bad peer list, TLS paths, or
    lease ordering at rest; see the [Command-Line Reference](CLI-Reference).
 5. **Roll the replicas one at a time**, letting each converge to `agreed` before
    the next (change membership incrementally so majorities always overlap; see
@@ -157,7 +157,7 @@ cluster is **observed**, differs.
 | --- | --- | --- | --- | --- |
 | Coordination | embedded mTLS gossip, no shared state | a `coordination.k8s.io/v1` `Lease` | a lease-bound etcd key | a flock-guarded TTL lease file on a shared POSIX mount |
 | Guarantee | best-effort (may skip or double-run in narrow windows) | **fenced, exactly-once** while the apiserver is reachable | **fenced, exactly-once** while etcd is reachable | **fenced** under NTP-bounded clock skew (~2 s budget) while the mount is reachable |
-| Extra dependency | none | none (optional `yacron2[kubernetes]`) | none | none |
+| Extra dependency | none | none (optional `cronstable[kubernetes]`) | none | none |
 | Needs | per-node mTLS certs + a static peer list | in-cluster (or kubeconfig) apiserver access + a Lease RBAC | reachable etcd endpoint(s) | a shared POSIX mount (S3 Files / EFS / NFSv4) with real cross-host locks, NTP on every node |
 | Best when | zero-dependency replicas, occasional skip/dup tolerable | already on Kubernetes and want a hard guarantee | already run etcd | you already have a shared mount and want fenced leadership with zero extra services |
 
@@ -167,8 +167,8 @@ The per-backend config keys (`cluster.kubernetes.*`, `cluster.etcd.*`,
 auth/TLS, failure modes, and monitoring are in
 [Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd).
 Runnable samples are in
-[`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes)
-and [`example/etcd/`](https://github.com/ptweezy/yacron2/tree/develop/example/etcd).
+[`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/develop/example/kubernetes)
+and [`example/etcd/`](https://github.com/ptweezy/cronstable/tree/develop/example/etcd).
 
 The rest of this page documents the **`gossip`** backend (the default) in
 depth; its trust model and quorum math are specific to it. The `clusterPolicy`
@@ -200,7 +200,7 @@ in the dashboard header, and is logged at startup and whenever a reload changes
 it. `clusterPolicy` (below) is part of the id, so two replicas that disagree on
 a job's policy show up as drift rather than silently coordinating differently.
 The full treatment of the job-set id lives in the
-[project README](https://github.com/ptweezy/yacron2#job-set-id).
+[project README](https://github.com/ptweezy/cronstable#job-set-id).
 
 ## Cluster peer attestation
 
@@ -214,20 +214,20 @@ job-set ids.
 cluster:
   listen: "0.0.0.0:8443"                  # the mTLS listener for this node
   tls:
-    ca:   /etc/yacron2/cluster-ca.pem     # trust anchor for peer certificates
-    cert: /etc/yacron2/this-node.pem      # this node's certificate
-    key:  /etc/yacron2/this-node.key
+    ca:   /etc/cronstable/cluster-ca.pem     # trust anchor for peer certificates
+    cert: /etc/cronstable/this-node.pem      # this node's certificate
+    key:  /etc/cronstable/this-node.key
   peers:
-    - host: yacron-b.internal:8443
-    - host: yacron-c.internal:8443
-  nodeName: yacron-a                      # optional; defaults to the system hostname
+    - host: cronstable-b.internal:8443
+    - host: cronstable-c.internal:8443
+  nodeName: cronstable-a                      # optional; defaults to the system hostname
   interval: 30                            # optional; seconds per round (default 30)
   driftAfter: 3                           # optional; rounds before "drifted" (default 3)
   connectTimeout: 10                      # optional; seconds per peer request (default 10)
   electLeader: false                      # optional; run jobs on the leader only (see below)
 ```
 
-Run `yacron2 --validate-config` before deploying to catch a bad `cluster`
+Run `cronstable --validate-config` before deploying to catch a bad `cluster`
 section (peer list, TLS paths, lease ordering) at rest rather than at startup;
 see the [Command-Line Reference](CLI-Reference).
 
@@ -236,15 +236,15 @@ The trust model is deliberately small and keeps no shared state:
 * **mTLS is the membership boundary.** A peer's certificate must chain to the
   configured `ca`, and (client side) match the host it was reached at, so only
   nodes the CA vouches for are ever attested. Standard TLS hostname verification
-  provides that SAN pinning: the cert presented by `yacron-b.internal:8443`
-  must carry `yacron-b.internal` as a Subject Alternative Name. The CA is the
-  *whole* authentication boundary (yacron2 trusts any cert it signs to assert
+  provides that SAN pinning: the cert presented by `cronstable-b.internal:8443`
+  must carry `cronstable-b.internal` as a Subject Alternative Name. The CA is the
+  *whole* authentication boundary (cronstable trusts any cert it signs to assert
   its identity and gossip state), so it **must** be a dedicated, closed CA
-  issued only to yacron2 nodes, **not** a shared service-mesh or
+  issued only to cronstable nodes, **not** a shared service-mesh or
   organisation-wide CA (any cert that CA admits can otherwise fabricate the
   `/peer` payload below: fake agreement, trip the conflict gate, or suppress an
   `@reboot` job). Provision the certificates from your own dedicated PKI (a
-  private cert-manager issuer, an internal CA); yacron2 only consumes them. The
+  private cert-manager issuer, an internal CA); cronstable only consumes them. The
   same per-node cert/key is used both to serve `/peer` and to authenticate as a
   client when polling peers. An **in-place
   renewal** of these files (same paths, new bytes) is detected and applied
@@ -259,7 +259,7 @@ The trust model is deliberately small and keeps no shared state:
 
 Every peer in the [`GET /cluster`](#observing-the-cluster) view and the
 dashboard panel carries one of these statuses (the constants live in
-`yacron2/cluster.py`):
+`cronstable/cluster.py`):
 
 | Status | Meaning |
 | --- | --- |
@@ -304,12 +304,12 @@ without double-running jobs:
 cluster:
   listen: "0.0.0.0:8443"
   tls:
-    ca:   /etc/yacron2/cluster-ca.pem
-    cert: /etc/yacron2/this-node.pem
-    key:  /etc/yacron2/this-node.key
+    ca:   /etc/cronstable/cluster-ca.pem
+    cert: /etc/cronstable/this-node.pem
+    key:  /etc/cronstable/this-node.key
   peers:
-    - host: yacron-b.internal:8443
-    - host: yacron-c.internal:8443
+    - host: cronstable-b.internal:8443
+    - host: cronstable-c.internal:8443
   electLeader: true
 ```
 
@@ -351,7 +351,7 @@ defer-vs-abandon-vs-handoff lifecycle is documented in
   **not** harmless at the boundary: a self-padded "3-node" config that is
   really 2 nodes sails past the `electLeader` 2-node refusal and runs as the
   degenerate quorum-2-of-2 cluster (both nodes must be up; any single failure
-  stops all `Leader` jobs cluster-wide), which yacron2 flags at runtime with a
+  stops all `Leader` jobs cluster-wide), which cronstable flags at runtime with a
   prominent WARNING. Remove the self entry rather than relying on the
   exclusion.
 * The computed size, quorum, elected leader, and whether this node is the leader
@@ -380,7 +380,7 @@ set and *both* would elect themselves: a silent double-run, exactly what
 election is meant to prevent. So `nodeName` uniqueness is a correctness
 requirement, not just a nicety.
 
-yacron2 enforces it at runtime. Each process mints a random **instance id** at
+cronstable enforces it at runtime. Each process mints a random **instance id** at
 startup and reports it on `/peer` alongside its `nodeName`. That lets a node
 distinguish two cases that otherwise look identical:
 
@@ -425,7 +425,7 @@ mid-roll, the old nodes still carry `N = 3` (quorum 2) while the new ones carry
 `N = 5` (quorum 3), so the old `{a, b}` and new `{c, d, e}` groups are each
 quorate and each run the `Leader` jobs.
 
-yacron2 closes this the same way it closes a duplicate `nodeName`. Each node
+cronstable closes this the same way it closes a duplicate `nodeName`. Each node
 reports its declared `N` on `/peer`, and a peer that **agrees on the job set but
 declares a different `N`** is treated as a first-class `conflict`: this node's
 `Leader` jobs **fail closed** until the cluster reconverges on one `N`. Because a
@@ -450,9 +450,9 @@ is *not* gated: it already accepts double-runs as the price of never skipping.
 A `Leader` job fires successfully only while a quorum is up and mutually
 reachable, so **pick an odd size**: each odd size adds one failure of headroom
 (3 tolerates 1, 5 tolerates 2, 7 tolerates 3), while an even size needs the same
-quorum as the odd size below it yet has an extra node that can fail, so yacron2
+quorum as the odd size below it yet has an extra node that can fail, so cronstable
 warns on even sizes (for `N > 2`). A 2-node cluster is strictly worse than a
-single replica (both must be up, with no failover upside), so yacron2 **refuses
+single replica (both must be up, with no failover upside), so cronstable **refuses
 to start** with `electLeader` and 2 nodes (a `ConfigError`); a 2-node cluster is
 fine for attestation-only.
 
@@ -642,10 +642,10 @@ workload fans out roughly evenly across the cluster.
 ```yaml
 cluster:
   listen: "0.0.0.0:8443"
-  tls: { ca: /etc/yacron2/cluster-ca.pem, cert: /etc/yacron2/this-node.pem, key: /etc/yacron2/this-node.key }
+  tls: { ca: /etc/cronstable/cluster-ca.pem, cert: /etc/cronstable/this-node.pem, key: /etc/cronstable/this-node.key }
   peers:
-    - host: yacron-b.internal:8443
-    - host: yacron-c.internal:8443
+    - host: cronstable-b.internal:8443
+    - host: cronstable-c.internal:8443
   electLeader: true
   distribution: spread      # default is single-leader
 ```
@@ -688,7 +688,7 @@ What to know:
   reconverges on one policy. `distribution` is *not* part of the job-set id (it
   is cluster config, not a job property), so a mismatch does not show up as
   drift; treat it like `electLeader` and roll it out uniformly. It is inert
-  without `electLeader` (and yacron2 warns if you set it anyway).
+  without `electLeader` (and cronstable warns if you set it anyway).
 
 ### Worked example
 
@@ -698,8 +698,8 @@ leader-gated jobs `tick-leader-only` (`Leader`) and `tick-prefer-leader`
 
 | Job | `single-leader` (default) | `spread` |
 | --- | --- | --- |
-| `tick-leader-only` | runs on `yacron-a` (the leader) | runs on `yacron-c` |
-| `tick-prefer-leader` | runs on `yacron-a` (the leader) | runs on `yacron-b` |
+| `tick-leader-only` | runs on `cronstable-a` (the leader) | runs on `cronstable-c` |
+| `tick-prefer-leader` | runs on `cronstable-a` (the leader) | runs on `cronstable-b` |
 
 So flipping to `spread` moves the two jobs onto two *different* nodes instead of
 piling both onto the leader. The owner is a deterministic function of the job
@@ -723,7 +723,7 @@ JSON. When no `cluster` section is configured it returns
 {
   "enabled": true,
   "backend": "gossip",             // the active cluster.backend
-  "node_name": "yacron-a",
+  "node_name": "cronstable-a",
   "job_set_id": "v1:…",
   "cluster_size": 3,
   "quorum": 2,
@@ -736,14 +736,14 @@ JSON. When no `cluster` section is configured it returns
   "policy_conflict": false,        // true if an agreeing peer declares a different distribution/elect_leader
   "conflicting_policies": [],      // those differing coordination-policy descriptors, if any
   "quorate": true,                 // whether this node sees a quorum
-  "leader": "yacron-a",            // null when not quorate, or always in spread mode
+  "leader": "cronstable-a",            // null when not quorate, or always in spread mode
   "is_leader": true,               // always false in spread mode (no single leader)
   "peers": [
-    {"host": "yacron-b.internal:8443", "status": "agreed",
-     "node_name": "yacron-b", "job_set_id": "v1:…",
+    {"host": "cronstable-b.internal:8443", "status": "agreed",
+     "node_name": "cronstable-b", "job_set_id": "v1:…",
      "last_seen": "2026-06-23T19:00:00+00:00", "last_error": null,
      "mismatch_streak": 0},
-    {"host": "yacron-c.internal:8443", "status": "unreachable",
+    {"host": "cronstable-c.internal:8443", "status": "unreachable",
      "node_name": null, "job_set_id": null,
      "last_seen": null, "last_error": "Cannot connect to host …",
      "mismatch_streak": 0}
@@ -792,7 +792,7 @@ mechanism can carry more than election. Opt in and each node also gossips its
 **whole-node CPU/memory** (the [`GET /node`](HTTP-API#get-node) numbers), so the
 fleet view shows every node's live load beside its runs — invaluable in `spread`
 mode for watching work distribute. The reading rides each `/peer` response as a
-small `X-Yacron2-Node-Stats` header rather than in the body, on full responses
+small `X-Cronstable-Node-Stats` header rather than in the body, on full responses
 and bodyless `304`s alike, so live load values never defeat the exchange's
 conditional `304` optimisation: a sharing cluster's steady-state round still
 costs headers only, and each absorbed reading is as fresh as the last
@@ -814,30 +814,30 @@ the store"). This section covers the gossip signals; the lease equivalents are i
 [Monitoring the lease backends](#monitoring-the-lease-backends).
 
 Every signal you would alert on is exported natively at `GET /metrics` (see
-[Metrics with Prometheus](Metrics-with-Prometheus)) as `yacron2_cluster_*`
-series -- `yacron2_cluster_quorate`, `yacron2_cluster_is_leader`,
-`yacron2_cluster_conflict{kind}`, `yacron2_cluster_peers{status}`,
-`yacron2_cluster_size` / `yacron2_cluster_quorum`, plus the
-`yacron2_cluster_leader_transitions_total` and
-`yacron2_cluster_quorum_transitions_total` counters -- each mirroring a
+[Metrics with Prometheus](Metrics-with-Prometheus)) as `cronstable_cluster_*`
+series -- `cronstable_cluster_quorate`, `cronstable_cluster_is_leader`,
+`cronstable_cluster_conflict{kind}`, `cronstable_cluster_peers{status}`,
+`cronstable_cluster_size` / `cronstable_cluster_quorum`, plus the
+`cronstable_cluster_leader_transitions_total` and
+`cronstable_cluster_quorum_transitions_total` counters -- each mirroring a
 pre-derived field on `GET /cluster` (the
 [statsd integration](Metrics-with-Statsd) is still per-job). Useful alerts:
 
 | Alert when | Field(s) | Metric(s) | Means |
 | --- | --- | --- | --- |
-| `quorate` is `false` for more than a few `interval`s | `quorate` | `yacron2_cluster_quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
-| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes`, `policy_conflict`, `conflicting_policies` | `yacron2_cluster_conflict{kind}` (`kind="nodename"` / `"size"` / `"policy"`) | a duplicate `nodeName`, a cluster-size disagreement, or a coordination-policy (`distribution`/`elect_leader`) mismatch is pausing `Leader` jobs (page on this) |
-| `agreed` peers fall below `quorum` | count of `peers[].status == "agreed"` vs `quorum` | `yacron2_cluster_peers{status="agreed"}` vs `yacron2_cluster_quorum` | the cluster is one failure from losing quorum (this node counts itself toward quorum, so `quorum − 1` agreed peers is the last quorate state; any fewer duplicates the `quorate` alert) |
-| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | `yacron2_cluster_peers{status="untrusted"}` | a peer's certificate failed verification (often a botched cert rotation; see [Certificate rotation](#certificate-rotation)) |
+| `quorate` is `false` for more than a few `interval`s | `quorate` | `cronstable_cluster_quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
+| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes`, `policy_conflict`, `conflicting_policies` | `cronstable_cluster_conflict{kind}` (`kind="nodename"` / `"size"` / `"policy"`) | a duplicate `nodeName`, a cluster-size disagreement, or a coordination-policy (`distribution`/`elect_leader`) mismatch is pausing `Leader` jobs (page on this) |
+| `agreed` peers fall below `quorum` | count of `peers[].status == "agreed"` vs `quorum` | `cronstable_cluster_peers{status="agreed"}` vs `cronstable_cluster_quorum` | the cluster is one failure from losing quorum (this node counts itself toward quorum, so `quorum − 1` agreed peers is the last quorate state; any fewer duplicates the `quorate` alert) |
+| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | `cronstable_cluster_peers{status="untrusted"}` | a peer's certificate failed verification (often a botched cert rotation; see [Certificate rotation](#certificate-rotation)) |
 
 The [example alerts](Metrics-with-Prometheus#example-alerts) on the Prometheus
 page include the quorum rule and the split-brain check
-(`sum(yacron2_cluster_is_leader) > 1`). A blackbox / JSON-exporter probe
+(`sum(cronstable_cluster_is_leader) > 1`). A blackbox / JSON-exporter probe
 (Prometheus `json_exporter`, a Nagios check, etc.) scraping `GET /cluster` on
 every replica remains a valid alternative, and is the only source for the
 detail fields the metrics do not carry (per-peer `last_seen` and `last_error`,
 `conflict_names`, `conflicting_sizes`, `conflicting_policies`; the leader's
-name surfaces only as the `yacron2_cluster_leader_info{leader}` label). The same
+name surfaces only as the `cronstable_cluster_leader_info{leader}` label). The same
 transitions are also **logged** (leadership and quorum changes, conflict
 onset at `ERROR` (clear at `INFO`), and per-peer `untrusted`/`unreachable`/drift
 at `WARNING`), so a log-based alert is a viable second source.
@@ -857,7 +857,7 @@ one calls itself the leader:
 
 ```shell
 # across all replicas, count how many believe they are the leader
-for url in yacron-a:8080 yacron-b:8080 yacron-c:8080; do
+for url in cronstable-a:8080 cronstable-b:8080 cronstable-c:8080; do
   curl -s "http://$url/cluster" \
     | python -c 'import sys,json; print(str(json.load(sys.stdin).get("is_leader")).lower())'
 done | grep -c '^true$'     # > 1 means a transient double-leader
@@ -942,7 +942,7 @@ windows at the cost of more polling traffic.
 
 ## Certificate rotation
 
-**Rotation is automatic** on the `gossip` backend: yacron2 reloads its mTLS
+**Rotation is automatic** on the `gossip` backend: cronstable reloads its mTLS
 contexts when the mounted CA/cert/key change in place. On each config-reload pass
 (every minute) it compares the on-disk CA, cert, and key against what it loaded
 at startup and, if any changed, restarts the cluster manager to rebuild the TLS
@@ -961,7 +961,7 @@ trust overlap, and recovering from an `untrusted` cascade), see
 The `kubernetes`, `etcd`, and `filesystem` backends replace the gossip protocol
 with a shared store, giving a **fenced** election while the store is reachable
 (exactly-once on `kubernetes`/`etcd`; on `filesystem`, fenced under NTP-bounded
-clock skew). They share one code path (`yacron2.leadership.LeaseBackend`) and
+clock skew). They share one code path (`cronstable.leadership.LeaseBackend`) and
 differ only in which store they talk to. This section covers how they elect, how
 to deploy each, their failure modes, and how to monitor them; the config keys
 are in the [Configuration Reference](Configuration-Reference#cluster).
@@ -972,9 +972,9 @@ apiserver's REST API and etcd's v3 gRPC-gateway JSON API, while `filesystem`
 talks to no service at all (its store is a directory, driven with the standard
 library). So the **core install gains no new dependency**, and by avoiding
 grpc/protobuf wheels every lease backend runs on the full set of architectures
-yacron2 ships for. The Kubernetes backend can optionally use the **official
+cronstable ships for. The Kubernetes backend can optionally use the **official
 `kubernetes` client** when it is installed
-(`pip install yacron2[kubernetes]`): `cluster.kubernetes.clientLibrary: auto`
+(`pip install cronstable[kubernetes]`): `cluster.kubernetes.clientLibrary: auto`
 (the default) prefers it when importable and otherwise falls back to the
 hand-rolled REST transport, so the choice is automatic per architecture
 (`library` requires the client, `http` forces the hand-rolled path). etcd always
@@ -1068,7 +1068,7 @@ Leadership is fenced on the **lease**, but each node still carries an identity:
   lead (only the node whose lease backs the key is leader); a shared name only
   makes the *displayed* holder ambiguous.
 * **Kubernetes**: `cluster.kubernetes.identity` (defaulting to `nodeName`) is
-  the human-readable holder; yacron2 appends a **per-process token** to the
+  the human-readable holder; cronstable appends a **per-process token** to the
   `holderIdentity` it actually writes (`<identity>#<token>`), so two nodes
   sharing an identity still write distinct holders and cannot both renew. The
   dashboard and `GET /cluster` strip the token back to the readable name (so
@@ -1095,7 +1095,7 @@ a quorum, so a plain `Deployment` with any replica count works:
 cluster:
   backend: kubernetes
   kubernetes:
-    leaseName: yacron2-leader      # the Lease object the replicas contend for
+    leaseName: cronstable-leader      # the Lease object the replicas contend for
     # leaseNamespace: null         # default: the pod's own namespace
     leaseDurationSeconds: 15        # failover happens within ~this long
     renewDeadlineSeconds: 10        # must be < leaseDurationSeconds
@@ -1108,7 +1108,7 @@ otherwise): `renewDeadlineSeconds > 0`,
 `leaseDurationSeconds > renewDeadlineSeconds`, `0 < retryPeriodSeconds <
 renewDeadlineSeconds`, and `renewDeadlineSeconds + retryPeriodSeconds <
 leaseDurationSeconds` (so a renew that just misses its deadline still leaves a
-retry inside the lease window). Run `yacron2 --validate-config` to check them
+retry inside the lease window). Run `cronstable --validate-config` to check them
 before deploying; see the [Command-Line Reference](CLI-Reference).
 
 * **RBAC (required).** The backend needs `get` (observe) and `update` (renew /
@@ -1122,7 +1122,7 @@ before deploying; see the [Command-Line Reference](CLI-Reference).
   rules:
     - apiGroups: ["coordination.k8s.io"]
       resources: ["leases"]
-      resourceNames: ["yacron2-leader"]   # keep in sync with cluster.kubernetes.leaseName
+      resourceNames: ["cronstable-leader"]   # keep in sync with cluster.kubernetes.leaseName
       verbs: ["get", "update"]
     - apiGroups: ["coordination.k8s.io"]
       resources: ["leases"]
@@ -1131,8 +1131,8 @@ before deploying; see the [Command-Line Reference](CLI-Reference).
 
   A ready-to-apply `ServiceAccount` + `Role` + `RoleBinding` + 3-replica
   `Deployment` is in
-  [`example/kubernetes/deployment.yaml`](https://github.com/ptweezy/yacron2/blob/develop/example/kubernetes/deployment.yaml).
-  Run `yacron2 --validate-config` on the config before applying the manifests;
+  [`example/kubernetes/deployment.yaml`](https://github.com/ptweezy/cronstable/blob/develop/example/kubernetes/deployment.yaml).
+  Run `cronstable --validate-config` on the config before applying the manifests;
   see the [Command-Line Reference](CLI-Reference).
 * **Credentials.** In-cluster, the pod's service-account token, CA, and
   namespace file are used automatically (`leaseNamespace` defaults to the pod's
@@ -1140,7 +1140,7 @@ before deploying; see the [Command-Line Reference](CLI-Reference).
   `cluster.kubernetes.kubeconfig` (and optionally `apiServer` to override the
   server URL).
 * **Transport (`clientLibrary`).** `auto` (default) uses the official
-  `kubernetes` client when it is importable (`pip install yacron2[kubernetes]`)
+  `kubernetes` client when it is importable (`pip install cronstable[kubernetes]`)
   and otherwise falls back to a hand-rolled apiserver REST transport over the
   core `aiohttp` dependency, so on an architecture without the client it still
   works. `http` forces the REST transport; `library` **requires** the native
@@ -1166,7 +1166,7 @@ cluster:
   backend: etcd
   etcd:
     endpoints: [http://etcd-0:2379, http://etcd-1:2379]
-    electionName: yacron2/leader   # the key; its value is the holder's nodeName
+    electionName: cronstable/leader   # the key; its value is the holder's nodeName
     ttl: 15                         # lease TTL, seconds (>= 3; keepalive every ~ttl/3)
     # username: root               # for an auth-enabled cluster …
     # password: { fromEnvVar: ETCD_PASSWORD }
@@ -1180,14 +1180,14 @@ cluster:
   `password` from exactly one of `value` / `fromFile` / `fromEnvVar` (like
   `web.authToken`); a configured-but-empty source fails closed at load. The auth
   token is obtained at startup and **re-fetched automatically when it expires**
-  (yacron2 re-authenticates on an etcd `401`), so a token TTL does not wedge the
+  (cronstable re-authenticates on an etcd `401`), so a token TTL does not wedge the
   backend. Always pair a `username` with a resolvable `password`.
 * **TLS.** For `https://` endpoints set `tls.ca` (and `tls.cert` / `tls.key` for
   client-cert auth). `http://` and `https://` endpoints are detected per-URL.
 * **Failover timing.** A dead holder is replaced within ~`ttl`. On a *graceful*
   shutdown the holder **revokes** its lease, deleting the key at once for
   immediate failover. The value at `electionName` is the holder's `nodeName`, so
-  `etcdctl get yacron2/leader` shows who leads. `ttl` must be **>= 3** (a smaller
+  `etcdctl get cronstable/leader` shows who leads. `ttl` must be **>= 3** (a smaller
   value is rejected at config load). etcd may *grant* a smaller TTL than
   requested (its `--min-lease-ttl` setting, or server load), which the backend
   honours: a smaller server-granted TTL narrows the effective leader window
@@ -1203,12 +1203,12 @@ to deploy and nothing beyond the standard library at work:
 cluster:
   backend: filesystem
   filesystem:
-    path: /mnt/shared/yacron2       # the directory the election lease lives in (required)
+    path: /mnt/shared/cronstable       # the directory the election lease lives in (required)
     # electionName: cluster/leader  # the lease's name inside the store
     # ttl: 15                        # lease time-to-live, seconds (>= 3; renewed every ~ttl/3)
     # deploymentId: null             # namespace inside the store; null -> "default"
     # topology: auto                 # auto | single-node | shared (assert shared on Windows/macOS)
-  nodeName: yacron-a
+  nodeName: cronstable-a
 ```
 
 The full key table is in the
@@ -1322,7 +1322,7 @@ treat its own freshly-won lease as expired).
   re-wins the key.
 * **etcd TTL below the floor.** If the server-honoured TTL ever drops below the
   usable floor (3 s), the fence collapses to ~zero and this node's `Leader` jobs
-  fail closed (safe, but it can no longer lead). yacron2 logs a **one-time
+  fail closed (safe, but it can no longer lead). cronstable logs a **one-time
   warning** on that transition (and a recovery once the granted TTL returns above
   the floor); check etcd's `--min-lease-ttl` and load if you see it.
 
@@ -1360,7 +1360,7 @@ For running multiple replicas on Kubernetes (both `backend: kubernetes` and
 ## Trying it locally
 
 The repository ships a ready-to-run three-node cluster in
-[`docker-compose-cluster.yml`](https://github.com/ptweezy/yacron2/blob/develop/docker-compose-cluster.yml).
+[`docker-compose-cluster.yml`](https://github.com/ptweezy/cronstable/blob/develop/docker-compose-cluster.yml).
 It generates a throwaway cluster CA and per-node certificates, brings up three
 mutually-attesting nodes with `electLeader: true` and one job of each
 `clusterPolicy`, and publishes each node's dashboard on a separate port
@@ -1369,7 +1369,7 @@ mutually-attesting nodes with `electLeader: true` and one job of each
 ```shell
 docker compose -f docker-compose-cluster.yml up --build
 # then open http://localhost:8080/ , :8081 , :8082 and watch the cluster panel
-docker compose -f docker-compose-cluster.yml stop yacron-a   # watch leadership move to yacron-b
+docker compose -f docker-compose-cluster.yml stop cronstable-a   # watch leadership move to cronstable-b
 ```
 
 The compose file's header comments document the full set of things to try
@@ -1377,15 +1377,15 @@ The compose file's header comments document the full set of things to try
 
 **A full showcase.** For the fullest end-to-end demo (`distribution: spread`,
 all three `clusterPolicy` values, and mTLS together), the repository ships
-[`docker-compose-acme.yml`](https://github.com/ptweezy/yacron2/blob/develop/docker-compose-acme.yml);
+[`docker-compose-acme.yml`](https://github.com/ptweezy/cronstable/blob/develop/docker-compose-acme.yml);
 its walkthrough is in
-[`example/acme-platform/README.md`](https://github.com/ptweezy/yacron2/blob/develop/example/acme-platform/README.md).
+[`example/acme-platform/README.md`](https://github.com/ptweezy/cronstable/blob/develop/example/acme-platform/README.md).
 
 ### A larger, CPU-heavy cluster
 
 To watch [`distribution: spread`](#distribution-one-leader-or-spread-the-load)
 fan real load across the cluster, the repository also ships
-[`docker-compose-cluster-large.yml`](https://github.com/ptweezy/yacron2/blob/develop/docker-compose-cluster-large.yml):
+[`docker-compose-cluster-large.yml`](https://github.com/ptweezy/cronstable/blob/develop/docker-compose-cluster-large.yml):
 **ten** nodes (dashboards on ports 8080–8089) running a larger job set with
 several CPU-heavy jobs, defaulting to `spread`. Each node's config is generated
 from environment variables by a small entrypoint, so there are no per-node files
@@ -1406,19 +1406,19 @@ header comments list how to inspect per-job owners and fail nodes.
 ### A fenced backend locally
 
 To try a **lease backend** instead of gossip,
-[`example/etcd/`](https://github.com/ptweezy/yacron2/tree/develop/example/etcd)
-ships a `docker-compose.yml` with a single etcd plus two yacron2 instances
+[`example/etcd/`](https://github.com/ptweezy/cronstable/tree/develop/example/etcd)
+ships a `docker-compose.yml` with a single etcd plus two cronstable instances
 (`backend: etcd`) and one job of each `clusterPolicy`:
 
 ```shell
 docker compose -f example/etcd/docker-compose.yml up --build
 # exactly one instance leads; fail it over and watch the other take over within ~ttl:
-docker compose -f example/etcd/docker-compose.yml stop yacron2-a
-docker compose -f example/etcd/docker-compose.yml exec etcd etcdctl get yacron2/leader
+docker compose -f example/etcd/docker-compose.yml stop cronstable-a
+docker compose -f example/etcd/docker-compose.yml exec etcd etcdctl get cronstable/leader
 ```
 
 For the Kubernetes `Lease` backend,
-[`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes)
+[`example/kubernetes/`](https://github.com/ptweezy/cronstable/tree/develop/example/kubernetes)
 has the RBAC + `Deployment` to apply against any cluster (k3d/kind for local).
 
 ## See also
@@ -1461,10 +1461,10 @@ How to read it:
 * **Even sizes are equal-or-worse, never better.** N=4 still needs a quorum of
   3, so it tolerates the same single failure as N=3, but it has an extra node
   that can fail, so its P(runs) is actually slightly *lower* (0.99941 vs 0.99970
-  at p=0.99). yacron2 warns on even sizes for exactly this reason.
+  at p=0.99). cronstable warns on even sizes for exactly this reason.
 * **2 is worse than 1.** A 2-node quorum is 2, so both must be up: P = p²
   (0.9801 at p=0.99), below a single node's `p` (0.99), with no failover upside.
-  yacron2 **refuses to start** with `electLeader` and a 2-node cluster, raising a
+  cronstable **refuses to start** with `electLeader` and a 2-node cluster, raising a
   `ConfigError` ("...strictly worse than a single replica..."). The same 2-node
   cluster is fine for attestation-only (without `electLeader`).
 

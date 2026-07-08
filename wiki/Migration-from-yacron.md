@@ -1,13 +1,13 @@
 # Migration from yacron
 
-yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) continuing
+cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) continuing
 from upstream 0.19. This page enumerates every breaking change introduced in
-yacron2 relative to yacron 0.19, and gives an operator checklist for
-moving an existing yacron 0.19 deployment to yacron2.
+cronstable relative to yacron 0.19, and gives an operator checklist for
+moving an existing yacron 0.19 deployment to cronstable.
 
-yacron2 carries forward all of upstream yacron's functionality: scheduling,
+cronstable carries forward all of upstream yacron's functionality: scheduling,
 reporting, retries, concurrency, metrics, and the HTTP API all behave as in
-0.19 except where a breaking change below says otherwise, and yacron2 adds
+0.19 except where a breaking change below says otherwise, and cronstable adds
 new options on top (e.g. the `web.authToken` and `web.socketMode` keys;
 `web.socketMode` only applies to `unix://` listeners and is therefore
 irrelevant on Windows, where unix-socket listeners are unsupported (see
@@ -20,34 +20,34 @@ from `False` to `True`.
 
 ## Breaking changes
 
-### Command and distribution renamed `yacron` -> `yacron2`
+### Command and distribution renamed `yacron` -> `cronstable`
 
-| Old (yacron 0.19) | New (yacron2) |
+| Old (yacron 0.19) | New (cronstable) |
 | --- | --- |
-| `pip install yacron` | `pip install yacron2` |
-| `yacron` command | `yacron2` command |
-| `import yacron` | `import yacron2` |
-| entry point `yacron.__main__:main` | `yacron2.__main__:main` |
+| `pip install yacron` | `pip install cronstable` |
+| `yacron` command | `cronstable` command |
+| `import yacron` | `import cronstable` |
+| entry point `yacron.__main__:main` | `cronstable.__main__:main` |
 
-The console script is declared as `yacron2 = "yacron2.__main__:main"` in
+The console script is declared as `cronstable = "cronstable.__main__:main"` in
 `pyproject.toml`. The internal logger name and the argparse program name are now
-`yacron2`, so CLI error and `--version` output read `yacron2`. See the
+`cronstable`, so CLI error and `--version` output read `cronstable`. See the
 [Command-Line Reference](CLI-Reference).
 
-### Default config directory `/etc/yacron.d` -> `/etc/yacron2.d`
+### Default config directory `/etc/yacron.d` -> `/etc/cronstable.d`
 
-The built-in default for `-c`/`--config` is now `/etc/yacron2.d`
-(`CONFIG_DEFAULT` in `yacron2/__main__.py`). Operators who relied on the old
+The built-in default for `-c`/`--config` is now `/etc/cronstable.d`
+(`CONFIG_DEFAULT` in `cronstable/__main__.py`). Operators who relied on the old
 default path must move their configuration directory, or pass the old path
 explicitly with `-c /etc/yacron.d`. The published container image and the
-example Dockerfile read from `/etc/yacron2.d`. See
+example Dockerfile read from `/etc/cronstable.d`. See
 [Includes, Defaults, and Multi-File Config](Includes-and-Defaults).
 
-This default is platform-specific: it is `/etc/yacron2.d` only on POSIX. On
-Windows the default is instead `%APPDATA%\yacron2` (e.g.
-`C:\Users\<you>\AppData\Roaming\yacron2`), falling back to the user profile
+This default is platform-specific: it is `/etc/cronstable.d` only on POSIX. On
+Windows the default is instead `%APPDATA%\cronstable` (e.g.
+`C:\Users\<you>\AppData\Roaming\cronstable`), falling back to the user profile
 (`~`) when `APPDATA` is unset. The "config not found -> exit 1" special case
-keys off whichever platform default applies (not the literal `/etc/yacron2.d`
+keys off whichever platform default applies (not the literal `/etc/cronstable.d`
 string). See [Running on Windows](Running-on-Windows).
 
 ### Minimum Python is now 3.10
@@ -55,32 +55,32 @@ string). See [Running on Windows](Running-on-Windows).
 `requires-python` is `>=3.10`; Python 3.10 through 3.14 are supported. Python
 3.9 and earlier are no longer supported. If your host runs an older
 interpreter, use the self-contained binary (which embeds Python) or the
-container image instead of a `pip` install. `pip install yacron2`
+container image instead of a `pip` install. `pip install cronstable`
 and the self-contained binaries also work natively on Windows (amd64/arm64);
 see [Running on Windows](Running-on-Windows). See [Installation](Installation).
 
-### Reporter shell environment variables renamed `YACRON_*` -> `YACRON2_*`
+### Reporter shell environment variables renamed `YACRON_*` -> `CRONSTABLE_*`
 
-The shell reporter exports its job-state variables with the `YACRON2_` prefix.
+The shell reporter exports its job-state variables with the `CRONSTABLE_` prefix.
 Any `onFailure`/`onSuccess`/`onPermanentFailure` shell-reporter scripts that
 reference the old `YACRON_*` names must be updated. The current variable set
 exported by the shell reporter is:
 
 | Variable | Description |
 | --- | --- |
-| `YACRON2_FAIL_REASON` | Failure reason string |
-| `YACRON2_FAILED` | `"1"` if the job failed, `"0"` otherwise |
-| `YACRON2_JOB_NAME` | Job name |
-| `YACRON2_JOB_COMMAND` | Job command |
-| `YACRON2_JOB_SCHEDULE` | Job schedule (unparsed) |
-| `YACRON2_RETCODE` | Process exit code as a string |
-| `YACRON2_STDERR` | Captured standard error |
-| `YACRON2_STDOUT` | Captured standard output |
-| `YACRON2_STDERR_TRUNCATED` | Whether stderr was truncated |
-| `YACRON2_STDOUT_TRUNCATED` | Whether stdout was truncated |
+| `CRONSTABLE_FAIL_REASON` | Failure reason string |
+| `CRONSTABLE_FAILED` | `"1"` if the job failed, `"0"` otherwise |
+| `CRONSTABLE_JOB_NAME` | Job name |
+| `CRONSTABLE_JOB_COMMAND` | Job command |
+| `CRONSTABLE_JOB_SCHEDULE` | Job schedule (unparsed) |
+| `CRONSTABLE_RETCODE` | Process exit code as a string |
+| `CRONSTABLE_STDERR` | Captured standard error |
+| `CRONSTABLE_STDOUT` | Captured standard output |
+| `CRONSTABLE_STDERR_TRUNCATED` | Whether stderr was truncated |
+| `CRONSTABLE_STDOUT_TRUNCATED` | Whether stdout was truncated |
 
 The `*_TRUNCATED` variables are exported by the shell reporter
-(`yacron2/job.py`) but are not listed in `README.md`; the other eight match the
+(`cronstable/job.py`) but are not listed in `README.md`; the other eight match the
 README. See [Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
 
 ### Mail `validate_certs` now defaults to `True`
@@ -115,7 +115,7 @@ See [Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
 ### Privilege drop: supplementary groups and derived gid
 
 The per-job `user`/`group` switch now performs the privilege drop in the
-correct order in the child process (`_demote` in `yacron2/job.py`):
+correct order in the child process (`_demote` in `cronstable/job.py`):
 
 1. Supplementary groups first. With a known login name and gid,
    `os.initgroups(username, gid)` gives the child exactly the target user's
@@ -141,11 +141,11 @@ numeric `user` retaining gid `0`) applies only on POSIX. See
 
 ### `defaults.environment` merges by key instead of concatenating
 
-When a `defaults` block and a job both define `environment` entries, yacron2
+When a `defaults` block and a job both define `environment` entries, cronstable
 merges them by key: a job overriding a default variable yields a single entry
 for that key (the job's value wins), rather than concatenating both into the
 list with a duplicate key. This is implemented in `mergedicts`
-(`yacron2/config.py`), which special-cases the `environment` list.
+(`cronstable/config.py`), which special-cases the `environment` list.
 
 Configurations that relied on the old duplicate-key concatenation behavior will
 behave differently. In practice the effective value of an overridden variable
@@ -155,9 +155,9 @@ keys.
 
 ### Dependency pin changes
 
-| Dependency | yacron 0.19 | yacron2 |
+| Dependency | yacron 0.19 | cronstable |
 | --- | --- | --- |
-| `crontab` | `==0.22.8` | dropped (cron expressions parsed by yacron2's built-in engine, same dialect) |
+| `crontab` | `==0.22.8` | dropped (cron expressions parsed by cronstable's built-in engine, same dialect) |
 | `strictyaml` | (older pin) | `>=1.7,<2` |
 | `aiohttp` | (older pin) | `>=3.10,<4` |
 | `aiosmtplib` | (older pin) | `>=3,<6` (v2+ login API) |
@@ -170,25 +170,25 @@ keys.
 images that do not ship the system tz database. Timezone handling migrated from
 third-party `pytz` to the standard-library `zoneinfo`; an invalid `timezone`
 now raises `ConfigError`. The new-version pins matter mainly if you install
-yacron2 into a shared environment alongside other packages that constrain these
+cronstable into a shared environment alongside other packages that constrain these
 same libraries. See [Schedules and Timezones](Schedules-and-Timezones).
 
 ## Migration checklist
 
-- [ ] Install the new distribution: `pip install yacron2` (or `pipx install
-  yacron2`), or switch to the container image / standalone binary. `pip` and
+- [ ] Install the new distribution: `pip install cronstable` (or `pipx install
+  cronstable`), or switch to the container image / standalone binary. `pip` and
   the standalone binaries (amd64/arm64) also work on Windows; see
   [Running on Windows](Running-on-Windows). See [Installation](Installation).
 - [ ] Ensure the target interpreter is Python 3.10 or newer. On older hosts, use
   the binary or container image.
-- [ ] Update any code/scripts that `import yacron` to `import yacron2`, and any
-  service unit or wrapper invoking the `yacron` command to invoke `yacron2`.
-- [ ] Move your config directory from `/etc/yacron.d` to `/etc/yacron2.d`, or
+- [ ] Update any code/scripts that `import yacron` to `import cronstable`, and any
+  service unit or wrapper invoking the `yacron` command to invoke `cronstable`.
+- [ ] Move your config directory from `/etc/yacron.d` to `/etc/cronstable.d`, or
   pass `-c /etc/yacron.d` explicitly. Update systemd units, Dockerfiles, and
   Kubernetes manifests accordingly. On Windows the platform default is
-  `%APPDATA%\yacron2` instead; see [Running on Windows](Running-on-Windows).
+  `%APPDATA%\cronstable` instead; see [Running on Windows](Running-on-Windows).
 - [ ] In every shell reporter script, rename `YACRON_*` references to
-  `YACRON2_*`.
+  `CRONSTABLE_*`.
 - [ ] For each `mail` reporter targeting a server with a self-signed or invalid
   certificate that previously worked, add `validate_certs: false` (or fix the
   server certificate). All other mail reporters now validate certificates by
@@ -206,10 +206,10 @@ same libraries. See [Schedules and Timezones](Schedules-and-Timezones).
 - [ ] If you install into a shared environment, reconcile the new dependency
   pins (`strictyaml>=1.7,<2`, `aiohttp>=3.10,<4`, `aiosmtplib>=3,<6`,
   `sentry-sdk>=2,<3`, `tzdata>=2024.1`; `pytz`, the `ruamel.yaml` pin and
-  the `crontab` package removed — cron expressions are parsed by yacron2's
+  the `crontab` package removed — cron expressions are parsed by cronstable's
   built-in engine).
 - [ ] Validate the migrated configuration before starting the scheduler:
-  `yacron2 -v -c <path>`. See [Command-Line Reference](CLI-Reference).
+  `cronstable -v -c <path>`. See [Command-Line Reference](CLI-Reference).
 
 For the full set of options and their current types and defaults, see the
 [Configuration Reference](Configuration-Reference).

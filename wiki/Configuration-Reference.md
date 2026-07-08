@@ -1,9 +1,9 @@
 # Configuration Reference
 
-The canonical, exhaustive reference for the yacron2 YAML configuration. It
+The canonical, exhaustive reference for the cronstable YAML configuration. It
 documents the top-level structure and every per-job option, with the exact
 strictyaml type, default, and load-time validation rule taken from
-`yacron2/config.py`. Deep topics (schedules, reporting, the HTTP API, metrics,
+`cronstable/config.py`. Deep topics (schedules, reporting, the HTTP API, metrics,
 logging, includes) have dedicated pages linked from each section.
 
 ## Configuration source
@@ -17,7 +17,7 @@ The document is parsed and validated against a fixed strictyaml schema
 Classic (Vixie-style) crontab files are accepted alongside YAML, recognised by
 name (`*.crontab`, `*.cron`, or a file named `crontab`): each entry is lowered
 to an ordinary job definition and merged over the same `DEFAULT_CONFIG`
-defaults documented below, so internally it is configured to yacron2's
+defaults documented below, so internally it is configured to cronstable's
 standard behavior rather than an emulation of cron's. A crontab can only
 define jobs; every other section on this page (and any per-job option beyond
 schedule, command, shell, timezone, and environment) is YAML-only. See
@@ -56,16 +56,16 @@ logging: { ... }    # optional: Python logging dictConfig
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
 | `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
-| `state` | `Map` | No | Enables the opt-in durable state store: restart-durable run history, missed-run catch-up, restart-surviving retries, and once-per-boot `@reboot` runs. Without it yacron2 is stateless (everything in memory, exactly as before). See [Durable State](Durable-State). |
+| `state` | `Map` | No | Enables the opt-in durable state store: restart-durable run history, missed-run catch-up, restart-surviving retries, and once-per-boot `@reboot` runs. Without it cronstable is stateless (everything in memory, exactly as before). See [Durable State](Durable-State). |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
 
 ### `web`
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `listen` | `Seq(Str)` | required | Listen URLs, e.g. `http://127.0.0.1:8080` or `unix:///tmp/yacron2.sock`. `http://` listeners work everywhere; `unix://` listeners are not supported on Windows (the Proactor loop lacks `create_unix_server`) and are skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`. Use an `http://` listener instead. See [Running on Windows](Running-on-Windows). |
+| `listen` | `Seq(Str)` | required | Listen URLs, e.g. `http://127.0.0.1:8080` or `unix:///tmp/cronstable.sock`. `http://` listeners work everywhere; `unix://` listeners are not supported on Windows (the Proactor loop lacks `create_unix_server`) and are skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`. Use an `http://` listener instead. See [Running on Windows](Running-on-Windows). |
 | `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. |
-| `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, yacron2 refuses to start. |
+| `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, cronstable refuses to start. |
 | `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. Only ever applies to unix sockets, so it is irrelevant on Windows (where `unix://` listeners are unsupported). |
 | `metrics` | `Bool \| Map` with `enabled` / `public` (each `Bool`) and `durationBuckets` (`Seq(Float)`) | enabled | The Prometheus `GET /metrics` endpoint, served by default whenever the web API is on. `metrics: false` (bool shorthand) disables it; the map form sets `enabled` (default `true`), `public` (default `false`; exempts only `/metrics` from `authToken`), and `durationBuckets` (histogram bounds in seconds; must be finite, positive, and strictly increasing, else a `ConfigError`). See [Metrics with Prometheus](Metrics-with-Prometheus). |
 | `nodeHistory` | `Bool \| Map` with `enabled` (`Bool`), `interval` (`Float`) and `points` (`Int`) | enabled | Background node CPU/memory sampling for the dashboard's node history chart, served by `GET /node/history`. On by default whenever the web API is on; `nodeHistory: false` disables the sampling task. The map form sets `interval` (seconds between samples, default `5.0`, minimum `1.0`) and `points` (ring size, default `720` — the last hour at the default cadence; 10–50000). The ring is in-memory only and follows the web app's lifecycle. |
@@ -122,15 +122,15 @@ odd count is best for a clean majority).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `leaseName` | `Str` | `yacron2-leader` | Name of the `Lease` object the replicas contend for. Must be a valid RFC1123 subdomain (lowercase alphanumerics, `-` and `.`; `<=253` chars), checked at load; it is spliced into the apiserver URL path, so a stray `/`, `?`, `#`, or space is rejected. |
+| `leaseName` | `Str` | `cronstable-leader` | Name of the `Lease` object the replicas contend for. Must be a valid RFC1123 subdomain (lowercase alphanumerics, `-` and `.`; `<=253` chars), checked at load; it is spliced into the apiserver URL path, so a stray `/`, `?`, `#`, or space is rejected. |
 | `leaseNamespace` | `Str` or null | null → in-cluster namespace | Namespace of the `Lease`; defaults to the pod's own namespace (the service-account namespace file). When set, must be a valid RFC1123 label (lowercase alphanumerics and `-`; `<=63` chars), checked at load. |
 | `leaseDurationSeconds` | `Int` | `15` | How long a renewal keeps the lease valid. Must be `> renewDeadlineSeconds`. |
 | `renewDeadlineSeconds` | `Int` | `10` | Per-round renew/observe deadline: a round that exceeds it is abandoned and retried next round, so a stuck apiserver call cannot run out the full lease. Must be `> 0` and `< leaseDurationSeconds`. |
 | `retryPeriodSeconds` | `Int` | `2` | Seconds between renew/observe rounds. Must be `> 0` and `< renewDeadlineSeconds` (a holder must be able to attempt a renew before its own deadline). Additionally, `renewDeadlineSeconds + retryPeriodSeconds < leaseDurationSeconds` is enforced at load, so the worst-case interval between two successful refreshes still fits inside the lease. |
-| `identity` | `Str` or null | null → `nodeName` | The human-readable holder for this node (shown in the dashboard / `GET /cluster`). yacron2 appends a **per-process token** to the `holderIdentity` it actually writes (`<identity>#<token>`), so two nodes sharing an `identity`/`nodeName` still write distinct holders and cannot both believe they hold the `Lease`. See [Node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
-| `kubeconfig` | `Str` or null | null → in-cluster | Path to a kubeconfig for out-of-cluster / local testing; otherwise the in-cluster service-account credentials are used. On the hand-rolled HTTP transport a kubeconfig user that relies on an `exec` credential plugin or an `auth-provider` raises a `ConfigError` (those must be executed, which only the native client can do); use `clientLibrary: library` (`yacron2[kubernetes]`) or a kubeconfig with a static token / client certificate instead. `insecure-skip-tls-verify` is honored (the apiserver certificate is not validated) but logs a warning. |
+| `identity` | `Str` or null | null → `nodeName` | The human-readable holder for this node (shown in the dashboard / `GET /cluster`). cronstable appends a **per-process token** to the `holderIdentity` it actually writes (`<identity>#<token>`), so two nodes sharing an `identity`/`nodeName` still write distinct holders and cannot both believe they hold the `Lease`. See [Node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
+| `kubeconfig` | `Str` or null | null → in-cluster | Path to a kubeconfig for out-of-cluster / local testing; otherwise the in-cluster service-account credentials are used. On the hand-rolled HTTP transport a kubeconfig user that relies on an `exec` credential plugin or an `auth-provider` raises a `ConfigError` (those must be executed, which only the native client can do); use `clientLibrary: library` (`cronstable[kubernetes]`) or a kubeconfig with a static token / client certificate instead. `insecure-skip-tls-verify` is honored (the apiserver certificate is not validated) but logs a warning. |
 | `apiServer` | `Str` or null | null | Override the apiserver URL (else the in-cluster `KUBERNETES_SERVICE_*` env or the kubeconfig). When set, must be an `https://` URL: a non-https value is a `ConfigError` at load, since the ServiceAccount bearer token must not travel in cleartext. |
-| `clientLibrary` | `Enum(["auto", "http", "library"])` | `auto` | Transport selection. `auto` uses the official `kubernetes` client when it is importable (install `yacron2[kubernetes]`) and otherwise falls back to a hand-rolled apiserver REST transport over `aiohttp`; `library` requires the native client (a `ConfigError` if absent); `http` forces the hand-rolled transport. |
+| `clientLibrary` | `Enum(["auto", "http", "library"])` | `auto` | Transport selection. `auto` uses the official `kubernetes` client when it is importable (install `cronstable[kubernetes]`) and otherwise falls back to a hand-rolled apiserver REST transport over `aiohttp`; `library` requires the native client (a `ConfigError` if absent); `http` forces the hand-rolled transport. |
 
 **etcd backend** (`backend: etcd`), under `cluster.etcd`. A lease-bound key is
 the fence; the backend uses etcd's v3 gRPC-gateway JSON/HTTP API directly (no
@@ -139,7 +139,7 @@ native client). Defaults from `DEFAULT_ETCD`:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `endpoints` | `Seq(Str)` | `["http://127.0.0.1:2379"]` | etcd client URLs, tried in order for failover. Each must be `http(s)://host[:port]`; the port is optional (defaults to the scheme's port, e.g. `443` behind an https ingress) and only an explicitly out-of-range port is rejected. Credentials embedded in the URL are refused. |
-| `electionName` | `Str` | `yacron2/leader` | The etcd key contended for; its value is the holder's `nodeName`. There is **no separate `identity` key** for etcd (the holder identity is always `cluster.nodeName`), but leadership is fenced on the **bound lease id**, not this string, so a duplicate `nodeName` cannot make two nodes both lead. See [Node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
+| `electionName` | `Str` | `cronstable/leader` | The etcd key contended for; its value is the holder's `nodeName`. There is **no separate `identity` key** for etcd (the holder identity is always `cluster.nodeName`), but leadership is fenced on the **bound lease id**, not this string, so a duplicate `nodeName` cannot make two nodes both lead. See [Node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
 | `ttl` | `Int` | `15` | Lease time-to-live, seconds. Must be `>= 3`: the leader holds the key only until `ttl` minus a 1s clock-skew margin, so a smaller `ttl` would make a fresh winner treat its own lease as already expired (no `Leader` job would ever run). The keepalive cadence is ~`ttl/3` against the **effective** ttl, which etcd may grant smaller than requested (a smaller granted TTL narrows the fence window). |
 | `username` | `Str` or null | null | etcd auth username (omit for an auth-less cluster). Pair it with a resolvable `password`. The auth token is re-fetched automatically when it expires (re-auth on a `401`). |
 | `password` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | unset | etcd auth password source, resolved like `web.authToken` from exactly one of `value` / `fromFile` / `fromEnvVar`; a configured-but-empty source fails closed. |
@@ -192,7 +192,7 @@ same requirement [Durable State](Durable-State) documents for shared mounts.
 Because the cluster schema has many load-time rejections (the ordering rules,
 the RFC1123 and https guards, the credential-over-plaintext refusals, and the
 lease-family rules above), check a cluster config before deploying with
-`yacron2 --validate-config`, which runs the full load path and prints the
+`cronstable --validate-config`, which runs the full load path and prints the
 first `ConfigError` without starting the scheduler. See
 [Command-Line Reference](CLI-Reference).
 
@@ -224,7 +224,7 @@ Two shapes:
   here are a `ConfigError` (redundant), and so are the overlay tuning keys
   `nodeName`/`interval`/`driftAfter`/`connectTimeout` (there is no overlay mesh
   to tune; the stats gossip at `cluster.interval`, so set the cluster-level keys
-  instead). The stats ride each `/peer` response as an `X-Yacron2-Node-Stats`
+  instead). The stats ride each `/peer` response as an `X-Cronstable-Node-Stats`
   header, never in the body, so sharing live load keeps the mesh's idle `304`
   optimisation intact.
 - **A lease backend** (`kubernetes`/`etcd`/`filesystem`) — election stays with the
@@ -236,7 +236,7 @@ Two shapes:
 cluster:
   backend: kubernetes            # election via a coordination.k8s.io Lease
   kubernetes:
-    leaseName: yacron2-leader
+    leaseName: cronstable-leader
   observability:                 # a gossip mesh JUST for the fleet view
     listen: "0.0.0.0:8140"
     tls: { ca: /tls/ca.pem, cert: /tls/node.pem, key: /tls/node.key }
@@ -255,7 +255,7 @@ degrades to "no data for that node", never poisoning the view.
 Optional. Enables the **durable state store**: restart-durable run history,
 missed-run catch-up, restart-surviving retries, once-per-boot `@reboot`
 dedupe, restart-durable Prometheus job counters, and durable output archival.
-yacron2 is stateless by default: absent this section everything stays in
+cronstable is stateless by default: absent this section everything stays in
 memory exactly as before. The store is a directory of immutable JSON records
 behind a single filesystem backend -- a local path gives single-node
 durability, while a shared Amazon EFS (NFSv4) / S3 Files mount gives the same
@@ -273,11 +273,11 @@ separate, client-local feature, unrelated to this store.)
 | `topology` | `Enum(["auto", "single-node", "shared"])` | `auto` | Whether the store may offer cross-node coordination. `auto` probes `/proc/mounts` for a shared network mount (NFS/EFS/S3 Files) and otherwise assumes `single-node`; Windows and macOS cannot probe, so there `auto` resolves to `single-node` unless overridden with `shared`. |
 | `deploymentId` | `Str` | none (namespace `default`) | Stable namespace prefix so several deployments can share one store/bucket without colliding or cross-reading. Unset means the `default` namespace. |
 | `maxRunsPerJob` | `Int` | `1000` | Durable finished-run retention per job (the durable analogue of the in-memory history ring); the ledger is pruned to this after each append. `<= 0` disables pruning (unbounded; rely on an external lifecycle rule). Durable retention is larger than the in-memory window on purpose. |
-| `onStoreUnavailable` | `Enum(["degrade", "fail-closed"])` | `degrade` | What the stateful features do while the store is configured but unavailable (down, unreadable, hung). `degrade`: durable-truth gates fail open to the in-memory state and failed writes are dropped with a warning (counted in `yacron2_state_dropped_writes_total`). `fail-closed`: prefer not running over possibly running wrong -- the `onlyIfLastSucceeded` gate blocks, a due durable retry defers until the store answers, and an unverifiable `@reboot` boot marker skips the boot run. Plain scheduled fires are **never** gated on the store under either policy. |
+| `onStoreUnavailable` | `Enum(["degrade", "fail-closed"])` | `degrade` | What the stateful features do while the store is configured but unavailable (down, unreadable, hung). `degrade`: durable-truth gates fail open to the in-memory state and failed writes are dropped with a warning (counted in `cronstable_state_dropped_writes_total`). `fail-closed`: prefer not running over possibly running wrong -- the `onlyIfLastSucceeded` gate blocks, a due durable retry defers until the store answers, and an unverifiable `@reboot` boot marker skips the boot run. Plain scheduled fires are **never** gated on the store under either policy. |
 | `gcGraceSeconds` | `Int` | `604800` (7 days) | Age past which durable state belonging to a job that no recent manifest references (no node's loaded config under this `deploymentId` has mentioned it for this long) is garbage collected. `<= 0` disables automatic GC. Values between `1` and `86399` are a `ConfigError` at load: a grace below the manifest cadence would make live peers' manifests look stale and collect their state. |
 | `maxOpsPerSecond` | `Int` or `Float` | `0` | Token-bucket cap on store operations per second (burst of one second's tokens), for request-rate/cost control on mounts that bill per request; throttled ops queue and are counted. `0` disables throttling. Must be `>= 0` (a negative value is a `ConfigError` at load). Lease (coordination) operations bypass the bucket: a lease renew queued behind bulk writes could overshoot its TTL and double-run the very job the lease exists to fence. |
 | `slotTtlSeconds` | `Int` or `Float` | `30` | TTL, in seconds, of the per-job concurrency slot lease taken for `concurrencyScope: cluster` jobs; the running holder renews it at a third of this, and a crashed holder's slot frees itself after at most this long. Must be `>= 5` (a `ConfigError` at load, `state.slotTtlSeconds must be >= 5`): the renew cadence needs headroom, and below ~5s one slow renew on a network mount expires a healthy holder's slot and invites the cross-node double-run the lease exists to fence. |
-| `jobApi` | `Map` | *(see below)* | The [job-facing state endpoint](Durable-State#job-facing-state): a loopback HTTP server the daemon injects into every job's environment, backing the `yacron2 state\|cursor\|lock\|artifact\|idempotent\|secret` commands. A nested block (merged over its defaults, so a partial block keeps the rest). |
+| `jobApi` | `Map` | *(see below)* | The [job-facing state endpoint](Durable-State#job-facing-state): a loopback HTTP server the daemon injects into every job's environment, backing the `cronstable state\|cursor\|lock\|artifact\|idempotent\|secret` commands. A nested block (merged over its defaults, so a partial block keeps the rest). |
 
 The `state.jobApi` sub-keys:
 
@@ -293,7 +293,7 @@ The `state.jobApi` sub-keys:
 `path` is the only required key. Full behavior -- the store layout and
 durability model, restart-surviving retries, missed-run catch-up, `@reboot`
 dedupe, the SLA trends endpoint, garbage collection, the state metrics, and
-the `yacron2 state` CLI subcommands (backup, restore, migrate, gc, check,
+the `cronstable state` CLI subcommands (backup, restore, migrate, gc, check,
 migrate-schema) --
 is documented in [Durable State](Durable-State). The per-job knobs that build
 on this store are under [Durable state and catch-up](#durable-state-and-catch-up)
@@ -374,8 +374,8 @@ in a `defaults` block (only the common keys are).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `captureStdout` | `Bool` | `false` | Capture the process's stdout for failure detection and reports. When false, the job's stdout passes through to yacron2's stdout. |
-| `captureStderr` | `Bool` | `true` | Capture the process's stderr for failure detection and reports. When false, the job's stderr passes through to yacron2's stderr. |
+| `captureStdout` | `Bool` | `false` | Capture the process's stdout for failure detection and reports. When false, the job's stdout passes through to cronstable's stdout. |
+| `captureStderr` | `Bool` | `true` | Capture the process's stderr for failure detection and reports. When false, the job's stderr passes through to cronstable's stderr. |
 | `saveLimit` | `Int` | `4096` | Maximum number of captured lines retained per stream (split into the first half and the last half; lines in between are discarded and counted). `0` disables retention. |
 | `maxLineLength` | `Int` | `16777216` (16 MiB) | Maximum bytes buffered per line by the stream reader. A longer line is skipped with a warning. |
 | `streamPrefix` | `Str` | `[{job_name} {stream_name}] ` | Format string prefixed to every emitted output line. Supports `{job_name}` and `{stream_name}` placeholders; set to `""` to disable. |
@@ -397,7 +397,7 @@ See [Schedules and Timezones](Schedules-and-Timezones).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `concurrencyPolicy` | `Enum(["Allow", "Forbid", "Replace"])` | `Allow` | Behavior when a scheduled run overlaps a still-running instance. `Allow`: run concurrently. `Forbid`: skip the new run. `Replace`: cancel the running instance and start the new one. |
-| `concurrencyScope` | `Enum(["node", "cluster"])` | `node` | How far `concurrencyPolicy` reaches. `node` (default): an overlap is another instance in this yacron2 process, exactly as before. `cluster`: `Forbid`/`Replace` also exclude instances of the job on other nodes sharing the [`state`](#state) store, via a per-job TTL slot lease (`slots/<job name>`) in the state store -- it works with or without a `cluster` section. Requires a `state` section somewhere in the assembled config: without one, load fails with a `ConfigError` naming the offending job(s). `cluster` with `concurrencyPolicy: Allow` is likewise a `ConfigError` at load (Allow places no bound on concurrent instances, so widening its scope gates nothing). Enforcement is best-effort at-least-once, not exactly-once; `state.slotTtlSeconds` and `state.onStoreUnavailable` govern the edges. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation) **only when set to `cluster`** (existing configs keep their digests; replicas disagreeing on it show as drift). See [Concurrency and Timeouts](Concurrency-and-Timeouts#concurrency-across-a-cluster). |
+| `concurrencyScope` | `Enum(["node", "cluster"])` | `node` | How far `concurrencyPolicy` reaches. `node` (default): an overlap is another instance in this cronstable process, exactly as before. `cluster`: `Forbid`/`Replace` also exclude instances of the job on other nodes sharing the [`state`](#state) store, via a per-job TTL slot lease (`slots/<job name>`) in the state store -- it works with or without a `cluster` section. Requires a `state` section somewhere in the assembled config: without one, load fails with a `ConfigError` naming the offending job(s). `cluster` with `concurrencyPolicy: Allow` is likewise a `ConfigError` at load (Allow places no bound on concurrent instances, so widening its scope gates nothing). Enforcement is best-effort at-least-once, not exactly-once; `state.slotTtlSeconds` and `state.onStoreUnavailable` govern the edges. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation) **only when set to `cluster`** (existing configs keep their digests; replicas disagreeing on it show as drift). See [Concurrency and Timeouts](Concurrency-and-Timeouts#concurrency-across-a-cluster). |
 | `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
 | `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). |
 | `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals, so both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). |
@@ -473,7 +473,7 @@ their schema and `_REPORT_DEFAULTS` are summarized here.
 | `password` | `Map` with `value`/`fromFile`/`fromEnvVar` (each `EmptyNone() \| Str`) | all `None` | SMTP login password source. |
 | `tls` | `Bool` | `false` | Use implicit TLS. |
 | `starttls` | `Bool` | `false` | Use STARTTLS. |
-| `validate_certs` | `Bool` | `true` | Validate TLS certificates. Defaults to `true` in yacron2 (a breaking change from upstream). |
+| `validate_certs` | `Bool` | `true` | Validate TLS certificates. Defaults to `true` in cronstable (a breaking change from upstream). |
 | `html` | `Bool` | `false` | Send the body as HTML. |
 
 #### `report.sentry`
@@ -483,7 +483,7 @@ Defaults from `_REPORT_DEFAULTS["sentry"]`:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `dsn` | `Map` with `value`/`fromFile`/`fromEnvVar` (each `EmptyNone() \| Str`) | all `None` | Sentry DSN source. |
-| `fingerprint` | `Seq(Str)` | `["yacron2", "{{ environment.HOSTNAME }}", "{{ name }}"]` | Issue-grouping fingerprint (jinja2 per entry). Replaces, never appends, on merge. |
+| `fingerprint` | `Seq(Str)` | `["cronstable", "{{ environment.HOSTNAME }}", "{{ name }}"]` | Issue-grouping fingerprint (jinja2 per entry). Replaces, never appends, on merge. |
 | `level` | `Str` | unset (effective `error`) | Sentry event level. When unset, events are captured at level `error`. |
 | `extra` | `MapPattern(Str, Str \| Int \| Bool)` | unset | Extra structured context. |
 | `body` | `Str` | default subject + body templates | Event message (jinja2). |
@@ -495,7 +495,7 @@ Defaults from `_REPORT_DEFAULTS["sentry"]`:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used to run the reporter command. The default is platform-specific, same as the per-job `shell` field: on Windows the default is empty (the reporter command runs via cmd.exe through `%ComSpec%`). Set `shell:` explicitly for another interpreter, or pass `command` as a list. See [Running on Windows](Running-on-Windows). |
-| `command` | `Str` or `Seq(Str)` | `None` | Reporter command (required key). Receives `YACRON2_*` environment variables. |
+| `command` | `Str` or `Seq(Str)` | `None` | Reporter command (required key). Receives `CRONSTABLE_*` environment variables. |
 
 #### `report.webhook`
 
@@ -534,8 +534,8 @@ in-memory history alone (the gate then resets on restart). See
 | --- | --- | --- | --- |
 | `environment` | `Seq(Map({"key": Str, "value": Str}))` | `[]` | Environment variables set for the process. Both `key` and `value` are required per entry. Merged by key with `defaults` and with `env_file` (config values win). |
 | `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
-| `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and exactly one source (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). The job reads one with `yacron2 secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
-| `stateAllowedScopes` | `Seq(Str)` | `[]` | Extra scope names (besides the job's own name and `global`) this job's `yacron2 state\|cursor\|lock\|artifact` calls may explicitly name via `--scope`. Naming any other scope -- most dangerously another job's own name, which IS that job's private scope -- is refused (`403`). See [Scopes](Durable-State#scopes). |
+| `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and exactly one source (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). The job reads one with `cronstable secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
+| `stateAllowedScopes` | `Seq(Str)` | `[]` | Extra scope names (besides the job's own name and `global`) this job's `cronstable state\|cursor\|lock\|artifact` calls may explicitly name via `--scope`. Naming any other scope -- most dangerously another job's own name, which IS that job's private scope -- is refused (`403`). See [Scopes](Durable-State#scopes). |
 
 ```yaml
 jobs:
@@ -558,7 +558,7 @@ See [Commands and Environment](Commands-and-Environment).
 | `group` | `Str` or `Int` | none | Group name or numeric gid the process runs as. If only `user` is set, the group defaults to that user's primary group. An unknown name raises a `ConfigError`. |
 
 This section is POSIX-only (the setuid/setgid model). On POSIX, setting `user`
-or `group` requires yacron2 to run as root (euid 0); otherwise a `ConfigError`
+or `group` requires cronstable to run as root (euid 0); otherwise a `ConfigError`
 is raised. Privilege switching is **not supported on Windows**: a job with
 `user` or `group` set raises a configuration error, verbatim
 `Job <name>: changing user/group is not supported on Windows`. See
@@ -585,7 +585,7 @@ appears in the dashboard run history and stats, in the durable run record's
 `resources` object (so it survives a restart), and as the metrics listed in
 [Metrics with Prometheus](Metrics-with-Prometheus). Report templates and the
 shell reporter also receive `cpu_seconds` / `max_rss_bytes`
-(`YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES`).
+(`CRONSTABLE_CPU_SECONDS` / `CRONSTABLE_MAX_RSS_BYTES`).
 
 DAG tasks accept `monitorResources` too, but surface the result differently:
 a finished task instance's usage is recorded in the `resources` object of its
@@ -634,7 +634,7 @@ background node sampler entirely.
 strictyaml enforces only the type (`Int`/`Float`). After type validation,
 `JobConfig._validate_numeric_ranges` enforces value ranges (plus one
 cross-field rule) and raises a `ConfigError` (prefixed `Job <name>:`) on
-violation. These checks run at load time, not at run time. New in the yacron2
+violation. These checks run at load time, not at run time. New in the cronstable
 fork.
 
 | Rule | Condition |

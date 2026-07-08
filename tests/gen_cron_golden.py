@@ -1,6 +1,6 @@
 """Regenerate the cron-expression golden vectors (tests/data/cron_golden.json).
 
-yacron2's in-house cron engine (:mod:`yacron2.cronexpr`) replaced the
+cronstable's in-house cron engine (:mod:`cronstable.cronexpr`) replaced the
 third-party ``crontab`` (parse-crontab) dependency.  Its compatibility is
 proven by replaying the vectors this script generates: for every expression
 in the corpus it records what the OLD library did (parse ok/error,
@@ -10,7 +10,7 @@ exactly the same.  The vectors are committed, so neither CI nor the install
 needs the old package; this script is only for regenerating or extending
 them.
 
-Usage (needs the old library, which is NOT a yacron2 dependency anymore)::
+Usage (needs the old library, which is NOT a cronstable dependency anymore)::
 
     pip install "crontab>=1,<2"
     python tests/gen_cron_golden.py

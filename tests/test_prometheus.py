@@ -1,4 +1,4 @@
-"""Tests for the native Prometheus metrics endpoint (yacron2.prometheus).
+"""Tests for the native Prometheus metrics endpoint (cronstable.prometheus).
 
 Three tiers, mirroring the web-API tests in test_cron.py: pure unit tests
 for the exposition renderer and the accumulator registry, direct handler
@@ -11,11 +11,11 @@ import math
 
 import pytest
 
-import yacron2.cron
+import cronstable.cron
 from tests._commands import cmd_print, cmd_sleep, yaml_command
-from yacron2.cron import Cron, JobRunInfo
-from yacron2.job import JobOutputStream
-from yacron2.prometheus import (
+from cronstable.cron import Cron, JobRunInfo
+from cronstable.job import JobOutputStream
+from cronstable.prometheus import (
     CONTENT_TYPE_OPENMETRICS,
     CONTENT_TYPE_TEXT,
     DEFAULT_DURATION_BUCKETS,
@@ -175,45 +175,45 @@ def test_registry_counts_runs_and_outcome_timestamps():
     metrics.job_run_recorded("j", "cancelled", None)
     text = _registry_text(metrics)
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="j", status="success"
+        text, "cronstable_job_runs_total", job_name="j", status="success"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="j", status="failure"
+        text, "cronstable_job_runs_total", job_name="j", status="failure"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="j", status="cancelled"
+        text, "cronstable_job_runs_total", job_name="j", status="cancelled"
     ) == 1
     # both last-outcome timestamps were stamped
     assert sample_value(
-        text, "yacron2_job_last_success_timestamp_seconds", job_name="j"
+        text, "cronstable_job_last_success_timestamp_seconds", job_name="j"
     ) is not None
     assert sample_value(
-        text, "yacron2_job_last_failure_timestamp_seconds", job_name="j"
+        text, "cronstable_job_last_failure_timestamp_seconds", job_name="j"
     ) is not None
     # histogram: 2.0 lands in le=5.0 and later, 400.0 only from le=900;
     # the cancelled run carried no duration.
     assert sample_value(
-        text, "yacron2_job_duration_seconds_bucket", job_name="j", le="1.0"
+        text, "cronstable_job_duration_seconds_bucket", job_name="j", le="1.0"
     ) == 0
     assert sample_value(
-        text, "yacron2_job_duration_seconds_bucket", job_name="j", le="5.0"
+        text, "cronstable_job_duration_seconds_bucket", job_name="j", le="5.0"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_duration_seconds_bucket", job_name="j", le="900.0"
+        text, "cronstable_job_duration_seconds_bucket", job_name="j", le="900.0"
     ) == 2
     assert sample_value(
-        text, "yacron2_job_duration_seconds_bucket", job_name="j", le="+Inf"
+        text, "cronstable_job_duration_seconds_bucket", job_name="j", le="+Inf"
     ) == 2
     assert sample_value(
-        text, "yacron2_job_duration_seconds_sum", job_name="j"
+        text, "cronstable_job_duration_seconds_sum", job_name="j"
     ) == 402.0
     assert sample_value(
-        text, "yacron2_job_duration_seconds_count", job_name="j"
+        text, "cronstable_job_duration_seconds_count", job_name="j"
     ) == 2
 
 
 def test_registry_accumulates_cpu_and_peak_rss():
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     metrics = PrometheusMetrics()
     metrics.job_run_recorded(
@@ -225,14 +225,14 @@ def test_registry_accumulates_cpu_and_peak_rss():
     text = _registry_text(metrics)
     # user/system CPU accumulate as a per-mode counter
     assert sample_value(
-        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+        text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
     ) == 3.0
     assert sample_value(
-        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="system"
+        text, "cronstable_job_cpu_seconds_total", job_name="j", mode="system"
     ) == 1.5
     # peak RSS is a high-water mark across runs, not a sum
     assert sample_value(
-        text, "yacron2_job_peak_rss_bytes", job_name="j"
+        text, "cronstable_job_peak_rss_bytes", job_name="j"
     ) == 4000
 
 
@@ -242,15 +242,15 @@ def test_registry_cpu_absent_for_unmonitored_job():
     text = _registry_text(metrics)
     # an unmonitored job exports no CPU counter / peak-RSS gauge at all
     assert sample_value(
-        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+        text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
     ) is None
     assert sample_value(
-        text, "yacron2_job_peak_rss_bytes", job_name="j"
+        text, "cronstable_job_peak_rss_bytes", job_name="j"
     ) is None
 
 
 def test_counter_snapshot_round_trip_seeds_cpu():
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     metrics = PrometheusMetrics()
     metrics.job_run_recorded(
@@ -263,15 +263,15 @@ def test_counter_snapshot_round_trip_seeds_cpu():
     assert seeded == 1
     text = _registry_text(restored)
     assert sample_value(
-        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+        text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
     ) == 1.0
     assert sample_value(
-        text, "yacron2_job_peak_rss_bytes", job_name="j"
+        text, "cronstable_job_peak_rss_bytes", job_name="j"
     ) == 8000
 
 
 def test_seed_counters_skips_corrupt_cpu_sums():
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     def snapshot_with(value):
         return {
@@ -289,10 +289,10 @@ def test_seed_counters_skips_corrupt_cpu_sums():
         metrics.seed_counters(snapshot_with(bad), keep=["j"])
         text = _registry_text(metrics)
         assert sample_value(
-            text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+            text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
         ) == 1.0
         assert sample_value(
-            text, "yacron2_job_cpu_seconds_total", job_name="j", mode="system"
+            text, "cronstable_job_cpu_seconds_total", job_name="j", mode="system"
         ) == 0.5
 
     # a normal positive value still seeds (added to the live accumulator)
@@ -303,10 +303,10 @@ def test_seed_counters_skips_corrupt_cpu_sums():
     metrics.seed_counters(snapshot_with(2.5), keep=["j"])
     text = _registry_text(metrics)
     assert sample_value(
-        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="user"
+        text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
     ) == 3.5
     assert sample_value(
-        text, "yacron2_job_cpu_seconds_total", job_name="j", mode="system"
+        text, "cronstable_job_cpu_seconds_total", job_name="j", mode="system"
     ) == 3.0
 
 
@@ -327,21 +327,21 @@ def test_registry_bucket_change_resets_histograms_not_counters():
     text = _registry_text(metrics)
     # the histogram restarted under the new bounds...
     assert sample_value(
-        text, "yacron2_job_duration_seconds_count", job_name="j"
+        text, "cronstable_job_duration_seconds_count", job_name="j"
     ) == 0
     assert sample_value(
-        text, "yacron2_job_duration_seconds_bucket", job_name="j", le="10.0"
+        text, "cronstable_job_duration_seconds_bucket", job_name="j", le="10.0"
     ) == 0
     # ...but the outcome counter kept its value
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="j", status="success"
+        text, "cronstable_job_runs_total", job_name="j", status="success"
     ) == 1
     # setting the same buckets again is a no-op (no reset)
     metrics.job_run_recorded("j", "success", 0.5)
     metrics.set_duration_buckets((1.0, 10.0))
     text = _registry_text(metrics)
     assert sample_value(
-        text, "yacron2_job_duration_seconds_count", job_name="j"
+        text, "cronstable_job_duration_seconds_count", job_name="j"
     ) == 1
 
 
@@ -353,11 +353,11 @@ def test_registry_failure_counters():
     metrics.job_permanent_failure("j")
     text = _registry_text(metrics)
     assert sample_value(
-        text, "yacron2_job_start_failures_total", job_name="j"
+        text, "cronstable_job_start_failures_total", job_name="j"
     ) == 1
-    assert sample_value(text, "yacron2_job_retries_total", job_name="j") == 2
+    assert sample_value(text, "cronstable_job_retries_total", job_name="j") == 2
     assert sample_value(
-        text, "yacron2_job_permanent_failures_total", job_name="j"
+        text, "cronstable_job_permanent_failures_total", job_name="j"
     ) == 1
 
 
@@ -365,20 +365,20 @@ def test_registry_config_parse_tracking():
     metrics = PrometheusMetrics()
     # before any parse, neither config family is emitted
     text = _registry_text(metrics)
-    assert "yacron2_config_last_reload_successful" not in text
+    assert "cronstable_config_last_reload_successful" not in text
     metrics.config_parse(True)
     text = _registry_text(metrics)
-    assert sample_value(text, "yacron2_config_last_reload_successful") == 1
+    assert sample_value(text, "cronstable_config_last_reload_successful") == 1
     ok_time = sample_value(
-        text, "yacron2_config_last_reload_success_timestamp_seconds"
+        text, "cronstable_config_last_reload_success_timestamp_seconds"
     )
     assert ok_time is not None
     metrics.config_parse(False)
     text = _registry_text(metrics)
-    assert sample_value(text, "yacron2_config_last_reload_successful") == 0
+    assert sample_value(text, "cronstable_config_last_reload_successful") == 0
     # the success timestamp still reports the last GOOD parse
     assert sample_value(
-        text, "yacron2_config_last_reload_success_timestamp_seconds"
+        text, "cronstable_config_last_reload_success_timestamp_seconds"
     ) == ok_time
 
 
@@ -428,43 +428,43 @@ async def test_web_metrics_handler_reports_job_state():
     resp = await cron._web_metrics(FakeRequest())
     assert resp.headers["Content-Type"] == CONTENT_TYPE_TEXT
     text = resp.body.decode("utf-8")
-    assert sample_value(text, "yacron2_jobs", state="enabled") == 1
-    assert sample_value(text, "yacron2_jobs", state="disabled") == 1
-    assert sample_value(text, "yacron2_job_enabled", job_name="alpha") == 1
-    assert sample_value(text, "yacron2_job_enabled", job_name="beta") == 0
-    assert sample_value(text, "yacron2_job_running", job_name="alpha") == 0
+    assert sample_value(text, "cronstable_jobs", state="enabled") == 1
+    assert sample_value(text, "cronstable_jobs", state="disabled") == 1
+    assert sample_value(text, "cronstable_job_enabled", job_name="alpha") == 1
+    assert sample_value(text, "cronstable_job_enabled", job_name="beta") == 0
+    assert sample_value(text, "cronstable_job_running", job_name="alpha") == 0
     # a cron schedule gets a next-run timestamp; @reboot/disabled does not
     assert sample_value(
-        text, "yacron2_job_next_run_timestamp_seconds", job_name="alpha"
+        text, "cronstable_job_next_run_timestamp_seconds", job_name="alpha"
     ) is not None
     assert sample_value(
-        text, "yacron2_job_next_run_timestamp_seconds", job_name="beta"
+        text, "cronstable_job_next_run_timestamp_seconds", job_name="beta"
     ) is None
     # the recorded run feeds both the counters and the last-run gauges
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="alpha", status="failure"
+        text, "cronstable_job_runs_total", job_name="alpha", status="failure"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_last_run_success", job_name="alpha"
+        text, "cronstable_job_last_run_success", job_name="alpha"
     ) == 0
     assert sample_value(
-        text, "yacron2_job_last_run_exit_code", job_name="alpha"
+        text, "cronstable_job_last_run_exit_code", job_name="alpha"
     ) == 3
     assert sample_value(
-        text, "yacron2_job_last_run_duration_seconds", job_name="alpha"
+        text, "cronstable_job_last_run_duration_seconds", job_name="alpha"
     ) == 7
     assert sample_value(
         text,
-        "yacron2_job_info",
+        "cronstable_job_info",
         job_name="alpha",
         schedule="*/5 * * * *",
         cluster_policy="Leader",
     ) == 1
     # build info and job-set fingerprint are present
-    assert "yacron2_info{version=" in text
-    assert 'yacron2_job_set_info{job_set_id="v1:' in text
+    assert "cronstable_info{version=" in text
+    assert 'cronstable_job_set_info{job_set_id="v1:' in text
     # no cluster configured
-    assert sample_value(text, "yacron2_cluster_enabled") == 0
+    assert sample_value(text, "cronstable_cluster_enabled") == 0
 
 
 _NEXT_RUN_GATE = """
@@ -491,13 +491,13 @@ async def test_next_run_gate_checks_enabled_and_schedule_independently():
     cron = Cron(None, config_yaml=_NEXT_RUN_GATE)
     text = cron.metrics.render(cron)
     assert sample_value(
-        text, "yacron2_job_next_run_timestamp_seconds", job_name="cron-on"
+        text, "cronstable_job_next_run_timestamp_seconds", job_name="cron-on"
     ) is not None
     assert sample_value(
-        text, "yacron2_job_next_run_timestamp_seconds", job_name="cron-off"
+        text, "cronstable_job_next_run_timestamp_seconds", job_name="cron-off"
     ) is None
     assert sample_value(
-        text, "yacron2_job_next_run_timestamp_seconds", job_name="boot-on"
+        text, "cronstable_job_next_run_timestamp_seconds", job_name="boot-on"
     ) is None
 
 
@@ -518,14 +518,14 @@ async def test_next_run_reads_seeded_next_fire_index():
     text = cron.metrics.render(cron)
     assert (
         sample_value(
-            text, "yacron2_job_next_run_timestamp_seconds", job_name="cron-on"
+            text, "cronstable_job_next_run_timestamp_seconds", job_name="cron-on"
         )
         == when.timestamp()
     )
     # a disabled job never enters the index, so it still gets no sample even
     # when an enabled sibling is served from it.
     assert sample_value(
-        text, "yacron2_job_next_run_timestamp_seconds", job_name="cron-off"
+        text, "cronstable_job_next_run_timestamp_seconds", job_name="cron-off"
     ) is None
 
 
@@ -540,7 +540,7 @@ async def test_web_metrics_handler_openmetrics_negotiation():
     )
     assert resp.headers["Content-Type"] == CONTENT_TYPE_OPENMETRICS
     text = resp.body.decode("utf-8")
-    assert "# TYPE yacron2_job_runs counter" in text
+    assert "# TYPE cronstable_job_runs counter" in text
     assert text.endswith("# EOF\n")
 
 
@@ -600,26 +600,26 @@ async def test_metrics_after_successful_and_failed_runs():
     await _run_to_completion(cron, "bad")
     text = cron.metrics.render(cron)
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="ok", status="success"
+        text, "cronstable_job_runs_total", job_name="ok", status="success"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="bad", status="failure"
+        text, "cronstable_job_runs_total", job_name="bad", status="failure"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_last_run_success", job_name="ok"
+        text, "cronstable_job_last_run_success", job_name="ok"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_last_run_exit_code", job_name="bad"
+        text, "cronstable_job_last_run_exit_code", job_name="bad"
     ) == 3
     assert sample_value(
-        text, "yacron2_job_duration_seconds_count", job_name="ok"
+        text, "cronstable_job_duration_seconds_count", job_name="ok"
     ) == 1
     # no retries were configured, so the failure is immediately permanent
     assert sample_value(
-        text, "yacron2_job_permanent_failures_total", job_name="bad"
+        text, "cronstable_job_permanent_failures_total", job_name="bad"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_permanent_failures_total", job_name="ok"
+        text, "cronstable_job_permanent_failures_total", job_name="ok"
     ) == 0
 
 
@@ -648,14 +648,14 @@ async def test_metrics_count_retries_and_permanent_failure():
     await _run_to_completion(cron, "flaky")
     text = cron.metrics.render(cron)
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="flaky", status="failure"
+        text, "cronstable_job_runs_total", job_name="flaky", status="failure"
     ) == 2
     assert sample_value(
-        text, "yacron2_job_retries_total", job_name="flaky"
+        text, "cronstable_job_retries_total", job_name="flaky"
     ) == 1
     # retries exhausted -> exactly one permanent failure
     assert sample_value(
-        text, "yacron2_job_permanent_failures_total", job_name="flaky"
+        text, "cronstable_job_permanent_failures_total", job_name="flaky"
     ) == 1
 
 
@@ -673,13 +673,13 @@ async def test_metrics_count_start_failures():
     await _run_to_completion(cron, "ghost")
     text = cron.metrics.render(cron)
     assert sample_value(
-        text, "yacron2_job_start_failures_total", job_name="ghost"
+        text, "cronstable_job_start_failures_total", job_name="ghost"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="ghost", status="failure"
+        text, "cronstable_job_runs_total", job_name="ghost", status="failure"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_last_run_exit_code", job_name="ghost"
+        text, "cronstable_job_last_run_exit_code", job_name="ghost"
     ) == 127
 
 
@@ -702,10 +702,10 @@ async def test_metrics_count_cancelled_runs():
     await cron._handle_finished_job(running_job)
     text = cron.metrics.render(cron)
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="slow", status="cancelled"
+        text, "cronstable_job_runs_total", job_name="slow", status="cancelled"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_last_run_success", job_name="slow"
+        text, "cronstable_job_last_run_success", job_name="slow"
     ) == 0
 
 
@@ -736,7 +736,7 @@ async def test_retry_swallowed_by_forbid_is_not_counted():
         await cron.schedule_retry_job("busy", 0, 1)
         text = cron.metrics.render(cron)
         assert sample_value(
-            text, "yacron2_job_retries_total", job_name="busy"
+            text, "cronstable_job_retries_total", job_name="busy"
         ) == 0
     finally:
         running_job.cancelled = True
@@ -806,32 +806,32 @@ async def test_cluster_metrics_from_manager_view():
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.cluster_manager = FakeManager()
     text = cron.metrics.render(cron)
-    assert sample_value(text, "yacron2_cluster_enabled") == 1
+    assert sample_value(text, "cronstable_cluster_enabled") == 1
     assert sample_value(
         text,
-        "yacron2_cluster_info",
+        "cronstable_cluster_info",
         backend="gossip",
         node_name="n1",
         distribution="single-leader",
     ) == 1
-    assert sample_value(text, "yacron2_cluster_size") == 3
-    assert sample_value(text, "yacron2_cluster_quorum") == 2
-    assert sample_value(text, "yacron2_cluster_quorate") == 1
-    assert sample_value(text, "yacron2_cluster_is_leader") == 1
-    assert sample_value(text, "yacron2_cluster_leader_info", leader="n1") == 1
-    assert sample_value(text, "yacron2_cluster_conflict", kind="nodename") == 0
-    assert sample_value(text, "yacron2_cluster_conflict", kind="policy") == 1
-    assert sample_value(text, "yacron2_cluster_peers", status="agreed") == 2
+    assert sample_value(text, "cronstable_cluster_size") == 3
+    assert sample_value(text, "cronstable_cluster_quorum") == 2
+    assert sample_value(text, "cronstable_cluster_quorate") == 1
+    assert sample_value(text, "cronstable_cluster_is_leader") == 1
+    assert sample_value(text, "cronstable_cluster_leader_info", leader="n1") == 1
+    assert sample_value(text, "cronstable_cluster_conflict", kind="nodename") == 0
+    assert sample_value(text, "cronstable_cluster_conflict", kind="policy") == 1
+    assert sample_value(text, "cronstable_cluster_peers", status="agreed") == 2
     assert sample_value(
-        text, "yacron2_cluster_peers", status="unreachable"
+        text, "cronstable_cluster_peers", status="unreachable"
     ) == 1
     # zero-filled for statuses with no peer, so alert series never vanish
-    assert sample_value(text, "yacron2_cluster_peers", status="drifted") == 0
+    assert sample_value(text, "cronstable_cluster_peers", status="drifted") == 0
     # observe-only cluster (electLeader off): the transition counters are
     # omitted rather than exposed permanently frozen at zero while the
     # quorate gauge visibly changes
-    assert "yacron2_cluster_leader_transitions_total" not in text
-    assert "yacron2_cluster_quorum_transitions_total" not in text
+    assert "cronstable_cluster_leader_transitions_total" not in text
+    assert "cronstable_cluster_quorum_transitions_total" not in text
 
 
 @pytest.mark.asyncio
@@ -845,9 +845,9 @@ async def test_cluster_metrics_survive_backend_error():
     text = cron.metrics.render(cron)
     # job metrics still render; the cluster block degrades to the enabled
     # gauge instead of failing the whole scrape
-    assert sample_value(text, "yacron2_cluster_enabled") == 1
-    assert "yacron2_cluster_info" not in text
-    assert 'yacron2_job_enabled{job_name="alpha"}' in text
+    assert sample_value(text, "cronstable_cluster_enabled") == 1
+    assert "cronstable_cluster_info" not in text
+    assert 'cronstable_job_enabled{job_name="alpha"}' in text
 
 
 @pytest.mark.asyncio
@@ -862,10 +862,10 @@ async def test_cluster_transition_counters():
     cron._log_cluster_role()  # leadership flips off, quorum unchanged
     text = cron.metrics.render(cron)
     assert sample_value(
-        text, "yacron2_cluster_leader_transitions_total"
+        text, "cronstable_cluster_leader_transitions_total"
     ) == 2
     assert sample_value(
-        text, "yacron2_cluster_quorum_transitions_total"
+        text, "cronstable_cluster_quorum_transitions_total"
     ) == 1
 
 
@@ -888,7 +888,7 @@ async def test_web_metrics_served_by_default():
                 assert resp.status == 200
                 assert resp.headers["Content-Type"] == CONTENT_TYPE_TEXT
                 text = await resp.text()
-                assert "yacron2_info{version=" in text
+                assert "cronstable_info{version=" in text
             # a Prometheus scraper advertising OpenMetrics gets it
             async with session.get(
                 base + "/metrics",
@@ -1060,10 +1060,10 @@ async def test_web_metrics_bucket_change_applies_on_web_restart():
         assert 'le="30.0"' in text
         assert 'le="300.0"' not in text
         assert sample_value(
-            text, "yacron2_job_duration_seconds_count", job_name="alpha"
+            text, "cronstable_job_duration_seconds_count", job_name="alpha"
         ) == 0
         assert sample_value(
-            text, "yacron2_job_runs_total", job_name="alpha",
+            text, "cronstable_job_runs_total", job_name="alpha",
             status="success",
         ) == 1
     finally:
@@ -1087,13 +1087,13 @@ def test_update_config_records_reload_outcome(tmp_path):
     cfg.write_text(_GOOD_FILE, encoding="utf-8")
     cron = Cron(str(cfg))
     text = cron.metrics.render(cron)
-    assert sample_value(text, "yacron2_config_last_reload_successful") == 1
+    assert sample_value(text, "cronstable_config_last_reload_successful") == 1
     # break the file: the reload fails and the gauge flips to 0
     cfg.write_text("jobs: [", encoding="utf-8")
-    with pytest.raises(yacron2.cron.ConfigError):
+    with pytest.raises(cronstable.cron.ConfigError):
         cron.update_config()
     text = cron.metrics.render(cron)
-    assert sample_value(text, "yacron2_config_last_reload_successful") == 0
+    assert sample_value(text, "cronstable_config_last_reload_successful") == 0
 
 
 def test_update_config_prunes_removed_jobs(tmp_path):
@@ -1135,7 +1135,7 @@ async def test_prune_spares_still_running_removed_job(tmp_path):
     cron.update_config()
     text = cron.metrics.render(cron)
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="doomed", status="success"
+        text, "cronstable_job_runs_total", job_name="doomed", status="success"
     ) == 1
     # the run finishes onto the surviving accumulator, not a fresh one
     running_job.cancelled = True
@@ -1144,10 +1144,10 @@ async def test_prune_spares_still_running_removed_job(tmp_path):
     await cron._handle_finished_job(running_job)
     text = cron.metrics.render(cron)
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="doomed", status="success"
+        text, "cronstable_job_runs_total", job_name="doomed", status="success"
     ) == 1
     assert sample_value(
-        text, "yacron2_job_runs_total", job_name="doomed", status="cancelled"
+        text, "cronstable_job_runs_total", job_name="doomed", status="cancelled"
     ) == 1
     # the next reload -- nothing running any more -- prunes it for good
     cron.update_config()

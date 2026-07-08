@@ -2,14 +2,14 @@ import re
 
 import pytest
 
-from yacron2.config import parse_config_string
-from yacron2.fingerprint import (
+from cronstable.config import parse_config_string
+from cronstable.fingerprint import (
     SCHEME_VERSION,
     canonical_job,
     job_digest,
     job_set_id,
 )
-from yacron2.platform import IS_WINDOWS
+from cronstable.platform import IS_WINDOWS
 
 
 def _jobs(yaml: str):

@@ -6,7 +6,7 @@ Two layers are exercised here:
   store (one file per key, atomic-rename rewrite under an advisory flock) and
   the content-addressed *blob* store -- driven straight against a real temp
   directory through :func:`tests.test_state._backend`;
-* the pure logic layer in :mod:`yacron2.jobstate` (KV, monotonic cursor,
+* the pure logic layer in :mod:`cronstable.jobstate` (KV, monotonic cursor,
   create-if-absent idempotency, named artifacts) over that backend.
 
 Style matches the other state test files: no frozen clock, bare ``async def``
@@ -19,10 +19,10 @@ import os
 import pytest
 
 from tests.test_state import _backend
-from yacron2 import jobstate, state
-from yacron2.config import ConfigError, parse_config, parse_config_string
-from yacron2.jobstate import JobStateError
-from yacron2.state import DOC_DELETE, DOC_KEEP
+from cronstable import jobstate, state
+from cronstable.config import ConfigError, parse_config, parse_config_string
+from cronstable.jobstate import JobStateError
+from cronstable.state import DOC_DELETE, DOC_KEEP
 
 
 def _cfg(yaml):

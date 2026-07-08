@@ -1,6 +1,6 @@
 # Metrics with statsd
 
-yacron2 can emit per-job lifecycle metrics to a [statsd](https://github.com/statsd/statsd) server over UDP. This page documents the `statsd` config block, the exact wire format yacron2 emits, and the delivery guarantees (best-effort, fire-and-forget, idempotent stop). statsd is the push-side metrics option; for pull-side scraping, yacron2 also serves a native [Prometheus endpoint](Metrics-with-Prometheus) on the web API, and both can be enabled at once.
+cronstable can emit per-job lifecycle metrics to a [statsd](https://github.com/statsd/statsd) server over UDP. This page documents the `statsd` config block, the exact wire format cronstable emits, and the delivery guarantees (best-effort, fire-and-forget, idempotent stop). statsd is the push-side metrics option; for pull-side scraping, cronstable also serves a native [Prometheus endpoint](Metrics-with-Prometheus) on the web API, and both can be enabled at once.
 
 ## Enabling statsd for a job
 
@@ -25,7 +25,7 @@ The schema for the block is `Map({"prefix": Str(), "host": Str(), "port": Int()}
 | --- | --- | --- | --- |
 | `host` | string | (required when `statsd` set) | Hostname or IP of the statsd server. Resolved per send; an unresolvable host produces a warning, not a crash (see [Best-effort delivery](#best-effort-delivery)). |
 | `port` | int | (required when `statsd` set) | UDP port of the statsd server (commonly `8125`). |
-| `prefix` | string | (required when `statsd` set) | Metric name prefix. Prepended verbatim to each metric name; no separator is added, so the prefix should not have a trailing dot (yacron2 inserts the `.` between the prefix and the metric suffix, e.g. `<prefix>.start`). |
+| `prefix` | string | (required when `statsd` set) | Metric name prefix. Prepended verbatim to each metric name; no separator is added, so the prefix should not have a trailing dot (cronstable inserts the `.` between the prefix and the metric suffix, e.g. `<prefix>.start`). |
 
 The whole `statsd` block defaults to absent (`None`); there is no partial default. If you set it, you must provide `host`, `port`, and `prefix`.
 
@@ -35,7 +35,7 @@ Metrics are encoded as UTF-8 statsd lines, one metric per line, terminated by a 
 
 ### On start
 
-When the subprocess has been launched, yacron2 records `time.perf_counter()` as the start time and sends a single datagram:
+When the subprocess has been launched, cronstable records `time.perf_counter()` as the start time and sends a single datagram:
 
 ```text
 <prefix>.start:1|g
@@ -47,7 +47,7 @@ The start metric is sent by `_on_start`, which runs only after the subprocess wa
 
 ### On stop
 
-When the job stops (normal exit, timeout, or cancellation), yacron2 computes the duration as `time.perf_counter() - start_time`, converts it to milliseconds with `int(round(duration_seconds * 1000))`, and sends a single datagram containing three metrics:
+When the job stops (normal exit, timeout, or cancellation), cronstable computes the duration as `time.perf_counter() - start_time`, converts it to milliseconds with `int(round(duration_seconds * 1000))`, and sends a single datagram containing three metrics:
 
 ```text
 <prefix>.stop:1|g
@@ -57,7 +57,7 @@ When the job stops (normal exit, timeout, or cancellation), yacron2 computes the
 
 - `<prefix>.stop:1|g`: gauge, always `1`.
 - `<prefix>.success:<1|0>|g`: gauge. `1` if the job did **not** fail, `0` if it failed. The value comes from `0 if job.failed else 1`, where `job.failed` is the [failure-detection](Failure-Detection-and-Retries) result (`failsWhen`). A nonzero exit code, output on a watched stream, or `failsWhen: always` therefore reports `success:0`.
-- `<prefix>.duration:<ms>|ms|@0.1`: timer (`|ms`) with a sample rate suffix of `@0.1`. The numeric value is the integer wall-clock duration in milliseconds, measured with `perf_counter` between start and stop. The `@0.1` sample-rate flag is sent literally on every datagram; yacron2 does not actually sample (it sends one duration per run), so the flag instructs the statsd server to scale the metric accordingly. Configure your statsd/dashboards to account for this.
+- `<prefix>.duration:<ms>|ms|@0.1`: timer (`|ms`) with a sample rate suffix of `@0.1`. The numeric value is the integer wall-clock duration in milliseconds, measured with `perf_counter` between start and stop. The `@0.1` sample-rate flag is sent literally on every datagram; cronstable does not actually sample (it sends one duration per run), so the flag instructs the statsd server to scale the metric accordingly. Configure your statsd/dashboards to account for this.
 
 When the job has [`monitorResources`](Configuration-Reference#metrics) on, the same stop datagram also carries the run's resource accounting:
 
@@ -101,7 +101,7 @@ This matters for `concurrencyPolicy: Replace`, where the scheduler may cancel a 
 
 ## Version notes
 
-- Sending job metrics to statsd was added in yacron 0.6.0 (inherited by yacron2; see `HISTORY.md`).
+- Sending job metrics to statsd was added in yacron 0.6.0 (inherited by cronstable; see `HISTORY.md`).
 - statsd reporting is strictly best-effort: a failure to send `job_started`/`job_stopped` (for example, an unresolvable statsd host) is logged as a warning instead of propagating out of job start/stop.
 - Job stop metrics are emitted exactly once per run; an idempotency guard on `_on_stop` prevents duplicate metrics when `cancel` races `wait` (e.g. `concurrencyPolicy=Replace`).
 - statsd UDP errors are logged with their detail (`UDP error received: %s`) rather than being dropped.

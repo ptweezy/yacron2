@@ -2,7 +2,7 @@
 #  Meridian grand tour — shared defaults + custom logging.
 #
 #  This file is pulled into platform.yaml with `include: [_defaults.yaml]`
-#  (see the top of platform.yaml). It is NOT loaded on its own: yacron2 skips
+#  (see the top of platform.yaml). It is NOT loaded on its own: cronstable skips
 #  any file in a config directory whose name starts with "_" or ".", so the
 #  only way it takes effect is through the include. That is exactly what
 #  `include:` is for — hoisting common definitions (defaults, reporting,
@@ -10,7 +10,7 @@
 #
 #  Because we are loaded from a config DIRECTORY, these `defaults:` apply only
 #  to the jobs in the file that includes us (platform.yaml). The classic
-#  crontab dropped in beside us (legacy.crontab) keeps yacron2's own standard
+#  crontab dropped in beside us (legacy.crontab) keeps cronstable's own standard
 #  defaults — that is the documented per-file rule for directories.
 # =====================================================================
 
@@ -24,8 +24,8 @@ defaults:
   captureStdout: true
   captureStderr: true
   # Sample each run's CPU time and peak resident memory. The numbers surface in
-  # the dashboard run history, at GET /metrics (yacron2_job_cpu_seconds_total,
-  # yacron2_job_last_run_max_rss_bytes) and over statsd — observability only,
+  # the dashboard run history, at GET /metrics (cronstable_job_cpu_seconds_total,
+  # cronstable_job_last_run_max_rss_bytes) and over statsd — observability only,
   # never changing a run's verdict.  The MAP form (vs a bare `true`) tunes the
   # sampler: `interval` is the process-tree polling cadence in seconds
   # (default 1.0), and `history` caps the per-run CPU%/RSS chart series behind

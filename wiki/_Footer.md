@@ -1,3 +1,3 @@
-This wiki documents [yacron2](https://github.com/ptweezy/yacron2). See the [README](https://github.com/ptweezy/yacron2/blob/main/README.md) and the [changelog](https://github.com/ptweezy/yacron2/blob/main/HISTORY.md).
+This wiki documents [cronstable](https://github.com/ptweezy/cronstable). See the [README](https://github.com/ptweezy/cronstable/blob/main/README.md) and the [changelog](https://github.com/ptweezy/cronstable/blob/main/HISTORY.md).
 
-yacron2 is a fork of [gjcarneiro/yacron](https://github.com/gjcarneiro/yacron).
+cronstable is a fork of [gjcarneiro/yacron](https://github.com/gjcarneiro/yacron).

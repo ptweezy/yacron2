@@ -1,14 +1,14 @@
 # Durable State
 
-By default yacron2 is **stateless**: run history, retry ladders, the next-fire
+By default cronstable is **stateless**: run history, retry ladders, the next-fire
 index and the Prometheus counters live in memory and reset with the process,
 and that zero-disk story is a feature. The optional **`state`** section adds
 the other half: a durable, restart-surviving store for the things that are
 worth keeping -- a run ledger, pending retries, `@reboot` boot markers, metric
 counters -- plus the scheduling features that only make sense once a store
 exists (missed-run catch-up, a depends-on-past gate, output archival, SLA
-trends). It is implemented in `yacron2/state.py` (the
-`FilesystemStateBackend`) and wired into the scheduler in `yacron2/cron.py`.
+trends). It is implemented in `cronstable/state.py` (the
+`FilesystemStateBackend`) and wired into the scheduler in `cronstable/cron.py`.
 
 > **Everything on this page is opt-in.** Without a `state` section the backend
 > is never constructed, no file is ever written, and the in-memory behaviour
@@ -56,10 +56,10 @@ One required key turns the whole feature set on:
 
 ```yaml
 state:
-  path: /var/lib/yacron2
+  path: /var/lib/cronstable
 ```
 
-With just that, and no per-job changes, yacron2 gains:
+With just that, and no per-job changes, cronstable gains:
 
 * a **[durable run ledger](#the-durable-run-ledger)** per job, rehydrated into
   the dashboard's history after a restart;
@@ -72,7 +72,7 @@ With just that, and no per-job changes, yacron2 gains:
 * **[`@reboot` once per OS boot](#reboot-once-per-os-boot)**: an `@reboot` job
   runs once per boot per host, not once per daemon restart;
 * **[restart-durable Prometheus counters](#restart-durable-prometheus-counters)**,
-  so `yacron2_job_*` totals no longer reset to zero on every restart;
+  so `cronstable_job_*` totals no longer reset to zero on every restart;
 * the **[`GET /jobs/{name}/trends`](#sla-trends-over-the-ledger)** endpoint,
   SLA aggregates over the ledger.
 
@@ -87,7 +87,7 @@ output).
 
 ```yaml
 state:
-  path: /var/lib/yacron2       # required; a local dir, or a shared mount
+  path: /var/lib/cronstable       # required; a local dir, or a shared mount
   topology: auto               # optional; auto | single-node | shared
   deploymentId: my-app         # optional; namespace inside a shared store
   maxRunsPerJob: 1000          # optional; durable retention per job
@@ -166,7 +166,7 @@ as `shared`, everything else as `single-node`. **Windows and macOS cannot
 probe**, so `auto` resolves to `single-node` there; set `topology: shared`
 explicitly when the path really is a shared mount. The resolved topology is
 logged at startup and exported as the `topology` label on the
-`yacron2_state_info` metric.
+`cronstable_state_info` metric.
 
 Several distinct deployments can point at one shared mount: give each its own
 `deploymentId` and they occupy disjoint namespaces (records, leases, GC).
@@ -220,7 +220,7 @@ with no native rename:
   thread so a blocking lock can never freeze the event loop.
 * **Writes never stall scheduling.** Durable writes are fire-and-forget
   background tasks; a failed write is dropped with a warning and counted
-  (`yacron2_state_dropped_writes_total`). The few *reads* on scheduling paths
+  (`cronstable_state_dropped_writes_total`). The few *reads* on scheduling paths
   (the depends-on-past gate, the catch-up watermark, rehydration) are bounded
   by a 10-second timeout, past which the caller falls back -- a hung NFS
   server degrades the stateful features, never job launches.
@@ -261,7 +261,7 @@ A **version stamp** (the `meta` stream) is written once at first start. A
 store stamped by a *newer* record scheme than this build understands logs a
 pointed warning at startup -- the records themselves are still handled by the
 quarantine-on-read rule, so a rolling downgrade degrades loudly rather than
-corrupting anything. See `yacron2 state migrate-schema` under
+corrupting anything. See `cronstable state migrate-schema` under
 [Administering the store](#administering-the-store) for the forward path.
 
 ## The durable run ledger
@@ -311,7 +311,7 @@ jobs:
 How the evaluation works:
 
 * **Computed from the durable watermark.** On startup (once the backend, and
-  in a cluster the owner election, are up) yacron2 reads each `onMissed`
+  in a cluster the owner election, are up) cronstable reads each `onMissed`
   job's last durable run and steps the schedule forward from it, occurrence
   by occurrence, **in the job's own timezone frame -- DST-safe**: a missed
   slot is what the live scheduler would actually have fired, not a naive
@@ -486,7 +486,7 @@ whenever the daemon happened to come back".
 
 A pending record is **settled instead of re-armed** when:
 
-* the job's **per-job config digest** changed (`yacron2.fingerprint.job_digest`
+* the job's **per-job config digest** changed (`cronstable.fingerprint.job_digest`
   -- deliberately stricter than the whole-set job-set id, so editing an
   *unrelated* job does not drop this job's retry, while any
   behaviour-affecting edit to *this* job does: the old ladder must not run
@@ -504,7 +504,7 @@ double-run** (at-most-once on the launch side, thanks to record-before-run).
 The at-least-once residue lives on the write side instead: the pending-record
 write is fire-and-forget, so a hard crash in the instant between arming a
 retry and the record landing loses that re-arm (counted in
-`yacron2_state_dropped_writes_total{kind="retry"}` when the store rejects the
+`cronstable_state_dropped_writes_total{kind="retry"}` when the store rejects the
 write outright).
 
 **`@reboot` keep-alive continuity.** An `@reboot` job with
@@ -514,7 +514,7 @@ restart breaks that loop (the job already "ran this boot", and the in-memory
 ladder died with the old process). With a store, when the
 [boot marker](#reboot-once-per-os-boot) shows the boot run already happened
 during *this* OS boot, the pending retry is re-armed instead of superseded --
-the supervised process keeps getting restarted across yacron2's own restarts.
+the supervised process keeps getting restarted across cronstable's own restarts.
 
 **Cross-node retry resume.** On a shared store the ladder can also survive
 the *node*, not just the process. Resume is active only when all three hold:
@@ -574,7 +574,7 @@ cluster-wide, exactly as above. While resume is active:
 
 ## `@reboot` once per OS boot
 
-Without a store, `@reboot` means "once per daemon start" -- restart yacron2
+Without a store, `@reboot` means "once per daemon start" -- restart cronstable
 and every `@reboot` job runs again. With `state` configured, a standalone
 (non-cluster-deferred) `@reboot` job runs **once per OS boot per host**:
 
@@ -615,12 +615,12 @@ most one write per 15 seconds, with a final unthrottled snapshot at shutdown.
 On boot the snapshot is **seeded back** (added into the fresh accumulators)
 once per process, only for jobs still present in the config; histogram state
 is restored only when the configured bucket bounds are unchanged. The result:
-`yacron2_job_runs_total` and friends carry on across restarts instead of
+`cronstable_job_runs_total` and friends carry on across restarts instead of
 resetting to zero.
 
 This is **lossy-durable by design**: a hard crash forfeits at most the events
 since the last snapshot (up to 15 seconds' worth), which Prometheus reads as a
-small, ordinary counter reset. `yacron2_start_time_seconds` still resets per
+small, ordinary counter reset. `cronstable_start_time_seconds` still resets per
 process, deliberately -- it measures the process. See
 [Metrics with Prometheus](Metrics-with-Prometheus) for the families
 themselves.
@@ -664,7 +664,7 @@ gated on the store under either policy**:
 | | `degrade` *(default)* | `fail-closed` |
 | --- | --- | --- |
 | Philosophy | behave exactly as the stateless daemon would | prefer not running over running wrong |
-| Failed durable writes | dropped with a warning, counted in `yacron2_state_dropped_writes_total` | same (writes are never blocking) |
+| Failed durable writes | dropped with a warning, counted in `cronstable_state_dropped_writes_total` | same (writes are never blocking) |
 | `onlyIfLastSucceeded` gate | decides from the in-memory history (fail open) | **blocks** the fire |
 | A due durable retry | proceeds on the in-memory ladder | **defers** and re-checks, like a closed cluster gate |
 | The cluster concurrency slot claim ([`concurrencyScope: cluster`](Clustering-and-Leader-Election)) | launches with **node-local** enforcement only for that run (a warning names the reason) | **skips** the launch, like a closed cluster gate |
@@ -689,7 +689,7 @@ forever. The store cleans up after itself, conservatively, anchored on
   scopes and dag names that config can write -- written on backend start and
   every 6 hours.
 * A **GC pass** (every 24 hours per process, plus on demand via
-  [`yacron2 state gc`](#administering-the-store)) deletes the streams (runs,
+  [`cronstable state gc`](#administering-the-store)) deletes the streams (runs,
   logs, catch-up, retries, reboot markers, in-flight records, slot cancel
   records, artifact streams) of jobs that **no recent manifest**
   -- from *any* node, *any* job set, same `deploymentId` -- references, *and*
@@ -734,7 +734,7 @@ The manifest-plus-grace design means a node that is merely *down* does not
 lose its jobs' history (its last manifest stays recent for the grace period),
 while a job genuinely deleted from every config ages out a week later. Set
 `gcGraceSeconds` to cover your longest plausible full-fleet outage, or `<= 0`
-to disable automatic GC entirely and run `yacron2 state gc` yourself. Values
+to disable automatic GC entirely and run `cronstable state gc` yourself. Values
 between `1` and `86399` are rejected at parse time: a grace shorter than the
 manifest cadence would make every live peer's manifests look stale and hand
 their state to the collector.
@@ -747,8 +747,8 @@ puts a token bucket over **every backend operation except lease operations**
 (burst = one second's tokens): operations past the rate queue rather than
 fail, the delay is invisible to scheduling (writes are already background
 tasks; bounded reads still honour their timeout), and the throttling is
-observable as `yacron2_state_throttled_ops_total` /
-`yacron2_state_throttle_wait_seconds_total`.
+observable as `cronstable_state_throttled_ops_total` /
+`cronstable_state_throttle_wait_seconds_total`.
 `0` (the default) disables the limiter -- the right choice for a local
 directory.
 
@@ -782,13 +782,13 @@ strings; an unknown scheduled time is the empty string):
 
 | Variable | Meaning |
 | --- | --- |
-| `YACRON2_STATE_URL` | Base URL of the loopback endpoint, e.g. `http://127.0.0.1:54321`. |
-| `YACRON2_STATE_TOKEN` | The per-run bearer token, revoked when the run ends. |
-| `YACRON2_RUN_ID` | A unique id for this run. |
-| `YACRON2_JOB_NAME` | The job name (the default *scope*, below). |
-| `YACRON2_ATTEMPT` | The retry attempt number (`0` on the first fire). |
-| `YACRON2_SCHEDULED_AT` | The scheduled fire time (ISO-8601), or empty. |
-| `YACRON2_HOST` | The host name. |
+| `CRONSTABLE_STATE_URL` | Base URL of the loopback endpoint, e.g. `http://127.0.0.1:54321`. |
+| `CRONSTABLE_STATE_TOKEN` | The per-run bearer token, revoked when the run ends. |
+| `CRONSTABLE_RUN_ID` | A unique id for this run. |
+| `CRONSTABLE_JOB_NAME` | The job name (the default *scope*, below). |
+| `CRONSTABLE_ATTEMPT` | The retry attempt number (`0` on the first fire). |
+| `CRONSTABLE_SCHEDULED_AT` | The scheduled fire time (ISO-8601), or empty. |
+| `CRONSTABLE_HOST` | The host name. |
 
 The commands read these; you rarely touch them directly. Set
 `state.jobApi.enabled: false` to keep the durable scheduler features while
@@ -809,17 +809,17 @@ scoped to the single run they were staged for.
 
 ### Durable key/value
 
-`yacron2 state get|set|delete|keys` is a restart-surviving map, scoped per job
-by default. It coexists with the `yacron2 state` [admin
+`cronstable state get|set|delete|keys` is a restart-surviving map, scoped per job
+by default. It coexists with the `cronstable state` [admin
 subcommands](#administering-the-store) (backup / gc / ...) -- the action name
 tells them apart.
 
 ```shell
-yacron2 state set last-cursor 12345
-value=$(yacron2 state get last-cursor)      # -> 12345
-yacron2 state set config '{"n": 3}' --json  # store parsed JSON, not a string
-yacron2 state keys                          # one key per line
-yacron2 state delete last-cursor
+cronstable state set last-cursor 12345
+value=$(cronstable state get last-cursor)      # -> 12345
+cronstable state set config '{"n": 3}' --json  # store parsed JSON, not a string
+cronstable state keys                          # one key per line
+cronstable state delete last-cursor
 ```
 
 `get` on a missing key prints nothing and exits `4`, so a script can branch on
@@ -827,7 +827,7 @@ absence. `set` refuses a value larger than `maxValueBytes`.
 
 ### Cursor / watermark
 
-`yacron2 cursor advance NAME VALUE` moves a monotonic watermark: the stored
+`cronstable cursor advance NAME VALUE` moves a monotonic watermark: the stored
 value only ever goes to `max(current, VALUE)`, so an out-of-order or replayed
 batch never walks it backwards, and on a shared store several nodes converge
 on the furthest point. A numeric value compares numerically (`9 < 10`); an
@@ -835,9 +835,9 @@ ISO-8601 timestamp compares as the string it is (`2026-06 < 2026-07`). This is
 the ETL "process only what is new" pattern:
 
 ```shell
-since=$(yacron2 cursor get watermark 2>/dev/null || echo 0)
+since=$(cronstable cursor get watermark 2>/dev/null || echo 0)
 # ... export rows with id > $since, tracking the new maximum ...
-yacron2 cursor advance watermark "$new_max"
+cronstable cursor advance watermark "$new_max"
 ```
 
 Pass `--force` to set the value even if it moves the cursor backwards (a
@@ -845,28 +845,28 @@ deliberate rewind).
 
 ### Idempotency keys
 
-`yacron2 idempotent KEY` claims a key once, fleet-wide: the first caller wins
+`cronstable idempotent KEY` claims a key once, fleet-wide: the first caller wins
 (exit `0`, do the work), every later caller loses (exit `5`, skip). A
 transport or store error exits `1` instead, so an outage is distinguishable
 from "already done". It is the "run this side effect at most once" guard for
 a retried or duplicated run:
 
 ```shell
-if yacron2 idempotent "charge-$(date -u +%F)"; then
+if cronstable idempotent "charge-$(date -u +%F)"; then
   charge-the-invoices          # runs at most once per day across the fleet
 fi
 ```
 
 `--ttl SECONDS` makes the claim expire (a bounded dedupe window; the default
 `0` is a permanent claim); `--release` drops a claim so the key can be won
-again. Like every yacron2 coordination primitive this is at-least-once, not
+again. Like every cronstable coordination primitive this is at-least-once, not
 exactly-once -- a caller that wins the claim then crashes before finishing has
 "claimed but not done" work, which is why the claim guards an *idempotent*
 side effect.
 
 ### Mutex and semaphore
 
-`yacron2 lock` is a fleet-wide lock backed by the same TTL lease the cluster
+`cronstable lock` is a fleet-wide lock backed by the same TTL lease the cluster
 concurrency slots use. The daemon holds the lease on the run's behalf, renews
 it while the job holds the lock, and releases it the instant the job releases
 *or the run ends* -- so a job that crashes or forgets to unlock never leaks a
@@ -875,15 +875,15 @@ convenient form, holding the lock for the duration of a wrapped command:
 
 ```shell
 # only one holder of "db-maintenance" runs across the whole fleet at a time:
-yacron2 lock run db-maintenance --scope global --wait --timeout 60 \
+cronstable lock run db-maintenance --scope global --wait --timeout 60 \
   -- /usr/local/bin/compact-db.sh
 ```
 
 `--permits N` makes it a **semaphore** of `N` concurrent holders instead of a
 mutex (`N = 1`). `--wait --timeout S` blocks up to `S` seconds for a free
 permit; without `--wait`, a taken lock returns immediately (exit `3`). For
-manual control, `yacron2 lock acquire NAME` prints a hold token and
-`yacron2 lock release TOKEN` frees it. The acquire reply also carries the
+manual control, `cronstable lock acquire NAME` prints a hold token and
+`cronstable lock release TOKEN` frees it. The acquire reply also carries the
 lease's monotonic **fence** token, for a job that needs true fencing on top of
 the lock (the honest limit: like every distributed lock this is at-least-once
 -- a holder that loses its lease to a store outage keeps running, and the
@@ -891,17 +891,17 @@ fence is how a careful job fences its own writes).
 
 ### Artifact store
 
-`yacron2 artifact put NAME [FILE]` publishes a small blob (from `FILE` or
+`cronstable artifact put NAME [FILE]` publishes a small blob (from `FILE` or
 stdin) under a name that a later run, or a peer node, reads back with
-`yacron2 artifact get NAME`. Payloads are content-addressed (identical bytes
+`cronstable artifact get NAME`. Payloads are content-addressed (identical bytes
 store once) and read newest-wins:
 
 ```shell
 build-report > report.csv
-yacron2 artifact put latest-report report.csv     # prints the sha256
+cronstable artifact put latest-report report.csv     # prints the sha256
 # ... a later run, possibly on another node ...
-yacron2 artifact get latest-report -o report.csv
-yacron2 artifact list                             # one name per line
+cronstable artifact get latest-report -o report.csv
+cronstable artifact list                             # one name per line
 ```
 
 `put` refuses a payload larger than `maxArtifactBytes`. Artifacts are durable
@@ -918,13 +918,13 @@ than placing them in the environment where they would show in
 `/proc/<pid>/environ` or a `ps -E`. Each secret is resolved fresh per run,
 served only to that run, and dropped when the run ends -- it never touches the
 durable store. The same `value` / `fromFile` / `fromEnvVar` source triple
-every other yacron2 secret uses:
+every other cronstable secret uses:
 
 ```yaml
 jobs:
   - name: build-report
     command: |
-      token=$(yacron2 secret get API_TOKEN)
+      token=$(cronstable secret get API_TOKEN)
       build-report --token "$token"
     schedule: "0 6 * * *"
     secrets:
@@ -932,35 +932,35 @@ jobs:
         fromEnvVar: REPORT_API_TOKEN     # or value:, or fromFile:
 ```
 
-`yacron2 secret get NAME` prints the value (exit `4` if it was not staged);
-`yacron2 secret list` prints the staged names (not their values). Declaring
+`cronstable secret get NAME` prints the value (exit `4` if it was not staged);
+`cronstable secret list` prints the staged names (not their values). Declaring
 `secrets` needs a `state` section with `jobApi` enabled, else the config is
 rejected.
 
 A full worked config is in
-[`example/job-state/yacron2tab.yaml`](https://github.com/ptweezy/yacron2/tree/develop/example/job-state).
+[`example/job-state/cronstable.yaml`](https://github.com/ptweezy/cronstable/tree/develop/example/job-state).
 The wire protocol (the `/v1/` endpoints) is in the
 [HTTP Control API](HTTP-API) reference, and every command's flags and exit
 codes are in the [Command-Line Reference](CLI-Reference).
 
 ## Administering the store
 
-The `yacron2 state` subcommands administer the store of the `state:` section
+The `cronstable state` subcommands administer the store of the `state:` section
 in your config (`-c/--config` works both before and after the subcommand:
-`yacron2 -c X state gc` and `yacron2 state gc -c X` are equivalent). Exit
+`cronstable -c X state gc` and `cronstable state gc -c X` are equivalent). Exit
 codes: `0` success, `1` error, `2` usage. Full flags and examples are in the
 [Command-Line Reference](CLI-Reference); in summary:
 
 | Command | Does |
 | --- | --- |
-| `yacron2 state backup -o FILE.tar.gz` | Writes an owner-only (`0o600`) `.tar.gz` of the store (records, documents, blobs, and leases; `tmp/` and `quarantine/` excluded). Safe against a live daemon. |
-| `yacron2 state restore FILE.tar.gz [--force]` | Restores a backup into the store; refuses a non-empty store without `--force` (which merges, keeping the newer lease fences), and sanitises archive members. Not safe while a daemon uses the store. |
-| `yacron2 state migrate --dest PATH [--dest-deployment-id ID]` | Copies the store between paths/mounts (local ↔ Amazon S3 Files / EFS) with torn-read-safe atomic placement; then point `state.path` at the new home. |
-| `yacron2 state gc [--dry-run]` | Runs a manual [GC pass](#garbage-collection-and-manifests); reports the reclaimed streams and orphaned artifact blobs, or why the blob sweep was skipped. |
-| `yacron2 state check` | Probes writability and prints an inventory of the store. |
-| `yacron2 state migrate-schema [--dry-run]` | Rewrites records of older *known* record schemes to the current one. `v1` is the only scheme so far, so today this reports and converts nothing; unknown versions are left to quarantine-on-read. |
+| `cronstable state backup -o FILE.tar.gz` | Writes an owner-only (`0o600`) `.tar.gz` of the store (records, documents, blobs, and leases; `tmp/` and `quarantine/` excluded). Safe against a live daemon. |
+| `cronstable state restore FILE.tar.gz [--force]` | Restores a backup into the store; refuses a non-empty store without `--force` (which merges, keeping the newer lease fences), and sanitises archive members. Not safe while a daemon uses the store. |
+| `cronstable state migrate --dest PATH [--dest-deployment-id ID]` | Copies the store between paths/mounts (local ↔ Amazon S3 Files / EFS) with torn-read-safe atomic placement; then point `state.path` at the new home. |
+| `cronstable state gc [--dry-run]` | Runs a manual [GC pass](#garbage-collection-and-manifests); reports the reclaimed streams and orphaned artifact blobs, or why the blob sweep was skipped. |
+| `cronstable state check` | Probes writability and prints an inventory of the store. |
+| `cronstable state migrate-schema [--dry-run]` | Rewrites records of older *known* record schemes to the current one. `v1` is the only scheme so far, so today this reports and converts nothing; unknown versions are left to quarantine-on-read. |
 
-The admin code (`yacron2/state_admin.py`) is imported only when a `state`
+The admin code (`cronstable/state_admin.py`) is imported only when a `state`
 subcommand runs, so the stateless install pays nothing for it.
 
 ## Observing the store
@@ -968,21 +968,21 @@ subcommand runs, so the stateless install pays nothing for it.
 The store exports its own health at `GET /metrics` alongside the job
 families (see [Metrics with Prometheus](Metrics-with-Prometheus)):
 
-* `yacron2_state_info{backend,topology}` -- what is configured;
-* `yacron2_state_ops_total{op}` / `yacron2_state_op_errors_total{op}` /
-  `yacron2_state_op_seconds_total{op}` -- operation counts, errors, and
+* `cronstable_state_info{backend,topology}` -- what is configured;
+* `cronstable_state_ops_total{op}` / `cronstable_state_op_errors_total{op}` /
+  `cronstable_state_op_seconds_total{op}` -- operation counts, errors, and
   in-store latency (divide seconds by ops for the mean) per operation
   (`append` / `list` / `derive-max` / `prune` / lease operations / `gc` / ...);
-* `yacron2_state_lock_acquisitions_total` /
-  `yacron2_state_lock_wait_seconds_total` -- advisory-lock contention
+* `cronstable_state_lock_acquisitions_total` /
+  `cronstable_state_lock_wait_seconds_total` -- advisory-lock contention
   (emitted once nonzero);
-* `yacron2_state_throttled_ops_total` /
-  `yacron2_state_throttle_wait_seconds_total` -- the
+* `cronstable_state_throttled_ops_total` /
+  `cronstable_state_throttle_wait_seconds_total` -- the
   [`maxOpsPerSecond`](#rate-limiting-maxopspersecond) limiter (emitted once
   nonzero; lease operations never show up here, because they
   [bypass the bucket](#rate-limiting-maxopspersecond) -- a queued renew
   could overshoot its TTL and double-run the job the lease fences);
-* `yacron2_state_dropped_writes_total{kind}` -- durable writes that failed
+* `cronstable_state_dropped_writes_total{kind}` -- durable writes that failed
   and were dropped (`kind`: `run-record`, `checkpoint`, `retry`,
   `reboot-marker`, `inflight`, `counters`, `manifest`). **This is the one to
   alert on**: a rising rate means the durable features are silently
@@ -997,7 +997,7 @@ A backend read error at scrape time omits the state families from that scrape
   files `0o600` (both further narrowed by your umask): records can carry job
   output, which routinely includes things that should not be world-readable.
 * **Same user on shared stores.** Because records are `0o600`, **every node
-  sharing a store must run yacron2 as the same user**; two nodes running as
+  sharing a store must run cronstable as the same user**; two nodes running as
   different users silently hide half the history from each other (a
   persistent `EACCES` on reads is the symptom, and the log warning says
   exactly this).
@@ -1010,7 +1010,7 @@ A backend read error at scrape time omits the state families from that scrape
   LUKS/dm-crypt locally, or the EFS / S3 encryption options on a shared
   mount. Secret [redaction of archived output](#output-archival-and-secret-redaction)
   reduces what lands in the files; it does not replace encrypting the volume.
-* **Backups.** `yacron2 state backup` is safe to run against a live daemon
+* **Backups.** `cronstable state backup` is safe to run against a live daemon
   (immutable records mean a backup never races a rewrite); pair it with
   `state restore` / `state migrate` for moves between hosts or mounts
   (those two are *not* safe against a store a daemon is actively using;
@@ -1020,10 +1020,10 @@ A backend read error at scrape time omits the state families from that scrape
 
 - [Orchestration and DAGs](Orchestration-and-DAGs): the durable workflow tier built entirely on this store (dag_run documents, XCom over the artifact store, per-run advance leases).
 - [Configuration Reference](Configuration-Reference): the `state` section and per-job option schema.
-- [Command-Line Reference](CLI-Reference): the `yacron2 state` administration subcommands.
+- [Command-Line Reference](CLI-Reference): the `cronstable state` administration subcommands.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): the retry ladder these records make durable.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the owner gate catch-up and retries re-check.
 - [Output Capturing](Output-Capturing): what `archiveOutput` persists.
 - [HTTP Control API](HTTP-API): `GET /jobs/{name}/trends`, the run endpoints, and the job-facing `/v1/` loopback endpoints.
 - [Web Dashboard](Web-Dashboard): the rehydrated history views, and the separate browser-side run ledger.
-- [Metrics with Prometheus](Metrics-with-Prometheus): the `yacron2_state_*` families and the restart-durable job counters.
+- [Metrics with Prometheus](Metrics-with-Prometheus): the `cronstable_state_*` families and the restart-durable job counters.

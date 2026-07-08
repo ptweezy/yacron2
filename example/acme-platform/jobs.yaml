@@ -1,15 +1,15 @@
 # =====================================================================
-#  "ACME Orders" — a full-fledged yacron2 showcase.
+#  "ACME Orders" — a full-fledged cronstable showcase.
 #
 #  A realistic scheduled workload for a fictional orders service (ingest ->
 #  transform -> load -> report, plus monitoring and housekeeping) that is
-#  deliberately built to exercise EVERYTHING yacron2 can do AND to make every
+#  deliberately built to exercise EVERYTHING cronstable can do AND to make every
 #  web-dashboard feature demo itself. Brought up as a 5-node mTLS cluster by
 #  ../../docker-compose-acme.yml. This one file is mounted IDENTICALLY into all
 #  five nodes (its fingerprint is the job-set id, so it must match to agree);
 #  each node's cluster section is generated at start by node-entrypoint.sh.
 #
-#  yacron2 features exercised here (see the per-job [tags]):
+#  cronstable features exercised here (see the per-job [tags]):
 #    * clustering: leader election + distribution: spread (per-job owners),
 #      mutual-TLS peer attestation, and the three clusterPolicies
 #      (Leader / PreferLeader / EveryNode)
@@ -135,7 +135,7 @@ jobs:
     schedule: "*/4 * * * *"
     clusterPolicy: Leader
 
-  # [tag: failsWhen producesStderr] Exits 0, but yacron2 marks it FAILED because
+  # [tag: failsWhen producesStderr] Exits 0, but cronstable marks it FAILED because
   # it wrote to stderr (:25-:29) — output-based failure, not exit-code based.
   - name: config-lint
     command: |
@@ -235,7 +235,7 @@ jobs:
     clusterPolicy: Leader
 
   # [tag: executionTimeout + killTimeout] Sleeps 30s but is capped at 10s, so
-  # yacron2 terminates it (then SIGKILLs after killTimeout) and records a
+  # cronstable terminates it (then SIGKILLs after killTimeout) and records a
   # timeout failure — the classic "exit 137/143" the dashboard can explain.
   - name: slow-report-generator
     command: |
@@ -319,7 +319,7 @@ jobs:
     onFailure:
       report:
         mail:
-          from: yacron2@acme.example
+          from: cronstable@acme.example
           to: oncall@acme.example
           smtpHost: mailpit
           smtpPort: 1025
@@ -362,7 +362,7 @@ jobs:
     onPermanentFailure:
       report:
         mail:
-          from: yacron2@acme.example
+          from: cronstable@acme.example
           to: oncall@acme.example
           smtpHost: mailpit
           smtpPort: 1025

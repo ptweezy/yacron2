@@ -1,6 +1,6 @@
-"""Secret scrubbing for archived job output (yacron2.redact)."""
+"""Secret scrubbing for archived job output (cronstable.redact)."""
 
-from yacron2.redact import REDACTED, redact_lines, redact_secrets
+from cronstable.redact import REDACTED, redact_lines, redact_secrets
 
 
 def test_key_value_secrets_redacted():

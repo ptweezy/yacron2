@@ -1,7 +1,7 @@
 FROM python:3.14-slim
 
-RUN pip install --no-cache-dir yacron2
+RUN pip install --no-cache-dir cronstable
 
-COPY yacron2tab.yaml /etc/yacron2.d/yacron2tab.yaml
+COPY cronstable.yaml /etc/cronstable.d/cronstable.yaml
 
-ENTRYPOINT ["yacron2"]
+ENTRYPOINT ["cronstable"]

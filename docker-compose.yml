@@ -1,4 +1,4 @@
-# Spins up yacron2 with the built-in web dashboard and a set of demo jobs to
+# Spins up cronstable with the built-in web dashboard and a set of demo jobs to
 # play with.
 #
 #   docker compose up --build      # start (rebuild image)
@@ -8,13 +8,13 @@
 # Open the dashboard at: http://localhost:8080/
 
 services:
-  yacron2:
+  cronstable:
     build:
       context: .
-    container_name: yacron2
+    container_name: cronstable
     ports:
       # host:container — dashboard + REST API are served on 8080 in the container
       - "8080:8080"
     volumes:
-      - ./example/demo/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro
+      - ./example/demo/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
     restart: unless-stopped

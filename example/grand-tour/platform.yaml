@@ -1,10 +1,10 @@
 # =====================================================================
-#  Meridian — the yacron2 GRAND TOUR.
+#  Meridian — the cronstable GRAND TOUR.
 #
-#  One config that exercises EVERYTHING yacron2 can do, wired into a single
+#  One config that exercises EVERYTHING cronstable can do, wired into a single
 #  coherent story: "Meridian", a fictional global commerce platform, whose
 #  entire scheduled back-office runs on a NINE-node, mutual-TLS, leader-electing
-#  yacron2 cluster that shares one durable state store.
+#  cronstable cluster that shares one durable state store.
 #
 #  This one file is mounted IDENTICALLY into all nine nodes (its fingerprint is
 #  the job-set id, so it must match for the peers to agree). Each node's
@@ -94,10 +94,10 @@ include:
 # volume (topology: shared), the cursors/locks/idempotency keys and every
 # dag_run coordinate across ALL nine nodes. `jobApi` runs a loopback endpoint
 # and injects its address + a per-run token into every job, so a job command
-# can reach the store through `yacron2 state|cursor|lock|artifact|idempotent|
-# secret` (and DAG tasks through `yacron2 xcom`).  [feature: state, jobApi]
+# can reach the store through `cronstable state|cursor|lock|artifact|idempotent|
+# secret` (and DAG tasks through `cronstable xcom`).  [feature: state, jobApi]
 state:
-  path: /var/lib/yacron2/state
+  path: /var/lib/cronstable/state
   topology: shared           # this mount is shared fleet-wide -> leases exclude
                              # across nodes, cursors converge to the furthest point
   # [feature: deploymentId] a stable namespace prefix inside the store, so an
@@ -111,7 +111,7 @@ state:
   # to run state-dependent jobs — the correct choice for exactly-once billing).
   onStoreUnavailable: degrade
   # [feature: gcGraceSeconds] retention floor (seconds) for unreferenced state
-  # beyond maxRunsPerJob; the offline `yacron2 state gc` pass honors this window.
+  # beyond maxRunsPerJob; the offline `cronstable state gc` pass honors this window.
   gcGraceSeconds: 86400
   # [feature: maxOpsPerSecond / slotTtlSeconds] a token-bucket rate limit on
   # store operations (0 = unlimited) and the lease TTL of the cluster
@@ -163,14 +163,14 @@ web:
     interval: 2
     points: 1800
   # [feature: web.authToken] OPT-IN bearer-token auth for the dashboard + REST
-  # API. Left commented so the tour boots OPEN by default (yacron2 refuses to
+  # API. Left commented so the tour boots OPEN by default (cronstable refuses to
   # start if authToken is set but resolves to an empty token). To turn it on,
   # uncomment and run:
   #   WEB_TOKEN=some-secret docker compose -f docker-compose-grand-tour.yml up
   # /metrics stays public (above); the pulse-* probes and the release DAG's
   # canary already present this same token, so they keep working.
   # authToken:
-  #   fromEnvVar: YACRON2_WEB_TOKEN
+  #   fromEnvVar: CRONSTABLE_WEB_TOKEN
 
 jobs:
   # =====================================================================
@@ -216,10 +216,10 @@ jobs:
   - name: incremental-orders-export
     command: |
       set -eu
-      last=$(yacron2 cursor get high_water --scope orders-domain 2>/dev/null || echo 0)
+      last=$(cronstable cursor get high_water --scope orders-domain 2>/dev/null || echo 0)
       next=$(( last + 100 ))
       echo "exporting orders $last..$next"
-      yacron2 cursor advance high_water "$next" --scope orders-domain
+      cronstable cursor advance high_water "$next" --scope orders-domain
     schedule: "*/5 * * * *"
     clusterPolicy: Leader
     # naming a scope other than the job's own requires an explicit allow-list
@@ -262,14 +262,14 @@ jobs:
   # shared namespace independent of either job's own name.
   - name: dedup-orders
     command: |
-      hw=$(yacron2 cursor get high_water --scope orders-domain 2>/dev/null || echo 0)
+      hw=$(cronstable cursor get high_water --scope orders-domain 2>/dev/null || echo 0)
       echo "dedup up to watermark $hw on $HOSTNAME"
     schedule: "*/4 * * * *"
     clusterPolicy: Leader
     stateAllowedScopes:
       - orders-domain
 
-  # [feature: failsWhen producesStderr] Exits 0, but yacron2 marks it FAILED at
+  # [feature: failsWhen producesStderr] Exits 0, but cronstable marks it FAILED at
   # :25-:29 because it wrote to stderr — failure by OUTPUT, not by exit code.
   - name: config-lint
     command: |
@@ -332,7 +332,7 @@ jobs:
   # bound how long a contending node waits for the slot.
   - name: compact-warehouse
     command: >
-      yacron2 lock run --global --wait --timeout 30 warehouse-maintenance
+      cronstable lock run --global --wait --timeout 30 warehouse-maintenance
       -- sh -c 'echo "compacting under the fleet mutex on $HOSTNAME"; sleep 5'
     schedule: "*/10 * * * *"
     clusterPolicy: EveryNode
@@ -343,7 +343,7 @@ jobs:
   # two while the rest wait for a permit.
   - name: render-thumbnails
     command: >
-      yacron2 lock run --global --permits 2 --wait --timeout 20 thumbnail-pool
+      cronstable lock run --global --permits 2 --wait --timeout 20 thumbnail-pool
       -- sh -c 'echo "rendering thumbnails (1 of <=2 fleet permits) on $HOSTNAME"; sleep 8'
     schedule: "*/2 * * * *"
     clusterPolicy: EveryNode
@@ -354,7 +354,7 @@ jobs:
   # Every job here is resource-monitored (the monitorResources map form is set
   # once in _defaults.yaml, so the whole fleet inherits it). Each run's CPU
   # time and peak memory land in the dashboard run history / stats and at GET
-  # /metrics (yacron2_job_cpu_seconds_total, yacron2_job_peak_rss_bytes);
+  # /metrics (cronstable_job_cpu_seconds_total, cronstable_job_peak_rss_bytes);
   # while running, live CPU%/RSS shows on the job row + drawer, and the
   # drawer's Resources tab charts each run's CPU/memory profile over time
   # (live for the running instance, recorded for past runs, with per-run
@@ -425,7 +425,7 @@ jobs:
   - name: charge-subscriptions
     command: |
       key="charge-$(date -u +%Y-%m-%dT%H)"
-      if yacron2 idempotent "$key"; then
+      if cronstable idempotent "$key"; then
         echo "charging this hour's subscriptions on $HOSTNAME (won $key)"
       else
         echo "already charged this hour; skipping on $HOSTNAME"
@@ -455,7 +455,7 @@ jobs:
     onPermanentFailure:
       report:
         mail:
-          from: yacron2@meridian.example
+          from: cronstable@meridian.example
           to: oncall@meridian.example
           smtpHost: mailpit
           smtpPort: 1025
@@ -464,20 +464,20 @@ jobs:
 
   # [feature: retry maximumRetries: -1 (retry FOREVER)] Drains a delivery outbox
   # that is "down" for the first few attempts of each run, then self-heals. With
-  # maximumRetries: -1 yacron2 retries indefinitely (bounded by maximumDelay),
+  # maximumRetries: -1 cronstable retries indefinitely (bounded by maximumDelay),
   # so it NEVER reaches onPermanentFailure — the pattern for a must-eventually-
   # succeed side effect. A durable KV counter makes the self-heal deterministic.
   - name: outbox-flush
     command: |
       set -eu
-      n=$(yacron2 state get outbox-attempt --global 2>/dev/null || echo 0)
+      n=$(cronstable state get outbox-attempt --global 2>/dev/null || echo 0)
       n=$(( n + 1 ))
       if [ "$n" -lt 3 ]; then
-        yacron2 state set outbox-attempt "$n" --global
+        cronstable state set outbox-attempt "$n" --global
         echo "outbox still draining (attempt $n) — will retry" >&2
         exit 1
       fi
-      yacron2 state set outbox-attempt 0 --global   # reset for the next run
+      cronstable state set outbox-attempt 0 --global   # reset for the next run
       echo "outbox flushed on $HOSTNAME after $n attempts"
     schedule: "*/5 * * * *"
     clusterPolicy: Leader
@@ -535,15 +535,15 @@ jobs:
   - name: build-daily-report
     command: |
       set -eu
-      token=$(yacron2 secret get REPORT_TOKEN)
-      signer=$(yacron2 secret get SIGNING_KEY)
+      token=$(cronstable secret get REPORT_TOKEN)
+      signer=$(cronstable secret get SIGNING_KEY)
       echo "building daily report on $HOSTNAME (token ${token%%-*}…, signer ${signer%%-*}…)"
       printf 'date,orders\n%s,1234\n' "$(date -u +%F)" > /tmp/daily-report.csv
-      yacron2 artifact put daily-report /tmp/daily-report.csv
-      echo "read back $(yacron2 artifact get daily-report | wc -l) lines; store holds: $(yacron2 artifact list)"
-      yacron2 state set last-report-at "$(date -u +%FT%TZ)" --global
-      yacron2 state set report-meta '{"rows":1234,"ok":true}' --json --global
-      echo "keys now: $(yacron2 state keys --global)"
+      cronstable artifact put daily-report /tmp/daily-report.csv
+      echo "read back $(cronstable artifact get daily-report | wc -l) lines; store holds: $(cronstable artifact list)"
+      cronstable state set last-report-at "$(date -u +%FT%TZ)" --global
+      cronstable state set report-meta '{"rows":1234,"ok":true}' --json --global
+      echo "keys now: $(cronstable state keys --global)"
     schedule: "0 6 * * *"
     clusterPolicy: Leader
     archiveOutput: true
@@ -572,7 +572,7 @@ jobs:
           body: |
             {"text": "✅ {{ name }} OK on {{ environment.HOSTNAME }} (success={{ success }})"}
         mail:
-          from: yacron2@meridian.example
+          from: cronstable@meridian.example
           to: ops@meridian.example
           smtpHost: mailpit
           smtpPort: 1025
@@ -628,7 +628,7 @@ jobs:
     command: echo "fiscal-year-open opened the new fiscal year on $HOSTNAME"
 
   # [feature: executionTimeout + killTimeout] Sleeps 30s but is capped at 10s,
-  # so yacron2 terminates it (SIGTERM, then SIGKILL after killTimeout) and
+  # so cronstable terminates it (SIGTERM, then SIGKILL after killTimeout) and
   # records a timeout failure — the classic exit≈137/143 the dashboard explains.
   # Reports the timeout via the shell reporter (a stand-in pager on stdout).
   - name: slow-report-generator
@@ -668,13 +668,13 @@ jobs:
           environment: production
           body: "fraud model refresh failed on {{ environment.HOSTNAME }}"
           fingerprint:
-            - yacron2
+            - cronstable
             - "{{ name }}"
           extra:
             service: fraud
             pipeline: ml
         mail:
-          from: yacron2@meridian.example
+          from: cronstable@meridian.example
           to: ml-oncall@meridian.example
           smtpHost: mailpit
           smtpPort: 1025
@@ -767,7 +767,7 @@ jobs:
     onFailure:
       report:
         mail:
-          from: yacron2@meridian.example
+          from: cronstable@meridian.example
           to: oncall@meridian.example
           smtpHost: mailpit
           smtpPort: 1025
@@ -835,7 +835,7 @@ jobs:
       - |
         import os, sys, time, urllib.request
         req = urllib.request.Request("http://127.0.0.1:8080/status")
-        tok = os.environ.get("YACRON2_WEB_TOKEN", "")
+        tok = os.environ.get("CRONSTABLE_WEB_TOKEN", "")
         if tok:
             req.add_header("Authorization", "Bearer " + tok)
         t0 = time.perf_counter()
@@ -865,7 +865,7 @@ jobs:
         import os, sys, time, urllib.request
         budget = 250.0
         req = urllib.request.Request("http://127.0.0.1:8080/status")
-        tok = os.environ.get("YACRON2_WEB_TOKEN", "")
+        tok = os.environ.get("CRONSTABLE_WEB_TOKEN", "")
         if tok:
             req.add_header("Authorization", "Bearer " + tok)
         t0 = time.perf_counter()
@@ -946,7 +946,7 @@ jobs:
   #     group: 65534
 
   # [feature: missed-run catch-up (run-once) + onlyIfLastSucceeded +
-  # archiveOutput + catchupJitterSeconds] onMissed: run-once makes yacron2 run
+  # archiveOutput + catchupJitterSeconds] onMissed: run-once makes cronstable run
   # this ONCE on startup if the daily slot was missed while the fleet was down
   # (bounded to a 12h-old miss). It COALESCES a multi-day gap to a single run —
   # contrast hourly-invoice-emit's run-all. onlyIfLastSucceeded skips it if the
@@ -969,9 +969,9 @@ jobs:
   - name: platform-pulse-counter
     command: |
       set -eu
-      n=$(yacron2 state get pulse-count --global 2>/dev/null || echo 0)
+      n=$(cronstable state get pulse-count --global 2>/dev/null || echo 0)
       n=$(( n + 1 ))
-      yacron2 state set pulse-count "$n" --global
+      cronstable state set pulse-count "$n" --global
       echo "platform pulse #$n (durable, fleet-wide) on $HOSTNAME"
     schedule: "*/3 * * * *"
     clusterPolicy: Leader
@@ -1025,7 +1025,7 @@ dags:
     tasks:
       - id: discover
         command: |
-          echo '["eu", "us", "apac"]' | yacron2 xcom push --key shards
+          echo '["eu", "us", "apac"]' | cronstable xcom push --key shards
       - id: load
         dependsOn:
           - discover
@@ -1035,13 +1035,13 @@ dags:
         retries: 2                   # per-task retries (2 -> 3 attempts)
         retryDelaySeconds: 5
         command: |
-          echo "load shard=$YACRON2_DAG_MAP_ITEM (index $YACRON2_DAG_MAP_INDEX)"
+          echo "load shard=$CRONSTABLE_DAG_MAP_ITEM (index $CRONSTABLE_DAG_MAP_INDEX)"
           sleep 2
       - id: verify
         dependsOn:
           - load                     # fan-in: waits for every mapped `load`
         command: |
-          shards=$(yacron2 xcom pull --task discover --key shards)
+          shards=$(cronstable xcom pull --task discover --key shards)
           echo "verify on $(hostname); loaded shards were: $shards"
 
   # [feature: DAG approval gate + sensor + triggerRule + manual trigger] A
@@ -1062,7 +1062,7 @@ dags:
     tasks:
       - id: build
         command: |
-          echo "release-$(date -u +%Y%m%d-%H%M%S)" | yacron2 xcom push --key tag
+          echo "release-$(date -u +%Y%m%d-%H%M%S)" | cronstable xcom push --key tag
       - id: approve
         type: approval
         dependsOn:
@@ -1081,7 +1081,7 @@ dags:
           - |
             import os, sys, urllib.request
             req = urllib.request.Request("http://127.0.0.1:8080/status")
-            tok = os.environ.get("YACRON2_WEB_TOKEN", "")
+            tok = os.environ.get("CRONSTABLE_WEB_TOKEN", "")
             if tok:
                 req.add_header("Authorization", "Bearer " + tok)
             sys.exit(0 if urllib.request.urlopen(req, timeout=3).status == 200 else 1)
@@ -1091,7 +1091,7 @@ dags:
           - canary
         triggerRule: all_done
         command: |
-          tag=$(yacron2 xcom pull --task build --key tag)
+          tag=$(cronstable xcom pull --task build --key tag)
           echo "published $tag on $(hostname)"
 
   # [feature: DAG linear pipeline + timezone] the simplest DAG shape: a straight

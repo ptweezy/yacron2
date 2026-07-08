@@ -1,4 +1,4 @@
-"""Capture yacron2 dashboard screenshots off the running grand-tour fleet.
+"""Capture cronstable dashboard screenshots off the running grand-tour fleet.
 
 Usage: python capture_dashboard.py [shot ...]
 With no args, captures every shot. Shots are saved to ./shots/ at 2880x1800
@@ -99,7 +99,7 @@ def fresh(page, theme=None, extra_prefs=None):
     if extra_prefs:
         prefs.update(extra_prefs)
     js = ";".join(
-        f"localStorage.setItem('yacron2.{k}', {json.dumps(v)})" for k, v in prefs.items()
+        f"localStorage.setItem('cronstable.{k}', {json.dumps(v)})" for k, v in prefs.items()
     )
     page.evaluate(js)
     page.reload()
@@ -149,9 +149,9 @@ def main():
             ),
         )
         ctx.add_init_script(
-            "try{if(!localStorage.getItem('yacron2.bootWant'))"
-            "localStorage.setItem('yacron2.boot','false');"
-            "localStorage.setItem('yacron2.zen','false');}catch(e){}"
+            "try{if(!localStorage.getItem('cronstable.bootWant'))"
+            "localStorage.setItem('cronstable.boot','false');"
+            "localStorage.setItem('cronstable.zen','false');}catch(e){}"
             # the logo idle-cruises via JS inline transforms, which the
             # reduced-motion CSS can't suppress; pin it upright so shots
             # don't catch it at a random angle
@@ -168,9 +168,9 @@ def main():
         if wants("dashboard-boot"):
             try:
                 page.evaluate(
-                    "localStorage.setItem('yacron2.bootWant','1');"
-                    "localStorage.setItem('yacron2.boot','true');"
-                    "localStorage.removeItem('yacron2.bootShownAt')"  # 12h replay gate
+                    "localStorage.setItem('cronstable.bootWant','1');"
+                    "localStorage.setItem('cronstable.boot','true');"
+                    "localStorage.removeItem('cronstable.bootShownAt')"  # 12h replay gate
                 )
                 page.reload()
                 page.wait_for_selector("#bootScreen", state="visible", timeout=8000)
@@ -180,8 +180,8 @@ def main():
                 results["dashboard-boot"] = f"FAIL {e}"
                 print(f"  boot shot failed: {e}")
             page.evaluate(
-                "localStorage.removeItem('yacron2.bootWant');"
-                "localStorage.setItem('yacron2.boot','false')"
+                "localStorage.removeItem('cronstable.bootWant');"
+                "localStorage.setItem('cronstable.boot','false')"
             )
             page.reload()
             wait_ready(page)

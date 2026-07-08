@@ -1,4 +1,4 @@
-# A local etcd plus two yacron2 instances electing a leader through it.
+# A local etcd plus two cronstable instances electing a leader through it.
 #
 #   docker compose -f example/etcd/docker-compose.yml up --build
 #
@@ -6,12 +6,12 @@
 # cluster panel: exactly one instance is the leader (holds the lease-bound
 # election key). Stop the leader and the other takes over within ~ttl seconds:
 #
-#   docker compose -f example/etcd/docker-compose.yml stop yacron2-a
+#   docker compose -f example/etcd/docker-compose.yml stop cronstable-a
 #
 # Inspect the election key directly:
 #
 #   docker compose -f example/etcd/docker-compose.yml exec etcd \
-#     etcdctl get yacron2/leader
+#     etcdctl get cronstable/leader
 services:
   etcd:
     # Pin a full patch tag: quay.io/coreos/etcd publishes no major.minor
@@ -22,16 +22,16 @@ services:
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://etcd:2379
     # No `ports:` mapping on purpose. This demo etcd has NO authentication and
-    # speaks plaintext HTTP, so the election key (yacron2/leader) would be
+    # speaks plaintext HTTP, so the election key (cronstable/leader) would be
     # world-writable to anything that can reach the host on 2379 -> trivial
-    # split-brain. The yacron2 nodes reach it over the compose network by its
+    # split-brain. The cronstable nodes reach it over the compose network by its
     # service name (etcd:2379), so it never needs to be published to the host.
     # For local etcdctl poking, run it inside the container instead:
-    #   docker compose -f docker-compose.yml exec etcd etcdctl get yacron2/leader
+    #   docker compose -f docker-compose.yml exec etcd etcdctl get cronstable/leader
     # If you must publish the client port, bind it to loopback only
     # ("127.0.0.1:2379:2379") and never expose this unauthenticated store
     # beyond localhost.
-    # The healthcheck lets the yacron2 nodes wait for etcd to be READY (see
+    # The healthcheck lets the cronstable nodes wait for etcd to be READY (see
     # their depends_on condition), not merely started. Without it the short-form
     # `depends_on: [etcd]` only waits for the container to start, so on first
     # boot the nodes race ahead and their logs show a few transient
@@ -44,26 +44,26 @@ services:
       timeout: 2s
       retries: 10
 
-  yacron2-a:
-    image: ghcr.io/ptweezy/yacron2:latest
-    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
-    hostname: yacron2-a          # becomes cluster.nodeName / the lease identity
+  cronstable-a:
+    image: ghcr.io/ptweezy/cronstable:latest
+    command: ["-c", "/etc/cronstable/cronstable.yaml"]
+    hostname: cronstable-a          # becomes cluster.nodeName / the lease identity
     depends_on:
       etcd:
         condition: service_healthy
     ports:
       - "8080:8080"
     volumes:
-      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
+      - ./cronstable.yaml:/etc/cronstable/cronstable.yaml:ro
 
-  yacron2-b:
-    image: ghcr.io/ptweezy/yacron2:latest
-    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
-    hostname: yacron2-b
+  cronstable-b:
+    image: ghcr.io/ptweezy/cronstable:latest
+    command: ["-c", "/etc/cronstable/cronstable.yaml"]
+    hostname: cronstable-b
     depends_on:
       etcd:
         condition: service_healthy
     ports:
       - "8081:8080"
     volumes:
-      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
+      - ./cronstable.yaml:/etc/cronstable/cronstable.yaml:ro

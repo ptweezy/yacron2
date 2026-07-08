@@ -1,7 +1,7 @@
-yacron2 large clustering demo
+cronstable large clustering demo
 =============================
 
-A bigger, CPU-heavy ten-node yacron2 cluster with mutual-TLS peer attestation
+A bigger, CPU-heavy ten-node cronstable cluster with mutual-TLS peer attestation
 and leader election, built to watch `distribution: spread` fan a real workload
 out across the cluster (vs single-leader, where one node runs all of it at
 once). Spread is ON by default here. Brought up by
@@ -42,7 +42,7 @@ itself by NODE_NAME. The variables it reads:
 The compose file sets DISTRIBUTION via `${DISTRIBUTION:-spread}`, so the
 defaults above are what you get unless you override them in the environment.
 
-Dashboards: yacron-a .. yacron-j on host ports 8080 .. 8089 (e.g.
+Dashboards: cronstable-a .. cronstable-j on host ports 8080 .. 8089 (e.g.
 http://localhost:8080/). Scroll to the "cluster" panel on any dashboard to watch
 attestation, leadership, and per-job ownership.
 

@@ -3,7 +3,7 @@
 The release binary jobs let uvloop compile from sdist on arches that have no
 prebuilt wheel (see .github/workflows/release.yml). A source build can succeed
 yet be subtly miscompiled -- especially under QEMU emulation -- and the frozen
-binary prefers uvloop whenever it is merely importable (yacron2/__main__.
+binary prefers uvloop whenever it is merely importable (cronstable/__main__.
 _new_event_loop), so an unusable uvloop would crash the daemon at start-up
 instead of falling back. Running a real (no-op) uvloop loop here catches that:
 the caller uninstalls uvloop on a nonzero exit, so the binary is frozen without

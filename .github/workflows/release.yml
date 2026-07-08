@@ -243,7 +243,7 @@ jobs:
           # freeze from it with `uv run` (uv discovers the setup-python 3.14).
           uv venv --python 3.14
           uv pip install pyinstaller==6.21.0  # pin matches pyinstaller/Dockerfile
-          uv pip install .                     # bakes the pinned version into yacron2/version.py
+          uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) so the binary runs the faster
           # event loop. Install a wheel where one exists, else build it from
           # sdist (ship uvloop as broadly as it compiles); a failed install
@@ -256,16 +256,16 @@ jobs:
           # Bundle orjson (the `speedups` extra) to accelerate the durable-state
           # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
           # needed). The shared script round-trip-verifies it and drops a broken
-          # build, so the binary falls back to stdlib json (yacron2/_json).
+          # build, so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
-          uv run pyinstaller pyinstaller/yacron2.spec
-          dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
-          mv dist/yacron2 "dist/yacron2-linux-${{ matrix.arch }}"
+          uv run pyinstaller pyinstaller/cronstable.spec
+          dist/cronstable --version            # smoke test: fails the job if the bundle is broken
+          mv dist/cronstable "dist/cronstable-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-linux-${{ matrix.arch }}
-          path: dist/yacron2-linux-${{ matrix.arch }}
+          name: cronstable-linux-${{ matrix.arch }}
+          path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
 
   # Build the musl/Alpine self-contained binaries, one per architecture. GitHub
@@ -345,7 +345,7 @@ jobs:
               apk add --no-cache build-base libffi-dev zlib-dev
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
-              pip install .                     # bakes the pinned version into yacron2/version.py
+              pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a musllinux wheel where one
               # exists (amd64/arm64), else a source build (ship it as broadly as
               # it compiles -- build-base above supplies the toolchain).
@@ -361,14 +361,14 @@ jobs:
               # when the wheel is missing; the shared script round-trip-verifies
               # it and drops a broken QEMU build -> stdlib json fallback.
               RUST_SETUP="apk add --no-cache curl && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
-              pyinstaller pyinstaller/yacron2.spec
-              dist/yacron2 --version            # smoke test: a musl binary on a musl host
-              mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
+              pyinstaller pyinstaller/cronstable.spec
+              dist/cronstable --version            # smoke test: a musl binary on a musl host
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}-musl
             '
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-linux-${{ matrix.arch }}-musl
-          path: dist/yacron2-linux-${{ matrix.arch }}-musl
+          name: cronstable-linux-${{ matrix.arch }}-musl
+          path: dist/cronstable-linux-${{ matrix.arch }}-musl
           if-no-files-found: error
 
   # Build the glibc self-contained binaries for the arches with no native GitHub
@@ -434,7 +434,7 @@ jobs:
               apt-get install -y --no-install-recommends build-essential libffi-dev zlib1g-dev
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the other binary jobs
-              pip install .                     # bakes the pinned version into yacron2/version.py
+              pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a manylinux wheel where one
               # exists (amd64/arm64), else a source build (ship it as broadly as
               # it compiles -- build-essential above supplies the toolchain).
@@ -450,14 +450,14 @@ jobs:
               # when the wheel is missing; the shared script round-trip-verifies
               # it and drops a broken QEMU build -> stdlib json fallback.
               RUST_SETUP="apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
-              pyinstaller pyinstaller/yacron2.spec
-              dist/yacron2 --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
-              mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
+              pyinstaller pyinstaller/cronstable.spec
+              dist/cronstable --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-linux-${{ matrix.arch }}
-          path: dist/yacron2-linux-${{ matrix.arch }}
+          name: cronstable-linux-${{ matrix.arch }}
+          path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
 
   # Build the self-contained macOS binaries, one per architecture on a native
@@ -507,21 +507,21 @@ jobs:
           # freeze from it with `uv run` (uv discovers the setup-python 3.14).
           uv venv --python 3.14
           uv pip install pyinstaller==6.21.0  # pin matches the Linux jobs
-          uv pip install .                     # bakes the pinned version into yacron2/version.py
+          uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
           # ships wheels for both arches. verify_uvloop.py confirms it imports and
           # runs a loop, else uninstalls it so the binary falls back to asyncio
-          # (yacron2/__main__._new_event_loop).
+          # (cronstable/__main__._new_event_loop).
           uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
           uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
           # Bundle orjson (the `speedups` extra) to accelerate the durable-state
           # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
           # needed). The shared script round-trip-verifies it and drops a broken
-          # build, so the binary falls back to stdlib json (yacron2/_json).
+          # build, so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
-          uv run pyinstaller pyinstaller/yacron2.spec
-          dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
+          uv run pyinstaller pyinstaller/cronstable.spec
+          dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Assert the binary is the intended native arch: Rosetta would happily
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
           # silently shipping a mislabelled asset. `file` reports x86_64/arm64.
@@ -529,7 +529,7 @@ jobs:
             amd64) want=x86_64 ;;
             arm64) want=arm64 ;;
           esac
-          file dist/yacron2 | grep -q "$want"
+          file dist/cronstable | grep -q "$want"
       # Developer ID sign + notarize the binary in place. Guarded on the cert
       # secret: if the macOS signing secrets are not configured, the step warns
       # and exits 0, leaving the unsigned binary to ship as before. Renaming
@@ -570,29 +570,29 @@ jobs:
           codesign --force --options runtime --timestamp \
             --entitlements pyinstaller/entitlements.plist \
             --keychain "$KEYCHAIN" \
-            --sign "$MACOS_SIGN_IDENTITY" dist/yacron2
-          codesign --verify --strict --verbose=2 dist/yacron2
+            --sign "$MACOS_SIGN_IDENTITY" dist/cronstable
+          codesign --verify --strict --verbose=2 dist/cronstable
 
           # Notarize: the zip is just the upload transport; the ticket binds to
           # the binary's signature, so we keep shipping the bare signed binary.
           echo "$MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
-          ditto -c -k dist/yacron2 "$RUNNER_TEMP/yacron2.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/yacron2.zip" \
+          ditto -c -k dist/cronstable "$RUNNER_TEMP/cronstable.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/cronstable.zip" \
             --key "$RUNNER_TEMP/AuthKey.p8" \
             --key-id "$MACOS_NOTARY_KEY_ID" \
             --issuer "$MACOS_NOTARY_ISSUER_ID" \
             --wait
       - name: Rename binary
-        run: mv dist/yacron2 "dist/yacron2-macos-${{ matrix.arch }}"
+        run: mv dist/cronstable "dist/cronstable-macos-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-macos-${{ matrix.arch }}
-          path: dist/yacron2-macos-${{ matrix.arch }}
+          name: cronstable-macos-${{ matrix.arch }}
+          path: dist/cronstable-macos-${{ matrix.arch }}
           if-no-files-found: error
 
   # Build the self-contained Windows binaries: amd64 on the hosted runner,
   # arm64 on the windows-11-arm runner. Same pyinstaller pin and `--version`
-  # smoke test as the Linux/macOS jobs; the assets are yacron2-windows-<arch>.exe.
+  # smoke test as the Linux/macOS jobs; the assets are cronstable-windows-<arch>.exe.
   # Any C-extension dep lacking a win_arm64 wheel (parts of the aiohttp stack and
   # ruamel.yaml.clib) compiles from sdist via the runner's Visual Studio ARM64
   # toolchain -- the same sdist fallback the QEMU Linux legs use for
@@ -635,20 +635,20 @@ jobs:
           # throwaway uv venv and freeze from it with `uv run`.
           uv venv --python 3.14
           uv pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
-          uv pip install .                     # bakes the pinned version into yacron2/version.py
+          uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle orjson (the `speedups` extra) for the durable-state / cluster
           # JSON paths; Windows amd64 ships a wheel (arm64 falls back if none).
           # The shared script round-trip-verifies it and drops a broken build,
-          # so the binary falls back to stdlib json (yacron2/_json).
+          # so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
-          uv run pyinstaller pyinstaller/yacron2.spec
-          ./dist/yacron2.exe --version      # smoke test: fails the job if the bundle is broken
-          mv dist/yacron2.exe "dist/yacron2-windows-${{ matrix.arch }}.exe"
+          uv run pyinstaller pyinstaller/cronstable.spec
+          ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
+          mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-windows-${{ matrix.arch }}
-          path: dist/yacron2-windows-${{ matrix.arch }}.exe
+          name: cronstable-windows-${{ matrix.arch }}
+          path: dist/cronstable-windows-${{ matrix.arch }}.exe
           if-no-files-found: error
 
   release:
@@ -696,13 +696,13 @@ jobs:
       # Pull in every per-arch binary built by the binaries-* jobs (Linux glibc
       # + musl, macOS) and flatten them into ./binaries. The pattern must stay
       # broad enough to match all of them -- a too-narrow pattern (e.g.
-      # `yacron2-linux-*`) does NOT error on the artifacts it misses, it just
+      # `cronstable-linux-*`) does NOT error on the artifacts it misses, it just
       # silently drops them from the release.
       - name: Download release binaries
         uses: actions/download-artifact@v8.0.1
         with:
           path: binaries
-          pattern: yacron2-*
+          pattern: cronstable-*
           merge-multiple: true
 
       # Publish a SHA256SUMS manifest alongside the assets so downloads can be
@@ -713,7 +713,7 @@ jobs:
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
-          cp dist/*.whl dist/*.tar.gz binaries/yacron2-* "$work"/
+          cp dist/*.whl dist/*.tar.gz binaries/cronstable-* "$work"/
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
 
@@ -756,25 +756,25 @@ jobs:
             SHA256SUMS
             dist/*.whl
             dist/*.tar.gz
-            binaries/yacron2-linux-amd64
-            binaries/yacron2-linux-arm64
-            binaries/yacron2-linux-i686
-            binaries/yacron2-linux-armv7
-            binaries/yacron2-linux-ppc64le
-            binaries/yacron2-linux-s390x
-            binaries/yacron2-linux-riscv64
-            binaries/yacron2-linux-amd64-musl
-            binaries/yacron2-linux-arm64-musl
-            binaries/yacron2-linux-i686-musl
-            binaries/yacron2-linux-armv7-musl
-            binaries/yacron2-linux-ppc64le-musl
-            binaries/yacron2-linux-s390x-musl
-            binaries/yacron2-linux-riscv64-musl
-            binaries/yacron2-linux-armv6-musl
-            binaries/yacron2-macos-amd64
-            binaries/yacron2-macos-arm64
-            binaries/yacron2-windows-amd64.exe
-            binaries/yacron2-windows-arm64.exe
+            binaries/cronstable-linux-amd64
+            binaries/cronstable-linux-arm64
+            binaries/cronstable-linux-i686
+            binaries/cronstable-linux-armv7
+            binaries/cronstable-linux-ppc64le
+            binaries/cronstable-linux-s390x
+            binaries/cronstable-linux-riscv64
+            binaries/cronstable-linux-amd64-musl
+            binaries/cronstable-linux-arm64-musl
+            binaries/cronstable-linux-i686-musl
+            binaries/cronstable-linux-armv7-musl
+            binaries/cronstable-linux-ppc64le-musl
+            binaries/cronstable-linux-s390x-musl
+            binaries/cronstable-linux-riscv64-musl
+            binaries/cronstable-linux-armv6-musl
+            binaries/cronstable-macos-amd64
+            binaries/cronstable-macos-arm64
+            binaries/cronstable-windows-amd64.exe
+            binaries/cronstable-windows-arm64.exe
 
   # Build + push the multi-arch container image at the just-released version.
   # Invoked here (workflow_call) rather than via `on: release` because a Release
@@ -793,8 +793,8 @@ jobs:
     secrets: inherit
 
   # Push the just-released version to the Homebrew tap (ptweezy/homebrew-tap) so
-  # `brew install ptweezy/tap/yacron2` and `brew upgrade` track releases with no
-  # manual step. Re-renders Formula/yacron2.rb from the template in this repo,
+  # `brew install ptweezy/tap/cronstable` and `brew upgrade` track releases with no
+  # manual step. Re-renders Formula/cronstable.rb from the template in this repo,
   # pinning each binary's SHA256 from the SHA256SUMS the `release` job published.
   #
   # Cross-repo pushes need a token the default GITHUB_TOKEN can't provide: set a
@@ -822,21 +822,21 @@ jobs:
           # Fetch the checksums this release just published (retry: the asset can
           # lag the API by a few seconds after the release is created).
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o SHA256SUMS \
-            "https://github.com/ptweezy/yacron2/releases/download/${VERSION}/SHA256SUMS"
+            "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/SHA256SUMS"
 
           git clone --depth 1 \
             "https://x-access-token:${TAP_TOKEN}@github.com/ptweezy/homebrew-tap.git" tap
           mkdir -p tap/Formula
           bash packaging/homebrew/render-formula.sh \
-            "$VERSION" SHA256SUMS packaging/homebrew/yacron2.rb.tmpl > tap/Formula/yacron2.rb
+            "$VERSION" SHA256SUMS packaging/homebrew/cronstable.rb.tmpl > tap/Formula/cronstable.rb
 
           cd tap
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Formula/yacron2.rb; then
+          if git diff --quiet -- Formula/cronstable.rb; then
             echo "Formula already current for ${VERSION}."
             exit 0
           fi
-          git add Formula/yacron2.rb
-          git commit -m "yacron2 ${VERSION}"
+          git add Formula/cronstable.rb
+          git commit -m "cronstable ${VERSION}"
           git push

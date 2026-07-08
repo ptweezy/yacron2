@@ -4,7 +4,7 @@ Every job's `schedule` determines *when* it runs; `utc` and `timezone` determine
 
 ## The `schedule` option
 
-`schedule` is **required** on every job. The strictyaml schema accepts two YAML types for it (`yacron2/config.py`):
+`schedule` is **required** on every job. The strictyaml schema accepts two YAML types for it (`cronstable/config.py`):
 
 ```
 "schedule": Str()
@@ -21,24 +21,24 @@ Every job's `schedule` determines *when* it runs; `utc` and `timezone` determine
 
 so `schedule` is either a string or an object. `JobConfig._parse_schedule` turns that raw value into one of:
 
-- a `yacron2.cronexpr.CronTab` instance (a parsed crontab expression), or
+- a `cronstable.cronexpr.CronTab` instance (a parsed crontab expression), or
 - the literal string `"@reboot"`.
 
 Any other value raises `ConfigError("invalid schedule: ...")`.
 
-The crontab dialect is implemented by yacron2's own built-in engine (`yacron2/cronexpr.py`, no third-party dependency). Field syntax is the dialect yacron2 has always accepted — ranges `1-5`, steps `*/5` (and `5/15`: start plus step, running to the field's end), lists `1,15,30`, case-insensitive names like `mon`/`jan` — not the system `cron(5)` man page. The notable rules:
+The crontab dialect is implemented by cronstable's own built-in engine (`cronstable/cronexpr.py`, no third-party dependency). Field syntax is the dialect cronstable has always accepted — ranges `1-5`, steps `*/5` (and `5/15`: start plus step, running to the field's end), lists `1,15,30`, case-insensitive names like `mon`/`jan` — not the system `cron(5)` man page. The notable rules:
 
 - **Day-of-week** accepts `0`–`7`, with both `0` and `7` meaning Sunday; a range ending in `0` wraps its end to Sunday-as-7, so `sat-sun` and `6-0` mean Saturday+Sunday.
 - **`L`** alone in day-of-month is the month's last day (`0 0 L * *`); `L<n>` in day-of-week is the month's *last* such weekday (`L5` = last Friday). No other field takes an `L`.
-- **Day-of-month AND day-of-week**: when both are restricted, a day must satisfy *both* (`0 0 13 * 5` fires only on Friday the 13th). Vixie cron fires when *either* matches; yacron2 deliberately keeps the AND rule its schedules have always had.
+- **Day-of-month AND day-of-week**: when both are restricted, a day must satisfy *both* (`0 0 13 * 5` fires only on Friday the 13th). Vixie cron fires when *either* matches; cronstable deliberately keeps the AND rule its schedules have always had.
 - **`year`** accepts 1970–2099, and `next()` never searches past 2099: a schedule with no remaining occurrence (`year: "2020"`, or an impossible date like Feb 30) simply never fires.
 
 Earlier releases delegated this dialect to the third-party parse-crontab library; the built-in engine is behavior-compatible with it, vector-by-vector — see `tests/gen_cron_golden.py` and `tests/data/cron_golden.json` for the recorded compatibility corpus.
 
-Schedules do not have to live in YAML at all: yacron2 also loads whole
+Schedules do not have to live in YAML at all: cronstable also loads whole
 classic crontab files (`*.crontab`, `*.cron`, or a file named `crontab`),
 whose entries use this same field dialect plus the `@` nicknames and default
-to UTC like every other yacron2 schedule. See [Classic Crontabs](Classic-Crontabs).
+to UTC like every other cronstable schedule. See [Classic Crontabs](Classic-Crontabs).
 
 ## Form 1: crontab string (5, 6 or 7 fields)
 
@@ -65,7 +65,7 @@ So a seven-field string schedules at **second granularity** (see [Second-level s
 
 ## Second-level schedules
 
-yacron2 can run jobs at second granularity. Give the schedule a `second` (via the seven-field string above, or the `second:` object key in [Form 3](#form-3-schedule-object)); both jobs below run every 15 seconds:
+cronstable can run jobs at second granularity. Give the schedule a `second` (via the seven-field string above, or the `second:` object key in [Form 3](#form-3-schedule-object)); both jobs below run every 15 seconds:
 
 ```yaml
 jobs:
@@ -91,9 +91,9 @@ jobs:
     schedule: "@reboot"
 ```
 
-Behavior comes from `Cron.job_should_run` (`yacron2/cron.py`): on the first scheduler pass the `startup` flag is `True` and a `@reboot` job returns `True`; on every subsequent pass `startup` is `False`, so `@reboot` jobs return `False`. Conversely, `CronTab`-scheduled jobs return `False` during the startup pass and are only evaluated on later passes. There is no recurring "@reboot". To keep a long-running process alive, `README.md` recommends a `@reboot` schedule combined with `onFailure.retry.maximumRetries: -1` (retry forever), so yacron2 relaunches the process whenever it exits/fails.
+Behavior comes from `Cron.job_should_run` (`cronstable/cron.py`): on the first scheduler pass the `startup` flag is `True` and a `@reboot` job returns `True`; on every subsequent pass `startup` is `False`, so `@reboot` jobs return `False`. Conversely, `CronTab`-scheduled jobs return `False` during the startup pass and are only evaluated on later passes. There is no recurring "@reboot". To keep a long-running process alive, `README.md` recommends a `@reboot` schedule combined with `onFailure.retry.maximumRetries: -1` (retry forever), so cronstable relaunches the process whenever it exits/fails.
 
-`"@reboot"` is the only `@`-keyword recognized by yacron2 itself. Other shorthands are *not* intercepted by `_parse_schedule`; the cron engine accepts `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily` and `@hourly` (their classic five-field expansions), while `@midnight` is accepted only in [classic crontab files](Classic-Crontabs), whose loader rewrites it to `@daily`.
+`"@reboot"` is the only `@`-keyword recognized by cronstable itself. Other shorthands are *not* intercepted by `_parse_schedule`; the cron engine accepts `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily` and `@hourly` (their classic five-field expansions), while `@midnight` is accepted only in [classic crontab files](Classic-Crontabs), whose loader rewrites it to `@daily`.
 
 ## Form 3: schedule object
 
@@ -109,7 +109,7 @@ jobs:
       dayOfWeek: "mon-fri"
 ```
 
-`schedule_object_to_crontab` (in `yacron2/config.py`) builds a crontab string from exactly these keys and `_parse_schedule` feeds it to `CronTab`:
+`schedule_object_to_crontab` (in `cronstable/config.py`) builds a crontab string from exactly these keys and `_parse_schedule` feeds it to `CronTab`:
 
 | Object key   | Crontab field | Default if omitted |
 |--------------|---------------|--------------------|
@@ -162,7 +162,7 @@ Resolution order (`timezone` wins):
 
 The resolved value is a `datetime.tzinfo` (or `None`) stored on the job and passed to `get_now(job.timezone)` when the schedule is tested. Because `utc` is `true` by default, **schedules are interpreted in UTC unless you opt out.**
 
-Timezone names are resolved via the standard-library `zoneinfo`, with the `tzdata` package providing the database. yacron2 depends on `tzdata>=2024.1` so resolution works on minimal/distroless images that lack a system zoneinfo database. (Prior to the migration documented in `HISTORY.md`, yacron2 used `pytz`; invalid timezones now raise `ConfigError` rather than being silently accepted.)
+Timezone names are resolved via the standard-library `zoneinfo`, with the `tzdata` package providing the database. cronstable depends on `tzdata>=2024.1` so resolution works on minimal/distroless images that lack a system zoneinfo database. (Prior to the migration documented in `HISTORY.md`, cronstable used `pytz`; invalid timezones now raise `ConfigError` rather than being silently accepted.)
 
 Local time:
 
@@ -188,7 +188,7 @@ jobs:
 
 ## How the scheduler ticks
 
-The scheduler does not run a per-job timer, and it does not scan every job on a fixed tick either. It keeps a **next-fire index** and **sleeps until the soonest job is due** (`yacron2/cron.py`):
+The scheduler does not run a per-job timer, and it does not scan every job on a fixed tick either. It keeps a **next-fire index** and **sleeps until the soonest job is due** (`cronstable/cron.py`):
 
 - **The next-fire index.** Every enabled `CronTab` job carries the instant it next fires — an aware **UTC** datetime — in `Cron._next_fire`, mirrored into the `_fire_heap` min-heap. Each instant is computed by `crontab.next()` in the job's *own* frame (its `timezone`, or the system-local zone when it has none) and stored back in UTC, so a job's DST offset is handled where it applies and the heap still orders everything on one absolute timeline. `@reboot` and disabled jobs are not in the index.
 - **Sleep until the soonest fire.** Each iteration sleeps until the earliest instant in the heap, capped at the next whole UTC minute so housekeeping (below) still runs about once a minute. On wake, only the jobs whose instant has arrived are serviced (`_due_names` pops them); nothing else is touched. An idle wake over a large fleet is an O(1) heap peek, and a wake with a due cohort does crontab work only for that cohort — cost scales with **jobs due**, not jobs configured.

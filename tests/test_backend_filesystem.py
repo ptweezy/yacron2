@@ -3,9 +3,9 @@
 Unlike the etcd/kubernetes backends there is no network transport to fake:
 the store IS a directory, so these tests drive real elections over a
 ``tmp_path`` shared by two backend instances.  Time is never slept on --
-the wall clock is the ``yacron2.state._now`` /
-``yacron2.backends.filesystem._wallclock`` seams and the monotonic gates
-are ``yacron2.backends.filesystem._monotonic``, all patched together; the
+the wall clock is the ``cronstable.state._now`` /
+``cronstable.backends.filesystem._wallclock`` seams and the monotonic gates
+are ``cronstable.backends.filesystem._monotonic``, all patched together; the
 renew loop's background task is never started (rounds are driven with
 ``await b._renew_once()``), matching the etcd test recipe.
 
@@ -19,11 +19,11 @@ import logging
 
 import pytest
 
-import yacron2.backends.filesystem as fsb_mod
-import yacron2.state as state_mod
-from yacron2.backends.filesystem import FilesystemBackend, display_name
-from yacron2.config import ConfigError, parse_config_string
-from yacron2.leadership import make_backend
+import cronstable.backends.filesystem as fsb_mod
+import cronstable.state as state_mod
+from cronstable.backends.filesystem import FilesystemBackend, display_name
+from cronstable.config import ConfigError, parse_config_string
+from cronstable.leadership import make_backend
 
 # --- helpers ---------------------------------------------------------------
 
@@ -433,7 +433,7 @@ async def test_follower_failing_ran_read_is_debug_and_throttled(
     try:
         calls = _failing_list_records(monkeypatch, b)
         caplog.set_level(
-            logging.DEBUG, logger="yacron2.backends.filesystem"
+            logging.DEBUG, logger="cronstable.backends.filesystem"
         )
         for _ in range(6):  # spans just under one refresh period
             await a._renew_once()  # A keeps leading throughout
@@ -473,7 +473,7 @@ async def test_leader_failing_ran_read_warns_once_per_period(
     try:
         calls = _failing_list_records(monkeypatch, a)
         caplog.set_level(
-            logging.DEBUG, logger="yacron2.backends.filesystem"
+            logging.DEBUG, logger="cronstable.backends.filesystem"
         )
         for _ in range(6):  # spans just under one warn period
             await a._renew_once()

@@ -1,7 +1,7 @@
 Classic crontabs
 ================
 
-yacron2 runs plain Vixie-style crontabs as-is, next to (or instead of) its
+cronstable runs plain Vixie-style crontabs as-is, next to (or instead of) its
 YAML configs. This directory is a runnable config dir mixing both formats.
 
 Files
@@ -16,23 +16,23 @@ Try it
 ------
 
   # from the repository root:
-  yacron2 -c example/crontab
+  cronstable -c example/crontab
 
-  # every legacy.crontab entry is an ordinary yacron2 job named
+  # every legacy.crontab entry is an ordinary cronstable job named
   # legacy.crontab:<line number>; watch them all (YAML and crontab alike)
   # in the dashboard:
   #   http://localhost:8080/
 
   # a single crontab also works with no YAML at all:
-  yacron2 -c example/crontab/legacy.crontab
+  cronstable -c example/crontab/legacy.crontab
 
 What to notice
 --------------
 
-  - Crontab entries get yacron2's standard defaults, not a cron emulation:
+  - Crontab entries get cronstable's standard defaults, not a cron emulation:
     schedules run in UTC unless CRON_TZ says otherwise, failure means a
     nonzero exit or stderr output (MAILTO is exported but sends no mail),
-    and uncaptured stdout passes through to yacron2's own stdout -- so the
+    and uncaptured stdout passes through to cronstable's own stdout -- so the
     crontab echoes land in your terminal, while the YAML job (with
     captureStdout: true) shows its output in the dashboard's log tail.
 
@@ -41,4 +41,4 @@ What to notice
     directory for as long as a migration takes.
 
 Full details and every deviation from cron:
-https://github.com/ptweezy/yacron2/wiki/Classic-Crontabs
+https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs

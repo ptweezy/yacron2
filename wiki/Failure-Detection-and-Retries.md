@@ -1,14 +1,14 @@
 # Failure Detection and Retries
 
-This page documents how yacron2 decides whether a job run failed (`failsWhen`), the exact precedence order of failure reasons, the retry mechanism with exponential backoff (`onFailure.retry`), and when each of the three report hooks (`onFailure`, `onPermanentFailure`, `onSuccess`) fires.
+This page documents how cronstable decides whether a job run failed (`failsWhen`), the exact precedence order of failure reasons, the retry mechanism with exponential backoff (`onFailure.retry`), and when each of the three report hooks (`onFailure`, `onPermanentFailure`, `onSuccess`) fires.
 
 ## Overview
 
-After a job process exits, yacron2 computes a single failure reason from the run's exit code and captured output. If the reason is non-empty the run is *failed*; otherwise it *succeeded*. Failure triggers `onFailure` reporting and, if a retry is configured and not yet exhausted, schedules another run after a backoff delay. When retries are exhausted (or none was configured) `onPermanentFailure` reporting fires. Success cancels any pending retry and fires `onSuccess` reporting.
+After a job process exits, cronstable computes a single failure reason from the run's exit code and captured output. If the reason is non-empty the run is *failed*; otherwise it *succeeded*. Failure triggers `onFailure` reporting and, if a retry is configured and not yet exhausted, schedules another run after a backoff delay. When retries are exhausted (or none was configured) `onPermanentFailure` reporting fires. Success cancels any pending retry and fires `onSuccess` reporting.
 
 ## Determining failure: `failsWhen`
 
-`failsWhen` is a per-job (or per-`defaults`) block of four booleans. It is evaluated by `RunningJob.fail_reason` (`yacron2/job.py`) after the process exits and its streams have been read.
+`failsWhen` is a per-job (or per-`defaults`) block of four booleans. It is evaluated by `RunningJob.fail_reason` (`cronstable/job.py`) after the process exits and its streams have been read.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -17,7 +17,7 @@ After a job process exits, yacron2 computes a single failure reason from the run
 | `nonzeroReturn` | Bool | `true` | If true, an exit code other than `0` marks the run as failed. |
 | `always` | Bool | `false` | If true, the run is always considered failed regardless of exit code or output. |
 
-In the strictyaml schema (`yacron2/config.py`), only `producesStdout` is required within a `failsWhen` map; `producesStderr`, `nonzeroReturn`, and `always` are `Opt(...)`. Defaults come from `DEFAULT_CONFIG["failsWhen"]` and are merged in before a `failsWhen` block is applied, so a partial `failsWhen` block inherits the defaults for the keys it omits.
+In the strictyaml schema (`cronstable/config.py`), only `producesStdout` is required within a `failsWhen` map; `producesStderr`, `nonzeroReturn`, and `always` are `Opt(...)`. Defaults come from `DEFAULT_CONFIG["failsWhen"]` and are merged in before a `failsWhen` block is applied, so a partial `failsWhen` block inherits the defaults for the keys it omits.
 
 Output detection considers both retained and discarded lines. A stream is treated as non-empty if it has saved content *or* if any lines were discarded (`saveLimit` exhausted, or `saveLimit: 0`). See [Output Capturing](Output-Capturing) for how `captureStdout`/`captureStderr` and `saveLimit` govern what is captured. If a stream is not captured, it cannot produce a failure reason: `producesStderr` only fires when `captureStderr` is enabled, and `producesStdout` only fires when `captureStdout` is enabled.
 
@@ -30,7 +30,7 @@ Output detection considers both retained and discarded lines. A stream is treate
 3. `producesStdout` is true and stdout is non-empty or any stdout lines were discarded -> `"failsWhen=producesStdout and stdout is not empty"`.
 4. `producesStderr` is true and stderr is non-empty or any stderr lines were discarded -> `"failsWhen=producesStderr and stderr is not empty"`.
 
-The first match wins; later conditions are not evaluated. The resulting string is exposed to report templates as the `fail_reason` variable and to the shell reporter as `YACRON2_FAIL_REASON`. The boolean `failed` is simply `fail_reason is not None`.
+The first match wins; later conditions are not evaluated. The resulting string is exposed to report templates as the `fail_reason` variable and to the shell reporter as `CRONSTABLE_FAIL_REASON`. The boolean `failed` is simply `fail_reason is not None`.
 
 ### Special exit codes
 
@@ -59,7 +59,7 @@ jobs:
 
 ## Retries: `onFailure.retry`
 
-Retries are configured under `onFailure.retry`. Retry orchestration lives in `yacron2/cron.py` (`launch_scheduled_job`, `handle_job_failure`, `schedule_retry_job`, `cancel_job_retries`); per-job backoff state is `JobRetryState` in `yacron2/job.py`. Retry state is in-memory by default, so a pending retry dies with the process; with a `state:` section configured it also survives daemon restarts (see "Restart-surviving retries" below), and on a shared store under leader election a ladder can even move to the node that now owns the job (see "Cross-node retry resume" below).
+Retries are configured under `onFailure.retry`. Retry orchestration lives in `cronstable/cron.py` (`launch_scheduled_job`, `handle_job_failure`, `schedule_retry_job`, `cancel_job_retries`); per-job backoff state is `JobRetryState` in `cronstable/job.py`. Retry state is in-memory by default, so a pending retry dies with the process; with a `state:` section configured it also survives daemon restarts (see "Restart-surviving retries" below), and on a shared store under leader election a ladder can even move to the node that now owns the job (see "Cross-node retry resume" below).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -96,7 +96,7 @@ The ladder is a pure function of the retry config and the attempt number, which 
 - A success (`handle_job_success`) calls `cancel_job_retries` and fires `onSuccess`, ending the sequence.
 - If a job is removed from the configuration while a retry is pending, `schedule_retry_job` logs a warning, discards the stale retry state, and skips the run cleanly (no exception).
 - When leader election is enabled (`cluster.electLeader`), `schedule_retry_job` re-checks the cluster gate before relaunching. A transient fail-closed condition (lost quorum, a detected conflict, a rebuilt gossip manager's still-converging view, a backend read error) does *not* end the sequence: the retry state is kept and the gate is re-checked after another delay of the same length (floored at one second; the first deferral of a wait is logged at INFO, repeats at DEBUG), so a keep-alive job survives the blip. Only when another node is *positively* identified as the job's owner does the pending retry leave this node, and what happens then depends on the store. When cross-node retry resume is active (a shared-topology state store under leader election, see "Cross-node retry resume" below) the ladder is **handed off**: the local retry state is cancelled, a `handoff` record supersedes the durable pending one, a WARNING is logged, and *no* `cancelled` run-history record is written -- the attempt is not ending, it is moving, and the new owner *resumes the same attempt* from its durable record. Otherwise the pending retry is **abandoned**: the retry state is cancelled and discarded, a WARNING is logged, the abandonment is recorded in the run history as `cancelled`, and the failed attempt is not re-run elsewhere: the new owner only picks up the job's *future scheduled firings*. Neither path fires `onPermanentFailure`. An `@reboot` ladder is anchored to its host's boot and is never handed off, and an `@reboot` one-shot has no future firing either (its boot run is already recorded), so an abandoned `@reboot` keep-alive ends cluster-wide even when resume is active; `EveryNode` ladders stay strictly per-node. See [Clustering and Leader Election](Clustering-and-Leader-Election).
-- On shutdown, all pending retries are cancelled before yacron2 exits. Without a `state:` section that ends the sequence for good; with one, the graceful-shutdown cancellation deliberately does *not* settle the durable pending record, so the next start re-arms it (see below).
+- On shutdown, all pending retries are cancelled before cronstable exits. Without a `state:` section that ends the sequence for good; with one, the graceful-shutdown cancellation deliberately does *not* settle the durable pending record, so the next start re-arms it (see below).
 
 ### Restart-surviving retries
 
@@ -104,7 +104,7 @@ Everything in this subsection activates only when a `state:` config section is p
 
 With `state:` configured, every job with a non-zero `maximumRetries` gets a durable retry ladder alongside the in-memory one:
 
-- When a retry is armed, a *pending* record is appended (fire-and-forget) to the job's durable retry stream, carrying the attempt number, the **absolute** `notBefore` deadline, and the job's per-job config digest (`yacron2.fingerprint.job_digest`). A write that never lands loses only the durability: the retry dies with the process, exactly the stateless behaviour. No durable record is written for a ladder that never scheduled a retry, so a retry-armed job that keeps succeeding costs no store writes.
+- When a retry is armed, a *pending* record is appended (fire-and-forget) to the job's durable retry stream, carrying the attempt number, the **absolute** `notBefore` deadline, and the job's per-job config digest (`cronstable.fingerprint.job_digest`). A write that never lands loses only the durability: the retry dies with the process, exactly the stateless behaviour. No durable record is written for a ladder that never scheduled a retry, so a retry-armed job that keeps succeeding costs no store writes.
 - Every way a ladder can resolve appends a *settled* record on top, so the next boot finds nothing pending. The settle reasons are `launched` (the settle-before-launch write below), `succeeded` (the run succeeded), `superseded` (a fresh scheduled fire reset the sequence), `cancelled` (e.g. a run cancelled from the dashboard), `exhausted` (`maximumRetries` reached), `owner-moved` (the cluster abandonment described above -- on a shared store the ladder is handed off instead of settled, see "Cross-node retry resume" below), `superseded-by-run` (a claim scan found a durable run newer than the ladder), and `job-removed` (the job disappeared from a reloaded config while the retry slept), plus the boot-time invalidation reasons below.
 - Just before a retry launches, its pending record is settled with reason `launched` -- record-before-run, so a crash right after the launch cannot re-arm the attempt that already ran. This is the at-most-once bias. The one caveat: under the default `onStoreUnavailable: degrade`, a settle write that cannot land launches anyway (at-least-once -- a crash in that narrow window could replay that one attempt after a restart); under `onStoreUnavailable: fail-closed` the launch is deferred and re-checked instead, exactly like a closed cluster gate.
 - A graceful shutdown does **not** settle: the shutdown drain cancels the in-process retry tasks but leaves the pending record on top of the stream, and that record is exactly what the next boot re-arms.
@@ -145,7 +145,7 @@ jobs:
 
 ### Restart a long-running process
 
-A schedule of `@reboot` runs the job once at yacron2 startup. Combined with `maximumRetries: -1`, this re-launches the process whenever it exits with a failure, indefinitely: a way to keep a long-running process alive under yacron2.
+A schedule of `@reboot` runs the job once at cronstable startup. Combined with `maximumRetries: -1`, this re-launches the process whenever it exits with a failure, indefinitely: a way to keep a long-running process alive under cronstable.
 
 ```yaml
 jobs:
@@ -160,7 +160,7 @@ jobs:
         backoffMultiplier: 2
 ```
 
-By default the keep-alive lasts only as long as the yacron2 process: a daemon restart runs the `@reboot` job afresh and any pending retry is lost. With a `state:` section configured, both halves become durable: the boot run is deduplicated to once per OS boot, and a pending retry is re-armed across daemon restarts, so the supervisor pattern survives them (see "Restart-surviving retries" above).
+By default the keep-alive lasts only as long as the cronstable process: a daemon restart runs the `@reboot` job afresh and any pending retry is lost. With a `state:` section configured, both halves become durable: the boot run is deduplicated to once per OS boot, and a pending retry is re-armed across daemon restarts, so the supervisor pattern survives them (see "Restart-surviving retries" above).
 
 See [Schedules and Timezones](Schedules-and-Timezones) for `@reboot` semantics.
 
@@ -203,4 +203,4 @@ A note on mail reporting: an `onSuccess` mail whose rendered body is empty (afte
 - `nonzeroReturn` checks `retcode != 0`, so both the synthetic `127` (launch failure) and `-100` (timeout) codes count as non-zero failures under the default.
 - The `failsWhen` evaluation runs once per completed run, including each retried run, so a retry that still produces stderr (with `producesStderr: true`) fails again and continues the backoff sequence.
 - Output-based failure (`producesStdout`/`producesStderr`) depends on stream capturing; without `captureStdout`/`captureStderr` the corresponding condition can never trigger because nothing is captured.
-- During shutdown, `handle_job_failure` returns early if the stop event is set: a job that finishes failing while yacron2 is shutting down is *not* reported (`onFailure`/`onPermanentFailure` do not fire) and is not retried. A job that finishes successfully during shutdown still cancels its retries and fires `onSuccess`.
+- During shutdown, `handle_job_failure` returns early if the stop event is set: a job that finishes failing while cronstable is shutting down is *not* reported (`onFailure`/`onPermanentFailure` do not fire) and is not retried. A job that finishes successfully during shutdown still cancels its retries and fires `onSuccess`.

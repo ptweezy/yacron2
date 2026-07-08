@@ -9,11 +9,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import yacron2.cron
+import cronstable.cron
 from tests._commands import cmd_hang, cmd_print, cmd_sleep, yaml_command
-from yacron2 import platform
-from yacron2.config import ConfigError, JobConfig, parse_config_string
-from yacron2.job import JobOutputStream, JobRetryState, RunningJob
+from cronstable import platform
+from cronstable.config import ConfigError, JobConfig, parse_config_string
+from cronstable.job import JobOutputStream, JobRetryState, RunningJob
 
 
 async def _noop():
@@ -36,13 +36,13 @@ def fixed_current_time(monkeypatch):
                 now = now.astimezone(timezone)
         return now
 
-    monkeypatch.setattr("yacron2.cron.get_now", get_now)
+    monkeypatch.setattr("cronstable.cron.get_now", get_now)
 
 
 @pytest.fixture()
 def tracing_running_job(monkeypatch):
     TracingRunningJob._TRACE = asyncio.Queue()
-    monkeypatch.setattr(yacron2.cron, "RunningJob", TracingRunningJob)
+    monkeypatch.setattr(cronstable.cron, "RunningJob", TracingRunningJob)
     yield TracingRunningJob
     TracingRunningJob._TRACE = asyncio.Queue()
 
@@ -120,7 +120,7 @@ JOB_THAT_FAILS = (
 )
 @pytest.mark.asyncio
 async def test_simple(tracing_running_job, config_yaml, expected_events):
-    cron = yacron2.cron.Cron(None, config_yaml=config_yaml)
+    cron = cronstable.cron.Cron(None, config_yaml=config_yaml)
 
     events = []
 
@@ -159,7 +159,7 @@ RETRYING_JOB_THAT_FAILS = (
 
 @pytest.mark.asyncio
 async def test_fail_retry(tracing_running_job):
-    cron = yacron2.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS)
+    cron = cronstable.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS)
 
     events = []
 
@@ -222,7 +222,7 @@ JOB_THAT_HANGS = (
 
 @pytest.mark.asyncio
 async def test_execution_timeout(tracing_running_job):
-    cron = yacron2.cron.Cron(None, config_yaml=JOB_THAT_HANGS)
+    cron = cronstable.cron.Cron(None, config_yaml=JOB_THAT_HANGS)
 
     events = []
     jobs_stdout = {}
@@ -279,7 +279,7 @@ async def test_concurrency_policy(policy):
     # Launch the same long-running job twice and assert the second launch is
     # handled per the policy. Driven directly (no wall-clock dependence) so it
     # is deterministic.
-    cron = yacron2.cron.Cron(
+    cron = cronstable.cron.Cron(
         None, config_yaml=CONCURRENT_JOB.format(policy=policy)
     )
     job = cron.cron_jobs["test"]
@@ -320,7 +320,7 @@ async def test_handle_finished_job_skips_replaced(monkeypatch):
     # success or failure (and must not trigger retries).
     from types import SimpleNamespace
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     calls = []
 
     async def fake_failure(job):
@@ -356,7 +356,7 @@ async def test_handle_finished_job_skips_replaced(monkeypatch):
 async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     from types import SimpleNamespace
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     calls = []
 
     async def fake_failure(job):
@@ -393,7 +393,7 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
 
 def test_simple_config_file(tracing_running_job):
     config_arg = str(Path(__file__).parent / "testconfig.yaml")
-    yacron2.cron.Cron(config_arg)
+    cronstable.cron.Cron(config_arg)
 
 
 RETRYING_JOB_THAT_FAILS2 = (
@@ -459,9 +459,9 @@ async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noq
     def get_reltime(ts):
         return START_TIME + datetime.timedelta(seconds=(ts - t0))
 
-    monkeypatch.setattr("yacron2.cron.get_now", get_now)
+    monkeypatch.setattr("cronstable.cron.get_now", get_now)
 
-    cron = yacron2.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS2)
+    cron = cronstable.cron.Cron(None, config_yaml=RETRYING_JOB_THAT_FAILS2)
 
     events = []
     numjobs = 0
@@ -519,7 +519,7 @@ async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noq
     ],
 )
 def test_naturaltime(value_in, out):
-    got_out = yacron2.cron.naturaltime(value_in)
+    got_out = cronstable.cron.naturaltime(value_in)
     assert got_out == out
 
 
@@ -527,7 +527,7 @@ def test_naturaltime(value_in, out):
 async def test_schedule_retry_job_disappeared():
     # a job removed from config while a retry is pending must not raise
     # UnboundLocalError; the retry is simply skipped.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     await cron.schedule_retry_job("nonexistent", 0.0, 0)
     assert "nonexistent" not in cron.retry_state
 
@@ -543,7 +543,7 @@ async def test_schedule_retry_job_abandoned_when_no_longer_owner():
     # a transient denial defers instead (see the blip test below).
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     cron.cluster_manager = types.SimpleNamespace(
         distribution="single-leader",
@@ -577,7 +577,7 @@ async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
     # relaunching once the blip clears.
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     quorate = False  # a one-interval quorum blip
 
@@ -623,7 +623,7 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
     # The retry must defer and relaunch once the view settles.
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     settled = False  # the ~2-interval re-attestation window
 
@@ -643,13 +643,13 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
         cron, "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
-    monkeypatch.setattr(yacron2.cron, "RETRY_GATE_RECHECK_FLOOR", 0.01)
+    monkeypatch.setattr(cronstable.cron, "RETRY_GATE_RECHECK_FLOOR", 0.01)
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.01, 1, 0.01)
     cron.retry_state["j"] = state
     import logging
 
-    with caplog.at_level(logging.DEBUG, logger="yacron2"):
+    with caplog.at_level(logging.DEBUG, logger="cronstable"):
         task = asyncio.create_task(cron.schedule_retry_job("j", 0.01, 1))
         await asyncio.sleep(0.1)  # the retry wakes mid-hold and defers
         assert launched == []  # not relaunched while the gates are held...
@@ -684,7 +684,7 @@ async def test_retry_abandonment_cancels_state_and_records(caplog):
     import logging
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     cron.cluster_manager = types.SimpleNamespace(
         distribution="single-leader",
@@ -698,7 +698,7 @@ async def test_retry_abandonment_cancels_state_and_records(caplog):
     cron.cron_jobs["j"] = job
     state = JobRetryState(0.1, 2, 1)
     cron.retry_state["j"] = state
-    with caplog.at_level(logging.WARNING, logger="yacron2"):
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
         await cron.schedule_retry_job("j", 0.0, 1)
     assert "j" not in cron.retry_state
     assert state.cancelled is True  # kills the rogue-relaunch path
@@ -754,7 +754,7 @@ def test_cluster_allows_fails_closed_on_backend_error():
     # scheduler); the gate fails closed instead.
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     def boom():
@@ -777,18 +777,18 @@ def test_cluster_allows_fails_closed_on_backend_error():
 
 def test_resolve_web_token_value():
     auth = {"value": "secret", "fromFile": None, "fromEnvVar": None}
-    token = yacron2.cron.Cron._resolve_web_token({"authToken": auth})
+    token = cronstable.cron.Cron._resolve_web_token({"authToken": auth})
     assert token == "secret"
 
 
 def test_resolve_web_token_envvar(monkeypatch):
-    monkeypatch.setenv("YACRON2_TEST_WEB_TOKEN", "envsecret")
-    token = yacron2.cron.Cron._resolve_web_token(
+    monkeypatch.setenv("CRONSTABLE_TEST_WEB_TOKEN", "envsecret")
+    token = cronstable.cron.Cron._resolve_web_token(
         {
             "authToken": {
                 "value": None,
                 "fromFile": None,
-                "fromEnvVar": "YACRON2_TEST_WEB_TOKEN",
+                "fromEnvVar": "CRONSTABLE_TEST_WEB_TOKEN",
             }
         }
     )
@@ -796,28 +796,28 @@ def test_resolve_web_token_envvar(monkeypatch):
 
 
 def test_resolve_web_token_absent():
-    assert yacron2.cron.Cron._resolve_web_token({"listen": []}) is None
+    assert cronstable.cron.Cron._resolve_web_token({"listen": []}) is None
 
 
 def test_resolve_web_token_missing_envvar_fails_closed(monkeypatch):
     # authToken configured but the env var is unset: must raise rather than
     # silently leaving the web API unauthenticated.
-    monkeypatch.delenv("YACRON2_TEST_WEB_TOKEN", raising=False)
-    with pytest.raises(yacron2.config.ConfigError):
-        yacron2.cron.Cron._resolve_web_token(
+    monkeypatch.delenv("CRONSTABLE_TEST_WEB_TOKEN", raising=False)
+    with pytest.raises(cronstable.config.ConfigError):
+        cronstable.cron.Cron._resolve_web_token(
             {
                 "authToken": {
                     "value": None,
                     "fromFile": None,
-                    "fromEnvVar": "YACRON2_TEST_WEB_TOKEN",
+                    "fromEnvVar": "CRONSTABLE_TEST_WEB_TOKEN",
                 }
             }
         )
 
 
 def test_resolve_web_token_empty_value_fails_closed():
-    with pytest.raises(yacron2.config.ConfigError):
-        yacron2.cron.Cron._resolve_web_token(
+    with pytest.raises(cronstable.config.ConfigError):
+        cronstable.cron.Cron._resolve_web_token(
             {
                 "authToken": {
                     "value": None,
@@ -831,8 +831,8 @@ def test_resolve_web_token_empty_value_fails_closed():
 def test_resolve_web_token_empty_file_fails_closed(tmp_path):
     empty = tmp_path / "token"
     empty.write_text("   \n")
-    with pytest.raises(yacron2.config.ConfigError):
-        yacron2.cron.Cron._resolve_web_token(
+    with pytest.raises(cronstable.config.ConfigError):
+        cronstable.cron.Cron._resolve_web_token(
             {
                 "authToken": {
                     "value": None,
@@ -847,7 +847,7 @@ def test_resolve_web_token_empty_file_fails_closed(tmp_path):
 async def test_auth_middleware():
     from aiohttp import web
 
-    middleware = yacron2.cron.Cron._make_auth_middleware("secret")
+    middleware = cronstable.cron.Cron._make_auth_middleware("secret")
 
     async def handler(request):
         return web.Response(text="ok")
@@ -867,20 +867,20 @@ async def test_auth_middleware():
 
 def test_web_site_from_url_bad_scheme():
     with pytest.raises(ValueError):
-        yacron2.cron.web_site_from_url(None, "ftp://localhost:1234")
+        cronstable.cron.web_site_from_url(None, "ftp://localhost:1234")
 
 
 def test_web_site_from_url_malformed_http():
     # missing host/port must raise ValueError (a skippable bad entry), not
-    # AssertionError (which would be reported as an internal yacron2 bug).
+    # AssertionError (which would be reported as an internal cronstable bug).
     with pytest.raises(ValueError):
-        yacron2.cron.web_site_from_url(None, "http://")
+        cronstable.cron.web_site_from_url(None, "http://")
 
 
 @pytest.mark.asyncio
 async def test_start_web_app_ignores_bad_listen_urls():
     # an unusable listen url is skipped, not surfaced as an exception
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     bad_config = {"listen": ["ftp://localhost:1234", "http://"]}
     try:
         await cron.start_stop_web_app(bad_config)  # must not raise
@@ -901,7 +901,7 @@ jobs:
 async def test_web_start_disabled_job_refused():
     from aiohttp import web
 
-    cron = yacron2.cron.Cron(None, config_yaml=DISABLED_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=DISABLED_JOB)
     cron.web_config = {}
 
     class Req:
@@ -918,7 +918,7 @@ async def test_web_start_disabled_job_refused():
 async def test_web_status_reports_disabled():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=DISABLED_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=DISABLED_JOB)
     cron.web_config = {}
 
     class Req:
@@ -948,7 +948,7 @@ jobs:
 async def test_web_list_jobs():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -977,7 +977,7 @@ async def test_web_list_jobs():
 async def test_web_job_set_id():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -985,9 +985,9 @@ async def test_web_job_set_id():
 
     resp = await cron._web_job_set_id(Req())
     assert resp.text == cron.job_set_id()
-    # the id always carries the live scheme label (see yacron2.fingerprint;
+    # the id always carries the live scheme label (see cronstable.fingerprint;
     # the golden-value tests pin the actual version)
-    from yacron2.fingerprint import SCHEME_VERSION
+    from cronstable.fingerprint import SCHEME_VERSION
 
     assert resp.text.startswith(SCHEME_VERSION + ":")
 
@@ -1003,8 +1003,8 @@ async def test_web_job_set_id():
 def test_job_set_id_logged_only_on_change(caplog):
     import logging
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
-    with caplog.at_level(logging.INFO, logger="yacron2"):
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    with caplog.at_level(logging.INFO, logger="cronstable"):
         cron._log_job_set_id()
         cron._log_job_set_id()  # unchanged: must not log again
     logged = [r.message for r in caplog.records if "Job set id" in r.message]
@@ -1016,9 +1016,9 @@ def test_job_set_id_logged_only_on_change(caplog):
 async def test_web_list_jobs_includes_last_run():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
-    cron.last_run["alpha"] = yacron2.cron.JobRunInfo(
+    cron.last_run["alpha"] = cronstable.cron.JobRunInfo(
         outcome="failure",
         exit_code=2,
         started_at=DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC),
@@ -1041,7 +1041,7 @@ async def test_web_list_jobs_includes_last_run():
 
 def _mk_run(outcome, exit_code=0, dur=1.0):
     start = DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
-    return yacron2.cron.JobRunInfo(
+    return cronstable.cron.JobRunInfo(
         outcome=outcome,
         exit_code=exit_code,
         started_at=start,
@@ -1052,7 +1052,7 @@ def _mk_run(outcome, exit_code=0, dur=1.0):
 
 
 def test_job_run_info_resources_round_trip():
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     run = _mk_run("success")
     run.resource_usage = ResourceUsage(1.0, 0.5, 9000, 4)
@@ -1060,7 +1060,7 @@ def test_job_run_info_resources_round_trip():
     assert d["resources"]["cpu_total_seconds"] == 1.5
     assert d["resources"]["max_rss_bytes"] == 9000
     # rehydrate from the ledger record
-    restored = yacron2.cron._job_run_info_from_dict(d)
+    restored = cronstable.cron._job_run_info_from_dict(d)
     assert restored is not None
     assert restored.resource_usage == run.resource_usage
 
@@ -1068,13 +1068,13 @@ def test_job_run_info_resources_round_trip():
 def test_job_run_info_round_trip_without_resources():
     d = _mk_run("success").to_dict()
     assert d["resources"] is None
-    restored = yacron2.cron._job_run_info_from_dict(d)
+    restored = cronstable.cron._job_run_info_from_dict(d)
     assert restored is not None
     assert restored.resource_usage is None
 
 
 def test_run_stats_cpu_and_memory_aggregates():
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     runs = []
     for cpu, rss in ((1.0, 1000), (3.0, 5000)):
@@ -1083,7 +1083,7 @@ def test_run_stats_cpu_and_memory_aggregates():
         runs.append(r)
     # one unmonitored run in the window: it must not skew the averages
     runs.append(_mk_run("success"))
-    stats = yacron2.cron._run_stats(runs)
+    stats = cronstable.cron._run_stats(runs)
     assert stats["avg_cpu_seconds"] == 2.0
     assert stats["max_cpu_seconds"] == 3.0
     assert stats["max_rss_bytes"] == 5000
@@ -1093,15 +1093,15 @@ def test_run_stats_cpu_and_memory_aggregates():
 
 
 def test_run_stats_no_monitored_runs_leaves_resource_fields_none():
-    stats = yacron2.cron._run_stats([_mk_run("success"), _mk_run("failure")])
+    stats = cronstable.cron._run_stats([_mk_run("success"), _mk_run("failure")])
     assert stats["avg_cpu_seconds"] is None
     assert stats["max_rss_bytes"] is None
     assert stats["last_cpu_seconds"] is None
 
 
 def test_record_run_caps_history():
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
-    limit = yacron2.cron.RUN_HISTORY_LIMIT
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    limit = cronstable.cron.RUN_HISTORY_LIMIT
     for i in range(limit + 10):
         cron._record_run("alpha", _mk_run("success", exit_code=i))
     hist = cron.run_history["alpha"]
@@ -1141,7 +1141,7 @@ class _FakeMesh:
 
 
 def test_fleet_backend_prefers_observability_mesh():
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.cluster_manager = object()
     assert cron._fleet_backend() is cron.cluster_manager
     mesh = object()
@@ -1153,10 +1153,10 @@ def test_fleet_backend_prefers_observability_mesh():
 async def test_start_stop_observability_builds_mesh_and_installs_providers(
     monkeypatch,
 ):
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     built = []
     monkeypatch.setattr(
-        yacron2.cron,
+        cronstable.cron,
         "make_backend",
         lambda cfg, jsid: built.append(_FakeMesh(cfg)) or built[-1],
     )
@@ -1179,10 +1179,10 @@ async def test_start_stop_observability_builds_mesh_and_installs_providers(
 
 @pytest.mark.asyncio
 async def test_start_stop_observability_respects_share_opt_out(monkeypatch):
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     made = []
     monkeypatch.setattr(
-        yacron2.cron,
+        cronstable.cron,
         "make_backend",
         lambda cfg, jsid: made.append(_FakeMesh(cfg)) or made[-1],
     )
@@ -1206,10 +1206,10 @@ async def test_start_stop_observability_reconciles_share_on_kept_mesh(
     # mesh: the latched share flag must be re-reconciled every reload, or
     # toggling off would keep gossiping CPU/memory until an unrelated restart
     # and toggling on would never start.
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     made = []
     monkeypatch.setattr(
-        yacron2.cron,
+        cronstable.cron,
         "make_backend",
         lambda cfg, jsid: made.append(_FakeMesh(cfg)) or made[-1],
     )
@@ -1236,7 +1236,7 @@ async def test_start_stop_observability_reconciles_share_on_kept_mesh(
 
 @pytest.mark.asyncio
 async def test_start_stop_observability_none_is_noop():
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     await cron.start_stop_observability(None)
     assert cron.observability_mesh is None
     await cron.start_stop_observability({"observabilityMesh": None})
@@ -1247,7 +1247,7 @@ async def test_start_stop_observability_none_is_noop():
 async def test_web_get_cluster_injects_local_node_stats():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class FakeMgr:
@@ -1270,7 +1270,7 @@ async def test_web_get_cluster_injects_local_node_stats():
 async def test_web_get_node_returns_resources():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -1287,7 +1287,7 @@ async def test_web_get_node_returns_resources():
 
 @pytest.mark.asyncio
 async def test_job_to_dict_includes_live_running_resources():
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     job = cron.cron_jobs["alpha"]
 
     class FakeRunning:
@@ -1309,7 +1309,7 @@ async def test_job_to_dict_includes_live_running_resources():
 
 @pytest.mark.asyncio
 async def test_job_to_dict_omits_running_resources_when_unmonitored():
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     job = cron.cron_jobs["alpha"]
 
     class FakeRunning:
@@ -1327,7 +1327,7 @@ async def test_job_to_dict_omits_running_resources_when_unmonitored():
 async def test_web_list_jobs_includes_history_and_timezone():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
     for outcome in ("success", "failure", "success"):
         cron._record_run("alpha", _mk_run(outcome))
@@ -1356,7 +1356,7 @@ async def test_web_list_jobs_includes_history_and_timezone():
 async def test_web_job_runs_endpoint_returns_runs_and_stats():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
     cron._record_run("alpha", _mk_run("success", dur=2.0))
     cron._record_run("alpha", _mk_run("failure", dur=4.0))
@@ -1392,7 +1392,7 @@ async def test_web_job_runs_endpoint_returns_runs_and_stats():
 async def test_web_job_runs_unknown_job_404():
     from aiohttp import web
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -1406,7 +1406,7 @@ async def test_web_job_runs_unknown_job_404():
 async def test_web_job_runs_empty_history():
     import json
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -1424,7 +1424,7 @@ async def test_web_job_runs_empty_history():
 async def test_web_cancel_unknown_job_404():
     from aiohttp import web
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -1438,7 +1438,7 @@ async def test_web_cancel_unknown_job_404():
 async def test_web_cancel_not_running_409():
     from aiohttp import web
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -1455,7 +1455,7 @@ async def test_handle_finished_job_records_cancelled(monkeypatch):
     # replacement, must not be reported as success/failure or retried.
     from types import SimpleNamespace
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     calls = []
 
     async def fake_failure(job):
@@ -1492,7 +1492,7 @@ async def test_handle_finished_job_records_cancelled(monkeypatch):
 async def test_web_cancel_running_job_terminates_and_records():
     # end-to-end: launch a real long-running job, cancel it via the endpoint,
     # and confirm it is actually terminated and recorded as "cancelled".
-    cron = yacron2.cron.Cron(
+    cron = cronstable.cron.Cron(
         None, config_yaml=CONCURRENT_JOB.format(policy="Allow")
     )
     cron.web_config = {}
@@ -1519,7 +1519,7 @@ async def test_web_cancel_running_job_terminates_and_records():
 
 @pytest.mark.asyncio
 async def test_web_index_served():
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -1527,13 +1527,13 @@ async def test_web_index_served():
 
     resp = await cron._web_index(Req())
     assert resp.content_type == "text/html"
-    assert "yacron2" in resp.text
+    assert "cronstable" in resp.text
     assert "<html" in resp.text.lower()
 
 
 @pytest.mark.asyncio
 async def test_web_index_sets_security_headers():
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
 
     class Req:
@@ -1555,7 +1555,7 @@ async def test_web_index_sets_security_headers():
 async def test_web_index_security_headers_overridable():
     # an operator-configured web.headers value wins over the secure default,
     # while defaults the operator didn't set are still applied.
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {"headers": {"X-Frame-Options": "SAMEORIGIN"}}
 
     class Req:
@@ -1570,8 +1570,8 @@ async def test_web_index_security_headers_overridable():
 async def test_auth_middleware_public_path():
     from aiohttp import web
 
-    middleware = yacron2.cron.Cron._make_auth_middleware(
-        "secret", yacron2.cron.WEB_PUBLIC_PATHS
+    middleware = cronstable.cron.Cron._make_auth_middleware(
+        "secret", cronstable.cron.WEB_PUBLIC_PATHS
     )
 
     async def handler(request):
@@ -1595,13 +1595,13 @@ async def test_web_job_logs_streams_last_run():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
     out = JobOutputStream()
     out.publish("stdout", "hello world\n")
     out.publish("stderr", "uh oh\n")
     out.close()
-    cron.last_run["alpha"] = yacron2.cron.JobRunInfo(
+    cron.last_run["alpha"] = cronstable.cron.JobRunInfo(
         outcome="success",
         exit_code=0,
         started_at=None,
@@ -1628,7 +1628,7 @@ async def test_web_job_logs_no_output():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
     app = web.Application()
     app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
@@ -1644,7 +1644,7 @@ async def test_web_job_logs_unknown_job():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
     app = web.Application()
     app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
@@ -1783,7 +1783,7 @@ def test_job_should_run(
         print("now: ", retval)
         return retval
 
-    monkeypatch.setattr("yacron2.cron.get_now", get_now)
+    monkeypatch.setattr("cronstable.cron.get_now", get_now)
 
     config_yaml = f"""
 jobs:
@@ -1796,7 +1796,7 @@ jobs:
     {enabled}
                             """
     print(config_yaml)
-    cron = yacron2.cron.Cron(None, config_yaml=config_yaml)
+    cron = cronstable.cron.Cron(None, config_yaml=config_yaml)
     job = list(cron.cron_jobs.values())[0]
     assert cron.job_should_run(startup, job) == result
 
@@ -1811,9 +1811,9 @@ async def test_run_survives_config_error(tmp_path, monkeypatch):
     # clean load at construction.
     cfg = tmp_path / "c.yaml"
     cfg.write_text(TWO_JOBS)
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
     assert set(cron.cron_jobs) == {"alpha", "beta"}
-    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.01)
 
     def boom(*args, **kwargs):
         raise ConfigError("boom")
@@ -1824,7 +1824,7 @@ async def test_run_survives_config_error(tmp_path, monkeypatch):
     # a new fingerprint, so every subsequent tick still sees the change and
     # retries.
     cfg.write_text(TWO_JOBS + "\n# edited\n")
-    monkeypatch.setattr("yacron2.cron.parse_config_with_sources", boom)
+    monkeypatch.setattr("cronstable.cron.parse_config_with_sources", boom)
 
     task = asyncio.create_task(cron.run())
     try:
@@ -1834,7 +1834,7 @@ async def test_run_survives_config_error(tmp_path, monkeypatch):
         assert not task.done()
         assert set(cron.cron_jobs) == {"alpha", "beta"}  # unchanged
         # the failed reload flips the standard "config broken on disk" signal
-        # (yacron2_config_last_reload_successful) even though the parse ran off
+        # (cronstable_config_last_reload_successful) even though the parse ran off
         # the loop, in a worker thread.
         assert cron.metrics._last_reload_ok is False
     finally:
@@ -1845,7 +1845,7 @@ async def test_run_survives_config_error(tmp_path, monkeypatch):
 def test_cluster_allows_per_policy():
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
 
     def job(policy):
         return types.SimpleNamespace(clusterPolicy=policy)
@@ -1897,7 +1897,7 @@ def test_cluster_allows_per_policy():
 def test_cluster_allows_spread_distribution():
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     def job(policy, name="j"):
@@ -1931,7 +1931,7 @@ def test_cluster_allows_spread_distribution():
 def test_cluster_role_logged_on_transition(caplog):
     import logging
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     class _Mgr:
@@ -1959,7 +1959,7 @@ def test_cluster_role_logged_on_transition(caplog):
             return []
 
     cron.cluster_manager = _Mgr(True)
-    with caplog.at_level(logging.INFO, logger="yacron2"):
+    with caplog.at_level(logging.INFO, logger="cronstable"):
         cron._log_cluster_role()
         cron._log_cluster_role()  # unchanged: no second log
         cron.cluster_manager = _Mgr(False)
@@ -1978,7 +1978,7 @@ def test_cluster_quorum_logged_on_follower_single_leader(caplog):
     # silent.
     import logging
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     class _Follower:
@@ -2003,7 +2003,7 @@ def test_cluster_quorum_logged_on_follower_single_leader(caplog):
             return []
 
     cron.cluster_manager = _Follower(True)
-    with caplog.at_level(logging.INFO, logger="yacron2"):
+    with caplog.at_level(logging.INFO, logger="cronstable"):
         cron._log_cluster_role()  # joins quorum as a follower
         cron.cluster_manager = _Follower(False)
         cron._log_cluster_role()  # loses quorum -> must log here
@@ -2020,7 +2020,7 @@ def test_cluster_quorum_logged_on_follower_single_leader(caplog):
 def test_cluster_role_logged_spread_quorum(caplog):
     import logging
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     class _SpreadMgr:
@@ -2042,7 +2042,7 @@ def test_cluster_role_logged_spread_quorum(caplog):
             return []
 
     cron.cluster_manager = _SpreadMgr(True)
-    with caplog.at_level(logging.INFO, logger="yacron2"):
+    with caplog.at_level(logging.INFO, logger="cronstable"):
         cron._log_cluster_role()
         cron._log_cluster_role()  # unchanged: no second log
         cron.cluster_manager = _SpreadMgr(False)
@@ -2062,7 +2062,7 @@ def test_cluster_role_logged_spread_quorum(caplog):
 def test_cluster_allows_leader_stands_down_on_conflict():
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     def job(policy, name="j"):
@@ -2097,7 +2097,7 @@ def test_cluster_allows_leader_stands_down_on_conflict():
 def test_cluster_allows_spread_leader_stands_down_on_conflict():
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     def job(policy, name="j"):
@@ -2128,7 +2128,7 @@ def test_cluster_allows_spread_leader_stands_down_on_conflict():
 def test_cluster_conflict_logged_on_transition(caplog):
     import logging
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     class _Mgr:
@@ -2153,7 +2153,7 @@ def test_cluster_conflict_logged_on_transition(caplog):
             return True
 
     cron.cluster_manager = _Mgr(True)
-    with caplog.at_level(logging.INFO, logger="yacron2"):
+    with caplog.at_level(logging.INFO, logger="cronstable"):
         cron._log_cluster_role()
         cron._log_cluster_role()  # unchanged: no second log
         cron.cluster_manager = _Mgr(False)
@@ -2166,7 +2166,7 @@ def test_cluster_conflict_logged_on_transition(caplog):
 def test_cluster_size_conflict_logged_on_transition(caplog):
     import logging
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     class _Mgr:
@@ -2194,7 +2194,7 @@ def test_cluster_size_conflict_logged_on_transition(caplog):
             return True
 
     cron.cluster_manager = _Mgr(True)
-    with caplog.at_level(logging.INFO, logger="yacron2"):
+    with caplog.at_level(logging.INFO, logger="cronstable"):
         cron._log_cluster_role()
         cron._log_cluster_role()  # unchanged: no second log
         cron.cluster_manager = _Mgr(False)
@@ -2211,7 +2211,7 @@ def test_cluster_policy_conflict_logged_on_transition(caplog):
     # breadcrumb just like a duplicate-name or size conflict, once per change.
     import logging
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
 
     class _Mgr:
@@ -2240,7 +2240,7 @@ def test_cluster_policy_conflict_logged_on_transition(caplog):
             return True
 
     cron.cluster_manager = _Mgr(True)
-    with caplog.at_level(logging.INFO, logger="yacron2"):
+    with caplog.at_level(logging.INFO, logger="cronstable"):
         cron._log_cluster_role()
         cron._log_cluster_role()  # unchanged: no second log
         cron.cluster_manager = _Mgr(False)
@@ -2258,9 +2258,9 @@ def test_cluster_policy_conflict_logged_on_transition(caplog):
 def test_is_deferrable_reboot():
     import types
 
-    from yacron2.cronexpr import CronTab
+    from cronstable.cronexpr import CronTab
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
 
     def job(policy, sched):
         return types.SimpleNamespace(clusterPolicy=policy, schedule=sched)
@@ -2323,7 +2323,7 @@ def _reboot_mgr(
 
 @pytest.mark.asyncio
 async def test_deferred_reboot_runs_on_owner(monkeypatch):
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2349,7 +2349,7 @@ async def test_deferred_reboot_disabled_on_owner_is_not_run(monkeypatch):
     # the same way job_should_run and the manual web trigger refuse a disabled
     # job. Otherwise an operator-disabled init/migration one-shot still runs
     # once cluster-wide on convergence.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2369,7 +2369,7 @@ async def test_deferred_reboot_disabled_on_owner_is_not_run(monkeypatch):
 async def test_deferred_reboot_disabled_no_manager_preferleader(monkeypatch):
     # The never-skip mgr-is-None PreferLeader branch must also refuse a job
     # disabled on reload (it otherwise runs every such one-shot here).
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     cron.cluster_manager = None
     launched = []
@@ -2389,7 +2389,7 @@ async def test_deferred_reboot_disabled_no_manager_preferleader(monkeypatch):
 async def test_deferred_reboot_disabled_after_election_removed(monkeypatch):
     # The election-removed branch (no longer gated) must also refuse a disabled
     # job rather than running it once on the way out.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = False  # election turned off on reload
     launched = []
     monkeypatch.setattr(
@@ -2412,7 +2412,7 @@ async def test_deferred_reboot_records_before_launch(monkeypatch):
     # peer/store aware it ran, so a failover owner would re-run a Leader
     # one-shot (a double-run). Pin the RELATIVE ORDER, not just the end state,
     # so swapping the two production lines (launch then record) fails here.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     events = []
     monkeypatch.setattr(
@@ -2444,7 +2444,7 @@ async def test_deferred_reboot_leader_runs_when_identity_differs(monkeypatch):
     # that identity string to node_name -- otherwise a one-shot Leader @reboot
     # job never runs on ANY node (the holder's identity != its node_name, and
     # every follower's leader_name() is that identity too).
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2486,7 +2486,7 @@ async def test_deferred_reboot_retired_on_ack_without_rerun(monkeypatch):
     # retires it WITHOUT running -- even if this node is now the elected owner.
     # This is what stops a re-run when leadership lands on a node that still
     # held the one-shot pending.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2509,7 +2509,7 @@ async def test_deferred_reboot_kept_when_other_owns(monkeypatch):
     # currently looks like the owner -- that node may itself be unable to run
     # it (reachable from us but not quorate from its own view), and dropping
     # would lose the boot job forever; we keep waiting instead.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2530,7 +2530,7 @@ async def test_deferred_reboot_leader_runs_after_owner_lands_here(monkeypatch):
     # #8 (continued): because we kept waiting above instead of dropping, the
     # one-shot still runs when leadership later lands on this node -- so a
     # deferred boot job is never silently lost.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2553,7 +2553,7 @@ async def test_deferred_reboot_preferleader_runs_without_quorum(monkeypatch):
     # #9: a PreferLeader @reboot must run even with no quorum (its contract is
     # to never skip while a node is up). The gate (_cluster_allows) uses the
     # quorum-free is_available_leader(), true on an isolated/minority node.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2577,7 +2577,7 @@ async def test_deferred_reboot_preferleader_runs_when_no_manager(monkeypatch):
     # PreferLeader @reboot must STILL run here -- its contract is never-skip,
     # exactly the store-unreachable case it exists to survive. Previously the
     # mgr-is-None branch returned early for ALL jobs, dropping it forever.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     cron.cluster_manager = None  # backend failed to start
     launched = []
@@ -2598,7 +2598,7 @@ async def test_deferred_reboot_leader_pending_no_manager(monkeypatch):
     # H1 (cont.): a Leader @reboot in the SAME no-manager state must NOT run --
     # it stays fail-closed and pending, re-evaluated once a manager comes up.
     # Asymmetric with PreferLeader above, mirroring _cluster_allows.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     cron.cluster_manager = None
     launched = []
@@ -2620,7 +2620,7 @@ async def test_deferred_reboot_preferleader_waits_for_available_owner(
 ):
     # the quorum-free availability owner can still be another node (a lower
     # name we mutually agree with); that node runs it, so we keep waiting.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2638,7 +2638,7 @@ async def test_deferred_reboot_preferleader_waits_for_available_owner(
 
 @pytest.mark.asyncio
 async def test_deferred_reboot_waits_without_quorum(monkeypatch):
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2656,7 +2656,7 @@ async def test_deferred_reboot_waits_without_quorum(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_deferred_reboot_waits_on_conflict(monkeypatch):
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2676,7 +2676,7 @@ async def test_deferred_reboot_waits_on_conflict(monkeypatch):
 @pytest.mark.asyncio
 async def test_deferred_reboot_runs_when_election_disabled(monkeypatch):
     # election removed on a reload: nothing gates these anymore -> run here
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = False
     launched = []
     monkeypatch.setattr(
@@ -2696,7 +2696,7 @@ async def test_deferred_reboot_kept_when_absent_election_disabled(monkeypatch):
     # #4 (election-disabled path): the same never-lose rule holds when election
     # was turned off on a reload -- a momentarily-absent name is kept pending,
     # not popped, and runs the current job once the name returns.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = False
     launched = []
     monkeypatch.setattr(
@@ -2729,7 +2729,7 @@ async def test_deferred_reboot_election_disabled_skips_non_reboot_reuse(
     # mirroring the gated path's _is_deferrable_reboot retirement.
     import types
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = False
     launched = []
     monkeypatch.setattr(
@@ -2753,7 +2753,7 @@ async def test_deferred_reboot_kept_on_transient_absence(monkeypatch):
     # re-add) before the cluster converges, it must NOT be dropped -- dropping
     # would lose the one-shot forever and break the never-lose property. It
     # stays pending while absent and runs once the name returns and we own it.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2778,7 +2778,7 @@ async def test_deferred_reboot_kept_on_transient_absence(monkeypatch):
 async def test_deferred_reboot_absent_job_never_runs(monkeypatch):
     # a deliberately-removed @reboot job that never returns must never run,
     # even though we keep it pending: the launch is gated on presence.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2798,7 +2798,7 @@ async def test_deferred_reboot_runs_current_config_on_name_reuse(monkeypatch):
     # #4 name-reuse edge: if a name is removed and later re-added for a
     # DIFFERENT @reboot job, the owner runs the CURRENT cron_jobs[name], never
     # the stale JobConfig captured at boot.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2825,7 +2825,7 @@ async def test_deferred_reboot_retired_when_name_reused_non_deferrable(
     # pending entry is retired WITHOUT running through the owner path -- the
     # new job is left to its own scheduling.
     import types
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
     monkeypatch.setattr(
@@ -2850,7 +2850,7 @@ async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
         '    schedule: "@reboot"\n    clusterPolicy: Leader\n',
         "",
     )
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.cron_jobs = OrderedDict((j.name, j) for j in config.jobs)
     cron._elect_leader_configured = True
     launched = []
@@ -2904,7 +2904,7 @@ async def test_web_start_deferred_reboot_retires_pending_and_marks_ran(
     # one-shot a second time -- possibly on another node, since the manual
     # run was never gossiped/persisted. A manual start IS the boot run: it
     # must retire the entry and mark it ran on the manager.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     cron._elect_leader_configured = True
     launched = []
@@ -2940,7 +2940,7 @@ async def test_web_start_deferred_reboot_without_manager(monkeypatch):
     # the same manual start with no manager running (backend failed to start)
     # must still retire the pending entry -- the local re-run protection --
     # and launch, without tripping on the absent manager.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     cron._elect_leader_configured = True
     cron.cluster_manager = None
@@ -2971,7 +2971,7 @@ async def test_web_start_deferred_reboot_concurrent_requests(monkeypatch):
     # loser must not 500 on a KeyError retiring an entry the winner already
     # retired: the entry is retired exactly once, and BOTH manual starts
     # still launch -- exactly as two manual starts of any other job would.
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     cron._elect_leader_configured = True
     launched = []
@@ -3030,8 +3030,8 @@ async def test_cluster_start_survives_bad_cert_files(caplog):
         "  electLeader: true\n"
     )
     config = parse_config_string(yaml, "")
-    cron = yacron2.cron.Cron(None)
-    with caplog.at_level(logging.ERROR, logger="yacron2"):
+    cron = cronstable.cron.Cron(None)
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
         await cron.start_stop_cluster(config.cluster_config)  # must not raise
     assert cron.cluster_manager is None
     # election intent is tracked regardless, so the Leader gate fails closed
@@ -3079,12 +3079,12 @@ async def test_cluster_restarts_on_in_place_cert_rotation(caplog):
         async def stop(self):
             self.stopped = True
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     fake = _FakeMgr(cfg)
     cron.cluster_manager = fake
     # same config object -> the config-change branch is skipped; only the
     # TLS-change signal can trigger the restart.
-    with caplog.at_level(logging.INFO, logger="yacron2"):
+    with caplog.at_level(logging.INFO, logger="cronstable"):
         await cron.start_stop_cluster(cfg)
     assert fake.stopped is True
     assert any(
@@ -3139,10 +3139,10 @@ async def test_cluster_cert_rotation_keeps_manager_when_unloadable(caplog):
         async def stop(self):
             self.stopped = True
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     fake = _FakeMgr(cfg)
     cron.cluster_manager = fake
-    with caplog.at_level(logging.WARNING, logger="yacron2"):
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
         await cron.start_stop_cluster(cfg)
     # the old manager is kept and was never stopped or replaced
     assert fake.stopped is False
@@ -3206,10 +3206,10 @@ async def test_cluster_config_change_keeps_manager_when_new_tls_unloadable(
     # old cert) and retries next reload. The certs here are absent (the
     # mid-rotation case), so gossip_tls_loadable(cfg_b) is False.
     cfg_a, cfg_b = _config_change_yamls()
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     fake = _ConfigChangeFakeMgr(cfg_a)
     cron.cluster_manager = fake
-    with caplog.at_level(logging.WARNING, logger="yacron2"):
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
         await cron.start_stop_cluster(cfg_b)
     assert fake.stopped is False  # kept, not torn down
     assert cron.cluster_manager is fake
@@ -3226,9 +3226,9 @@ async def test_cluster_config_change_tears_down_when_new_tls_loadable(
     # reconstruction then fails closed on the (here deliberately absent) certs.
     cfg_a, cfg_b = _config_change_yamls()
     monkeypatch.setattr(
-        "yacron2.cluster.gossip_tls_loadable", lambda cfg: True
+        "cronstable.cluster.gossip_tls_loadable", lambda cfg: True
     )
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     fake = _ConfigChangeFakeMgr(cfg_a)
     cron.cluster_manager = fake
     await cron.start_stop_cluster(cfg_b)
@@ -3267,7 +3267,7 @@ async def test_cluster_observability_only_change_keeps_manager_reconciles():
     # LATCHED share flag is re-reconciled to the new config every reload, so
     # the toggle actually reaches the running gossip mesh.
     cfg_off, cfg_on = _observability_toggle_yamls()
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     fake = _ConfigChangeFakeMgr(cfg_off)
     cron.cluster_manager = fake
     # toggle ON: manager kept, share flag reconciled to True
@@ -3306,7 +3306,7 @@ jobs:
 async def test_web_app_enforces_auth_when_token_configured():
     import aiohttp
 
-    cron = yacron2.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
     await cron.start_stop_web_app(
         {
             "listen": ["http://127.0.0.1:0"],
@@ -3343,7 +3343,7 @@ async def test_web_app_enforces_auth_when_token_configured():
 async def test_web_app_ui_path_public_but_data_paths_require_auth():
     import aiohttp
 
-    cron = yacron2.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
     await cron.start_stop_web_app(
         {
             "listen": ["http://127.0.0.1:0"],
@@ -3381,12 +3381,12 @@ async def test_web_app_restarts_on_config_change(monkeypatch):
             started.append(self.url)
 
     monkeypatch.setattr(
-        yacron2.cron,
+        cronstable.cron,
         "web_site_from_url",
         lambda runner, url: FakeSite(url),
     )
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     await cron.start_stop_web_app({"listen": ["http://host-a:8000"]})
     runner1 = cron.web_runner
     assert runner1 is not None
@@ -3452,11 +3452,11 @@ async def test_run_reloads_changed_config(tmp_path, monkeypatch):
     # tiny sleep so the reload loop iterates quickly instead of waiting out the
     # real ~60s to the next minute boundary.
     # accept the subminute flag arg the loop now passes to next_sleep_interval
-    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.02)
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.02)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_RELOAD_V1)
 
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
     assert set(cron.cron_jobs) == {"alpha", "beta"}
     id1 = cron.job_set_id()
 
@@ -3494,7 +3494,7 @@ _RETRY_DRAIN_JOB = (
 async def test_run_drains_pending_retry_on_shutdown():
     # the @reboot job fails at once and schedules a retry with a long delay,
     # so a pending (sleeping) retry task sits in retry_state when we shut down.
-    cron = yacron2.cron.Cron(None, config_yaml=_RETRY_DRAIN_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRY_DRAIN_JOB)
 
     task = asyncio.create_task(cron.run())
     try:
@@ -3518,7 +3518,7 @@ web:
   listen:
     - http://127.0.0.1:0
   authToken:
-    fromEnvVar: YACRON2_TEST_MISSING_TOKEN
+    fromEnvVar: CRONSTABLE_TEST_MISSING_TOKEN
 cluster:
   listen: "127.0.0.1:18443"
   tls:
@@ -3546,12 +3546,12 @@ async def test_web_config_error_does_not_disengage_cluster_gate(
     # keep running with the web API down.
     import logging
 
-    monkeypatch.delenv("YACRON2_TEST_MISSING_TOKEN", raising=False)
+    monkeypatch.delenv("CRONSTABLE_TEST_MISSING_TOKEN", raising=False)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_GATED_CLUSTER_BAD_WEB_TOKEN)
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
 
-    with caplog.at_level(logging.ERROR, logger="yacron2"):
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
         task = asyncio.create_task(cron.run())
         try:
             await _wait_until(lambda: cron._elect_leader_configured)
@@ -3576,7 +3576,7 @@ async def test_shutdown_stops_cluster_manager_before_job_drain():
     # stalled until the slowest local job finished. Leadership must be
     # released after retries are cancelled but BEFORE the drain, so failover
     # proceeds while the jobs finish.
-    cron = yacron2.cron.Cron(
+    cron = cronstable.cron.Cron(
         None, config_yaml=CONCURRENT_JOB.format(policy="Allow")
     )
     events = []
@@ -3619,7 +3619,7 @@ def test_sigterm_triggers_graceful_shutdown():
     # owns the signal and it does not reach the default disposition.
     loop = asyncio.new_event_loop()
     try:
-        cron = yacron2.cron.Cron(None)  # no jobs: run() idles until signalled
+        cron = cronstable.cron.Cron(None)  # no jobs: run() idles until signalled
         remove = platform.install_shutdown_handlers(loop, cron.signal_shutdown)
         try:
             loop.call_later(0.05, lambda: os.kill(os.getpid(), signal.SIGTERM))
@@ -3636,10 +3636,10 @@ async def test_fleet_job_summaries_snapshot():
     # the compact per-job snapshot gossiped to peers for the fleet view:
     # lean fixed-shape entries only -- notably no fail_reason (arbitrary
     # operator text) and no command line, which stay on this node's own API.
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     out = JobOutputStream()
     out.close()
-    cron.last_run["alpha"] = yacron2.cron.JobRunInfo(
+    cron.last_run["alpha"] = cronstable.cron.JobRunInfo(
         outcome="failure",
         exit_code=3,
         started_at=DT(1999, 12, 31, 11, 59, 58, tzinfo=UTC),
@@ -3703,31 +3703,31 @@ def _set_now(monkeypatch, holder):
             )
         return now
 
-    monkeypatch.setattr("yacron2.cron.get_now", get_now)
+    monkeypatch.setattr("cronstable.cron.get_now", get_now)
 
 
 def test_schedule_slot_resolution(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 0, 0, 4, 500000)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=_SECONDS_JOB)
     sec = cron.cron_jobs["sec"]
     minute = cron.cron_jobs["min"]
     # a second-level job truncates to the whole second (microseconds zeroed)
-    assert yacron2.cron.schedule_slot(sec) == DT(
+    assert cronstable.cron.schedule_slot(sec) == DT(
         2020, 1, 1, 0, 0, 4, tzinfo=UTC
     )
     # a minute-level job truncates to the top of the minute, as always
-    assert yacron2.cron.schedule_slot(minute) == DT(
+    assert cronstable.cron.schedule_slot(minute) == DT(
         2020, 1, 1, 0, 0, 0, tzinfo=UTC
     )
 
 
 def test_needs_subminute():
     # an enabled second-level job makes the scheduler tick per-second
-    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=_SECONDS_JOB)
     assert cron._needs_subminute() is True
     # minute-only config does not
-    cron2 = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron2 = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     assert cron2._needs_subminute() is False
     # a DISABLED second-level job must not force per-second ticking
     disabled = """
@@ -3737,7 +3737,7 @@ jobs:
     schedule: "*/15 * * * * * *"
     enabled: false
 """
-    cron3 = yacron2.cron.Cron(None, config_yaml=disabled)
+    cron3 = cronstable.cron.Cron(None, config_yaml=disabled)
     assert cron3._needs_subminute() is False
 
 
@@ -3748,7 +3748,7 @@ jobs:
 def test_job_should_run_at_seconds(monkeypatch, second, should_run):
     holder = {"now": DT(2020, 1, 1, 0, 0, second)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=_SECONDS_JOB)
     job = cron.cron_jobs["sec"]  # "*/15 * * * * * *"
     assert cron.job_should_run(False, job) is should_run
 
@@ -3758,9 +3758,9 @@ def test_next_sleep_interval_modes(monkeypatch):
     _set_now(monkeypatch, holder)
     # minute mode snaps to the next minute (preserving the sub-second offset,
     # exactly as the historical behaviour did): from :30.5 that is 30.0s away.
-    assert yacron2.cron.next_sleep_interval(False) == pytest.approx(30.0)
+    assert cronstable.cron.next_sleep_interval(False) == pytest.approx(30.0)
     # sub-minute mode snaps to the next whole-second boundary: :30.5 -> :31.0
-    assert yacron2.cron.next_sleep_interval(True) == pytest.approx(0.5)
+    assert cronstable.cron.next_sleep_interval(True) == pytest.approx(0.5)
 
 
 @pytest.mark.asyncio
@@ -3773,7 +3773,7 @@ async def test_spawn_jobs_subminute_dedup(monkeypatch):
     # minute in progress at start-up are skipped, not fired for a partial run.
     holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    cron = cronstable.cron.Cron(None, config_yaml=_SECONDS_JOB)
 
     launched = []
 
@@ -3814,7 +3814,7 @@ def _drive_cron(monkeypatch, holder, config_yaml):
     """A Cron wired to the controllable clock, recording (name, slot-second)
     at each launch by reading the de-dup slot spawn_jobs just set."""
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml=config_yaml)
+    cron = cronstable.cron.Cron(None, config_yaml=config_yaml)
     launched = []
 
     async def fake_launch(job):
@@ -3830,7 +3830,7 @@ def _seed_due(cron, *names):
     Mirrors what a real pass does once the loop has been running -- the loop's
     start-up seeding is strictly-future, which deliberately skips the current
     slot."""
-    now = yacron2.cron.get_now(datetime.timezone.utc)
+    now = cronstable.cron.get_now(datetime.timezone.utc)
     for name in names:
         cron._set_next_fire(name, now)
 
@@ -3861,7 +3861,7 @@ async def test_service_slots_bounds_catchup_after_long_gap(monkeypatch):
     cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
 
     await cron._service_slots(startup=True)
-    gap = int(yacron2.cron.CATCHUP_LIMIT.total_seconds()) + 5
+    gap = int(cronstable.cron.CATCHUP_LIMIT.total_seconds()) + 5
     holder["now"] = DT(2020, 1, 1, 0, 0, gap)
     await cron._service_slots(startup=False)
 
@@ -3934,7 +3934,7 @@ async def test_spawn_jobs_launches_concurrently(monkeypatch):
     # a slot's wall time is ~one spawn-time instead of N x spawn-time. Under
     # the old sequential loop only the first launch would ever start (it blocks
     # on `release`), so `started` would never fire and this would time out.
-    cron = yacron2.cron.Cron(None, config_yaml=_THREE_DUE)
+    cron = cronstable.cron.Cron(None, config_yaml=_THREE_DUE)
 
     order = []
     started = asyncio.Event()
@@ -3964,7 +3964,7 @@ async def test_single_due_job_still_launches(monkeypatch):
     # The len == 1 fast path (await directly, no gather) still launches the one
     # due job, so the optimisation does not regress the common single-job slot.
     # Only "alpha" is due here ("beta" is a disabled @reboot one-shot).
-    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     launched = []
 
     async def fake_launch(job):
@@ -3990,20 +3990,20 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
     cfg = tmp_path / "c.yaml"
     cfg.write_text(TWO_JOBS)
     # construction parses once, synchronously, on this (the loop) thread
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
     main_thread = threading.get_ident()
 
     seen = []
-    real_parse = yacron2.cron.parse_config_with_sources
+    real_parse = cronstable.cron.parse_config_with_sources
 
     def recording_parse(arg):
         seen.append(threading.get_ident())
         return real_parse(arg)
 
     monkeypatch.setattr(
-        "yacron2.cron.parse_config_with_sources", recording_parse
+        "cronstable.cron.parse_config_with_sources", recording_parse
     )
-    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.01)
     # Force every housekeeping pass to reparse by defeating the
     # unchanged-config skip cache: an ever-incrementing signature never equals
     # the stored one, so reload_config always treats the config as changed and
@@ -4065,7 +4065,7 @@ async def test_startup_gates_reboot_before_servicing(tmp_path, monkeypatch):
     # Leader one-shot must stay deferred and fail closed -- never launched.
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_LEADER_REBOOT_BAD_CLUSTER)
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
 
     launched = []
 
@@ -4073,7 +4073,7 @@ async def test_startup_gates_reboot_before_servicing(tmp_path, monkeypatch):
         launched.append(job.name)
 
     monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
-    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 0.01)
 
     task = asyncio.create_task(cron.run())
     try:
@@ -4147,8 +4147,8 @@ def test_compute_next_fire_is_now_plus_delay_utc(monkeypatch):
     # gauge use, so all three agree.
     holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml=_ONE_MINUTE_JOB)
-    now = yacron2.cron.get_now(UTC)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_MINUTE_JOB)
+    now = cronstable.cron.get_now(UTC)
     job = cron.cron_jobs["m"]
     delay = job.schedule.next(now=now, default_utc=True)
     assert cron._compute_next_fire(job, now) == now + datetime.timedelta(
@@ -4165,8 +4165,8 @@ def test_compute_next_fire_lands_on_a_matching_slot(monkeypatch):
     # */10 schedule so the next fire is minutes away (no DST boundary crossed).
     holder = {"now": DT(2020, 6, 1, 12, 34, 56)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml=_TZ_JOBS)
-    now = yacron2.cron.get_now(UTC)
+    cron = cronstable.cron.Cron(None, config_yaml=_TZ_JOBS)
+    now = cronstable.cron.get_now(UTC)
     for name, job in cron.cron_jobs.items():
         fire = cron._compute_next_fire(job, now)
         assert fire is not None and fire.tzinfo is not None
@@ -4182,8 +4182,8 @@ def test_sleep_interval_uses_soonest_fire(monkeypatch):
     # The loop sleeps until the soonest job's next fire, not a fixed tick.
     holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)  # sec */15 + min
-    cron._ensure_seeded(yacron2.cron.get_now(UTC))
+    cron = cronstable.cron.Cron(None, config_yaml=_SECONDS_JOB)  # sec */15 + min
+    cron._ensure_seeded(cronstable.cron.get_now(UTC))
     # soonest is the */15 job at :15 -> 15s away (the minute job is 60s away)
     assert cron._sleep_interval() == pytest.approx(15.0, abs=0.05)
 
@@ -4193,8 +4193,8 @@ def test_sleep_interval_capped_by_housekeeping(monkeypatch):
     # so config reload / cluster upkeep stays ~once a minute.
     holder = {"now": DT(2020, 1, 1, 3, 0, 15)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml=_NOON_DAILY)  # next fire 12:00
-    cron._ensure_seeded(yacron2.cron.get_now(UTC))
+    cron = cronstable.cron.Cron(None, config_yaml=_NOON_DAILY)  # next fire 12:00
+    cron._ensure_seeded(cronstable.cron.get_now(UTC))
     # capped at the next minute boundary (03:01:00), i.e. 45s
     assert cron._sleep_interval() == pytest.approx(45.0, abs=0.05)
 
@@ -4202,7 +4202,7 @@ def test_sleep_interval_capped_by_housekeeping(monkeypatch):
 def test_sleep_interval_no_jobs_uses_housekeeping(monkeypatch):
     holder = {"now": DT(2020, 1, 1, 3, 0, 15)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None)  # nothing scheduled
+    cron = cronstable.cron.Cron(None)  # nothing scheduled
     assert cron._peek_soonest_fire() is None
     assert cron._sleep_interval() == pytest.approx(45.0, abs=0.05)
 
@@ -4347,7 +4347,7 @@ def test_reload_utc_to_timezone_utc_preserves_next_fire(tmp_path, monkeypatch):
     _set_now(monkeypatch, holder)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_ONE_MINUTE_JOB)  # utc:true by default
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
     assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
 
     # reload AT the boundary with an explicit `timezone: UTC` added
@@ -4380,7 +4380,7 @@ def test_reload_preserves_unchanged_next_fire(tmp_path, monkeypatch):
     _set_now(monkeypatch, holder)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_ONE_MINUTE_JOB)
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
     assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
 
     # reload AT the boundary minute, same schedule
@@ -4396,7 +4396,7 @@ def test_reload_reseeds_changed_schedule(tmp_path, monkeypatch):
     _set_now(monkeypatch, holder)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_ONE_MINUTE_JOB)
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
     assert cron._next_fire["m"] == DT(2020, 1, 1, 0, 1, tzinfo=UTC)
 
     cfg.write_text(_ONE_MINUTE_JOB.replace('"* * * * *"', '"*/5 * * * *"'))
@@ -4412,7 +4412,7 @@ def test_reload_refreshes_index(tmp_path, monkeypatch):
     _set_now(monkeypatch, holder)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_RELOAD_BEFORE)
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
     keep_before = cron._next_fire["keep"]
     assert set(cron._next_fire) == {"keep", "drop"}
 
@@ -4428,7 +4428,7 @@ def test_reload_drops_disabled_job(tmp_path, monkeypatch):
     _set_now(monkeypatch, holder)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_ONE_MINUTE_JOB)
-    cron = yacron2.cron.Cron(str(cfg))
+    cron = cronstable.cron.Cron(str(cfg))
     assert "m" in cron._next_fire
 
     cfg.write_text(_ONE_MINUTE_JOB.rstrip() + "\n    enabled: false\n")
@@ -4437,7 +4437,7 @@ def test_reload_drops_disabled_job(tmp_path, monkeypatch):
 
 
 def _count_crontab_calls(monkeypatch):
-    import yacron2.cronexpr as crontab_mod
+    import cronstable.cronexpr as crontab_mod
 
     counts = {"test": 0, "next": 0}
     orig_test = crontab_mod.CronTab.test
@@ -4471,7 +4471,7 @@ async def test_perf_wake_is_o_due_not_o_all(monkeypatch, capsys):
     )
     holder = {"now": DT(2020, 1, 1, 0, 30, 0)}
     _set_now(monkeypatch, holder)
-    cron = yacron2.cron.Cron(None, config_yaml="jobs:\n" + jobs)
+    cron = cronstable.cron.Cron(None, config_yaml="jobs:\n" + jobs)
 
     async def fake_launch(job):
         pass
@@ -4505,7 +4505,7 @@ async def test_perf_wake_is_o_due_not_o_all(monkeypatch, capsys):
     new_idle = (time.perf_counter() - t0) / idle_reps
 
     sample = next(iter(cron.cron_jobs.values()))
-    slot = yacron2.cron.schedule_slot(sample, holder["now"])
+    slot = cronstable.cron.schedule_slot(sample, holder["now"])
     scan_reps = 50
     t0 = time.perf_counter()
     for _ in range(scan_reps):

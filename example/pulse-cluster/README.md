@@ -38,9 +38,9 @@ still fires **exactly once per minute** on the leader.
 docker compose -f docker-compose-pulse-cluster.yml up --build
 ```
 
-- yacron-a → <http://localhost:8080/> (the leader while all three are up)
-- yacron-b → <http://localhost:8081/>
-- yacron-c → <http://localhost:8082/> (also the upstream under test — a follower)
+- cronstable-a → <http://localhost:8080/> (the leader while all three are up)
+- cronstable-b → <http://localhost:8081/>
+- cronstable-c → <http://localhost:8082/> (also the upstream under test — a follower)
 
 A one-shot `certgen` service mints a throwaway cluster CA and one cert per node
 before the nodes start (`gen-certs.sh`; **local-experimentation certs only** —
@@ -55,19 +55,19 @@ docker compose -f docker-compose-pulse-cluster.yml down -v
 
 ## Two independent experiments
 
-The default upstream is **yacron-c**, deliberately a *follower* (highest node
+The default upstream is **cronstable-c**, deliberately a *follower* (highest node
 name, so never the leader). That keeps these two demos from interfering:
 
-- **Fail the leader** — `docker compose -f docker-compose-pulse-cluster.yml stop yacron-a`.
-  Quorum holds (2 of 3), leadership moves to **yacron-b**, and `latency-slo`
+- **Fail the leader** — `docker compose -f docker-compose-pulse-cluster.yml stop cronstable-a`.
+  Quorum holds (2 of 3), leadership moves to **cronstable-b**, and `latency-slo`
   resumes on <http://localhost:8081/>. The upstream is still up, so liveness
   stays green everywhere. *(Pure leader-failover.)*
 
-- **Outage** — `docker compose -f docker-compose-pulse-cluster.yml stop yacron-c`.
+- **Outage** — `docker compose -f docker-compose-pulse-cluster.yml stop cronstable-c`.
   Within ~5 s, `liveness-probe` goes **red** on the surviving nodes and their
   reports print the on-call `PAGE` line — the outage is caught from every
   remaining vantage point. Quorum is unaffected (a + b = 2 of 3). Bring it
-  back with `... start yacron-c`. *(Pure outage-detection.)*
+  back with `... start cronstable-c`. *(Pure outage-detection.)*
 
 ## Spread the leader work (optional)
 

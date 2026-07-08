@@ -1,6 +1,6 @@
 # Architecture and Internals
 
-Internal design reference for developers reading or extending yacron2. It maps
+Internal design reference for developers reading or extending cronstable. It maps
 the modules, describes the single-threaded asyncio event loop, the scheduler
 main loop and hot reload, the running-job lifecycle, the retry state machine,
 concurrency handling, and signal-driven shutdown. It references functions by
@@ -9,8 +9,8 @@ name rather than repeating the option reference; see
 
 ## Module map
 
-yacron2 is an asyncio Python daemon that runs natively on Linux, macOS, and
-Windows. All OS-specific behavior is isolated in `yacron2/platform.py`
+cronstable is an asyncio Python daemon that runs natively on Linux, macOS, and
+Windows. All OS-specific behavior is isolated in `cronstable/platform.py`
 (`DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`,
 `install_shutdown_handlers`, plus the `IS_WINDOWS` flag). `grp`/`pwd` and per-job
 user/group switching remain POSIX-only and are runtime-gated on `IS_WINDOWS`
@@ -19,24 +19,24 @@ operator-facing walkthrough.
 
 | Module | Responsibility |
 | --- | --- |
-| `yacron2/__main__.py` | CLI entry point. Argument parsing, basic logging setup, event-loop creation, shutdown-handler registration (delegated to `platform.install_shutdown_handlers`), and process exit codes. |
-| `yacron2/platform.py` | The single home for all per-OS branches: `DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`, `install_shutdown_handlers`, and the `IS_WINDOWS` flag. The rest of the codebase reads the same on every platform. |
-| `yacron2/config.py` | strictyaml `CONFIG_SCHEMA`, `DEFAULT_CONFIG`, `_REPORT_DEFAULTS`; config loading from a file or directory; include handling and dict merging (`mergedicts`); `JobConfig` parsing/validation; `Yacron2Config` dataclass. |
-| `yacron2/cronexpr.py` | The built-in cron expression engine: `CronTab` parsing (5/6/7-field dialect, names, `L` forms, `@`-nicknames), `next()` (strictly-future, DST-correct, 2099 horizon) and `test()`. A stdlib-only leaf module; behavior-compatible with the parse-crontab library it replaced, enforced by the golden vectors in `tests/data/cron_golden.json`. See [Schedules and Timezones](Schedules-and-Timezones). |
-| `yacron2/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
-| `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`), and `JobRetryState`. |
-| `yacron2/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and by `cluster.py` (peer comparison). |
-| `yacron2/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory that builds the one named by `cluster.backend` (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`, `filesystem` -> `backends.filesystem.FilesystemBackend`) via deferred imports. |
-| `yacron2/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). |
-| `yacron2/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. |
-| `yacron2/backends/filesystem.py` | `FilesystemBackend` (a `LeaseBackend`): leader election through the flock-guarded, fence-counted TTL lease of `state.FilesystemStateBackend` over a shared POSIX mount (Amazon S3 Files / EFS / NFSv4) -- no coordination service, the mount is the store; stdlib-only. |
-| `yacron2/backends/__init__.py` | Shared backend helpers, notably the pure `select_transport(client_library, native_available, backend)` used by the kubernetes backend to pick its transport (`auto` prefers the native client, `library` requires it, `http` forces the hand-rolled path). |
-| `yacron2/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
-| `yacron2/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
-| `yacron2/prometheus.py` | `PrometheusMetrics` accumulators plus the hand-rolled text/OpenMetrics exposition renderer behind `GET /metrics`. |
-| `yacron2/state.py` | The opt-in durable state store: the `StateBackend` ABC and the single `FilesystemStateBackend` concrete serving both a local directory and an Amazon S3 Files / EFS (NFSv4) mount -- the mount, not the code, decides the reach (`detect_topology` probes it). Immutable schema-versioned JSON records written via temp file + atomic rename (unknown/corrupt records are quarantined on read, never fatal), derived-maximum cursors, advisory-`flock` TTL leases with a monotonic fence, and the `make_state_backend` factory. The backend is only constructed (`start_stop_state`) when a `state:` section is configured; stdlib-only, so the stateless install pays nothing. |
-| `yacron2/state_admin.py` | Offline administration of the durable store behind the `yacron2 state ...` subcommands: `backup`/`restore`, `migrate` (between paths/mounts), manual `gc`, `check` (writability probe + inventory), and `migrate-schema`. Works straight from the `state` config section with no running daemon, and stays safe against a live one. Imported lazily by `__main__.py` only when a `state` subcommand is used. |
-| `yacron2/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
+| `cronstable/__main__.py` | CLI entry point. Argument parsing, basic logging setup, event-loop creation, shutdown-handler registration (delegated to `platform.install_shutdown_handlers`), and process exit codes. |
+| `cronstable/platform.py` | The single home for all per-OS branches: `DEFAULT_SHELL`, `DEFAULT_CONFIG_PATH`, `supports_unix_sockets`, `encode_argv`, `install_shutdown_handlers`, and the `IS_WINDOWS` flag. The rest of the codebase reads the same on every platform. |
+| `cronstable/config.py` | strictyaml `CONFIG_SCHEMA`, `DEFAULT_CONFIG`, `_REPORT_DEFAULTS`; config loading from a file or directory; include handling and dict merging (`mergedicts`); `JobConfig` parsing/validation; `CronstableConfig` dataclass. |
+| `cronstable/cronexpr.py` | The built-in cron expression engine: `CronTab` parsing (5/6/7-field dialect, names, `L` forms, `@`-nicknames), `next()` (strictly-future, DST-correct, 2099 horizon) and `test()`. A stdlib-only leaf module; behavior-compatible with the parse-crontab library it replaced, enforced by the golden vectors in `tests/data/cron_golden.json`. See [Schedules and Timezones](Schedules-and-Timezones). |
+| `cronstable/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
+| `cronstable/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`), and `JobRetryState`. |
+| `cronstable/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and by `cluster.py` (peer comparison). |
+| `cronstable/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory that builds the one named by `cluster.backend` (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`, `filesystem` -> `backends.filesystem.FilesystemBackend`) via deferred imports. |
+| `cronstable/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). |
+| `cronstable/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. |
+| `cronstable/backends/filesystem.py` | `FilesystemBackend` (a `LeaseBackend`): leader election through the flock-guarded, fence-counted TTL lease of `state.FilesystemStateBackend` over a shared POSIX mount (Amazon S3 Files / EFS / NFSv4) -- no coordination service, the mount is the store; stdlib-only. |
+| `cronstable/backends/__init__.py` | Shared backend helpers, notably the pure `select_transport(client_library, native_available, backend)` used by the kubernetes backend to pick its transport (`auto` prefers the native client, `library` requires it, `http` forces the hand-rolled path). |
+| `cronstable/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
+| `cronstable/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
+| `cronstable/prometheus.py` | `PrometheusMetrics` accumulators plus the hand-rolled text/OpenMetrics exposition renderer behind `GET /metrics`. |
+| `cronstable/state.py` | The opt-in durable state store: the `StateBackend` ABC and the single `FilesystemStateBackend` concrete serving both a local directory and an Amazon S3 Files / EFS (NFSv4) mount -- the mount, not the code, decides the reach (`detect_topology` probes it). Immutable schema-versioned JSON records written via temp file + atomic rename (unknown/corrupt records are quarantined on read, never fatal), derived-maximum cursors, advisory-`flock` TTL leases with a monotonic fence, and the `make_state_backend` factory. The backend is only constructed (`start_stop_state`) when a `state:` section is configured; stdlib-only, so the stateless install pays nothing. |
+| `cronstable/state_admin.py` | Offline administration of the durable store behind the `cronstable state ...` subcommands: `backup`/`restore`, `migrate` (between paths/mounts), manual `gc`, `check` (writability probe + inventory), and `migrate-schema`. Works straight from the `state` config section with no running daemon, and stays safe against a live one. Imported lazily by `__main__.py` only when a `state` subcommand is used. |
+| `cronstable/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
 `fingerprint`, `leadership`) -> (`statsd`, `config`). `cron.py` imports
@@ -50,15 +50,15 @@ lazily by `make_backend`, so `backends/` never enters the import graph unless
 private `FilesystemStateBackend` as its lease store); `config.py` has no
 dependency on `cron.py` or `job.py`.
 `prometheus.py` is a leaf module like `statsd.py`: it imports only
-`yacron2.version` at module scope, `cron.py` imports it, and its renderer
-late-imports `yacron2.cron` helpers at scrape time to break the cycle.
-`platform.py` is a leaf module with no yacron2 dependencies, imported by
+`cronstable.version` at module scope, `cron.py` imports it, and its renderer
+late-imports `cronstable.cron` helpers at scrape time to break the cycle.
+`platform.py` is a leaf module with no cronstable dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.
 `state.py` depends only on `config` and `platform`; `cron.py` imports it and
 builds the backend via `make_state_backend` inside `start_stop_state` (only
 when a `state:` section is configured). `state_admin.py` (which depends on
 `config` and `state`) is imported lazily by `__main__` for the
-`yacron2 state ...` subcommands, so it never enters the daemon's import graph.
+`cronstable state ...` subcommands, so it never enters the daemon's import graph.
 
 ## The event loop
 
@@ -201,7 +201,7 @@ re-checks the gate before relaunching a scheduled-job retry). See
   return `False` on non-startup iterations, so a `@reboot` job runs once at
   daemon start and never on the regular cadence.
 
-As `README.md` puts it, `@reboot` "will only run the job when yacron2 is
+As `README.md` puts it, `@reboot` "will only run the job when cronstable is
 initially executed."
 
 When a `state:` section is configured, a non-cluster-deferred `@reboot` job
@@ -259,11 +259,11 @@ as failures and do not schedule new retries.
 ## Configuration hot reload
 
 `update_config` is the single point of reload. When `config_arg` is `None`
-(the unit-test path) it returns an empty `Yacron2Config`. Otherwise it calls
+(the unit-test path) it returns an empty `CronstableConfig`. Otherwise it calls
 `parse_config(self.config_arg)`, which dispatches on whether the argument is a
 directory (`_parse_config_dir`) or a single file (`parse_config_file`). On
 success it overwrites `self.cron_jobs` with a fresh `OrderedDict` keyed by job
-name and returns the full `Yacron2Config` (jobs, web config, job defaults,
+name and returns the full `CronstableConfig` (jobs, web config, job defaults,
 logging config). Because reload happens once per minute at the top of the loop,
 config edits take effect within a minute without a restart. Schedule parsing,
 include merging, and defaults application all happen inside `parse_config*`; see
@@ -304,7 +304,7 @@ Leader election sits behind a pluggable-backend seam. The
 scheduler never talks to a concrete cluster implementation directly: it only ever
 asks *am I allowed to run this job?* through a handful of methods on whatever
 object `cluster.backend` selected. That seam is the `LeadershipBackend` ABC in
-`yacron2/leadership.py`, and `make_backend(cluster_config, get_job_set_id)` is the
+`cronstable/leadership.py`, and `make_backend(cluster_config, get_job_set_id)` is the
 factory that builds the chosen one (via deferred imports, so a lease backend
 never enters the import graph for the common gossip case):
 
@@ -365,7 +365,7 @@ the leader gate is correct even if the backend is absent.
 
 ### The gossip backend: `ClusterManager`
 
-The gossip concrete (`ClusterManager` in `yacron2/cluster.py`) owns two things:
+The gossip concrete (`ClusterManager` in `cronstable/cluster.py`) owns two things:
 
 - **The mTLS `/peer` listener**: its own `aiohttp` `AppRunner` on the `cluster`
   `listen` address, with a server SSL context that *requires* a CA-signed client
@@ -421,7 +421,7 @@ election. The full body:
   // this node's stable, human-readable identity (the configured nodeName,
   // defaulting to the hostname). The election's key: elect_leader picks the
   // minimum live name, so two nodes sharing this is a conflict_names conflict.
-  "node_name": "yacron-a",
+  "node_name": "cronstable-a",
   // the order-independent job-set fingerprint (fingerprint.canonical_job);
   // peers with a different value are "drifted" (running a different config).
   "job_set_id": "3f2a...c9",
@@ -441,13 +441,13 @@ election. The full body:
   // agreed, so the poller can confirm the edge is two-way (mutual agreement)
   // and spot a duplicate nodeName transitively (one name, two instance_ids).
   "members": [
-    { "node_name": "yacron-a", "instance_id": "b17e...", "agreed": true },
-    { "node_name": "yacron-b", "instance_id": "6c40...", "agreed": true }
+    { "node_name": "cronstable-a", "instance_id": "b17e...", "agreed": true },
+    { "node_name": "cronstable-b", "instance_id": "6c40...", "agreed": true }
   ],
   // the peers this node MUTUALLY agrees with (witnessed two-way edges): the
   // poller uses this as sound evidence that a transitively-reached node is
   // itself quorate, driving bridge-discovery deferral.
-  "mutual_agreeing": ["yacron-b", "yacron-c"],
+  "mutual_agreeing": ["cronstable-b", "cronstable-c"],
   // @reboot one-shots already run in the cluster (this node's, plus any it
   // learned from agreed peers), so a poller can retire its matching deferred
   // job without re-running it. Capped to MAX_ADVERTISED_REBOOT_JOBS.
@@ -461,7 +461,7 @@ election. The full body:
   // candidates): stronger than mutual_agreeing. A poller folds these into its
   // spread Leader-path owner set, so it only ever defers a job to a node
   // vouched able to run it.
-  "quorate_vouched": ["yacron-a", "yacron-b", "yacron-c"]
+  "quorate_vouched": ["cronstable-a", "cronstable-b", "cronstable-c"]
 }
 ```
 
@@ -762,7 +762,7 @@ call sites and logged as warnings so telemetry never crashes the scheduler. See
 ## Prometheus metrics
 
 The pull-side sibling of statsd is the `PrometheusMetrics` registry in
-`yacron2/prometheus.py`, owned by the `Cron` object rather than the web app, so
+`cronstable/prometheus.py`, owned by the `Cron` object rather than the web app, so
 counters survive web-app restarts and cluster-manager rebuilds across reloads
 (they reset only on process restart; `update_config` prunes series for jobs
 removed from the config). Cumulative state is recorded by synchronous in-memory
@@ -773,7 +773,7 @@ quorum-transition latches. Gauges are not stored at all: `Cron._web_metrics`
 calls the renderer, which computes them at scrape time from `cron_jobs`,
 `running_jobs`, `last_run`, and `cluster_manager.view_dict()`. If a backend
 read fails during a scrape, the cluster block degrades to
-`yacron2_cluster_enabled` alone instead of failing the whole scrape. See
+`cronstable_cluster_enabled` alone instead of failing the whole scrape. See
 [Metrics with Prometheus](Metrics-with-Prometheus).
 
 ## Concurrency model summary

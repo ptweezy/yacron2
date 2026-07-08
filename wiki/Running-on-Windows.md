@@ -1,6 +1,6 @@
 # Running on Windows
 
-yacron2 runs natively on Windows, alongside Linux and macOS. This page is the
+cronstable runs natively on Windows, alongside Linux and macOS. This page is the
 canonical reference for the handful of behaviors that differ on Windows: how
 to install it, where it looks for configuration, how a string `command` is fed
 to a shell, how to stop the daemon, how a job is terminated, the two
@@ -10,19 +10,19 @@ Everything not listed here behaves exactly as it does on POSIX, so the rest of
 this wiki applies unchanged.
 
 All of the OS-specific behavior is isolated in a single module
-(`yacron2/platform.py`); the scheduler, job runner, config loader, and entry
+(`cronstable/platform.py`); the scheduler, job runner, config loader, and entry
 point read the same on every platform.
 
 ## Supported platforms and architectures
 
-yacron2 supports Windows on two CPU architectures: `amd64` (x64) and `arm64`
+cronstable supports Windows on two CPU architectures: `amd64` (x64) and `arm64`
 (ARM64). You can install it either as a normal Python package or as a
 self-contained executable.
 
 | Architecture | pip / pipx | Standalone binary |
 | --- | --- | --- |
-| `amd64` (x64) | `pip install yacron2` | `yacron2-windows-amd64.exe` |
-| `arm64` (ARM64) | `pip install yacron2` | `yacron2-windows-arm64.exe` |
+| `amd64` (x64) | `pip install cronstable` | `cronstable-windows-amd64.exe` |
+| `arm64` (ARM64) | `pip install cronstable` | `cronstable-windows-arm64.exe` |
 
 The full test suite runs on Windows (both x64 and ARM64) in CI on every commit,
 and every release builds both Windows binaries. See
@@ -31,30 +31,30 @@ release workflow.
 
 ## Installation
 
-There are two ways to install yacron2 on Windows.
+There are two ways to install cronstable on Windows.
 
 ### pip / pipx
 
-`pip install yacron2` works on Windows just as it does on POSIX, installing the
-`yacron2` console script into your environment. A supported Python (3.10 or
+`pip install cronstable` works on Windows just as it does on POSIX, installing the
+`cronstable` console script into your environment. A supported Python (3.10 or
 newer) must be present. See [Installation](Installation) for the Python and
 dependency requirements that apply on every platform.
 
 ```shell
-pip install yacron2
-yacron2 --version
+pip install cronstable
+cronstable --version
 ```
 
 ### Standalone binary (no Python required)
 
 Every release attaches self-contained executables
-(`yacron2-windows-amd64.exe` (x64) and `yacron2-windows-arm64.exe` (ARM64)) on
-the [releases page](https://github.com/ptweezy/yacron2/releases). Python is
+(`cronstable-windows-amd64.exe` (x64) and `cronstable-windows-arm64.exe` (ARM64)) on
+the [releases page](https://github.com/ptweezy/cronstable/releases). Python is
 **not** required on the target system; the interpreter is embedded in the
 executable. Download the asset for your architecture, then run it:
 
 ```shell
-yacron2-windows-amd64.exe --version
+cronstable-windows-amd64.exe --version
 ```
 
 The binaries are built natively on Windows runners (the ARM64 binary on a
@@ -69,40 +69,40 @@ architectures.
 
 ## Default configuration location
 
-When `-c`/`--config` is omitted, the directory yacron2 looks in is
+When `-c`/`--config` is omitted, the directory cronstable looks in is
 platform-specific:
 
 | Platform | Default `-c` path |
 | --- | --- |
-| POSIX | `/etc/yacron2.d` |
-| Windows | `%APPDATA%\yacron2` (e.g. `C:\Users\<you>\AppData\Roaming\yacron2`) |
+| POSIX | `/etc/cronstable.d` |
+| Windows | `%APPDATA%\cronstable` (e.g. `C:\Users\<you>\AppData\Roaming\cronstable`) |
 
-On Windows the default is `%APPDATA%\yacron2`, the Windows analog of
-`/etc/yacron2.d`. If `APPDATA` is somehow unset (rare, for example a bare
-service account with no roaming profile), yacron2 falls back to the user
+On Windows the default is `%APPDATA%\cronstable`, the Windows analog of
+`/etc/cronstable.d`. If `APPDATA` is somehow unset (rare, for example a bare
+service account with no roaming profile), cronstable falls back to the user
 profile directory (`~`, i.e. `os.path.expanduser("~")`) and uses
-`<profile>\yacron2`.
+`<profile>\cronstable`.
 
 You can point `-c` anywhere (a single YAML file or a directory of `*.yaml` /
 `*.yml` files) exactly as on POSIX:
 
 ```shell
-yacron2 -c C:\path\to\yacron2tab.yaml
+cronstable -c C:\path\to\cronstable.yaml
 ```
 
 ### "Configuration file not found" applies to this path
 
-yacron2 has a special-case exit for a missing **default** config path: when the
+cronstable has a special-case exit for a missing **default** config path: when the
 `-c` argument is left at the platform default and that path does not exist,
-yacron2 prints the following to stderr, prints the usage help, and exits `1`:
+cronstable prints the following to stderr, prints the usage help, and exits `1`:
 
 ```text
-yacron2 error: configuration file not found, please provide one with the --config option
+cronstable error: configuration file not found, please provide one with the --config option
 ```
 
 This check keys off the **platform default value**, not the literal string
-`/etc/yacron2.d`. On Windows it therefore fires when `-c` resolves to
-`%APPDATA%\yacron2` (whether you omit `-c` or pass that path explicitly) and
+`/etc/cronstable.d`. On Windows it therefore fires when `-c` resolves to
+`%APPDATA%\cronstable` (whether you omit `-c` or pass that path explicitly) and
 the directory does not exist. For any *other* non-existent path you pass with
 `-c`, you instead get the generic configuration-error path (a logged
 `Configuration error: ...` and exit `1`). See the
@@ -169,13 +169,13 @@ inherited and how launch failures are handled), see
 
 ## Graceful shutdown
 
-To stop yacron2 on Windows, press `Ctrl-C` (or `Ctrl-Break`). As on POSIX, this
-is a *graceful* shutdown: yacron2 stops scheduling new runs and finishes the
+To stop cronstable on Windows, press `Ctrl-C` (or `Ctrl-Break`). As on POSIX, this
+is a *graceful* shutdown: cronstable stops scheduling new runs and finishes the
 currently running jobs first, exactly as `SIGTERM` does on POSIX. It does not
 force-kill its own running jobs on shutdown.
 
 Internally, POSIX wires `SIGINT`/`SIGTERM` onto the asyncio event loop. The
-Windows Proactor loop has no `add_signal_handler`, so on Windows yacron2 instead
+Windows Proactor loop has no `add_signal_handler`, so on Windows cronstable instead
 installs `signal.signal` handlers for `SIGINT` (Ctrl-C) and `SIGBREAK`
 (Ctrl-Break / console close) and runs a lightweight heartbeat timer so the
 interpreter observes the pending handler promptly even while the loop is blocked
@@ -186,7 +186,7 @@ in the [Command-Line Reference](CLI-Reference).
 
 ## Job termination semantics
 
-When yacron2 stops a job (because its `executionTimeout` expired, because of
+When cronstable stops a job (because its `executionTimeout` expired, because of
 `concurrencyPolicy: Replace`, or because of a cancel request through the
 [HTTP Control API](HTTP-API)) it calls `proc.terminate()`, waits up to
 `killTimeout` seconds, then escalates to `proc.kill()`. The meaning of those two
@@ -200,7 +200,7 @@ calls differs by platform:
 On Windows there are no POSIX signals: both `terminate()` and `kill()` map to
 `TerminateProcess`, an immediate, ungraceful stop. The child is **not** notified
 to clean up, so the `terminate()` → `kill()` escalation is effectively moot.
-`killTimeout` still bounds how long yacron2 waits between the two calls, but the
+`killTimeout` still bounds how long cronstable waits between the two calls, but the
 outcome is the same hard kill either way. A job cannot trap a "please shut down"
 signal on Windows the way it can trap `SIGTERM` on POSIX.
 
@@ -282,7 +282,7 @@ cluster: the filesystem election store at <path> resolved topology 'single-node'
 Coordinating *across* Windows hosts over a shared mount therefore requires
 both an explicit assertion (`state.topology: shared` and/or
 `cluster.filesystem.topology: shared`) **and** a mount that truly honours
-byte-range locks across hosts. yacron2 cannot check the second half on
+byte-range locks across hosts. cronstable cannot check the second half on
 Windows, so with `topology: shared` asserted the election still logs a loud
 startup advisory, verbatim, and the residual risk rests on your assertion:
 
@@ -307,7 +307,7 @@ probe.
 
 ## Everything else behaves identically
 
-Apart from the differences above, yacron2 behaves the same on Windows as on
+Apart from the differences above, cronstable behaves the same on Windows as on
 POSIX. The YAML crontab, schedules and timezones, environment variables and env
 files, output capturing, concurrency, failure detection and retries, reporting
 (mail / Sentry / shell / webhook), statsd metrics, the Prometheus `/metrics` endpoint,

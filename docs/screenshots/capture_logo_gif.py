@@ -21,7 +21,7 @@ from pathlib import Path
 from PIL import Image
 from playwright.sync_api import sync_playwright
 
-WEB = Path(__file__).resolve().parents[2] / "yacron2" / "web"
+WEB = Path(__file__).resolve().parents[2] / "cronstable" / "web"
 OUT = Path(__file__).parent / "shots"
 PORT = 8123
 
@@ -49,9 +49,9 @@ def capture(browser, theme, fname):
         reduced_motion="no-preference",  # keep the CRT glow classes on
     )
     ctx.add_init_script(
-        "try{localStorage.setItem('yacron2.boot','false');"
-        "localStorage.setItem('yacron2.zen','false');"
-        f"localStorage.setItem('yacron2.theme','\"{theme}\"');}}catch(e){{}}"
+        "try{localStorage.setItem('cronstable.boot','false');"
+        "localStorage.setItem('cronstable.zen','false');"
+        f"localStorage.setItem('cronstable.theme','\"{theme}\"');}}catch(e){{}}"
     )
     page = ctx.new_page()
     page.goto(f"http://127.0.0.1:{PORT}/index.html")

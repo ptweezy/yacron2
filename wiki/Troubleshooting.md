@@ -1,6 +1,6 @@
 # Troubleshooting and FAQ
 
-A problem -> cause -> fix reference for common yacron2 failures, grounded in the
+A problem -> cause -> fix reference for common cronstable failures, grounded in the
 source. Each entry names the exact config option, default, or code path involved.
 For full option semantics see the [Configuration Reference](Configuration-Reference);
 for deployment specifics see [Production and Container Deployment](Production-Deployment).
@@ -9,45 +9,45 @@ for deployment specifics see [Production and Container Deployment](Production-De
 
 ### "configuration file not found"
 
-**Symptom.** yacron2 exits immediately with:
+**Symptom.** cronstable exits immediately with:
 
 ```text
-yacron2 error: configuration file not found, please provide one with the --config option
+cronstable error: configuration file not found, please provide one with the --config option
 ```
 
 followed by the argument help, and exit code `1`.
 
 **Cause.** `__main__.py` defaults `-c`/`--config` to a platform-specific
-`CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH`: `/etc/yacron2.d` on POSIX, or
-`%APPDATA%\yacron2` on Windows (for example `C:\Users\<you>\AppData\Roaming\yacron2`,
+`CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH`: `/etc/cronstable.d` on POSIX, or
+`%APPDATA%\cronstable` on Windows (for example `C:\Users\<you>\AppData\Roaming\cronstable`,
 falling back to the user profile `~` if `APPDATA` is unset). When that default is in
 effect *and* the path does not exist
-(`args.config == CONFIG_DEFAULT and not os.path.exists(args.config)`), yacron2
+(`args.config == CONFIG_DEFAULT and not os.path.exists(args.config)`), cronstable
 prints the error and exits before constructing the scheduler. The not-found special
-case keys off the *platform default value*, not the literal string `/etc/yacron2.d`,
-so on Windows it fires when `-c` is left at `%APPDATA%\yacron2` and that path does not
+case keys off the *platform default value*, not the literal string `/etc/cronstable.d`,
+so on Windows it fires when `-c` is left at `%APPDATA%\cronstable` and that path does not
 exist. See [Running on Windows](Running-on-Windows).
 
-**Fix.** Create `/etc/yacron2.d/` and place `*.yaml`/`*.yml` files in it, or pass an
+**Fix.** Create `/etc/cronstable.d/` and place `*.yaml`/`*.yml` files in it, or pass an
 explicit path with `-c FILE-OR-DIR` (a single file or a directory). On Windows the
-default location to create and populate is `%APPDATA%\yacron2` rather than
-`/etc/yacron2.d`; see [Running on Windows](Running-on-Windows). Note the error
+default location to create and populate is `%APPDATA%\cronstable` rather than
+`/etc/cronstable.d`; see [Running on Windows](Running-on-Windows). Note the error
 text is only emitted for the *default* path; an explicit `-c` pointing at a missing
-file instead surfaces as a `ConfigError` (see below). yacron2's default is
-`/etc/yacron2.d` rather than yacron's `/etc/yacron.d`; if you upgraded from yacron,
+file instead surfaces as a `ConfigError` (see below). cronstable's default is
+`/etc/cronstable.d` rather than yacron's `/etc/yacron.d`; if you upgraded from yacron,
 move your config directory. See [Migration from yacron](Migration-from-yacron) and the
 [Command-Line Reference](CLI-Reference).
 
 ### "Configuration error" / a missing or unreadable explicit config file
 
-**Symptom.** `Configuration error: <message>` is logged and yacron2 exits `1`.
+**Symptom.** `Configuration error: <message>` is logged and cronstable exits `1`.
 
 **Cause.** Any `ConfigError` raised during initial parse aborts startup
 (`__main__.py` wraps `Cron(args.config)` and exits on `ConfigError`). When `-c`
 points at a single file that is missing or unreadable, `parse_config` catches the
 `OSError` and re-raises it as a clean `ConfigError` with the OS message.
 
-**Fix.** Correct the path/permissions or the YAML. Run `yacron2 -v -c <path>` to
+**Fix.** Correct the path/permissions or the YAML. Run `cronstable -v -c <path>` to
 validate without starting the scheduler; on success it logs `Configuration is valid.`
 and exits `0`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults).
 
@@ -80,7 +80,7 @@ shared libraries from there, so it needs a temp directory that is both **writabl
 and **executable**. Under a read-only root filesystem (a hardened container), `/tmp`
 is read-only too, and the unpack/exec fails. This requirement is unique to the
 standalone binary. The published container image and `pip`/`pipx` installs run
-yacron2 as an ordinary Python package and never self-extract.
+cronstable as an ordinary Python package and never self-extract.
 
 **Fix.** Provide a small writable, executable temp mount. With Docker, note that
 `--tmpfs` defaults to `noexec`, so you must request `exec` explicitly:
@@ -88,8 +88,8 @@ yacron2 as an ordinary Python package and never self-extract.
 ```shell
 docker run --rm --read-only \
   --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m \
-  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
-  your-image-with-the-binary -c /etc/yacron2.d
+  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
+  your-image-with-the-binary -c /etc/cronstable.d
 ```
 
 On Kubernetes mount an `emptyDir` at `/tmp` (writable and executable by default;
@@ -99,12 +99,12 @@ executable directory with `TMPDIR=/path`. See [Installation](Installation) and
 
 ## Per-job user/group switching
 
-### "yacron2 is not running as superuser"
+### "cronstable is not running as superuser"
 
 **Symptom.** Startup (or reload) fails with:
 
 ```text
-Job <name> wants to change user or group, but yacron2 is not running as superuser
+Job <name> wants to change user or group, but cronstable is not running as superuser
 ```
 
 **Cause.** A job sets `user` and/or `group`. `_resolve_user_group` raises this
@@ -136,7 +136,7 @@ database, the gid is left unset and supplementary groups are cleared. See
 
 ### API serves without authentication / refuses to start
 
-**Symptom (intended hardening).** With `web.authToken` configured, yacron2 either
+**Symptom (intended hardening).** With `web.authToken` configured, cronstable either
 logs `web: requiring bearer-token authentication` and requires
 `Authorization: Bearer <token>` on every route, or raises:
 
@@ -201,12 +201,12 @@ configs` / `multiple logging configs`.)
 
 ### A job runs immediately on startup (or never runs at startup)
 
-**Symptom.** A job fires the moment yacron2 starts, or you expected one to fire at
+**Symptom.** A job fires the moment cronstable starts, or you expected one to fire at
 startup and it did not.
 
 **Cause.** At startup (`startup=True`), `job_should_run` returns `True` *only* for
 jobs whose schedule is the literal string `@reboot`; all CronTab-scheduled jobs return
-`False` and wait for their next matching minute. yacron2 wakes aligned to the start of
+`False` and wait for their next matching minute. cronstable wakes aligned to the start of
 each minute and runs a CronTab job when `crontab.test(now.replace(second=0))` matches.
 
 **Fix.** Use `schedule: "@reboot"` for run-on-start behavior; use a normal crontab
@@ -250,7 +250,7 @@ stay five-field and minute-granular.
 
 **Cause.** `_resolve_timezone` calls `ZoneInfo(timezone)`; a
 `ZoneInfoNotFoundError`/`ValueError` is re-raised as `ConfigError`. On slim images
-that lack the system tz database, yacron2 depends on the bundled `tzdata` package to
+that lack the system tz database, cronstable depends on the bundled `tzdata` package to
 resolve names.
 
 **Fix.** Use a valid IANA name (for example `America/Los_Angeles`). The `timezone`
@@ -322,8 +322,8 @@ defaults above. See [Failure Detection and Retries](Failure-Detection-and-Retrie
 reports.
 
 **Cause.** Defaults are `captureStderr: true`, `captureStdout: false`. A stream that
-is *not* captured is passed through to yacron2's own stdout/stderr (job stderr to
-yacron2 stderr); only captured streams are saved and available to `failsWhen` and to
+is *not* captured is passed through to cronstable's own stdout/stderr (job stderr to
+cronstable stderr); only captured streams are saved and available to `failsWhen` and to
 report templates. Captured lines are prefixed per `streamPrefix`
 (default `"[{job_name} {stream_name}] "`).
 
@@ -366,7 +366,7 @@ set, `onFailure.retry.maximumRetries >= -1` (`-1` = retry forever),
 **Symptom.** Mail that delivered fine under yacron now fails with a TLS/certificate
 validation error.
 
-**Cause.** yacron2's mail `validate_certs` default is `True` (a change from yacron;
+**Cause.** cronstable's mail `validate_certs` default is `True` (a change from yacron;
 `_REPORT_DEFAULTS["mail"]["validate_certs"] = True`). The mail reporter passes
 `validate_certs=mail["validate_certs"]` to `aiosmtplib.SMTP`, so delivery to servers
 with self-signed or otherwise invalid certificates that previously worked silently now
@@ -398,7 +398,7 @@ an empty rendered body is also skipped.
 
 ### No statsd metrics arrive
 
-**Symptom.** Expected metrics never reach statsd. yacron2 emits four per job:
+**Symptom.** Expected metrics never reach statsd. cronstable emits four per job:
 `start`, `stop`, and `success` as gauges (`|g`) and `duration` as a timer
 (`|ms|@0.1`), prefixed by the job's `statsd.prefix`. At most a log warning
 `Job <name>: failed to send statsd … metric` or an error
@@ -415,7 +415,7 @@ and verify the host resolves and the UDP path is open. See
 
 ### Prometheus scrapes return 401
 
-**Symptom.** Prometheus marks the yacron2 target down with
+**Symptom.** Prometheus marks the cronstable target down with
 `server returned HTTP status 401 Unauthorized`; `curl http://host:port/metrics`
 returns `401`.
 
@@ -479,7 +479,7 @@ the dashboard cluster panel, and an `ERROR` log line reports the duplicate.
 
 **Cause.** Two processes are running with the **same `nodeName`** (distinguished
 by their random per-process instance ids). Because each would elect itself as the
-lowest name in its own view, both could lead: a silent double-run. yacron2
+lowest name in its own view, both could lead: a silent double-run. cronstable
 detects this and **fails `Leader` jobs closed** until it clears (`PreferLeader`
 and `EveryNode` are not gated).
 
@@ -517,7 +517,7 @@ peer never counts toward agreement, so quorum can drop.
 **Cause (gossip only).** The peer's certificate did not verify: it does not chain
 to the configured `tls.ca`, or its SAN/hostname does not match the address it was
 reached at (standard TLS hostname pinning, e.g. the cert at
-`yacron-b.internal:8443` must carry `yacron-b.internal` as a SAN). This most often
+`cronstable-b.internal:8443` must carry `cronstable-b.internal` as a SAN). This most often
 follows a botched CA roll (the overlap step was skipped) or a node whose cert
 refresh lagged.
 
@@ -540,7 +540,7 @@ so it is strictly worse than a single replica. …
 
 **Cause.** With `electLeader` and a 2-node cluster the quorum is 2, so **both**
 nodes must be up for either to run: lower availability than a single replica and
-no failover. yacron2 refuses it outright rather than silently degrade. (A 2-node
+no failover. cronstable refuses it outright rather than silently degrade. (A 2-node
 cluster is fine for attestation-only, without `electLeader`.)
 
 **Fix.** Use 3 or more nodes (an odd count is best), or run a single replica

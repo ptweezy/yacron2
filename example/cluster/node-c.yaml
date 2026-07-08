@@ -1,15 +1,15 @@
-# Per-node cluster section for yacron-c (mounted as cluster.yaml on this node).
+# Per-node cluster section for cronstable-c (mounted as cluster.yaml on this node).
 # See node-a.yaml for the annotated version.
 cluster:
   listen: "0.0.0.0:8443"
   tls:
     ca:   /certs/ca.pem
-    cert: /certs/yacron-c.pem       # this node's cert (SAN = yacron-c)
-    key:  /certs/yacron-c.key
+    cert: /certs/cronstable-c.pem       # this node's cert (SAN = cronstable-c)
+    key:  /certs/cronstable-c.key
   peers:                            # every OTHER member
-    - host: yacron-a:8443
-    - host: yacron-b:8443
-  nodeName: yacron-c
+    - host: cronstable-a:8443
+    - host: cronstable-b:8443
+  nodeName: cronstable-c
   electLeader: true
   interval: 10
   driftAfter: 2

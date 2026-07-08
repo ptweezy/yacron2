@@ -159,7 +159,7 @@ jobs:
           # freeze from it with `uv run` (uv discovers the setup-python 3.14).
           uv venv --python 3.14
           uv pip install pyinstaller==6.21.0  # pin matches pyinstaller/Dockerfile
-          uv pip install .                     # bakes the pinned version into yacron2/version.py
+          uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) so the binary runs the faster
           # event loop. Install a wheel where one exists, else build it from
           # sdist (ship uvloop as broadly as it compiles); a failed install
@@ -172,16 +172,16 @@ jobs:
           # Bundle orjson (the `speedups` extra) to accelerate the durable-state
           # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
           # needed). The shared script round-trip-verifies it and drops a broken
-          # build, so the binary falls back to stdlib json (yacron2/_json).
+          # build, so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
-          uv run pyinstaller pyinstaller/yacron2.spec
-          dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
-          mv dist/yacron2 "dist/yacron2-linux-${{ matrix.arch }}"
+          uv run pyinstaller pyinstaller/cronstable.spec
+          dist/cronstable --version            # smoke test: fails the job if the bundle is broken
+          mv dist/cronstable "dist/cronstable-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-linux-${{ matrix.arch }}
-          path: dist/yacron2-linux-${{ matrix.arch }}
+          name: cronstable-linux-${{ matrix.arch }}
+          path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -263,7 +263,7 @@ jobs:
               apk add --no-cache build-base libffi-dev zlib-dev
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
-              pip install .                     # bakes the pinned version into yacron2/version.py
+              pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a musllinux wheel where one
               # exists (amd64/arm64), else a source build (ship it as broadly as
               # it compiles -- build-base above supplies the toolchain).
@@ -279,14 +279,14 @@ jobs:
               # when the wheel is missing; the shared script round-trip-verifies
               # it and drops a broken QEMU build -> stdlib json fallback.
               RUST_SETUP="apk add --no-cache curl && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
-              pyinstaller pyinstaller/yacron2.spec
-              dist/yacron2 --version            # smoke test: a musl binary on a musl host
-              mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
+              pyinstaller pyinstaller/cronstable.spec
+              dist/cronstable --version            # smoke test: a musl binary on a musl host
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}-musl
             '
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-linux-${{ matrix.arch }}-musl
-          path: dist/yacron2-linux-${{ matrix.arch }}-musl
+          name: cronstable-linux-${{ matrix.arch }}-musl
+          path: dist/cronstable-linux-${{ matrix.arch }}-musl
           if-no-files-found: error
           retention-days: 7
 
@@ -352,7 +352,7 @@ jobs:
               apt-get install -y --no-install-recommends build-essential libffi-dev zlib1g-dev
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the other binary jobs
-              pip install .                     # bakes the pinned version into yacron2/version.py
+              pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a manylinux wheel where one
               # exists (amd64/arm64), else a source build (ship it as broadly as
               # it compiles -- build-essential above supplies the toolchain).
@@ -368,14 +368,14 @@ jobs:
               # when the wheel is missing; the shared script round-trip-verifies
               # it and drops a broken QEMU build -> stdlib json fallback.
               RUST_SETUP="apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
-              pyinstaller pyinstaller/yacron2.spec
-              dist/yacron2 --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
-              mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
+              pyinstaller pyinstaller/cronstable.spec
+              dist/cronstable --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-linux-${{ matrix.arch }}
-          path: dist/yacron2-linux-${{ matrix.arch }}
+          name: cronstable-linux-${{ matrix.arch }}
+          path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -426,21 +426,21 @@ jobs:
           # freeze from it with `uv run` (uv discovers the setup-python 3.14).
           uv venv --python 3.14
           uv pip install pyinstaller==6.21.0  # pin matches the Linux jobs
-          uv pip install .                     # bakes the pinned version into yacron2/version.py
+          uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
           # ships wheels for both arches. verify_uvloop.py confirms it imports and
           # runs a loop, else uninstalls it so the binary falls back to asyncio
-          # (yacron2/__main__._new_event_loop).
+          # (cronstable/__main__._new_event_loop).
           uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
           uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
           # Bundle orjson (the `speedups` extra) to accelerate the durable-state
           # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
           # needed). The shared script round-trip-verifies it and drops a broken
-          # build, so the binary falls back to stdlib json (yacron2/_json).
+          # build, so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
-          uv run pyinstaller pyinstaller/yacron2.spec
-          dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
+          uv run pyinstaller pyinstaller/cronstable.spec
+          dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Assert the binary is the intended native arch: Rosetta would happily
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
           # silently producing a mislabelled asset. `file` reports x86_64/arm64.
@@ -448,12 +448,12 @@ jobs:
             amd64) want=x86_64 ;;
             arm64) want=arm64 ;;
           esac
-          file dist/yacron2 | grep -q "$want"
-          mv dist/yacron2 "dist/yacron2-macos${{ matrix.os }}-${{ matrix.arch }}"
+          file dist/cronstable | grep -q "$want"
+          mv dist/cronstable "dist/cronstable-macos${{ matrix.os }}-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-macos${{ matrix.os }}-${{ matrix.arch }}
-          path: dist/yacron2-macos${{ matrix.os }}-${{ matrix.arch }}
+          name: cronstable-macos${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/cronstable-macos${{ matrix.os }}-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -464,7 +464,7 @@ jobs:
   # sdist using the runner's Visual Studio ARM64 toolchain, the same way the
   # QEMU Linux legs compile from sdist for riscv64/armv6. Same pyinstaller pin
   # and `--version` smoke test as the other binary jobs; the bundle is a single
-  # self-contained yacron2-windows-<arch>.exe. Steps use bash (git bash ships on
+  # self-contained cronstable-windows-<arch>.exe. Steps use bash (git bash ships on
   # the Windows runners) so they read identically to the Linux/macOS jobs.
   binaries-windows:
     needs: version
@@ -499,19 +499,19 @@ jobs:
           # throwaway uv venv and freeze from it with `uv run`.
           uv venv --python 3.14
           uv pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
-          uv pip install .                     # bakes the pinned version into yacron2/version.py
+          uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle orjson (the `speedups` extra) for the durable-state / cluster
           # JSON paths; Windows amd64 ships a wheel (arm64 falls back if none).
           # The shared script round-trip-verifies it and drops a broken build,
-          # so the binary falls back to stdlib json (yacron2/_json).
+          # so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
-          uv run pyinstaller pyinstaller/yacron2.spec
-          ./dist/yacron2.exe --version      # smoke test: fails the job if the bundle is broken
-          mv dist/yacron2.exe "dist/yacron2-windows-${{ matrix.arch }}.exe"
+          uv run pyinstaller pyinstaller/cronstable.spec
+          ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
+          mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: yacron2-windows-${{ matrix.arch }}
-          path: dist/yacron2-windows-${{ matrix.arch }}.exe
+          name: cronstable-windows-${{ matrix.arch }}
+          path: dist/cronstable-windows-${{ matrix.arch }}.exe
           if-no-files-found: error
           retention-days: 7

@@ -3,9 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from yacron2 import config
-from yacron2.config import ConfigError
-from yacron2.platform import IS_WINDOWS
+from cronstable import config
+from cronstable.config import ConfigError
+from cronstable.platform import IS_WINDOWS
 
 
 def test_mergedicts():
@@ -706,7 +706,7 @@ def test_user_string_resolves_uid_gid_and_name(monkeypatch):
 def test_numeric_user_resolves_uid_and_derives_gid_name(monkeypatch):
     # a numeric `user: 1000` is taken directly as the uid; the primary gid and
     # login name are derived from the passwd db so a numeric user does not
-    # silently keep yacron2's (root) gid. (The schema is Int() | Str(), so a
+    # silently keep cronstable's (root) gid. (The schema is Int() | Str(), so a
     # bare number parses as an int and reaches this branch.)
     def getpwnam(name):
         raise AssertionError("a numeric user must not be looked up by name")
@@ -801,7 +801,7 @@ def test_user_group_requires_superuser(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# web.metrics (the native Prometheus endpoint; see yacron2/prometheus.py)
+# web.metrics (the native Prometheus endpoint; see cronstable/prometheus.py)
 # ---------------------------------------------------------------------------
 
 _WEB_METRICS_BASE = """
@@ -814,7 +814,7 @@ web:
 def test_web_metrics_absent_by_default():
     conf = config.parse_config_string(_WEB_METRICS_BASE, "")
     # the key is simply absent; enabled-by-default is applied at the use
-    # site (yacron2.prometheus.resolve_metrics_config)
+    # site (cronstable.prometheus.resolve_metrics_config)
     assert "metrics" not in conf.web_config
 
 
@@ -897,7 +897,7 @@ def test_schedule_object_second_builds_seven_field_crontab():
     # renders to a full 7-field crontab line (year defaults to "*").
     job = _one_job('    schedule:\n      second: "*/15"\n      minute: "*"\n')
     assert job.has_seconds is True
-    from yacron2.cronexpr import CronTab
+    from cronstable.cronexpr import CronTab
 
     assert isinstance(job.schedule, CronTab)
     # fires at seconds 0,15,30,45 of the minute (7-field dialect)

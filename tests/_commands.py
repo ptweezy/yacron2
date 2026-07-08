@@ -91,18 +91,18 @@ def cmd_hang(first, seconds):
 
 
 def cmd_write_env(path):
-    """argv that appends the YACRON2_* report env vars to ``path``.
+    """argv that appends the CRONSTABLE_* report env vars to ``path``.
 
-    Replaces the shell reporter's ``echo "$YACRON2_... " >> file``; verifies
+    Replaces the shell reporter's ``echo "$CRONSTABLE_... " >> file``; verifies
     the same thing (the reporter exports those variables to its command).
     """
     code = (
         "import os; "
         "open({}, 'a', encoding='utf-8').write("
         "'{{}} - {{}} - {{}} - Error code {{}}'.format("
-        "os.environ['YACRON2_JOB_NAME'], "
-        "os.environ['YACRON2_JOB_COMMAND'], "
-        "os.environ['YACRON2_JOB_SCHEDULE'], "
-        "os.environ['YACRON2_RETCODE']))"
+        "os.environ['CRONSTABLE_JOB_NAME'], "
+        "os.environ['CRONSTABLE_JOB_COMMAND'], "
+        "os.environ['CRONSTABLE_JOB_SCHEDULE'], "
+        "os.environ['CRONSTABLE_RETCODE']))"
     ).format(json.dumps(path))
     return _py(code)

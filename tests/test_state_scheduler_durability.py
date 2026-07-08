@@ -21,11 +21,11 @@ import json
 import pytest
 from aiohttp import web
 
-import yacron2.platform as platform_mod
-from yacron2.cron import Cron
-from yacron2.fingerprint import job_digest
-from yacron2.job import JobRetryState
-from yacron2.prometheus import PrometheusMetrics
+import cronstable.platform as platform_mod
+from cronstable.cron import Cron
+from cronstable.fingerprint import job_digest
+from cronstable.job import JobRetryState
+from cronstable.prometheus import PrometheusMetrics
 from tests.test_state import (
     _count_launcher,
     _drain_state_writes,
@@ -1104,7 +1104,7 @@ async def test_state_periodic_writes_manifest(tmp_path):
 async def test_collect_state_garbage_keeps_manifested_jobs(
     tmp_path, monkeypatch
 ):
-    import yacron2.state as state_mod
+    import cronstable.state as state_mod
 
     cron = await _stateful_cron(tmp_path, _RETRY_JOB)
     try:
@@ -1163,7 +1163,7 @@ async def test_manifest_per_host_streams_survive_large_fleet(
     # deferred FOREVER (removed jobs' streams then grew without bound).
     # Per-host streams (manifests/<host>) mean one host's own retained span
     # never shrinks no matter how many OTHER hosts join the fleet.
-    import yacron2.state as state_mod
+    import cronstable.state as state_mod
 
     cron = await _stateful_cron(tmp_path, _RETRY_JOB)
     try:
@@ -1231,7 +1231,7 @@ async def test_dropped_writes_counted_and_rendered(tmp_path):
         assert cron.metrics._state_dropped.get("run-record") == 1
         text = cron.metrics.render(cron)
         assert (
-            'yacron2_state_dropped_writes_total{kind="run-record"} 1' in text
+            'cronstable_state_dropped_writes_total{kind="run-record"} 1' in text
         )
     finally:
         cron.state_backend = None
@@ -1247,22 +1247,22 @@ async def test_state_metric_families_rendered(tmp_path):
         text = cron.metrics.render(cron)
         assert (
             sample_value(
-                text, "yacron2_state_ops_total", op="append"
+                text, "cronstable_state_ops_total", op="append"
             )
             >= 1
         )
         assert (
-            sample_value(text, "yacron2_state_op_errors_total", op="append")
+            sample_value(text, "cronstable_state_op_errors_total", op="append")
             == 0
         )
         assert (
-            sample_value(text, "yacron2_state_op_seconds_total", op="append")
+            sample_value(text, "cronstable_state_op_seconds_total", op="append")
             is not None
         )
         assert (
             sample_value(
                 text,
-                "yacron2_state_info",
+                "cronstable_state_info",
                 backend="filesystem",
                 topology="single-node",
             )
@@ -1271,8 +1271,8 @@ async def test_state_metric_families_rendered(tmp_path):
         # scrape survives a stats() blow-up (degrade, never 500)
         cron.state_backend.stats = _raise_runtime  # type: ignore[method-assign]
         text = cron.metrics.render(cron)
-        assert "yacron2_state_ops_total" not in text
-        assert sample_value(text, "yacron2_job_runs_total", **{
+        assert "cronstable_state_ops_total" not in text
+        assert sample_value(text, "cronstable_job_runs_total", **{
             "job_name": "j", "status": "success"
         }) == 1
     finally:

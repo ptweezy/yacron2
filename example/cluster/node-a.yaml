@@ -1,4 +1,4 @@
-# Per-node cluster section for yacron-a (mounted as cluster.yaml on this node).
+# Per-node cluster section for cronstable-a (mounted as cluster.yaml on this node).
 #
 # Only the node identity differs between node-a/-b/-c: nodeName, the peer list
 # (every OTHER member), and this node's TLS cert/key. None of this affects the
@@ -7,12 +7,12 @@ cluster:
   listen: "0.0.0.0:8443"            # the mutual-TLS /peer listener (internal only)
   tls:
     ca:   /certs/ca.pem             # shared cluster CA (trust anchor)
-    cert: /certs/yacron-a.pem       # this node's cert (SAN = yacron-a)
-    key:  /certs/yacron-a.key
+    cert: /certs/cronstable-a.pem       # this node's cert (SAN = cronstable-a)
+    key:  /certs/cronstable-a.key
   peers:                            # every OTHER member -> cluster size = 3
-    - host: yacron-b:8443
-    - host: yacron-c:8443
-  nodeName: yacron-a                # lowest name -> the leader when all agree
+    - host: cronstable-b:8443
+    - host: cronstable-c:8443
+  nodeName: cronstable-a                # lowest name -> the leader when all agree
   electLeader: true                 # only the elected leader runs scheduled jobs
   interval: 10                      # poll every 10s so the demo reacts quickly
   driftAfter: 2                     # report drift after 2 mismatched rounds

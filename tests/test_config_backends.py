@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from yacron2.config import (
+from cronstable.config import (
     DEFAULT_ETCD,
     DEFAULT_FILESYSTEM,
     DEFAULT_K8S,
@@ -412,7 +412,7 @@ def test_etcd_rejects_stray_kubernetes_store_block():
         "    endpoints:\n"
         "      - https://etcd:2379\n"
         "  kubernetes:\n"
-        "    leaseName: yacron2-leader\n"
+        "    leaseName: cronstable-leader\n"
     )
     with pytest.raises(ConfigError, match="cluster.kubernetes is configured"):
         _cluster(yaml)
@@ -832,14 +832,14 @@ _FS = (
     "  backend: filesystem\n"
     "  nodeName: node-a\n"
     "  filesystem:\n"
-    "    path: /mnt/shared/yacron2\n"
+    "    path: /mnt/shared/cronstable\n"
 )
 
 
 def test_filesystem_defaults_filled():
     cfg = _cluster(_FS)
     fsb = cfg["filesystem"]
-    assert fsb["path"] == "/mnt/shared/yacron2"
+    assert fsb["path"] == "/mnt/shared/cronstable"
     assert fsb["electionName"] == DEFAULT_FILESYSTEM["electionName"]
     assert fsb["ttl"] == DEFAULT_FILESYSTEM["ttl"]
     assert fsb["deploymentId"] is None

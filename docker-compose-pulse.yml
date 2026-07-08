@@ -1,6 +1,6 @@
 # Pulse — a real-time uptime / SLA monitor showcasing second-level scheduling.
 #
-# A single yacron2 node that probes a latency-critical HTTP endpoint every few
+# A single cronstable node that probes a latency-critical HTTP endpoint every few
 # SECONDS (not minutes), heartbeats every 10s, and rolls up once a minute. The
 # service under test is this node's own web API, so it runs with nothing else.
 #
@@ -12,12 +12,12 @@
 # (including how to simulate an outage).
 
 services:
-  yacron2-pulse:
+  cronstable-pulse:
     build:
       context: .
-    container_name: yacron2-pulse
+    container_name: cronstable-pulse
     ports:
       - "8080:8080"
     volumes:
-      - ./example/pulse-monitor/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro
+      - ./example/pulse-monitor/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
     restart: unless-stopped

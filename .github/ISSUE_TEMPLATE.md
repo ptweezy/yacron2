@@ -1,4 +1,4 @@
-* yacron2 version:
+* cronstable version:
 * Python version:
 * Operating System:
 

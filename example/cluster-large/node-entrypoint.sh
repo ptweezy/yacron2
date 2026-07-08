@@ -1,6 +1,6 @@
 #!/bin/sh
 # Entry point for the 10-node demo: build this node's cluster config from
-# environment variables, then exec yacron2. This keeps the compose file small
+# environment variables, then exec cronstable. This keeps the compose file small
 # (no ten hand-written peer lists): every node shares one CLUSTER_HOSTS list and
 # excludes itself by NODE_NAME.
 #
@@ -30,9 +30,9 @@ if ! _valid "$NODE_NAME" || [ "${NODE_NAME#*:}" != "$NODE_NAME" ]; then
   exit 1
 fi
 
-DIR="${YACRON2_DIR:-/tmp/yacron2.d}"
+DIR="${CRONSTABLE_DIR:-/tmp/cronstable.d}"
 mkdir -p "$DIR"
-# the job set is mounted read-only at /config/jobs.yaml; yacron2 needs every
+# the job set is mounted read-only at /config/jobs.yaml; cronstable needs every
 # config file in one directory, so copy it next to the generated cluster.yaml.
 cp /config/jobs.yaml "$DIR/jobs.yaml"
 
@@ -69,4 +69,4 @@ cp /config/jobs.yaml "$DIR/jobs.yaml"
 } > "$DIR/cluster.yaml"
 
 echo "[entrypoint] ${NODE_NAME}: wrote $DIR/cluster.yaml"
-exec yacron2 -c "$DIR"
+exec cronstable -c "$DIR"

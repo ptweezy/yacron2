@@ -1,7 +1,7 @@
 #!/bin/sh
 # Entry point for the Meridian grand-tour cluster: build this node's `cluster:`
 # section from environment variables, assemble the config directory, then exec
-# yacron2. Keeps the compose file small (no nine hand-written peer lists): every
+# cronstable. Keeps the compose file small (no nine hand-written peer lists): every
 # node shares one CLUSTER_HOSTS list and excludes itself by NODE_NAME.
 #
 # Env in:
@@ -45,9 +45,9 @@ case "$BACKEND" in
   *) echo "[entrypoint] invalid BACKEND: ${BACKEND} (want gossip|filesystem)" >&2; exit 1 ;;
 esac
 
-DIR="${YACRON2_DIR:-/tmp/yacron2.d}"
+DIR="${CRONSTABLE_DIR:-/tmp/cronstable.d}"
 mkdir -p "$DIR"
-# The config is mounted read-only at /config; yacron2 needs every config file in
+# The config is mounted read-only at /config; cronstable needs every config file in
 # one directory alongside the generated cluster.yaml, so copy the loadable files
 # next to it. platform.yaml pulls in _defaults.yaml via `include:` (resolved
 # relative to this directory), and legacy.crontab is loaded as a classic
@@ -68,7 +68,7 @@ if [ "$BACKEND" = "filesystem" ]; then
     echo "  interval: ${INTERVAL:-10}"
     echo "  driftAfter: ${DRIFT_AFTER:-2}"
     echo "  filesystem:"
-    echo "    path: /var/lib/yacron2/state"
+    echo "    path: /var/lib/cronstable/state"
     echo "    electionName: cluster/leader"
     echo "    ttl: 15"
     echo "    deploymentId: meridian-prod"
@@ -129,4 +129,4 @@ else
 fi
 
 echo "[entrypoint] ${NODE_NAME}: wrote $DIR/cluster.yaml (backend=${BACKEND})"
-exec yacron2 -c "$DIR"
+exec cronstable -c "$DIR"

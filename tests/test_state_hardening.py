@@ -1,4 +1,4 @@
-"""Regression tests for the adversarial-review hardening of yacron2.state.
+"""Regression tests for the adversarial-review hardening of cronstable.state.
 
 Each test pins a CONFIRMED bug fixed in the hardening pass; if a fix
 regresses, the matching test fails.  Covered invariants:
@@ -33,7 +33,7 @@ regresses, the matching test fails.  Covered invariants:
   replace-write path does.
 
 No tight wall-clock timing anywhere: lease expiry is driven by
-monkeypatching ``yacron2.state._now`` (the one time source), so nothing here
+monkeypatching ``cronstable.state._now`` (the one time source), so nothing here
 depends on the coarse Windows clock.
 """
 
@@ -45,9 +45,9 @@ import time
 
 import pytest
 
-from yacron2 import state
-from yacron2.dag import DAG_LEASE_PREFIX
-from yacron2.state import FilesystemStateBackend
+from cronstable import state
+from cronstable.dag import DAG_LEASE_PREFIX
+from cronstable.state import FilesystemStateBackend
 
 
 def _backend(tmp_path, **over):
@@ -346,9 +346,9 @@ def test_tilde_path_expands_to_home():
     # "~" went through abspath, creating a literal "~" directory under
     # whatever CWD the daemon started in.  Construction only -- no start(),
     # so nothing is created under the real home.
-    backend = _backend("~/some-yacron2-test-path")
+    backend = _backend("~/some-cronstable-test-path")
     home = os.path.expanduser("~")
-    expected = os.path.abspath(os.path.join(home, "some-yacron2-test-path"))
+    expected = os.path.abspath(os.path.join(home, "some-cronstable-test-path"))
     assert backend.root == expected
     assert backend.root.startswith(home)
 

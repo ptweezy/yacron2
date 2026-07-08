@@ -1,10 +1,10 @@
 """The DAG runtime driven against a real backend + loopback API.
 
 Where test_state_dag.py exercises the pure state machine, this file drives
-:class:`yacron2.dagrun.DagScheduler` end to end: a real
-:class:`~yacron2.state.FilesystemStateBackend` in a temp dir, the real loopback
+:class:`cronstable.dagrun.DagScheduler` end to end: a real
+:class:`~cronstable.state.FilesystemStateBackend` in a temp dir, the real loopback
 job-state API bound to an ephemeral port, and real task subprocesses (launched
-through the same :class:`~yacron2.job.RunningJob` path a job uses).  A small
+through the same :class:`~cronstable.job.RunningJob` path a job uses).  A small
 in-test pump stands in for ``Cron.run``'s reaper: it awaits each launched task,
 routes its completion through ``cron._handle_finished_job`` (which the DAG
 scheduler picks up), then flushes the spawned advances, looping until the run is
@@ -13,7 +13,7 @@ terminal.
 Style: bare ``async def`` tests, ``asyncio_mode = auto``, no frozen clock and no
 duration asserts (the drive loop is progress-driven, not time-driven).  Task
 commands are ``[sys.executable, ...]`` argv lists (no shell), so they are
-cross-platform; the fan-out / XCom test uses the real ``yacron2 xcom`` CLI over
+cross-platform; the fan-out / XCom test uses the real ``cronstable xcom`` CLI over
 the loopback endpoint.
 """
 
@@ -24,8 +24,8 @@ import sys
 
 import pytest
 
-from yacron2 import dag, dagrun
-from yacron2.cron import Cron
+from cronstable import dag, dagrun
+from cronstable.cron import Cron
 
 _PY = sys.executable
 _UTC = datetime.timezone.utc
@@ -36,7 +36,7 @@ def _utcnow():
 
 
 def _state_cfg(yaml):
-    from yacron2.config import parse_config_string
+    from cronstable.config import parse_config_string
 
     return parse_config_string(yaml, "").state_config
 
@@ -216,28 +216,28 @@ async def test_e2e_fanout_and_xcom(tmp_path):
         outdir = tmp_path / "work"
         outdir.mkdir()
 
-        # gen publishes the fan-out list through the real `yacron2 xcom` CLI.
+        # gen publishes the fan-out list through the real `cronstable xcom` CLI.
         _set_cmd(
             cron, "fan", "gen",
-            [_PY, "-m", "yacron2", "xcom", "push", "--key", "items",
+            [_PY, "-m", "cronstable", "xcom", "push", "--key", "items",
              str(items_file)],
         )
         # each mapped worker writes its injected item to work/<index>.
         worker = (
             "import os;"
-            "open(os.path.join(r'{}', os.environ['YACRON2_DAG_MAP_INDEX']),"
-            "'w').write(os.environ['YACRON2_DAG_MAP_ITEM'])".format(outdir)
+            "open(os.path.join(r'{}', os.environ['CRONSTABLE_DAG_MAP_INDEX']),"
+            "'w').write(os.environ['CRONSTABLE_DAG_MAP_ITEM'])".format(outdir)
         )
         _set_cmd(cron, "fan", "work", [_PY, "-c", worker])
         _set_cmd(cron, "fan", "collect", [_PY, "-c", "pass"])
         _set_cmd(
             cron, "fan", "producer",
-            [_PY, "-m", "yacron2", "xcom", "push", "--key", "msg",
+            [_PY, "-m", "cronstable", "xcom", "push", "--key", "msg",
              str(msg_file)],
         )
         _set_cmd(
             cron, "fan", "consumer",
-            [_PY, "-m", "yacron2", "xcom", "pull", "--task", "producer",
+            [_PY, "-m", "cronstable", "xcom", "pull", "--task", "producer",
              "--key", "msg", "-o", str(consumed)],
         )
 
@@ -311,7 +311,7 @@ async def test_mapped_upstream_nonportable_value_does_not_wedge(tmp_path):
         items_file.write_text("[100000000000000000000]")  # 10^20 > 2^64 - 1
         _set_cmd(
             cron, "np", "gen",
-            [_PY, "-m", "yacron2", "xcom", "push", "--key", "items",
+            [_PY, "-m", "cronstable", "xcom", "push", "--key", "items",
              str(items_file)],
         )
         _set_cmd(cron, "np", "work", [_PY, "-c", "pass"])
@@ -1095,8 +1095,8 @@ async def test_retention_prune_releases_xcom_blobs_to_the_sweep(tmp_path):
     # reclaim exactly the pruned run's blobs and keep the retained run's.
     import os
 
-    import yacron2.state as state_mod
-    from yacron2 import jobstate
+    import cronstable.state as state_mod
+    from cronstable import jobstate
 
     cron = await _make_cron(tmp_path, _RETAIN_ONE)
     try:
@@ -1182,8 +1182,8 @@ async def test_removed_dag_history_collected_by_daemon_gc_pass(tmp_path,
     # run of the same removed dag survives untouched.
     import os
 
-    import yacron2.state as state_mod
-    from yacron2 import jobstate
+    import cronstable.state as state_mod
+    from cronstable import jobstate
 
     cron = await _make_cron(tmp_path, _LINEAR)
     try:
@@ -1250,7 +1250,7 @@ async def test_monitored_task_resources_land_in_run_record(tmp_path):
     # a finished DAG task's sampled usage (RunningJob.resource_usage) must be
     # recorded on its task record in the dag_run document and ride the run
     # API (get_run returns the raw document, which _web_dag_run serves).
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     yaml = (
         "dags:\n  - name: mon\n    tasks:\n"

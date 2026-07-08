@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Render the Homebrew formula for a yacron2 release by substituting the version
-# and the per-artifact SHA256 sums into yacron2.rb.tmpl.
+# Render the Homebrew formula for a cronstable release by substituting the version
+# and the per-artifact SHA256 sums into cronstable.rb.tmpl.
 #
 # Checksums are read from a published SHA256SUMS manifest (the one attached to
 # the GitHub Release), so the formula always pins the exact bytes users get.
 #
-# Usage: render-formula.sh <version> <sha256sums-file> <template> > yacron2.rb
+# Usage: render-formula.sh <version> <sha256sums-file> <template> > cronstable.rb
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then
@@ -33,8 +33,8 @@ sha_for() {
 
 sed \
   -e "s/@VERSION@/${version}/g" \
-  -e "s/@SHA_MACOS_ARM64@/$(sha_for yacron2-macos-arm64)/g" \
-  -e "s/@SHA_MACOS_AMD64@/$(sha_for yacron2-macos-amd64)/g" \
-  -e "s/@SHA_LINUX_ARM64@/$(sha_for yacron2-linux-arm64)/g" \
-  -e "s/@SHA_LINUX_AMD64@/$(sha_for yacron2-linux-amd64)/g" \
+  -e "s/@SHA_MACOS_ARM64@/$(sha_for cronstable-macos-arm64)/g" \
+  -e "s/@SHA_MACOS_AMD64@/$(sha_for cronstable-macos-amd64)/g" \
+  -e "s/@SHA_LINUX_ARM64@/$(sha_for cronstable-linux-arm64)/g" \
+  -e "s/@SHA_LINUX_AMD64@/$(sha_for cronstable-linux-amd64)/g" \
   "$template"

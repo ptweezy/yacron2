@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yacron2"
+name = "cronstable"
 description = "A modern, distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,10 +48,10 @@ dependencies = [
     # that don't ship the system tzdata.
     "tzdata>=2024.1",
     # per-run CPU/memory accounting (opt-in `monitorResources`; see
-    # yacron2.resources). psutil gives a portable, process-tree-aware read of
+    # cronstable.resources). psutil gives a portable, process-tree-aware read of
     # a job's CPU time and resident memory on Linux, macOS and Windows alike --
     # asyncio's own subprocess reaping only surfaces the exit code. The feature
-    # is off by default, but the import is unconditional so `yacron2 --help`
+    # is off by default, but the import is unconditional so `cronstable --help`
     # and the type checker resolve it everywhere; it ships wheels for the
     # mainstream targets and builds from source elsewhere.
     "psutil>=5.9",
@@ -79,15 +79,15 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ptweezy/yacron2"
-Documentation = "https://github.com/ptweezy/yacron2#readme"
-Source = "https://github.com/ptweezy/yacron2"
-Changelog = "https://github.com/ptweezy/yacron2/releases"
-Issues = "https://github.com/ptweezy/yacron2/issues"
-Container = "https://github.com/ptweezy/yacron2/pkgs/container/yacron2"
+Homepage = "https://github.com/ptweezy/cronstable"
+Documentation = "https://github.com/ptweezy/cronstable#readme"
+Source = "https://github.com/ptweezy/cronstable"
+Changelog = "https://github.com/ptweezy/cronstable/releases"
+Issues = "https://github.com/ptweezy/cronstable/issues"
+Container = "https://github.com/ptweezy/cronstable/pkgs/container/cronstable"
 
 [project.scripts]
-yacron2 = "yacron2.__main__:main"
+cronstable = "cronstable.__main__:main"
 
 [project.optional-dependencies]
 # Optional: use the official Kubernetes client for the `kubernetes` leadership
@@ -99,14 +99,14 @@ yacron2 = "yacron2.__main__:main"
 kubernetes = ["kubernetes>=27"]
 # Optional: swap asyncio's event loop for uvloop's faster libuv-based one
 # (cluster HTTP, web dashboard, Prometheus scrape). Best-effort at runtime --
-# yacron2 falls back to stock asyncio when it is absent -- so it stays off the
+# cronstable falls back to stock asyncio when it is absent -- so it stays off the
 # core install to keep the zero-new-dep, architecture-portable baseline intact.
 # Gated off Windows, which has no uvloop build (and needs the Proactor loop for
 # subprocesses anyway); pip skips it there rather than failing to resolve.
 speedups = [
     "uvloop>=0.19; sys_platform != 'win32'",
     # orjson accelerates the durable-state persistence and cluster-gossip JSON
-    # paths (see yacron2._json, which falls back to the stdlib json when it is
+    # paths (see cronstable._json, which falls back to the stdlib json when it is
     # absent). Like uvloop it is best-effort: it ships no wheels for some of
     # the leaner architectures we target (riscv64, armv6, musl ppc64le/s390x),
     # so it stays optional and the zero-new-dep, architecture-portable core
@@ -133,14 +133,14 @@ dev = [
 # The kubernetes/etcd leadership backends talk to their store over plain HTTP
 # via the core aiohttp dependency (no kubernetes/etcd3 client, no grpc), so
 # they add no runtime dependency and need no optional extra -- which also keeps
-# yacron2's wide architecture coverage intact.
-packages = ["yacron2", "yacron2.web", "yacron2.backends"]
+# cronstable's wide architecture coverage intact.
+packages = ["cronstable", "cronstable.web", "cronstable.backends"]
 
 [tool.setuptools.package-data]
-"yacron2.web" = ["*.html"]
+"cronstable.web" = ["*.html"]
 
 [tool.setuptools_scm]
-version_file = "yacron2/version.py"
+version_file = "cronstable/version.py"
 
 [tool.black]
 line-length = 79
@@ -185,7 +185,7 @@ strict_optional = true
 
 [[tool.mypy.overrides]]
 # The optional `speedups` deps are imported behind try/except with a stdlib
-# fallback (orjson in yacron2._json, uvloop in yacron2.__main__), so a checkout
+# fallback (orjson in cronstable._json, uvloop in cronstable.__main__), so a checkout
 # without the extra installed must still type-check cleanly.
 module = ["orjson", "uvloop"]
 ignore_missing_imports = true
@@ -195,9 +195,9 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["yacron2"]
+source = ["cronstable"]
 branch = true
-omit = ["yacron2/version.py"]
+omit = ["cronstable/version.py"]
 
 [tool.coverage.report]
 show_missing = true

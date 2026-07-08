@@ -1,13 +1,13 @@
 # History
 
-yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron),
+cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron),
 continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
-project, on which yacron2 is based.
+project, on which cronstable is based.
 
 ## 1.2.10 (2026-07-07)
 
-yacron2 now parses cron expressions itself.  This release retires the
+cronstable now parses cron expressions itself.  This release retires the
 third-party `crontab` (parse-crontab) library in favor of a small,
 stdlib-only engine that lives in the tree -- so the scheduler owns the one
 piece of syntax every job depends on, the dialect is documented and tested
@@ -19,8 +19,8 @@ fall-back folds).  Nothing changes for existing configs -- the dialect, the
 timezone model, and the strictly-future fire semantics are all preserved
 vector-by-vector.
 
-- **`yacron2/cronexpr.py`: the built-in cron engine.** A new `CronTab` class
-  parses the crontab dialect yacron2 has always accepted (5/6/7 fields,
+- **`cronstable/cronexpr.py`: the built-in cron engine.** A new `CronTab` class
+  parses the crontab dialect cronstable has always accepted (5/6/7 fields,
   ranges, steps including bare-start `5/15`, lists, case-insensitive
   `jan`/`mon` names, `0`-`7` weekdays with `6-0` wrap, `L`-last-day and
   `L5`-last-Friday forms, `@`-nicknames) and answers the scheduler's two
@@ -154,13 +154,13 @@ default and the observability overlay is opt-in.
   per-run CPU and peak-memory columns and stats. The HTTP API carries
   `resources` on each run in the history, live `running_resources` on a
   running job, and windowed CPU/RSS aggregates in the job stats. Prometheus
-  grows `yacron2_job_cpu_seconds_total{job_name, mode}` (user/system),
-  `yacron2_job_peak_rss_bytes`, and last-run CPU/RSS gauges -- emitted only
+  grows `cronstable_job_cpu_seconds_total{job_name, mode}` (user/system),
+  `cronstable_job_peak_rss_bytes`, and last-run CPU/RSS gauges -- emitted only
   once a job has a monitored run, and persisted across restarts by the
   durable metrics snapshot. A monitored run's statsd stop datagram gains a
   `cpu` timer and a `max_rss` gauge (an unmonitored job's datagram is
   unchanged), and failure reports get `cpu_seconds` / `max_rss_bytes` (and
-  friends) plus `YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES` template
+  friends) plus `CRONSTABLE_CPU_SECONDS` / `CRONSTABLE_MAX_RSS_BYTES` template
   variables.
 
 - **`GET /node`: the node's own live load.** A new endpoint samples the
@@ -177,7 +177,7 @@ default and the observability overlay is opt-in.
 - **`cluster.observability`: gossip as a secondary data plane.** Opt in and
   every node shares its whole-node CPU/memory across the cluster. Under
   `backend: gossip` the reading rides the election mesh as a small
-  `X-Yacron2-Node-Stats` response header on full and `304` responses alike,
+  `X-Cronstable-Node-Stats` response header on full and `304` responses alike,
   so a sharing cluster's steady-state round still costs headers only. The
   lease backends (`kubernetes`/`etcd`/`filesystem`), which have no
   node-to-node channel of their own, can stand up a *second,
@@ -203,7 +203,7 @@ default and the observability overlay is opt-in.
 
 ## 1.2.7 (2026-07-06)
 
-This release makes yacron2 **stateful**. An opt-in durable state store lets
+This release makes cronstable **stateful**. An opt-in durable state store lets
 the scheduler remember across restarts -- retries that survive a daemon
 restart, `@reboot` that really means once per boot, Prometheus counters that
 do not reset -- and turns a shared directory into fleet-wide coordination:
@@ -272,22 +272,22 @@ untouched.
 - **Every job gets a state API.** With `state.jobApi` (on by default once a
   store is configured) the daemon serves a loopback-only HTTP endpoint and
   injects its address and a per-run bearer token into each job's
-  environment; the `yacron2` binary doubles as the client. `yacron2 state
-  get/set/delete/keys` is durable KV; `yacron2 cursor` keeps resumable
-  positions; `yacron2 lock` gives fleet-wide mutexes and semaphores backed
+  environment; the `cronstable` binary doubles as the client. `cronstable state
+  get/set/delete/keys` is durable KV; `cronstable cursor` keeps resumable
+  positions; `cronstable lock` gives fleet-wide mutexes and semaphores backed
   by the same TTL leases the cluster uses, with fencing tokens and a
-  `lock run --` wrapper; `yacron2 idempotent` makes run-once guards honest
-  (exit `0` fresh, `5` duplicate, `1` transport or store error); `yacron2
+  `lock run --` wrapper; `cronstable idempotent` makes run-once guards honest
+  (exit `0` fresh, `5` duplicate, `1` transport or store error); `cronstable
   artifact` stores content-addressed payloads under configurable size caps.
   A job's `secrets:` block stages secrets over the endpoint for exactly one
   run -- resolved fresh, served only to that run, never in the environment
-  and never in the durable store -- read back with `yacron2 secret get`.
+  and never in the durable store -- read back with `cronstable secret get`.
   Scopes default to the job's own name; `stateAllowedScopes` opens shared
   ones.
 
 - **DAG orchestration.** A new `dags:` section defines multi-step pipelines
   on the job grammar: tasks with `dependsOn` and per-task retries, XCom
-  hand-off between tasks (`yacron2 xcom push/pull`), mapped fan-out over a
+  hand-off between tasks (`cronstable xcom push/pull`), mapped fan-out over a
   pushed list (capped, launched in bounded batches), sensors that poke on
   an interval, and approval gates a human resolves from the dashboard or
   API. Dags run on cron schedules (the job schedule grammar, minus
@@ -307,7 +307,7 @@ untouched.
   Prometheus endpoint grows state-store and DAG metric families. All routes
   are documented on the wiki's HTTP-API page.
 
-- **Store administration.** `yacron2 state backup` writes an owner-only
+- **Store administration.** `cronstable state backup` writes an owner-only
   `.tar.gz` of the whole store, safe against a live daemon; `state restore`
   merges it back atomically (fence-aware, refuses a non-empty store without
   `--force`, and is not safe while a daemon uses the store); `state
@@ -319,7 +319,7 @@ untouched.
 
 - **Packaging and examples.** orjson joins uvloop in the `speedups` extra,
   accelerating the durable-state and cluster-gossip JSON paths through
-  `yacron2._json`, whose stdlib fallback is behavior-identical -- the core
+  `cronstable._json`, whose stdlib fallback is behavior-identical -- the core
   install stays zero-new-dependency and architecture-portable, and the
   prebuilt binaries bundle orjson wherever a real wheel or verified source
   build exists, with a verify-or-strip step mirroring uvloop's. New
@@ -387,8 +387,8 @@ lease renew -- lowers steady-state memory, and adds an optional faster event
 loop.
 
 - **Optional uvloop event loop (`speedups` extra).** `pip install
-  yacron2[speedups]` swaps asyncio's selector loop for uvloop's faster
-  libuv-based one, speeding every I/O path yacron2 drives: cluster gossip and
+  cronstable[speedups]` swaps asyncio's selector loop for uvloop's faster
+  libuv-based one, speeding every I/O path cronstable drives: cluster gossip and
   lease HTTP, the web dashboard, and the Prometheus scrape. It is entirely
   opt-in and best-effort -- `__main__` selects uvloop lazily on POSIX and falls
   back to stock asyncio, behavior unchanged, whenever it is absent or
@@ -433,7 +433,7 @@ loop.
   the webhook body) are shared by reference rather than duplicated on each
   fingerprint. The PyInstaller binaries are now built with `optimize=2`, which
   strips docstrings and (side-effect-free, internal-invariant) asserts from the
-  frozen bytecode -- yacron2's modules are deliberately docstring-dense, so this
+  frozen bytecode -- cronstable's modules are deliberately docstring-dense, so this
   shrinks the binary and lowers resident memory for the life of the daemon.
 
 - **The idle scheduler no longer polls once a second.** The job reaper waited on
@@ -642,7 +642,7 @@ existing deployment.
   labels updated to match, labelling the leading second and trailing year
   columns correctly), and its next-fire preview shows seconds.
 
-- **Clicking the wordmark spins the logo.** The "yacron2" wordmark now triggers
+- **Clicking the wordmark spins the logo.** The "cronstable" wordmark now triggers
   the same mark-spin animation as clicking the mark glyph.
 
 ### Examples and documentation
@@ -651,7 +651,7 @@ existing deployment.
   built entirely on second-level scheduling: it probes a latency-critical service
   every few seconds, heartbeats every ten, and rolls up a summary once a minute
   (which still fires exactly once per minute alongside the per-second probes). It
-  watches yacron2's own `/status` endpoint, so `docker compose -f
+  watches cronstable's own `/status` endpoint, so `docker compose -f
   docker-compose-pulse.yml up` needs nothing else running.
 
 - **`example/pulse-cluster`** -- the clustered sibling: a three-node,
@@ -771,7 +771,7 @@ existing deployment.
 
 ## 1.2.1 (2026-07-02)
 
-This is the largest yacron2 release since the fork. Its headline feature is
+This is the largest cronstable release since the fork. Its headline feature is
 clustering: several replicas can now verify they hold the same job set, elect
 a leader so each scheduled job runs on one node instead of every node, spread
 jobs across the fleet, and fail over when a node dies, coordinating either
@@ -825,7 +825,7 @@ behavior changes that apply to existing deployments.
   current `clusterOwner`.
 - **Mutual TLS is the entire trust boundary.** A peer must present a
   certificate chaining to the configured CA and matching the host it was
-  reached at, so the CA should be dedicated to yacron2 nodes and nothing
+  reached at, so the CA should be dedicated to cronstable nodes and nothing
   else. Certificates rotated in place are detected and reloaded without a
   restart. The peer endpoint is served only on the cluster listener, never
   on the web API listener.
@@ -834,7 +834,7 @@ behavior changes that apply to existing deployments.
   where a `Leader` job can be skipped or a `PreferLeader` job can
   double-run, and the new wiki page enumerates them. When you need fenced
   exactly-once execution, use one of the lease backends below.
-- `yacron2 --validate-config` validates the entire `cluster` section (peer
+- `cronstable --validate-config` validates the entire `cluster` section (peer
   list, TLS material, lease timing invariants) without starting anything.
 
 ### Kubernetes and etcd lease backends
@@ -849,26 +849,26 @@ behavior changes that apply to existing deployments.
   cannot express per-job ownership).
 - **Kubernetes** (`cluster.kubernetes.*`): replicas campaign for a
   `coordination.k8s.io/v1` Lease object using the client-go leader-election
-  algorithm (`leaseName` defaults to `yacron2-leader`;
+  algorithm (`leaseName` defaults to `cronstable-leader`;
   `leaseDurationSeconds`/`renewDeadlineSeconds`/`retryPeriodSeconds` default
   to 15/10/2, with the client-go timing invariants enforced at config load).
   In-cluster ServiceAccount token, CA, namespace, and API server are
   detected automatically; a `kubeconfig` and an explicit `apiServer` (https
   only) are supported. The backend talks to the API server over the bundled
   aiohttp by default; installing the new optional extra
-  (`pip install yacron2[kubernetes]`) switches to the official Kubernetes
+  (`pip install cronstable[kubernetes]`) switches to the official Kubernetes
   client (`clientLibrary: auto|http|library`). The stored holder identity
   embeds a per-process token, so two pods that accidentally share a name
   cannot both hold the lease. `example/kubernetes/` ships a ready-to-apply
   Deployment with the minimal ServiceAccount, Role, and RoleBinding.
 - **etcd** (`cluster.etcd.*`): replicas campaign for a lease-bound key
-  (`electionName` defaults to `yacron2/leader`) through etcd's v3 JSON/HTTP
+  (`electionName` defaults to `cronstable/leader`) through etcd's v3 JSON/HTTP
   gRPC gateway, using a create-if-absent transaction fenced by the lease id
   (`ttl` defaults to 15 seconds, minimum 3). Multiple `endpoints` fail over
   in order; optional `username`/`password` (literal, `fromFile`, or
   `fromEnvVar`) and client TLS are supported, and credentials are refused
   unless every endpoint is `https://`. `example/etcd/` ships a compose demo
-  with an etcd and two yacron2 replicas.
+  with an etcd and two cronstable replicas.
 - **Failover is fast and clock-safe on both.** All fencing runs on the
   monotonic clock with a one-second skew margin (no wall-clock or cross-node
   clock-sync assumptions): a holder whose renewals stall demotes itself
@@ -891,7 +891,7 @@ behavior changes that apply to existing deployments.
   sidecar and no new dependency (the exposition is generated in-process).
   Both the classic text format and OpenMetrics 1.0 are served, negotiated
   via the `Accept` header.
-- Per-job series cover run outcomes (`yacron2_job_runs_total` labeled by
+- Per-job series cover run outcomes (`cronstable_job_runs_total` labeled by
   `job_name` and `status`), retries, permanent failures, failures to start,
   a duration histogram with configurable buckets
   (`web.metrics.durationBuckets`), last success/failure/run timestamps and
@@ -899,8 +899,8 @@ behavior changes that apply to existing deployments.
   cover the version, start time, job-set id, job counts, and config-reload
   health. Cluster series cover size, quorum, leadership, per-peer status
   counts, conflicts, and leader/quorum transition counters; the wiki
-  suggests alerting on `sum(yacron2_cluster_is_leader) > 1` and on losing
-  `yacron2_cluster_quorate`. Metrics are recorded at the same point as the
+  suggests alerting on `sum(cronstable_cluster_is_leader) > 1` and on losing
+  `cronstable_cluster_quorate`. Metrics are recorded at the same point as the
   run history, so `/metrics` and `/jobs/{name}/runs` never disagree.
 - `web.authToken`, when configured, protects `/metrics` like every other
   endpoint; `web.metrics.public: true` exempts just this endpoint for a
@@ -918,10 +918,10 @@ behavior changes that apply to existing deployments.
   `@midnight`), position-sensitive `VAR=value` environment lines, comments,
   and the `\%` escape. `SHELL` and `CRON_TZ` assignments are honored as the
   job's `shell` and `timezone`.
-- Each entry becomes a normal yacron2 job named `<file>:<line>`,
+- Each entry becomes a normal cronstable job named `<file>:<line>`,
   indistinguishable downstream: it shows up on the dashboard and HTTP API,
   participates in the job-set id and clustering, and can be run or
-  cancelled on demand. yacron2's defaults apply rather than cron's (UTC
+  cancelled on demand. cronstable's defaults apply rather than cron's (UTC
   unless `CRON_TZ` says otherwise; any stderr output marks the run as
   failed). Deviations are deliberate and loud: an unescaped `%` is a
   load-time error instead of silently not feeding stdin, `MAILTO` is
@@ -983,7 +983,7 @@ behavior changes that apply to existing deployments.
   now guards against any `OSError` (file-descriptor exhaustion, fork or
   memory limits, permission errors), not just a missing executable: the run
   is recorded as an ordinary start failure with exit code 127 (and counted
-  in `yacron2_job_start_failures_total`) instead of the error propagating
+  in `cronstable_job_start_failures_total`) instead of the error propagating
   out of the scheduling loop and taking the daemon down.
 
 ### Upgrade notes
@@ -994,15 +994,15 @@ behavior changes that apply to existing deployments.
 - The job-set id changes once on upgrade: `clusterPolicy` is now part of
   every job's fingerprint, so an unchanged configuration hashes to a
   different `v1:` id than 1.1.8 through 1.1.11 reported. Compare ids only
-  between nodes running the same yacron2 version; a mixed-version fleet
+  between nodes running the same cronstable version; a mixed-version fleet
   reads as drift until the rollout completes.
 - Config directories now load crontab-named files (`*.crontab`, `*.cron`,
   `crontab`) that earlier releases silently ignored.
 
 ### Packaging
 
-- New `yacron2.backends` subpackage, and a new optional extra:
-  `pip install yacron2[kubernetes]` installs the official Kubernetes client
+- New `cronstable.backends` subpackage, and a new optional extra:
+  `pip install cronstable[kubernetes]` installs the official Kubernetes client
   for `clientLibrary: library`. A core install gains no new runtime
   dependency and the supported Python range is unchanged. The PyPI metadata
   gains prometheus/metrics/monitoring keywords and an updated description.
@@ -1037,7 +1037,7 @@ behavior changes that apply to existing deployments.
 
 ## 1.1.11 (2026-06-29)
 
-- **Coverage is now published to [Codecov](https://codecov.io/gh/ptweezy/yacron2).**
+- **Coverage is now published to [Codecov](https://codecov.io/gh/ptweezy/cronstable).**
   Every CI matrix cell uploads its own `coverage.xml` under an
   `<os>-py<version>` flag, and Codecov merges them into one combined number, so
   POSIX-only paths that Windows skips (privilege drop, `user`/`group`
@@ -1096,14 +1096,14 @@ behavior changes that apply to existing deployments.
   UBI 9), `-fedora`, `-opensuse` (Leap), `-amazonlinux` (2023) and
   `-distroless`, plus an explicit `-debian` alias for the default. Pick the base
   that matches your host userland or image-provenance policy; behavior is
-  identical, since yacron2 is a pure-Python app (Python >= 3.10) and each image
+  identical, since cronstable is a pure-Python app (Python >= 3.10) and each image
   uses its distro's native interpreter. The Debian image still owns the bare
   `latest`/`<version>` tags and the widest architecture coverage. See
   [Distro variants](README.md#distro-variants).
 
 ## 1.1.8 (2026-06-23)
 
-- **Job-set id.** yacron2 can now emit a *job-set id*: an order-independent
+- **Job-set id.** cronstable can now emit a *job-set id*: an order-independent
   hash of every job's effective configuration. Two instances deployed from the
   same configuration produce the same id, so replicas can confirm they hold an
   identical set of jobs. It is taken over the merged, effective config (so
@@ -1113,26 +1113,26 @@ behavior changes that apply to existing deployments.
   host-specific resolved uid/gid, and embeds no secret material (inline
   reporting secrets are redacted, and only `environment` variable names are
   hashed, not their values). Get it from
-  the CLI (`yacron2 --job-set-id`, prints and exits), the web API
+  the CLI (`cronstable --job-set-id`, prints and exits), the web API
   (`GET /job-set-id`, also `application/json`), and the dashboard header; it is
   logged once at startup and again whenever a config reload changes it. The
   scheme is versioned (a `v1:` prefix) so ids are only compared within a scheme.
 
 ## 1.1.7 (2026-06-23)
 
-- **Windows support.** yacron2 now runs natively on Windows, in addition to
+- **Windows support.** cronstable now runs natively on Windows, in addition to
   Linux and macOS. The core was made portable: the POSIX-only `grp`/`pwd`
   imports are now lazy and guarded, Ctrl-C / Ctrl-Break shutdown is wired up
   without the POSIX-only event-loop signal handlers, and subprocess argv is
-  encoded per platform. `pip install yacron2` works on Windows, and every
-  release now also ships self-contained binaries `yacron2-windows-amd64.exe`
-  and `yacron2-windows-arm64.exe` (Python not required on the target).
+  encoded per platform. `pip install cronstable` works on Windows, and every
+  release now also ships self-contained binaries `cronstable-windows-amd64.exe`
+  and `cronstable-windows-arm64.exe` (Python not required on the target).
   - On Windows a string `command` with no explicit `shell` runs through the
     native command processor (`%ComSpec%`, i.e. `cmd.exe`), mirroring the
     `/bin/sh` default on POSIX. Set `shell:` or pass `command` as a list for
     anything else.
-  - The default config location (`-c`) is `%APPDATA%\yacron2` on Windows
-    (`/etc/yacron2.d` is unchanged on POSIX).
+  - The default config location (`-c`) is `%APPDATA%\cronstable` on Windows
+    (`/etc/cronstable.d` is unchanged on POSIX).
   - Two features remain POSIX-only and are reported clearly on Windows: per-job
     `user`/`group` switching (rejected with a configuration error) and
     `unix://` web listeners (skipped with a warning; use an `http://` listener).
@@ -1144,9 +1144,9 @@ behavior changes that apply to existing deployments.
 
 - Add self-contained binaries for two more Linux architectures, bringing
   every release to eight Linux architectures plus macOS: 64-bit RISC-V
-  (`riscv64`) in both glibc and musl flavors (`yacron2-linux-riscv64` and
-  `yacron2-linux-riscv64-musl`) and 32-bit ARMv6 (`armv6`, e.g. Raspberry
-  Pi Zero / Pi 1) in musl only (`yacron2-linux-armv6-musl`). As with the
+  (`riscv64`) in both glibc and musl flavors (`cronstable-linux-riscv64` and
+  `cronstable-linux-riscv64-musl`) and 32-bit ARMv6 (`armv6`, e.g. Raspberry
+  Pi Zero / Pi 1) in musl only (`cronstable-linux-armv6-musl`). As with the
   other binaries, Python is not required on the target system. Neither arch
   has a native GitHub runner, so they build inside a container via
   `docker run --platform` under QEMU emulation.
@@ -1168,7 +1168,7 @@ behavior changes that apply to existing deployments.
 
 ## 1.1.5 (2026-06-22)
 
-This is a documentation release; there are no changes to the `yacron2`
+This is a documentation release; there are no changes to the `cronstable`
 package itself.
 
 ### Documentation
@@ -1189,7 +1189,7 @@ package itself.
 
 - Add self-contained binaries for two more Linux architectures to every
   release, in both glibc and musl flavors: little-endian POWER (`ppc64le`)
-  and IBM Z (`s390x`) (`yacron2-linux-ppc64le`, `yacron2-linux-s390x`, and
+  and IBM Z (`s390x`) (`cronstable-linux-ppc64le`, `cronstable-linux-s390x`, and
   their `-musl` variants) alongside the existing `amd64`, `arm64`, `i686`
   and `armv7` builds. As with the other binaries, Python is not required on
   the target system. Neither arch has a native GitHub runner, so they build
@@ -1205,9 +1205,9 @@ package itself.
 ## 1.1.3 (2026-06-22)
 
 - Add self-contained binaries for two more Linux architectures to every
-  release, in both glibc and musl flavors: 32-bit x86 (`yacron2-linux-i686`
-  and `yacron2-linux-i686-musl`) and 32-bit ARM (`yacron2-linux-armv7` and
-  `yacron2-linux-armv7-musl`), alongside the existing 64-bit `amd64` and
+  release, in both glibc and musl flavors: 32-bit x86 (`cronstable-linux-i686`
+  and `cronstable-linux-i686-musl`) and 32-bit ARM (`cronstable-linux-armv7` and
+  `cronstable-linux-armv7-musl`), alongside the existing 64-bit `amd64` and
   `arm64` builds. As with the other binaries, Python is not required on the
   target system. The 32-bit binaries are built inside a 32-bit container
   (`i686` natively on the x86-64 runner, `armv7` under QEMU emulation).
@@ -1219,7 +1219,7 @@ package itself.
 
 ## 1.1.2 (2026-06-21)
 
-This is a documentation release; there are no changes to the `yacron2`
+This is a documentation release; there are no changes to the `cronstable`
 package itself.
 
 ### Documentation
@@ -1272,8 +1272,8 @@ package itself.
 - Add a `web.ui` option; set `ui: false` to expose only the REST API and
   disable the dashboard.
 - Keep run history and live logs in memory only, so the dashboard does
-  not change yacron2's read-only-filesystem deployment story; history
-  resets when yacron2 restarts.
+  not change cronstable's read-only-filesystem deployment story; history
+  resets when cronstable restarts.
 - Ship a `docker-compose.yml` and a demo crontab for trying the
   dashboard against a set of varied example jobs.
 
@@ -1291,7 +1291,7 @@ package itself.
 
 ## 1.0.16 (2026-06-21)
 
-- Publish container images to Docker Hub as `docker.io/ptweezy/yacron2`
+- Publish container images to Docker Hub as `docker.io/ptweezy/cronstable`
   on every release, in addition to GHCR. The two registries carry the
   same multi-arch (`linux/amd64` + `linux/arm64`) image, so you can
   pull from whichever you prefer.
@@ -1304,7 +1304,7 @@ package itself.
 ## 1.0.15 (2026-06-21)
 
 - Lower the minimum required Python version from 3.13 to 3.10;
-  yacron2 now supports Python 3.10, 3.11, 3.12, 3.13, and 3.14.
+  cronstable now supports Python 3.10, 3.11, 3.12, 3.13, and 3.14.
 - Add PyPI trove classifiers for Python 3.10, 3.11, and 3.12 so the
   expanded support is reflected on the package page.
 - Expand the test matrix (`tox` and CI) to run across all five
@@ -1367,7 +1367,7 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
 ## 1.0.10 (2026-06-20)
 
 - Release binaries now include macOS builds for both Apple Silicon
-  (`yacron2-macos-arm64`) and Intel (`yacron2-macos-amd64`),
+  (`cronstable-macos-arm64`) and Intel (`cronstable-macos-amd64`),
   alongside the existing Linux glibc and musl binaries. As with the
   Linux binaries, Python is not required on the target machine.
 - Document clearing the macOS Gatekeeper quarantine with
@@ -1390,7 +1390,7 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
   `emptyDir`, or point `TMPDIR` at a writable, executable directory.
 - Clarify that this temp-directory requirement is unique to the
   standalone binary: the published container image and `pip`/`pipx`
-  installs run yacron2 as a normal Python package and need no
+  installs run cronstable as a normal Python package and need no
   writable temp directory.
 
 ### Container image
@@ -1404,9 +1404,9 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
 ## 1.0.8 (2026-06-20)
 
 - Add self-contained musl binaries to every release for Alpine and
-  other musl-based systems: `yacron2-linux-amd64-musl` and
-  `yacron2-linux-arm64-musl`, alongside the existing glibc
-  `yacron2-linux-amd64` and `yacron2-linux-arm64` builds. Python is
+  other musl-based systems: `cronstable-linux-amd64-musl` and
+  `cronstable-linux-arm64-musl`, alongside the existing glibc
+  `cronstable-linux-amd64` and `cronstable-linux-arm64` builds. Python is
   not required on the target system.
 - Build the release binaries with Python 3.14.
 
@@ -1425,7 +1425,7 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
 
 - Release binaries are now published for both `linux/amd64` and
   `linux/arm64`. Every GitHub Release attaches a self-contained
-  `yacron2-linux-amd64` and `yacron2-linux-arm64` executable, each built
+  `cronstable-linux-amd64` and `cronstable-linux-arm64` executable, each built
   natively on its target architecture (previously only a single binary
   was provided).
 - The downloadable binaries embed Python, so none is required on the
@@ -1445,7 +1445,7 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
 
 - Config reload failures no longer risk crashing the scheduler: if
   re-reading the configuration fails (for example, a YAML error introduced
-  while yacron2 is running), the previously-loaded jobs keep running
+  while cronstable is running), the previously-loaded jobs keep running
   instead of the main loop failing on an unset `config` reference.
 - A job whose command cannot be launched (for example, the executable does
   not exist) is now reported as an ordinary failure with exit code `127`,
@@ -1460,7 +1460,7 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
   longer leak one connection per report.
 - Sentry and e-mail reporting no longer raise `KeyError` when the DSN or
   password is configured with `fromEnvVar` but the environment variable is
-  unset; yacron2 logs an error and skips that report instead.
+  unset; cronstable logs an error and skips that report instead.
 
 ### Configuration
 
@@ -1494,7 +1494,7 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
 ## 1.0.3 (2026-06-19)
 
 This is a tooling and documentation release; there are no changes to the
-`yacron2` package itself.
+`cronstable` package itself.
 
 ### Release automation & CI
 
@@ -1532,7 +1532,7 @@ This is a tooling and documentation release; there are no changes to the
 
 - The web API now fails closed when `web.authToken` is configured but
   resolves to an empty token (an unset `fromEnvVar`, or an empty/missing
-  `fromFile`): yacron2 raises a `ConfigError` and refuses to start the
+  `fromFile`): cronstable raises a `ConfigError` and refuses to start the
   HTTP server, instead of silently serving the control API without
   authentication.
 - The web API now honors `enabled: false`. `POST /jobs/<name>/start`
@@ -1551,7 +1551,7 @@ This is a tooling and documentation release; there are no changes to the
 
 ### Cleanups
 
-- Removed a dead Windows event-loop branch from `main()` (yacron2 is
+- Removed a dead Windows event-loop branch from `main()` (cronstable is
   POSIX-only because it imports `grp`/`pwd` at load time).
 - `naturaltime` no longer relies on an `assert` for control flow (which
   would be stripped under `python -O`).
@@ -1562,27 +1562,27 @@ This is a tooling and documentation release; there are no changes to the
 
 ### About this release
 
-- yacron2 1.0.0 is the first release of the yacron2 fork, based on
+- cronstable 1.0.0 is the first release of the cronstable fork, based on
   gjcarneiro/yacron 0.19. It carries forward all of upstream yacron's
   functionality and adds modernized packaging, a Python 3.13+ runtime, new
   web-API authentication, and a set of security and correctness fixes.
 - The project, package, command, config directory, and reporter environment
-  variables have all been renamed from `yacron` to `yacron2` (see Breaking
+  variables have all been renamed from `yacron` to `cronstable` (see Breaking
   changes for migration steps).
 
 ### Breaking changes
 
 - The installed command and PyPI distribution are renamed `yacron` ->
-  `yacron2` (install with `pip install yacron2`; run `yacron2`). The
-  Python import package is now `yacron2` and the entry point is
-  `yacron2.__main__:main`.
+  `cronstable` (install with `pip install cronstable`; run `cronstable`). The
+  Python import package is now `cronstable` and the entry point is
+  `cronstable.__main__:main`.
 - The default config directory changed from `/etc/yacron.d` to
-  `/etc/yacron2.d`; operators relying on the default path must move their
+  `/etc/cronstable.d`; operators relying on the default path must move their
   config directory.
 - Minimum Python is now 3.13 (`requires-python >=3.13`); only Python 3.13 and
   3.14 are supported. Python 3.7 through 3.12 are no longer supported.
 - Reporter shell environment variables were renamed `YACRON_*` ->
-  `YACRON2_*` (e.g. `YACRON2_JOB_NAME`, `YACRON2_RETCODE`). Existing
+  `CRONSTABLE_*` (e.g. `CRONSTABLE_JOB_NAME`, `CRONSTABLE_RETCODE`). Existing
   `onFailure`/`onSuccess` shell scripts must be updated.
 - mail `validate_certs` now defaults to `True`, so SMTP TLS certificate
   validation is enabled unless explicitly disabled. Delivery to servers with
@@ -1613,7 +1613,7 @@ This is a tooling and documentation release; there are no changes to the
   sockets, logging a warning rather than failing on invalid values; non-unix
   schemes are ignored.
 - Job stderr is now written to the process's stderr instead of stdout, so
-  operators separating yacron2's own stdout/stderr streams get correctly routed
+  operators separating cronstable's own stdout/stderr streams get correctly routed
   output.
 - Config now validates numeric ranges at load time and raises a clear
   `ConfigError` for invalid values (`saveLimit>=0`, `maxLineLength>0`,
@@ -1664,8 +1664,8 @@ This is a tooling and documentation release; there are no changes to the
 - The asyncio event loop is now created with `asyncio.new_event_loop()`
   instead of the deprecated `asyncio.get_event_loop()` (carried from
   upstream).
-- Internal logger and argparse program name updated to `yacron2`; CLI
-  error/version output now reads `yacron2`.
+- Internal logger and argparse program name updated to `cronstable`; CLI
+  error/version output now reads `cronstable`.
 
 ### Packaging & build
 
@@ -1673,10 +1673,10 @@ This is a tooling and documentation release; there are no changes to the
   `pyproject.toml` using the setuptools build backend (`setuptools>=77`,
   `setuptools_scm>=8`); `setup.py` and `setup.cfg` were removed.
 - Versioning continues via setuptools_scm, now configured under
-  `[tool.setuptools_scm]` writing `yacron2/version.py`.
+  `[tool.setuptools_scm]` writing `cronstable/version.py`.
 - Adopted a PEP 639 SPDX license expression (`license = "MIT"`) with
   `license-files`, and updated the LICENSE with a `Copyright (c) 2026, the
-  yacron2 developers` line alongside the original 2019 copyright.
+  cronstable developers` line alongside the original 2019 copyright.
 - Added a `[project.optional-dependencies]` `dev` extra (mypy,
   mypy-extensions, pytest, pytest-asyncio, pytest-cov, ruff, tox) and trimmed
   `requirements_dev.txt` to match (dropped flake8, types-pytz, and stale
@@ -1700,27 +1700,27 @@ This is a tooling and documentation release; there are no changes to the
 - Modernized `tox.ini` (envlist `py313, py314, lint, mypy`), removed the
   Travis mapping section, added `skip_install` to the lint/mypy envs, dropped
   `types-pytz` from the mypy env, and pointed lint/mypy commands at the
-  `yacron2` package.
+  `cronstable` package.
 - Bumped pre-commit hook revisions (ruff-pre-commit and bandit).
 
 ### Docs & examples
 
 - Converted the README from reStructuredText to Markdown (`README.rst` ->
-  `README.md`) and rebranded it to yacron2, with a new intro noting it is a
+  `README.md`) and rebranded it to cronstable, with a new intro noting it is a
   fork of gjcarneiro/yacron continuing from 0.19. The content is otherwise the
   same as upstream 0.19, not a rewrite; install docs now require Python >=
   3.13, the prebuilt binary targets glibc 2.39 / Ubuntu 24.04, and releases
-  come from github.com/ptweezy/yacron2.
+  come from github.com/ptweezy/cronstable.
 - `HISTORY.rst` gained a fork-attribution preamble; older entries are
   retained as upstream yacron history.
 - Modernized the Docker example: base image `python:3.14-slim` with `pip
-  install yacron2` (replacing ubuntu:xenial + virtualenv), config copied into
-  `/etc/yacron2.d`, and `ENTRYPOINT ['yacron2']`.
+  install cronstable` (replacing ubuntu:xenial + virtualenv), config copied into
+  `/etc/cronstable.d`, and `ENTRYPOINT ['cronstable']`.
 - Updated the Kubernetes example to the `apps/v1` Deployment API with the
-  now-required selector, rebranded `yacrondemo` -> `yacron2demo`.
+  now-required selector, rebranded `yacrondemo` -> `cronstabledemo`.
 - Rebranded the ad-hoc example config directory, example tab file, PyInstaller
   spec/launcher, and listen socket paths (`/tmp/yacron.sock` ->
-  `/tmp/yacron2.sock`) to yacron2.
+  `/tmp/cronstable.sock`) to cronstable.
 
 ### Credits (trailing upstream changes)
 

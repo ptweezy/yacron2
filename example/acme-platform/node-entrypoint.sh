@@ -1,6 +1,6 @@
 #!/bin/sh
 # Entry point for the "ACME Orders" cluster demo: build this node's cluster
-# config from environment variables, then exec yacron2. Keeps the compose file
+# config from environment variables, then exec cronstable. Keeps the compose file
 # small (no five hand-written peer lists): every node shares one CLUSTER_HOSTS
 # list and excludes itself by NODE_NAME. Same shape as the cluster-large demo.
 #
@@ -30,9 +30,9 @@ if ! _valid "$NODE_NAME" || [ "${NODE_NAME#*:}" != "$NODE_NAME" ]; then
   exit 1
 fi
 
-DIR="${YACRON2_DIR:-/tmp/yacron2.d}"
+DIR="${CRONSTABLE_DIR:-/tmp/cronstable.d}"
 mkdir -p "$DIR"
-# the job set is mounted read-only at /config/jobs.yaml; yacron2 needs every
+# the job set is mounted read-only at /config/jobs.yaml; cronstable needs every
 # config file in one directory, so copy it next to the generated cluster.yaml.
 # (env_file / report sinks referenced by absolute path, e.g. /config/acme.env,
 # are read straight from the mount and do not need copying here.)
@@ -64,4 +64,4 @@ cp /config/jobs.yaml "$DIR/jobs.yaml"
 } > "$DIR/cluster.yaml"
 
 echo "[entrypoint] ${NODE_NAME}: wrote $DIR/cluster.yaml"
-exec yacron2 -c "$DIR"
+exec cronstable -c "$DIR"

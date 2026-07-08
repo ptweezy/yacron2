@@ -3,7 +3,7 @@
 Adversarial-review follow-ups not covered elsewhere: the platform file
 lock must BLOCK (never raise) under contention, the backend's
 daemon-thread ``_call`` helper must keep a hung store abandonable, and
-the shutdown flush in :meth:`yacron2.cron.Cron.run` must persist
+the shutdown flush in :meth:`cronstable.cron.Cron.run` must persist
 in-flight run records without ever letting a wedged store hang exit.
 
 Timing discipline (Windows CI has coarse ~15.6ms timers and slow
@@ -20,11 +20,11 @@ import time
 
 import pytest
 
-from yacron2.config import parse_config_string
-from yacron2.cron import Cron, JobRunInfo
-from yacron2.job import JobOutputStream
-from yacron2.platform import exclusive_file_lock
-from yacron2.state import FilesystemStateBackend
+from cronstable.config import parse_config_string
+from cronstable.cron import Cron, JobRunInfo
+from cronstable.job import JobOutputStream
+from cronstable.platform import exclusive_file_lock
+from cronstable.state import FilesystemStateBackend
 
 _UTC = datetime.timezone.utc
 
@@ -145,7 +145,7 @@ def test_exclusive_lock_blocks_then_succeeds_under_contention(tmp_path):
 
 async def test_call_runs_sync_half_on_daemon_thread(tmp_path):
     # _call must run the blocking half on a DAEMON thread named
-    # "yacron2-state", never the default executor: non-daemonic workers
+    # "cronstable-state", never the default executor: non-daemonic workers
     # are joined at interpreter exit, so one wedged in a dead NFS hard
     # mount would hang process shutdown forever.
     backend = _backend(tmp_path)
@@ -163,7 +163,7 @@ async def test_call_runs_sync_half_on_daemon_thread(tmp_path):
     rec_id = await backend.append_record("s", {"i": 1})
     assert rec_id
     assert seen["daemon"] is True
-    assert seen["name"].startswith("yacron2-state")
+    assert seen["name"].startswith("cronstable-state")
 
 
 class _StoreBoom(Exception):
@@ -227,7 +227,7 @@ async def test_inventory_runs_via_call_daemon_thread(tmp_path):
     # polling GET /state against a hung mount wedged the non-daemon
     # default workers one by one, after which config reload -- and the
     # interpreter-exit join of those workers -- hung behind them.  The
-    # walk must ride the same "yacron2-state" daemon lane as every other
+    # walk must ride the same "cronstable-state" daemon lane as every other
     # op, and be accounted in the per-op stats like one.
     backend = _backend(tmp_path)
     await backend.start()
@@ -244,7 +244,7 @@ async def test_inventory_runs_via_call_daemon_thread(tmp_path):
     inv = await backend.inventory()
     assert inv["enumerable"] is True
     assert seen["daemon"] is True
-    assert seen["name"].startswith("yacron2-state")
+    assert seen["name"].startswith("cronstable-state")
     assert "inventory" in backend.stats()["ops"]
 
 

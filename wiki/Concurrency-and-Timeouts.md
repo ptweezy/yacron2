@@ -1,6 +1,6 @@
 # Concurrency and Timeouts
 
-This page documents how yacron2 handles overlapping runs of the same job
+This page documents how cronstable handles overlapping runs of the same job
 (`concurrencyPolicy`, and how far that policy reaches: `concurrencyScope`)
 and how it bounds the duration of a single run (`executionTimeout`,
 `killTimeout`). These options are per-job (settable in `defaults`) and govern
@@ -20,9 +20,9 @@ a [durable state store](Durable-State).
 
 ## Overview
 
-A job is identified by its `name`. yacron2 tracks, per name, a list of
+A job is identified by its `name`. cronstable tracks, per name, a list of
 currently-running instances. When a scheduled time arrives (or a manual start
-is requested through the [HTTP Control API](HTTP-API)), yacron2 checks whether
+is requested through the [HTTP Control API](HTTP-API)), cronstable checks whether
 any instance of that job is already running and consults `concurrencyPolicy`
 before launching a new one. That tracking is local to one daemon process: by
 default (`concurrencyScope: node`) the local list is the whole story, while
@@ -151,7 +151,7 @@ can widen `Forbid` and `Replace` to the whole fleet with the per-job
 
 ```yaml
 state:
-  path: /mnt/shared/yacron2-state   # the same store on every node
+  path: /mnt/shared/cronstable-state   # the same store on every node
   topology: shared
 
 jobs:
@@ -275,7 +275,7 @@ concurrencyScope: cluster claims degrade per onStoreUnavailable`.
 The contract is **at-least-once**, not exactly-once. The gate closes the
 routine overlap windows, but these remain open by design:
 
-- **A holder that loses its slot keeps running.** yacron2 never kills work
+- **A holder that loses its slot keeps running.** cronstable never kills work
   over a store blip. If a store outage outlasts the slot TTL and another
   node takes the slot over, the original holder logs `Job <name>: its
   cluster concurrency slot was taken over by <node> while it is still
@@ -322,13 +322,13 @@ to system clock adjustments while the job runs.
 
 When the run is awaited (`RunningJob.wait`):
 
-- If no deadline is set, yacron2 waits indefinitely for the process to exit.
+- If no deadline is set, cronstable waits indefinitely for the process to exit.
 - If a deadline is set, the remaining time is computed as
   `execution_deadline - time.perf_counter()`. If that remaining time is `> 0`,
   the process exit is awaited under `asyncio.wait_for(..., timeout)`; if it is
   already `<= 0`, the timeout path is taken immediately.
 
-On timeout (the remaining time elapses, or was non-positive), yacron2:
+On timeout (the remaining time elapses, or was non-positive), cronstable:
 
 1. Logs `Job <name> exceeded its executionTimeout of <N> seconds, cancelling
    it...`.

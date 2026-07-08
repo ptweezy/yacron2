@@ -1,7 +1,7 @@
 #!/bin/sh
 # Best-effort: bundle orjson (the `speedups` extra) into the current build env
-# so the frozen binary / container image ships it. yacron2 falls back to the
-# stdlib json whenever orjson is absent (yacron2/_json), so EVERY path here is
+# so the frozen binary / container image ships it. cronstable falls back to the
+# stdlib json whenever orjson is absent (cronstable/_json), so EVERY path here is
 # non-fatal -- it just records, per arch, which way this build went (grep the
 # build log for "orjson"). The script always exits 0.
 #

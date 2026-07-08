@@ -6,7 +6,7 @@ import socket
 import aiohttp
 import pytest
 
-from yacron2.cluster import (
+from cronstable.cluster import (
     NODE_STATS_HEADER,
     STATUS_AGREED,
     STATUS_CONFLICT,
@@ -27,8 +27,8 @@ from yacron2.cluster import (
     elect_leader,
     quorum_size,
 )
-from yacron2.config import DEFAULT_CLUSTER, ConfigError, parse_config_string
-from yacron2.fingerprint import SCHEME_VERSION
+from cronstable.config import DEFAULT_CLUSTER, ConfigError, parse_config_string
+from cronstable.fingerprint import SCHEME_VERSION
 
 NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
 
@@ -45,12 +45,12 @@ jobs:
 cluster:
   listen: "0.0.0.0:8443"
   tls:
-    ca: /etc/yacron2/ca.pem
-    cert: /etc/yacron2/node.pem
-    key: /etc/yacron2/node.key
+    ca: /etc/cronstable/ca.pem
+    cert: /etc/cronstable/node.pem
+    key: /etc/cronstable/node.key
   peers:
-    - host: yacron-b:8443
-    - host: yacron-c:8443
+    - host: cronstable-b:8443
+    - host: cronstable-c:8443
 """
 
 
@@ -59,8 +59,8 @@ def test_cluster_config_parsed_with_defaults():
     assert cfg is not None
     assert cfg["listen"] == "0.0.0.0:8443"
     assert [p["host"] for p in cfg["peers"]] == [
-        "yacron-b:8443",
-        "yacron-c:8443",
+        "cronstable-b:8443",
+        "cronstable-c:8443",
     ]
     assert cfg["interval"] == DEFAULT_CLUSTER["interval"]
     assert cfg["driftAfter"] == DEFAULT_CLUSTER["driftAfter"]
@@ -84,10 +84,10 @@ def test_cluster_config_rejects_bad_numbers():
 def test_cluster_config_rejects_bad_peer_address():
     # #11: a portless / malformed peer host fails the load with a pointer to
     # the offending value, instead of surfacing later as an opaque poll error.
-    bad = CLUSTER_YAML.replace("yacron-b:8443", "yacron-b")  # no port
+    bad = CLUSTER_YAML.replace("cronstable-b:8443", "cronstable-b")  # no port
     with pytest.raises(ConfigError, match="host:port"):
         parse_config_string(bad, "")
-    bad = CLUSTER_YAML.replace("yacron-c:8443", "yacron-c:notaport")
+    bad = CLUSTER_YAML.replace("cronstable-c:8443", "cronstable-c:notaport")
     with pytest.raises(ConfigError, match="host:port"):
         parse_config_string(bad, "")
 
@@ -101,12 +101,12 @@ def test_cluster_config_rejects_bad_listen_address():
 def test_cluster_config_dedups_peers():
     # #10: a repeated peer host collapses to one (ClusterView keys by host), so
     # cluster_size / quorum reflect distinct members rather than the raw count.
-    dup = CLUSTER_YAML + "    - host: yacron-b:8443\n"
+    dup = CLUSTER_YAML + "    - host: cronstable-b:8443\n"
     cfg = parse_config_string(dup, "").cluster_config
     assert cfg is not None
     assert [p["host"] for p in cfg["peers"]] == [
-        "yacron-b:8443",
-        "yacron-c:8443",
+        "cronstable-b:8443",
+        "cronstable-c:8443",
     ]
 
 
@@ -117,24 +117,24 @@ def test_cluster_config_excludes_self_listed_peer():
     cfg = parse_config_string(y, "").cluster_config
     assert cfg is not None
     assert [p["host"] for p in cfg["peers"]] == [
-        "yacron-b:8443",
-        "yacron-c:8443",
+        "cronstable-b:8443",
+        "cronstable-c:8443",
     ]
 
 
 def test_cluster_config_excludes_self_listed_by_hostname_behind_wildcard():
     # the common uniform-peer-list mistake: a node bound to a wildcard listen
     # (0.0.0.0) and self-listed by its nodeName. The literal listen string
-    # ("0.0.0.0:8443") does not match "yacron-a:8443", so a literal-only check
+    # ("0.0.0.0:8443") does not match "cronstable-a:8443", so a literal-only check
     # would let it survive config-time dedup and inflate N -- which, if the
     # self-poll never succeeds (cert SAN / loopback quirk), permanently pins
     # Leader jobs closed cluster-wide. It is recognised structurally at load.
-    y = CLUSTER_YAML + '    - host: "yacron-a:8443"\n  nodeName: yacron-a\n'
+    y = CLUSTER_YAML + '    - host: "cronstable-a:8443"\n  nodeName: cronstable-a\n'
     cfg = parse_config_string(y, "").cluster_config
     assert cfg is not None
     assert [p["host"] for p in cfg["peers"]] == [
-        "yacron-b:8443",
-        "yacron-c:8443",
+        "cronstable-b:8443",
+        "cronstable-c:8443",
     ]
 
 
@@ -144,8 +144,8 @@ def test_self_listed_behind_wildcard_does_not_bypass_two_node_guard():
     # peer (quorum 2 -> both must be up -> strictly worse than one replica).
     y = (
         TWO_NODE_YAML
-        + '    - host: "yacron-a:8443"\n'
-        + "  nodeName: yacron-a\n"
+        + '    - host: "cronstable-a:8443"\n'
+        + "  nodeName: cronstable-a\n"
         + "  electLeader: true\n"
     )
     with pytest.raises(ConfigError, match="strictly worse than a single"):
@@ -153,7 +153,7 @@ def test_self_listed_behind_wildcard_does_not_bypass_two_node_guard():
 
 
 def test_is_self_listed_edge_cases():
-    from yacron2.config import _is_self_listed
+    from cronstable.config import _is_self_listed
 
     # exact listen match (any host form)
     assert _is_self_listed("0.0.0.0:8443", "0.0.0.0:8443", "node-a") is True
@@ -204,8 +204,8 @@ def test_distinct_peer_behind_wildcard_is_kept():
     cfg = parse_config_string(y, "").cluster_config
     assert cfg is not None
     assert [p["host"] for p in cfg["peers"]] == [
-        "yacron-b:8443",
-        "yacron-c:8443",
+        "cronstable-b:8443",
+        "cronstable-c:8443",
     ]
 
 
@@ -218,8 +218,8 @@ def test_loopback_self_listing_dropped():
     cfg = parse_config_string(y, "").cluster_config
     assert cfg is not None
     assert [p["host"] for p in cfg["peers"]] == [
-        "yacron-b:8443",
-        "yacron-c:8443",
+        "cronstable-b:8443",
+        "cronstable-c:8443",
     ]
 
 
@@ -233,7 +233,7 @@ def test_loopback_self_listing_does_not_bypass_two_node_guard():
 
 
 def test_is_self_listed_loopback_edge_cases():
-    from yacron2.config import _is_self_listed
+    from cronstable.config import _is_self_listed
 
     # literal loopback + matching-family wildcard + same port -> self
     assert _is_self_listed("127.0.0.1:8443", "0.0.0.0:8443", "node-a") is True
@@ -827,9 +827,9 @@ class _Req:
 async def test_web_cluster_endpoint_disabled():
     import json
 
-    import yacron2.cron
+    import cronstable.cron
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     resp = await cron._web_get_cluster(_Req())
     assert json.loads(resp.text) == {"enabled": False, "peers": []}
@@ -839,7 +839,7 @@ async def test_web_cluster_endpoint_disabled():
 async def test_web_cluster_endpoint_enabled():
     import json
 
-    import yacron2.cron
+    import cronstable.cron
 
     class StubManager:
         def view_dict(self):
@@ -849,7 +849,7 @@ async def test_web_cluster_endpoint_enabled():
                 "peers": [{"host": "p:1", "status": "agreed"}],
             }
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     cron.cluster_manager = StubManager()
     resp = await cron._web_get_cluster(_Req())
@@ -867,13 +867,13 @@ async def test_web_cluster_lease_payload_carries_fleet_hint():
     # the overlay's fleet_view()), false without it.
     import json
 
-    import yacron2.cron
+    import cronstable.cron
 
     class StubLease:
         def view_dict(self):
             return {"backend": "kubernetes", "node_name": "n", "peers": []}
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     cron.cluster_manager = StubLease()
     resp = await cron._web_get_cluster(_Req())
@@ -889,13 +889,13 @@ async def test_web_cluster_gossip_payload_has_no_fleet_hint():
     # the dashboard's gossip branch shows the fleet button unconditionally.
     import json
 
-    import yacron2.cron
+    import cronstable.cron
 
     class StubGossip:
         def view_dict(self):
             return {"backend": "gossip", "node_name": "n", "peers": []}
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     cron.cluster_manager = StubGossip()
     resp = await cron._web_get_cluster(_Req())
@@ -906,9 +906,9 @@ async def test_web_cluster_gossip_payload_has_no_fleet_hint():
 async def test_web_fleet_endpoint_disabled_without_cluster():
     import json
 
-    import yacron2.cron
+    import cronstable.cron
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     resp = await cron._web_get_fleet(_Req())
     assert json.loads(resp.text) == {"enabled": False, "nodes": []}
@@ -921,13 +921,13 @@ async def test_web_fleet_endpoint_disabled_for_lease_backends():
     # reports the feature unavailable so the dashboard hides its fleet view.
     import json
 
-    import yacron2.cron
+    import cronstable.cron
 
     class StubLease:
         def fleet_view(self):
             return None
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     cron.cluster_manager = StubLease()
     resp = await cron._web_get_fleet(_Req())
@@ -938,7 +938,7 @@ async def test_web_fleet_endpoint_disabled_for_lease_backends():
 async def test_web_fleet_endpoint_passes_through_gossip_view():
     import json
 
-    import yacron2.cron
+    import cronstable.cron
 
     class StubManager:
         def fleet_view(self):
@@ -949,7 +949,7 @@ async def test_web_fleet_endpoint_passes_through_gossip_view():
                 "nodes": [{"node_name": "n", "self": True, "jobs": {}}],
             }
 
-    cron = yacron2.cron.Cron(None)
+    cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     cron.cluster_manager = StubManager()
     resp = await cron._web_get_fleet(_Req())
@@ -961,7 +961,7 @@ async def test_web_fleet_endpoint_passes_through_gossip_view():
 def test_lease_backend_seam_defaults_for_fleet():
     # the ABC defaults: no summaries channel (set_provider is a no-op that
     # must still accept the scheduler's install call) and no fleet view.
-    from yacron2.leadership import LeadershipBackend
+    from cronstable.leadership import LeadershipBackend
 
     class Minimal(LeadershipBackend):
         async def start(self):
@@ -1155,11 +1155,11 @@ jobs:
 cluster:
   listen: "0.0.0.0:8443"
   tls:
-    ca: /etc/yacron2/ca.pem
-    cert: /etc/yacron2/node.pem
-    key: /etc/yacron2/node.key
+    ca: /etc/cronstable/ca.pem
+    cert: /etc/cronstable/node.pem
+    key: /etc/cronstable/node.key
   peers:
-    - host: yacron-b:8443
+    - host: cronstable-b:8443
 """
 
 
@@ -1179,7 +1179,7 @@ def test_dedup_makes_padded_two_node_cluster_rejected():
     # #10: listing the single real peer twice is really a 2-node cluster.
     # After de-duplication the electLeader 2-node guard correctly fires, where
     # the raw count would have masqueraded as 3 nodes and slipped through.
-    y = TWO_NODE_YAML + "    - host: yacron-b:8443\n  electLeader: true\n"
+    y = TWO_NODE_YAML + "    - host: cronstable-b:8443\n  electLeader: true\n"
     with pytest.raises(ConfigError, match="strictly worse than a single"):
         parse_config_string(y, "")
 
@@ -1204,10 +1204,10 @@ def test_elect_leader_warns_on_even_size():
     # CLUSTER_YAML has 2 peers -> 3 nodes; add one more for an even 4. The
     # warning is computed (not logged) by cluster_config_warnings so the daemon
     # can emit it once on (re)start instead of on every config reload.
-    from yacron2.config import cluster_config_warnings
+    from cronstable.config import cluster_config_warnings
 
     even_yaml = (
-        CLUSTER_YAML + "    - host: yacron-d:8443\n  electLeader: true\n"
+        CLUSTER_YAML + "    - host: cronstable-d:8443\n  electLeader: true\n"
     )
     cfg = parse_config_string(even_yaml, "").cluster_config
     assert cfg is not None and cfg["electLeader"] is True
@@ -1232,7 +1232,7 @@ def test_distribution_spread_parsed():
 
 
 def test_distribution_spread_without_electleader_warns():
-    from yacron2.config import cluster_config_warnings
+    from cronstable.config import cluster_config_warnings
 
     cfg = parse_config_string(
         CLUSTER_YAML + "  distribution: spread\n", ""
@@ -1484,10 +1484,10 @@ def no_tls(monkeypatch):
     # make ClusterManager constructible without real certs; start() then serves
     # plaintext (ssl_context=None), which is all these tests need.
     monkeypatch.setattr(
-        "yacron2.cluster.build_client_ssl_context", lambda tls: None
+        "cronstable.cluster.build_client_ssl_context", lambda tls: None
     )
     monkeypatch.setattr(
-        "yacron2.cluster.build_server_ssl_context", lambda tls: None
+        "cronstable.cluster.build_server_ssl_context", lambda tls: None
     )
 
 
@@ -1750,7 +1750,7 @@ def test_convergence_hold_is_bounded_for_one_way_peers(no_tls):
     # _SETTLE_ROUNDS completed rounds the node leans toward running (the
     # documented PreferLeader double-run direction), never a permanent
     # stand-down.
-    from yacron2.cluster import _SETTLE_ROUNDS
+    from cronstable.cluster import _SETTLE_ROUNDS
 
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1"], "node-b"),
@@ -3024,7 +3024,7 @@ def test_gossip_tls_loadable_non_gossip_and_missing(tmp_path):
     # to pre-validate (always True); a gossip config with absent certs
     # (a half-written/mid-rotation cert) is NOT loadable (False), so
     # manager is kept. Uses stdlib ssl only -> runs without cryptography.
-    from yacron2.cluster import gossip_tls_loadable
+    from cronstable.cluster import gossip_tls_loadable
 
     assert gossip_tls_loadable({"backend": "etcd"}) is True
     assert gossip_tls_loadable({"backend": "kubernetes"}) is True
@@ -3044,7 +3044,7 @@ def test_gossip_tls_loadable_non_gossip_and_missing(tmp_path):
 def test_gossip_tls_loadable_valid_material(tmp_path):
     # RELOAD-TLS-COMBINED: valid on-disk gossip TLS loads -> True, so a config
     # change proceeds normally. Crypto-gated (mints real certs).
-    from yacron2.cluster import gossip_tls_loadable
+    from cronstable.cluster import gossip_tls_loadable
 
     tls = _write_tls(tmp_path)
     cfg = _cfg(tls, "127.0.0.1:1", ["b:1"], "node-a")
@@ -3638,7 +3638,7 @@ async def test_poll_peer_rejects_non_string_node_name(no_tls):
 @pytest.mark.asyncio
 async def test_poll_peer_rejects_oversized_body(no_tls):
     # #4: an over-cap body is refused rather than buffered (OOM guard).
-    from yacron2.cluster import MAX_PEER_RESPONSE_BYTES
+    from cronstable.cluster import MAX_PEER_RESPONSE_BYTES
 
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
@@ -3676,7 +3676,7 @@ async def test_poll_peer_rejects_deeply_nested_json(no_tls, monkeypatch):
     # platform-specific (CPython 3.14 on Linux parses far deeper before it
     # raises than 3.13 or any Windows build did), so inject the RecursionError
     # to pin the handling rather than the parser's moving threshold.
-    import yacron2.cluster as cluster_mod
+    import cronstable.cluster as cluster_mod
 
     def _raise_recursion(_raw):
         raise RecursionError("maximum recursion depth exceeded")
@@ -3860,7 +3860,7 @@ async def test_peer_status_change_logs_untrusted_with_error(no_tls, caplog):
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
     )
     session = _FakeSession(_FakeGet(exc=_FakeSSLError()))
-    with caplog.at_level(logging.WARNING, logger="yacron2.cluster"):
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
         await mgr._poll_peer(session, "b:1", "v1:mine")
     assert mgr.view.peers["b:1"].status == STATUS_UNTRUSTED
     assert any(
@@ -3879,7 +3879,7 @@ async def test_peer_status_change_unreachable_quiet_at_startup(no_tls, caplog):
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
     )
     down = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
-    with caplog.at_level(logging.INFO, logger="yacron2.cluster"):
+    with caplog.at_level(logging.INFO, logger="cronstable.cluster"):
         await mgr._poll_peer(down, "b:1", "v1:mine")
     assert mgr.view.peers["b:1"].status == STATUS_UNREACHABLE
     assert not [r for r in caplog.records if "unreachable" in r.message]
@@ -3906,7 +3906,7 @@ async def test_peer_status_change_warns_only_on_real_drop(no_tls, caplog):
         )
     )
     down = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
-    with caplog.at_level(logging.INFO, logger="yacron2.cluster"):
+    with caplog.at_level(logging.INFO, logger="cronstable.cluster"):
         await mgr._poll_peer(agreed, "b:1", "v1:mine")  # unknown -> agreed
         await mgr._poll_peer(agreed, "b:1", "v1:mine")  # agreed again: quiet
         await mgr._poll_peer(down, "b:1", "v1:mine")  # agreed -> unreachable
@@ -3953,7 +3953,7 @@ async def test_self_poll_warns_on_degenerate_two_node_election(no_tls, caplog):
     cfg["electLeader"] = True
     mgr = ClusterManager(cfg, lambda: "v1:mine")
     session = _self_poll_session(mgr)
-    with caplog.at_level(logging.WARNING, logger="yacron2.cluster"):
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
         await mgr._poll_peer(session, "10.0.0.1:8443", "v1:mine")
     assert mgr.view.peers["10.0.0.1:8443"].status == STATUS_SELF
     assert mgr.cluster_size() == 2  # the declared 3 was one self-listing big
@@ -3995,7 +3995,7 @@ async def test_self_poll_benign_self_listing_logs_info_only(no_tls, caplog):
     cfg["electLeader"] = True
     mgr = ClusterManager(cfg, lambda: "v1:mine")
     session = _self_poll_session(mgr)
-    with caplog.at_level(logging.INFO, logger="yacron2.cluster"):
+    with caplog.at_level(logging.INFO, logger="cronstable.cluster"):
         await mgr._poll_peer(session, "10.0.0.1:8443", "v1:mine")
     assert mgr.view.peers["10.0.0.1:8443"].status == STATUS_SELF
     assert mgr.cluster_size() == 3
@@ -4055,7 +4055,7 @@ async def test_degenerate_self_warning_survives_multihomed_dedup_lag(
             host = url[len("https://"):-len("/peer")]
             return self._by_host[host]()
 
-    with caplog.at_level(logging.INFO, logger="yacron2.cluster"):
+    with caplog.at_level(logging.INFO, logger="cronstable.cluster"):
         # the self-poll lands while the duplicate's addresses are unpolled:
         # cluster_size() reads 3 at the transition -> benign INFO, no warning
         await mgr._poll_peer(
@@ -4109,7 +4109,7 @@ async def test_handle_reboot_ran_times_out_on_slow_body(no_tls):
 @pytest.mark.asyncio
 async def test_handle_reboot_ran_rejects_oversized_body(no_tls):
     # A5/DoS: an over-cap body is refused (413) before any JSON parse.
-    from yacron2.cluster import MAX_PEER_RESPONSE_BYTES
+    from cronstable.cluster import MAX_PEER_RESPONSE_BYTES
 
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
@@ -4133,7 +4133,7 @@ async def test_handle_reboot_ran_rejects_deeply_nested_json(
     # The overflow depth is interpreter/platform dependent (see
     # test_poll_peer_rejects_deeply_nested_json), so inject the RecursionError
     # directly instead of relying on a fixed nesting depth.
-    import yacron2.cluster as cluster_mod
+    import cronstable.cluster as cluster_mod
 
     def _raise_recursion(_raw):
         raise RecursionError("maximum recursion depth exceeded")
@@ -4229,7 +4229,7 @@ def test_parse_str_list_drops_control_char_entries():
 
 
 def test_parse_job_summaries_absent_vs_empty():
-    from yacron2.cluster import _parse_job_summaries
+    from cronstable.cluster import _parse_job_summaries
 
     # absent / malformed (an older build, or junk) -> None, so the fleet view
     # can tell "gossips no summaries" from "genuinely has zero jobs" ({}).
@@ -4240,7 +4240,7 @@ def test_parse_job_summaries_absent_vs_empty():
 
 
 def test_parse_job_summaries_rebuilds_expected_shape_only():
-    from yacron2.cluster import _parse_job_summaries
+    from cronstable.cluster import _parse_job_summaries
 
     parsed = _parse_job_summaries(
         {
@@ -4284,7 +4284,7 @@ def test_parse_job_summaries_rebuilds_expected_shape_only():
 
 
 def test_parse_job_summaries_hostile_fields_degrade_not_poison():
-    from yacron2.cluster import _parse_job_summaries
+    from cronstable.cluster import _parse_job_summaries
 
     parsed = _parse_job_summaries(
         {
@@ -4327,7 +4327,7 @@ def test_parse_job_summaries_hostile_fields_degrade_not_poison():
 
 
 def test_parse_node_stats_absent_and_garbage():
-    from yacron2.cluster import _parse_node_stats
+    from cronstable.cluster import _parse_node_stats
 
     assert _parse_node_stats(None) is None
     assert _parse_node_stats("junk") is None
@@ -4337,7 +4337,7 @@ def test_parse_node_stats_absent_and_garbage():
 
 
 def test_parse_node_stats_rebuilds_whitelisted_finite_only():
-    from yacron2.cluster import _parse_node_stats
+    from cronstable.cluster import _parse_node_stats
 
     parsed = _parse_node_stats(
         {
@@ -4367,7 +4367,7 @@ def test_parse_node_stats_rebuilds_whitelisted_finite_only():
 
 
 def test_parse_node_stats_drops_nonfinite_and_bools():
-    from yacron2.cluster import _parse_node_stats
+    from cronstable.cluster import _parse_node_stats
 
     # Inf/NaN would make /fleet unparseable to browsers; bools are not numbers
     parsed = _parse_node_stats(
@@ -4381,7 +4381,7 @@ def test_parse_node_stats_drops_nonfinite_and_bools():
 
 
 def test_parse_job_summaries_caps_cardinality():
-    from yacron2.cluster import (
+    from cronstable.cluster import (
         MAX_ADVERTISED_JOB_SUMMARIES,
         _parse_job_summaries,
     )
@@ -4538,7 +4538,7 @@ async def test_poll_peer_ignores_malformed_node_stats_header(no_tls):
     # the header is CA-vouched-but-untrusted input: bad JSON, a non-dict, or
     # an oversized value must read as "no reading this round" -- the poll
     # itself (agreement, last_seen, every gate) still succeeds
-    from yacron2.cluster import MAX_NODE_STATS_HEADER_LEN
+    from cronstable.cluster import MAX_NODE_STATS_HEADER_LEN
 
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
@@ -4568,7 +4568,7 @@ def test_view_expires_node_stats_without_fresh_reading(no_tls):
     # header DOES carry stats refreshes. peer_node_stats here is exactly what
     # _observe_peer passes per response after parsing the header (None =
     # header absent that round).
-    from yacron2.cluster import NODE_STATS_STALE_ROUNDS
+    from cronstable.cluster import NODE_STATS_STALE_ROUNDS
 
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
@@ -4614,7 +4614,7 @@ def test_view_expires_node_stats_without_fresh_reading(no_tls):
 
 
 def test_advertised_job_summaries_caps_deterministically(no_tls):
-    from yacron2.cluster import (
+    from cronstable.cluster import (
         MAX_ADVERTISED_JOB_SUMMARIES,
         MAX_JOB_SUMMARY_NAME_LEN,
     )

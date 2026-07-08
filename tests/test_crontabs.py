@@ -4,9 +4,9 @@ import datetime
 
 import pytest
 
-from yacron2 import config, crontabs
-from yacron2.config import ConfigError
-from yacron2.cronexpr import CronTab
+from cronstable import config, crontabs
+from cronstable.config import ConfigError
+from cronstable.cronexpr import CronTab
 
 
 def test_basic_line_gets_standard_defaults():
@@ -24,7 +24,7 @@ def test_basic_line_gets_standard_defaults():
     assert job.schedule_unparsed == "*/15 * * * *"
     assert isinstance(job.schedule, CronTab)
     # the "reasonable standards" contract: a crontab entry is an ordinary
-    # yacron2 job carrying the standard defaults, not a cron emulation.
+    # cronstable job carrying the standard defaults, not a cron emulation.
     assert job.shell == config.DEFAULT_CONFIG["shell"]
     assert job.captureStderr is True
     assert job.captureStdout is False
@@ -186,7 +186,7 @@ def test_names_use_basename_and_line_numbers():
 def test_system_crontab_user_column_is_not_stripped():
     # /etc/crontab and /etc/cron.d files carry a sixth "user" column.
     # There is no reliable way to tell that apart from a command's first
-    # word, so yacron2 reads the user-crontab format only and the column
+    # word, so cronstable reads the user-crontab format only and the column
     # lands in the command -- a documented pitfall, asserted here so a
     # future "clever" heuristic has to face this test.
     conf = config.parse_crontab_string(

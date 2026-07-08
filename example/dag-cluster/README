@@ -1,7 +1,7 @@
-yacron2 clustered DAGs (orchestration on a shared store)
+cronstable clustered DAGs (orchestration on a shared store)
 ========================================================
 
-This example runs three yacron2 nodes that share one durable state store and
+This example runs three cronstable nodes that share one durable state store and
 elect a leader over it, running the same DAG config. It shows the orchestration
 tier coordinating across a fleet with no coordination service beyond the shared
 mount itself:
@@ -23,10 +23,10 @@ identical either way.
 Files
 -----
 
-  yacron2tab.yaml      the shared config: a `state` store (topology: shared),
+  cronstable.yaml      the shared config: a `state` store (topology: shared),
                        `cluster.backend: filesystem` election over it, and two
                        DAGs -- a scheduled fan-out ETL and a human-gated release
-  docker-compose.yml   three yacron2 nodes + one shared state volume (plus a
+  docker-compose.yml   three cronstable nodes + one shared state volume (plus a
                        one-shot init that makes the volume writable by the
                        image's unprivileged user)
 
@@ -69,14 +69,14 @@ Try it
 
   # failover / crash-resume: stop the current leader mid-run; another node
   # adopts its runs within a lease TTL and finishes them from durable state:
-  docker compose -f docker-compose.yml stop yacron2-a
+  docker compose -f docker-compose.yml stop cronstable-a
 
 Notes
 -----
 
   * DAGs require a `state` section with `jobApi` enabled (the tasks reach the
     store -- and their XCom -- through the injected loopback endpoint via
-    `yacron2 xcom | artifact | state`).
+    `cronstable xcom | artifact | state`).
   * The filesystem election backend trusts the wall clock (two ~1s skew
     margins); the three containers share the host clock, so election is clean.
     Across real hosts, keep them NTP-synced (see the Clustering wiki page).

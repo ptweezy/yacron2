@@ -1,4 +1,4 @@
-"""Tests for per-run CPU/memory accounting (yacron2.resources)."""
+"""Tests for per-run CPU/memory accounting (cronstable.resources)."""
 
 import asyncio
 import contextlib
@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import yacron2.resources as resources
-from yacron2.resources import (
+import cronstable.resources as resources
+from cronstable.resources import (
     MAX_SERIES_POINTS,
     NODE_SNAPSHOT_TTL,
     NodeResourceSampler,
@@ -253,7 +253,7 @@ def test_node_sampler_snapshot():
 
 
 def test_node_sampler_without_psutil(monkeypatch):
-    monkeypatch.setattr("yacron2.resources.psutil", None)
+    monkeypatch.setattr("cronstable.resources.psutil", None)
     assert NodeResourceSampler().snapshot() is None
 
 
@@ -317,7 +317,7 @@ async def test_monitor_bogus_pid_is_inert():
 @pytest.mark.asyncio
 async def test_monitor_without_psutil_is_noop(monkeypatch):
     # simulate a checkout without the optional import resolving.
-    monkeypatch.setattr("yacron2.resources.psutil", None)
+    monkeypatch.setattr("cronstable.resources.psutil", None)
     monitor = ResourceMonitor(1, job_name="x", interval=0.05)
     monitor.start()
     assert not monitor.available

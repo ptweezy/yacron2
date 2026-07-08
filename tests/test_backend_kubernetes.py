@@ -11,12 +11,12 @@ import time
 
 import pytest
 
-from yacron2.backends import (
+from cronstable.backends import (
     TRANSPORT_HTTP,
     TRANSPORT_LIBRARY,
     select_transport,
 )
-from yacron2.backends.kubernetes import (
+from cronstable.backends.kubernetes import (
     _UNKNOWN_HOLDER,
     ACTION_ACQUIRE,
     ACTION_CREATE,
@@ -37,7 +37,7 @@ from yacron2.backends.kubernetes import (
     plan_lease_write,
     resolve_namespace,
 )
-from yacron2.config import ConfigError, parse_config_string
+from cronstable.config import ConfigError, parse_config_string
 
 NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
@@ -137,18 +137,18 @@ def test_parse_and_build_lease_annotations_roundtrip():
     obj = {
         "metadata": {
             "resourceVersion": "9",
-            "annotations": {"yacron2.io/reboot-ran": "blob"},
+            "annotations": {"cronstable.io/reboot-ran": "blob"},
         },
         "spec": {"holderIdentity": "node-a", "leaseDurationSeconds": 15},
     }
     state = parse_lease(obj)
-    assert state.annotations == {"yacron2.io/reboot-ran": "blob"}
+    assert state.annotations == {"cronstable.io/reboot-ran": "blob"}
     body = build_lease_body(
         "yl", "ns", "node-a", NOW, 15, state, ACTION_RENEW,
-        {"yacron2.io/reboot-ran": "blob2"},
+        {"cronstable.io/reboot-ran": "blob2"},
     )
     assert body["metadata"]["annotations"] == {
-        "yacron2.io/reboot-ran": "blob2"
+        "cronstable.io/reboot-ran": "blob2"
     }
     # no annotations passed -> the block is omitted
     bare = build_lease_body("yl", "ns", "node-a", NOW, 15, None, ACTION_CREATE)
@@ -344,7 +344,7 @@ def test_identity_is_unique_per_process():
 
 def test_display_holder_strips_instance_token():
     assert display_holder("node-a#deadbeef0000") == "node-a"
-    assert display_holder("yacron2-0#abc123") == "yacron2-0"
+    assert display_holder("cronstable-0#abc123") == "cronstable-0"
     # no suffix (a foreign / older holder) -> shown unchanged
     assert display_holder("legacy-holder") == "legacy-holder"
     assert display_holder(None) is None
@@ -395,7 +395,7 @@ def test_namespace_ignores_incluster_file_when_kubeconfig_set(monkeypatch):
     # Lease in two different namespaces (the SA file's value vs "default") -- a
     # cross-namespace split-brain. Both resolve through
     # KubernetesBackend._resolve_namespace identically.
-    import yacron2.backends.kubernetes as k8s_mod
+    import cronstable.backends.kubernetes as k8s_mod
 
     monkeypatch.setattr(k8s_mod, "_incluster_namespace", lambda: "prod")
 
@@ -698,7 +698,7 @@ async def test_renew_once_anchors_steal_at_observe_time(monkeypatch):
     def fake_mono():
         return mono[0]
 
-    monkeypatch.setattr("yacron2.backends.kubernetes._monotonic", fake_mono)
+    monkeypatch.setattr("cronstable.backends.kubernetes._monotonic", fake_mono)
 
     lease_obj = {
         "metadata": {"name": "yl", "namespace": "ns", "resourceVersion": "7"},
@@ -1015,7 +1015,7 @@ async def test_deleted_lease_not_recreated_under_live_holder(monkeypatch):
     # would make two leaders until the prior holder's local fence lapses.
     clock = [1000.0]
     monkeypatch.setattr(
-        "yacron2.backends.kubernetes._monotonic", lambda: clock[0]
+        "cronstable.backends.kubernetes._monotonic", lambda: clock[0]
     )
     store = _FakeApiStore()
     holder = _store_backend(store, "node-b#held")
@@ -1045,7 +1045,7 @@ async def test_persist_reboot_ran_eagerly_writes_annotation():
     await b._renew_once()  # acquire the lease
     await b.mark_reboot_ran("migrate")  # eager persist
     stored = parse_lease(store.get())
-    from yacron2.leadership import REBOOT_RAN_KEY, decode_reboot_ran
+    from cronstable.leadership import REBOOT_RAN_KEY, decode_reboot_ran
 
     jsid, jobs = decode_reboot_ran(stored.annotations.get(REBOOT_RAN_KEY))
     assert jsid == "v1:job" and jobs == {"migrate"}
@@ -1061,7 +1061,7 @@ async def test_release_preserves_reboot_ran_annotation():
     await b.mark_reboot_ran("migrate")
     await b._release()
     state = parse_lease(store.get())
-    from yacron2.leadership import REBOOT_RAN_KEY, decode_reboot_ran
+    from cronstable.leadership import REBOOT_RAN_KEY, decode_reboot_ran
 
     assert state.holder is None  # released
     _, jobs = decode_reboot_ran(state.annotations.get(REBOOT_RAN_KEY))
@@ -1077,7 +1077,7 @@ async def test_release_does_not_restamp_stale_reboot_ran_under_new_id():
     # under v1 by re-stamping it with the live v2 id: every later observe
     # would adopt that pairing as genuine and the redefined one-shot would be
     # retired without ever running, on every node, forever.
-    from yacron2.leadership import REBOOT_RAN_KEY, decode_reboot_ran
+    from cronstable.leadership import REBOOT_RAN_KEY, decode_reboot_ran
 
     live = {"id": "v1:job"}
     store = _FakeApiStore()
@@ -1114,7 +1114,7 @@ async def test_renew_once_rescopes_reboot_ran_on_job_set_change():
     # @reboot job changes the live id WITHOUT rebuilding the backend; the next
     # round must NOT re-stamp the stale mark under the new id (which would
     # suppress the redefined one-shot cluster-wide).
-    from yacron2.leadership import REBOOT_RAN_KEY, decode_reboot_ran
+    from cronstable.leadership import REBOOT_RAN_KEY, decode_reboot_ran
 
     live = {"id": "v1:job"}
     store = _FakeApiStore()

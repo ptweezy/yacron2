@@ -1,4 +1,4 @@
-# A TEN-node yacron2 cluster for watching leader election and, especially,
+# A TEN-node cronstable cluster for watching leader election and, especially,
 # `distribution: spread` fan a larger, CPU-heavy job set out across the cluster.
 #
 #   docker compose -f docker-compose-cluster-large.yml up --build      # start
@@ -6,13 +6,13 @@
 #   docker stats                                                       # watch CPU
 #   docker compose -f docker-compose-cluster-large.yml down -v         # stop + wipe
 #
-# Ten nodes (yacron-a .. yacron-j) are deployed from one identical job set
+# Ten nodes (cronstable-a .. cronstable-j) are deployed from one identical job set
 # (example/cluster-large/jobs.yaml, 14 jobs, six CPU-heavy). Each node's cluster
 # config is generated at start by example/cluster-large/node-entrypoint.sh from
 # environment variables, so the compose file needs no per-node peer lists: every
 # node shares one CLUSTER_HOSTS list and drops itself by NODE_NAME.
 #
-# Dashboards: yacron-a..j on host ports 8080..8089 (e.g. http://localhost:8080/).
+# Dashboards: cronstable-a..j on host ports 8080..8089 (e.g. http://localhost:8080/).
 #
 # DISTRIBUTION (defaults to "spread"): with spread, each leader-gated job gets
 # its own per-job owner via rendezvous hashing, so the 12 Leader/PreferLeader
@@ -30,12 +30,12 @@
 #        [print(j["name"],"->",j.get("clusterOwner")) for j in json.load(sys.stdin) \
 #         if j.get("clusterPolicy") in ("Leader","PreferLeader")]'; break; done
 #   3. Watch CPU fan out:  docker stats   (vs DISTRIBUTION=single-leader -> one hot node)
-#   4. Fail nodes:  docker compose -f docker-compose-cluster-large.yml stop yacron-a yacron-b
+#   4. Fail nodes:  docker compose -f docker-compose-cluster-large.yml stop cronstable-a cronstable-b
 #      quorum (6 of 10) survives up to 4 failures; the owned jobs of stopped
 #      nodes are reassigned to survivors. Stop 5+ and the cluster loses quorum
 #      and Leader jobs stand down (PreferLeader keeps going).
 #
-# NOTE ON SIZE: 10 is an EVEN cluster size, so yacron2 logs a warning at start
+# NOTE ON SIZE: 10 is an EVEN cluster size, so cronstable logs a warning at start
 # (quorum 6 tolerates 4 failures, the same as 9; the 10th node only adds
 # something that can fail). It is fine for this demo; for real use prefer an odd
 # count (9 or 11).
@@ -44,7 +44,7 @@
 # your machine. Reduce by stopping some nodes, or trim jobs in
 # example/cluster-large/jobs.yaml.
 
-x-cluster-hosts: &cluster_hosts "yacron-a:8443,yacron-b:8443,yacron-c:8443,yacron-d:8443,yacron-e:8443,yacron-f:8443,yacron-g:8443,yacron-h:8443,yacron-i:8443,yacron-j:8443"
+x-cluster-hosts: &cluster_hosts "cronstable-a:8443,cronstable-b:8443,cronstable-c:8443,cronstable-d:8443,cronstable-e:8443,cronstable-f:8443,cronstable-g:8443,cronstable-h:8443,cronstable-i:8443,cronstable-j:8443"
 
 x-node-env: &node-env
   CLUSTER_HOSTS: *cluster_hosts
@@ -56,7 +56,7 @@ x-node-env: &node-env
 x-node: &node
   build:
     context: .
-  image: yacron2-cluster:local       # built once, reused by all ten nodes
+  image: cronstable-cluster:local       # built once, reused by all ten nodes
   entrypoint: ["sh", "/node-entrypoint.sh"]
   restart: unless-stopped
   depends_on:
@@ -80,16 +80,16 @@ services:
       - cluster-large-certs:/certs
       - ./example/cluster-large/gen-certs.sh:/gen-certs.sh:ro
 
-  yacron-a: { <<: *node, hostname: yacron-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: yacron-a } }
-  yacron-b: { <<: *node, hostname: yacron-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: yacron-b } }
-  yacron-c: { <<: *node, hostname: yacron-c, ports: ["8082:8080"], environment: { <<: *node-env, NODE_NAME: yacron-c } }
-  yacron-d: { <<: *node, hostname: yacron-d, ports: ["8083:8080"], environment: { <<: *node-env, NODE_NAME: yacron-d } }
-  yacron-e: { <<: *node, hostname: yacron-e, ports: ["8084:8080"], environment: { <<: *node-env, NODE_NAME: yacron-e } }
-  yacron-f: { <<: *node, hostname: yacron-f, ports: ["8085:8080"], environment: { <<: *node-env, NODE_NAME: yacron-f } }
-  yacron-g: { <<: *node, hostname: yacron-g, ports: ["8086:8080"], environment: { <<: *node-env, NODE_NAME: yacron-g } }
-  yacron-h: { <<: *node, hostname: yacron-h, ports: ["8087:8080"], environment: { <<: *node-env, NODE_NAME: yacron-h } }
-  yacron-i: { <<: *node, hostname: yacron-i, ports: ["8088:8080"], environment: { <<: *node-env, NODE_NAME: yacron-i } }
-  yacron-j: { <<: *node, hostname: yacron-j, ports: ["8089:8080"], environment: { <<: *node-env, NODE_NAME: yacron-j } }
+  cronstable-a: { <<: *node, hostname: cronstable-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-a } }
+  cronstable-b: { <<: *node, hostname: cronstable-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-b } }
+  cronstable-c: { <<: *node, hostname: cronstable-c, ports: ["8082:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-c } }
+  cronstable-d: { <<: *node, hostname: cronstable-d, ports: ["8083:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-d } }
+  cronstable-e: { <<: *node, hostname: cronstable-e, ports: ["8084:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-e } }
+  cronstable-f: { <<: *node, hostname: cronstable-f, ports: ["8085:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-f } }
+  cronstable-g: { <<: *node, hostname: cronstable-g, ports: ["8086:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-g } }
+  cronstable-h: { <<: *node, hostname: cronstable-h, ports: ["8087:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-h } }
+  cronstable-i: { <<: *node, hostname: cronstable-i, ports: ["8088:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-i } }
+  cronstable-j: { <<: *node, hostname: cronstable-j, ports: ["8089:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-j } }
 
 volumes:
   cluster-large-certs:

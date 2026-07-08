@@ -1,13 +1,13 @@
 """The leadership seam: ABC defaults, never-skip semantics, factory dispatch.
 
-These exercise :mod:`yacron2.leadership` with tiny in-test backends (no
+These exercise :mod:`cronstable.leadership` with tiny in-test backends (no
 network, no crypto), which is what carries its coverage in CI.
 """
 
 import pytest
 
-from yacron2.config import parse_config_string
-from yacron2.leadership import (
+from cronstable.config import parse_config_string
+from cronstable.leadership import (
     REBOOT_RAN_KEY,
     LeadershipBackend,
     LeaseBackend,
@@ -378,12 +378,12 @@ cluster:
     cert: /nonexistent/node.pem
     key: /nonexistent/node.key
   peers:
-    - host: yacron-b:8443
+    - host: cronstable-b:8443
 """
 
 
 def test_make_backend_kubernetes():
-    from yacron2.backends.kubernetes import KubernetesBackend
+    from cronstable.backends.kubernetes import KubernetesBackend
 
     cfg = parse_config_string(_K8S_YAML, "").cluster_config
     backend = make_backend(cfg, lambda: "v1:x")
@@ -392,7 +392,7 @@ def test_make_backend_kubernetes():
 
 
 def test_make_backend_etcd():
-    from yacron2.backends.etcd import EtcdBackend
+    from cronstable.backends.etcd import EtcdBackend
 
     cfg = parse_config_string(_ETCD_YAML, "").cluster_config
     backend = make_backend(cfg, lambda: "v1:x")

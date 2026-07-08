@@ -1,6 +1,6 @@
 """The optional durable state backend: config, records, cursor, lease, probe.
 
-Exercises :mod:`yacron2.state` and its config/lifecycle wiring end to end
+Exercises :mod:`cronstable.state` and its config/lifecycle wiring end to end
 against a real temp directory (the "local filesystem == Amazon S3 Files, one
 backend" path), with the topology probe and clock stubbed where a test needs to
 drive them deterministically.
@@ -15,11 +15,11 @@ import threading
 
 import pytest
 
-from yacron2 import state
-from yacron2.config import ConfigError, parse_config_string
-from yacron2.cron import Cron, JobRunInfo, _job_run_info_from_dict
-from yacron2.job import JobOutputStream
-from yacron2.state import (
+from cronstable import state
+from cronstable.config import ConfigError, parse_config_string
+from cronstable.cron import Cron, JobRunInfo, _job_run_info_from_dict
+from cronstable.job import JobOutputStream
+from cronstable.state import (
     FilesystemStateBackend,
     Lease,
     _fs_safe,
@@ -64,9 +64,9 @@ def test_no_state_section_is_none():
 
 
 def test_state_defaults_filled():
-    cfg = _state_cfg("state:\n  path: /var/lib/yacron2\n")
+    cfg = _state_cfg("state:\n  path: /var/lib/cronstable\n")
     assert cfg is not None
-    assert cfg["path"] == "/var/lib/yacron2"
+    assert cfg["path"] == "/var/lib/cronstable"
     assert cfg["topology"] == "auto"
     assert cfg["deploymentId"] is None
 
@@ -74,7 +74,7 @@ def test_state_defaults_filled():
 def test_state_all_fields():
     cfg = _state_cfg(
         "state:\n"
-        "  path: /mnt/s3files/yacron2\n"
+        "  path: /mnt/s3files/cronstable\n"
         "  topology: shared\n"
         "  deploymentId: my-app\n"
     )
@@ -103,7 +103,7 @@ def test_multiple_state_sections_via_include_rejected(tmp_path):
     child.write_text("state:\n  path: /b\n")
     parent = tmp_path / "parent.yaml"
     parent.write_text("state:\n  path: /a\ninclude:\n  - child.yaml\n")
-    from yacron2.config import parse_config_file
+    from cronstable.config import parse_config_file
 
     with pytest.raises(ConfigError, match="multiple state configs"):
         parse_config_file(str(parent))
@@ -116,7 +116,7 @@ def test_state_section_from_config_dir(tmp_path):
         "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
     )
     (tmp_path / "20-state.yaml").write_text("state:\n  path: /srv/state\n")
-    from yacron2.config import parse_config
+    from cronstable.config import parse_config
 
     cfg = parse_config(str(tmp_path))
     assert cfg.state_config is not None
@@ -126,7 +126,7 @@ def test_state_section_from_config_dir(tmp_path):
 def test_multiple_state_sections_in_dir_rejected(tmp_path):
     (tmp_path / "a.yaml").write_text("state:\n  path: /a\n")
     (tmp_path / "b.yaml").write_text("state:\n  path: /b\n")
-    from yacron2.config import parse_config
+    from cronstable.config import parse_config
 
     with pytest.raises(ConfigError, match="Multiple 'state' configurations"):
         parse_config(str(tmp_path))
@@ -465,7 +465,7 @@ async def test_unrecognised_schema_version_is_left_in_place(tmp_path):
 
 
 async def test_unrecognised_schema_version_fails_closed_when_strict(tmp_path):
-    from yacron2.state import _DocumentUnreadable
+    from cronstable.state import _DocumentUnreadable
 
     backend = _backend(tmp_path)
     await backend.start()
@@ -1351,7 +1351,7 @@ async def test_depends_on_past_ignores_cancelled(tmp_path):
 
 
 async def test_launch_scheduled_job_skips_on_depends_on_past(tmp_path, caplog):
-    caplog.set_level(logging.INFO, logger="yacron2")
+    caplog.set_level(logging.INFO, logger="cronstable")
     cron = await _dep_cron(tmp_path)
     await _put_outcome(cron, "failure", "2026-07-01T10:00:00+00:00")
     calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]

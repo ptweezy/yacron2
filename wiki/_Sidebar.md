@@ -1,4 +1,4 @@
-### [yacron2 Wiki](Home)
+### [cronstable Wiki](Home)
 
 - **Getting Started**
   - [Installation](Installation)

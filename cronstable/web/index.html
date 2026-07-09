@@ -2231,7 +2231,11 @@
       const reach = (p.L1 + p.L2) * S;
       const hw = Math.ceil(p.trackHalf * S + reach + 4);
       const hh = Math.ceil(reach + 5);
-      this._geom = { S: S, railY: 4.2, railX: p.trackHalf * S + 4 };
+      // the rail spans the full box so the end gates sit flush with the
+      // logo's edges (snug against the wordmark). the cart's travel is
+      // shorter, and the tip's worst-case reach (trackHalf + L1 + L2,
+      // which sizes hw) stays ~2px inside the gates — nothing ever clips.
+      this._geom = { S: S, railY: 4.2, railX: hw - 2 };
       const mk = (t, at, parent) => {
         const n = document.createElementNS(NS, t);
         for (const k in at) n.setAttribute(k, at[k]);

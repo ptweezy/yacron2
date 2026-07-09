@@ -60,8 +60,9 @@ pre-commit install
 
 ## Releasing
 
-Releases are **automated** by the [`release`](.github/workflows/release.yml)
-GitHub Actions workflow. Version numbers come from git tags via
+Releases are **automated** by the single [`CI`](.github/workflows/release.yml)
+GitHub Actions pipeline (one workflow builds and tests everything on every
+commit and, on a release, publishes it). Version numbers come from git tags via
 `setuptools_scm`; you never edit a version by hand.
 
 ### Cutting a release
@@ -101,28 +102,31 @@ workflow**, then pick the bump level from the dropdown.
 
 ### What the pipeline does
 
-On a release the workflow, in order:
+The same pipeline runs on every commit and PR; only the publish steps are
+gated behind the release check. On a release it, in order:
 
-1. **decides** whether to release and at what level (the strict marker check);
+1. **decides** whether to release and at what level (the strict marker check,
+   which only fires on a push to `main` or a manual dispatch);
 2. **computes** the next version from the latest `X.Y.Z` tag (refusing if that
    tag already exists);
-3. **gates** on `tox` (py310, py311, py312, py313, py314, lint, mypy): a red build means no release;
-4. **builds** the wheel + sdist *and* the self-contained PyInstaller binaries
-   for Linux (`amd64`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x`
-   and `riscv64`, glibc and musl), macOS (`arm64` + `amd64`) and Windows
-   (`amd64` + `arm64`), each on a matching runner (the non-native Linux arches
-   inside a container under QEMU; Windows ARM64 on the `windows-11-arm`
-   runner), smoke-tested with `--version`, all at the computed version,
-   *before* publishing, so a broken build fails the run instead of producing a
-   half-finished release;
-5. **publishes the wheel + sdist to PyPI** via [Trusted Publishing
-   (OIDC)](https://docs.pypi.org/trusted-publishers/): there is no API token to
-   manage or leak;
-6. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
+3. **builds and tests everything in parallel** — `tox` (py310–py314, lint,
+   mypy), the wheel + sdist, the self-contained PyInstaller binaries for Linux
+   (`amd64`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x` and
+   `riscv64`, glibc and musl), macOS (`arm64` + `amd64`) and Windows (`amd64` +
+   `arm64`), each smoke-tested with `--version`, plus a build-only pass over
+   every Docker image — all at the computed version. This whole matrix is the
+   **gate**: a red anywhere (a failed test, a broken binary, or a broken
+   `Dockerfile`) means no release;
+4. **only once the entire gate is green**, publishes the wheel + sdist to PyPI
+   via [Trusted Publishing (OIDC)](https://docs.pypi.org/trusted-publishers/):
+   there is no API token to manage or leak;
+5. **after a successful publish**, creates and pushes the `X.Y.Z` tag and a
    GitHub Release with the wheel, sdist, and all the binaries
    (`cronstable-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}`, their
    `-musl` variants plus `cronstable-linux-armv6-musl`, `cronstable-macos-{arm64,amd64}`,
-   and `cronstable-windows-{amd64,arm64}.exe`) attached.
+   and `cronstable-windows-{amd64,arm64}.exe`) plus a single `SHA256SUMS`
+   attached, then pushes the multi-arch container images and updates the
+   Homebrew tap.
 
 Because no file is committed back to the repo, a release never re-triggers the
 workflow. Because the tag is created *after* publishing, a failed publish leaves
@@ -130,22 +134,20 @@ no orphan tag and a re-run cleanly retries the same version.
 
 ## Container image
 
-The official image is built and published by the
-[`docker`](.github/workflows/docker.yml) workflow, from the top-level
-[`Dockerfile`](Dockerfile):
+The official image is built and published by the single
+[`CI`](.github/workflows/release.yml) pipeline, from the top-level
+[`Dockerfile`](Dockerfile) (and the per-distro `docker/Dockerfile.*`):
 
-- **On each published release** it builds one multi-arch (`linux/amd64`,
-  `linux/arm64`, `linux/386`, `linux/arm/v7`, `linux/ppc64le` and `linux/s390x`)
-  image and pushes it, tagged `<version>` and `:latest`, to both
-  `ghcr.io/ptweezy/cronstable` and `docker.io/ptweezy/cronstable`. GHCR authenticates
-  with the built-in `GITHUB_TOKEN`; Docker Hub uses the `DOCKERHUB_USERNAME` and
-  `DOCKERHUB_TOKEN` repository secrets.
-- **On pull requests / `main` pushes** that touch the `Dockerfile`, the package,
-  or the workflow, it builds the image *without* pushing, so a broken
+- **On every commit and PR** it builds every image *without* pushing (the
+  `docker` gate job), across their full published arch sets, so a broken
   `Dockerfile` fails CI before a release.
-- **Manually** (Actions → docker → Run workflow) you can (re)build any existing
-  release tag, useful to backfill an image for a release cut before this
-  workflow existed, or to retry a failed push.
+- **On a release**, once the whole gate is green, the `docker-push` job builds
+  and pushes each distro's multi-arch image, tagged `<version>` and `:latest`
+  (the Debian base owns the bare tags; variants get a `-<distro>` suffix), to
+  both `ghcr.io/ptweezy/cronstable` and `docker.io/ptweezy/cronstable`. GHCR
+  authenticates with the built-in `GITHUB_TOKEN`; Docker Hub uses the
+  `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets (skipped if
+  unset).
 
 Build it locally the same way CI does (the version is read from git, or pass
 `--build-arg VERSION=X.Y.Z`):

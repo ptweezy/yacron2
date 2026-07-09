@@ -1,44 +1,38 @@
-name: release
+name: CI
 
-# Release pipeline (opt-in). It runs when:
-#   - ANY commit included in a push to main has a [release] marker anywhere in
-#     its message (not just the tip commit):
+# ONE pipeline for everything. On EVERY push (any branch) and pull request it
+# builds and tests the whole product in parallel -- the full tox matrix
+# (lint/mypy/pytest), the wheel + sdist, the self-contained PyInstaller binaries
+# for Linux (amd64, arm64, i686, armv7, ppc64le, s390x and riscv64 in both glibc
+# and musl/Alpine flavors, plus armv6 in musl only), macOS (arm64 + amd64 on
+# macOS 15, shipped; plus macOS 26/Tahoe as non-gating CI coverage) and Windows
+# (amd64 + arm64), and every Docker image (8 distros, full arch set, build-only)
+# -- and gates on ALL of it. Nothing is published on an ordinary commit.
+#
+# A release happens ONLY when either:
+#   - a push to `main` carries a [release] marker in ANY of its commits:
 #         [release]          -> minor (default)
 #         [release:major]    -> major
 #         [release:minor]    -> minor
 #         [release:patch]    -> patch
-#     If several markers appear across the push, the most significant bump wins
-#     (major > minor > patch). NOTE: the match is a substring, so a literal
-#     "[release:patch]" written anywhere in a commit message WILL trigger a
-#     release -- don't quote the marker verbatim in a commit message unless you
-#     mean it. (Only commit messages are scanned, never file contents.)
-#   - or it is started manually via workflow_dispatch (bump from the dropdown,
-#     or an exact `tag` to release a specific X.Y.Z instead of the computed
-#     next one -- the `tag` input wins over `bump` when set).
+#     (most significant marker across the push wins; substring match, so don't
+#     quote the marker verbatim in a message unless you mean it), or
+#   - it is started via workflow_dispatch (bump from the dropdown, or an exact
+#     `tag` to release a specific X.Y.Z; the `tag` input wins over `bump`).
 #
-# On release it: runs the tox gate and, in parallel, builds at the computed
-# version (SETUPTOOLS_SCM_PRETEND_VERSION) the wheel + sdist and self-contained
-# PyInstaller binaries for Linux (amd64, arm64, i686, armv7, ppc64le, s390x and
-# riscv64 in both glibc and musl/Alpine flavors, plus armv6 in musl only as
-# Debian has no arm32v6), macOS (arm64 + amd64) and Windows (amd64 + arm64), each
-# built on a matching runner (the non-native arches inside a container,
-# armv7/armv6/ppc64le/s390x/riscv64 under QEMU). The binary jobs depend on
-# [decide, version] but NOT the gate, so they build alongside tox instead of
-# after it; the publish still needs the gate, so a speculative build only costs
-# compute on the rare release-time tox failure.
+# On a release, once EVERY build + test job above has succeeded (the gate),
+# and ONLY then, the pipeline publishes: the wheel + sdist to PyPI via Trusted
+# Publishing (OIDC, skip-existing so a retry is a no-op), tags the commit
+# (RELEASE_TOKEN so the tag can point at a commit that touches
+# .github/workflows/), cuts a GitHub Release with ALL prebuilt binaries + a
+# single SHA256SUMS, pushes every Docker image, and updates the Homebrew tap.
+# Because the Release is gated on all binaries AND the Docker build, a broken or
+# flaky arch (or Dockerfile) fails the run BEFORE anything is published -- never
+# a half release. A failed publish leaves no orphan tag (tagged only after PyPI
+# accepts), so a re-run cleanly retries.
 #
-# The `release` job then publishes the wheel + sdist to PyPI via Trusted
-# Publishing (OIDC) and, ONLY after a successful publish, tags the commit and
-# cuts a GitHub Release -- gated on tox plus the FAST NATIVE binaries only (Linux
-# glibc amd64/arm64, macOS, Windows), which are the set Homebrew pins and a
-# strong pre-publish canary. The slower binaries (every musl arch, glibc i686,
-# and the QEMU-emulated arches) attach to that Release afterward via
-# `attach-binaries`, so a slow or flaky emulated build can never hold up the PyPI
-# publish. No file is committed back -> no loop; a broken fast binary fails the
-# run before the publish (never a half release), a failed publish leaves no
-# orphan tag (tagged only after PyPI accepts) so a re-run cleanly retries, and a
-# failed slow arch only drops its own asset -- re-run that leg to add it later,
-# no PyPI version burned.
+# This file replaces the former build.yml + docker.yml + tox.yml + release.yml,
+# whose binary/tox builds it deduplicates into one definition each.
 #
 # Example commit message:
 #     Add retry backoff to the HTTP reporter
@@ -47,7 +41,8 @@ name: release
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]  # build + test on every commit, on every branch
+  pull_request:       # and on every PR (covers fork PRs, which don't push here)
   workflow_dispatch:
     inputs:
       bump:
@@ -60,29 +55,44 @@ on:
         type: string
         default: ""
 
+# One in-flight run per branch. A same-repo branch push and its PR share a group
+# (github.ref_name == the PR's head ref), so the duplicate is cancelled rather
+# than run twice. main is never cancelled (cancel-in-progress false there):
+# consecutive main pushes QUEUE so releases serialize instead of racing, and a
+# workflow_dispatch release is likewise protected from a later push cancelling it.
 concurrency:
-  group: release
-  cancel-in-progress: false
+  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch' }}
 
-# Least-privilege default for all jobs; the `release` job opts up to the
-# narrower set of write scopes it actually needs (see its own permissions:).
+# Least-privilege default for all jobs; the publish jobs opt up to the narrower
+# write scopes they actually need (see each one's own permissions:).
 permissions:
   contents: read
 
-# Network + interpreter hardening for the runner-native jobs that install with
-# uv (gate/tox, native binaries, macOS, Windows, and the wheel+sdist build):
-# UV_HTTP_TIMEOUT raises uv's per-request socket timeout (uv retries internally)
-# and UV_PYTHON_DOWNLOADS=never keeps uv on the setup-python interpreter rather
-# than fetching a managed one. The emulated foreign-arch binary jobs stay on pip
-# inside their `docker run` containers -- uv's official image is amd64/arm64
-# only and its musl ppc64le/s390x wheels don't exist -- mirroring build.yml.
+# Network hardening for transient PyPI/network blips. Runner-native jobs install
+# with uv (UV_HTTP_TIMEOUT raises its per-request socket timeout; uv retries
+# internally) and UV_PYTHON_DOWNLOADS=never keeps uv on the setup-python
+# interpreter rather than fetching a managed one. The emulated foreign-arch
+# binary jobs stay on pip inside their `docker run` containers (uv's official
+# image is amd64/arm64 only and lacks musl ppc64le/s390x wheels) and read
+# PIP_RETRIES/PIP_TIMEOUT, forwarded into `docker run` with `-e`.
 env:
+  PIP_RETRIES: "5"
+  PIP_TIMEOUT: "60"
   UV_HTTP_TIMEOUT: "60"
   UV_PYTHON_DOWNLOADS: "never"
 
 jobs:
-  # Decide whether to release and at what level. Kept separate (and strict) so
-  # the trigger logic lives in a real script, never a fuzzy `contains()` match.
+  # ---------------------------------------------------------------------------
+  # Decide + version (run on every event; feed both the gate and the publish).
+  # ---------------------------------------------------------------------------
+
+  # Decide whether this run is a release and at what level. Kept separate (and
+  # strict) so the trigger logic lives in a real script, never a fuzzy
+  # `contains()` match. A release requires a workflow_dispatch OR a push to main
+  # with a [release] marker -- a marker on any other branch, or a PR, never
+  # releases (this file triggers on all branches + PRs, so `decide` itself must
+  # enforce the main-only rule the old push:branches:[main] filter used to).
   decide:
     runs-on: ubuntu-latest
     outputs:
@@ -95,6 +105,7 @@ jobs:
       - id: d
         env:
           EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           INPUT_BUMP: ${{ github.event.inputs.bump }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
@@ -105,7 +116,7 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ]; then
             release=true
             bump="${INPUT_BUMP:-minor}"
-          else
+          elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
             # Trigger if ANY commit introduced by this push has a [release]
             # marker anywhere in its message -- not just the tip commit. The
             # range is the commits new in this push (BEFORE..AFTER); on a
@@ -135,30 +146,49 @@ jobs:
               fi
             fi
           fi
+          # else: a PR or a non-main push -> build + test only, never release.
           echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "bump=$bump" >> "$GITHUB_OUTPUT"
-          echo "::notice::release=$release bump=$bump (event=$EVENT)"
+          echo "::notice::release=$release bump=$bump (event=$EVENT ref=$REF)"
 
-  # Compute the next version once, here, so the binary builders and the
-  # publish/release job all build at the same number. Refuses to proceed if the
-  # computed tag already exists.
+  # Compute the version ONCE so every builder pins the same number via
+  # SETUPTOOLS_SCM_PRETEND_VERSION. Runs unconditionally (the gate builds always
+  # need a version): on a release it computes the next X.Y.Z (or the explicit
+  # `tag` override) and refuses if that tag already exists; otherwise it emits
+  # the natural setuptools_scm dev version (e.g. 1.2.9.devN+g<sha>), exactly as
+  # the old build.yml did for its per-commit builds.
   version:
     needs: decide
-    if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     outputs:
       new: ${{ steps.ver.outputs.new }}
     steps:
       - uses: actions/checkout@v7.0.0
         with:
-          fetch-depth: 0  # full history + tags so we can find the latest X.Y.Z
-      - name: Compute next version
+          fetch-depth: 0  # full history + tags so setuptools_scm / tag math resolve
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.3.0
+        with:
+          version: "0.11.26"
+      - name: Compute version
         id: ver
         env:
+          RELEASE: ${{ needs.decide.outputs.release }}
           BUMP: ${{ needs.decide.outputs.bump }}
           OVERRIDE: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
+          if [ "$RELEASE" != "true" ]; then
+            # Build-only run: resolve setuptools_scm's natural dev version off
+            # git in a throwaway env (no venv/install left behind).
+            new="$(uv run --no-project --with setuptools-scm python -m setuptools_scm)"
+            echo "new=$new" >> "$GITHUB_OUTPUT"
+            echo "::notice::Build-only at version $new (no release)."
+            exit 0
+          fi
+
           git fetch --tags --force
           if [ -n "${OVERRIDE:-}" ]; then
             # Explicit override from workflow_dispatch: release exactly this
@@ -185,47 +215,122 @@ jobs:
             echo "::notice::Releasing $new (previous $latest, bump=$BUMP)"
           fi
 
-          # Applies to both paths: never clobber an existing tag (a failed
-          # publish leaves no orphan tag, so a clean retry is still possible).
+          # Never clobber an existing tag (a failed publish leaves no orphan tag,
+          # so a clean retry is still possible).
           if git rev-parse -q --verify "refs/tags/$new" >/dev/null; then
             echo "::error::Tag $new already exists; refusing to re-release." >&2
             exit 1
           fi
-
           echo "new=$new" >> "$GITHUB_OUTPUT"
 
-  gate:
-    needs: decide
-    if: needs.decide.outputs.release == 'true'
+  # ---------------------------------------------------------------------------
+  # Gate: tests + all binaries + all Docker images. Runs on EVERY event, in
+  # parallel. The publish jobs below need every one of these to succeed.
+  # ---------------------------------------------------------------------------
+
+  tox-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
+      # tox-uv pulls in uv and makes tox provision envs + install deps with it.
+      - run: pip install --upgrade pip
+      - run: pip install tox tox-uv
+      - run: tox -e lint
+
+  tox-mypy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
+      - run: pip install --upgrade pip
+      - run: pip install tox tox-uv
+      - run: tox -e mypy
+
+  tox:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]  # macOS is POSIX like Linux; add macos-latest to cover it too
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        experimental: [false]
+        include:
+          # Windows on ARM64: a gating row on the latest stable Python so the
+          # runtime is exercised on win-arm64 (the released .exe targets it too).
+          - os: windows-11-arm
+            python: '3.14'
+            experimental: false
+          # Python 3.15 is in beta. Run it for early signal, but never let it
+          # gate CI -> continue-on-error. allow-prereleases lets setup-python
+          # pick up the beta (a no-op for the stable rows).
+          - os: ubuntu-latest
+            python: '3.15'
+            experimental: true
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    # The suite runs in 1-3 min per cell; 20 bounds a hung asyncio test.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+      - run: pip install --upgrade pip
+      - run: pip install tox tox-uv
+      - run: tox -e py
+      # Every matrix cell uploads its own coverage.xml; Codecov merges them by
+      # flag into one combined number. fail_ci_if_error stays false so a Codecov
+      # outage never reds the build (and fork PRs with no token still pass).
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          flags: ${{ matrix.os }}-py${{ matrix.python }}
+          fail_ci_if_error: false
+
+  # Wheel + sdist, built and `twine check`ed exactly as it will be published to
+  # PyPI. Uploaded as an artifact the `release` job publishes verbatim (so the
+  # exact bytes that were checked here are what ship).
+  dist:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
         with:
-          fetch-depth: 0  # full history + tags so setuptools_scm resolves a version
+          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - uses: actions/setup-python@v6.3.0
         with:
-          python-version: |
-            3.10
-            3.11
-            3.12
-            3.13
-            3.14
-      # tox-uv pulls in uv and makes tox provision envs + install deps with it.
-      - run: pip install --upgrade pip tox tox-uv
-      - run: tox  # runs py310, py311, py312, py313, py314, lint, mypy (see tox.ini)
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.3.0
+        with:
+          version: "0.11.26"
+      - name: Build distributions
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          uv build                                      # wheel + sdist into dist/
+          uvx twine check dist/*.whl dist/*.tar.gz       # twine, run ephemerally
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
-  # Build the self-contained glibc PyInstaller binaries (amd64, arm64) on native
-  # runners (no QEMU). With macOS + Windows these are the "fast native" binaries
-  # the `release` job gates the publish on, and the set Homebrew pins. Depends on
-  # [decide, version] but NOT gate, so it builds in parallel with tox; the publish
-  # in `release` still needs both, so an un-gated speculative build only wastes
-  # compute on the rare release-time tox failure. Built before the publish, so a
-  # broken binary fails the run rather than producing a half release; the per-arch
-  # `--version` smoke test catches a bad bundle here. These target glibc (the
-  # Ubuntu runner's libc) -- `binaries-musl` covers Alpine/musl hosts.
+  # Self-contained glibc PyInstaller binaries (amd64, arm64) on native runners
+  # (no QEMU). The per-arch `--version` smoke test catches a bad bundle here.
+  # These target glibc (the Ubuntu runner's libc); `binaries-musl` covers
+  # Alpine/musl hosts.
   binaries:
-    needs: [decide, version]
-    if: needs.decide.outputs.release == 'true'
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -278,24 +383,16 @@ jobs:
           name: cronstable-linux-${{ matrix.arch }}
           path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
+          retention-days: 7
 
-  # Build the musl/Alpine self-contained binaries, one per architecture. GitHub
-  # runners are glibc (Ubuntu), so the build runs *inside* an Alpine container
-  # via `docker run` rather than a job-level `container:` -- that keeps checkout
-  # and upload-artifact on the glibc host (Alpine lacks the glibc Node the runner
-  # injects for JS actions) and confines musl to the build itself. amd64/arm64
-  # build on native runners and i686 runs natively on the amd64 runner; armv7,
-  # armv6, ppc64le, s390x and riscv64 run under QEMU. armv6 is musl-only -- the
-  # Debian/glibc image has no arm32v6, so it has no binaries-glibc-extra
-  # counterpart. Same pyinstaller pin and `--version` smoke test as the glibc job
-  # above; the asset carries a `-musl` suffix so it sits alongside the glibc one
-  # on the release. These do NOT gate the publish (needs is [decide, version], no
-  # gate): `attach-binaries` uploads them to the Release AFTER the PyPI publish,
-  # so a slow QEMU leg here never blocks the release, and with fail-fast off one
-  # arch failing still ships the rest.
+  # Self-contained musl/Alpine binaries, one per arch. Runners are glibc, so the
+  # build runs inside an Alpine container via `docker run` (checkout + upload
+  # stay on the glibc host). amd64/arm64 build natively; i686 runs natively on
+  # the amd64 runner; armv7, armv6, ppc64le, s390x and riscv64 run under QEMU.
+  # armv6 is musl-only (Debian/glibc ships no arm32v6). Same pyinstaller pin and
+  # `--version` smoke test as the glibc job; the asset carries a `-musl` suffix.
   binaries-musl:
-    needs: [decide, version]
-    if: needs.decide.outputs.release == 'true'
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -325,10 +422,6 @@ jobs:
             runner: ubuntu-24.04
             platform: linux/riscv64
             qemu: true            # no native riscv64 on the runners -> emulate
-          # armv6 is musl-only: Debian/glibc ships no arm32v6 image (it ships
-          # arm32v5), so there is no binaries-glibc-extra counterpart. Entire
-          # C-ext stack + PyInstaller bootloader compile from sdist (no musllinux
-          # armv6 wheels) -> slowest leg.
           - arch: armv6
             runner: ubuntu-24.04
             platform: linux/arm/v6
@@ -339,8 +432,7 @@ jobs:
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
-      # container (armv7, armv6, ppc64le, s390x, riscv64). amd64/arm64/i686 run
-      # natively and skip this.
+      # container. amd64/arm64/i686 run natively and skip this.
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.2.0
       - name: Build binary (Alpine/musl)
@@ -350,6 +442,7 @@ jobs:
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
             -v "$PWD:/src" -w /src \
             python:3.14-alpine sh -euc '
               # build-base brings the C toolchain + strip (the spec sets
@@ -361,12 +454,10 @@ jobs:
               pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
               pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a musllinux wheel where one
-              # exists (amd64/arm64), else a source build (ship it as broadly as
-              # it compiles -- build-base above supplies the toolchain).
-              # verify_uvloop.py proves the result runs a loop (a source build can
-              # miscompile under QEMU) and uninstalls it otherwise, so a broken
-              # uvloop is never frozen in; the binary then cleanly falls back to
-              # asyncio.
+              # exists (amd64/arm64), else a source build. verify_uvloop.py proves
+              # the result runs a loop (a source build can miscompile under QEMU)
+              # and uninstalls it otherwise, so a broken uvloop is never frozen
+              # in; the binary then cleanly falls back to asyncio.
               pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
               python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
               # Bundle orjson (the `speedups` extra): a musllinux wheel on amd64/
@@ -384,25 +475,15 @@ jobs:
           name: cronstable-linux-${{ matrix.arch }}-musl
           path: dist/cronstable-linux-${{ matrix.arch }}-musl
           if-no-files-found: error
+          retention-days: 7
 
-  # Build the glibc self-contained binaries for the arches with no native GitHub
-  # runner (i686, armv7, ppc64le, s390x, riscv64). The native `binaries` job
-  # covers only amd64 and arm64 (the runners GitHub hosts) and PyInstaller is not
-  # a cross-compiler, so -- like binaries-musl -- these build inside a container
-  # via `docker run --platform`, here on python:3.14-slim (Debian glibc). i686
-  # (linux/386) runs natively on the amd64 runner; armv7, ppc64le, s390x and
-  # riscv64 run under QEMU. glibc wheel coverage varies: ppc64le/s390x have full
-  # manylinux wheels, while the i686 aiohttp stack, propcache-on-armv7, and
-  # multidict/frozenlist/ruamel.yaml.clib on riscv64 ship no wheel and compile
-  # from sdist -- so build-essential is installed either way. Same pyinstaller
-  # pin and `--version` smoke test as the other binary jobs; assets carry no
-  # -musl suffix and sit beside the 64-bit glibc binaries on the release. Like
-  # binaries-musl these do NOT gate the publish (needs is [decide, version]):
-  # `attach-binaries` uploads them to the Release after the PyPI publish, so a
-  # slow QEMU leg never blocks the release.
+  # Self-contained glibc binaries for the arches with no native GitHub runner
+  # (i686, armv7, ppc64le, s390x, riscv64). PyInstaller is not a cross-compiler,
+  # so -- like binaries-musl -- these build inside a container via
+  # `docker run --platform`, here on python:3.14-slim (Debian glibc). i686 runs
+  # natively on the amd64 runner; armv7, ppc64le, s390x and riscv64 under QEMU.
   binaries-glibc-extra:
-    needs: [decide, version]
-    if: needs.decide.outputs.release == 'true'
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -440,6 +521,7 @@ jobs:
           set -euo pipefail
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -e PIP_RETRIES -e PIP_TIMEOUT \
             -v "$PWD:/src" -w /src \
             python:3.14-slim sh -euc '
               # build-essential brings gcc + strip (the spec sets strip=True);
@@ -453,12 +535,10 @@ jobs:
               pip install pyinstaller==6.21.0   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a manylinux wheel where one
-              # exists (amd64/arm64), else a source build (ship it as broadly as
-              # it compiles -- build-essential above supplies the toolchain).
-              # verify_uvloop.py proves the result runs a loop (a source build can
-              # miscompile under QEMU) and uninstalls it otherwise, so a broken
-              # uvloop is never frozen in; the binary then cleanly falls back to
-              # asyncio.
+              # exists (amd64/arm64), else a source build. verify_uvloop.py proves
+              # the result runs a loop (a source build can miscompile under QEMU)
+              # and uninstalls it otherwise, so a broken uvloop is never frozen
+              # in; the binary then cleanly falls back to asyncio.
               pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
               python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
               # Bundle orjson (the `speedups` extra): a manylinux wheel on amd64/
@@ -476,35 +556,39 @@ jobs:
           name: cronstable-linux-${{ matrix.arch }}
           path: dist/cronstable-linux-${{ matrix.arch }}
           if-no-files-found: error
+          retention-days: 7
 
-  # Build the self-contained macOS binaries, one per architecture on a native
-  # runner. PyInstaller is not a cross-compiler, so each runner emits its own
-  # arch: arm64 on Apple Silicon, amd64 on the Intel runner. Same pyinstaller
-  # pin and `--version` smoke test as the Linux jobs; the assets carry a
-  # `-macos-<arch>` suffix. The runner labels are pinned (like the Linux
-  # `ubuntu-24.04*` jobs) so a release never silently jumps macOS versions --
-  # bump them when GitHub retires this generation (note `macos-latest` is arm64
-  # only; the Intel sibling is `macos-15-intel`).
-  #
-  # The binary is Developer ID signed (hardened runtime) and notarized when the
-  # signing secrets are configured (see the "Sign and notarize" step). A bare
-  # Mach-O cannot be stapled, so notarization publishes the ticket online and
-  # Gatekeeper validates on first run -- no `xattr -d com.apple.quarantine`
-  # needed by end users. If the secrets are absent the step is skipped with a
-  # warning and the build ships unsigned (the old behavior), so a release is
-  # never blocked on signing setup.
+  # Self-contained macOS binaries. The shipped pair is macOS 15 (arm64 + amd64),
+  # signed + notarized on a release. macOS 26 (Tahoe) is built too for early
+  # OS-version breakage signal, but it is CI-ONLY: continue-on-error so a flaky
+  # Tahoe build never blocks a release, and it is neither signed nor attached.
+  # `ship` picks the shipped rows; `asset` names the artifact (the shipped ones
+  # keep the bare `macos-<arch>` names the Release + Homebrew formula expect).
   binaries-macos:
     needs: [decide, version]
-    if: needs.decide.outputs.release == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
-            runner: macos-15          # Apple Silicon
+            runner: macos-15          # macOS 15, Apple Silicon -- shipped
+            ship: true
+            asset: macos-arm64
           - arch: amd64
-            runner: macos-15-intel    # Intel
+            runner: macos-15-intel    # macOS 15, Intel -- shipped
+            ship: true
+            asset: macos-amd64
+          - arch: arm64
+            runner: macos-26          # macOS 26 (Tahoe), Apple Silicon -- CI only
+            ship: false
+            asset: macos26-arm64
+          - arch: amd64
+            runner: macos-26-intel    # macOS 26 (Tahoe), Intel -- CI only
+            ship: false
+            asset: macos26-amd64
     runs-on: ${{ matrix.runner }}
+    # The macOS 26 rows are coverage-only: never let them gate a release.
+    continue-on-error: ${{ !matrix.ship }}
     steps:
       - uses: actions/checkout@v7.0.0
         with:
@@ -527,32 +611,31 @@ jobs:
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
           # ships wheels for both arches. verify_uvloop.py confirms it imports and
-          # runs a loop, else uninstalls it so the binary falls back to asyncio
-          # (cronstable/__main__._new_event_loop).
+          # runs a loop, else uninstalls it so the binary falls back to asyncio.
           uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
           uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
-          # Bundle orjson (the `speedups` extra) to accelerate the durable-state
-          # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
-          # needed). The shared script round-trip-verifies it and drops a broken
-          # build, so the binary falls back to stdlib json (cronstable/_json).
+          # Bundle orjson (the `speedups` extra); macOS ships wheels (no Rust).
+          # The shared script round-trip-verifies it and drops a broken build, so
+          # the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Assert the binary is the intended native arch: Rosetta would happily
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
-          # silently shipping a mislabelled asset. `file` reports x86_64/arm64.
+          # silently producing a mislabelled asset. `file` reports x86_64/arm64.
           case "${{ matrix.arch }}" in
             amd64) want=x86_64 ;;
             arm64) want=arm64 ;;
           esac
           file dist/cronstable | grep -q "$want"
-      # Developer ID sign + notarize the binary in place. Guarded on the cert
-      # secret: if the macOS signing secrets are not configured, the step warns
-      # and exits 0, leaving the unsigned binary to ship as before. Renaming
-      # after signing is safe -- the notarization ticket is keyed to the code
-      # signature (cdhash), not the filename -- so this runs before the `mv`.
+      # Developer ID sign + notarize the SHIPPED binary in place, on a release
+      # only. Guarded on the cert secret too: if the signing secrets are not
+      # configured, the step warns and exits 0, shipping an unsigned binary.
+      # Renaming after signing is safe -- the notarization ticket is keyed to the
+      # code signature (cdhash), not the filename -- so this runs before the `mv`.
       - name: Sign and notarize
+        if: ${{ needs.decide.outputs.release == 'true' && matrix.ship }}
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -600,27 +683,22 @@ jobs:
             --issuer "$MACOS_NOTARY_ISSUER_ID" \
             --wait
       - name: Rename binary
-        run: mv dist/cronstable "dist/cronstable-macos-${{ matrix.arch }}"
+        run: mv dist/cronstable "dist/cronstable-${{ matrix.asset }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: cronstable-macos-${{ matrix.arch }}
-          path: dist/cronstable-macos-${{ matrix.arch }}
+          name: cronstable-${{ matrix.asset }}
+          path: dist/cronstable-${{ matrix.asset }}
           if-no-files-found: error
+          retention-days: 7
 
-  # Build the self-contained Windows binaries: amd64 on the hosted runner,
-  # arm64 on the windows-11-arm runner. Same pyinstaller pin and `--version`
-  # smoke test as the Linux/macOS jobs; the assets are cronstable-windows-<arch>.exe.
-  # Any C-extension dep lacking a win_arm64 wheel (parts of the aiohttp stack and
-  # ruamel.yaml.clib) compiles from sdist via the runner's Visual Studio ARM64
-  # toolchain -- the same sdist fallback the QEMU Linux legs use for
-  # riscv64/armv6. There is no Windows code-signing step (the binaries ship
-  # unsigned, like the Linux binaries). A failing arch fails this job before the
-  # publish, so the release simply doesn't happen (no tag is cut) rather than
-  # half-completing. Steps use bash (git bash ships on the Windows runners) so
-  # they read like the other jobs.
+  # Self-contained Windows binaries: amd64 on the hosted runner, arm64 on the
+  # windows-11-arm runner. Any C-extension dep lacking a win_arm64 wheel (parts
+  # of the aiohttp stack, ruamel.yaml.clib) compiles from sdist via the runner's
+  # Visual Studio ARM64 toolchain. Same pyinstaller pin + `--version` smoke test;
+  # the assets are cronstable-windows-<arch>.exe. Steps use bash (git bash ships
+  # on the Windows runners).
   binaries-windows:
-    needs: [decide, version]
-    if: needs.decide.outputs.release == 'true'
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -667,9 +745,88 @@ jobs:
           name: cronstable-windows-${{ matrix.arch }}
           path: dist/cronstable-windows-${{ matrix.arch }}.exe
           if-no-files-found: error
+          retention-days: 7
+
+  # Build EVERY container image (8 distros, full published arch set) build-only,
+  # no push -- the Docker half of the gate. Proves every Dockerfile still builds
+  # for every arch on every commit; `docker-push` re-runs these with a push once
+  # the whole gate passes. Uniform across PRs and releases (no secrets, no
+  # login), so a fork PR exercises it too.
+  docker:
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # one distro failing must not cancel the others
+      matrix:
+        include:
+          - distro: debian
+            dockerfile: Dockerfile
+            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+          - distro: alpine
+            dockerfile: docker/Dockerfile.alpine
+            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+          - distro: ubuntu
+            dockerfile: docker/Dockerfile.ubuntu
+            platforms: "linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+          - distro: rhel
+            dockerfile: docker/Dockerfile.rhel
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+          - distro: fedora
+            dockerfile: docker/Dockerfile.fedora
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+          - distro: opensuse
+            dockerfile: docker/Dockerfile.opensuse
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+          - distro: amazonlinux
+            dockerfile: docker/Dockerfile.amazonlinux
+            platforms: "linux/amd64,linux/arm64"
+          # distroless is amd64/arm64 only: gcr.io/distroless/python3-debian12
+          # publishes no ppc64le/s390x manifest, so requesting them aborts.
+          - distro: distroless
+            dockerfile: docker/Dockerfile.distroless
+            platforms: "linux/amd64,linux/arm64"
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0  # full history so setuptools_scm can resolve a version
+      - uses: docker/setup-qemu-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.2.0
+      - name: Build image (build-only gate)
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: false
+          tags: cronstable:ci-${{ matrix.distro }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.new }}
+          provenance: false
+          # Scope the GHA cache per distro so the builds don't clobber each
+          # other's layers (and warm the cache for the release `docker-push`).
+          cache-from: type=gha,scope=${{ matrix.distro }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.distro }}
+
+  # ---------------------------------------------------------------------------
+  # Publish. Runs ONLY on a release, and ONLY after every gate job above has
+  # succeeded. Skip-propagation makes docker-push/homebrew skip automatically
+  # when `release` is skipped on an ordinary commit (do NOT add always()).
+  # ---------------------------------------------------------------------------
 
   release:
-    needs: [decide, version, gate, binaries, binaries-macos, binaries-windows]
+    needs:
+      - decide
+      - version
+      - tox
+      - tox-lint
+      - tox-mypy
+      - dist
+      - binaries
+      - binaries-musl
+      - binaries-glibc-extra
+      - binaries-macos
+      - binaries-windows
+      - docker
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -680,21 +837,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v6.3.0
+      # The wheel + sdist built (and twine-checked) by `dist`: publish these
+      # exact bytes rather than rebuilding.
+      - name: Download distributions
+        uses: actions/download-artifact@v8.0.1
         with:
-          python-version: '3.14'
-
-      - uses: astral-sh/setup-uv@v8.3.0
-        with:
-          version: "0.11.26"
-
-      - name: Build distributions
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
-        run: |
-          set -euo pipefail
-          uv build                                      # wheel + sdist into dist/
-          uvx twine check dist/*.whl dist/*.tar.gz       # twine, run ephemerally
+          name: dist
+          path: dist
 
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@v1.14.0
@@ -721,13 +870,12 @@ jobs:
           # .github/workflows/ unless the token carries the `workflows` scope --
           # which is NOT grantable to GITHUB_TOKEN. This release tag points at a
           # commit that may itself modify this workflow, so pushing it with
-          # GITHUB_TOKEN is rejected ("refusing to allow a GitHub App to create or
-          # update workflow ... without workflows permission"). Push instead with
-          # RELEASE_TOKEN -- a PAT or GitHub App token with `workflow` scope
-          # (fine-grained: Contents + Workflows: write) -- exactly like the
-          # cross-repo Homebrew push uses HOMEBREW_TAP_TOKEN. If it is unset we
-          # fall back to GITHUB_TOKEN with a warning (works only when the tagged
-          # commit doesn't touch .github/workflows/).
+          # GITHUB_TOKEN is rejected. Push instead with RELEASE_TOKEN -- a PAT or
+          # GitHub App token with `workflow` scope (fine-grained: Contents +
+          # Workflows: write) -- exactly like the cross-repo Homebrew push uses
+          # HOMEBREW_TAP_TOKEN. If it is unset we fall back to GITHUB_TOKEN with a
+          # warning (works only when the tagged commit doesn't touch
+          # .github/workflows/).
           if [ -n "${RELEASE_TOKEN:-}" ]; then
             git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$NEW"
           else
@@ -735,14 +883,10 @@ jobs:
             git push origin "refs/tags/$NEW"
           fi
 
-      # This job attaches only the fast native binaries (Linux glibc amd64/arm64,
-      # macOS, Windows); the musl/i686/emulated arches are attached later by
-      # attach-binaries. The pattern is broad and merges whatever artifacts have
-      # been uploaded so far, but only the six fast assets are hashed + attached
-      # below (see the explicit lists), so any slow-arch artifact that happens to
-      # be ready is downloaded here yet ignored. The six fast ones are guaranteed
-      # present -- `release` needs their jobs. (A broad pattern never errors on
-      # artifacts it misses; it just skips them.)
+      # Pull in every per-arch binary the gate built (fast + slow). The pattern
+      # is broad and flattens them into ./binaries; the CI-only macOS 26 assets
+      # (cronstable-macos26-*) land here too but are neither hashed nor attached
+      # below (the lists are explicit).
       - name: Download release binaries
         uses: actions/download-artifact@v8.0.1
         with:
@@ -750,26 +894,28 @@ jobs:
           pattern: cronstable-*
           merge-multiple: true
 
-      # Publish a SHA256SUMS.fast manifest (fast native binaries only) so the
-      # Homebrew formula can pin an exact digest per binary before the slow
-      # arches finish. Hash with bare filenames (no path prefix) so it verifies
-      # cleanly against assets downloaded into any directory. This is
-      # deliberately NOT named `SHA256SUMS` -- GitHub's immutable-release
-      # protection forbids ever deleting/replacing an asset's bytes once
-      # published, so the canonical `SHA256SUMS` covering every binary is
-      # created exactly once, later, by attach-binaries; if `release` claimed
-      # that name first, attach-binaries could never publish the complete one.
-      - name: Generate SHA256SUMS.fast
+      # One SHA256SUMS over the dist + every SHIPPED binary (bare filenames, so
+      # `sha256sum -c` works from any directory). Enumerated explicitly -- a
+      # `cronstable-*` glob would fold the CI-only macOS 26 binaries into the
+      # shipped manifest.
+      - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
           cp dist/*.whl dist/*.tar.gz \
              binaries/cronstable-linux-amd64 binaries/cronstable-linux-arm64 \
+             binaries/cronstable-linux-i686 binaries/cronstable-linux-armv7 \
+             binaries/cronstable-linux-ppc64le binaries/cronstable-linux-s390x \
+             binaries/cronstable-linux-riscv64 \
+             binaries/cronstable-linux-amd64-musl binaries/cronstable-linux-arm64-musl \
+             binaries/cronstable-linux-i686-musl binaries/cronstable-linux-armv7-musl \
+             binaries/cronstable-linux-ppc64le-musl binaries/cronstable-linux-s390x-musl \
+             binaries/cronstable-linux-riscv64-musl binaries/cronstable-linux-armv6-musl \
              binaries/cronstable-macos-amd64 binaries/cronstable-macos-arm64 \
              binaries/cronstable-windows-amd64.exe binaries/cronstable-windows-arm64.exe \
              "$work"/
-          ( cd "$work" && sha256sum -- * ) > SHA256SUMS.fast
-          cat SHA256SUMS.fast
+          ( cd "$work" && sha256sum -- * ) > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Build release notes from HISTORY.md
         env:
@@ -780,11 +926,8 @@ jobs:
           # own "## X.Y.Z" header and the next "## " header), dropping leading
           # blank lines. The header is matched on whitespace-split fields
           # ($1 == "##", $2 == the exact version) so it hits whether the heading
-          # is still bare ("## 1.2.9") or already dated ("## 1.2.9 (2026-07-07)")
-          # -- at release time the newest entry is the undated form, so a
-          # trailing-space/substring match would silently miss it. The exact $2
-          # match also keeps releasing 1.2.1 from swallowing 1.2.10's section.
-          # Empty if there is no matching section.
+          # is still bare ("## 1.2.9") or already dated ("## 1.2.9 (2026-07-07)").
+          # The exact $2 match also keeps 1.2.1 from swallowing 1.2.10's section.
           awk -v ver="$NEW" '
             $1 == "##" && $2 == ver { cap = 1; next }
             cap && /^## / { exit }
@@ -806,145 +949,176 @@ jobs:
           # "What's Changed" / Full Changelog compare link.
           body_path: release-notes.md
           generate_release_notes: true
-          # Only the fast native binaries are attached here; attach-binaries adds
-          # the musl/i686/emulated arches to this same Release after the publish,
-          # along with the canonical `SHA256SUMS` covering everything.
+          # Every shipped binary + the single SHA256SUMS, attached in one shot
+          # (no later attach step, so nothing ever fights immutable-release
+          # protection).
           files: |
-            SHA256SUMS.fast
+            SHA256SUMS
             dist/*.whl
             dist/*.tar.gz
             binaries/cronstable-linux-amd64
             binaries/cronstable-linux-arm64
+            binaries/cronstable-linux-i686
+            binaries/cronstable-linux-armv7
+            binaries/cronstable-linux-ppc64le
+            binaries/cronstable-linux-s390x
+            binaries/cronstable-linux-riscv64
+            binaries/cronstable-linux-amd64-musl
+            binaries/cronstable-linux-arm64-musl
+            binaries/cronstable-linux-i686-musl
+            binaries/cronstable-linux-armv7-musl
+            binaries/cronstable-linux-ppc64le-musl
+            binaries/cronstable-linux-s390x-musl
+            binaries/cronstable-linux-riscv64-musl
+            binaries/cronstable-linux-armv6-musl
             binaries/cronstable-macos-amd64
             binaries/cronstable-macos-arm64
             binaries/cronstable-windows-amd64.exe
             binaries/cronstable-windows-arm64.exe
 
-  # Attach the remaining self-contained binaries to the Release the `release` job
-  # already published: every musl arch, the glibc i686 build, and the QEMU-
-  # emulated glibc/musl arches (armv7, armv6, ppc64le, s390x, riscv64). These are
-  # deliberately NOT in `release`'s needs, so a slow or flaky emulated arch can
-  # never hold up the PyPI publish or the macOS/Windows/glibc-amd64/arm64 assets
-  # Homebrew depends on. Runs whenever the release succeeded (`always()` + a
-  # release==success guard, so it also runs when a slow binary job failed) and
-  # uploads only the arches that actually built -- a failed leg just drops its own
-  # asset and can be re-run later to add it, no PyPI version burned. The
-  # canonical SHA256SUMS manifest (dist + every binary now present) is generated
-  # here for the first and only time -- GitHub immutable releases forbid ever
-  # deleting/replacing an asset's bytes, so nothing below ever passes --clobber;
-  # instead it reads the Release's current asset names and uploads only what
-  # isn't already there. That also makes a re-run (e.g. after fixing one failed
-  # slow leg) safe: everything already attached is skipped rather than re-erroring.
-  attach-binaries:
-    needs: [decide, version, release, binaries-musl, binaries-glibc-extra]
-    if: ${{ always() && needs.release.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # upload assets to the existing Release
-    env:
-      GH_TOKEN: ${{ github.token }}
-      # This job has no `actions/checkout` step, so `gh` cannot infer the repo
-      # from a git remote (it shells out to git and dies with "not a git
-      # repository"). Point `gh release download/upload` at the repo explicitly.
-      GH_REPO: ${{ github.repository }}
-      NEW: ${{ needs.version.outputs.new }}
-    steps:
-      # Pull down every per-arch binary that built (fast + slow). A too-narrow
-      # pattern silently drops artifacts, so match all and select by name below.
-      - name: Download all binaries
-        uses: actions/download-artifact@v8.0.1
-        with:
-          path: binaries
-          pattern: cronstable-*
-          merge-multiple: true
-      - name: Attach binaries and publish SHA256SUMS
-        run: |
-          set -euo pipefail
-          # The wheel + sdist are Release assets (not CI artifacts); fetch them so
-          # the manifest covers them too, exactly like `release` did for the fast set.
-          gh release download "$NEW" --dir dist --pattern '*.whl' --pattern '*.tar.gz'
-
-          # Build the full manifest over dist + every binary now present (bare
-          # filenames, so `sha256sum -c` works from any directory).
-          work="$(mktemp -d)"
-          cp dist/*.whl dist/*.tar.gz binaries/cronstable-* "$work"/
-          ( cd "$work" && sha256sum -- * ) > SHA256SUMS
-          cat SHA256SUMS
-
-          # Immutable releases never let an asset's bytes be deleted or replaced,
-          # so this never passes --clobber. Instead, read what's already attached
-          # and upload only the names that aren't -- making both a normal first
-          # pass and a later re-run (e.g. after fixing one previously-failed slow
-          # leg) safe: anything already on the Release is left untouched rather
-          # than re-attempted.
-          existing="$(gh release view "$NEW" --json assets --jq '.assets[].name')"
-          asset_missing() { ! grep -qxF "$1" <<<"$existing"; }
-
-          assets=()
-          if asset_missing SHA256SUMS; then
-            assets+=(SHA256SUMS)
-          else
-            echo "::notice::SHA256SUMS is already attached to $NEW; leaving the existing manifest as-is."
-          fi
-          # A leg that failed to build is absent from ./binaries, so we warn and
-          # skip it rather than fail the upload -- re-run that leg later to add it.
-          for f in \
-            binaries/cronstable-linux-i686 \
-            binaries/cronstable-linux-armv7 \
-            binaries/cronstable-linux-ppc64le \
-            binaries/cronstable-linux-s390x \
-            binaries/cronstable-linux-riscv64 \
-            binaries/cronstable-linux-amd64-musl \
-            binaries/cronstable-linux-arm64-musl \
-            binaries/cronstable-linux-i686-musl \
-            binaries/cronstable-linux-armv7-musl \
-            binaries/cronstable-linux-ppc64le-musl \
-            binaries/cronstable-linux-s390x-musl \
-            binaries/cronstable-linux-riscv64-musl \
-            binaries/cronstable-linux-armv6-musl; do
-            name="${f##*/}"
-            if [ ! -e "$f" ]; then
-              echo "::warning::${name} did not build; not attaching it (re-run its leg to add it later)."
-            elif asset_missing "$name"; then
-              assets+=("$f")
-            else
-              echo "::notice::${name} is already attached to $NEW; skipping."
-            fi
-          done
-
-          if [ "${#assets[@]}" -eq 0 ]; then
-            echo "::notice::Nothing new to attach to $NEW."
-          else
-            gh release upload "$NEW" "${assets[@]}"
-          fi
-
-  # Build + push the multi-arch container image at the just-released version.
-  # Invoked here (workflow_call) rather than via `on: release` because a Release
-  # created by GITHUB_TOKEN does not emit a triggering `release: published`
-  # event. Runs after `release` so the tag it checks out already exists; the
-  # Dockerfile was already proven buildable by docker.yml's per-commit CI.
-  docker:
+  # Build + push the multi-arch container images at the just-released version.
+  # Runs after `release` (so the tag it checks out exists) and is thus gated on
+  # the whole build+test gate, including the `docker` build-only job, via
+  # `needs: release`. Pushes one image per distro to GHCR (and Docker Hub when
+  # the DOCKERHUB_* secrets are set); the Debian image owns the bare
+  # `latest`/`<version>` tags, the variants get `-<distro>` suffixes.
+  docker-push:
     needs: [decide, version, release]
     if: needs.decide.outputs.release == 'true'
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write   # push to GHCR
-    uses: ./.github/workflows/docker.yml
-    with:
-      version: ${{ needs.version.outputs.new }}
-    secrets: inherit
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            dockerfile: Dockerfile
+            suffix: ""
+            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+          - distro: alpine
+            dockerfile: docker/Dockerfile.alpine
+            suffix: "-alpine"
+            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+          - distro: ubuntu
+            dockerfile: docker/Dockerfile.ubuntu
+            suffix: "-ubuntu"
+            platforms: "linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+          - distro: rhel
+            dockerfile: docker/Dockerfile.rhel
+            suffix: "-rhel"
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+          - distro: fedora
+            dockerfile: docker/Dockerfile.fedora
+            suffix: "-fedora"
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+          - distro: opensuse
+            dockerfile: docker/Dockerfile.opensuse
+            suffix: "-opensuse"
+            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+          - distro: amazonlinux
+            dockerfile: docker/Dockerfile.amazonlinux
+            suffix: "-amazonlinux"
+            platforms: "linux/amd64,linux/arm64"
+          - distro: distroless
+            dockerfile: docker/Dockerfile.distroless
+            suffix: "-distroless"
+            platforms: "linux/amd64,linux/arm64"
+    steps:
+      - name: Resolve registries
+        id: registries
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          images="ghcr.io/${REPO,,}"   # GHCR image names must be lowercase
+          dockerhub=false
+          # Require BOTH secrets before enabling Docker Hub. Gating on the
+          # username alone would, in the half-configured case, still try the
+          # Docker Hub login -- which fails and aborts the whole job, taking the
+          # otherwise-safe GHCR push down with it. Demanding both degrades
+          # cleanly to GHCR-only.
+          if [ -n "${DOCKERHUB_USERNAME:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            images="${images}"$'\n'"docker.io/${DOCKERHUB_USERNAME}/cronstable"
+            dockerhub=true
+          fi
+          {
+            echo "dockerhub=$dockerhub"
+            echo "images<<EOF"
+            echo "$images"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ needs.version.outputs.new }}  # the tag `release` just pushed
+          fetch-depth: 0 # full history so setuptools_scm can resolve a version
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ steps.registries.outputs.images }}
+          # The distro suffix (e.g. `-alpine`) is appended to every tag; it is
+          # empty for Debian, which therefore owns the bare `latest`/`<version>`.
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
+          tags: |
+            type=raw,value=${{ needs.version.outputs.new }}
+            type=raw,value=latest
+            # Explicit -debian alias so the default base is pinnable by name too
+            # (latest-debian / <version>-debian), mirroring the other variants.
+            type=raw,value=${{ needs.version.outputs.new }}-debian,enable=${{ matrix.distro == 'debian' }}
+            type=raw,value=latest-debian,enable=${{ matrix.distro == 'debian' }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to Docker Hub
+        if: steps.registries.outputs.dockerhub == 'true'
+        uses: docker/login-action@v4.4.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v4.2.0
+      - uses: docker/setup-buildx-action@v4.2.0
+
+      - name: Build and push
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.new }}
+          provenance: false
+          # Reuse the layers the gate `docker` job just cached (same per-distro
+          # scope), so this is mostly manifest assembly + push.
+          cache-from: type=gha,scope=${{ matrix.distro }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.distro }}
 
   # Push the just-released version to the Homebrew tap (ptweezy/homebrew-tap) so
-  # `brew install ptweezy/tap/cronstable` and `brew upgrade` track releases with no
-  # manual step. Re-renders Formula/cronstable.rb from the template in this repo,
-  # pinning each binary's SHA256 from the SHA256SUMS.fast the `release` job
-  # published (it covers exactly the macOS + linux glibc amd64/arm64 sums this
-  # formula needs, and is available immediately -- no waiting on attach-binaries).
+  # `brew install ptweezy/tap/cronstable` and `brew upgrade` track releases with
+  # no manual step. Re-renders Formula/cronstable.rb from the template in this
+  # repo, pinning each binary's SHA256 from the SHA256SUMS the `release` job
+  # published (it covers the macOS + linux glibc amd64/arm64 sums this formula
+  # needs).
   #
   # Cross-repo pushes need a token the default GITHUB_TOKEN can't provide: set a
   # repo secret HOMEBREW_TAP_TOKEN to a PAT (fine-grained, Contents: read/write
-  # on ptweezy/homebrew-tap is enough). If it is unset the job warns and skips,
-  # exactly like the macOS signing step, so a release is never blocked on it.
+  # on ptweezy/homebrew-tap is enough). If it is unset the job warns and skips.
   homebrew:
     needs: [decide, version, release]
     if: needs.decide.outputs.release == 'true'
@@ -966,7 +1140,7 @@ jobs:
           # Fetch the checksums this release just published (retry: the asset can
           # lag the API by a few seconds after the release is created).
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o SHA256SUMS \
-            "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/SHA256SUMS.fast"
+            "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/SHA256SUMS"
 
           git clone --depth 1 \
             "https://x-access-token:${TAP_TOKEN}@github.com/ptweezy/homebrew-tap.git" tap

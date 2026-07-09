@@ -1,362 +1,486 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="carolina">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>cronstable vs. the field — cron scheduler feature comparison</title>
+<meta name="color-scheme" content="dark light">
+<title>cronstable // feature comparison vs cron-family schedulers and orchestrators</title>
 <style>
+  /* ============================================================= *
+   *  cronstable // feature comparison                             *
+   *  Same phosphor-CRT design language as the live dashboard.     *
+   * ============================================================= */
+
+  /* ---------- shared tokens (never change per theme) ---------- */
   :root{
-    --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", sans-serif;
-
-    /* light (default) — cronstable's own GitHub-style ops palette */
-    --bg:#eef1f5;
-    --surface:#ffffff;
-    --surface-2:#f6f8fa;
-    --surface-3:#eceff3;
-    --border:#d5dbe2;
-    --border-strong:#c0c8d1;
-    --text:#1b2028;
-    --text-muted:#586372;
-    --text-faint:#8b95a2;
-    --accent:#0969da;
-    --accent-strong:#0a58ca;
-    --accent-tint:rgba(9,105,218,.07);
-    --accent-band:rgba(9,105,218,.05);--glow:rgba(9,105,218,.30);
-    --brass:#9a6700;
-    --brass-strong:#8a5b00;
-    --brass-tint:rgba(154,103,0,.10);
-    --yes:#1a7f37;
-    --yes-tint:rgba(26,127,55,.10);
-    --partial:#9a6700;
-    --no:#b0b8c1;
-    --shadow:0 1px 2px rgba(16,24,40,.06), 0 8px 28px rgba(16,24,40,.06);
-    --shadow-lift:0 2px 6px rgba(16,24,40,.08), 0 18px 46px rgba(16,24,40,.12);
-  }
-  @media (prefers-color-scheme: dark){
-    :root{
-      --bg:#0a0e14;
-      --surface:#12181f;
-      --surface-2:#0f151c;
-      --surface-3:#161d26;
-      --border:#262f3a;
-      --border-strong:#39434f;
-      --text:#e6edf3;
-      --text-muted:#9aa5b1;
-      --text-faint:#616d7a;
-      --accent:#4c8dff;
-      --accent-strong:#79aaff;
-      --accent-tint:rgba(76,141,255,.13);
-      --accent-band:rgba(76,141,255,.07);--glow:rgba(76,141,255,.5);
-      --brass:#e3b341;
-      --brass-strong:#f0c65a;
-      --brass-tint:rgba(227,179,65,.13);
-      --yes:#3fb950;
-      --yes-tint:rgba(63,185,80,.12);
-      --partial:#e3b341;
-      --no:#48525e;
-      --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.4);
-      --shadow-lift:0 2px 6px rgba(0,0,0,.5), 0 22px 54px rgba(0,0,0,.55);
-    }
-  }
-  :root[data-theme="dark"]{
-    --bg:#0a0e14;--surface:#12181f;--surface-2:#0f151c;--surface-3:#161d26;
-    --border:#262f3a;--border-strong:#39434f;--text:#e6edf3;--text-muted:#9aa5b1;--text-faint:#616d7a;
-    --accent:#4c8dff;--accent-strong:#79aaff;--accent-tint:rgba(76,141,255,.13);--accent-band:rgba(76,141,255,.07);--glow:rgba(76,141,255,.5);
-    --brass:#e3b341;--brass-strong:#f0c65a;--brass-tint:rgba(227,179,65,.13);
-    --yes:#3fb950;--yes-tint:rgba(63,185,80,.12);--partial:#e3b341;--no:#48525e;
-    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.4);
-    --shadow-lift:0 2px 6px rgba(0,0,0,.5), 0 22px 54px rgba(0,0,0,.55);
-  }
-  :root[data-theme="light"]{
-    --bg:#eef1f5;--surface:#ffffff;--surface-2:#f6f8fa;--surface-3:#eceff3;
-    --border:#d5dbe2;--border-strong:#c0c8d1;--text:#1b2028;--text-muted:#586372;--text-faint:#8b95a2;
-    --accent:#0969da;--accent-strong:#0a58ca;--accent-tint:rgba(9,105,218,.07);--accent-band:rgba(9,105,218,.05);--glow:rgba(9,105,218,.30);
-    --brass:#9a6700;--brass-strong:#8a5b00;--brass-tint:rgba(154,103,0,.10);
-    --yes:#1a7f37;--yes-tint:rgba(26,127,55,.10);--partial:#9a6700;--no:#b0b8c1;
-    --shadow:0 1px 2px rgba(16,24,40,.06), 0 8px 28px rgba(16,24,40,.06);
-    --shadow-lift:0 2px 6px rgba(16,24,40,.08), 0 18px 46px rgba(16,24,40,.12);
+    color-scheme: dark;
+    --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code",
+            Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue",
+            Arial, "Noto Sans", sans-serif;
+    --ok:#3fd271; --fail:#ff5f56; --run:#4aa8ff; --pending:#ffbf47;
+    --disabled:#7d8590; --cancelled:#c98bff; --unknown:#9aa5b1;
+    --radius:3px;
+    --shadow-lg:0 10px 40px rgba(0,0,0,.7);
+    --maxw:1200px;
+    /* marketing accents mapped onto the phosphor palette */
+    --yes:var(--ok);
+    --partial:var(--pending);
+    --gold:var(--pending);
   }
 
+  /* ---------- dark phosphor themes ---------- */
+  html[data-theme="carolina"]{
+    --bg:#04070b;--bg2:#060c13;--panel:#081019;--panel2:#0b1620;--hover:#0f1e2b;
+    --border:#173347;--border2:#22506e;--fg:#5cabde;--fg-dim:#4b9cd3;--fg-faint:#5a90b0;
+    --accent:#b5ddf5;--glow:rgba(92,171,222,.5);--selbg:rgba(75,156,211,.12);
+  }
+  html[data-theme="amber"]{
+    --bg:#0a0806;--bg2:#0f0b07;--panel:#110c07;--panel2:#160f08;--hover:#1d1409;
+    --border:#3a2a12;--border2:#523c1a;--fg:#ffb000;--fg-dim:#c98a2c;--fg-faint:#a37a38;
+    --accent:#ffd98a;--glow:rgba(255,176,0,.55);--selbg:rgba(255,176,0,.12);
+  }
+  html[data-theme="green"]{
+    --bg:#020503;--bg2:#04100a;--panel:#05130c;--panel2:#07190f;--hover:#0a2014;
+    --border:#144028;--border2:#1d6038;--fg:#38ff7a;--fg-dim:#1fbf57;--fg-faint:#22a85c;
+    --accent:#b6ffce;--glow:rgba(56,255,122,.5);--selbg:rgba(56,255,122,.12);
+  }
+  html[data-theme="modern"]{
+    --bg:#0d1117;--bg2:#0f141b;--panel:#161b22;--panel2:#1b212b;--hover:#1d242e;
+    --border:#2a313c;--border2:#3a424f;--fg:#d6dee8;--fg-dim:#9aa4b2;--fg-faint:#8b95a3;
+    --accent:#79c0ff;--glow:rgba(121,192,255,0);--selbg:rgba(121,192,255,.12);
+  }
+  html[data-theme="standard"]{
+    --bg:#0f1114;--bg2:#14161a;--panel:#171b20;--panel2:#1c2126;--hover:#1f232a;
+    --border:#31383f;--border2:#48505a;--fg:#e6e9ed;--fg-dim:#a6aeb9;--fg-faint:#8f98a3;
+    --accent:#4c8dff;--glow:rgba(76,141,255,0);--selbg:rgba(76,141,255,.14);
+  }
+
+  /* ---------- paper (light) twins ---------- */
+  html[data-theme="carolina-light"]{
+    --bg:#e7f0f8;--bg2:#d7e6f3;--panel:#f3f8fc;--panel2:#dfecf6;--hover:#d0e2f0;
+    --border:#a8c9e2;--border2:#4b9cd3;--fg:#0e3a5c;--fg-dim:#175e91;--fg-faint:#3b688c;
+    --accent:#0d67ac;--glow:rgba(23,94,145,.25);--selbg:rgba(75,156,211,.18);
+  }
+  html[data-theme="amber-light"]{
+    --bg:#f3e9d2;--bg2:#eadcbc;--panel:#faf3e3;--panel2:#f0e5c9;--hover:#e7d8b4;
+    --border:#cdb582;--border2:#a98f52;--fg:#3f2d00;--fg-dim:#6d500b;--fg-faint:#755c20;
+    --accent:#855700;--glow:rgba(138,90,0,.28);--selbg:rgba(179,125,0,.16);
+  }
+  html[data-theme="green-light"]{
+    --bg:#e4f2e6;--bg2:#d4e8d8;--panel:#f2faf2;--panel2:#ddefe0;--hover:#cfe6d4;
+    --border:#a9cdb2;--border2:#7fb28c;--fg:#0b3a1e;--fg-dim:#1a6238;--fg-faint:#3a7050;
+    --accent:#0d7034;--glow:rgba(18,105,55,.25);--selbg:rgba(24,128,68,.15);
+  }
+  html[data-theme="modern-light"]{
+    --bg:#f6f8fa;--bg2:#eaeef2;--panel:#ffffff;--panel2:#f6f8fa;--hover:#eff2f5;
+    --border:#d0d7de;--border2:#a8b3bd;--fg:#1f2328;--fg-dim:#57606a;--fg-faint:#656e79;
+    --accent:#0969da;--glow:rgba(9,105,218,0);--selbg:rgba(9,105,218,.12);
+  }
+  html[data-theme="standard-light"]{
+    --bg:#ffffff;--bg2:#f2f4f7;--panel:#ffffff;--panel2:#f7f8fa;--hover:#eceff3;
+    --border:#d9dee5;--border2:#aab3bf;--fg:#14181d;--fg-dim:#4b5563;--fg-faint:#5d6675;
+    --accent:#0b5ed7;--glow:rgba(11,94,215,0);--selbg:rgba(11,94,215,.12);
+  }
+  /* every paper theme: flip scheme, soften shadow, re-ink status darker */
+  html[data-theme$="-light"]{
+    color-scheme:light;
+    --shadow-lg:0 10px 40px rgba(0,0,0,.18);
+    --ok:#12692b;--fail:#b32d23;--run:#0757b8;--pending:#7d5300;
+    --disabled:#565e68;--cancelled:#7a3fd6;--unknown:#57606a;
+  }
+  html[data-theme="standard-light"]{
+    --ok:#107a33;--fail:#d31f1f;--run:#0b5ed7;--pending:#b45309;--cancelled:#7c3aed;
+  }
+
+  /* ---------- base ---------- */
   *{box-sizing:border-box}
-  body{margin:0}
-  .page{
-    font-family:var(--sans);
-    background:
-      radial-gradient(1200px 420px at 82% -8%, var(--accent-tint), transparent 60%),
-      var(--bg);
-    color:var(--text);
-    line-height:1.5;
-    -webkit-font-smoothing:antialiased;
-    padding:clamp(18px,4vw,56px) clamp(14px,4vw,44px) 72px;
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font-family:var(--mono);font-size:13px;line-height:1.5;letter-spacing:.2px;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
   }
-  .wrap{max-width:1200px;margin:0 auto}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  ::selection{background:var(--accent);color:var(--bg)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius)}
+  /* prose runs in the interface sans, like the dashboard's reader mode */
+  .lede,.sec-head p,.mcp-top p,.quad li,.tk p,footer p,.cta-note{font-family:var(--sans);letter-spacing:0}
+
+  /* ---------- CRT overlay ---------- */
+  #crt{position:fixed;inset:0;pointer-events:none;z-index:9000}
+  body.scan #crt::before{
+    content:"";position:absolute;inset:0;mix-blend-mode:multiply;
+    background:repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0,rgba(0,0,0,0) 1px,rgba(0,0,0,.16) 1px,rgba(0,0,0,.16) 3px);
+  }
+  body.fx #crt::after{
+    content:"";position:absolute;inset:0;
+    background:radial-gradient(ellipse at center,rgba(0,0,0,0) 55%,rgba(0,0,0,.42) 100%);
+  }
+  body.fx.flicker #crt{animation:flicker 3.2s infinite steps(60)}
+  @keyframes flicker{0%,97%,100%{opacity:1}97.5%{opacity:.85}98%{opacity:1}98.5%{opacity:.92}}
+  html[data-theme$="-light"] body.scan #crt::before{
+    background:repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0,rgba(0,0,0,0) 1px,rgba(0,0,0,.05) 1px,rgba(0,0,0,.05) 3px);
+  }
+  html[data-theme$="-light"] body.fx #crt::after{
+    background:radial-gradient(ellipse at center,rgba(0,0,0,0) 55%,rgba(0,0,0,.12) 100%);
+  }
+  body.fx .glow,body.fx h1,body.fx h2,body.fx .mark,body.fx .snip{text-shadow:0 0 6px var(--glow)}
+
+  /* ---------- product top bar (mirrors the dashboard chrome) ---------- */
+  .topbar{
+    position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    padding:8px clamp(12px,4vw,22px);border-bottom:1px solid var(--border);
+    background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(6px);
+    font-family:var(--mono);font-size:12px;color:var(--fg-dim);
+  }
+  .topbar .brand{display:flex;align-items:baseline;gap:8px;white-space:nowrap}
+  .topbar .brand .mark{color:var(--fg);font-weight:700;display:inline-block;transform-origin:50% 50%}
+  .topbar .brand b{color:var(--fg);font-weight:700;letter-spacing:.4px}
+  .topbar .brand .slash{color:var(--fg-faint)}
+  .topbar .grow{flex:1 1 40px}
+  .topbar .clock{font-variant-numeric:tabular-nums;color:var(--fg-faint)}
+  .topbar .tb-hide{display:inline-flex}
+  @media(max-width:720px){.topbar .tb-hide{display:none}}
+  .topbar select{
+    font-family:var(--mono);font-size:11.5px;color:var(--fg-dim);
+    background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+    padding:3px 6px;cursor:pointer;
+  }
+  .topbar select:hover{border-color:var(--border2)}
+
+  /* ---------- shared atoms ---------- */
+  .pill{
+    display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:var(--radius);
+    background:var(--panel);border:1px solid var(--border);font-family:var(--mono);
+    font-size:11.5px;color:var(--fg-dim);white-space:nowrap;font-variant-numeric:tabular-nums;
+  }
+  .pill b{color:var(--fg);font-weight:700}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none;background:var(--fg-faint)}
+  .dot.ok{background:var(--ok)} .dot.fail{background:var(--fail)}
+  .dot.run{background:var(--run)} .dot.pending{background:var(--pending)}
+  .dot.live{background:#5cff97;color:var(--ok);filter:drop-shadow(0 0 4px rgba(92,255,151,.9));
+    box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}
+  @keyframes pulse{
+    0%{box-shadow:0 0 0 0 color-mix(in srgb,currentColor 55%,transparent)}
+    70%{box-shadow:0 0 0 5px transparent}100%{box-shadow:0 0 0 0 transparent}
+  }
+  .btn{
+    display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:var(--radius);
+    font-family:var(--mono);font-size:12px;font-weight:600;border:1px solid var(--border);
+    background:var(--panel2);color:var(--fg);cursor:pointer;transition:all .12s ease;white-space:nowrap;
+  }
+  .btn:hover{background:var(--hover);border-color:var(--border2);text-decoration:none}
+  .btn.primary{background:var(--selbg);border-color:var(--border2);color:var(--fg)}
+  .btn.primary:hover{background:color-mix(in srgb,var(--accent) 18%,var(--selbg))}
+  .btn.lg{font-size:13.5px;padding:9px 16px}
+
+  /* ---------- page shell ---------- */
+  .page{
+    background:radial-gradient(1200px 480px at 84% -10%,color-mix(in srgb,var(--accent) 8%,transparent),transparent 60%);
+    padding:clamp(20px,4vw,52px) clamp(14px,4vw,22px) 72px;
+  }
+  .wrap{max-width:var(--maxw);margin:0 auto}
 
   /* ---------- hero ---------- */
   .eyebrow{
-    font-family:var(--mono);
-    font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;
-    color:var(--text-muted);
-    display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;
-    margin:0 0 22px;
+    font-family:var(--mono);font-size:11px;letter-spacing:1.4px;text-transform:uppercase;
+    color:var(--fg-faint);display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:0 0 22px;
   }
-  .eyebrow .dot{width:5px;height:5px;border-radius:50%;background:var(--accent);display:inline-block}
+  .eyebrow .dot{background:var(--fg-dim)}
   .wordmark{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:14px}
-  /* the real cronstable brand mark: the ▚ glyph, ink-coloured with a themed glow,
-     spinning the way it does in the live dashboard (which cruises it at 345deg/s) */
   .wordmark .mark{
-    font-family:var(--mono);font-weight:700;color:var(--text);
-    font-size:32px;line-height:1;flex:0 0 auto;align-self:center;
-    display:inline-block;transform-origin:50% 50%;
-    text-shadow:0 0 10px var(--glow);
-    animation:markspin 2.6s linear infinite;
+    font-family:var(--mono);font-weight:700;color:var(--fg);font-size:34px;line-height:1;
+    flex:0 0 auto;align-self:center;display:inline-block;transform-origin:50% 50%;cursor:pointer;
     -webkit-user-select:none;user-select:none;
   }
-  .wordmark .mark:hover{animation-duration:1.04s}
-  @keyframes markspin{to{transform:rotate(360deg)}}
-  .wordmark .name{font-family:var(--mono);font-weight:680;font-size:clamp(22px,3.2vw,30px);letter-spacing:-.01em}
-  .wordmark .say{font-family:var(--mono);color:var(--text-faint);font-size:13px}
-
+  .wordmark .name{font-family:var(--mono);font-weight:700;font-size:clamp(22px,3.2vw,30px);letter-spacing:.5px;color:var(--fg)}
+  .wordmark .say{font-family:var(--mono);color:var(--fg-faint);font-size:13px}
   h1{
-    font-family:var(--mono);
-    font-weight:680;
-    font-size:clamp(27px,4.9vw,50px);
-    line-height:1.04;
-    letter-spacing:-.02em;
-    text-wrap:balance;
-    margin:.15em 0 0;
-    max-width:16ch;
+    font-family:var(--mono);font-weight:700;font-size:clamp(26px,4.7vw,48px);line-height:1.06;
+    letter-spacing:-.01em;text-wrap:balance;margin:.15em 0 0;max-width:17ch;color:var(--fg);
   }
   h1 .hl{color:var(--accent)}
-  h1 .hl-b{
-    color:var(--brass);
-    box-shadow:inset 0 -.16em 0 var(--brass-tint);
-  }
-  .lede{
-    font-size:clamp(15px,1.7vw,18px);
-    color:var(--text-muted);
-    max-width:64ch;
-    margin:22px 0 0;
-    text-wrap:pretty;
-  }
-  .lede strong{color:var(--text);font-weight:620}
+  h1 .hl-b{color:var(--gold);box-shadow:inset 0 -.16em 0 color-mix(in srgb,var(--gold) 22%,transparent)}
+  .lede{font-size:clamp(14px,1.6vw,17px);color:var(--fg-dim);max-width:66ch;margin:22px 0 0;text-wrap:pretty;line-height:1.6}
+  .lede strong{color:var(--fg);font-weight:700}
 
-  .chips{display:flex;flex-wrap:wrap;gap:10px;margin:28px 0 0}
+  .chips{display:flex;flex-wrap:wrap;gap:9px;margin:26px 0 0}
   .chip{
-    display:inline-flex;align-items:center;gap:9px;
-    background:var(--surface);border:1px solid var(--border);
-    border-radius:999px;padding:8px 14px 8px 11px;
-    box-shadow:var(--shadow);
+    display:inline-flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);
+    border-radius:var(--radius);padding:6px 12px 6px 10px;font-family:var(--mono);
   }
-  .chip b{font-family:var(--mono);font-size:15px;font-variant-numeric:tabular-nums;letter-spacing:-.01em;color:var(--text)}
-  .chip span{font-size:12px;color:var(--text-muted)}
-  .chip .cd{width:7px;height:7px;border-radius:50%;background:var(--accent)}
-  .chip.brass .cd{background:var(--brass)}
-  .chip.green .cd{background:var(--yes)}
+  .chip b{font-size:14px;font-variant-numeric:tabular-nums;color:var(--fg)}
+  .chip span{font-size:11.5px;color:var(--fg-faint);font-family:var(--sans);letter-spacing:0}
+  .chip .cd{width:7px;height:7px;border-radius:50%;background:var(--fg-dim)}
+  .chip.brass .cd{background:var(--gold)}
+  .chip.green .cd{background:var(--ok)}
+
+  .cta-row{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin:30px 0 0}
+  .cta-note{font-size:12.5px;color:var(--fg-faint)}
+  .cta-note .k{color:var(--fg-dim)}
 
   /* ---------- section framing ---------- */
-  .sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:60px 0 16px}
-  .sec-head h2{
-    font-family:var(--mono);font-weight:640;font-size:clamp(16px,2vw,20px);letter-spacing:-.01em;margin:0;
-  }
-  .sec-head p{margin:4px 0 0;color:var(--text-muted);font-size:13.5px;max-width:64ch}
-  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--text-muted);font-family:var(--mono)}
+  .sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:58px 0 14px}
+  .sec-head h2{font-family:var(--mono);font-weight:700;font-size:clamp(15px,2vw,19px);letter-spacing:.3px;margin:0;color:var(--fg);
+    display:flex;align-items:center;gap:9px}
+  .sec-head h2::before{content:"\250C\2500";color:var(--fg-faint);font-weight:400}
+  .sec-head p{margin:6px 0 0;color:var(--fg-faint);font-size:13px;max-width:66ch;line-height:1.55}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--fg-faint);font-family:var(--mono)}
   .legend .lk{display:inline-flex;align-items:center;gap:6px}
 
   /* ---------- matrix ---------- */
-  .matrix-card{
-    background:var(--surface);
-    border:1px solid var(--border);
-    border-radius:16px;
-    box-shadow:var(--shadow-lift);
-    overflow:hidden;
-  }
+  .matrix-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-lg);overflow:hidden}
   .matrix-scroll{overflow-x:auto;overflow-y:visible}
-  table.matrix{border-collapse:separate;border-spacing:0;width:100%;min-width:1060px}
+  table.matrix{border-collapse:separate;border-spacing:0;width:100%;min-width:1060px;font-family:var(--mono)}
   table.matrix th,table.matrix td{text-align:center;vertical-align:middle}
 
   thead th{
-    position:sticky;top:0;z-index:3;
-    background:var(--surface-2);
-    border-bottom:1px solid var(--border-strong);
-    padding:14px 10px 12px;
+    position:sticky;top:0;z-index:3;background:var(--panel2);
+    border-bottom:1px solid var(--border2);padding:13px 10px 12px;
   }
-  thead th.feat{z-index:5;text-align:left;padding-left:20px}
+  thead th.feat{z-index:5;text-align:left;padding-left:18px}
   th.feat,td.feat{
-    position:sticky;left:0;z-index:2;background:var(--surface);
-    text-align:left;min-width:214px;width:214px;
-    border-right:1px solid var(--border);
+    position:sticky;left:0;z-index:2;background:var(--panel);text-align:left;
+    min-width:214px;width:214px;border-right:1px solid var(--border);
   }
-  thead th.feat{background:var(--surface-2)}
+  thead th.feat{background:var(--panel2)}
+  .th-name{font-size:12.5px;font-weight:700;color:var(--fg);white-space:nowrap;letter-spacing:.2px}
+  .th-sub{font-size:10px;color:var(--fg-faint);margin-top:3px;white-space:nowrap;text-transform:uppercase;letter-spacing:.6px}
+  .meter{height:4px;border-radius:2px;background:var(--bg2);margin:9px auto 0;width:74px;overflow:hidden;border:1px solid var(--border)}
+  .meter i{display:block;height:100%;background:var(--fg-faint)}
+  .th-count{font-size:10px;color:var(--fg-faint);margin-top:6px;font-variant-numeric:tabular-nums;text-transform:uppercase;letter-spacing:.6px}
 
-  .th-name{font-family:var(--mono);font-size:13px;font-weight:640;color:var(--text);white-space:nowrap;letter-spacing:-.01em}
-  .th-sub{font-size:10.5px;color:var(--text-faint);margin-top:2px;white-space:nowrap}
-  .meter{height:4px;border-radius:3px;background:var(--surface-3);margin:9px auto 0;width:74px;overflow:hidden}
-  .meter i{display:block;height:100%;background:var(--text-faint);border-radius:3px}
-  .th-count{font-family:var(--mono);font-size:10.5px;color:var(--text-muted);margin-top:6px;font-variant-numeric:tabular-nums}
-
-  /* cronstable column */
-  col.cs-col{background:var(--accent-band)}
-  th.cs,td.cs{background:var(--accent-band);border-left:1.5px solid var(--accent);border-right:1.5px solid var(--accent)}
-  thead th.cs{
-    background:linear-gradient(180deg,var(--accent-tint),var(--accent-band));
-    border-top:2px solid var(--accent);
-  }
-  thead th.cs .th-name{color:var(--accent-strong)}
-  thead th.cs .meter i{background:var(--accent)}
+  /* cronstable column: accent-highlighted, like the "self" node on the board */
+  col.cs-col{background:color-mix(in srgb,var(--fg-dim) 7%,transparent)}
+  th.cs,td.cs{background:color-mix(in srgb,var(--fg-dim) 7%,transparent);
+    border-left:1.5px solid var(--fg-dim);border-right:1.5px solid var(--fg-dim)}
+  thead th.cs{background:color-mix(in srgb,var(--fg-dim) 14%,var(--panel2));border-top:2px solid var(--fg-dim)}
+  thead th.cs .th-name{color:var(--accent)}
+  thead th.cs .meter i{background:var(--fg-dim)}
   .th-tag{
-    display:inline-block;font-family:var(--mono);font-size:9px;letter-spacing:.12em;text-transform:uppercase;
-    color:var(--accent-strong);border:1px solid var(--accent);border-radius:5px;padding:1px 6px;margin-top:7px;
+    display:inline-block;font-size:9px;letter-spacing:1.2px;text-transform:uppercase;color:var(--accent);
+    border:1px solid var(--fg-dim);border-radius:var(--radius);padding:1px 6px;margin-top:7px;
   }
-  /* orchestrator column — set apart from the cron-family group */
-  th.orch,td.orch{border-left:1px dashed var(--border-strong)}
-  .th-tag.orch{color:var(--text-muted);border-color:var(--border-strong)}
+  th.orch,td.orch{border-left:1px dashed var(--border2)}
+  .th-tag.orch{color:var(--fg-faint);border-color:var(--border2)}
 
   /* group rows */
-  tr.group td{
-    position:sticky;left:0;
-    background:var(--surface-3);
-    border-top:1px solid var(--border);border-bottom:1px solid var(--border);
-    text-align:left;padding:9px 20px;
-  }
-  tr.group .g-label{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--text-muted);font-weight:640}
-  tr.group.ai td{background:linear-gradient(90deg,var(--brass-tint),transparent 70%);border-top:1px solid var(--brass)}
-  tr.group.ai .g-label{color:var(--brass-strong)}
-  tr.group .g-uniq{color:var(--brass-strong);border:1px solid var(--brass);border-radius:5px;font-size:8.5px;padding:1px 5px;margin-left:8px;letter-spacing:.1em}
+  tr.group td{position:sticky;left:0;background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border);text-align:left;padding:8px 18px}
+  tr.group .g-label{font-size:10.5px;letter-spacing:1.4px;text-transform:uppercase;color:var(--fg-faint);font-weight:700}
+  tr.group.ai td{background:linear-gradient(90deg,color-mix(in srgb,var(--gold) 14%,transparent),transparent 70%);border-top:1px solid var(--gold)}
+  tr.group.ai .g-label{color:var(--gold)}
+  tr.group .g-uniq{color:var(--gold);border:1px solid var(--gold);border-radius:var(--radius);font-size:8.5px;padding:1px 5px;margin-left:8px;letter-spacing:1px}
 
   /* body cells */
-  tbody td{padding:11px 10px;border-bottom:1px solid var(--border)}
+  tbody td{padding:11px 10px;border-bottom:1px solid color-mix(in srgb,var(--border) 60%,transparent)}
   tbody tr:last-child td{border-bottom:none}
-  td.feat{padding:11px 14px 11px 20px}
-  .f-name{font-size:13px;font-weight:560;color:var(--text);line-height:1.3}
-  .f-sub{font-size:11px;color:var(--text-faint);margin-top:2px;font-family:var(--mono)}
-  tr.spot td{background:var(--brass-tint)}
-  /* sticky column must stay opaque so scrolled cells don't bleed through it */
-  tr.spot td.feat{background-color:var(--surface);background-image:linear-gradient(var(--brass-tint),var(--brass-tint))}
-  tr.spot td.cs{background:linear-gradient(180deg,var(--accent-band),var(--brass-tint))}
-  tbody tr:hover td{background:var(--surface-2)}
-  tbody tr:hover td.cs{background:var(--accent-tint)}
-  tbody tr.spot:hover td{background:var(--brass-tint)}
+  td.feat{padding:11px 14px 11px 18px}
+  .f-name{font-size:12.5px;font-weight:600;color:var(--fg);line-height:1.3}
+  .f-sub{font-size:10.5px;color:var(--fg-faint);margin-top:2px}
+  .f-sub code,td.feat code{font-family:var(--mono);font-size:11px;background:var(--bg2);padding:0 4px;border-radius:2px;border:1px solid var(--border)}
+  tr.spot td{background:color-mix(in srgb,var(--gold) 9%,transparent)}
+  tr.spot td.feat{background-color:var(--panel);background-image:linear-gradient(color-mix(in srgb,var(--gold) 9%,transparent),color-mix(in srgb,var(--gold) 9%,transparent))}
+  tr.spot td.cs{background:linear-gradient(180deg,color-mix(in srgb,var(--fg-dim) 8%,transparent),color-mix(in srgb,var(--gold) 9%,transparent))}
+  tbody tr:hover td{background:var(--hover)}
+  tbody tr:hover td.cs{background:color-mix(in srgb,var(--fg-dim) 13%,var(--hover))}
+  tbody tr.spot:hover td{background:color-mix(in srgb,var(--gold) 12%,transparent)}
 
   /* status marks */
-  .mk{display:inline-grid;place-items:center;width:23px;height:23px;border-radius:50%;font-size:13px;line-height:1;margin:0 auto}
-  .yes .mk{background:var(--yes);color:#fff;font-weight:700}
-  .cs .mk{background:var(--yes);color:#fff;box-shadow:0 0 0 3px var(--yes-tint)}
-  .partial .mk{background:transparent;color:var(--partial);border:1.6px solid var(--partial);font-size:12px;font-weight:700}
-  .addon .mk{background:transparent;color:var(--brass);border:1.6px dashed var(--brass);font-weight:700;font-size:14px}
-  .no .mk{color:var(--no);background:transparent;font-size:16px}
-  .cap{display:block;font-family:var(--mono);font-size:9.5px;line-height:1.25;color:var(--text-muted);margin-top:5px;max-width:132px;margin-left:auto;margin-right:auto}
-  td.cs .cap{color:var(--accent-strong);opacity:.92}
-  .addon .cap,.partial .cap{color:var(--partial)}
+  .mk{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;font-size:12px;line-height:1;margin:0 auto}
+  .yes .mk{background:var(--ok);color:var(--bg);font-weight:700}
+  .cs .mk{background:var(--ok);color:var(--bg);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 22%,transparent)}
+  .partial .mk{background:transparent;color:var(--pending);border:1.6px solid var(--pending);font-size:11px;font-weight:700}
+  .addon .mk{background:transparent;color:var(--gold);border:1.6px dashed var(--gold);font-weight:700;font-size:13px}
+  .no .mk{color:var(--disabled);background:transparent;font-size:15px}
+  .cap{display:block;font-family:var(--mono);font-size:9.5px;line-height:1.25;color:var(--fg-faint);margin:5px auto 0;max-width:132px}
+  td.cs .cap{color:var(--fg-dim);opacity:.95}
+  .addon .cap,.partial .cap{color:var(--pending)}
 
   /* ---------- MCP spotlight ---------- */
   .mcp{
-    margin-top:26px;
-    border:1px solid var(--border);
-    border-radius:18px;
-    background:
-      radial-gradient(700px 300px at 90% -20%, var(--accent-tint), transparent 65%),
-      var(--surface);
-    box-shadow:var(--shadow-lift);
-    overflow:hidden;
+    margin-top:24px;border:1px solid var(--border);border-radius:var(--radius);
+    background:radial-gradient(700px 300px at 90% -20%,color-mix(in srgb,var(--fg-dim) 9%,transparent),transparent 65%),var(--panel);
+    box-shadow:var(--shadow-lg);overflow:hidden;
   }
-  .mcp-top{padding:clamp(22px,3vw,34px);border-bottom:1px solid var(--border);display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start;justify-content:space-between}
+  .mcp-top{padding:clamp(20px,3vw,32px);border-bottom:1px solid var(--border);display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start;justify-content:space-between}
   .mcp-top .lead{max-width:60ch}
-  .mcp-kicker{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--brass-strong);display:flex;align-items:center;gap:8px}
-  .mcp-kicker .sq{width:8px;height:8px;background:var(--brass);border-radius:2px;transform:rotate(45deg)}
-  .mcp h3{font-family:var(--mono);font-weight:660;font-size:clamp(19px,2.5vw,26px);letter-spacing:-.015em;margin:12px 0 0;text-wrap:balance}
+  .mcp-kicker{font-family:var(--mono);font-size:10.5px;letter-spacing:1.4px;text-transform:uppercase;color:var(--gold);display:flex;align-items:center;gap:8px}
+  .mcp-kicker .sq{width:8px;height:8px;background:var(--gold);transform:rotate(45deg)}
+  .mcp h3{font-family:var(--mono);font-weight:700;font-size:clamp(18px,2.4vw,25px);letter-spacing:-.005em;margin:12px 0 0;text-wrap:balance;color:var(--fg)}
   .mcp h3 .a{color:var(--accent)}
-  .mcp-top p{color:var(--text-muted);font-size:14.5px;margin:12px 0 0}
-  .mcp-top p code{font-family:var(--mono);font-size:.86em;background:var(--surface-3);padding:1px 6px;border-radius:5px;color:var(--text)}
+  .mcp-top p{color:var(--fg-dim);font-size:14px;margin:12px 0 0;line-height:1.6}
+  .mcp-top p code{font-family:var(--mono);font-size:.86em;background:var(--bg2);padding:1px 6px;border-radius:2px;border:1px solid var(--border);color:var(--fg)}
 
   .snip{
-    font-family:var(--mono);font-size:12px;line-height:1.7;
-    background:var(--surface-2);border:1px solid var(--border);border-radius:12px;
-    padding:14px 16px;color:var(--text-muted);min-width:270px;
-    overflow-x:auto;
+    font-family:var(--mono);font-size:12px;line-height:1.7;background:var(--bg2);
+    border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;color:var(--fg-dim);min-width:270px;overflow-x:auto;
   }
-  .snip .p{color:var(--text-faint)}
-  .snip .c{color:var(--accent)}
-  .snip .k{color:var(--brass-strong)}
-  .snip .ok{color:var(--yes)}
-  .snip b{color:var(--text);font-weight:600}
+  .snip .p{color:var(--fg-faint)}
+  .snip .c{color:var(--fg-dim)}
+  .snip .k{color:var(--gold)}
+  .snip .ok{color:var(--ok)}
+  .snip b{color:var(--fg);font-weight:700}
 
   .mcp-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border)}
-  .quad{background:var(--surface);padding:22px 20px}
-  .quad .qh{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12.5px;font-weight:640;letter-spacing:.02em;color:var(--text)}
-  .quad .qi{width:22px;height:22px;flex:0 0 auto;display:grid;place-items:center;border-radius:6px;background:var(--accent-tint);color:var(--accent)}
-  .quad.act .qi{background:var(--yes-tint);color:var(--yes)}
-  .quad.safe .qi{background:var(--brass-tint);color:var(--brass-strong)}
+  .quad{background:var(--panel);padding:22px 20px}
+  .quad .qh{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:.3px;color:var(--fg)}
+  .quad .qi{width:22px;height:22px;flex:0 0 auto;display:grid;place-items:center;border-radius:var(--radius);background:color-mix(in srgb,var(--fg-dim) 16%,transparent);color:var(--fg-dim)}
+  .quad.act .qi{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .quad.safe .qi{background:color-mix(in srgb,var(--gold) 16%,transparent);color:var(--gold)}
   .quad ul{list-style:none;margin:14px 0 0;padding:0;display:flex;flex-direction:column;gap:9px}
-  .quad li{font-size:12.5px;color:var(--text-muted);padding-left:16px;position:relative;line-height:1.42}
-  .quad li::before{content:"";position:absolute;left:0;top:8px;width:5px;height:5px;border-radius:50%;background:var(--text-faint)}
-  .quad.act li::before{background:var(--yes)}
-  .quad.safe li::before{background:var(--brass)}
-  .quad li b{color:var(--text);font-weight:600}
-  .quad li code{font-family:var(--mono);font-size:11px;background:var(--surface-3);padding:0 5px;border-radius:4px;color:var(--text)}
+  .quad li{font-size:12.5px;color:var(--fg-dim);padding-left:16px;position:relative;line-height:1.45}
+  .quad li::before{content:"";position:absolute;left:0;top:8px;width:5px;height:5px;border-radius:50%;background:var(--fg-faint)}
+  .quad.act li::before{background:var(--ok)}
+  .quad.safe li::before{background:var(--gold)}
+  .quad li b{color:var(--fg);font-weight:700}
+  .quad li code{font-family:var(--mono);font-size:11px;background:var(--bg2);padding:0 5px;border-radius:2px;border:1px solid var(--border);color:var(--fg)}
+
+  /* ---------- range / spectrum band ---------- */
+  .range{display:flex;align-items:center;gap:12px;margin:2px 0 16px;font-family:var(--mono)}
+  .range-end{display:flex;flex-direction:column;gap:2px;white-space:nowrap;flex:0 0 auto}
+  .range-end b{font-size:12.5px;color:var(--fg-dim);font-weight:700}
+  .range-end span{font-size:9.5px;color:var(--fg-faint);text-transform:uppercase;letter-spacing:.7px}
+  .range-end.right{text-align:right}
+  .range-bar{position:relative;flex:1 1 auto;height:30px;border-radius:var(--radius);background:var(--bg2);border:1px solid var(--border);overflow:hidden}
+  .range-bar::after{content:"";position:absolute;inset:0;
+    background:linear-gradient(90deg,color-mix(in srgb,var(--fg-dim) 8%,transparent),color-mix(in srgb,var(--fg-dim) 24%,transparent) 55%,color-mix(in srgb,var(--accent) 20%,transparent));}
+  .range-bar b{position:relative;z-index:1;display:grid;place-items:center;height:100%;font-size:11.5px;font-weight:700;color:var(--accent);letter-spacing:.6px}
+  .spectrum{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .sp-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow-lg)}
+  .sp-card.pro{border-color:var(--border2)}
+  .sp-tag{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10px;letter-spacing:1.1px;text-transform:uppercase;color:var(--fg-faint);font-weight:700}
+  .sp-tag::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--fg-faint)}
+  .sp-card.pro .sp-tag{color:var(--accent)}
+  .sp-card.pro .sp-tag::before{background:var(--accent)}
+  .sp-card p{margin:11px 0 0;font-family:var(--sans);font-size:13px;line-height:1.6;color:var(--fg-dim)}
+  .sp-card p b{color:var(--fg);font-weight:700}
+
+  /* ---------- pillars (everything besides the agent interface) ---------- */
+  .pillars{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:2px}
+  .pil{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px 20px 18px;box-shadow:var(--shadow-lg);display:flex;flex-direction:column}
+  .pil .ph{display:flex;align-items:center;gap:11px;font-family:var(--mono);font-weight:700;font-size:13.5px;color:var(--fg);letter-spacing:.2px}
+  .pil .pi{width:28px;height:28px;flex:0 0 auto;display:grid;place-items:center;border-radius:var(--radius);background:color-mix(in srgb,var(--fg-dim) 15%,transparent);color:var(--fg-dim)}
+  .pil.core .pi{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .pil p{margin:12px 0 0;color:var(--fg-dim);font-size:12.5px;line-height:1.6;font-family:var(--sans);letter-spacing:0}
+  .pil p b{color:var(--fg);font-weight:700}
+  .pil .tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto;padding-top:14px}
+  .pil .tags span{font-family:var(--mono);font-size:10px;color:var(--fg-faint);background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:2px 7px;letter-spacing:.3px;white-space:nowrap}
 
   /* ---------- takeaways ---------- */
   .takeaways{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:22px}
-  .tk{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:var(--shadow)}
-  .tk .n{font-family:var(--mono);font-size:26px;font-weight:680;letter-spacing:-.02em;color:var(--accent);font-variant-numeric:tabular-nums}
-  .tk .n.brass{color:var(--brass)}
-  .tk .t{font-weight:620;margin-top:6px;font-size:14px}
-  .tk p{margin:6px 0 0;color:var(--text-muted);font-size:13px}
+  .tk{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px}
+  .tk .n{font-family:var(--mono);font-size:25px;font-weight:700;letter-spacing:-.01em;color:var(--fg-dim);font-variant-numeric:tabular-nums}
+  .tk .n.brass{color:var(--gold)}
+  .tk .t{font-family:var(--mono);font-weight:700;margin-top:6px;font-size:13.5px;color:var(--fg)}
+  .tk p{margin:7px 0 0;color:var(--fg-faint);font-size:12.5px;line-height:1.55}
 
   /* ---------- footer ---------- */
-  footer{margin-top:44px;border-top:1px solid var(--border);padding-top:20px;color:var(--text-faint);font-size:12px;line-height:1.6}
+  footer{margin-top:42px;border-top:1px solid var(--border);padding-top:20px;color:var(--fg-faint);font-size:12px;line-height:1.65}
   footer .m{font-family:var(--mono)}
-  footer b{color:var(--text-muted);font-weight:600}
-  footer a{color:var(--accent);text-decoration:none}
-  footer a:hover{text-decoration:underline}
+  footer b{color:var(--fg-dim);font-weight:700}
+  footer a{color:var(--accent)}
+  footer em{color:var(--fg-dim);font-style:normal}
 
-  a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
-
-  @media (max-width:860px){
+  @media(max-width:860px){
     .mcp-grid{grid-template-columns:repeat(2,1fr)}
+    .pillars{grid-template-columns:repeat(2,1fr)}
     .takeaways{grid-template-columns:1fr}
   }
-  @media (max-width:560px){
-    .mcp-grid{grid-template-columns:1fr}
-  }
-  @media (prefers-reduced-motion:reduce){
-    .wordmark .mark{animation:none}
+  @media(max-width:560px){.mcp-grid{grid-template-columns:1fr}.pillars{grid-template-columns:1fr}.spectrum{grid-template-columns:1fr}}
+  @media(prefers-reduced-motion:reduce){
+    .wordmark .mark,.topbar .brand .mark{animation:none!important}
+    .dot.live{animation:none}
+    body.fx.flicker #crt{animation:none}
     *{scroll-behavior:auto}
-  }</style>
+  }
+</style>
 </head>
-<body>
+<body class="fx scan">
+<div id="crt"></div>
+<header class="topbar">
+  <span class="brand"><span class="mark" id="tbMark">&#x259A;</span> <b>cronstable</b> <span class="slash">//</span> feature comparison</span>
+  <span class="pill tb-hide"><span class="dot ok"></span>v1.2.8</span>
+  <span class="pill tb-hide">#5978710a7e1f</span>
+  <span class="grow"></span>
+  <span class="clock tb-hide" id="tbClock">--:--:-- UTC</span>
+  <span class="pill"><span class="dot live"></span>live</span>
+  <select id="themeSel" title="Theme" aria-label="Theme">
+        <option value="carolina">Carolina</option>
+        <option value="carolina-light">Carolina · light</option>
+        <option value="amber">Amber</option>
+        <option value="amber-light">Amber · light</option>
+        <option value="green">Green</option>
+        <option value="green-light">Green · light</option>
+        <option value="modern">Modern</option>
+        <option value="modern-light">Modern · light</option>
+        <option value="standard">Standard</option>
+        <option value="standard-light">Standard · light</option>
+  </select>
+  <a class="btn primary" href="./demo/">&#9654; open dashboard</a>
+</header>
 <div class="page">
 <div class="wrap">
 
   <!-- HERO -->
   <header>
-    <p class="eyebrow"><span class="dot"></span>Feature comparison<span class="dot"></span>Cron-family schedulers &amp; orchestrators<span class="dot"></span>July 2026</p>
-
     <div class="wordmark">
-      <span class="mark" aria-hidden="true">&#x259A;</span>
+      <span class="mark" id="heroMark" aria-hidden="true">&#x259A;</span>
       <span class="name">cronstable</span>
       <span class="say">/ kraahn-stuh-bl /</span>
     </div>
 
-    <h1>The only cron your <span class="hl-b">AI agent</span> can actually <span class="hl">drive</span>.</h1>
+    <h1>As simple as <span class="hl">cron</span>, as capable as <span class="hl">Airflow</span>, in one daemon.</h1>
 
-    <p class="lede"><strong>cronstable ships a built-in Model Context Protocol server</strong> — so Claude, Cursor or Copilot can observe every job, DAG and node, and act on them when you opt in. Nothing else in the field ships one natively — not even Apache Airflow. And it arrives alongside durable state, a real DAG engine, leader-elected clustering and a live dashboard, in a single hardened, dependency-free daemon.</p>
+    <p class="lede">Point cronstable at the crontab you already run and <strong>it behaves like plain cron</strong>. Reach for DAGs, durable state, leader-elected clustering and a live dashboard only when you need them, all from one dependency-free daemon. And when you want it, a built-in Model Context Protocol server lets an AI agent drive the whole thing.</p>
 
     <div class="chips">
-      <span class="chip brass"><span class="cd"></span><b>23</b><span>MCP tools</span></span>
-      <span class="chip brass"><span class="cd"></span><b>5</b><span>triage playbooks</span></span>
       <span class="chip green"><span class="cd"></span><b>24 / 24</b><span>native features</span></span>
+      <span class="chip"><span class="cd"></span><b>5-in-1</b><span>scheduler &middot; DAGs &middot; state &middot; cluster &middot; console</span></span>
+      <span class="chip brass"><span class="cd"></span><b>23</b><span>MCP tools</span></span>
       <span class="chip"><span class="cd"></span><b>0</b><span>new dependencies</span></span>
       <span class="chip"><span class="cd"></span><b>13</b><span>OS &times; arch builds</span></span>
     </div>
+
+      <div class="cta-row">
+        <a class="btn primary lg" href="./demo/index.html">&#9654; Explore the live dashboard</a>
+        <span class="cta-note">An interactive board that drives <span class="k">every view</span>: jobs, DAGs, the cluster, durable state and live logs. Synthetic data; no cluster required.</span>
+      </div>
   </header>
+
+  <!-- SPECTRUM: start simple, scale up -->
+  <div class="sec-head">
+    <div>
+      <h2>Start simple, scale when you're ready</h2>
+      <p>The same binary covers the whole range. Run it as a nicer cron on one box, or turn on the orchestration, HA and agent tooling as you grow. You never swap tools or rewrite your jobs to move from one end to the other.</p>
+    </div>
+  </div>
+
+  <div class="range" aria-hidden="true">
+    <span class="range-end left"><b>cron</b><span>drop-in</span></span>
+    <div class="range-bar"><b>cronstable spans the whole range</b></div>
+    <span class="range-end right"><b>Airflow</b><span>full orchestration</span></span>
+  </div>
+
+  <div class="spectrum">
+    <div class="sp-card">
+      <div class="sp-tag">Homelab / single box</div>
+      <p>Point it at the crontab you already have and keep it. One static binary, <b>no database, no broker, no daemon zoo</b>. It stays out of your way and only does what a cron does until you ask for more.</p>
+    </div>
+    <div class="sp-card pro">
+      <div class="sp-tag">Team / production</div>
+      <p>Switch on <b>DAGs, leader-elected HA, fenced exactly-once, a durable state store, metrics</b> and the agent interface. The same binary reaches Airflow-class orchestration without the metadata DB or the worker fleet.</p>
+    </div>
+  </div>
 
   <!-- MATRIX -->
   <div class="sec-head">
     <div>
       <h2>How it stacks up</h2>
-      <p>cronstable versus its closest cron-family competitors — plus Apache Airflow, the heavyweight orchestrator, for scale. Every competitor cell was fact-checked against the project's official docs, then adversarially re-verified.</p>
+      <p>cronstable versus its closest cron-family competitors, plus Apache Airflow as a heavier orchestrator for scale.</p>
     </div>
     <div class="legend" aria-hidden="true">
       <span class="lk"><span class="mk yes" style="width:16px;height:16px;font-size:10px">✓</span> Native</span>
@@ -379,7 +503,6 @@
             <span class="th-name">cronstable</span>
             <div class="meter"><i style="width:100%"></i></div>
             <div class="th-count">24 native</div>
-            <span class="th-tag">This is us</span>
           </th>
           <th scope="col"><span class="th-name">yacron</span><div class="th-sub">Python · YAML</div><div class="meter"><i style="width:29%"></i></div><div class="th-count">7 native</div></th>
           <th scope="col"><span class="th-name">supercronic</span><div class="th-sub">Go · crontab</div><div class="meter"><i style="width:21%"></i></div><div class="th-count">5 native</div></th>
@@ -497,7 +620,7 @@
         <!-- GROUP: ORCHESTRATION -->
         <tr class="group"><td colspan="9"><span class="g-label">Orchestration &amp; workflows</span></td></tr>
 
-        <tr>
+        <tr class="spot">
           <td class="feat"><div class="f-name">DAGs / dependency graphs</div><div class="f-sub">durable workflow engine</div></td>
           <td class="cs yes"><span class="mk">✓</span><span class="cap">fan-out · sensors · resume</span></td>
           <td class="no" title="No job dependencies or workflow engine; jobs run independently."><span class="mk">–</span></td>
@@ -506,7 +629,7 @@
           <td class="partial" title="parent_job / dependent_jobs chaining on completion; not a full DAG workflow engine."><span class="mk">◐</span><span class="cap">chaining only</span></td>
           <td class="partial" title="Chain reaction with success/error branching, not a declarative multi-parent DAG."><span class="mk">◐</span><span class="cap">chains only</span></td>
           <td class="addon" title="No native dependencies; requires Argo Workflows or Tekton."><span class="mk">+</span><span class="cap">Argo / Tekton</span></td>
-          <td class="yes orch" title="Python-defined DAGs with rich task dependency graphs — Airflow's core purpose."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Python-defined DAGs with task dependency graphs; Airflow's core purpose."><span class="mk">✓</span></td>
         </tr>
 
         <tr>
@@ -572,7 +695,7 @@
           <td class="partial orch" title="Scheduler DB row-locks dedupe scheduling; no fencing token, zombie/duplicate runs possible."><span class="mk">◐</span><span class="cap">no fencing</span></td>
         </tr>
 
-        <tr>
+        <tr class="spot">
           <td class="feat"><div class="f-name">Durable state store for jobs</div><div class="f-sub">KV · locks · cursors · secrets</div></td>
           <td class="cs yes"><span class="mk">✓</span><span class="cap">+ idempotency &amp; artifacts</span></td>
           <td class="no" title="No KV, locks, cursors, idempotency, secrets, or artifact store."><span class="mk">–</span></td>
@@ -652,7 +775,7 @@
 
         <tr>
           <td class="feat"><div class="f-name">Native Windows + macOS + Linux</div></td>
-          <td class="cs yes"><span class="mk">✓</span><span class="cap">all three, first-class</span></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">all three, native</span></td>
           <td class="no" title="Linux-only; binary targets glibc 2.23+, no Windows/macOS."><span class="mk">–</span></td>
           <td class="no" title="Only Linux binaries published; pure-Go, so buildable from source."><span class="mk">–</span></td>
           <td class="partial" title="Prebuilt Windows/macOS/Linux binaries, but Docker-centric; only job-local runs on host."><span class="mk">◐</span><span class="cap">Docker-centric</span></td>
@@ -703,11 +826,69 @@
    </div>
   </div>
 
+  <!-- PILLARS: everything besides the agent interface -->
+  <div class="sec-head">
+    <div>
+      <h2>Everything else it packs in</h2>
+      <p>The agent interface gets the attention, but most of cronstable is the scheduler under it: a DAG engine, a fenced cluster, a durable state store and a live console, all in the same dependency-free daemon.</p>
+    </div>
+  </div>
+
+  <div class="pillars">
+    <div class="pil core">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.4"></circle><circle cx="18" cy="6" r="2.4"></circle><circle cx="18" cy="18" r="2.4"></circle><path d="M8.1 10.9 15.9 7.1M8.1 13.1 15.9 16.9"></path></svg>
+      </span>DAG engine</div>
+      <p>A durable workflow engine rather than plain job chaining: <b>fan-out</b>, <b>sensors</b> that wait on external conditions, and <b>XCom</b> hand-offs between tasks. Runs survive a restart and resume mid-flight; pause on a <b>human approval gate</b>, then <b>backfill</b> history when you need to.</p>
+      <div class="tags"><span>fan-out</span><span>sensors</span><span>XCom</span><span>approval gates</span><span>backfill</span><span>resume</span></div>
+    </div>
+
+    <div class="pil core">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.4"></rect><rect x="3" y="13" width="18" height="7" rx="1.4"></rect><path d="M7 7.5h.01M7 16.5h.01"></path></svg>
+      </span>Fenced, elected cluster</div>
+      <p>Run replicas from one config with <b>mTLS leader election</b> and quorum, so a job never double-fires. <b>Fenced exactly-once</b> execution through a lease backend keeps a stalled leader from overwriting its successor's work.</p>
+      <div class="tags"><span>mTLS</span><span>leader election</span><span>quorum</span><span>fenced exactly-once</span></div>
+    </div>
+
+    <div class="pil core">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"></path><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"></path></svg>
+      </span>Durable state store</div>
+      <p>A store your jobs can use directly: <b>KV, locks, cursors, secrets, idempotency keys and artifacts</b>, all surviving restarts. It runs without an external database or Redis.</p>
+      <div class="tags"><span>KV</span><span>locks</span><span>cursors</span><span>secrets</span><span>idempotency</span><span>artifacts</span></div>
+    </div>
+
+    <div class="pil">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="1.4"></rect><path d="M8 20h8M12 16v4"></path></svg>
+      </span>Live console</div>
+      <p>A web dashboard that <b>tails logs</b>, <b>runs and cancels</b> jobs on demand, and walks any DAG's task graph, with 10 phosphor themes. Backed by an <b>HTTP REST API</b> and native <b>Prometheus + statsd</b>.</p>
+      <div class="tags"><span>live tail</span><span>run/cancel</span><span>REST API</span><span>Prometheus</span><span>10 themes</span></div>
+    </div>
+
+    <div class="pil">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7.5v5l3.2 2"></path></svg>
+      </span>Scheduling core</div>
+      <p>Runs your classic <b>Vixie crontab files unchanged</b>, with <b>per-job IANA timezones</b>, concurrency policies, exec/kill timeouts, <b>retries with exponential backoff</b>, and <b>missed-run catch-up</b> after downtime.</p>
+      <div class="tags"><span>crontab as-is</span><span>per-job TZ</span><span>timeouts</span><span>backoff</span><span>catch-up</span></div>
+    </div>
+
+    <div class="pil">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 3.5 7v10L12 21.5 20.5 17V7L12 2.5Z"></path><path d="M3.7 7 12 11.5 20.3 7M12 11.5v10"></path></svg>
+      </span>Portable &amp; hardened</div>
+      <p>Runs natively on <b>Windows, macOS and Linux</b>, shipped as self-contained binaries across <b>13 OS &times; arch targets</b>, plus <b>distroless images</b> that run non-root on a read-only root filesystem. Adds <b>zero</b> new dependencies.</p>
+      <div class="tags"><span>Win</span><span>mac</span><span>Linux</span><span>13 builds</span><span>distroless</span><span>non-root</span></div>
+    </div>
+  </div>
+
   <!-- MCP SPOTLIGHT -->
   <div class="sec-head">
     <div>
-      <h2>The part nobody else has</h2>
-      <p>The dashed column above tells the story. Here is what that one green cell actually gives you.</p>
+      <h2>One cool thing about cronstable</h2>
+      <p>we're the only scheduler with a native agent interface.</p>
     </div>
   </div>
 
@@ -715,16 +896,16 @@
     <div class="mcp-top">
       <div class="lead">
         <div class="mcp-kicker"><span class="sq"></span>Built-in MCP server</div>
-        <h3>Point <span class="a">Claude, Cursor or Copilot</span> straight at your scheduler.</h3>
-        <p>cronstable speaks the Model Context Protocol natively — served at <code>POST /mcp</code> over Streamable HTTP and through a <code>cronstable mcp</code> stdio bridge for desktop clients. It's hand-rolled in pure Python against MCP revision <b style="font-weight:600">2025-11-25</b>, so enabling it adds <b style="font-weight:600">zero</b> new dependencies. An agent gets look-but-don't-touch access until you deliberately hand it the keys.</p>
+        <h3>Point <span class="a">Claude, Cursor or Copilot</span> at your scheduler.</h3>
+        <p>cronstable speaks the Model Context Protocol natively, served at <code>POST /mcp</code> over Streamable HTTP and through a <code>cronstable mcp</code> stdio bridge for desktop clients. It's written in pure Python against MCP revision <b style="font-weight:600">2025-11-25</b>. Enabling it adds <b style="font-weight:600">zero</b> new dependencies. The agent gets read-only access until you grant it write tools.</p>
       </div>
-      <pre class="snip" aria-label="Wiring cronstable's MCP server to Claude Code"><span class="p"># wire it to Claude Code — remote or local</span>
+      <pre class="snip" aria-label="Wiring cronstable's MCP server to Claude Code"><span class="p"># wire it to Claude Code (remote or local)</span>
 claude mcp add <span class="k">--transport</span> http \
   cronstable https://host/<span class="c">mcp</span> \
   <span class="k">--header</span> <span class="c">"Authorization: Bearer $TOKEN"</span>
 
 $ cronstable mcp <span class="k">--check</span>
-<span class="ok">mcp check: ok</span> — protocol 2025-11-25,
+<span class="ok">mcp check: ok</span>, protocol 2025-11-25,
   <b>23 tool(s)</b> at http://127.0.0.1:8080/mcp</pre>
     </div>
 
@@ -734,7 +915,7 @@ $ cronstable mcp <span class="k">--check</span>
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.6"></circle></svg>
         </span>Observe</div>
         <ul>
-          <li>Every <b>job, run &amp; trend</b> — status, history, live log tails</li>
+          <li>Every <b>job, run &amp; trend</b>: status, history, live log tails</li>
           <li><b>DAGs</b>, their runs and XCom data hand-offs</li>
           <li>The <b>cluster &amp; fleet</b>, node-by-node</li>
           <li><b>Metrics</b> and the durable <b>state store</b></li>
@@ -743,7 +924,7 @@ $ cronstable mcp <span class="k">--check</span>
       <div class="quad act">
         <div class="qh"><span class="qi" aria-hidden="true">
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m13 2-9 12h7l-1 8 9-12h-7l1-8Z"></path></svg>
-        </span>Act — on opt-in</div>
+        </span>Act &middot; opt-in</div>
         <ul>
           <li><b>Run</b> or <b>cancel</b> a job on demand</li>
           <li><b>Trigger</b>, <b>backfill</b> or <b>approve</b> a DAG</li>
@@ -779,28 +960,68 @@ $ cronstable mcp <span class="k">--check</span>
   <!-- TAKEAWAYS -->
   <div class="takeaways">
     <div class="tk">
-      <div class="n brass">1 of 8</div>
-      <div class="t">Only cronstable ships a native MCP server</div>
-      <p>Across every tool surveyed, it's the sole native agent interface. Airflow and Kubernetes reach it only through third-party, whole-system MCP add-ons — Airflow's own is still a draft proposal.</p>
+      <div class="n">5-in-1</div>
+      <div class="t">Orchestration without the Airflow overhead</div>
+      <p>Scheduler, durable DAG engine, a job-facing state store, a leader-elected cluster and a live console in one binary. It matches Airflow's orchestration without the metadata DB, the separate workers, or the Python-only footprint.</p>
     </div>
     <div class="tk">
-      <div class="n">4-in-1</div>
-      <div class="t">The DAG engine without the Airflow tax</div>
-      <p>Scheduler, durable DAG engine, leader-elected cluster and live console in one binary — matching Airflow's orchestration, minus the metadata DB, the workers, and the Python-only footprint.</p>
+      <div class="n brass">1 of 8</div>
+      <div class="t">Only cronstable ships a native MCP server</div>
+      <p>Across every tool surveyed, it's the only native agent interface. Airflow and Kubernetes reach MCP only through third-party, whole-system add-ons, and Airflow's own server is still a draft proposal.</p>
     </div>
     <div class="tk">
       <div class="n">0 deps</div>
-      <div class="t">Hardened, portable, batteries-included</div>
+      <div class="t">Portable and dependency-free</div>
       <p>Pure-Python with no new dependencies, self-contained binaries for 13 OS/arch targets, and images that run non-root on a read-only root filesystem.</p>
     </div>
   </div>
 
-  <footer>
-    <p class="m"><b>Methodology.</b> Rows are cronstable's own capability set. Competitor cells were researched against each project's official documentation, README and changelog, then adversarially re-verified — every "not available" mark survived a dedicated attempt to refute it. Four claims were revised on evidence: dkron per-job resource gauges and Cronicle crontab-import / Time-Machine backfill were softened to "partial", and Airflow's statsd/OpenTelemetry metrics were confirmed native. Airflow's own MCP server is a draft proposal (AIP-91) with only third-party REST wrappers today, so it is graded "add-on" like Kubernetes; "classic crontab" is scored "no" for tools that accept a cron <em>expression</em> but do not ingest crontab <em>files</em>.</p>
-    <p class="m" style="margin-top:10px"><b>Compared:</b> yacron, supercronic, Ofelia, dkron (OSS + Pro noted), Cronicle, native Kubernetes CronJob, and Apache Airflow (the heavyweight orchestrator, shown for scale). Snapshot July 2026; features move — verify against current docs before quoting. Native counts reflect these 24 comparison rows and are directional, not a benchmark.</p>
-  </footer>
+  <!-- CLOSING CTA -->
+  <div class="sec-head">
+    <div>
+      <h2>See it running</h2>
+      <p>Open the live dashboard and drive a nine-node fleet yourself: tail a job's logs, walk a DAG's task graph, watch leader election, and inspect the durable state store.</p>
+    </div>
+  </div>
+  <div class="cta-row" style="margin-top:2px">
+    <a class="btn primary lg" href="./demo/">&#9654; Open the live dashboard demo</a>
+    <a class="btn lg" href="https://github.com/ptweezy/cronstable">&#9733; cronstable on GitHub</a>
+  </div>
 
 </div>
 </div>
+  <script>
+  (function(){
+    var root = document.documentElement, KEY = "cronstable.cmp.theme";
+    var sel = document.getElementById("themeSel");
+    try { var saved = localStorage.getItem(KEY); if (saved) root.setAttribute("data-theme", saved); } catch(e){}
+    if (sel) {
+      sel.value = root.getAttribute("data-theme") || "carolina";
+      sel.addEventListener("change", function(){
+        root.setAttribute("data-theme", sel.value);
+        try { localStorage.setItem(KEY, sel.value); } catch(e){}
+      });
+    }
+    // UTC clock: the dashboard header ticks the same way
+    function two(n){ return (n < 10 ? "0" : "") + n; }
+    var clk = document.getElementById("tbClock");
+    function tick(){ if(!clk) return; var d = new Date();
+      clk.textContent = two(d.getUTCHours())+":"+two(d.getUTCMinutes())+":"+two(d.getUTCSeconds())+" UTC"; }
+    setInterval(tick, 1000); tick();
+    // brand mark spin: the board's 345 deg/s cruise with click-to-bump; reduced motion leaves it still
+    var reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var marks = [document.getElementById("tbMark"), document.getElementById("heroMark")].filter(Boolean);
+    if (!reduce && marks.length) {
+      var CRUISE = 345, vel = CRUISE, ang = 0, last = performance.now();
+      function frame(now){ var dt = Math.min(0.05, (now - last)/1000); last = now;
+        ang = (ang + vel*dt) % 360; vel = CRUISE + (vel - CRUISE)*Math.pow(0.7578, dt);
+        for (var i=0;i<marks.length;i++) marks[i].style.transform = "rotate("+ang+"deg)";
+        requestAnimationFrame(frame); }
+      requestAnimationFrame(frame);
+      marks.forEach(function(m){ m.style.cursor="pointer"; m.title="spin";
+        m.addEventListener("click", function(){ vel += 360; }); });
+    }
+  })();
+  </script>
 </body>
 </html>

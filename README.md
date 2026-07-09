@@ -1,4 +1,4 @@
-# ![The cronstable mark, spinning the way it does in the live dashboard](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/logo-spin.gif)
+# ![The cronstable mark, spinning the way it does so beautifully](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/logo-spin.gif)
 
 [![PyPI version](https://img.shields.io/pypi/v/cronstable.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/cronstable/)
 [![Python versions](https://img.shields.io/pypi/pyversions/cronstable.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/cronstable/)

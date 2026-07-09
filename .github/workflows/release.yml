@@ -750,15 +750,16 @@ jobs:
           pattern: cronstable-*
           merge-multiple: true
 
-      # Publish a SHA256SUMS manifest alongside the assets so downloads can be
-      # verified (`sha256sum -c SHA256SUMS`) and the Homebrew formula can pin an
-      # exact digest per binary. Hash with bare filenames (no path prefix) so it
-      # verifies cleanly against assets downloaded into any directory. Only the
-      # fast native binaries exist on the Release at this point; attach-binaries
-      # regenerates this manifest over the full set once the musl/i686/emulated
-      # arches finish. Homebrew pins from here and references only the macOS +
-      # linux glibc amd64/arm64 sums, all of which are in this fast set.
-      - name: Generate SHA256SUMS
+      # Publish a SHA256SUMS.fast manifest (fast native binaries only) so the
+      # Homebrew formula can pin an exact digest per binary before the slow
+      # arches finish. Hash with bare filenames (no path prefix) so it verifies
+      # cleanly against assets downloaded into any directory. This is
+      # deliberately NOT named `SHA256SUMS` -- GitHub's immutable-release
+      # protection forbids ever deleting/replacing an asset's bytes once
+      # published, so the canonical `SHA256SUMS` covering every binary is
+      # created exactly once, later, by attach-binaries; if `release` claimed
+      # that name first, attach-binaries could never publish the complete one.
+      - name: Generate SHA256SUMS.fast
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
@@ -767,8 +768,8 @@ jobs:
              binaries/cronstable-macos-amd64 binaries/cronstable-macos-arm64 \
              binaries/cronstable-windows-amd64.exe binaries/cronstable-windows-arm64.exe \
              "$work"/
-          ( cd "$work" && sha256sum -- * ) > SHA256SUMS
-          cat SHA256SUMS
+          ( cd "$work" && sha256sum -- * ) > SHA256SUMS.fast
+          cat SHA256SUMS.fast
 
       - name: Build release notes from HISTORY.md
         env:
@@ -806,9 +807,10 @@ jobs:
           body_path: release-notes.md
           generate_release_notes: true
           # Only the fast native binaries are attached here; attach-binaries adds
-          # the musl/i686/emulated arches to this same Release after the publish.
+          # the musl/i686/emulated arches to this same Release after the publish,
+          # along with the canonical `SHA256SUMS` covering everything.
           files: |
-            SHA256SUMS
+            SHA256SUMS.fast
             dist/*.whl
             dist/*.tar.gz
             binaries/cronstable-linux-amd64
@@ -827,8 +829,12 @@ jobs:
   # release==success guard, so it also runs when a slow binary job failed) and
   # uploads only the arches that actually built -- a failed leg just drops its own
   # asset and can be re-run later to add it, no PyPI version burned. The
-  # SHA256SUMS manifest is regenerated over the dist + every binary now present
-  # and re-uploaded (--clobber) so it ends up complete.
+  # canonical SHA256SUMS manifest (dist + every binary now present) is generated
+  # here for the first and only time -- GitHub immutable releases forbid ever
+  # deleting/replacing an asset's bytes, so nothing below ever passes --clobber;
+  # instead it reads the Release's current asset names and uploads only what
+  # isn't already there. That also makes a re-run (e.g. after fixing one failed
+  # slow leg) safe: everything already attached is skipped rather than re-erroring.
   attach-binaries:
     needs: [decide, version, release, binaries-musl, binaries-glibc-extra]
     if: ${{ always() && needs.release.result == 'success' }}
@@ -851,28 +857,37 @@ jobs:
           path: binaries
           pattern: cronstable-*
           merge-multiple: true
-      - name: Attach binaries and refresh SHA256SUMS
+      - name: Attach binaries and publish SHA256SUMS
         run: |
           set -euo pipefail
           # The wheel + sdist are Release assets (not CI artifacts); fetch them so
-          # the regenerated manifest covers them too, exactly like `release` did.
+          # the manifest covers them too, exactly like `release` did for the fast set.
           gh release download "$NEW" --dir dist --pattern '*.whl' --pattern '*.tar.gz'
 
-          # Regenerate the full manifest over dist + every binary now present
-          # (bare filenames, so `sha256sum -c` works from any directory). Same
-          # construction the `release` job used, now including the arches that
-          # were still building then; --clobber below replaces the fast-only copy.
+          # Build the full manifest over dist + every binary now present (bare
+          # filenames, so `sha256sum -c` works from any directory).
           work="$(mktemp -d)"
           cp dist/*.whl dist/*.tar.gz binaries/cronstable-* "$work"/
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
 
-          # Upload the refreshed manifest plus only the arches this job owns (the
-          # fast ones are already on the Release). A leg that failed to build is
-          # absent from ./binaries, so we warn and skip it rather than fail the
-          # upload -- re-run that leg later to add its asset. Seeding the array
-          # with SHA256SUMS keeps it non-empty even if every slow arch failed.
-          assets=(SHA256SUMS)
+          # Immutable releases never let an asset's bytes be deleted or replaced,
+          # so this never passes --clobber. Instead, read what's already attached
+          # and upload only the names that aren't -- making both a normal first
+          # pass and a later re-run (e.g. after fixing one previously-failed slow
+          # leg) safe: anything already on the Release is left untouched rather
+          # than re-attempted.
+          existing="$(gh release view "$NEW" --json assets --jq '.assets[].name')"
+          asset_missing() { ! grep -qxF "$1" <<<"$existing"; }
+
+          assets=()
+          if asset_missing SHA256SUMS; then
+            assets+=(SHA256SUMS)
+          else
+            echo "::notice::SHA256SUMS is already attached to $NEW; leaving the existing manifest as-is."
+          fi
+          # A leg that failed to build is absent from ./binaries, so we warn and
+          # skip it rather than fail the upload -- re-run that leg later to add it.
           for f in \
             binaries/cronstable-linux-i686 \
             binaries/cronstable-linux-armv7 \
@@ -887,13 +902,21 @@ jobs:
             binaries/cronstable-linux-s390x-musl \
             binaries/cronstable-linux-riscv64-musl \
             binaries/cronstable-linux-armv6-musl; do
-            if [ -e "$f" ]; then
+            name="${f##*/}"
+            if [ ! -e "$f" ]; then
+              echo "::warning::${name} did not build; not attaching it (re-run its leg to add it later)."
+            elif asset_missing "$name"; then
               assets+=("$f")
             else
-              echo "::warning::${f##*/} did not build; not attaching it (re-run its leg to add it later)."
+              echo "::notice::${name} is already attached to $NEW; skipping."
             fi
           done
-          gh release upload "$NEW" "${assets[@]}" --clobber
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::notice::Nothing new to attach to $NEW."
+          else
+            gh release upload "$NEW" "${assets[@]}"
+          fi
 
   # Build + push the multi-arch container image at the just-released version.
   # Invoked here (workflow_call) rather than via `on: release` because a Release
@@ -914,7 +937,9 @@ jobs:
   # Push the just-released version to the Homebrew tap (ptweezy/homebrew-tap) so
   # `brew install ptweezy/tap/cronstable` and `brew upgrade` track releases with no
   # manual step. Re-renders Formula/cronstable.rb from the template in this repo,
-  # pinning each binary's SHA256 from the SHA256SUMS the `release` job published.
+  # pinning each binary's SHA256 from the SHA256SUMS.fast the `release` job
+  # published (it covers exactly the macOS + linux glibc amd64/arm64 sums this
+  # formula needs, and is available immediately -- no waiting on attach-binaries).
   #
   # Cross-repo pushes need a token the default GITHUB_TOKEN can't provide: set a
   # repo secret HOMEBREW_TAP_TOKEN to a PAT (fine-grained, Contents: read/write
@@ -941,7 +966,7 @@ jobs:
           # Fetch the checksums this release just published (retry: the asset can
           # lag the API by a few seconds after the release is created).
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o SHA256SUMS \
-            "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/SHA256SUMS"
+            "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/SHA256SUMS.fast"
 
           git clone --depth 1 \
             "https://x-access-token:${TAP_TOKEN}@github.com/ptweezy/homebrew-tap.git" tap

@@ -19,7 +19,12 @@ the exported GIFs only; the live dashboard mark is left exactly as it was.
 The replay speed is derived from the page's MARK_CRUISE constant, so a retune
 there keeps the GIF honest on the next regen.
 
-Needs playwright (+ its Chromium) and Pillow. GIFs land in shots/.
+Each variant is written twice: a 24-bit `<name>.webp` (the primary — no
+256-palette banding on the glow or the glitch's saturated ghosts) and a
+256-colour `<name>.gif` twin for clients that don't render animated WebP, the
+same webp-primary / gif-fallback convention as build_reel.py.
+
+Needs playwright (+ its Chromium) and Pillow. Files land in shots/.
 """
 import http.server
 import random
@@ -45,6 +50,13 @@ FRAMES = FRAMES_PER_REV * LOOP_REVS
 PAD = 12              # css px around the brand box (glow + rotation overflow)
 SCALE = 2             # device pixels per css px, matches the PNG set
 
+# WebP is the primary (24-bit colour -> no 256-palette banding on the glow or
+# the glitch's saturated ghosts); the GIF is a 256-colour twin for clients that
+# don't render animated WebP. Mirrors docs/screenshots/build_reel.py.
+WEBP_LOSSLESS = True  # True = pixel-perfect (larger); False = high-q lossy
+WEBP_QUALITY = 92     # lossy mode: fidelity. lossless mode: compression effort (->100)
+WEBP_METHOD = 6       # libwebp effort (0-6): best ratio
+
 # ---- glitch (tuned live in docs/screenshots/logo-glitch-tuner) --------------
 # The ink SWITCHES clean to the target theme and holds (no dim); on top of it the
 # glyph is torn into a chromatic misregistration — offset colour
@@ -69,9 +81,10 @@ GHOSTS_PAPER = [(210, 24, 66), (0, 132, 194), (22, 150, 74), (124, 48, 196)]
 # NB: "standard" is intentionally left out — for the logo it's a near-white,
 # no-glow ink indistinguishable from "modern", so two adjacent white stops would
 # look like a glitch that changes nothing. One neutral beat (modern) is plenty.
+# (basename — each variant writes both <name>.webp and <name>.gif)
 VARIANTS = [
-    ("logo-spin.gif", "carolina", ["amber", "green", "modern"]),
-    ("logo-spin-light.gif", "carolina-light",
+    ("logo-spin", "carolina", ["amber", "green", "modern"]),
+    ("logo-spin-light", "carolina-light",
      ["amber-light", "green-light", "modern-light"]),
 ]
 
@@ -172,7 +185,7 @@ def spiderverse(img, env, rng, paper):
     return out
 
 
-def capture(browser, theme, stops, fname):
+def capture(browser, theme, stops, base):
     ctx = browser.new_context(
         viewport={"width": 900, "height": 200},
         device_scale_factor=SCALE,
@@ -258,17 +271,25 @@ def capture(browser, theme, stops, fname):
     mapped = [f.quantize(palette=pal, dither=Image.Dither.NONE) for f in frames]
 
     OUT.mkdir(exist_ok=True)
-    mapped[0].save(
-        OUT / fname,
-        save_all=True,
-        append_images=mapped[1:],
-        duration=FRAME_MS,
-        loop=0,
-        optimize=True,
+    # WebP primary: full 24-bit RGB frames, no palette (the quality win). In
+    # lossless mode `quality` is the compression *effort* (100 = smallest, still
+    # pixel-perfect); in lossy mode it's fidelity.
+    webp = OUT / f"{base}.webp"
+    frames[0].save(
+        webp, format="WEBP", save_all=True, append_images=frames[1:],
+        duration=FRAME_MS, loop=0, method=WEBP_METHOD,
+        lossless=WEBP_LOSSLESS,
+        quality=100 if WEBP_LOSSLESS else WEBP_QUALITY,
     )
-    kb = (OUT / fname).stat().st_size // 1024
+    # GIF twin: the 256-colour fallback
+    gif = OUT / f"{base}.gif"
+    mapped[0].save(
+        gif, format="GIF", save_all=True, append_images=mapped[1:],
+        duration=FRAME_MS, loop=0, optimize=True,
+    )
     tour = " -> ".join(seq) if starts else theme
-    print(f"[gif] {fname}: {FRAMES}f @ {FRAME_MS}ms, {len(starts)} hops [{tour}], {kb} KB")
+    print(f"[img] {base}: {FRAMES}f @ {FRAME_MS}ms, {len(starts)} hops [{tour}] "
+          f"-> webp {webp.stat().st_size // 1024} KB, gif {gif.stat().st_size // 1024} KB")
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
@@ -282,8 +303,8 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        for fname, theme, stops in VARIANTS:
-            capture(browser, theme, stops, fname)
+        for base, theme, stops in VARIANTS:
+            capture(browser, theme, stops, base)
         browser.close()
     srv.shutdown()
 

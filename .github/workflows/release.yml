@@ -1162,10 +1162,14 @@ jobs:
           cd tap
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Formula/cronstable.rb; then
+          # Stage FIRST, then compare the index: a plain `git diff` ignores
+          # untracked files, so on the formula's first publication it reported
+          # "no changes" and the job exited green without ever committing --
+          # the tap stayed empty while every release passed.
+          git add Formula/cronstable.rb
+          if git diff --cached --quiet; then
             echo "Formula already current for ${VERSION}."
             exit 0
           fi
-          git add Formula/cronstable.rb
           git commit -m "cronstable ${VERSION}"
           git push

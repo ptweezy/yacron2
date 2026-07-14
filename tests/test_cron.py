@@ -591,7 +591,8 @@ async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
     )
     launched = []
     monkeypatch.setattr(
-        cron, "maybe_launch_job",
+        cron,
+        "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
@@ -640,7 +641,8 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
     assert cron._cluster_owner_moved(job) is False
     launched = []
     monkeypatch.setattr(
-        cron, "maybe_launch_job",
+        cron,
+        "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     monkeypatch.setattr(cronstable.cron, "RETRY_GATE_RECHECK_FLOOR", 0.01)
@@ -664,9 +666,7 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
     deferred = [r for r in caplog.records if "deferred" in r.message]
     assert len(deferred) > 1  # the loop really re-checked several times
     assert [r.levelno for r in deferred].count(logging.INFO) == 1
-    assert all(
-        r.levelno in (logging.INFO, logging.DEBUG) for r in deferred
-    )
+    assert all(r.levelno in (logging.INFO, logging.DEBUG) for r in deferred)
     # (a settled view where the gate STAYS False is the genuine move case,
     # covered by test_schedule_retry_job_abandoned_when_no_longer_owner)
 
@@ -863,6 +863,14 @@ async def test_auth_middleware():
         await middleware(FakeRequest("Bearer wrong"), handler)
     with pytest.raises(web.HTTPUnauthorized):
         await middleware(FakeRequest(None), handler)
+    # a non-ASCII token must be a clean 401: compare_digest raises TypeError
+    # (-> 500 + traceback) on any non-ASCII str operand.
+    with pytest.raises(web.HTTPUnauthorized):
+        await middleware(FakeRequest("Bearer café"), handler)
+    # surrogates (raw header bytes that never decoded) cannot even encode --
+    # and can never match a real token; still a 401, not a 500.
+    with pytest.raises(web.HTTPUnauthorized):
+        await middleware(FakeRequest("Bearer t\udc80k"), handler)
 
 
 def test_web_site_from_url_bad_scheme():
@@ -4475,6 +4483,38 @@ def test_reload_drops_disabled_job(tmp_path, monkeypatch):
     cfg.write_text(_ONE_MINUTE_JOB.rstrip() + "\n    enabled: false\n")
     cron.update_config()
     assert "m" not in cron._next_fire  # disabled -> not scheduled
+
+
+def test_reload_prunes_finished_run_maps(tmp_path, monkeypatch):
+    # _apply_reload prunes _last_run_slot and the metric series of removed
+    # jobs; last_run and run_history must go with them. A removed job's
+    # display data is unreachable (every payload guards on cron_jobs
+    # membership first), so keeping it is a pure leak -- worst under classic
+    # crontabs, whose <file>:<line> job names are reminted by every line
+    # added or removed above them.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_BEFORE)
+    cron = cronstable.cron.Cron(str(cfg))
+    for name in ("keep", "drop"):
+        info = cronstable.cron.JobRunInfo(
+            outcome="success",
+            exit_code=0,
+            started_at=DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC),
+            finished_at=DT(2020, 1, 1, 0, 0, 1, tzinfo=UTC),
+            fail_reason=None,
+            output=JobOutputStream(),
+        )
+        cron.last_run[name] = info
+        cron.run_history[name].append(info)
+
+    cfg.write_text(_RELOAD_AFTER)
+    cron.update_config()
+    assert "drop" not in cron.last_run  # removed job's data pruned
+    assert "drop" not in cron.run_history
+    assert "keep" in cron.last_run  # surviving job's data kept
+    assert len(cron.run_history["keep"]) == 1
 
 
 def _count_crontab_calls(monkeypatch):

@@ -43,6 +43,14 @@ def test_more_token_formats_redacted():
     assert REDACTED in redact_secrets("sk_live_" + "a1B2" * 6)
     out = redact_secrets("Authorization: Basic dXNlcjpwYXNzd29yZA==")
     assert "dXNlcjpwYXNzd29yZA" not in out
+    # HTTP's whitespace after the colon is OPTIONAL: the unspaced form
+    # (curl -H "Authorization:Basic ...") is just as valid and leaked as-is.
+    out = redact_secrets("Authorization:Basic dXNlcjpwYXNzd29yZA==")
+    assert "dXNlcjpwYXNzd29yZA" not in out
+    # ...while "basic" still needs a separator anchoring it to the header
+    # name, so ordinary English stays untouched.
+    plain = "a basic understanding of headers"
+    assert redact_secrets(plain) == plain
 
 
 def test_escaped_quotes_in_quoted_values_do_not_leak_tail():

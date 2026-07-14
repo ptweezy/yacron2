@@ -753,6 +753,45 @@ async def test_decision_on_unowned_run_does_not_pin_wake(tmp_path):
         await _teardown(cron)
 
 
+async def test_next_wake_delay_prunes_stale_advance_locks(tmp_path):
+    # regression: advance_one setdefaults a per-ref Lock -- including for
+    # peer-owned runs reached via an approval or a recorded completion --
+    # and nothing pruned the map, so a long-lived daemon accumulated one
+    # Lock per run it ever touched.  The sweep must also never drop a lock
+    # that is held, awaited, or owned: a waiter resumes holding the OLD
+    # object, and a fresh setdefault would advance the same run twice.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        stale = ("lin", "manual-stale")
+        held = ("lin", "manual-held")
+        cron._dag._locks.setdefault(stale, asyncio.Lock())
+        held_lock = cron._dag._locks.setdefault(held, asyncio.Lock())
+        await held_lock.acquire()
+        cron._dag.next_wake_delay()
+        assert stale not in cron._dag._locks  # unowned + idle: swept
+        assert held in cron._dag._locks  # held: kept
+
+        # the release window: a waiter has been woken (its future resolved)
+        # but has not resumed -- the lock reads unlocked, yet dropping it now
+        # would strand the waiter on the old object while a newcomer mints a
+        # fresh one.  The sweep must skip it.
+        async def _waiter():
+            async with held_lock:
+                pass
+
+        task = asyncio.ensure_future(_waiter())
+        await asyncio.sleep(0)  # _waiter registers itself as a waiter
+        held_lock.release()  # wakes the waiter; it has not run yet
+        assert not held_lock.locked()
+        cron._dag.next_wake_delay()
+        assert held in cron._dag._locks  # waiter pending: kept
+        await task  # the waiter acquires + releases the SURVIVING lock
+        cron._dag.next_wake_delay()
+        assert held not in cron._dag._locks  # now truly idle: swept
+    finally:
+        await _teardown(cron)
+
+
 async def test_wake_ignores_inflight_sensor_poke(tmp_path):
     # regression: a RUNNING sensor whose poke subprocess is in flight kept
     # its stale PAST nextPokeAt as a wake candidate, pinning the loop's sleep

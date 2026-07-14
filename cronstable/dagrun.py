@@ -285,6 +285,25 @@ class DagScheduler:
         for ref in list(self._wake):
             if ref not in self._owned:
                 del self._wake[ref]
+        # prune per-run advance locks the same way: advance_one setdefaults
+        # an entry for every ref ever advanced here -- including peer-owned
+        # runs reached via an approval or a recorded completion -- and
+        # nothing else removes them (only a backend swap clears the map), so
+        # a long-lived daemon would hold one Lock per run it ever touched.
+        # Owned refs stay (they are hot), and a lock is never dropped while
+        # held or awaited: a waiter resumes holding the OLD object, so
+        # dropping it would let the next arrival mint a fresh Lock and
+        # advance the same run concurrently.  asyncio.Lock has no public
+        # waiter count; if the private _waiters peek ever stops resolving,
+        # getattr's None keeps this pruning (fail-open) rather than the leak.
+        for ref in list(self._locks):
+            lock = self._locks[ref]
+            if (
+                ref not in self._owned
+                and not lock.locked()
+                and not getattr(lock, "_waiters", None)
+            ):
+                del self._locks[ref]
         candidates = [self._next_sched_check]
         candidates.extend(self._wake.values())
         for pc in self._pending_completions.values():

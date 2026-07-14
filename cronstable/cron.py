@@ -726,6 +726,13 @@ class Cron:
         # forward-only next-fire index below is what actually de-duplicates
         # launches, so this no longer gates firing. See _launch_plan.
         self._last_run_slot = {}  # type: Dict[str, datetime.datetime]
+        # name -> most recent finished run, for the web UI (in-memory only)
+        # name -> bounded history of recent finished runs, oldest first, for
+        # the web UI's history/stats view (in-memory only, like last_run).
+        # Both pruned on reload like _last_run_slot; initialized HERE, before
+        # the update_config() below runs _apply_reload the first time.
+        self.last_run = {}  # type: Dict[str, JobRunInfo]
+        self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         # The next-fire index: name -> the aware-UTC instant the job next
         # fires, for every enabled CronTab job (a @reboot/string schedule or a
         # disabled job is absent). _fire_heap is a min-heap of (when, name)
@@ -767,11 +774,6 @@ class Cron:
         self._stop_event = asyncio.Event()
         self._jobs_running = asyncio.Event()
         self.retry_state = {}  # type: Dict[str, JobRetryState]
-        # name -> most recent finished run, for the web UI (in-memory only)
-        self.last_run = {}  # type: Dict[str, JobRunInfo]
-        # name -> bounded history of recent finished runs, oldest first, for
-        # the web UI's history/stats view (in-memory only, like last_run)
-        self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
         # the optional MCP server config and its handler. Both track the web
@@ -1333,6 +1335,16 @@ class Cron:
             for name, slot in self._last_run_slot.items()
             if name in keep
         }
+        # Prune the finished-run display data the same way. A removed job's
+        # last_run/run_history is unreachable (jobs_payload and the /runs
+        # endpoints iterate cron_jobs only), so keeping it is pure leaked
+        # memory -- worst under classic crontabs, whose <file>:<line> job
+        # names are reminted by every line added or removed above them.
+        self.last_run = {
+            name: info for name, info in self.last_run.items() if name in keep
+        }
+        for name in [n for n in self.run_history if n not in keep]:
+            del self.run_history[name]
         # Bring the next-fire index in step with the new job set: drop removed
         # / now-unscheduled jobs, reseed jobs whose schedule changed, and keep
         # the existing next-fire for jobs whose schedule is unchanged (a reseed
@@ -3671,6 +3683,8 @@ class Cron:
     def _make_auth_middleware(
         token: str, public_paths: "frozenset[str]" = frozenset()
     ):
+        token_bytes = token.encode("utf-8")
+
         @web.middleware
         async def auth_middleware(request, handler):
             if public_paths and request.path in public_paths:
@@ -3680,9 +3694,17 @@ class Cron:
             # RFC 7235: the auth scheme is case-insensitive (Bearer/bearer).
             # Compare only the token, in constant time, to avoid leaking it via
             # timing (the scheme is not secret).
-            if scheme.lower() != "bearer" or not hmac.compare_digest(
-                presented, token
-            ):
+            if scheme.lower() != "bearer":
+                raise web.HTTPUnauthorized()
+            try:
+                # compare as bytes: compare_digest raises TypeError on any
+                # non-ASCII str (turning a garbage token into a 500, not a
+                # 401), and a header that cannot even encode (surrogates
+                # from raw header bytes) can never match a real token.
+                presented_bytes = presented.encode("utf-8")
+            except UnicodeEncodeError:
+                raise web.HTTPUnauthorized() from None
+            if not hmac.compare_digest(presented_bytes, token_bytes):
                 raise web.HTTPUnauthorized()
             return await handler(request)
 

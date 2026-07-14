@@ -56,6 +56,26 @@ STATE_OP_TIMEOUT = 10.0
 # ``lock/<scope>/<name>#<i>``; distinct from every scheduler lease name.
 LOCK_LEASE_PREFIX = "lock/"
 
+# Ceiling on a semaphore's permit count.  Every permit is a distinct lease
+# the acquire loop probes SEQUENTIALLY per pass, so ``permits`` comes straight
+# from the request body and an absurd value (--permits 1000000000) would turn
+# one CLI call into up to a billion awaited store operations.  1024 is far
+# beyond any sane job-coordination semaphore while keeping a full
+# under-contention pass bounded.
+MAX_LOCK_PERMITS = 1024
+
+
+def _bracket_host(host: str) -> str:
+    """A host formatted for a URL authority (IPv6 literals bracketed).
+
+    The bound address comes back from getsockname() bare (``::1``), but the
+    base URL built from it is injected into every job as CRONSTABLE_STATE_URL
+    -- and ``http://::1:8080`` is unparseable (no way to tell which colon
+    splits the port).
+    """
+    return "[{}]".format(host) if ":" in host else host
+
+
 # Environment variables injected into every job when the endpoint is enabled.
 # CRONSTABLE_JOB_NAME deliberately matches the key ShellReporter already sets.
 ENV_URL = "CRONSTABLE_STATE_URL"
@@ -197,6 +217,10 @@ class JobLockManager:
         """
         if permits < 1:
             raise JobStateError("permits must be >= 1")
+        if permits > MAX_LOCK_PERMITS:
+            raise JobStateError(
+                "permits must be <= {}".format(MAX_LOCK_PERMITS)
+            )
         backend = self._backend_getter()
         if backend is None:
             raise JobStateError("state backend is unavailable", status=503)
@@ -448,7 +472,9 @@ class JobStateAPI:
         if runner.addresses:
             addr = runner.addresses[0]
             bound_host, bound_port = str(addr[0]), int(addr[1])
-        self._base_url = "http://{}:{}".format(bound_host, bound_port)
+        self._base_url = "http://{}:{}".format(
+            _bracket_host(bound_host), bound_port
+        )
         self._runner = runner
         logger.info("state job API listening on %s", self._base_url)
 

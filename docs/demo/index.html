@@ -910,7 +910,11 @@
   .wb-next.run { color: var(--run); }
   .wb-next.run.long { color: var(--pending); }
   .wb-last { font-weight: 700; font-size: calc(15px * var(--wb-u, 1)); font-variant-numeric: tabular-nums; margin-top: auto;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    display: flex; gap: 4px; min-width: 0; white-space: nowrap; overflow: hidden; }
+  /* on a tight tile the AGE yields, never the exit code -- "16s… · exit 69"
+     still answers "what broke"; "16s ago · exi…" answers nothing */
+  .wb-last .wb-ago { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+  .wb-last .wb-exit { flex: none; }
   .wb-last.fail { color: var(--fail); }
   .wb-last.cancelled { color: var(--cancelled); }
   .wb-last.unknown { color: var(--unknown); }
@@ -970,14 +974,16 @@
   .wb-verdict.sev-crit { background: color-mix(in srgb, var(--fail) 12%, var(--bg)); border-bottom-color: var(--fail); }
   .wb-verdict.sev-crit .head { color: var(--fail); }
   body.fx .wb-verdict.sev-crit .head { text-shadow: 0 0 10px color-mix(in srgb, var(--fail) 60%, transparent); }
-  /* compact tile mode (fit governor): trade the spark for density before
-     anything has to be cut */
+  /* compact tile mode (fit governor): denser tiles before anything has to be
+     cut. Compact rows stretch (1fr) to fill the glass, so the spark is only
+     dropped while the rows are actually tight -- wb-roomy (stretched rows
+     re-earn the spark's height) keeps the trail */
   .wallboard.wb-compact .wb-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); grid-auto-rows: minmax(68px, 1fr); gap: 8px; padding: 12px; }
   .wallboard.wb-compact .wb-tile { padding: 6px 9px; gap: 2px; }
   .wallboard.wb-compact .wb-glyph { font-size: 15px; }
   .wallboard.wb-compact .wb-name { font-size: 12px; }
   .wallboard.wb-compact .wb-next, .wallboard.wb-compact .wb-last { font-size: 11px; }
-  .wallboard.wb-compact .wb-spark { display: none; }
+  .wallboard.wb-compact:not(.wb-roomy) .wb-spark { display: none; }
   body.tv > header, body.tv > main { display: none; }
   /* Surfaces the app can open while the wallboard is up -- the auto-opened 401
      token modal, the ⌘K palette, the drawer, toasts -- must stack ABOVE its
@@ -4469,9 +4475,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
           // existing per-second pass, so the age stays live between polls
           line = '<div class="wb-last ' + h.key + '">' +
             (lr && lr.finished_at
-              ? '<span data-ago="' + escAttr(lr.finished_at) + '">' + esc(fmtAgo(lr.finished_at)) + "</span>"
-              : "<span>" + (h.key === "unknown" ? "interrupted" : "—") + "</span>") +
-            (h.key === "fail" && lr && lr.exit_code != null ? " · exit " + esc(lr.exit_code) : "") +
+              ? '<span class="wb-ago" data-ago="' + escAttr(lr.finished_at) + '">' + esc(fmtAgo(lr.finished_at)) + "</span>"
+              : '<span class="wb-ago">' + (h.key === "unknown" ? "interrupted" : "—") + "</span>") +
+            (h.key === "fail" && lr && lr.exit_code != null ? '<span class="wb-exit">· exit ' + esc(lr.exit_code) + "</span>" : "") +
             "</div>";
         } else if (!job.enabled) {
           line = '<div class="wb-next">—</div>';
@@ -4555,10 +4561,17 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   }
   // ---- fit-to-screen governor ---------------------------------------
   // A TV has no one to scroll it, so the grid must never silently clip.
-  // Three regimes, re-decided on every paint and resize:
+  // Regimes, re-decided on every paint and resize:
   //   sparse  -- fewer tiles than fill the screen at 190px: grow them (and
   //              their type, via the --wb-u scale unit) to use the glass;
-  //   compact -- too many for full tiles: denser 120px tiles, spark dropped;
+  //   scaled  -- full tiles shrink to as little as WB_SPARSE_MIN before
+  //              giving anything up: a smaller tile that keeps its name,
+  //              glance line AND spark beats compact density, which buys
+  //              room a mid-size board then wastes as stretched dead space;
+  //   compact -- below the floor: denser 120px tiles. Compact rows stretch
+  //              (1fr) to fill the glass, so when the stretched height
+  //              re-earns the spark (roomyH) the trail comes back
+  //              (wb-roomy); only a truly tight board drops it;
   //   cut     -- too many even compact: hide the tail (worst-first sorting
   //              makes it the least interesting slice) behind an explicit
   //              footer chip computed from what was ACTUALLY cut.
@@ -4569,16 +4582,18 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   // over-penalizing dense boards the way a padded constant would.
   // ch stays in lockstep with the .wb-compact grid-auto-rows rule; pad/cpad
   // are per-regime model paddings (measuring the live padding would make the
-  // compact<->full decision depend on the regime already applied).
-  const WB_TILE = { w: 190, fixH: 41, varH: 95, gap: 12, pad: 18, cw: 120, ch: 68, cgap: 8, cpad: 12 };
-  const WB_SPARSE_MIN = 0.85;   // below this scale full tiles read worse than compact density
+  // compact<->full decision depend on the regime already applied). roomyH is
+  // the compact tile's content stack including its 16px spark (~80px) plus
+  // breathing room, so a wb-roomy tile never clips the trail it re-admits.
+  const WB_TILE = { w: 190, fixH: 41, varH: 95, gap: 12, pad: 18, cw: 120, ch: 68, cgap: 8, cpad: 12, roomyH: 92 };
+  const WB_SPARSE_MIN = 0.7;    // full-tile floor: glance type ~12px, name ~9px -- small, but it keeps the trail
   function fitWallboardGrid() {
     if (!state.wallboard) return;
     const g = $("wbGrid"), wb = $("wallboard"), chip = $("wbMore");
     const tiles = g.children, n = tiles.length;
     const W = g.clientWidth - 2 * WB_TILE.pad;
     const H = g.clientHeight - 2 * WB_TILE.pad;
-    let compact = false, cap = n, u = 1, cols = 0;
+    let compact = false, roomy = false, cap = n, u = 1, cols = 0;
     if (n && W > 0 && H > 0) {
       // the largest uniform scale that shows all n full-size tiles unclipped
       let best = 0;
@@ -4597,9 +4612,15 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         const cc = Math.max(1, Math.floor((W2 + WB_TILE.cgap) / (WB_TILE.cw + WB_TILE.cgap)));
         const cr = Math.max(1, Math.floor((H2 + WB_TILE.cgap) / (WB_TILE.ch + WB_TILE.cgap)));
         cap = cc * cr;
+        // 1fr stretches the rows actually shown to fill the glass: when the
+        // stretch re-earns the spark's height, keep the trail -- density
+        // that pays out as dead space is worse than the tiles it replaced
+        const rowsShown = Math.max(1, Math.ceil(Math.min(n, cap) / cc));
+        roomy = (H2 - (rowsShown - 1) * WB_TILE.cgap) / rowsShown >= WB_TILE.roomyH;
       }
     }
     wb.classList.toggle("wb-compact", compact);
+    wb.classList.toggle("wb-roomy", roomy);
     wb.style.setProperty("--wb-u", u.toFixed(2));
     g.style.gridTemplateColumns = cols ? "repeat(" + cols + ", 1fr)" : "";
     g.style.gridAutoRows = cols ? "minmax(" + Math.floor(WB_TILE.fixH + WB_TILE.varH * u) + "px, 1fr)" : "";

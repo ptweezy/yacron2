@@ -39,13 +39,15 @@ CLI, configuration, and APIs are untouched.
 - **The grid fits itself to the glass.** A TV has no one to scroll it, so a
   new fit governor re-decides the layout on every paint, resize, and zoom
   change: a handful of jobs on a big screen grows its tiles and type
-  proportionally to use the glass; a crowded fleet steps down to compact
-  tiles (sparkline dropped) before anything has to go; and if even that
-  overflows, the healthiest tail is cut behind an explicit footer chip
-  computed from what was actually cut (`+22 offscreen . none failing`,
-  turning red with exact counts if failing or unknown tiles ever overflow a
-  whole screen).  The board never silently clips a failure behind a scrollbar
-  nobody can reach.
+  proportionally to use the glass; a crowded fleet first scales full tiles
+  down -- name, glance line, and run-history sparkline all kept -- before
+  conceding anything; only past the readability floor does it step down to
+  compact tiles, and even those keep the sparkline whenever their stretched
+  rows leave it room; and if even compact overflows, the healthiest tail is
+  cut behind an explicit footer chip computed from what was actually cut
+  (`+22 offscreen . none failing`, turning red with exact counts if failing
+  or unknown tiles ever overflow a whole screen).  The board never silently
+  clips a failure behind a scrollbar nobody can reach.
 
 - **Wallboard correctness fixes.** The `unknown` state was missing from the
   worst-first sort order, which left the entire tile ordering unspecified

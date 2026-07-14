@@ -344,9 +344,11 @@ event, or cluster alert — the same correlation verdict the dashboard's bar
 shows). Clicking a tile exits to that job's drawer; `Esc` or `w` exits.
 
 The grid also fits itself to the glass: a handful of jobs on a big screen get
-proportionally larger tiles and type, a crowded fleet steps down to compact
-tiles, and if even that overflows, the healthiest tail is cut behind an
-explicit footer chip (`+22 offscreen · none failing`) — computed from what was
+proportionally larger tiles and type, a crowded fleet scales full tiles down
+(names, glance lines and sparklines all kept) before stepping down to compact
+tiles — which keep the sparkline too whenever their rows have room for it —
+and if even that overflows, the healthiest tail is cut behind an explicit
+footer chip (`+22 offscreen · none failing`) — computed from what was
 actually cut, so the board never silently clips a failure behind a scrollbar
 nobody can reach.
 

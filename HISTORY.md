@@ -5,6 +5,34 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.15 (2026-07-13)
+
+A maintenance release: no functional changes to cronstable itself -- the
+package, the CLI, and every shipped binary behave exactly as in 1.2.14.  It
+consolidates the project's separate CI workflows into one gated pipeline,
+hardens the release automation and updates the contributor
+docs to match.
+
+- **One CI/CD pipeline.** The former `build.yml`, `docker.yml`, and `tox.yml`
+  are folded into a single `release.yml` that builds and tests the whole product
+  on every push and pull request -- the tox lint/mypy/pytest matrix, the wheel +
+  sdist, every self-contained binary (Linux glibc and musl across the full arch
+  set, macOS arm64/amd64, Windows amd64/arm64), and all eight Docker images --
+  and gates a release on all of it.  Nothing publishes on an ordinary commit; a
+  release still ships the PyPI upload, the GitHub Release with every binary and a
+  single `SHA256SUMS`, the container images, and the Homebrew tap update, but
+  only after the entire build + test matrix is green.
+
+- **Reliable release publishing.** The consolidated pipeline attaches every
+  release asset in one shot as the GitHub Release is created (no separate attach
+  step that could fail against an already-published, immutable release), and the
+  Homebrew tap update is no longer best-effort -- if the tap cannot be updated
+  (for example, a missing token) the release now fails loudly instead of
+  finishing green with a stale formula.
+
+- **Contributor docs.** `CONTRIBUTING.md` and the "Contributing and Releasing"
+  wiki page are rewritten for the single-pipeline flow.
+
 ## 1.2.13 (2026-07-08)
 
 cronstable becomes drivable by an AI agent.  A new, opt-in **MCP server**

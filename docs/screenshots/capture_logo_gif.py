@@ -7,21 +7,28 @@ inline transform). Every frame lands on an exact fraction of a revolution, so
 the last frame wraps perfectly onto the first and the loop never stutters.
 
 The loop spans several whole revolutions (LOOP_REVS) so a single glitch can be
-buried mid-loop: for ~15 frames the brand's ink *switches* clean to another
-theme's palette (no dim — it holds the new colour) while the glyph is torn into
-a chromatic misregistration — offset silhouettes in saturated
-red / cyan / green / violet, jittering per frame — plus a digital slice tear,
-then it snaps back. A GIF repeats identically every cycle, so stretching the
-loop is the only way to make the glitch read as *occasional* rather than every
+buried mid-loop: for ~10 frames the brand's ink *switches* clean to the next
+theme (no dim — it holds the new colour from there on) while the whole wordmark
+eases sideways and the glyph splits into a chromatic misregistration — offset
+silhouettes in saturated red / cyan / green / violet plus a digital slice tear
+— which pulses once and settles. A GIF repeats identically every cycle, so
+stretching the loop is the only way to make the glitch read as *occasional*
+rather than every
 second. Pixel dimensions are unchanged — only the loop gets longer. This touches
 the exported GIFs only; the live dashboard mark is left exactly as it was.
 
 The replay speed is derived from the page's MARK_CRUISE constant, so a retune
 there keeps the GIF honest on the next regen.
 
-Needs playwright (+ its Chromium) and Pillow. GIFs land in shots/.
+Each variant is written twice: a 24-bit `<name>.webp` (the primary — no
+256-palette banding on the glow or the glitch's saturated ghosts) and a
+256-colour `<name>.gif` twin for clients that don't render animated WebP, the
+same webp-primary / gif-fallback convention as build_reel.py.
+
+Needs playwright (+ its Chromium) and Pillow. Files land in shots/.
 """
 import http.server
+import math
 import random
 import re
 import threading
@@ -29,7 +36,7 @@ from functools import partial
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageEnhance, ImageOps
+from PIL import Image, ImageChops, ImageOps
 from playwright.sync_api import sync_playwright
 
 WEB = Path(__file__).resolve().parents[2] / "cronstable" / "web"
@@ -40,20 +47,30 @@ PORT = 8123
 # floor, so DON'T raise it for smoothness (it would only slow the spin). Extra
 # frames come from more revolutions instead.
 FRAMES_PER_REV = 52   # angular resolution of one revolution (true-speed at ~20ms)
-LOOP_REVS = 16        # whole revolutions per loop; more revs => each stop holds longer
+LOOP_REVS = 43        # whole revolutions per loop; more revs => each stop holds longer
 FRAMES = FRAMES_PER_REV * LOOP_REVS
 PAD = 12              # css px around the brand box (glow + rotation overflow)
 SCALE = 2             # device pixels per css px, matches the PNG set
+
+# WebP is the primary (24-bit colour -> no 256-palette banding on the glow or
+# the glitch's saturated ghosts); the GIF is a 256-colour twin for clients that
+# don't render animated WebP. Mirrors docs/screenshots/build_reel.py.
+WEBP_LOSSLESS = True  # True = pixel-perfect (larger); False = high-q lossy
+WEBP_QUALITY = 92     # lossy mode: fidelity. lossless mode: compression effort (->100)
+WEBP_METHOD = 6       # libwebp effort (0-6): best ratio
 
 # ---- glitch (tuned live in docs/screenshots/logo-glitch-tuner) --------------
 # The ink SWITCHES clean to the target theme and holds (no dim); on top of it the
 # glyph is torn into a chromatic misregistration — offset colour
 # silhouettes that jitter per frame — plus a digital slice tear.
 GLITCH = True
-GLITCH_MS = 300       # length of each glitch/switch (clamped to whole frames, ~15f)
+GLITCH_MS = 200       # length of each glitch/switch (clamped to whole frames, ~10f)
 GLITCH_SPLIT = 4.5    # px of chromatic offset for the colour ghosts at peak
 GLITCH_TEAR = 3       # horizontal slice shears at the peak (0 = none)
-SEED = 20260708       # fixes the per-frame jitter so regens are reproducible
+GLITCH_MOVE = 2.0     # css px the wordmark itself eases sideways & back (peak, *SCALE)
+MIN_HOLD_MS = 2500    # a colour holds at least this long before it can hop again
+SEED = 20260708       # fixes the per-frame glitch jitter (reproducible)
+HOP_SEED = 7          # fixes the random hop spacing; reroll for a different rhythm
 
 # the saturated silhouette inks the glyph splits into during a glitch. Screened
 # on over a dark theme (they glow) and multiplied under a paper theme (they read
@@ -69,9 +86,10 @@ GHOSTS_PAPER = [(210, 24, 66), (0, 132, 194), (22, 150, 74), (124, 48, 196)]
 # NB: "standard" is intentionally left out — for the logo it's a near-white,
 # no-glow ink indistinguishable from "modern", so two adjacent white stops would
 # look like a glitch that changes nothing. One neutral beat (modern) is plenty.
+# (basename — each variant writes both <name>.webp and <name>.gif)
 VARIANTS = [
-    ("logo-spin.gif", "carolina", ["amber", "green", "modern"]),
-    ("logo-spin-light.gif", "carolina-light",
+    ("logo-spin", "carolina", ["amber", "green", "modern"]),
+    ("logo-spin-light", "carolina-light",
      ["amber-light", "green-light", "modern-light"]),
 ]
 
@@ -108,27 +126,41 @@ def journey(base, stops):
     Returns (seq, starts): `seq` is the held colour per segment, `starts[i]` is
     the frame the glitch that switches INTO seq[i+1] begins on. seq[0] == the
     base and the last segment is the base again, so the base spans the seam.
+
+    Hops are placed at RANDOM (but floored) intervals so the glitches don't fall
+    on a predictable beat — each colour holds at least MIN_HOLD_MS, with the rest
+    of the loop shared out by random weights. Deterministic via SEED.
     """
     seq = [base] + list(stops) + [base] if GLITCH and stops else [base]
     hops = len(seq) - 1
     if hops <= 0:
         return seq, []
     length = max(1, round(GLITCH_MS / FRAME_MS))
-    starts = [round(i / (hops + 1) * FRAMES) for i in range(1, hops + 1)]
-    starts[-1] = min(starts[-1], FRAMES - length - 2)  # resolve before the seam
+    segs = hops + 1
+    floor = length + round(MIN_HOLD_MS / FRAME_MS)     # min frames per segment
+    free = FRAMES - floor * segs
+    rng = random.Random(HOP_SEED)
+    if free <= 0:                                      # loop too short: even split
+        seg_lens = [FRAMES // segs] * segs
+    else:
+        w = [rng.uniform(1.0, 3.2) for _ in range(segs)]
+        wt = sum(w)
+        seg_lens = [floor + int(free * x / wt) for x in w]
+    seg_lens[-1] += FRAMES - sum(seg_lens)             # absorb rounding drift
+    starts, acc = [], 0
+    for L in seg_lens[:-1]:
+        acc += L
+        starts.append(acc)
+    starts[-1] = min(starts[-1], FRAMES - length - 2)  # last hop resolves pre-seam
     return seq, starts
 
 
 def glitch_env(i, span):
-    """0..1 aberration strength across a glitch of `span` frames: a fast rise, a
-    plateau while the switched colour holds, a fast fall — a *switch*, not a
-    pulse."""
-    rise = fall = min(3, span // 3)
-    if i < rise:
-        return (i + 1) / (rise + 1)
-    if i >= span - fall:
-        return (span - i) / (fall + 1)
-    return 1.0
+    """0..1 aberration strength across a glitch of `span` frames: one smooth
+    rise-and-fall, ~0 at the ends so the base wordmark returns home cleanly. The
+    colour *switch* itself is separate (held from the hop onward); this only
+    shapes the chromatic-split / tear / base-slide intensity."""
+    return math.sin(math.pi * (i + 0.5) / span)
 
 
 def _silhouette(gray, color, paper):
@@ -141,9 +173,11 @@ def _silhouette(gray, color, paper):
 
 def spiderverse(img, env, rng, paper):
     """Split the (already colour-switched) glyph into jittered, saturated
-    silhouettes for a chromatic misregistration, then slice-tear."""
+    silhouettes for a chromatic misregistration, then slice-tear. The whole
+    wordmark also eases sideways (GLITCH_MOVE) so the foundation itself moves."""
     if env <= 0:
         return img
+    img = ImageChops.offset(img, int(round(GLITCH_MOVE * SCALE * env)), 0)
     gray = img.convert("L")
     ghosts = GHOSTS_PAPER if paper else GHOSTS_DARK
     reach = GLITCH_SPLIT * SCALE * (0.55 + 0.75 * env)
@@ -155,9 +189,8 @@ def spiderverse(img, env, rng, paper):
         dy = int(round(rng.uniform(-reach, reach) * 0.55))
         layer = ImageChops.offset(_silhouette(gray, ghosts[gi], paper), dx, dy)
         if paper:
-            out = ImageChops.darker(out, layer)  # colours print under the paper
+            out = ImageChops.darker(out, layer)   # colours print under the paper
         else:
-            layer = ImageEnhance.Brightness(layer).enhance(0.5 + 0.5 * env)
             out = ImageChops.lighter(out, layer)  # colours glow over the black
     if GLITCH_TEAR:
         w, h = out.size
@@ -172,7 +205,7 @@ def spiderverse(img, env, rng, paper):
     return out
 
 
-def capture(browser, theme, stops, fname):
+def capture(browser, theme, stops, base):
     ctx = browser.new_context(
         viewport={"width": 900, "height": 200},
         device_scale_factor=SCALE,
@@ -258,17 +291,28 @@ def capture(browser, theme, stops, fname):
     mapped = [f.quantize(palette=pal, dither=Image.Dither.NONE) for f in frames]
 
     OUT.mkdir(exist_ok=True)
-    mapped[0].save(
-        OUT / fname,
-        save_all=True,
-        append_images=mapped[1:],
-        duration=FRAME_MS,
-        loop=0,
-        optimize=True,
+    # WebP primary: full 24-bit RGB frames, no palette (the quality win). In
+    # lossless mode `quality` is the compression *effort* (100 = smallest, still
+    # pixel-perfect); in lossy mode it's fidelity.
+    webp = OUT / f"{base}.webp"
+    frames[0].save(
+        webp, format="WEBP", save_all=True, append_images=frames[1:],
+        duration=FRAME_MS, loop=0, method=WEBP_METHOD,
+        lossless=WEBP_LOSSLESS,
+        quality=100 if WEBP_LOSSLESS else WEBP_QUALITY,
     )
-    kb = (OUT / fname).stat().st_size // 1024
+    # GIF twin: the 256-colour fallback
+    gif = OUT / f"{base}.gif"
+    mapped[0].save(
+        gif, format="GIF", save_all=True, append_images=mapped[1:],
+        duration=FRAME_MS, loop=0, optimize=True,
+    )
     tour = " -> ".join(seq) if starts else theme
-    print(f"[gif] {fname}: {FRAMES}f @ {FRAME_MS}ms, {len(starts)} hops [{tour}], {kb} KB")
+    bounds = [0, *starts, FRAMES]
+    holds = "/".join(f"{(b - a) * FRAME_MS / 1000:.1f}" for a, b in zip(bounds, bounds[1:]))
+    print(f"[img] {base}: {FRAMES}f @ {FRAME_MS}ms ({FRAMES * FRAME_MS / 1000:.1f}s), "
+          f"{len(starts)} hops [{tour}], holds {holds}s "
+          f"-> webp {webp.stat().st_size // 1024} KB, gif {gif.stat().st_size // 1024} KB")
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
@@ -282,8 +326,8 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        for fname, theme, stops in VARIANTS:
-            capture(browser, theme, stops, fname)
+        for base, theme, stops in VARIANTS:
+            capture(browser, theme, stops, base)
         browser.close()
     srv.shutdown()
 

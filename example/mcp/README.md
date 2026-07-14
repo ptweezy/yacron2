@@ -7,7 +7,7 @@ observe and control the scheduler.
 ## Run it
 
 ```shell
-docker compose -f docker-compose-mcp.yml up --build
+docker compose -f example/mcp/docker-compose.yml up --build
 ```
 
 - Dashboard: <http://localhost:8080/> (enter the token `dev-token` when

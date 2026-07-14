@@ -15,7 +15,7 @@
 # PULSE_TARGET (and tighten/relax PULSE_BUDGET_MS) in the environment.
 #
 #   # in a container (publishes the dashboard on :8080)
-#   docker compose -f docker-compose-pulse.yml up --build
+#   docker compose -f example/pulse-monitor/docker-compose.yml up --build
 #
 #   # or locally, from a checkout
 #   cronstable -c example/pulse-monitor/cronstable.yaml

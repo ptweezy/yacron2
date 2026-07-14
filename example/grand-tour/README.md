@@ -29,7 +29,7 @@ If you only run one example, run this one. For a gentler start see
 ## Run it
 
 ```console
-docker compose -f docker-compose-grand-tour.yml up --build
+docker compose -f example/grand-tour/docker-compose.yml up --build
 ```
 
 The nine nodes build the image from this repo, so the example works before the
@@ -41,7 +41,7 @@ state/DAG features ship in a published release. Then open:
 | Prometheus metrics (per node) | <http://localhost:8080/metrics> |
 | On-call inbox (Mailpit) | <http://localhost:8025/> |
 | Job metrics (statsd → Prometheus) | <http://localhost:9102/metrics> |
-| Webhook sink | `docker compose -f docker-compose-grand-tour.yml logs -f webhook-sink` |
+| Webhook sink | `docker compose -f example/grand-tour/docker-compose.yml logs -f webhook-sink` |
 
 Nine full nodes plus the sinks (and the second-level probes ticking every 2s on
 each node) is a real load on a laptop. Trim nodes or probes if it runs hot.
@@ -49,7 +49,7 @@ each node) is a real load on a laptop. Trim nodes or probes if it runs hot.
 Stop and wipe everything (including the throwaway certs and the state store):
 
 ```console
-docker compose -f docker-compose-grand-tour.yml down -v
+docker compose -f example/grand-tour/docker-compose.yml down -v
 ```
 
 ## How it all coordinates
@@ -142,20 +142,20 @@ their own:
 
 1. **Watch the spread.** Open two dashboards side by side and compare each job's
    **Owner**. Stop a node
-   (`docker compose -f docker-compose-grand-tour.yml stop meridian-a`) and watch
-   its owned jobs and DAGs re-home to the survivors.
+   (`docker compose -f example/grand-tour/docker-compose.yml stop meridian-a`)
+   and watch its owned jobs and DAGs re-home to the survivors.
 2. **Lose quorum.** Stop 5 of 9 nodes: `Leader` jobs stand down (dashboard shows
    *no quorum*), while `PreferLeader` jobs keep running.
 3. **Compare single-leader vs spread.**
-   `DISTRIBUTION=single-leader docker compose -f docker-compose-grand-tour.yml up -d`
+   `DISTRIBUTION=single-leader docker compose -f example/grand-tour/docker-compose.yml up -d`
    and watch every owned job collapse onto one node.
 4. **Swap the leadership backend.** Bring the fleet up with the shared-mount
    lease instead of the gossip mesh — no certs, no `/peer` endpoint, election is
    one file on the state volume (single-leader only):
 
    ```console
-   docker compose -f docker-compose-grand-tour.yml down
-   BACKEND=filesystem docker compose -f docker-compose-grand-tour.yml up
+   docker compose -f example/grand-tour/docker-compose.yml down
+   BACKEND=filesystem docker compose -f example/grand-tour/docker-compose.yml up
    ```
 
    Stop the leader and watch a follower adopt the lease file within a TTL.
@@ -163,7 +163,7 @@ their own:
    [`platform.yaml`](platform.yaml), then:
 
    ```console
-   WEB_TOKEN=s3cret docker compose -f docker-compose-grand-tour.yml up -d
+   WEB_TOKEN=s3cret docker compose -f example/grand-tour/docker-compose.yml up -d
    curl -i http://localhost:8080/status                       # 401 Unauthorized
    curl -H 'Authorization: Bearer s3cret' http://localhost:8080/status   # 200
    curl -i http://localhost:8080/metrics                      # still public (200)
@@ -206,7 +206,7 @@ their own:
     at the config dir the entrypoint assembled inside any node):
 
     ```console
-    dc="docker compose -f docker-compose-grand-tour.yml"
+    dc="docker compose -f example/grand-tour/docker-compose.yml"
     $dc exec meridian-a cronstable -c /tmp/cronstable.d state check         # inventory: record counts per prefix
     $dc exec meridian-a cronstable -c /tmp/cronstable.d state gc --dry-run  # preview reclaimable state
     $dc exec meridian-a cronstable -c /tmp/cronstable.d state backup -o /tmp/meridian-state.tar.gz
@@ -256,6 +256,7 @@ See [`example/kubernetes`](../kubernetes) and
 
 | File | Purpose |
 | --- | --- |
+| [`docker-compose.yml`](docker-compose.yml) | the nine nodes plus the Mailpit / statsd / webhook sinks; its header comments list the things to try |
 | [`platform.yaml`](platform.yaml) | the annotated job set + DAGs + `state:` + `web:` (mounted identically into all nine nodes) |
 | [`_defaults.yaml`](_defaults.yaml) | shared `defaults:` + custom `logging:`, pulled in via `include:` |
 | [`legacy.crontab`](legacy.crontab) | a classic Vixie crontab, loaded as-is from the same config dir |

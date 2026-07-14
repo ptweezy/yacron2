@@ -44,7 +44,7 @@ The DAGs
 Try it
 ------
 
-  docker compose -f docker-compose.yml up --build
+  docker compose -f example/dag-cluster/docker-compose.yml up --build
 
   # one leader; the shard-etl DAG fires every 2 minutes. Watch the dashboards:
   #   http://localhost:8080/   http://localhost:8081/   http://localhost:8082/
@@ -69,7 +69,7 @@ Try it
 
   # failover / crash-resume: stop the current leader mid-run; another node
   # adopts its runs within a lease TTL and finishes them from durable state:
-  docker compose -f docker-compose.yml stop cronstable-a
+  docker compose -f example/dag-cluster/docker-compose.yml stop cronstable-a
 
 Notes
 -----

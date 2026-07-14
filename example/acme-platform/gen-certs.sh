@@ -1,8 +1,8 @@
 #!/bin/sh
 # Generate a throwaway cluster CA and one leaf cert per node for the "ACME
-# Orders" cluster demo (docker-compose-acme.yml). Run by the `certgen` service
-# into the shared volume before the nodes start. Same as the other cluster
-# demos' gen-certs.sh, just with the five ACME node names.
+# Orders" cluster demo (example/acme-platform/docker-compose.yml). Run by the
+# `certgen` service into the shared volume before the nodes start. Same as the
+# other cluster demos' gen-certs.sh, just with the five ACME node names.
 #
 # FOR LOCAL EXPERIMENTATION ONLY. Real deployments provision per-node certs from
 # their own PKI; cronstable only consumes them.
@@ -13,7 +13,7 @@ NODES="cronstable-a cronstable-b cronstable-c cronstable-d cronstable-e"
 
 if [ -f "$CERTS/ca.pem" ]; then
   echo "certs already present in $CERTS — leaving them in place."
-  echo "To regenerate: docker compose -f docker-compose-acme.yml down -v"
+  echo "To regenerate: docker compose -f example/acme-platform/docker-compose.yml down -v"
   exit 0
 fi
 

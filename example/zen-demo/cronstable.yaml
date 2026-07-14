@@ -1,8 +1,8 @@
 # Zen screensaver demo — a deliberately CALM board.
 #
-# Brought up by ../../docker-compose-zen.yml. The point of this config is to see
-# the dashboard's zen all-clear screensaver, which only appears when a wallboard
-# is idle AND healthy: nothing Running and nothing Failing.
+# Brought up by example/zen-demo/docker-compose.yml. The point of this config
+# is to see the dashboard's zen all-clear screensaver, which only appears when
+# a wallboard is idle AND healthy: nothing Running and nothing Failing.
 #
 # This is a single, non-clustered node (no `cluster:` section), so unlike the
 # clustered ACME demo there is no cluster panel here: no Owner column, no

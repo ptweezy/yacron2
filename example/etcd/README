@@ -29,16 +29,16 @@ Try it
   # only over the compose network (etcd:2379). Never expose an unauthenticated
   # etcd beyond localhost; for real use enable auth + TLS (see below).
 
-  docker compose -f docker-compose.yml up --build
+  docker compose -f example/etcd/docker-compose.yml up --build
 
   # exactly one instance is the leader; watch the cluster panel:
   #   http://localhost:8080/    http://localhost:8081/
 
-  # fail the leader over:
-  docker compose -f docker-compose.yml stop cronstable-a   # the other takes over within ~ttl
+  # fail the leader over (the other takes over within ~ttl):
+  docker compose -f example/etcd/docker-compose.yml stop cronstable-a
 
   # see the election key value (the current holder's nodeName):
-  docker compose -f docker-compose.yml exec etcd etcdctl get cronstable/leader
+  docker compose -f example/etcd/docker-compose.yml exec etcd etcdctl get cronstable/leader
 
 Authentication and TLS
 ----------------------

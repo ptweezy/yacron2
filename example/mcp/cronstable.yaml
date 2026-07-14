@@ -1,12 +1,12 @@
 # cronstable with the MCP server enabled, for AI agents.
 #
-# Brought up by ../../docker-compose-mcp.yml. The `web` section turns on the
-# HTTP API + dashboard; the `mcp` section exposes the Model Context Protocol
-# server at POST /mcp so an agent (Claude, Cursor, VS Code Copilot, ...) can
-# observe and control these jobs. The jobs are deliberately varied so an agent
-# has something interesting to reason about: a steady heartbeat, a job that
-# fails (for the triage prompt), a long-runner you can catch "running", and a
-# manual "run on demand" job.
+# Brought up by example/mcp/docker-compose.yml, alongside this file. The `web`
+# section turns on the HTTP API + dashboard; the `mcp` section exposes the
+# Model Context Protocol server at POST /mcp so an agent (Claude, Cursor,
+# VS Code Copilot, ...) can observe and control these jobs. The jobs are
+# deliberately varied so an agent has something interesting to reason about: a
+# steady heartbeat, a job that fails (for the triage prompt), a long-runner you
+# can catch "running", and a manual "run on demand" job.
 #
 # Open http://localhost:8080/ for the dashboard, and point an MCP client at
 # http://localhost:8080/mcp (bearer token from CRONSTABLE_WEB_TOKEN). See

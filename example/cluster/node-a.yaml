@@ -25,4 +25,4 @@ cluster:
                                     # leader, so jobs fan out across nodes. Set
                                     # it on ALL three node files together, then
                                     # `docker compose ... up -d`. See THINGS TO
-                                    # TRY #7 in docker-compose-cluster.yml.
+                                    # TRY #7 in example/cluster/docker-compose.yml.

@@ -11,12 +11,12 @@ mail, and a **statsd exporter** receives job metrics.
 ## Run it
 
 This is the deep end. For a gentler start, try a single node
-(`example/demo` / `docker-compose.yml`), a plainer 3-node cluster
-(`docker-compose-cluster.yml`), or a larger CPU-spread 10-node cluster
-(`docker-compose-cluster-large.yml`).
+(`example/demo` / the root `docker-compose.yml`), a plainer 3-node cluster
+(`example/cluster/docker-compose.yml`), or a larger CPU-spread 10-node
+cluster (`example/cluster-large/docker-compose.yml`).
 
 ```console
-docker compose -f docker-compose-acme.yml up --build
+docker compose -f example/acme-platform/docker-compose.yml up --build
 ```
 
 - Node dashboards: <http://localhost:8080/> (cronstable-a), …8081–8084 (b–e)
@@ -27,7 +27,7 @@ docker compose -f docker-compose-acme.yml up --build
 Stop and wipe (including the throwaway certs):
 
 ```console
-docker compose -f docker-compose-acme.yml down -v
+docker compose -f example/acme-platform/docker-compose.yml down -v
 ```
 
 ## cronstable features exercised
@@ -73,7 +73,8 @@ PreferLeader and fan out under spread.
 ## Things to try
 
 1. **Watch the spread**: open two dashboards side by side and compare each job's
-   Owner; stop a node (`docker compose -f docker-compose-acme.yml stop cronstable-a`)
+   Owner; stop a node
+   (`docker compose -f example/acme-platform/docker-compose.yml stop cronstable-a`)
    and watch its owned jobs re-home to survivors.
 2. **Lose quorum**: stop 3 of the 5 nodes; Leader jobs stand down (dashboard
    shows *no quorum*), while PreferLeader jobs keep running.

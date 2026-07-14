@@ -5,9 +5,10 @@
 #  transform -> load -> report, plus monitoring and housekeeping) that is
 #  deliberately built to exercise EVERYTHING cronstable can do AND to make every
 #  web-dashboard feature demo itself. Brought up as a 5-node mTLS cluster by
-#  ../../docker-compose-acme.yml. This one file is mounted IDENTICALLY into all
-#  five nodes (its fingerprint is the job-set id, so it must match to agree);
-#  each node's cluster section is generated at start by node-entrypoint.sh.
+#  example/acme-platform/docker-compose.yml. This one file is mounted
+#  IDENTICALLY into all five nodes (its fingerprint is the job-set id, so it
+#  must match to agree); each node's cluster section is generated at start by
+#  node-entrypoint.sh.
 #
 #  cronstable features exercised here (see the per-job [tags]):
 #    * clustering: leader election + distribution: spread (per-job owners),

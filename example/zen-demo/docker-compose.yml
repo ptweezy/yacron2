@@ -7,8 +7,8 @@
 # This is a single, non-clustered node, so (unlike the clustered ACME demo) the
 # dashboard shows no cluster panel: no Owner column and no quorum/leader status.
 #
-#   docker compose -f docker-compose-zen.yml up --build      # start
-#   docker compose -f docker-compose-zen.yml down            # stop and remove
+#   docker compose -f example/zen-demo/docker-compose.yml up --build      # start
+#   docker compose -f example/zen-demo/docker-compose.yml down            # stop and remove
 #
 # Then open http://localhost:8080/ , optionally set Settings -> "Zen idle" -> 10s,
 # press  w  to enter the wallboard, and wait. See
@@ -17,10 +17,10 @@
 services:
   cronstable-zen:
     build:
-      context: .
+      context: ../..
     container_name: cronstable-zen
     ports:
       - "8080:8080"
     volumes:
-      - ./example/zen-demo/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
+      - ./cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
     restart: unless-stopped

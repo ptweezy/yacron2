@@ -1,10 +1,10 @@
 # A TEN-node cronstable cluster for watching leader election and, especially,
 # `distribution: spread` fan a larger, CPU-heavy job set out across the cluster.
 #
-#   docker compose -f docker-compose-cluster-large.yml up --build      # start
-#   docker compose -f docker-compose-cluster-large.yml logs -f         # logs
-#   docker stats                                                       # watch CPU
-#   docker compose -f docker-compose-cluster-large.yml down -v         # stop + wipe
+#   docker compose -f example/cluster-large/docker-compose.yml up --build      # start
+#   docker compose -f example/cluster-large/docker-compose.yml logs -f         # logs
+#   docker stats                                                               # watch CPU
+#   docker compose -f example/cluster-large/docker-compose.yml down -v         # stop + wipe
 #
 # Ten nodes (cronstable-a .. cronstable-j) are deployed from one identical job set
 # (example/cluster-large/jobs.yaml, 14 jobs, six CPU-heavy). Each node's cluster
@@ -20,7 +20,7 @@
 # stats` and you'll see CPU spread around. Flip to a single leader to see the
 # contrast (ONE node runs every Leader job and all CPU burns at once):
 #
-#   DISTRIBUTION=single-leader docker compose -f docker-compose-cluster-large.yml up -d
+#   DISTRIBUTION=single-leader docker compose -f example/cluster-large/docker-compose.yml up -d
 #
 # THINGS TO TRY
 #   1. Converge:   curl -s localhost:8080/cluster | python -m json.tool
@@ -30,7 +30,7 @@
 #        [print(j["name"],"->",j.get("clusterOwner")) for j in json.load(sys.stdin) \
 #         if j.get("clusterPolicy") in ("Leader","PreferLeader")]'; break; done
 #   3. Watch CPU fan out:  docker stats   (vs DISTRIBUTION=single-leader -> one hot node)
-#   4. Fail nodes:  docker compose -f docker-compose-cluster-large.yml stop cronstable-a cronstable-b
+#   4. Fail nodes:  docker compose -f example/cluster-large/docker-compose.yml stop cronstable-a cronstable-b
 #      quorum (6 of 10) survives up to 4 failures; the owned jobs of stopped
 #      nodes are reassigned to survivors. Stop 5+ and the cluster loses quorum
 #      and Leader jobs stand down (PreferLeader keeps going).
@@ -55,7 +55,7 @@ x-node-env: &node-env
 
 x-node: &node
   build:
-    context: .
+    context: ../..
   image: cronstable-cluster:local       # built once, reused by all ten nodes
   entrypoint: ["sh", "/node-entrypoint.sh"]
   restart: unless-stopped
@@ -63,8 +63,8 @@ x-node: &node
     certgen:
       condition: service_completed_successfully
   volumes:
-    - ./example/cluster-large/jobs.yaml:/config/jobs.yaml:ro
-    - ./example/cluster-large/node-entrypoint.sh:/node-entrypoint.sh:ro
+    - ./jobs.yaml:/config/jobs.yaml:ro
+    - ./node-entrypoint.sh:/node-entrypoint.sh:ro
     - cluster-large-certs:/certs:ro
 
 services:
@@ -78,7 +78,7 @@ services:
     command: ["sh", "/gen-certs.sh"]
     volumes:
       - cluster-large-certs:/certs
-      - ./example/cluster-large/gen-certs.sh:/gen-certs.sh:ro
+      - ./gen-certs.sh:/gen-certs.sh:ro
 
   cronstable-a: { <<: *node, hostname: cronstable-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-a } }
   cronstable-b: { <<: *node, hostname: cronstable-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-b } }

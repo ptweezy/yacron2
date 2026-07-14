@@ -35,7 +35,7 @@ still fires **exactly once per minute** on the leader.
 ## Run it
 
 ```console
-docker compose -f docker-compose-pulse-cluster.yml up --build
+docker compose -f example/pulse-cluster/docker-compose.yml up --build
 ```
 
 - cronstable-a → <http://localhost:8080/> (the leader while all three are up)
@@ -50,7 +50,7 @@ see the peer table, quorum, and elected leader.
 Stop and wipe (including the throwaway certs):
 
 ```console
-docker compose -f docker-compose-pulse-cluster.yml down -v
+docker compose -f example/pulse-cluster/docker-compose.yml down -v
 ```
 
 ## Two independent experiments
@@ -58,12 +58,14 @@ docker compose -f docker-compose-pulse-cluster.yml down -v
 The default upstream is **cronstable-c**, deliberately a *follower* (highest node
 name, so never the leader). That keeps these two demos from interfering:
 
-- **Fail the leader** — `docker compose -f docker-compose-pulse-cluster.yml stop cronstable-a`.
+- **Fail the leader** —
+  `docker compose -f example/pulse-cluster/docker-compose.yml stop cronstable-a`.
   Quorum holds (2 of 3), leadership moves to **cronstable-b**, and `latency-slo`
   resumes on <http://localhost:8081/>. The upstream is still up, so liveness
   stays green everywhere. *(Pure leader-failover.)*
 
-- **Outage** — `docker compose -f docker-compose-pulse-cluster.yml stop cronstable-c`.
+- **Outage** —
+  `docker compose -f example/pulse-cluster/docker-compose.yml stop cronstable-c`.
   Within ~5 s, `liveness-probe` goes **red** on the surviving nodes and their
   reports print the on-call `PAGE` line — the outage is caught from every
   remaining vantage point. Quorum is unaffected (a + b = 2 of 3). Bring it
@@ -73,17 +75,17 @@ name, so never the leader). That keeps these two demos from interfering:
 
 By default one leader runs every `Leader` job. Uncomment `distribution: spread`
 in **all three** `node-*.yaml` files and recreate
-(`docker compose -f docker-compose-pulse-cluster.yml up -d`): `latency-slo` and
-`sla-rollup` then get per-job owners via rendezvous hashing, so they can land on
-different nodes instead of both on the leader — same quorum gate, same
-guarantee, just spread out.
+(`docker compose -f example/pulse-cluster/docker-compose.yml up -d`):
+`latency-slo` and `sla-rollup` then get per-job owners via rendezvous hashing,
+so they can land on different nodes instead of both on the leader — same quorum
+gate, same guarantee, just spread out.
 
 ## See also
 
 - [`example/pulse-monitor`](../pulse-monitor) — the single-node version.
-- [`docker-compose-cluster.yml`](../../docker-compose-cluster.yml) — the clustering
-  feature tour (all `clusterPolicy` values, drift, quorum) without the
-  monitoring theme.
+- [`example/cluster/docker-compose.yml`](../cluster/docker-compose.yml) — the
+  clustering feature tour (all `clusterPolicy` values, drift, quorum) without
+  the monitoring theme.
 - [Clustering and Leader Election](../../wiki/Clustering-and-Leader-Election.md)
   and [Second-level schedules](../../wiki/Schedules-and-Timezones.md#second-level-schedules)
   in the wiki.

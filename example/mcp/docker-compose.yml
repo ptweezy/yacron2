@@ -2,8 +2,8 @@
 # enabled, so an AI agent (Claude, Cursor, VS Code Copilot, ...) can observe
 # and control the scheduler over POST /mcp.
 #
-#   docker compose -f docker-compose-mcp.yml up --build      # start
-#   docker compose -f docker-compose-mcp.yml down            # stop and remove
+#   docker compose -f example/mcp/docker-compose.yml up --build      # start
+#   docker compose -f example/mcp/docker-compose.yml down            # stop and remove
 #
 # Then open http://localhost:8080/ for the dashboard, and point an MCP client
 # at http://localhost:8080/mcp with the bearer token below. A quick check with
@@ -17,7 +17,7 @@
 services:
   cronstable-mcp:
     build:
-      context: .
+      context: ../..
     container_name: cronstable-mcp
     ports:
       - "8080:8080"
@@ -26,5 +26,5 @@ services:
       # anything beyond a local demo (and prefer a secret over an inline value).
       CRONSTABLE_WEB_TOKEN: dev-token
     volumes:
-      - ./example/mcp/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
+      - ./cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
     restart: unless-stopped

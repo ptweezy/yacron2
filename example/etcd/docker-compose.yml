@@ -27,7 +27,8 @@ services:
     # split-brain. The cronstable nodes reach it over the compose network by its
     # service name (etcd:2379), so it never needs to be published to the host.
     # For local etcdctl poking, run it inside the container instead:
-    #   docker compose -f docker-compose.yml exec etcd etcdctl get cronstable/leader
+    #   docker compose -f example/etcd/docker-compose.yml exec etcd \
+    #     etcdctl get cronstable/leader
     # If you must publish the client port, bind it to loopback only
     # ("127.0.0.1:2379:2379") and never expose this unauthenticated store
     # beyond localhost.

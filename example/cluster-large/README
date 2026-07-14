@@ -5,14 +5,16 @@ A bigger, CPU-heavy ten-node cronstable cluster with mutual-TLS peer attestation
 and leader election, built to watch `distribution: spread` fan a real workload
 out across the cluster (vs single-leader, where one node runs all of it at
 once). Spread is ON by default here. Brought up by
-../../docker-compose-cluster-large.yml:
+example/cluster-large/docker-compose.yml:
 
-    docker compose -f docker-compose-cluster-large.yml up --build
+    docker compose -f example/cluster-large/docker-compose.yml up --build
 
 Watch the load fan out with `docker stats` while the CPU-heavy jobs run.
 
 Files
 -----
+  docker-compose.yml   The ten nodes plus the one-shot `certgen`; `distribution:
+                       spread` is on by default here.
   jobs.yaml            The shared job set, mounted IDENTICALLY into all ten
                        nodes (14 jobs: 12 Leader/PreferLeader, of which six are
                        CPU-heavy, plus two EveryNode). The job-set id is a
@@ -53,7 +55,7 @@ hashing, so the twelve Leader/PreferLeader jobs (and the CPU burns) fan out
 across the ten nodes. To see the contrast, where ONE elected leader runs every
 Leader job and all CPU burns at once, start with single-leader:
 
-    DISTRIBUTION=single-leader docker compose -f docker-compose-cluster-large.yml up -d
+    DISTRIBUTION=single-leader docker compose -f example/cluster-large/docker-compose.yml up -d
 
 Same quorum gate and same guarantee either way; spread is purely a load
 optimization.

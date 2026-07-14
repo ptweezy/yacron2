@@ -1,8 +1,8 @@
 #!/bin/sh
 # Generate a throwaway cluster CA and one leaf cert per node for the Meridian
-# grand-tour cluster (docker-compose-grand-tour.yml). Run by the `certgen`
-# service into the shared volume before the nodes start. Same shape as the
-# other cluster demos' gen-certs.sh, with the nine Meridian node names.
+# grand-tour cluster (example/grand-tour/docker-compose.yml). Run by the
+# `certgen` service into the shared volume before the nodes start. Same shape
+# as the other cluster demos' gen-certs.sh, with the nine Meridian node names.
 #
 # FOR LOCAL EXPERIMENTATION ONLY. Real deployments provision per-node certs from
 # their own PKI; cronstable only consumes them.
@@ -13,7 +13,7 @@ NODES="meridian-a meridian-b meridian-c meridian-d meridian-e meridian-f meridia
 
 if [ -f "$CERTS/ca.pem" ]; then
   echo "certs already present in $CERTS — leaving them in place."
-  echo "To regenerate: docker compose -f docker-compose-grand-tour.yml down -v"
+  echo "To regenerate: docker compose -f example/grand-tour/docker-compose.yml down -v"
   exit 0
 fi
 

@@ -1,5 +1,5 @@
-# Shared job set for the docker-compose-pulse-cluster.yml demo — a CLUSTERED,
-# second-level uptime / SLA monitor.
+# Shared job set for the example/pulse-cluster/docker-compose.yml demo — a
+# CLUSTERED, second-level uptime / SLA monitor.
 #
 # This is the clustered sibling of example/pulse-monitor. Three nodes probe a
 # critical upstream every few SECONDS, but they coordinate over mutual TLS so

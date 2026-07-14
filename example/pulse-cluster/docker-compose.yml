@@ -1,10 +1,10 @@
 # Pulse (clustered) — a THREE-NODE, second-level uptime / SLA monitor with
 # mutual-TLS peer attestation and leader election.
 #
-#   docker compose -f docker-compose-pulse-cluster.yml up --build     # start
-#   docker compose -f docker-compose-pulse-cluster.yml logs -f        # watch
-#   docker compose -f docker-compose-pulse-cluster.yml down           # stop
-#   docker compose -f docker-compose-pulse-cluster.yml down -v        # stop + wipe certs
+#   docker compose -f example/pulse-cluster/docker-compose.yml up --build     # start
+#   docker compose -f example/pulse-cluster/docker-compose.yml logs -f        # watch
+#   docker compose -f example/pulse-cluster/docker-compose.yml down           # stop
+#   docker compose -f example/pulse-cluster/docker-compose.yml down -v        # stop + wipe certs
 #
 # Three nodes (cronstable-a, -b, -c) run one identical pulse job set
 # (example/pulse-cluster/jobs.yaml) plus a per-node cluster section. A one-shot
@@ -22,12 +22,12 @@
 #    upstream. `latency-slo` (Leader, every 2s) advances on cronstable-a ONLY, so
 #    the upstream is sampled once, not three times. Both count down in SECONDS.
 #
-# 2. Fail the leader.   docker compose -f docker-compose-pulse-cluster.yml stop cronstable-a
+# 2. Fail the leader.   docker compose -f example/pulse-cluster/docker-compose.yml stop cronstable-a
 #    Quorum holds (2 of 3); leadership moves to cronstable-b, and `latency-slo`
 #    resumes on 8081. The upstream (cronstable-c) is still up, so liveness stays
 #    green everywhere. This is a pure LEADER-FAILOVER demo.
 #
-# 3. Simulate an upstream outage.  docker compose -f docker-compose-pulse-cluster.yml stop cronstable-c
+# 3. Simulate an upstream outage.  docker compose -f example/pulse-cluster/docker-compose.yml stop cronstable-c
 #    cronstable-c is the PULSE_TARGET, so within ~5s `liveness-probe` goes RED on
 #    the remaining nodes (8080/8081) and their reports print the on-call PAGE
 #    line — the outage is caught from every surviving vantage point. Quorum is
@@ -39,13 +39,13 @@
 #    `sla-rollup` get per-job owners (rendezvous-hashed), so they can land on
 #    different nodes instead of both on the leader.
 #
-# For the single-node version, see docker-compose-pulse.yml /
-# example/pulse-monitor. For the clustering feature tour without the monitoring
-# theme, see docker-compose-cluster.yml.
+# For the single-node version, see example/pulse-monitor/docker-compose.yml.
+# For the clustering feature tour without the monitoring theme, see
+# example/cluster/docker-compose.yml.
 
 x-cronstable-node: &cronstable-node
   build:
-    context: .
+    context: ../..
   image: cronstable-pulse-cluster:local   # built once, reused by all three nodes
   restart: unless-stopped
   depends_on:
@@ -59,7 +59,7 @@ services:
     command: ["sh", "/gen-certs.sh"]
     volumes:
       - pulse-certs:/certs
-      - ./example/pulse-cluster/gen-certs.sh:/gen-certs.sh:ro
+      - ./gen-certs.sh:/gen-certs.sh:ro
 
   cronstable-a:
     <<: *cronstable-node
@@ -68,8 +68,8 @@ services:
     ports:
       - "8080:8080"                    # dashboard; 8443 (cluster mTLS) stays internal
     volumes:
-      - ./example/pulse-cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./example/pulse-cluster/node-a.yaml:/etc/cronstable.d/cluster.yaml:ro
+      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./node-a.yaml:/etc/cronstable.d/cluster.yaml:ro
       - pulse-certs:/certs:ro
 
   cronstable-b:
@@ -79,8 +79,8 @@ services:
     ports:
       - "8081:8080"
     volumes:
-      - ./example/pulse-cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./example/pulse-cluster/node-b.yaml:/etc/cronstable.d/cluster.yaml:ro
+      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./node-b.yaml:/etc/cronstable.d/cluster.yaml:ro
       - pulse-certs:/certs:ro
 
   cronstable-c:
@@ -90,8 +90,8 @@ services:
     ports:
       - "8082:8080"
     volumes:
-      - ./example/pulse-cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./example/pulse-cluster/node-c.yaml:/etc/cronstable.d/cluster.yaml:ro
+      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./node-c.yaml:/etc/cronstable.d/cluster.yaml:ro
       - pulse-certs:/certs:ro
 
 volumes:

@@ -12,7 +12,7 @@
 #  `state:` store below is a shared volume, so cursors/locks/idempotency and
 #  every dag_run coordinate across the whole fleet.
 #
-#  Brought up by  ../../docker-compose-grand-tour.yml.
+#  Brought up by  example/grand-tour/docker-compose.yml.
 #
 #  Every job/task is preceded by a one-line `[feature: ...]` tag naming what it
 #  demonstrates and a short note on why. The commands are deliberately SMALL:
@@ -166,7 +166,7 @@ web:
   # API. Left commented so the tour boots OPEN by default (cronstable refuses to
   # start if authToken is set but resolves to an empty token). To turn it on,
   # uncomment and run:
-  #   WEB_TOKEN=some-secret docker compose -f docker-compose-grand-tour.yml up
+  #   WEB_TOKEN=some-secret docker compose -f example/grand-tour/docker-compose.yml up
   # /metrics stays public (above); the pulse-* probes and the release DAG's
   # canary already present this same token, so they keep working.
   # authToken:

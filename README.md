@@ -148,7 +148,7 @@ each of these is a few lines away:
   approval gate ([tutorial](#tutorial-3-your-first-dag-a-durable-pipeline)).
 * **Run replicas safely**: leader election so two copies never double-fire
   ([tutorial](#tutorial-4-two-replicas-zero-double-runs)).
-* **See it all at once**: `docker compose -f docker-compose-grand-tour.yml up
+* **See it all at once**: `docker compose -f example/grand-tour/docker-compose.yml up
   --build` boots a nine-node cluster running every feature together
   ([example gallery](#example-gallery)).
 
@@ -604,7 +604,7 @@ in the wiki is the full walkthrough, and
 [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to
 enable it.
 
-**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f docker-compose-grand-tour.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
+**Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
 
 ## Tutorials
 
@@ -756,21 +756,23 @@ ownership across the fleet instead of concentrating it on one leader. Deeper:
 ## Example gallery
 
 Every example in [`example/`](example) is a self-contained, annotated,
-runnable project; the compose files live in the repo root. Highlights:
+runnable project; each compose file lives in its example's folder (the `demo`
+quickstart uses the root `docker-compose.yml`). Highlights:
 
 | Example | One command | Shows off |
 | --- | --- | --- |
 | [`demo`](example/demo) | `docker compose up` | The dashboard playground: varied jobs, live logs, retries, a long-runner, an on-demand job. |
-| [`grand-tour`](example/grand-tour) | `docker compose -f docker-compose-grand-tour.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all four reporters wired to live sinks. |
-| [`cluster`](example/cluster) | `docker compose -f docker-compose-cluster.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, live failover. |
-| [`cluster-large`](example/cluster-large) | `docker compose -f docker-compose-cluster-large.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
+| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all four reporters wired to live sinks. |
+| [`cluster`](example/cluster) | `docker compose -f example/cluster/docker-compose.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, live failover. |
+| [`cluster-large`](example/cluster-large) | `docker compose -f example/cluster-large/docker-compose.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
 | [`dag`](example/dag) | `cronstable -c example/dag` | Orchestration alone, single node: dependencies, XCom, fan-out, a sensor, an approval gate. |
 | [`dag-cluster`](example/dag-cluster) | `docker compose -f example/dag-cluster/docker-compose.yml up` | DAGs coordinating across three nodes on one shared store: crash-resume, exactly-once tasks. |
 | [`job-state`](example/job-state) | `cronstable -c example/job-state` | The job-facing state primitives: KV, cursors, locks, idempotency keys, artifacts, secrets. |
-| [`pulse-monitor`](example/pulse-monitor) | `docker compose -f docker-compose-pulse.yml up` | Second-level scheduling as a real-time uptime / SLA monitor. |
-| [`pulse-cluster`](example/pulse-cluster) | `docker compose -f docker-compose-pulse-cluster.yml up` | The same probes fanned across a 3-node leader-electing cluster. |
-| [`acme-platform`](example/acme-platform) | `docker compose -f docker-compose-acme.yml up` | A realistic 5-node "data platform back-office" showcase. |
-| [`zen-demo`](example/zen-demo) | `docker compose -f docker-compose-zen.yml up` | A deliberately calm board, for the wallboard's zen screensaver. |
+| [`mcp`](example/mcp) | `docker compose -f example/mcp/docker-compose.yml up --build` | The MCP server: an AI agent (Claude, Cursor, Copilot) observing and driving the scheduler over `POST /mcp`, or the `cronstable mcp` stdio bridge. |
+| [`pulse-monitor`](example/pulse-monitor) | `docker compose -f example/pulse-monitor/docker-compose.yml up` | Second-level scheduling as a real-time uptime / SLA monitor. |
+| [`pulse-cluster`](example/pulse-cluster) | `docker compose -f example/pulse-cluster/docker-compose.yml up` | The same probes fanned across a 3-node leader-electing cluster. |
+| [`acme-platform`](example/acme-platform) | `docker compose -f example/acme-platform/docker-compose.yml up` | A realistic 5-node "data platform back-office" showcase. |
+| [`zen-demo`](example/zen-demo) | `docker compose -f example/zen-demo/docker-compose.yml up` | A deliberately calm board, for the wallboard's zen screensaver. |
 | [`crontab`](example/crontab) | `cronstable -c example/crontab` | Classic Vixie crontabs running as-is next to YAML jobs. |
 | [`kubernetes`](example/kubernetes) | `kubectl apply -f example/kubernetes/deployment.yaml` | Leader election through a `coordination.k8s.io/v1` Lease. |
 | [`etcd`](example/etcd) | `docker compose -f example/etcd/docker-compose.yml up` | Leader election through an etcd lease, over plain HTTP. |
@@ -878,10 +880,10 @@ seconds; seconds require the full seven fields.)
 For a runnable end-to-end example, see
 [`example/pulse-monitor`](example/pulse-monitor) — a small real-time uptime / SLA
 monitor that probes a service every few seconds
-(`docker compose -f docker-compose-pulse.yml up`) — and its clustered sibling
+(`docker compose -f example/pulse-monitor/docker-compose.yml up`) — and its clustered sibling
 [`example/pulse-cluster`](example/pulse-cluster), which fans the probes across a
 three-node leader-electing cluster
-(`docker compose -f docker-compose-pulse-cluster.yml up`).
+(`docker compose -f example/pulse-cluster/docker-compose.yml up`).
 
 Important: by default all time is interpreted to be in UTC, but you can
 request to use local time instead.  For instance, the cron job below runs

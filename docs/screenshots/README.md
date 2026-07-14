@@ -12,7 +12,7 @@ clipping. To refresh them after a UI change:
    10-15 minutes of uptime so sparklines and history fill in:
 
    ```shell
-   docker compose -f docker-compose-grand-tour.yml up --build -d
+   docker compose -f example/grand-tour/docker-compose.yml up --build -d
    ```
 
 2. **Run the capture script** (needs `playwright` + its Chromium in the

@@ -2,21 +2,25 @@ cronstable clustering demo
 =======================
 
 A ready-to-run three-node cronstable cluster with mutual-TLS peer attestation and
-leader election. Brought up by ../../docker-compose-cluster.yml:
+leader election. Brought up by example/cluster/docker-compose.yml:
 
-    docker compose -f docker-compose-cluster.yml up --build
+    docker compose -f example/cluster/docker-compose.yml up --build
 
 Files
 -----
-  jobs.yaml      The shared job set, mounted IDENTICALLY into all three nodes.
-                 One job per clusterPolicy (EveryNode / Leader / PreferLeader)
-                 plus a manual-only job. The job-set id is a fingerprint of this
-                 file, so it must be identical on every node for them to agree.
-  node-a.yaml    Per-node `cluster` section (mounted as cluster.yaml on the node)
-  node-b.yaml      — TLS identity, peer list, and node name. These differ per
-  node-c.yaml      node but do NOT change the job-set id.
-  gen-certs.sh   Generates a throwaway cluster CA + per-node certs (SAN = service
-                 name) into the shared `cluster-certs` volume on first start.
+  docker-compose.yml   The three nodes plus the one-shot `certgen`; its header
+                       comments list the things to try.
+  jobs.yaml            The shared job set, mounted IDENTICALLY into all three
+                       nodes. One job per clusterPolicy (EveryNode / Leader /
+                       PreferLeader) plus a manual-only job. The job-set id is a
+                       fingerprint of this file, so it must be identical on every
+                       node for them to agree.
+  node-a.yaml          Per-node `cluster` section (mounted as cluster.yaml on
+  node-b.yaml            the node) — TLS identity, peer list, and node name.
+  node-c.yaml            These differ per node but do NOT change the job-set id.
+  gen-certs.sh         Generates a throwaway cluster CA + per-node certs (SAN =
+                       service name) into the shared `cluster-certs` volume on
+                       first start.
 
 Dashboards: cronstable-a http://localhost:8080/ , cronstable-b :8081 , cronstable-c :8082 .
 Scroll to the "cluster" panel on any dashboard to watch attestation and

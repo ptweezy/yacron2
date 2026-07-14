@@ -8,16 +8,16 @@
 #  reporters wired to live sinks. See example/grand-tour/README.md for the full
 #  tour and example/grand-tour/platform.yaml for the annotated job set.
 #
-#    docker compose -f docker-compose-grand-tour.yml up --build     # start
-#    docker compose -f docker-compose-grand-tour.yml logs -f        # watch output
-#    docker compose -f docker-compose-grand-tour.yml down -v        # stop + wipe
+#    docker compose -f example/grand-tour/docker-compose.yml up --build     # start
+#    docker compose -f example/grand-tour/docker-compose.yml logs -f        # watch output
+#    docker compose -f example/grand-tour/docker-compose.yml down -v        # stop + wipe
 #
 #  Open:
 #    Node dashboards   http://localhost:8080/  (meridian-a; b..i on 8081..8088)
 #    Prometheus /metrics  http://localhost:8080/metrics  (per node)
 #    On-call inbox     http://localhost:8025/  (Mailpit)
 #    Job metrics       http://localhost:9102/metrics  (statsd exporter)
-#    Webhook sink      docker compose -f docker-compose-grand-tour.yml logs -f webhook-sink
+#    Webhook sink      docker compose -f example/grand-tour/docker-compose.yml logs -f webhook-sink
 #
 #  HOW COORDINATION WORKS (no extra service beyond the state volume):
 #    * cluster.backend defaults to gossip: each node serves a mutual-TLS
@@ -34,14 +34,14 @@
 #
 #  THREE env knobs (all optional, all default to the simplest thing):
 #    * Compare a single leader with the per-job spread:
-#        DISTRIBUTION=single-leader docker compose -f docker-compose-grand-tour.yml up -d
+#        DISTRIBUTION=single-leader docker compose -f example/grand-tour/docker-compose.yml up -d
 #    * Swap the gossip mesh for a lease over the shared mount (NO certs, NO
 #      /peer endpoint — election is a single file on the state volume; note a
 #      lease backend is single-leader only, so `spread` does not apply):
-#        BACKEND=filesystem docker compose -f docker-compose-grand-tour.yml up
+#        BACKEND=filesystem docker compose -f example/grand-tour/docker-compose.yml up
 #    * Turn on bearer-token auth for the dashboard + REST API (uncomment
 #      web.authToken in platform.yaml first; /metrics stays public):
-#        WEB_TOKEN=some-secret docker compose -f docker-compose-grand-tour.yml up
+#        WEB_TOKEN=some-secret docker compose -f example/grand-tour/docker-compose.yml up
 #
 #  NOTE ON SIZE: 9 is an odd cluster size (quorum 5, tolerates 4 node failures).
 #  Stop 5+ nodes and the cluster loses quorum: Leader jobs stand down while
@@ -75,7 +75,7 @@ x-node-env: &node-env
 
 x-node: &node
   build:
-    context: .
+    context: ../..
     dockerfile: Dockerfile
   image: cronstable-grand-tour:local        # built once, reused by all nine nodes
   entrypoint: ["sh", "/node-entrypoint.sh"]
@@ -92,12 +92,12 @@ x-node: &node
     webhook-sink:
       condition: service_started
   volumes:
-    - ./example/grand-tour/platform.yaml:/config/platform.yaml:ro
-    - ./example/grand-tour/_defaults.yaml:/config/_defaults.yaml:ro
-    - ./example/grand-tour/legacy.crontab:/config/legacy.crontab:ro
-    - ./example/grand-tour/platform.env:/config/platform.env:ro
-    - ./example/grand-tour/secrets:/config/secrets:ro
-    - ./example/grand-tour/node-entrypoint.sh:/node-entrypoint.sh:ro
+    - ./platform.yaml:/config/platform.yaml:ro
+    - ./_defaults.yaml:/config/_defaults.yaml:ro
+    - ./legacy.crontab:/config/legacy.crontab:ro
+    - ./platform.env:/config/platform.env:ro
+    - ./secrets:/config/secrets:ro
+    - ./node-entrypoint.sh:/node-entrypoint.sh:ro
     - gt-certs:/certs:ro
     - gt-state:/var/lib/cronstable/state       # the shared, durable state store
 
@@ -112,7 +112,7 @@ services:
     command: ["sh", "/gen-certs.sh"]
     volumes:
       - gt-certs:/certs
-      - ./example/grand-tour/gen-certs.sh:/gen-certs.sh:ro
+      - ./gen-certs.sh:/gen-certs.sh:ro
 
   # A Docker named volume is created root-owned, but the cronstable image runs as
   # an unprivileged user (uid 65534). This one-shot makes the shared state store

@@ -1,4 +1,4 @@
-# Shared job set for the docker-compose-cluster.yml demo.
+# Shared job set for the example/cluster/docker-compose.yml demo.
 #
 # This file is mounted IDENTICALLY into all three nodes. That is the whole
 # point: two instances agree (and a quorum/leader can form) only if their

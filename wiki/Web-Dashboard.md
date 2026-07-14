@@ -154,12 +154,12 @@ job list and renders:
 [![The cluster panel: nine peers all agreed, quorum met, per-node load meters, per-node job ownership, and the DAG card above it](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png)
 
 > **Try it:** the bundled Compose demos bring the dashboard up with one command.
-> [`docker-compose-cluster.yml`](https://github.com/ptweezy/cronstable/blob/develop/docker-compose-cluster.yml)
+> [`example/cluster/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/cluster/docker-compose.yml)
 > starts the three-node gossip cluster (`cronstable-a` / `cronstable-b` / `cronstable-c`) so
 > you can watch the peer table, roles, and leadership move live; stop a node to
 > see the summary and dots react. For the ambient wallboard view (including the
 > "zen" all-clear screensaver),
-> [`docker-compose-zen.yml`](https://github.com/ptweezy/cronstable/blob/develop/docker-compose-zen.yml)
+> [`example/zen-demo/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/zen-demo/docker-compose.yml)
 > runs a single deliberately calm node.
 
 - a **summary line** with this node's name (e.g. `cronstable-a`) and the agreement
@@ -365,7 +365,7 @@ pulses as its real next-fire instant arrives, with a subtitle counting the jobs
 armed and naming the next one due. Any input wakes it. It deliberately refuses
 to show the all-green field on stale data (an unverified all-clear is `NO
 SIGNAL`, not nominal) and respects `prefers-reduced-motion`. The
-`docker-compose-zen.yml` demo boots a single calm node to show it off.
+`example/zen-demo/docker-compose.yml` demo boots a single calm node to show it off.
 
 ## Activity heatmap
 

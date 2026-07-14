@@ -4,8 +4,8 @@
 # SECONDS (not minutes), heartbeats every 10s, and rolls up once a minute. The
 # service under test is this node's own web API, so it runs with nothing else.
 #
-#   docker compose -f docker-compose-pulse.yml up --build      # start
-#   docker compose -f docker-compose-pulse.yml down            # stop and remove
+#   docker compose -f example/pulse-monitor/docker-compose.yml up --build      # start
+#   docker compose -f example/pulse-monitor/docker-compose.yml down            # stop and remove
 #
 # Then open http://localhost:8080/ and watch the probe rows count down in
 # seconds. See example/pulse-monitor/README.md for the full walkthrough
@@ -14,10 +14,10 @@
 services:
   cronstable-pulse:
     build:
-      context: .
+      context: ../..
     container_name: cronstable-pulse
     ports:
       - "8080:8080"
     volumes:
-      - ./example/pulse-monitor/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
+      - ./cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
     restart: unless-stopped

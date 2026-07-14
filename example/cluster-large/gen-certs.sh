@@ -1,8 +1,8 @@
 #!/bin/sh
 # Generate a throwaway cluster CA and one leaf cert per node for the 10-node
-# docker-compose-cluster-large.yml demo. Run by the `certgen` service into the
-# shared volume before the nodes start. Same as the 3-node demo's gen-certs.sh,
-# just with ten node names.
+# example/cluster-large/docker-compose.yml demo. Run by the `certgen` service
+# into the shared volume before the nodes start. Same as the 3-node demo's
+# gen-certs.sh, just with ten node names.
 #
 # FOR LOCAL EXPERIMENTATION ONLY. Real deployments provision per-node certs from
 # their own PKI; cronstable only consumes them.
@@ -14,7 +14,7 @@ NODES="cronstable-a cronstable-b cronstable-c cronstable-d cronstable-e \
 
 if [ -f "$CERTS/ca.pem" ]; then
   echo "certs already present in $CERTS — leaving them in place."
-  echo "To regenerate: docker compose -f docker-compose-cluster-large.yml down -v"
+  echo "To regenerate: docker compose -f example/cluster-large/docker-compose.yml down -v"
   exit 0
 fi
 

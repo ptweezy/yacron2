@@ -179,7 +179,7 @@ The [`example/mcp`](https://github.com/ptweezy/cronstable/tree/develop/example/m
 project boots a node with the MCP server enabled:
 
 ```shell
-docker compose -f docker-compose-mcp.yml up
+docker compose -f example/mcp/docker-compose.yml up
 # then, in another shell, point a client (or the bridge) at it:
 CRONSTABLE_WEB_TOKEN=dev-token \
   cronstable mcp --url http://127.0.0.1:8080 --check

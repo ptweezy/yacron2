@@ -1,7 +1,7 @@
 #!/bin/sh
 # Generate a throwaway cluster CA and one leaf cert per node for the
-# docker-compose-pulse-cluster.yml demo. Run automatically by the `certgen`
-# service into the shared `pulse-certs` volume before the nodes start.
+# example/pulse-cluster/docker-compose.yml demo. Run automatically by the
+# `certgen` service into the shared `pulse-certs` volume before the nodes start.
 #
 # THESE CERTS ARE FOR LOCAL EXPERIMENTATION ONLY — a single CA key sitting in a
 # volume, 10-year validity, owner-only keys. For real deployments provision
@@ -18,7 +18,7 @@ NODES="cronstable-a cronstable-b cronstable-c"
 
 if [ -f "$CERTS/ca.pem" ]; then
   echo "certs already present in $CERTS — leaving them in place."
-  echo "To regenerate: docker compose -f docker-compose-pulse-cluster.yml down -v"
+  echo "To regenerate: docker compose -f example/pulse-cluster/docker-compose.yml down -v"
   exit 0
 fi
 

@@ -1,10 +1,10 @@
 # A three-node cronstable cluster with mutual-TLS peer attestation and leader
 # election — a playground for the clustering features.
 #
-#   docker compose -f docker-compose-cluster.yml up --build      # start
-#   docker compose -f docker-compose-cluster.yml logs -f         # watch output
-#   docker compose -f docker-compose-cluster.yml down            # stop
-#   docker compose -f docker-compose-cluster.yml down -v         # stop + wipe certs
+#   docker compose -f example/cluster/docker-compose.yml up --build      # start
+#   docker compose -f example/cluster/docker-compose.yml logs -f         # watch output
+#   docker compose -f example/cluster/docker-compose.yml down            # stop
+#   docker compose -f example/cluster/docker-compose.yml down -v         # stop + wipe certs
 #
 # Three nodes (cronstable-a, -b, -c) are deployed from one identical job set
 # (example/cluster/jobs.yaml) plus a per-node cluster section that gives each
@@ -33,15 +33,15 @@
 #        - tick-leader-only  (Leader)      -> runs ONLY on the leader (cronstable-a)
 #        - tick-prefer-leader(PreferLeader)-> runs on the lowest reachable node
 #
-# 3. Fail the leader.   docker compose -f docker-compose-cluster.yml stop cronstable-a
+# 3. Fail the leader.   docker compose -f example/cluster/docker-compose.yml stop cronstable-a
 #    cronstable-b and cronstable-c still see each other -> quorum holds (2 of 3), and
 #    leadership moves to cronstable-b. tick-leader-only now advances on 8081.
 #
-# 4. Lose quorum.       docker compose -f docker-compose-cluster.yml stop cronstable-a cronstable-b
+# 4. Lose quorum.       docker compose -f example/cluster/docker-compose.yml stop cronstable-a cronstable-b
 #    The lone survivor (cronstable-c) can see only itself: 1 of 3 is below quorum, so
 #    it STANDS DOWN — tick-leader-only stops running anywhere (the safety/
 #    liveness trade). tick-every-node keeps running on cronstable-c regardless.
-#    Bring them back:   docker compose -f docker-compose-cluster.yml start cronstable-a cronstable-b
+#    Bring them back:   docker compose -f example/cluster/docker-compose.yml start cronstable-a cronstable-b
 #
 # 5. Manual triggers ignore the leader. Hit "Run now" on `run-me-anywhere` from
 #    a follower's dashboard (8081/8082) — it runs there. Manual triggers and
@@ -52,15 +52,15 @@
 #        cp example/cluster/jobs.yaml example/cluster/jobs-drift.yaml
 #        # edit jobs-drift.yaml: change any job (e.g. its command or schedule)
 #    then point cronstable-c at it by editing this file's cronstable-c jobs bind mount:
-#        ./example/cluster/jobs-drift.yaml:/etc/cronstable.d/jobs.yaml:ro
+#        ./jobs-drift.yaml:/etc/cronstable.d/jobs.yaml:ro
 #    and recreate just that node:
-#        docker compose -f docker-compose-cluster.yml up -d cronstable-c
+#        docker compose -f example/cluster/docker-compose.yml up -d cronstable-c
 #    cronstable-c's job-set id now differs, so cronstable-a and cronstable-b report it
 #    "drifted" (after driftAfter=2 rounds) on their cluster panels.
 #
 # 7. Spread the load. By default ONE leader (cronstable-a) runs every Leader job.
 #    Uncomment `distribution: spread` in ALL THREE example/cluster/node-*.yaml
-#    files and recreate (`docker compose -f docker-compose-cluster.yml up -d`).
+#    files and recreate (`docker compose -f example/cluster/docker-compose.yml up -d`).
 #    Now each leader-gated job is owned by a (possibly different) node via
 #    rendezvous hashing, so the work fans out instead of piling on the leader.
 #    With these job names and all three nodes healthy you will see:
@@ -73,11 +73,11 @@
 #
 #    For a bigger playground (10 nodes, more jobs, several CPU-heavy, spread on
 #    by default so you can watch the load fan out in `docker stats`), see
-#    docker-compose-cluster-large.yml.
+#    example/cluster-large/docker-compose.yml.
 
 x-cronstable-node: &cronstable-node
   build:
-    context: .
+    context: ../..
   image: cronstable-cluster:local      # built once, reused by all three nodes
   restart: unless-stopped
   depends_on:
@@ -99,7 +99,7 @@ services:
     command: ["sh", "/gen-certs.sh"]
     volumes:
       - cluster-certs:/certs
-      - ./example/cluster/gen-certs.sh:/gen-certs.sh:ro
+      - ./gen-certs.sh:/gen-certs.sh:ro
 
   cronstable-a:
     <<: *cronstable-node
@@ -108,8 +108,8 @@ services:
     ports:
       - "8080:8080"                 # dashboard; 8443 (cluster mTLS) stays internal
     volumes:
-      - ./example/cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./example/cluster/node-a.yaml:/etc/cronstable.d/cluster.yaml:ro
+      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./node-a.yaml:/etc/cronstable.d/cluster.yaml:ro
       - cluster-certs:/certs:ro
 
   cronstable-b:
@@ -119,8 +119,8 @@ services:
     ports:
       - "8081:8080"
     volumes:
-      - ./example/cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./example/cluster/node-b.yaml:/etc/cronstable.d/cluster.yaml:ro
+      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./node-b.yaml:/etc/cronstable.d/cluster.yaml:ro
       - cluster-certs:/certs:ro
 
   cronstable-c:
@@ -130,8 +130,8 @@ services:
     ports:
       - "8082:8080"
     volumes:
-      - ./example/cluster/jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./example/cluster/node-c.yaml:/etc/cronstable.d/cluster.yaml:ro
+      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
+      - ./node-c.yaml:/etc/cronstable.d/cluster.yaml:ro
       - cluster-certs:/certs:ro
 
 volumes:

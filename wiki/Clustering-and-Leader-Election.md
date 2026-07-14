@@ -62,7 +62,7 @@ The fastest way to see a leader-electing cluster is the bundled three-node demo,
 which mints a throwaway CA and per-node certs for you:
 
 ```shell
-docker compose -f docker-compose-cluster.yml up --build
+docker compose -f example/cluster/docker-compose.yml up --build
 # then open http://localhost:8080/ , :8081 , :8082 and watch the cluster panel
 ```
 
@@ -1360,16 +1360,16 @@ For running multiple replicas on Kubernetes (both `backend: kubernetes` and
 ## Trying it locally
 
 The repository ships a ready-to-run three-node cluster in
-[`docker-compose-cluster.yml`](https://github.com/ptweezy/cronstable/blob/develop/docker-compose-cluster.yml).
+[`example/cluster/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/cluster/docker-compose.yml).
 It generates a throwaway cluster CA and per-node certificates, brings up three
 mutually-attesting nodes with `electLeader: true` and one job of each
 `clusterPolicy`, and publishes each node's dashboard on a separate port
 (8080/8081/8082) so you can watch leadership move when you stop the leader:
 
 ```shell
-docker compose -f docker-compose-cluster.yml up --build
+docker compose -f example/cluster/docker-compose.yml up --build
 # then open http://localhost:8080/ , :8081 , :8082 and watch the cluster panel
-docker compose -f docker-compose-cluster.yml stop cronstable-a   # watch leadership move to cronstable-b
+docker compose -f example/cluster/docker-compose.yml stop cronstable-a   # watch leadership move to cronstable-b
 ```
 
 The compose file's header comments document the full set of things to try
@@ -1377,7 +1377,7 @@ The compose file's header comments document the full set of things to try
 
 **A full showcase.** For the fullest end-to-end demo (`distribution: spread`,
 all three `clusterPolicy` values, and mTLS together), the repository ships
-[`docker-compose-acme.yml`](https://github.com/ptweezy/cronstable/blob/develop/docker-compose-acme.yml);
+[`example/acme-platform/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/acme-platform/docker-compose.yml);
 its walkthrough is in
 [`example/acme-platform/README.md`](https://github.com/ptweezy/cronstable/blob/develop/example/acme-platform/README.md).
 
@@ -1385,18 +1385,18 @@ its walkthrough is in
 
 To watch [`distribution: spread`](#distribution-one-leader-or-spread-the-load)
 fan real load across the cluster, the repository also ships
-[`docker-compose-cluster-large.yml`](https://github.com/ptweezy/cronstable/blob/develop/docker-compose-cluster-large.yml):
+[`example/cluster-large/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/cluster-large/docker-compose.yml):
 **ten** nodes (dashboards on ports 8080–8089) running a larger job set with
 several CPU-heavy jobs, defaulting to `spread`. Each node's config is generated
 from environment variables by a small entrypoint, so there are no per-node files
 to maintain.
 
 ```shell
-docker compose -f docker-compose-cluster-large.yml up --build
+docker compose -f example/cluster-large/docker-compose.yml up --build
 docker stats     # watch CPU spread across the nodes (a few cores busy on several nodes)
 
 # contrast: pin everything to one leader and watch a single node light up
-DISTRIBUTION=single-leader docker compose -f docker-compose-cluster-large.yml up -d
+DISTRIBUTION=single-leader docker compose -f example/cluster-large/docker-compose.yml up -d
 ```
 
 (Ten is an *even* size, so the nodes log the even-size warning; that is expected

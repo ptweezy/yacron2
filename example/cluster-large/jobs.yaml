@@ -1,4 +1,4 @@
-# Shared job set for the 10-node docker-compose-cluster-large.yml demo.
+# Shared job set for the 10-node example/cluster-large/docker-compose.yml demo.
 #
 # Mounted IDENTICALLY into all ten nodes (the job-set id is a fingerprint of
 # this file, so it must match on every node for them to agree). Node identity in

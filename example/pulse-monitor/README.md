@@ -22,7 +22,7 @@ is nothing else to start — the monitor watches its own liveness endpoint.
 
 ```console
 # in a container (publishes the dashboard on :8080)
-docker compose -f docker-compose-pulse.yml up --build
+docker compose -f example/pulse-monitor/docker-compose.yml up --build
 
 # …or locally, from a checkout (needs python3, which the cronstable image has)
 cronstable -c example/pulse-monitor/cronstable.yaml
@@ -35,7 +35,7 @@ fills in several times a minute. Open a probe's logs to tail its verdicts live.
 Stop it:
 
 ```console
-docker compose -f docker-compose-pulse.yml down
+docker compose -f example/pulse-monitor/docker-compose.yml down
 ```
 
 ## The jobs
@@ -76,7 +76,7 @@ the on-call "PAGE" line appear in `liveness-probe`'s report output:
 
 ```console
 # container
-docker compose -f docker-compose-pulse.yml run --rm \
+docker compose -f example/pulse-monitor/docker-compose.yml run --rm \
   -e PULSE_TARGET=http://127.0.0.1:9/nope cronstable-pulse
 
 # local

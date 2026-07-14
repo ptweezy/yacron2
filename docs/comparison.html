@@ -1,0 +1,1944 @@
+<!doctype html>
+<html lang="en" data-theme="carolina">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>cronstable // feature comparison vs cron-family schedulers and orchestrators</title>
+<style>
+  /* ============================================================= *
+   *  cronstable // feature comparison                             *
+   *  Same phosphor-CRT design language as the live dashboard.     *
+   * ============================================================= */
+
+  /* ---------- shared tokens (never change per theme) ---------- */
+  :root{
+    color-scheme: dark;
+    --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code",
+            Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue",
+            Arial, "Noto Sans", sans-serif;
+    --ok:#3fd271; --fail:#ff5f56; --run:#4aa8ff; --pending:#ffbf47;
+    --disabled:#7d8590; --cancelled:#c98bff; --unknown:#9aa5b1;
+    --radius:3px;
+    --shadow-lg:0 10px 40px rgba(0,0,0,.7);
+    --maxw:1200px;
+    /* marketing accents mapped onto the phosphor palette */
+    --yes:var(--ok);
+    --partial:var(--pending);
+    --gold:var(--pending);
+  }
+
+  /* ---------- dark phosphor themes ---------- */
+  html[data-theme="carolina"]{
+    --bg:#04070b;--bg2:#060c13;--panel:#081019;--panel2:#0b1620;--hover:#0f1e2b;
+    --border:#173347;--border2:#22506e;--fg:#5cabde;--fg-dim:#4b9cd3;--fg-faint:#5a90b0;
+    --accent:#b5ddf5;--glow:rgba(92,171,222,.5);--selbg:rgba(75,156,211,.12);
+  }
+  html[data-theme="amber"]{
+    --bg:#0a0806;--bg2:#0f0b07;--panel:#110c07;--panel2:#160f08;--hover:#1d1409;
+    --border:#3a2a12;--border2:#523c1a;--fg:#ffb000;--fg-dim:#c98a2c;--fg-faint:#a37a38;
+    --accent:#ffd98a;--glow:rgba(255,176,0,.55);--selbg:rgba(255,176,0,.12);
+  }
+  html[data-theme="green"]{
+    --bg:#020503;--bg2:#04100a;--panel:#05130c;--panel2:#07190f;--hover:#0a2014;
+    --border:#144028;--border2:#1d6038;--fg:#38ff7a;--fg-dim:#1fbf57;--fg-faint:#22a85c;
+    --accent:#b6ffce;--glow:rgba(56,255,122,.5);--selbg:rgba(56,255,122,.12);
+  }
+  html[data-theme="modern"]{
+    --bg:#0d1117;--bg2:#0f141b;--panel:#161b22;--panel2:#1b212b;--hover:#1d242e;
+    --border:#2a313c;--border2:#3a424f;--fg:#d6dee8;--fg-dim:#9aa4b2;--fg-faint:#8b95a3;
+    --accent:#79c0ff;--glow:rgba(121,192,255,0);--selbg:rgba(121,192,255,.12);
+  }
+  html[data-theme="standard"]{
+    --bg:#0f1114;--bg2:#14161a;--panel:#171b20;--panel2:#1c2126;--hover:#1f232a;
+    --border:#31383f;--border2:#48505a;--fg:#e6e9ed;--fg-dim:#a6aeb9;--fg-faint:#8f98a3;
+    --accent:#4c8dff;--glow:rgba(76,141,255,0);--selbg:rgba(76,141,255,.14);
+  }
+
+  /* ---------- paper (light) twins ---------- */
+  html[data-theme="carolina-light"]{
+    --bg:#e7f0f8;--bg2:#d7e6f3;--panel:#f3f8fc;--panel2:#dfecf6;--hover:#d0e2f0;
+    --border:#a8c9e2;--border2:#4b9cd3;--fg:#0e3a5c;--fg-dim:#175e91;--fg-faint:#3b688c;
+    --accent:#0d67ac;--glow:rgba(23,94,145,.25);--selbg:rgba(75,156,211,.18);
+  }
+  html[data-theme="amber-light"]{
+    --bg:#f3e9d2;--bg2:#eadcbc;--panel:#faf3e3;--panel2:#f0e5c9;--hover:#e7d8b4;
+    --border:#cdb582;--border2:#a98f52;--fg:#3f2d00;--fg-dim:#6d500b;--fg-faint:#755c20;
+    --accent:#855700;--glow:rgba(138,90,0,.28);--selbg:rgba(179,125,0,.16);
+  }
+  html[data-theme="green-light"]{
+    --bg:#e4f2e6;--bg2:#d4e8d8;--panel:#f2faf2;--panel2:#ddefe0;--hover:#cfe6d4;
+    --border:#a9cdb2;--border2:#7fb28c;--fg:#0b3a1e;--fg-dim:#1a6238;--fg-faint:#3a7050;
+    --accent:#0d7034;--glow:rgba(18,105,55,.25);--selbg:rgba(24,128,68,.15);
+  }
+  html[data-theme="modern-light"]{
+    --bg:#f6f8fa;--bg2:#eaeef2;--panel:#ffffff;--panel2:#f6f8fa;--hover:#eff2f5;
+    --border:#d0d7de;--border2:#a8b3bd;--fg:#1f2328;--fg-dim:#57606a;--fg-faint:#656e79;
+    --accent:#0969da;--glow:rgba(9,105,218,0);--selbg:rgba(9,105,218,.12);
+  }
+  html[data-theme="standard-light"]{
+    --bg:#ffffff;--bg2:#f2f4f7;--panel:#ffffff;--panel2:#f7f8fa;--hover:#eceff3;
+    --border:#d9dee5;--border2:#aab3bf;--fg:#14181d;--fg-dim:#4b5563;--fg-faint:#5d6675;
+    --accent:#0b5ed7;--glow:rgba(11,94,215,0);--selbg:rgba(11,94,215,.12);
+  }
+  /* every paper theme: flip scheme, soften shadow, re-ink status darker */
+  html[data-theme$="-light"]{
+    color-scheme:light;
+    --shadow-lg:0 10px 40px rgba(0,0,0,.18);
+    --ok:#12692b;--fail:#b32d23;--run:#0757b8;--pending:#7d5300;
+    --disabled:#565e68;--cancelled:#7a3fd6;--unknown:#57606a;
+  }
+  html[data-theme="standard-light"]{
+    --ok:#107a33;--fail:#d31f1f;--run:#0b5ed7;--pending:#b45309;--cancelled:#7c3aed;
+  }
+
+  /* ---------- base ---------- */
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font-family:var(--mono);font-size:13px;line-height:1.5;letter-spacing:.2px;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  }
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  ::selection{background:var(--accent);color:var(--bg)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius)}
+  /* prose runs in the interface sans, like the dashboard's reader mode */
+  .lede,.sec-head p,.mcp-top p,.quad li,.tk p,footer p,.cta-note{font-family:var(--sans);letter-spacing:0}
+
+  /* ---------- CRT overlay ---------- */
+  #crt{position:fixed;inset:0;pointer-events:none;z-index:9000}
+  body.scan #crt::before{
+    content:"";position:absolute;inset:0;mix-blend-mode:multiply;
+    background:repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0,rgba(0,0,0,0) 1px,rgba(0,0,0,.16) 1px,rgba(0,0,0,.16) 3px);
+  }
+  body.fx #crt::after{
+    content:"";position:absolute;inset:0;
+    background:radial-gradient(ellipse at center,rgba(0,0,0,0) 55%,rgba(0,0,0,.42) 100%);
+  }
+  body.fx.flicker #crt{animation:flicker 3.2s infinite steps(60)}
+  @keyframes flicker{0%,97%,100%{opacity:1}97.5%{opacity:.85}98%{opacity:1}98.5%{opacity:.92}}
+  html[data-theme$="-light"] body.scan #crt::before{
+    background:repeating-linear-gradient(to bottom,
+      rgba(0,0,0,0) 0,rgba(0,0,0,0) 1px,rgba(0,0,0,.05) 1px,rgba(0,0,0,.05) 3px);
+  }
+  html[data-theme$="-light"] body.fx #crt::after{
+    background:radial-gradient(ellipse at center,rgba(0,0,0,0) 55%,rgba(0,0,0,.12) 100%);
+  }
+  body.fx .glow,body.fx h1,body.fx h2,body.fx .mark,body.fx .snip{text-shadow:0 0 6px var(--glow)}
+
+  /* ---------- product top bar (mirrors the dashboard chrome) ---------- */
+  .topbar{
+    position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    padding:8px clamp(12px,4vw,22px);border-bottom:1px solid var(--border);
+    background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(6px);
+    font-family:var(--mono);font-size:12px;color:var(--fg-dim);
+  }
+  .topbar .brand{display:flex;align-items:baseline;gap:8px;white-space:nowrap}
+  /* the mark is each wordmark's l: a live cart-and-double-pendulum simulation
+     (see the logo engine script) scaled to the glyph and overlaid on its cell,
+     so the balanced pendulum IS the letter. the svg is absolutely positioned
+     by CronstableLogo.mountGlyph — zero layout impact. without JS the spans
+     just print their l. */
+  .topbar .brand .mark svg,.wordmark .mark svg{display:block;filter:drop-shadow(0 0 5px var(--glow))}
+  .topbar .brand b{color:var(--fg);font-weight:700;letter-spacing:.4px}
+  .topbar .brand .slash{color:var(--fg-faint)}
+  .topbar .grow{flex:1 1 40px}
+  .topbar .clock{font-variant-numeric:tabular-nums;color:var(--fg-faint)}
+  .topbar .tb-hide{display:inline-flex}
+  @media(max-width:720px){.topbar .tb-hide{display:none}}
+  .topbar select{
+    font-family:var(--mono);font-size:11.5px;color:var(--fg-dim);
+    background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+    padding:3px 6px;cursor:pointer;
+  }
+  .topbar select:hover{border-color:var(--border2)}
+
+  /* ---------- shared atoms ---------- */
+  .pill{
+    display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:var(--radius);
+    background:var(--panel);border:1px solid var(--border);font-family:var(--mono);
+    font-size:11.5px;color:var(--fg-dim);white-space:nowrap;font-variant-numeric:tabular-nums;
+  }
+  .pill b{color:var(--fg);font-weight:700}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none;background:var(--fg-faint)}
+  .dot.ok{background:var(--ok)} .dot.fail{background:var(--fail)}
+  .dot.run{background:var(--run)} .dot.pending{background:var(--pending)}
+  .dot.live{background:#5cff97;color:var(--ok);filter:drop-shadow(0 0 4px rgba(92,255,151,.9));
+    box-shadow:0 0 0 0 currentColor;animation:pulse 1.8s infinite}
+  @keyframes pulse{
+    0%{box-shadow:0 0 0 0 color-mix(in srgb,currentColor 55%,transparent)}
+    70%{box-shadow:0 0 0 5px transparent}100%{box-shadow:0 0 0 0 transparent}
+  }
+  .btn{
+    display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:var(--radius);
+    font-family:var(--mono);font-size:12px;font-weight:600;border:1px solid var(--border);
+    background:var(--panel2);color:var(--fg);cursor:pointer;transition:all .12s ease;white-space:nowrap;
+  }
+  .btn:hover{background:var(--hover);border-color:var(--border2);text-decoration:none}
+  .btn.primary{background:var(--selbg);border-color:var(--border2);color:var(--fg)}
+  .btn.primary:hover{background:color-mix(in srgb,var(--accent) 18%,var(--selbg))}
+  .btn.lg{font-size:13.5px;padding:9px 16px}
+
+  /* ---------- page shell ---------- */
+  .page{
+    background:radial-gradient(1200px 480px at 84% -10%,color-mix(in srgb,var(--accent) 8%,transparent),transparent 60%);
+    padding:clamp(20px,4vw,52px) clamp(14px,4vw,22px) 72px;
+  }
+  .wrap{max-width:var(--maxw);margin:0 auto}
+
+  /* ---------- hero ---------- */
+  .eyebrow{
+    font-family:var(--mono);font-size:11px;letter-spacing:1.4px;text-transform:uppercase;
+    color:var(--fg-faint);display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:0 0 22px;
+  }
+  .eyebrow .dot{background:var(--fg-dim)}
+  .wordmark{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:14px;-webkit-user-select:none;user-select:none}
+  .wordmark .name{font-family:var(--mono);font-weight:700;font-size:clamp(22px,3.2vw,30px);letter-spacing:.5px;color:var(--fg)}
+  .wordmark .say{font-family:var(--mono);color:var(--fg-faint);font-size:13px}
+  h1{
+    font-family:var(--mono);font-weight:700;font-size:clamp(26px,4.7vw,48px);line-height:1.06;
+    letter-spacing:-.01em;text-wrap:balance;margin:.15em 0 0;max-width:17ch;color:var(--fg);
+  }
+  h1 .hl{color:var(--accent)}
+  h1 .hl-b{color:var(--gold);box-shadow:inset 0 -.16em 0 color-mix(in srgb,var(--gold) 22%,transparent)}
+  .lede{font-size:clamp(14px,1.6vw,17px);color:var(--fg-dim);max-width:66ch;margin:22px 0 0;text-wrap:pretty;line-height:1.6}
+  .lede strong{color:var(--fg);font-weight:700}
+
+  .chips{display:flex;flex-wrap:wrap;gap:9px;margin:26px 0 0}
+  .chip{
+    display:inline-flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--border);
+    border-radius:var(--radius);padding:6px 12px 6px 10px;font-family:var(--mono);
+  }
+  .chip b{font-size:14px;font-variant-numeric:tabular-nums;color:var(--fg)}
+  .chip span{font-size:11.5px;color:var(--fg-faint);font-family:var(--sans);letter-spacing:0}
+  .chip .cd{width:7px;height:7px;border-radius:50%;background:var(--fg-dim)}
+  .chip.brass .cd{background:var(--gold)}
+  .chip.green .cd{background:var(--ok)}
+
+  .cta-row{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin:30px 0 0}
+  .cta-note{font-size:12.5px;color:var(--fg-faint)}
+  .cta-note .k{color:var(--fg-dim)}
+
+  /* ---------- section framing ---------- */
+  .sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:58px 0 14px}
+  .sec-head h2{font-family:var(--mono);font-weight:700;font-size:clamp(15px,2vw,19px);letter-spacing:.3px;margin:0;color:var(--fg);
+    display:flex;align-items:center;gap:9px}
+  .sec-head h2::before{content:"\250C\2500";color:var(--fg-faint);font-weight:400}
+  .sec-head p{margin:6px 0 0;color:var(--fg-faint);font-size:13px;max-width:66ch;line-height:1.55}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--fg-faint);font-family:var(--mono)}
+  .legend .lk{display:inline-flex;align-items:center;gap:6px}
+
+  /* ---------- matrix ---------- */
+  .matrix-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-lg);overflow:hidden}
+  .matrix-scroll{overflow-x:auto;overflow-y:visible}
+  table.matrix{border-collapse:separate;border-spacing:0;width:100%;min-width:1060px;font-family:var(--mono)}
+  table.matrix th,table.matrix td{text-align:center;vertical-align:middle}
+
+  thead th{
+    position:sticky;top:0;z-index:3;background:var(--panel2);
+    border-bottom:1px solid var(--border2);padding:13px 10px 12px;
+  }
+  thead th.feat{z-index:5;text-align:left;padding-left:18px}
+  th.feat,td.feat{
+    position:sticky;left:0;z-index:2;background:var(--panel);text-align:left;
+    min-width:214px;width:214px;border-right:1px solid var(--border);
+  }
+  thead th.feat{background:var(--panel2)}
+  .th-name{font-size:12.5px;font-weight:700;color:var(--fg);white-space:nowrap;letter-spacing:.2px}
+  .th-sub{font-size:10px;color:var(--fg-faint);margin-top:3px;white-space:nowrap;text-transform:uppercase;letter-spacing:.6px}
+  .meter{height:4px;border-radius:2px;background:var(--bg2);margin:9px auto 0;width:74px;overflow:hidden;border:1px solid var(--border)}
+  .meter i{display:block;height:100%;background:var(--fg-faint)}
+  .th-count{font-size:10px;color:var(--fg-faint);margin-top:6px;font-variant-numeric:tabular-nums;text-transform:uppercase;letter-spacing:.6px}
+
+  /* cronstable column: accent-highlighted, like the "self" node on the board */
+  col.cs-col{background:color-mix(in srgb,var(--fg-dim) 7%,transparent)}
+  th.cs,td.cs{background:color-mix(in srgb,var(--fg-dim) 7%,transparent);
+    border-left:1.5px solid var(--fg-dim);border-right:1.5px solid var(--fg-dim)}
+  thead th.cs{background:color-mix(in srgb,var(--fg-dim) 14%,var(--panel2));border-top:2px solid var(--fg-dim)}
+  thead th.cs .th-name{color:var(--accent)}
+  thead th.cs .meter i{background:var(--fg-dim)}
+  .th-tag{
+    display:inline-block;font-size:9px;letter-spacing:1.2px;text-transform:uppercase;color:var(--accent);
+    border:1px solid var(--fg-dim);border-radius:var(--radius);padding:1px 6px;margin-top:7px;
+  }
+  th.orch,td.orch{border-left:1px dashed var(--border2)}
+  .th-tag.orch{color:var(--fg-faint);border-color:var(--border2)}
+
+  /* group rows */
+  tr.group td{position:sticky;left:0;background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border);text-align:left;padding:8px 18px}
+  tr.group .g-label{font-size:10.5px;letter-spacing:1.4px;text-transform:uppercase;color:var(--fg-faint);font-weight:700}
+  tr.group.ai td{background:linear-gradient(90deg,color-mix(in srgb,var(--gold) 14%,transparent),transparent 70%);border-top:1px solid var(--gold)}
+  tr.group.ai .g-label{color:var(--gold)}
+  tr.group .g-uniq{color:var(--gold);border:1px solid var(--gold);border-radius:var(--radius);font-size:8.5px;padding:1px 5px;margin-left:8px;letter-spacing:1px}
+
+  /* body cells */
+  tbody td{padding:11px 10px;border-bottom:1px solid color-mix(in srgb,var(--border) 60%,transparent)}
+  tbody tr:last-child td{border-bottom:none}
+  td.feat{padding:11px 14px 11px 18px}
+  .f-name{font-size:12.5px;font-weight:600;color:var(--fg);line-height:1.3}
+  .f-sub{font-size:10.5px;color:var(--fg-faint);margin-top:2px}
+  .f-sub code,td.feat code{font-family:var(--mono);font-size:11px;background:var(--bg2);padding:0 4px;border-radius:2px;border:1px solid var(--border)}
+  tr.spot td{background:color-mix(in srgb,var(--gold) 9%,transparent)}
+  tr.spot td.feat{background-color:var(--panel);background-image:linear-gradient(color-mix(in srgb,var(--gold) 9%,transparent),color-mix(in srgb,var(--gold) 9%,transparent))}
+  tr.spot td.cs{background:linear-gradient(180deg,color-mix(in srgb,var(--fg-dim) 8%,transparent),color-mix(in srgb,var(--gold) 9%,transparent))}
+  tbody tr:hover td{background:var(--hover)}
+  tbody tr:hover td.cs{background:color-mix(in srgb,var(--fg-dim) 13%,var(--hover))}
+  tbody tr.spot:hover td{background:color-mix(in srgb,var(--gold) 12%,transparent)}
+
+  /* status marks */
+  .mk{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;font-size:12px;line-height:1;margin:0 auto}
+  .yes .mk{background:var(--ok);color:var(--bg);font-weight:700}
+  .cs .mk{background:var(--ok);color:var(--bg);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 22%,transparent)}
+  .partial .mk{background:transparent;color:var(--pending);border:1.6px solid var(--pending);font-size:11px;font-weight:700}
+  .addon .mk{background:transparent;color:var(--gold);border:1.6px dashed var(--gold);font-weight:700;font-size:13px}
+  .no .mk{color:var(--disabled);background:transparent;font-size:15px}
+  .cap{display:block;font-family:var(--mono);font-size:9.5px;line-height:1.25;color:var(--fg-faint);margin:5px auto 0;max-width:132px}
+  td.cs .cap{color:var(--fg-dim);opacity:.95}
+  .addon .cap,.partial .cap{color:var(--pending)}
+
+  /* ---------- MCP spotlight ---------- */
+  .mcp{
+    margin-top:24px;border:1px solid var(--border);border-radius:var(--radius);
+    background:radial-gradient(700px 300px at 90% -20%,color-mix(in srgb,var(--fg-dim) 9%,transparent),transparent 65%),var(--panel);
+    box-shadow:var(--shadow-lg);overflow:hidden;
+  }
+  .mcp-top{padding:clamp(20px,3vw,32px);border-bottom:1px solid var(--border);display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start;justify-content:space-between}
+  .mcp-top .lead{max-width:60ch}
+  .mcp-kicker{font-family:var(--mono);font-size:10.5px;letter-spacing:1.4px;text-transform:uppercase;color:var(--gold);display:flex;align-items:center;gap:8px}
+  .mcp-kicker .sq{width:8px;height:8px;background:var(--gold);transform:rotate(45deg)}
+  .mcp h3{font-family:var(--mono);font-weight:700;font-size:clamp(18px,2.4vw,25px);letter-spacing:-.005em;margin:12px 0 0;text-wrap:balance;color:var(--fg)}
+  .mcp h3 .a{color:var(--accent)}
+  .mcp-top p{color:var(--fg-dim);font-size:14px;margin:12px 0 0;line-height:1.6}
+  .mcp-top p code{font-family:var(--mono);font-size:.86em;background:var(--bg2);padding:1px 6px;border-radius:2px;border:1px solid var(--border);color:var(--fg)}
+
+  .snip{
+    font-family:var(--mono);font-size:12px;line-height:1.7;background:var(--bg2);
+    border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;color:var(--fg-dim);min-width:270px;overflow-x:auto;
+  }
+  .snip .p{color:var(--fg-faint)}
+  .snip .c{color:var(--fg-dim)}
+  .snip .k{color:var(--gold)}
+  .snip .ok{color:var(--ok)}
+  .snip b{color:var(--fg);font-weight:700}
+
+  .mcp-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border)}
+  .quad{background:var(--panel);padding:22px 20px}
+  .quad .qh{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:.3px;color:var(--fg)}
+  .quad .qi{width:22px;height:22px;flex:0 0 auto;display:grid;place-items:center;border-radius:var(--radius);background:color-mix(in srgb,var(--fg-dim) 16%,transparent);color:var(--fg-dim)}
+  .quad.act .qi{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .quad.safe .qi{background:color-mix(in srgb,var(--gold) 16%,transparent);color:var(--gold)}
+  .quad ul{list-style:none;margin:14px 0 0;padding:0;display:flex;flex-direction:column;gap:9px}
+  .quad li{font-size:12.5px;color:var(--fg-dim);padding-left:16px;position:relative;line-height:1.45}
+  .quad li::before{content:"";position:absolute;left:0;top:8px;width:5px;height:5px;border-radius:50%;background:var(--fg-faint)}
+  .quad.act li::before{background:var(--ok)}
+  .quad.safe li::before{background:var(--gold)}
+  .quad li b{color:var(--fg);font-weight:700}
+  .quad li code{font-family:var(--mono);font-size:11px;background:var(--bg2);padding:0 5px;border-radius:2px;border:1px solid var(--border);color:var(--fg)}
+
+  /* ---------- range / spectrum band ---------- */
+  .range{display:flex;align-items:center;gap:12px;margin:2px 0 16px;font-family:var(--mono)}
+  .range-end{display:flex;flex-direction:column;gap:2px;white-space:nowrap;flex:0 0 auto}
+  .range-end b{font-size:12.5px;color:var(--fg-dim);font-weight:700}
+  .range-end span{font-size:9.5px;color:var(--fg-faint);text-transform:uppercase;letter-spacing:.7px}
+  .range-end.right{text-align:right}
+  .range-bar{position:relative;flex:1 1 auto;height:30px;border-radius:var(--radius);background:var(--bg2);border:1px solid var(--border);overflow:hidden}
+  .range-bar::after{content:"";position:absolute;inset:0;
+    background:linear-gradient(90deg,color-mix(in srgb,var(--fg-dim) 8%,transparent),color-mix(in srgb,var(--fg-dim) 24%,transparent) 55%,color-mix(in srgb,var(--accent) 20%,transparent));}
+  .range-bar b{position:relative;z-index:1;display:grid;place-items:center;height:100%;font-size:11.5px;font-weight:700;color:var(--accent);letter-spacing:.6px}
+  .spectrum{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .sp-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow-lg)}
+  .sp-card.pro{border-color:var(--border2)}
+  .sp-tag{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10px;letter-spacing:1.1px;text-transform:uppercase;color:var(--fg-faint);font-weight:700}
+  .sp-tag::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--fg-faint)}
+  .sp-card.pro .sp-tag{color:var(--accent)}
+  .sp-card.pro .sp-tag::before{background:var(--accent)}
+  .sp-card p{margin:11px 0 0;font-family:var(--sans);font-size:13px;line-height:1.6;color:var(--fg-dim)}
+  .sp-card p b{color:var(--fg);font-weight:700}
+
+  /* ---------- pillars (everything besides the agent interface) ---------- */
+  .pillars{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:2px}
+  .pil{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px 20px 18px;box-shadow:var(--shadow-lg);display:flex;flex-direction:column}
+  .pil .ph{display:flex;align-items:center;gap:11px;font-family:var(--mono);font-weight:700;font-size:13.5px;color:var(--fg);letter-spacing:.2px}
+  .pil .pi{width:28px;height:28px;flex:0 0 auto;display:grid;place-items:center;border-radius:var(--radius);background:color-mix(in srgb,var(--fg-dim) 15%,transparent);color:var(--fg-dim)}
+  .pil.core .pi{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .pil p{margin:12px 0 0;color:var(--fg-dim);font-size:12.5px;line-height:1.6;font-family:var(--sans);letter-spacing:0}
+  .pil p b{color:var(--fg);font-weight:700}
+  .pil .tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto;padding-top:14px}
+  .pil .tags span{font-family:var(--mono);font-size:10px;color:var(--fg-faint);background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:2px 7px;letter-spacing:.3px;white-space:nowrap}
+
+  /* ---------- takeaways ---------- */
+  .takeaways{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:22px}
+  .tk{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px}
+  .tk .n{font-family:var(--mono);font-size:25px;font-weight:700;letter-spacing:-.01em;color:var(--fg-dim);font-variant-numeric:tabular-nums}
+  .tk .n.brass{color:var(--gold)}
+  .tk .t{font-family:var(--mono);font-weight:700;margin-top:6px;font-size:13.5px;color:var(--fg)}
+  .tk p{margin:7px 0 0;color:var(--fg-faint);font-size:12.5px;line-height:1.55}
+
+  /* ---------- footer ---------- */
+  footer{margin-top:42px;border-top:1px solid var(--border);padding-top:20px;color:var(--fg-faint);font-size:12px;line-height:1.65}
+  footer .m{font-family:var(--mono)}
+  footer b{color:var(--fg-dim);font-weight:700}
+  footer a{color:var(--accent)}
+  footer em{color:var(--fg-dim);font-style:normal}
+
+  @media(max-width:860px){
+    .mcp-grid{grid-template-columns:repeat(2,1fr)}
+    .pillars{grid-template-columns:repeat(2,1fr)}
+    .takeaways{grid-template-columns:1fr}
+  }
+  @media(max-width:560px){.mcp-grid{grid-template-columns:1fr}.pillars{grid-template-columns:1fr}.spectrum{grid-template-columns:1fr}}
+  @media(prefers-reduced-motion:reduce){
+    .dot.live{animation:none}
+    body.fx.flicker #crt{animation:none}
+    *{scroll-behavior:auto}
+  }
+</style>
+</head>
+<body class="fx scan">
+<div id="crt"></div>
+<header class="topbar">
+  <span class="brand"><b>cronstab<span class="mark" id="tbMark">l</span>e</b> <span class="slash">//</span> feature comparison</span>
+  <span class="pill tb-hide"><span class="dot ok"></span>v1.2.8</span>
+  <span class="pill tb-hide">#5978710a7e1f</span>
+  <span class="grow"></span>
+  <span class="clock tb-hide" id="tbClock">--:--:-- UTC</span>
+  <span class="pill"><span class="dot live"></span>live</span>
+  <select id="themeSel" title="Theme" aria-label="Theme">
+        <option value="carolina">Carolina</option>
+        <option value="carolina-light">Carolina · light</option>
+        <option value="amber">Amber</option>
+        <option value="amber-light">Amber · light</option>
+        <option value="green">Green</option>
+        <option value="green-light">Green · light</option>
+        <option value="modern">Modern</option>
+        <option value="modern-light">Modern · light</option>
+        <option value="standard">Standard</option>
+        <option value="standard-light">Standard · light</option>
+  </select>
+  <a class="btn primary" href="./demo/">&#9654; open dashboard</a>
+</header>
+<div class="page">
+<div class="wrap">
+
+  <!-- HERO -->
+  <header>
+    <div class="wordmark" title="the l is a self-balancing double pendulum — click the wordmark to nudge it, sweep your cursor to brush it">
+      <span class="name">cronstab<span class="mark" id="heroMark">l</span>e</span>
+      <span class="say">/ kraahn-stuh-bl /</span>
+    </div>
+
+    <h1>As simple as <span class="hl">cron</span>, as capable as <span class="hl">Airflow</span>, in one daemon.</h1>
+
+    <p class="lede">Point cronstable at the crontab you already run and <strong>it behaves like plain cron</strong>. Reach for DAGs, durable state, leader-elected clustering and a live dashboard only when you need them, all from one dependency-free daemon. And when you want it, a built-in Model Context Protocol server lets an AI agent drive the whole thing.</p>
+
+    <div class="chips">
+      <span class="chip green"><span class="cd"></span><b>24 / 24</b><span>native features</span></span>
+      <span class="chip"><span class="cd"></span><b>5-in-1</b><span>scheduler &middot; DAGs &middot; state &middot; cluster &middot; console</span></span>
+      <span class="chip brass"><span class="cd"></span><b>23</b><span>MCP tools</span></span>
+      <span class="chip"><span class="cd"></span><b>0</b><span>new dependencies</span></span>
+      <span class="chip"><span class="cd"></span><b>13</b><span>OS &times; arch builds</span></span>
+    </div>
+
+      <div class="cta-row">
+        <a class="btn primary lg" href="./demo/index.html">&#9654; Explore the live dashboard</a>
+        <span class="cta-note">An interactive board that drives <span class="k">every view</span>: jobs, DAGs, the cluster, durable state and live logs. Synthetic data; no cluster required.</span>
+      </div>
+  </header>
+
+  <!-- SPECTRUM: start simple, scale up -->
+  <div class="sec-head">
+    <div>
+      <h2>Start simple, scale when you're ready</h2>
+      <p>The same binary covers the whole range. Run it as a nicer cron on one box, or turn on the orchestration, HA and agent tooling as you grow. You never swap tools or rewrite your jobs to move from one end to the other.</p>
+    </div>
+  </div>
+
+  <div class="range" aria-hidden="true">
+    <span class="range-end left"><b>cron</b><span>drop-in</span></span>
+    <div class="range-bar"><b>cronstable spans the whole range</b></div>
+    <span class="range-end right"><b>Airflow</b><span>full orchestration</span></span>
+  </div>
+
+  <div class="spectrum">
+    <div class="sp-card">
+      <div class="sp-tag">Homelab / single box</div>
+      <p>Point it at the crontab you already have and keep it. One static binary, <b>no database, no broker, no daemon zoo</b>. It stays out of your way and only does what a cron does until you ask for more.</p>
+    </div>
+    <div class="sp-card pro">
+      <div class="sp-tag">Team / production</div>
+      <p>Switch on <b>DAGs, leader-elected HA, fenced exactly-once, a durable state store, metrics</b> and the agent interface. The same binary reaches Airflow-class orchestration without the metadata DB or the worker fleet.</p>
+    </div>
+  </div>
+
+  <!-- MATRIX -->
+  <div class="sec-head">
+    <div>
+      <h2>How it stacks up</h2>
+      <p>cronstable versus its closest cron-family competitors, plus Apache Airflow as a heavier orchestrator for scale.</p>
+    </div>
+    <div class="legend" aria-hidden="true">
+      <span class="lk"><span class="mk yes" style="width:16px;height:16px;font-size:10px">✓</span> Native</span>
+      <span class="lk"><span class="mk partial" style="width:16px;height:16px;font-size:9px">◐</span> Partial</span>
+      <span class="lk"><span class="mk addon" style="width:16px;height:16px;font-size:10px">+</span> Add-on</span>
+      <span class="lk"><span class="mk no" style="width:16px;height:16px;font-size:12px">–</span> None</span>
+    </div>
+  </div>
+
+  <div class="matrix-card">
+   <div class="matrix-scroll">
+    <table class="matrix">
+      <colgroup>
+        <col><col class="cs-col"><col><col><col><col><col><col><col>
+      </colgroup>
+      <thead>
+        <tr>
+          <th class="feat" scope="col"><span class="th-name">Capability</span></th>
+          <th class="cs" scope="col">
+            <span class="th-name">cronstable</span>
+            <div class="meter"><i style="width:100%"></i></div>
+            <div class="th-count">24 native</div>
+          </th>
+          <th scope="col"><span class="th-name">yacron</span><div class="th-sub">Python · YAML</div><div class="meter"><i style="width:29%"></i></div><div class="th-count">7 native</div></th>
+          <th scope="col"><span class="th-name">supercronic</span><div class="th-sub">Go · crontab</div><div class="meter"><i style="width:21%"></i></div><div class="th-count">5 native</div></th>
+          <th scope="col"><span class="th-name">Ofelia</span><div class="th-sub">Go · Docker</div><div class="meter"><i style="width:13%"></i></div><div class="th-count">3 native</div></th>
+          <th scope="col"><span class="th-name">dkron</span><div class="th-sub">Go · distributed</div><div class="meter"><i style="width:33%"></i></div><div class="th-count">8 native</div></th>
+          <th scope="col"><span class="th-name">Cronicle</span><div class="th-sub">Node · master/worker</div><div class="meter"><i style="width:38%"></i></div><div class="th-count">9 native</div></th>
+          <th scope="col"><span class="th-name">K8s CronJob</span><div class="th-sub">native resource</div><div class="meter"><i style="width:25%"></i></div><div class="th-count">6 native</div></th>
+          <th class="orch" scope="col"><span class="th-name">Airflow</span><div class="th-sub">Python · orchestrator</div><div class="meter"><i style="width:54%"></i></div><div class="th-count">13 native</div><span class="th-tag orch">Diff. class</span></th>
+        </tr>
+      </thead>
+      <tbody>
+
+        <!-- GROUP: AI -->
+        <tr class="group ai"><td colspan="9"><span class="g-label">AI &amp; agent control</span><span class="g-uniq">Signature</span></td></tr>
+
+        <tr class="spot">
+          <td class="feat"><div class="f-name">MCP server for AI agents</div><div class="f-sub">observe &amp; control</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">23 tools · read-only default</span></td>
+          <td class="no" title="No MCP server; no config keys or code reference MCP."><span class="mk">–</span></td>
+          <td class="no" title="No MCP server; nothing AI-related in code, README, or flags."><span class="mk">–</span></td>
+          <td class="no" title="No Model Context Protocol server; absent from all code and docs."><span class="mk">–</span></td>
+          <td class="no" title="No MCP server; no AI-agent integration in OSS or Pro."><span class="mk">–</span></td>
+          <td class="no" title="No MCP server anywhere in docs or repo."><span class="mk">–</span></td>
+          <td class="addon" title="No native MCP; third-party Kubernetes MCP servers drive the whole cluster, not the CronJob."><span class="mk">+</span><span class="cap">3rd-party cluster MCP</span></td>
+          <td class="addon orch" title="No core MCP server: AIP-91 native server is still a draft; only third-party REST wrappers (mcp-server-apache-airflow) exist."><span class="mk">+</span><span class="cap">draft; 3rd-party wrapper</span></td>
+        </tr>
+
+        <tr class="spot">
+          <td class="feat"><div class="f-name">Agent triage &amp; resources</div><div class="f-sub">canned playbooks + context</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">5 prompts + URI resources</span></td>
+          <td class="no" title="No AI-agent features, triage prompts, or resources of any kind."><span class="mk">–</span></td>
+          <td class="no" title="No AI-agent features, canned prompts, or resources of any kind."><span class="mk">–</span></td>
+          <td class="no" title="No AI-agent features, prompts, or resources of any kind."><span class="mk">–</span></td>
+          <td class="no" title="No AI features, canned triage prompts, or agent resources."><span class="mk">–</span></td>
+          <td class="no" title="No AI/agent features or triage prompts documented."><span class="mk">–</span></td>
+          <td class="no" title="CronJob ships no canned triage prompts or AI-agent resources."><span class="mk">–</span></td>
+          <td class="no orch" title="AIP-101 AI Assistant is only a draft proposal; no shipped triage prompts or agent resources."><span class="mk">–</span></td>
+        </tr>
+
+        <!-- GROUP: SCHEDULING -->
+        <tr class="group"><td colspan="9"><span class="g-label">Scheduling core</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">YAML job configuration</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">native YAML crontab</span></td>
+          <td class="yes" title="YAML is the native and only config format (strictyaml)."><span class="mk">✓</span></td>
+          <td class="no" title="Configuration is a crontab file only; no YAML."><span class="mk">–</span></td>
+          <td class="no" title="INI-style config files and Docker labels only; no YAML."><span class="mk">–</span></td>
+          <td class="no" title="Jobs are JSON via REST API/UI; only the daemon config file is YAML."><span class="mk">–</span></td>
+          <td class="no" title="Config is JSON (config.json); events stored in DB, not YAML."><span class="mk">–</span></td>
+          <td class="yes" title="Defined as a YAML/JSON manifest (spec.schedule, jobTemplate)."><span class="mk">✓</span></td>
+          <td class="addon orch" title="DAGs are Python code; declarative YAML jobs only via the third-party astronomer/dag-factory library."><span class="mk">+</span><span class="cap">via dag-factory</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Classic crontab files as-is</div><div class="f-sub">Vixie <code style="font-family:var(--mono);font-size:11px">/etc/crontab</code></div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">runs it unchanged</span></td>
+          <td class="no" title="Requires YAML; schedule uses crontab-syntax strings, not Vixie crontab files."><span class="mk">–</span></td>
+          <td class="yes" title="Crontab-compatible; adds optional seconds resolution and CRON_TZ."><span class="mk">✓</span></td>
+          <td class="no" title="Per-job cron-syntax schedules in INI/labels; does not ingest crontab files."><span class="mk">–</span></td>
+          <td class="no" title="6-field cron expressions via API; does not ingest Vixie crontab files."><span class="mk">–</span></td>
+          <td class="partial" title="Event editor 'Import' accepts classic 5-field crontab syntax, converting it to a timing object; not crontab files as-is."><span class="mk">◐</span><span class="cap">import only</span></td>
+          <td class="no" title="Single cron expression in spec.schedule; not Vixie crontab files."><span class="mk">–</span></td>
+          <td class="no orch" title="Accepts cron expression strings in a schedule field; does not ingest Vixie crontab files."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Arbitrary per-job timezones</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">any IANA zone, per job</span></td>
+          <td class="yes" title="Per-job timezone attribute since v0.11 (pytz), plus utc flag."><span class="mk">✓</span></td>
+          <td class="yes" title="Per-crontab CRON_TZ lines plus TZ / etc-localtime override."><span class="mk">✓</span></td>
+          <td class="partial" title="Works via robfig/cron CRON_TZ= schedule prefix; undocumented, no tz field."><span class="mk">◐</span><span class="cap">prefix hack</span></td>
+          <td class="yes" title="Per-job timezone field; DST/leap-aware scheduling."><span class="mk">✓</span></td>
+          <td class="yes" title="Per-event IANA timezone saved with each event."><span class="mk">✓</span></td>
+          <td class="yes" title="spec.timeZone IANA field, stable since v1.27; per-CronJob."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Per-DAG timezone via pendulum; DST-aware scheduling built in."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Concurrency policy + timeouts</div><div class="f-sub">execution &amp; kill timeout</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">policy + exec/kill timeout</span></td>
+          <td class="yes" title="concurrencyPolicy Allow/Forbid/Replace plus executionTimeout and killTimeout."><span class="mk">✓</span></td>
+          <td class="partial" title="Serial by default, -overlapping opt-in; no execution or kill timeout."><span class="mk">◐</span><span class="cap">no timeout</span></td>
+          <td class="partial" title="Has no-overlap concurrency option but no execution or kill timeout."><span class="mk">◐</span><span class="cap">no timeout</span></td>
+          <td class="yes" title="Concurrency allow/forbid; shell executor timeout kills overrunning process."><span class="mk">✓</span></td>
+          <td class="yes" title="Event concurrency limit plus timeout that aborts overrunning jobs."><span class="mk">✓</span></td>
+          <td class="yes" title="concurrencyPolicy Allow/Forbid/Replace + Job activeDeadlineSeconds kill timeout."><span class="mk">✓</span></td>
+          <td class="yes orch" title="max_active_runs / max_active_tasks, pools, execution_timeout (kills task), dagrun_timeout."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Retries with exponential backoff</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">backoff · survives restart</span></td>
+          <td class="yes" title="onFailure retry: maximumRetries, initialDelay, maximumDelay, backoffMultiplier (exponential)."><span class="mk">✓</span></td>
+          <td class="no" title="No retry or backoff logic in code or docs."><span class="mk">–</span></td>
+          <td class="no" title="No automatic retry or exponential backoff option."><span class="mk">–</span></td>
+          <td class="partial" title="Retry count, same node only; no exponential backoff or configurable delay."><span class="mk">◐</span><span class="cap">no backoff</span></td>
+          <td class="partial" title="Up to 32 retries with fixed retry delay, not exponential backoff."><span class="mk">◐</span><span class="cap">fixed delay</span></td>
+          <td class="yes" title="Job backoffLimit (default 6), exponential backoff 10s to 6min cap."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Per-task retries with retry_delay, retry_exponential_backoff, and max_retry_delay cap."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Missed-run catch-up</div><div class="f-sub">after downtime</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">durable catch-up</span></td>
+          <td class="no" title="No missed-run catch-up; no config key or documented behavior."><span class="mk">–</span></td>
+          <td class="no" title="No catch-up; missed runs during downtime are skipped."><span class="mk">–</span></td>
+          <td class="no" title="No missed-run catch-up; robfig/cron with no run persistence."><span class="mk">–</span></td>
+          <td class="no" title="No missed-run catch-up after downtime; only schedules next fire."><span class="mk">–</span></td>
+          <td class="yes" title="'Run All (Catch-Up)' mode reruns missed jobs after downtime."><span class="mk">✓</span></td>
+          <td class="partial" title="startingDeadlineSeconds gates missed runs; only one catch-up Job, not per-interval."><span class="mk">◐</span><span class="cap">one run only</span></td>
+          <td class="yes orch" title="catchup parameter schedules every missed interval after downtime (default off in Airflow 3)."><span class="mk">✓</span></td>
+        </tr>
+
+        <!-- GROUP: ORCHESTRATION -->
+        <tr class="group"><td colspan="9"><span class="g-label">Orchestration &amp; workflows</span></td></tr>
+
+        <tr class="spot">
+          <td class="feat"><div class="f-name">DAGs / dependency graphs</div><div class="f-sub">durable workflow engine</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">fan-out · sensors · resume</span></td>
+          <td class="no" title="No job dependencies or workflow engine; jobs run independently."><span class="mk">–</span></td>
+          <td class="no" title="Independent jobs only; no dependency graph or workflow engine."><span class="mk">–</span></td>
+          <td class="no" title="No dependencies/DAGs in upstream; DAGs exist only in a fork."><span class="mk">–</span></td>
+          <td class="partial" title="parent_job / dependent_jobs chaining on completion; not a full DAG workflow engine."><span class="mk">◐</span><span class="cap">chaining only</span></td>
+          <td class="partial" title="Chain reaction with success/error branching, not a declarative multi-parent DAG."><span class="mk">◐</span><span class="cap">chains only</span></td>
+          <td class="addon" title="No native dependencies; requires Argo Workflows or Tekton."><span class="mk">+</span><span class="cap">Argo / Tekton</span></td>
+          <td class="yes orch" title="Python-defined DAGs with task dependency graphs; Airflow's core purpose."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Cross-task data hand-off</div><div class="f-sub">XCom</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">XCom between tasks</span></td>
+          <td class="no" title="No cross-task data hand-off; no workflow tasks exist."><span class="mk">–</span></td>
+          <td class="no" title="No workflow tasks, so no cross-task data hand-off."><span class="mk">–</span></td>
+          <td class="no" title="No cross-task data hand-off between jobs."><span class="mk">–</span></td>
+          <td class="no" title="No cross-task data hand-off between chained jobs."><span class="mk">–</span></td>
+          <td class="yes" title="chain_data passes arbitrary JSON to the next chained event."><span class="mk">✓</span></td>
+          <td class="addon" title="Not in CronJob; Argo Workflows passes parameters/artifacts between steps."><span class="mk">+</span><span class="cap">Argo</span></td>
+          <td class="yes orch" title="XCom passes data between tasks; pluggable custom XCom backends supported. (cronstable borrows the name.)"><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Human approval gates</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">pause for sign-off</span></td>
+          <td class="no" title="No human approval gates; no workflow concept at all."><span class="mk">–</span></td>
+          <td class="no" title="No workflows or human approval gates."><span class="mk">–</span></td>
+          <td class="no" title="No human approval gates."><span class="mk">–</span></td>
+          <td class="no" title="No human approval gates in workflows."><span class="mk">–</span></td>
+          <td class="no" title="No human approval gates documented in workflows."><span class="mk">–</span></td>
+          <td class="addon" title="None native; Argo Workflows suspend/resume steps provide manual gates."><span class="mk">+</span><span class="cap">Argo</span></td>
+          <td class="yes orch" title="Airflow 3.1+ HITL ApprovalOperator / HITLOperator in the bundled standard provider, with UI forms."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Backfill / historical reruns</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">whole-DAG backfill</span></td>
+          <td class="no" title="No backfill or historical rerun capability documented."><span class="mk">–</span></td>
+          <td class="no" title="No backfill or historical rerun capability."><span class="mk">–</span></td>
+          <td class="no" title="No backfill or historical rerun capability."><span class="mk">–</span></td>
+          <td class="no" title="No backfill/historical rerun; only immediate on-demand run endpoint."><span class="mk">–</span></td>
+          <td class="partial" title="Event 'Time Machine' resets an event cursor to a past time and re-runs forward; requires Catch-Up mode."><span class="mk">◐</span><span class="cap">time machine</span></td>
+          <td class="no" title="No schedule/DAG backfill; would manually create Jobs for past runs."><span class="mk">–</span></td>
+          <td class="yes orch" title="airflow dags backfill CLI; Airflow 3 adds backfill via the UI/API."><span class="mk">✓</span></td>
+        </tr>
+
+        <!-- GROUP: DISTRIBUTED -->
+        <tr class="group"><td colspan="9"><span class="g-label">Distributed &amp; fault-tolerant</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Clustering + no double-run</div><div class="f-sub">replicas from one config</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">mTLS leader election · quorum</span></td>
+          <td class="no" title="Single-instance only; no leader election or replica coordination."><span class="mk">–</span></td>
+          <td class="no" title="Single-process; no clustering or leader election."><span class="mk">–</span></td>
+          <td class="no" title="Single instance; no clustering or leader election."><span class="mk">–</span></td>
+          <td class="yes" title="Serf gossip + Raft leader election; tag-targeted single execution."><span class="mk">✓</span></td>
+          <td class="yes" title="Multi-server auto-failover; primary elected by hostname sort, shared storage."><span class="mk">✓</span></td>
+          <td class="yes" title="HA control plane leader-elects controllers (Lease); single active CronJob controller."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Active-active multiple schedulers dedupe via DB row-locks (no double-run); no leader election."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Fenced exactly-once</div><div class="f-sub">lease / lock fenced</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">fenced via lease backend</span></td>
+          <td class="no" title="No fenced leases or exactly-once execution; no clustering primitives."><span class="mk">–</span></td>
+          <td class="no" title="No leases or fencing; each replica runs independently."><span class="mk">–</span></td>
+          <td class="no" title="No lease/fencing; no exactly-once execution guarantee."><span class="mk">–</span></td>
+          <td class="partial" title="Leader election avoids double-schedule, but no lease fencing; retries are at-least-once."><span class="mk">◐</span><span class="cap">no fencing</span></td>
+          <td class="no" title="Single-primary scheduler; no fenced-lease / etcd exactly-once guarantee."><span class="mk">–</span></td>
+          <td class="no" title="Docs: two Jobs or none may be created; jobs must be idempotent."><span class="mk">–</span></td>
+          <td class="partial orch" title="Scheduler DB row-locks dedupe scheduling; no fencing token, zombie/duplicate runs possible."><span class="mk">◐</span><span class="cap">no fencing</span></td>
+        </tr>
+
+        <tr class="spot">
+          <td class="feat"><div class="f-name">Durable state store for jobs</div><div class="f-sub">KV · locks · cursors · secrets</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">+ idempotency &amp; artifacts</span></td>
+          <td class="no" title="No KV, locks, cursors, idempotency, secrets, or artifact store."><span class="mk">–</span></td>
+          <td class="no" title="Stateless; no KV, locks, cursors, secrets, or artifacts."><span class="mk">–</span></td>
+          <td class="no" title="History in-memory; save driver writes reports, no state store for jobs."><span class="mk">–</span></td>
+          <td class="no" title="Internal BoltDB not exposed to jobs; no KV/locks/cursors/secrets/artifacts API."><span class="mk">–</span></td>
+          <td class="no" title="No KV/locks/cursors/idempotency/secrets store exposed to jobs."><span class="mk">–</span></td>
+          <td class="partial" title="Secrets/ConfigMaps + PersistentVolumes exist; no job-facing KV/locks/cursors/idempotency store."><span class="mk">◐</span><span class="cap">PV/Secrets only</span></td>
+          <td class="partial orch" title="Variables (KV), Connections/secrets backends and XCom; no locks, cursors, idempotency, or artifacts."><span class="mk">◐</span><span class="cap">Variables/secrets</span></td>
+        </tr>
+
+        <!-- GROUP: OBSERVABILITY -->
+        <tr class="group"><td colspan="9"><span class="g-label">Observability &amp; control</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Live web dashboard</div><div class="f-sub">tail · run · cancel</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">live tail · 10 themes</span></td>
+          <td class="no" title="REST API only; no HTML dashboard, log tailing, or cancel."><span class="mk">–</span></td>
+          <td class="no" title="Only a Prometheus /metrics endpoint; no web dashboard or run/cancel."><span class="mk">–</span></td>
+          <td class="no" title="No web UI; open feature request, no --enable-web flag."><span class="mk">–</span></td>
+          <td class="partial" title="Web UI with on-demand run and execution output; no cancel or live tail."><span class="mk">◐</span><span class="cap">no cancel/tail</span></td>
+          <td class="yes" title="Real-time web UI, live log viewer, run/abort on demand."><span class="mk">✓</span></td>
+          <td class="addon" title="Kubernetes Dashboard is a separate Helm add-on, not default; otherwise kubectl logs."><span class="mk">+</span><span class="cap">separate UI</span></td>
+          <td class="yes orch" title="Web UI: Grid/Graph views, live log viewing, trigger DAG, clear/mark tasks."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">HTTP REST control API</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">status · start · cancel · history</span></td>
+          <td class="yes" title="Optional HTTP API: /version, /status, /jobs/{name}/start; no cancel endpoint."><span class="mk">✓</span></td>
+          <td class="no" title="No control API; /metrics is a read-only Prometheus scrape."><span class="mk">–</span></td>
+          <td class="no" title="No HTTP/REST control API in the daemon."><span class="mk">–</span></td>
+          <td class="yes" title="Full HTTP REST API for jobs and executions."><span class="mk">✓</span></td>
+          <td class="yes" title="Full HTTP REST API with API keys for automation."><span class="mk">✓</span></td>
+          <td class="yes" title="Kubernetes API server is REST; full CronJob CRUD via API/kubectl."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Stable REST API (v1 in 2.x; a redesigned API server in Airflow 3)."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Prometheus + statsd metrics</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">both, native</span></td>
+          <td class="yes" title="Native statsd only (prefix/host/port); no Prometheus exporter."><span class="mk">✓</span></td>
+          <td class="yes" title="-prometheus-listen-address exposes /metrics (exec, success/fail, duration)."><span class="mk">✓</span></td>
+          <td class="no" title="No native Prometheus or statsd metrics endpoint."><span class="mk">–</span></td>
+          <td class="yes" title="Prometheus /metrics endpoint, statsd, DogStatsD, and OTel."><span class="mk">✓</span></td>
+          <td class="no" title="No native Prometheus/statsd; JSON stats API only."><span class="mk">–</span></td>
+          <td class="addon" title="No native metrics; kube-state-metrics add-on exposes kube_cronjob_* for Prometheus."><span class="mk">+</span><span class="cap">kube-state-metrics</span></td>
+          <td class="yes orch" title="Native statsd and OpenTelemetry metrics in core (Prometheus via a statsd exporter)."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Per-job resource monitoring</div><div class="f-sub">CPU time · peak memory</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">whole process tree</span></td>
+          <td class="no" title="No per-job CPU-time or peak-memory monitoring documented."><span class="mk">–</span></td>
+          <td class="no" title="Tracks execution duration only; no CPU time or peak memory."><span class="mk">–</span></td>
+          <td class="no" title="No per-job CPU time or peak memory monitoring."><span class="mk">–</span></td>
+          <td class="partial" title="Shell executor exposes per-job Prometheus gauges dkron_job_cpu_usage / mem_usage_kb (port 9422); recent addition."><span class="mk">◐</span><span class="cap">Prom gauges</span></td>
+          <td class="yes" title="Monitors per-job CPU, memory and log size every 10s, with limits."><span class="mk">✓</span></td>
+          <td class="addon" title="Needs metrics-server or cAdvisor+Prometheus; no native per-Job CPU/peak-memory."><span class="mk">+</span><span class="cap">metrics-server</span></td>
+          <td class="no orch" title="No native per-task CPU-time or peak-memory tracking in Airflow core."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Failure reporting</div><div class="f-sub">mail · Sentry · Slack</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">+ webhook &amp; shell</span></td>
+          <td class="yes" title="Native mail and Sentry; Slack/webhook via shell reporter."><span class="mk">✓</span></td>
+          <td class="partial" title="Native Sentry integration (-sentry-dsn); no email, Slack, or webhook."><span class="mk">◐</span><span class="cap">Sentry only</span></td>
+          <td class="yes" title="Mail (SMTP), Slack webhook, and save-to-directory drivers, with only-on-error options."><span class="mk">✓</span></td>
+          <td class="partial" title="OSS global Slack webhook; per-job Slack/email processors are Pro-only; no Sentry."><span class="mk">◐</span><span class="cap">Pro for per-job</span></td>
+          <td class="yes" title="Failure email plus web hooks (Slack via webhook); no native Sentry."><span class="mk">✓</span></td>
+          <td class="addon" title="Events only; needs a Prometheus Alertmanager add-on for Slack/email/webhook."><span class="mk">+</span><span class="cap">Alertmanager</span></td>
+          <td class="yes orch" title="Native email_on_failure and Sentry integration; Slack/PagerDuty via provider packages."><span class="mk">✓</span></td>
+        </tr>
+
+        <!-- GROUP: PLATFORM -->
+        <tr class="group"><td colspan="9"><span class="g-label">Platform &amp; deployment</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Native Windows + macOS + Linux</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">all three, native</span></td>
+          <td class="no" title="Linux-only; binary targets glibc 2.23+, no Windows/macOS."><span class="mk">–</span></td>
+          <td class="no" title="Only Linux binaries published; pure-Go, so buildable from source."><span class="mk">–</span></td>
+          <td class="partial" title="Prebuilt Windows/macOS/Linux binaries, but Docker-centric; only job-local runs on host."><span class="mk">◐</span><span class="cap">Docker-centric</span></td>
+          <td class="yes" title="Prebuilt Windows, macOS, Linux, FreeBSD binaries (amd64/arm64)."><span class="mk">✓</span></td>
+          <td class="partial" title="POSIX only: Linux and macOS; Windows not natively supported."><span class="mk">◐</span><span class="cap">no Windows</span></td>
+          <td class="no" title="Requires a cluster; Linux (with Windows worker nodes) only, container-only, no macOS."><span class="mk">–</span></td>
+          <td class="no orch" title="Windows unsupported; Linux only (macOS for local dev only), plus containers."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Self-contained multi-arch binaries</div><div class="f-sub">no runtime install</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">8 Linux arches + mac + win</span></td>
+          <td class="partial" title="Self-contained binary exists but Linux x86-64 only, not multi-arch."><span class="mk">◐</span><span class="cap">x86-64 only</span></td>
+          <td class="yes" title="Static Go binaries: linux amd64/386/arm/arm64; no runtime install."><span class="mk">✓</span></td>
+          <td class="yes" title="Self-contained Go binaries: linux/darwin/windows across amd64/arm64/386."><span class="mk">✓</span></td>
+          <td class="yes" title="Static CGO-free multi-arch binaries; deb/rpm/tar.gz, no runtime install."><span class="mk">✓</span></td>
+          <td class="no" title="Installed via npm; requires the Node.js runtime, no self-contained binaries."><span class="mk">–</span></td>
+          <td class="no" title="Ships component binaries/images, but a CronJob needs a full cluster, not one binary."><span class="mk">–</span></td>
+          <td class="no orch" title="Distributed as a Python pip package that needs a Python runtime; no self-contained binaries."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Hardened container images</div><div class="f-sub">non-root · read-only · distroless</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">+ 8 distro variants</span></td>
+          <td class="no" title="No official hardened/non-root/distroless image; users build their own."><span class="mk">–</span></td>
+          <td class="no" title="Ships no image; you COPY the binary into your own (scratch/distroless-capable)."><span class="mk">–</span></td>
+          <td class="no" title="alpine image runs as root, not read-only, not distroless."><span class="mk">–</span></td>
+          <td class="no" title="Alpine image runs as root; no distroless or read-only variant."><span class="mk">–</span></td>
+          <td class="no" title="No official image; only third-party Docker, none hardened/distroless."><span class="mk">–</span></td>
+          <td class="partial" title="No shipped image; you bring the container; securityContext / Pod Security Standards harden it."><span class="mk">◐</span><span class="cap">you harden it</span></td>
+          <td class="partial orch" title="Official image runs non-root (UID 50000) but is Debian-slim, not distroless and not read-only-rootfs friendly."><span class="mk">◐</span><span class="cap">not distroless</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Minimal runtime dependencies</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">pure Python · MCP adds none</span></td>
+          <td class="partial" title="pip pulls aiohttp, ruamel.yaml, strictyaml, crontab, sentry-sdk, aiosmtplib, jinja2, pytz."><span class="mk">◐</span><span class="cap">8 pip deps</span></td>
+          <td class="yes" title="Single statically-linked Go binary; zero runtime dependencies."><span class="mk">✓</span></td>
+          <td class="yes" title="Single static Go binary; needs a Docker daemon for container jobs."><span class="mk">✓</span></td>
+          <td class="yes" title="Single static Go binary; embedded BoltDB, no external database required."><span class="mk">✓</span></td>
+          <td class="no" title="Requires the Node.js runtime plus roughly 24 npm packages."><span class="mk">–</span></td>
+          <td class="no" title="Requires a full cluster: etcd, apiserver, controller-manager, scheduler, kubelet, runtime."><span class="mk">–</span></td>
+          <td class="no orch" title="Heavy: needs Python plus a metadata DB, scheduler, API server, workers, and a triggerer."><span class="mk">–</span></td>
+        </tr>
+
+      </tbody>
+    </table>
+   </div>
+  </div>
+
+  <!-- PILLARS: everything besides the agent interface -->
+  <div class="sec-head">
+    <div>
+      <h2>Everything else it packs in</h2>
+      <p>The agent interface gets the attention, but most of cronstable is the scheduler under it: a DAG engine, a fenced cluster, a durable state store and a live console, all in the same dependency-free daemon.</p>
+    </div>
+  </div>
+
+  <div class="pillars">
+    <div class="pil core">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.4"></circle><circle cx="18" cy="6" r="2.4"></circle><circle cx="18" cy="18" r="2.4"></circle><path d="M8.1 10.9 15.9 7.1M8.1 13.1 15.9 16.9"></path></svg>
+      </span>DAG engine</div>
+      <p>A durable workflow engine rather than plain job chaining: <b>fan-out</b>, <b>sensors</b> that wait on external conditions, and <b>XCom</b> hand-offs between tasks. Runs survive a restart and resume mid-flight; pause on a <b>human approval gate</b>, then <b>backfill</b> history when you need to.</p>
+      <div class="tags"><span>fan-out</span><span>sensors</span><span>XCom</span><span>approval gates</span><span>backfill</span><span>resume</span></div>
+    </div>
+
+    <div class="pil core">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="1.4"></rect><rect x="3" y="13" width="18" height="7" rx="1.4"></rect><path d="M7 7.5h.01M7 16.5h.01"></path></svg>
+      </span>Fenced, elected cluster</div>
+      <p>Run replicas from one config with <b>mTLS leader election</b> and quorum, so a job never double-fires. <b>Fenced exactly-once</b> execution through a lease backend keeps a stalled leader from overwriting its successor's work.</p>
+      <div class="tags"><span>mTLS</span><span>leader election</span><span>quorum</span><span>fenced exactly-once</span></div>
+    </div>
+
+    <div class="pil core">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"></path><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"></path></svg>
+      </span>Durable state store</div>
+      <p>A store your jobs can use directly: <b>KV, locks, cursors, secrets, idempotency keys and artifacts</b>, all surviving restarts. It runs without an external database or Redis.</p>
+      <div class="tags"><span>KV</span><span>locks</span><span>cursors</span><span>secrets</span><span>idempotency</span><span>artifacts</span></div>
+    </div>
+
+    <div class="pil">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="1.4"></rect><path d="M8 20h8M12 16v4"></path></svg>
+      </span>Live console</div>
+      <p>A web dashboard that <b>tails logs</b>, <b>runs and cancels</b> jobs on demand, and walks any DAG's task graph, with 10 phosphor themes. Backed by an <b>HTTP REST API</b> and native <b>Prometheus + statsd</b>.</p>
+      <div class="tags"><span>live tail</span><span>run/cancel</span><span>REST API</span><span>Prometheus</span><span>10 themes</span></div>
+    </div>
+
+    <div class="pil">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7.5v5l3.2 2"></path></svg>
+      </span>Scheduling core</div>
+      <p>Runs your classic <b>Vixie crontab files unchanged</b>, with <b>per-job IANA timezones</b>, concurrency policies, exec/kill timeouts, <b>retries with exponential backoff</b>, and <b>missed-run catch-up</b> after downtime.</p>
+      <div class="tags"><span>crontab as-is</span><span>per-job TZ</span><span>timeouts</span><span>backoff</span><span>catch-up</span></div>
+    </div>
+
+    <div class="pil">
+      <div class="ph"><span class="pi" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 3.5 7v10L12 21.5 20.5 17V7L12 2.5Z"></path><path d="M3.7 7 12 11.5 20.3 7M12 11.5v10"></path></svg>
+      </span>Portable &amp; hardened</div>
+      <p>Runs natively on <b>Windows, macOS and Linux</b>, shipped as self-contained binaries across <b>13 OS &times; arch targets</b>, plus <b>distroless images</b> that run non-root on a read-only root filesystem. Adds <b>zero</b> new dependencies.</p>
+      <div class="tags"><span>Win</span><span>mac</span><span>Linux</span><span>13 builds</span><span>distroless</span><span>non-root</span></div>
+    </div>
+  </div>
+
+  <!-- MCP SPOTLIGHT -->
+  <div class="sec-head">
+    <div>
+      <h2>One cool thing about cronstable</h2>
+      <p>we're the only scheduler with a native agent interface.</p>
+    </div>
+  </div>
+
+  <div class="mcp">
+    <div class="mcp-top">
+      <div class="lead">
+        <div class="mcp-kicker"><span class="sq"></span>Built-in MCP server</div>
+        <h3>Point <span class="a">Claude, Cursor or Copilot</span> at your scheduler.</h3>
+        <p>cronstable speaks the Model Context Protocol natively, served at <code>POST /mcp</code> over Streamable HTTP and through a <code>cronstable mcp</code> stdio bridge for desktop clients. It's written in pure Python against MCP revision <b style="font-weight:600">2025-11-25</b>. Enabling it adds <b style="font-weight:600">zero</b> new dependencies. The agent gets read-only access until you grant it write tools.</p>
+      </div>
+      <pre class="snip" aria-label="Wiring cronstable's MCP server to Claude Code"><span class="p"># wire it to Claude Code (remote or local)</span>
+claude mcp add <span class="k">--transport</span> http \
+  cronstable https://host/<span class="c">mcp</span> \
+  <span class="k">--header</span> <span class="c">"Authorization: Bearer $TOKEN"</span>
+
+$ cronstable mcp <span class="k">--check</span>
+<span class="ok">mcp check: ok</span>, protocol 2025-11-25,
+  <b>23 tool(s)</b> at http://127.0.0.1:8080/mcp</pre>
+    </div>
+
+    <div class="mcp-grid">
+      <div class="quad">
+        <div class="qh"><span class="qi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.6"></circle></svg>
+        </span>Observe</div>
+        <ul>
+          <li>Every <b>job, run &amp; trend</b>: status, history, live log tails</li>
+          <li><b>DAGs</b>, their runs and XCom data hand-offs</li>
+          <li>The <b>cluster &amp; fleet</b>, node-by-node</li>
+          <li><b>Metrics</b> and the durable <b>state store</b></li>
+        </ul>
+      </div>
+      <div class="quad act">
+        <div class="qh"><span class="qi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m13 2-9 12h7l-1 8 9-12h-7l1-8Z"></path></svg>
+        </span>Act &middot; opt-in</div>
+        <ul>
+          <li><b>Run</b> or <b>cancel</b> a job on demand</li>
+          <li><b>Trigger</b>, <b>backfill</b> or <b>approve</b> a DAG</li>
+          <li>Every write needs <code>confirm: true</code></li>
+          <li>Backfills default to a <b>dry-run</b> preview</li>
+        </ul>
+      </div>
+      <div class="quad">
+        <div class="qh"><span class="qi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 12h16M4 19h10"></path></svg>
+        </span>Triage playbooks</div>
+        <ul>
+          <li><b>Root-cause</b> a failing job</li>
+          <li>Walk <b>why a DAG run failed</b></li>
+          <li>Scope the <b>blast radius</b> of a change</li>
+          <li>Fleet-health digest &amp; <b>backfill plan</b></li>
+        </ul>
+      </div>
+      <div class="quad safe">
+        <div class="qh"><span class="qi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6l-7-3Z"></path></svg>
+        </span>Safe by default</div>
+        <ul>
+          <li><b>Read-only</b> until you opt in to mutating tools</li>
+          <li>Inherits web auth; <b>fails closed</b> with no token</li>
+          <li>Secret values &amp; KV data <b>redacted</b></li>
+          <li>Origin &amp; body defenses against rebinding</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAKEAWAYS -->
+  <div class="takeaways">
+    <div class="tk">
+      <div class="n">5-in-1</div>
+      <div class="t">Orchestration without the Airflow overhead</div>
+      <p>Scheduler, durable DAG engine, a job-facing state store, a leader-elected cluster and a live console in one binary. It matches Airflow's orchestration without the metadata DB, the separate workers, or the Python-only footprint.</p>
+    </div>
+    <div class="tk">
+      <div class="n brass">1 of 8</div>
+      <div class="t">Only cronstable ships a native MCP server</div>
+      <p>Across every tool surveyed, it's the only native agent interface. Airflow and Kubernetes reach MCP only through third-party, whole-system add-ons, and Airflow's own server is still a draft proposal.</p>
+    </div>
+    <div class="tk">
+      <div class="n">0 deps</div>
+      <div class="t">Portable and dependency-free</div>
+      <p>Pure-Python with no new dependencies, self-contained binaries for 13 OS/arch targets, and images that run non-root on a read-only root filesystem.</p>
+    </div>
+  </div>
+
+  <!-- CLOSING CTA -->
+  <div class="sec-head">
+    <div>
+      <h2>See it running</h2>
+      <p>Open the live dashboard and drive a nine-node fleet yourself: tail a job's logs, walk a DAG's task graph, watch leader election, and inspect the durable state store.</p>
+    </div>
+  </div>
+  <div class="cta-row" style="margin-top:2px">
+    <a class="btn primary lg" href="./demo/">&#9654; Open the live dashboard demo</a>
+    <a class="btn lg" href="https://github.com/ptweezy/cronstable">&#9733; cronstable on GitHub</a>
+  </div>
+
+</div>
+</div>
+<!-- logo engine: copied verbatim from cronstable/web/index.html (the live
+     dashboard header's mark). this page is served by GitHub Pages with no
+     build step, so the block is inlined; keep it in sync by re-copying it
+     wholesale. -->
+<script>
+/* =====================================================================
+ *  logo engine — a real self-balancing double pendulum on a cart.
+ *
+ *  This is not a canned animation. The header mark integrates the full
+ *  nonlinear cart/double-pendulum dynamics (RK4 at 240 Hz) and balances
+ *  itself with an LQR controller whose gains are computed at page load
+ *  from a numerical linearization (discrete Riccati iteration). A weak
+ *  detent spring at the elbow gives the stand its deliberate slight bend —
+ *  the leaned pose is a true equilibrium, solved in the constructor, and
+ *  the controller regulates to it. While the daemon is live the letter
+ *  stands with that easy bend, riding out little gusts; lose the
+ *  signal and the motor cuts — it collapses and swings, pumping energy
+ *  (dE/dt = -a*G exactly) but held just short of the top. When the signal
+ *  returns, a receding-horizon cross-entropy planner threads the swing
+ *  into the balance controller's basin — every catch is verified by a
+ *  2-second closed-loop rollout before it is committed. A hard recovery
+ *  gets running room: the right end of the track swings open toward
+ *  mid-page — the physics bound leaps at once, while a phantom rail
+ *  and a fleeing end gate keep the picture honest — and eases back
+ *  to the end of the word once the letter stands at home. Stability isn't
+ *  a metaphor here; it is recomputed 240 times a second.
+ *
+ *  State s = [x, xd, th1, w1, th2, w2]; angles from upright; control is
+ *  cart acceleration. Tuned + Monte-Carlo-tested headlessly (recovery
+ *  median ~15 s, ~100% by 90 s, zero unverified catches in 10-min soak).
+ * ===================================================================== */
+"use strict";
+(function () {
+  const DP = {
+    g: 9.81,
+    L1: 0.34, L2: 0.26,      // link lengths (m)
+    m1: 0.14, m2: 0.09,      // point masses at link tips (kg)
+    d1: 0.005, d2: 0.002,    // joint viscous damping
+    kElbow: 0.06,            // elbow detent: sinusoidal (magnetic-style), torque k*sin(rel-rest).
+                             // Deliberately WEAK: it only has to define the bent stand (the rest
+                             // angle absorbs the difference); anything stiffer measurably drags
+                             // on the swing-up (Monte-Carlo'd — k=0.25 strands recoveries whirling)
+    bendStand: 0.10,         // the stand is deliberately bent: link 2 leans this far (rad)
+    elbowRest: 0,            // detent rest angle; computed from bendStand in the constructor
+    trackHalf: 0.42,         // cart travel each side of center (m)
+    aMaxBalance: 18,         // accel authority while balancing (m/s^2)
+    aMaxCatch: 24,           // extra muscle in the first 1.2 s of a catch
+    aMaxSwing: 26,           // swing-up authority (escalates to 34)
+    dt: 1 / 240,             // physics step (s)
+  };
+  const LQR_Q = [4, 3.2, 120, 1.33, 162, 2], LQR_R = 0.12;
+  const SEG_N = 8, SEG_DT = 0.12;                  // CEM plan: 0.96 s horizon
+  const SEG_STEPS = Math.round(SEG_DT / (1 / 120));
+  const ENGAGE_GATE = 12000;                       // z'Pz gate before verifying
+  const VERIFY_COOLDOWN = 0.06;                    // s between catch rollouts
+
+  const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+  const wrapA = (a) => {
+    const T = 2 * Math.PI;
+    a = ((a % T) + T) % T;
+    return a > Math.PI ? a - T : a;
+  };
+  const mulberry32 = (seed) => {
+    let t = seed >>> 0;
+    return () => {
+      t += 0x6D2B79F5;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  // ---- dynamics: M(q) qdd = b, solved 2x2 per evaluation ----
+  function deriv(p, s, a) {
+    const xd = s[1], th1 = s[2], w1 = s[3], th2 = s[4], w2 = s[5];
+    const s1 = Math.sin(th1), c1 = Math.cos(th1);
+    const s2 = Math.sin(th2), c2 = Math.cos(th2);
+    const D = th1 - th2, sD = Math.sin(D), cD = Math.cos(D);
+    const M = p.m1 + p.m2;
+    const M11 = M * p.L1 * p.L1;
+    const M12 = p.m2 * p.L1 * p.L2 * cD;
+    const M22 = p.m2 * p.L2 * p.L2;
+    // elbow detent: a weak SINUSOIDAL spring (magnetic-cogging style) with a
+    // bent rest angle — it is what makes the standing l lean. Sinusoidal, not
+    // linear-wrapped: the torque is smooth and periodic over full elbow
+    // rotations (a wrapped linear spring flips sign discontinuously at the
+    // fold, which poisons RK4 and the CEM rollouts during a tumble).
+    const spr = p.kElbow ? p.kElbow * Math.sin(th2 - th1 - p.elbowRest) : 0;
+    const Q1 = -p.d1 * w1 + p.d2 * (w2 - w1) + spr;
+    const Q2 = -p.d2 * (w2 - w1) - spr;
+    const b1 = -p.m2 * p.L1 * p.L2 * w2 * w2 * sD + p.g * M * p.L1 * s1 - M * p.L1 * c1 * a + Q1;
+    const b2 = p.m2 * p.L1 * p.L2 * w1 * w1 * sD + p.g * p.m2 * p.L2 * s2 - p.m2 * p.L2 * c2 * a + Q2;
+    const det = M11 * M22 - M12 * M12;
+    return [xd, a, w1, (M22 * b1 - M12 * b2) / det, w2, (M11 * b2 - M12 * b1) / det];
+  }
+  function rk4(p, s, a, dt) {
+    const k1 = deriv(p, s, a);
+    const s2 = s.map((v, i) => v + 0.5 * dt * k1[i]);
+    const k2 = deriv(p, s2, a);
+    const s3 = s.map((v, i) => v + 0.5 * dt * k2[i]);
+    const k3 = deriv(p, s3, a);
+    const s4 = s.map((v, i) => v + dt * k3[i]);
+    const k4 = deriv(p, s4, a);
+    return s.map((v, i) => v + (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+  }
+  // pendulum energy in the cart frame (incl. the detent's PE); the swing-up
+  // target is the energy AT the bent stand — sim.EUP, computed per instance
+  function energy(p, s) {
+    const th1 = s[2], w1 = s[3], th2 = s[4], w2 = s[5];
+    const M = p.m1 + p.m2;
+    return 0.5 * M * p.L1 * p.L1 * w1 * w1
+      + 0.5 * p.m2 * p.L2 * p.L2 * w2 * w2
+      + p.m2 * p.L1 * p.L2 * w1 * w2 * Math.cos(th1 - th2)
+      + p.g * (M * p.L1 * Math.cos(th1) + p.m2 * p.L2 * Math.cos(th2))
+      + p.kElbow * (1 - Math.cos(th2 - th1 - p.elbowRest));
+  }
+  // energy-flow coupling: dE/dt = -a * G(s); the pump pushes against G
+  const Gterm = (p, s) =>
+    (p.m1 + p.m2) * p.L1 * Math.cos(s[2]) * s[3] + p.m2 * p.L2 * Math.cos(s[4]) * s[5];
+
+  // ---- LQR gains from a numerical linearization at the (bent) stand ----
+  function computeLQR(p, s0) {
+    const n = 6, eps = 1e-6, dtc = 0.002;
+    const mm = (A, B) => {
+      const rn = A.length, cm = B[0].length, kk = B.length;
+      const C = Array.from({ length: rn }, () => new Float64Array(cm));
+      for (let i = 0; i < rn; i++)
+        for (let t = 0; t < kk; t++) {
+          const a = A[i][t];
+          if (a === 0) continue;
+          for (let j = 0; j < cm; j++) C[i][j] += a * B[t][j];
+        }
+      return C;
+    };
+    const eye = (k) => Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) => (i === j ? 1 : 0)));
+    const f0 = deriv(p, s0, 0);
+    const A = eye(n).map((r) => r.map(() => 0));
+    for (let j = 0; j < n; j++) {
+      const sp = s0.slice(); sp[j] += eps;
+      const fp = deriv(p, sp, 0);
+      for (let i = 0; i < n; i++) A[i][j] = (fp[i] - f0[i]) / eps;
+    }
+    const fB = deriv(p, s0, eps);
+    const Bc = f0.map((v, i) => [(fB[i] - v) / eps]);
+    let Ad = eye(n), term = eye(n);
+    let Sint = eye(n).map((r) => r.map((v) => v * dtc)), termI = Sint.map((r) => r.slice());
+    for (let k = 1; k <= 8; k++) {
+      term = mm(term, A).map((r) => Array.from(r, (v) => v * dtc / k));
+      Ad = Ad.map((r, i) => r.map((v, j) => v + term[i][j]));
+      termI = mm(termI, A).map((r) => Array.from(r, (v) => v * dtc / (k + 1)));
+      Sint = Sint.map((r, i) => r.map((v, j) => v + termI[i][j]));
+    }
+    const Bd = mm(Sint, Bc);
+    const Q = eye(n).map((r, i) => r.map((v, j) => (i === j ? LQR_Q[i] : 0)));
+    let P = Q.map((r) => r.slice());
+    const T = (X) => X[0].map((_, j) => X.map((r) => r[j]));
+    for (let it = 0; it < 120000; it++) {
+      const PA = mm(P, Ad), PB = mm(P, Bd);
+      const AtPA = mm(T(Ad), PA), AtPB = mm(T(Ad), PB);
+      let BtPB = 0;
+      for (let i = 0; i < n; i++) BtPB += Bd[i][0] * PB[i][0];
+      const inv = 1 / (LQR_R + BtPB);
+      // re-symmetrized each pass: the naive recursion sheds symmetry via
+      // cancellation on this stiff system and diverges to NaN without it
+      let Pn = eye(n).map((r, i) => r.map((_, j) => Q[i][j] + AtPA[i][j] - AtPB[i][0] * inv * AtPB[j][0]));
+      Pn = Pn.map((r, i) => r.map((v, j) => 0.5 * (v + Pn[j][i])));
+      let diff = 0, pmax = 0;
+      for (let i = 0; i < n; i++)
+        for (let j = 0; j < n; j++) {
+          diff = Math.max(diff, Math.abs(Pn[i][j] - P[i][j]));
+          pmax = Math.max(pmax, Math.abs(Pn[i][j]));
+        }
+      P = Pn;
+      if (diff < 1e-12 * Math.max(1, pmax)) break;
+    }
+    const PB = mm(P, Bd), PA = mm(P, Ad);
+    let BtPB = 0;
+    for (let i = 0; i < n; i++) BtPB += Bd[i][0] * PB[i][0];
+    const K = [];
+    for (let j = 0; j < n; j++) {
+      let BtPA = 0;
+      for (let i = 0; i < n; i++) BtPA += Bd[i][0] * PA[i][j];
+      K.push(BtPA / (LQR_R + BtPB));
+    }
+    return { K, P };
+  }
+
+  // ---- simulator + supervisor: balance -> limp -> swing -> balance ----
+  class PendulumSim {
+    constructor(params, opts) {
+      this.p = Object.assign({}, DP, params || {});
+      this.opts = Object.assign({
+        catchWhileDisconnected: false,
+        limpDuration: 0.55,
+        disconnectedEnergyFrac: 0.94,  // strive, never top out, while offline
+        seed: 1,
+        gusts: true,
+      }, opts || {});
+      // track bounds (m, relative to the balance point x = 0). trackMin/
+      // trackMax params make the track asymmetric — the wordmark mount
+      // stretches it to the ends of "cronstable" while the equilibrium
+      // stays at the l's cell.
+      this.xMin = this.p.trackMin != null ? this.p.trackMin : -this.p.trackHalf;
+      this.xMax = this.p.trackMax != null ? this.p.trackMax : this.p.trackHalf;
+      this.rand = mulberry32(this.opts.seed);
+      // the stand is deliberately BENT (bendStand): solve the elbow detent's
+      // rest angle so the leaned pose is a true equilibrium — link 2 leans by
+      // bendStand, link 1 counter-leans so the chain's CG sits plumb over the
+      // cart, and gravity's torque about the elbow is held by the spring.
+      // The LQR is linearized there and _wrapped() measures errors from
+      // there, so the controller balances the bent letter on purpose.
+      {
+        const p = this.p;
+        const A = (p.m1 + p.m2) * p.L1, B = p.m2 * p.L2;
+        const th2s = p.kElbow ? p.bendStand : 0;   // no spring, no bend to hold
+        const th1s = Math.asin(clamp(-(B / A) * Math.sin(th2s), -1, 1));
+        const stretch = p.kElbow
+          ? Math.asin(clamp(B * p.g * Math.sin(th2s) / p.kElbow, -1, 1)) : 0;
+        p.elbowRest = (th2s - th1s) - stretch;
+        this.sEq = [0, 0, th1s, 0, th2s, 0];
+        this.EUP = energy(p, this.sEq);
+      }
+      const lq = computeLQR(this.p, this.sEq);
+      this.K = lq.K; this.P = lq.P;
+      this.s = this.sEq.slice();
+      this.mode = "balance";
+      this.connected = true;
+      this.t = 0;
+      this.a = 0;
+      this.limpUntil = 0;
+      this.swingStart = 0;
+      this.catchT = -1;
+      this.plan = null;
+      this.planAge = 0;
+      this.cem = null;
+      this.lastVerify = -1;
+      this.onMode = null;
+      this.noise = { gustT: 3 + 4 * this.rand(), gust: 0, gustEnd: 0 };
+    }
+    setConnected(c) {
+      c = !!c;
+      if (c === this.connected) return;
+      this.connected = c;
+      if (!c && this.mode === "balance") this._toMode("limp");
+      // reconnect mid-swing: start the escalation clock warm — the user is
+      // watching a recovery, skip the most patient settings
+      if (c && this.mode === "swing") this.swingStart = this.t - 8;
+    }
+    poke(strength) {
+      const k = strength == null ? 3.5 : strength;
+      const dir = this.rand() < 0.5 ? -1 : 1;
+      this.s[3] += dir * k;
+      this.s[5] += dir * k * (0.6 + 0.8 * this.rand());
+    }
+    // a pointer sweeping through the linkage brushes it aside: quadratic
+    // ("wind") drag at the closest approach between the cursor's swept path
+    // (ax,ay)→(bx,by) and each link, projected through the point Jacobian
+    // onto the joint velocities — the lever arm and the angle of attack both
+    // shape the kick. Swept-path contact (not point sampling) so a fast
+    // flick can't tunnel between mousemove events; a slow hover barely
+    // stirs it. Args in sim units (m, s, m); per-event clamps keep
+    // teleporting cursors from exploding the state.
+    brush(ax, ay, bx, by, dt, R) {
+      const p = this.p, s = this.s;
+      const vx = (bx - ax) / dt, vy = (by - ay) / dt;
+      const v2 = vx * vx + vy * vy;
+      if (v2 < 1e-4) return;
+      const sp = Math.sqrt(v2);
+      const s1 = Math.sin(s[2]), c1 = Math.cos(s[2]);
+      const s2 = Math.sin(s[4]), c2 = Math.cos(s[4]);
+      const ex = s[0] + p.L1 * s1, ey = p.L1 * c1;
+      const tx = ex + p.L2 * s2, ty = ey + p.L2 * c2;
+      // closest approach between the path and a link segment (clamped
+      // projections, one refinement pass — exact enough for a brush)
+      const hit = (q0x, q0y, q1x, q1y) => {
+        const ux = bx - ax, uy = by - ay;
+        const wx = q1x - q0x, wy = q1y - q0y;
+        const rx = ax - q0x, ry = ay - q0y;
+        const A = ux * ux + uy * uy, B = ux * wx + uy * wy, C = wx * wx + wy * wy;
+        const D = ux * rx + uy * ry, E = wx * rx + wy * ry;
+        const den = A * C - B * B;
+        let sc = den > 1e-12 ? clamp((B * E - C * D) / den, 0, 1) : 0;
+        let tc = C > 1e-12 ? clamp((B * sc + E) / C, 0, 1) : 0;
+        sc = A > 1e-12 ? clamp((B * tc - D) / A, 0, 1) : 0;
+        tc = C > 1e-12 ? clamp((B * sc + E) / C, 0, 1) : 0;
+        const dx = (ax + sc * ux) - (q0x + tc * wx), dy = (ay + sc * uy) - (q0y + tc * wy);
+        return { t: tc, d: Math.hypot(dx, dy) };
+      };
+      const G1 = 0.09, G2 = 0.14;
+      const av1 = (vx * c1 - vy * s1) * sp;        // drag along link 1's swing direction
+      const h1 = hit(s[0], 0, ex, ey);
+      if (h1.d < R) s[3] += clamp(G1 * (1 - h1.d / R) * av1 * h1.t * dt, -0.5, 0.5);
+      const h2 = hit(ex, ey, tx, ty);
+      if (h2.d < R) {
+        const fall = 1 - h2.d / R;
+        s[5] += clamp(G2 * fall * (vx * c2 - vy * s2) * sp * h2.t * dt, -0.7, 0.7);
+        s[3] += clamp(0.6 * G1 * fall * av1 * dt, -0.4, 0.4);  // the elbow carries the blow too
+      }
+    }
+    _toMode(m) {
+      if (m === this.mode) return;
+      this.mode = m;
+      this.plan = null;
+      this.cem = null;
+      if (m === "limp") this.limpUntil = this.t + this.opts.limpDuration;
+      if (m === "swing") this.swingStart = this.t;
+      if (m === "balance") this.catchT = this.t;
+      if (this.onMode) this.onMode(m);
+    }
+    _wrapped(s) {
+      s = s || this.s;
+      const q = this.sEq;   // errors are measured from the bent stand
+      return [s[0], s[1], wrapA(s[2] - q[2]), s[3], wrapA(s[4] - q[4]), s[5]];
+    }
+    _lqrAccel(z, aMax) {
+      let a = 0;
+      for (let i = 0; i < 6; i++) a -= this.K[i] * z[i];
+      return clamp(a, -aMax, aMax);
+    }
+    _vCost(s) {
+      const z = this._wrapped(s);
+      let c = 0;
+      for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) c += z[i] * this.P[i][j] * z[j];
+      return c;
+    }
+    _balanceAuthority() {
+      return this.catchT >= 0 && this.t - this.catchT < 1.2
+        ? (this.catchAuth != null ? this.catchAuth : this.p.aMaxCatch)
+        : this.p.aMaxBalance;
+    }
+    // patience buys muscle: swing + catch authority escalate over time
+    _swingCap() {
+      return Math.min(34, this.p.aMaxSwing + Math.floor((this.t - this.swingStart) / 8) * 2);
+    }
+    _catchAuthority() {
+      const tSw = this.mode === "swing" ? this.t - this.swingStart : 0;
+      return Math.min(32, this.p.aMaxCatch + Math.floor(tSw / 10) * 3);
+    }
+    _pumpTarget() {
+      if (!this.connected) return this.opts.disconnectedEnergyFrac;
+      const tSw = this.t - this.swingStart;
+      // periodic calm-down dumps excess energy and restarts the approach
+      // geometry, escaping unproductive limit cycles on stubborn recoveries
+      if (tSw > 25 && (tSw % 15) < 1.5) return 0.75;
+      return Math.min(1.35, 1.10 + Math.floor(tSw / 6) * 0.05);
+    }
+    _pumpAccel() {
+      const p = this.p, s = this.s, EUP = this.EUP;
+      const E = energy(p, s);
+      const dE = EUP * this._pumpTarget() - E;
+      let a;
+      if (E > EUP * (this._pumpTarget() - 0.03)) {
+        a = -30 * s[0] - 8 * s[1];                 // coast: recenter, wait
+      } else {
+        let pump = -10 * Math.tanh(2.5 * dE / EUP) * Math.tanh(Gterm(p, s) / 0.05);
+        if (Math.abs(s[3]) + Math.abs(s[5]) < 0.08 && Math.cos(s[2]) < 0) {
+          pump = 10 * Math.sin(2 * Math.PI * 0.9 * this.t); // bootstrap from dead hang
+        }
+        a = pump - 45 * s[0] - 6.5 * s[1];
+      }
+      return clamp(a, -p.aMaxSwing, p.aMaxSwing);
+    }
+    _rolloutCost(s0, segs, aCap) {
+      const p = this.p;
+      let s = s0.slice(), best = Infinity;
+      for (let i = 0; i < SEG_N * SEG_STEPS; i++) {
+        s = rk4(p, s, clamp(segs[(i / SEG_STEPS) | 0], -aCap, aCap), 1 / 120);
+        if (s[0] > this.xMax * 0.95 || s[0] < this.xMin * 0.95) return Infinity;
+        if ((i & 1) === 1) {
+          const c = this._vCost(s);
+          if (c < best) best = c;
+        }
+      }
+      return best;
+    }
+    // one anytime-CEM iteration per animation frame: (mean, sigma) carry
+    // across frames, mean shifted by the executed amount (fractional
+    // segments, blended) so the plan keeps phase. ~80 rollouts per call.
+    _cemFrame() {
+      const aCap = this._swingCap();
+      let c = this.cem;
+      if (!c) {
+        c = this.cem = { mean: new Array(SEG_N).fill(0), sigma: new Array(SEG_N).fill(aCap * 0.6) };
+      } else {
+        const off = this.planAge / 240 / SEG_DT;
+        c.mean = c.mean.map((_, i) => {
+          const q = i + off, i0 = Math.floor(q), f = q - i0;
+          const v0 = i0 < SEG_N ? c.mean[i0] : 0;
+          const v1 = i0 + 1 < SEG_N ? c.mean[i0 + 1] : 0;
+          return v0 * (1 - f) + v1 * f;
+        });
+        for (let i = 0; i < SEG_N; i++) c.sigma[i] = Math.min(aCap * 0.6, c.sigma[i] * 1.25 + 0.3);
+      }
+      const pop = [];
+      for (let k = 0; k < 80; k++) {
+        const segs = c.mean.map((m, i) =>
+          k === 0 ? clamp(m, -aCap, aCap)
+                  : clamp(m + (this.rand() * 2 - 1) * c.sigma[i] * 1.7, -aCap, aCap));
+        const cost = this._rolloutCost(this.s, segs, aCap);
+        if (cost < Infinity) pop.push({ segs: segs, cost: cost });
+      }
+      if (!pop.length) { this.plan = null; this.planAge = 0; return; }
+      pop.sort((a, b) => a.cost - b.cost);
+      const elite = pop.slice(0, Math.max(6, Math.floor(pop.length * 0.12)));
+      for (let i = 0; i < SEG_N; i++) {
+        let m = 0;
+        for (const e of elite) m += e.segs[i];
+        m /= elite.length;
+        let v = 0;
+        for (const e of elite) v += (e.segs[i] - m) * (e.segs[i] - m);
+        c.mean[i] = m;
+        c.sigma[i] = Math.sqrt(v / elite.length) + 0.5;
+      }
+      this.plan = { segs: elite[0].segs };
+      this.planAge = 0;
+    }
+    // candidate catch: near upright AND a full 2 s closed-loop rollout with
+    // the balance controller stabilizes — no catch is taken on faith
+    _tryCatch() {
+      if (!this.connected && !this.opts.catchWhileDisconnected) return false;
+      const p = this.p;
+      const z = this._wrapped();
+      if (Math.abs(z[2]) > 0.55 || Math.abs(z[4]) > 0.8) return false;
+      if (Math.abs(z[3]) > 4 || Math.abs(z[5]) > 5) return false;
+      const aCatch = this._catchAuthority(); // must match execution authority
+      let s = this.s.slice();
+      const dt = 1 / 240;
+      for (let i = 0; i < Math.round(2.0 / dt); i++) {
+        const zz = this._wrapped(s);
+        if (Math.abs(zz[2]) > 1.0 || Math.abs(zz[4]) > 1.25 || zz[0] > this.xMax || zz[0] < this.xMin) return false;
+        s = rk4(p, s, this._lqrAccel(zz, i * dt < 1.2 ? aCatch : p.aMaxBalance), dt);
+      }
+      const zf = this._wrapped(s);
+      this.catchAuth = aCatch;
+      return Math.abs(zf[2]) < 0.06 && Math.abs(zf[4]) < 0.08 &&
+             Math.abs(zf[3]) < 0.5 && Math.abs(zf[5]) < 0.6;
+    }
+    _swingFrame() {
+      const p = this.p, EUP = this.EUP;
+      const E = energy(p, this.s);
+      const z2 = wrapA(this.s[2]);
+      const inRegion = this.connected &&
+        E > EUP * 0.75 && E < EUP * 1.9 && Math.abs(z2) < 1.35 && Math.abs(this.s[3]) < 7;
+      if (!inRegion) { this.plan = null; this.cem = null; return; }
+      this._cemFrame();
+      if (this.t - this.lastVerify > VERIFY_COOLDOWN && this._vCost(this.s) < ENGAGE_GATE) {
+        this.lastVerify = this.t;
+        if (this._tryCatch()) this._toMode("balance");
+      }
+    }
+    // advance by real seconds; call once per animation frame (planning is
+    // amortized per call so the worst-case frame stays cheap)
+    step(elapsed) {
+      const p = this.p;
+      let remaining = clamp(elapsed, 0, 0.05);
+      if (this.mode === "swing") this._swingFrame();
+      while (remaining > 1e-9) {
+        const dt = Math.min(p.dt, remaining);
+        remaining -= dt;
+        this.t += dt;
+        let a = 0;
+        if (this.mode === "balance") {
+          const z = this._wrapped();
+          if (Math.abs(z[2]) > 1.0 || Math.abs(z[4]) > 1.3 || z[0] > this.xMax * 1.02 || z[0] < this.xMin * 1.02) {
+            this._toMode(this.connected ? "swing" : "limp");
+          } else {
+            a = this._lqrAccel(z, this._balanceAuthority());
+            if (this.opts.gusts) {
+              const n = this.noise;
+              if (this.t > n.gustT) {
+                n.gust = (this.rand() - 0.5) * 0.55;  // a whisper: the standing l should sway, not lurch
+                n.gustEnd = this.t + 0.25;
+                n.gustT = this.t + 2.5 + 5 * this.rand();
+              }
+              if (this.t < n.gustEnd) this.s[3] += n.gust * dt * 6;
+              a = clamp(a + (this.rand() - 0.5) * 0.5, -p.aMaxBalance, p.aMaxBalance);
+            }
+          }
+        } else if (this.mode === "limp") {
+          a = clamp(-2.0 * this.s[1], -3, 3); // motor dead; gentle rolling drag
+          if (this.t >= this.limpUntil) this._toMode("swing");
+        } else if (this.plan) {
+          a = this.plan.segs[Math.min(SEG_N - 1, (this.planAge / (SEG_DT * 240)) | 0)];
+          this.planAge++;
+        } else {
+          a = this._pumpAccel();
+        }
+        this.a = a;
+        this.s = rk4(p, this.s, a, dt);
+        if (this.s[0] > this.xMax * 1.05 || this.s[0] < this.xMin * 1.05) {  // hard end-stops
+          this.s[0] = clamp(this.s[0], this.xMin * 1.05, this.xMax * 1.05);
+          this.s[1] = 0;
+          if (this.mode === "balance") this._toMode("swing");
+        }
+      }
+    }
+    pose() {
+      const x = this.s[0], th1 = this.s[2], th2 = this.s[4];
+      const j2 = { x: x + this.p.L1 * Math.sin(th1), y: this.p.L1 * Math.cos(th1) };
+      return {
+        cart: x,
+        j2: j2,
+        tip: { x: j2.x + this.p.L2 * Math.sin(th2), y: j2.y + this.p.L2 * Math.cos(th2) },
+        mode: this.mode,
+        a: this.a,
+      };
+    }
+  }
+
+  // ---- renderer: builds an svg into `el` and drives the sim via rAF ----
+  class CronstableLogo {
+    constructor(el, opts) {
+      this.el = el;
+      this.opts = Object.assign({
+        connected: () => true,
+        reducedMotion: () => false,
+        scale: 28,                    // px per meter
+        ui: 1,                        // cart/bobs/rail are drawn for the 28px/m mark; ×ui rescales that chrome
+        railX: null,                  // rail gates override, signed [x1, x2] px (default: flush with the box edges)
+        railMax: null,                // dynamic right gate: how far (px) it may open during a recovery (null = fixed)
+        decorative: null,             // aria-hidden svg — for mounts where host text already names the logo
+        seed: (Math.random() * 1e9) | 0,
+      }, opts || {});
+      this.sim = new PendulumSim(this.opts.params, { seed: this.opts.seed });
+      this.trail = [];
+      this._raf = 0;
+      this._last = 0;
+      this._mode = "";
+      this._frame = this._frame.bind(this);
+      this._build();
+      this.sync();
+    }
+    _build() {
+      const NS = "http://www.w3.org/2000/svg";
+      const S = this.opts.scale, U = this.opts.ui, p = this.sim.p;
+      const reach = (p.L1 + p.L2) * S;
+      const wL = Math.ceil(-this.sim.xMin * S + reach + 4);  // box extent left of the balance point
+      // … and right (symmetric by default; a dynamic gate needs room to its cap)
+      const wR = Math.ceil(Math.max(this.sim.xMax * S, this.opts.railMax || 0) + reach + 4);
+      const hh = Math.ceil(reach + 5);
+      // by default the rail spans the full box so the end gates sit flush
+      // with the logo's edges. the cart's travel is shorter, and the tip's
+      // worst-case reach (|track bound| + L1 + L2, which sizes the box)
+      // stays ~2px inside the gates — nothing ever clips. a railX override
+      // ([x1, x2] px) places the gates explicitly instead: the glyph mount
+      // puts them at the outer ends of the wordmark.
+      const rx = this.opts.railX != null ? this.opts.railX : [2 - wL, wR - 2];
+      this._geom = { S: S, U: U, railY: 4.2 * U, railX: rx };
+      // dynamic right gate (opt-in via railMax): while the mark is recovering
+      // the physics bound opens out and the drawn gate flees ahead of the
+      // cart — state here, policy in _gateStep. gate travel is measured
+      // RELATIVE to rest, so the physics bound extends relative to restM and
+      // any railX/track pairing stays in register.
+      this._gate = this.opts.railMax == null ? null : {
+        x: rx[1], rest: rx[1],
+        cap: Math.max(this.opts.railMax, rx[1]),
+        min: 12 * U,            // drawn gate → cart-edge clearance
+        restM: this.sim.xMax,   // the word-edge physics bound to come home to
+        settledAt: -1,
+        pending: null,          // resize shrink arriving mid-recovery, held (see setRailMax)
+        v: 0,                   // low-passed rightward cart charge, px/s (see _gateStep)
+        rv: 0,                  // retract speed slew, px/s — eases the ride home in from zero
+      };
+      const mk = (t, at, parent) => {
+        const n = document.createElementNS(NS, t);
+        for (const k in at) n.setAttribute(k, at[k]);
+        (parent || this.svg).appendChild(n);
+        return n;
+      };
+      this.svg = document.createElementNS(NS, "svg");
+      const svgAt = {
+        viewBox: (-wL) + " " + (-hh) + " " + (wL + wR) + " " + (2 * hh),
+        width: wL + wR, height: 2 * hh,
+      };
+      if (this.opts.decorative) svgAt["aria-hidden"] = "true";
+      else {
+        svgAt.role = "img";
+        svgAt["aria-label"] = "cronstable logo: a self-balancing double pendulum on a cart";
+      }
+      for (const k in svgAt) this.svg.setAttribute(k, svgAt[k]);
+      const g = this._geom;
+      this.eTrail = mk("polyline", { class: "p-trail", fill: "none", stroke: "var(--accent)", "stroke-width": 1, opacity: 0.35, points: "" });
+      mk("line", { class: "p-rail", x1: g.railX[0], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
+      // phantom track: the temporary rail that fills in behind the fleeing
+      // right gate while the track is opened out (see _gateStep)
+      this.eGhost = !this._gate ? null : mk("line", { class: "p-rail-ext", x1: g.railX[1], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
+      mk("line", { class: "p-stop", x1: g.railX[0], y1: g.railY - 3 * U, x2: g.railX[0], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
+      this.eStopR = mk("line", { class: "p-stop", x1: g.railX[1], y1: g.railY - 3 * U, x2: g.railX[1], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
+      this.eL1 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
+      this.eL2 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
+      this.eCart = mk("rect", { class: "p-cart", width: 7 * U, height: 2.8 * U, rx: 0.9 * U, y: 0.7 * U, fill: "var(--fg)" });
+      this.ePivot = mk("circle", { class: "p-pivot", r: 0.85 * U, cy: 0, fill: "var(--fg)" });
+      this.eElbow = mk("circle", { class: "p-bob", r: 1.7 * U, fill: "var(--accent)" });
+      this.eTip = mk("circle", { class: "p-bob", r: 2.1 * U, fill: "var(--accent)" });
+      this.el.appendChild(this.svg);
+      this._render();
+    }
+    _render() {
+      const g = this._geom, S = g.S;
+      const w = this.sim.pose();
+      const cx = w.cart * S;
+      const j2x = w.j2.x * S, j2y = -w.j2.y * S;
+      const tx = w.tip.x * S, ty = -w.tip.y * S;
+      this.eCart.setAttribute("x", cx - 3.5 * g.U);
+      this.ePivot.setAttribute("cx", cx);
+      this.eL1.setAttribute("x1", cx); this.eL1.setAttribute("y1", 0);
+      this.eL1.setAttribute("x2", j2x); this.eL1.setAttribute("y2", j2y);
+      this.eL2.setAttribute("x1", j2x); this.eL2.setAttribute("y1", j2y);
+      this.eL2.setAttribute("x2", tx); this.eL2.setAttribute("y2", ty);
+      this.eElbow.setAttribute("cx", j2x); this.eElbow.setAttribute("cy", j2y);
+      this.eTip.setAttribute("cx", tx); this.eTip.setAttribute("cy", ty);
+      if (w.mode !== "balance") {
+        this.trail.push(tx.toFixed(1) + "," + ty.toFixed(1));
+        if (this.trail.length > 44) this.trail.shift();
+      } else if (this.trail.length) {
+        this.trail.splice(0, 2); // fade the trail out after a catch
+      }
+      this.eTrail.setAttribute("points", this.trail.join(" "));
+      const gt = this._gate;
+      if (gt && gt.x !== this._gateDrawn) {
+        this._gateDrawn = gt.x;
+        this.eStopR.setAttribute("x1", gt.x);
+        this.eStopR.setAttribute("x2", gt.x);
+        // the phantom rail runs flush to the fleeing gate at full rail
+        // strength — no fade: the line growing from zero length is its own
+        // smooth reveal (gate motion near rest is sub-px per frame), and any
+        // partial opacity reads as a gap against the solid rail
+        this.eGhost.setAttribute("x2", gt.x);
+      }
+      if (w.mode !== this._mode) {
+        this._mode = w.mode;
+        this.svg.setAttribute("data-mode", w.mode);
+        const bob = w.mode === "balance" ? "var(--accent)" : "var(--pending)";
+        this.eElbow.setAttribute("fill", bob);
+        this.eTip.setAttribute("fill", bob);
+      }
+    }
+    _frame(t) {
+      this._raf = 0;
+      if (this.opts.reducedMotion()) { this._park(); return; }
+      const dt = this._last ? (t - this._last) / 1000 : 1 / 60;
+      this._last = t;
+      this.sim.step(dt);
+      this._gateStep(dt);
+      this._render();
+      this._raf = requestAnimationFrame(this._frame);
+    }
+    // reduced motion: no animation at all — a still pose that is still
+    // honest about state (upright when live, hanging when not)
+    _park() {
+      if (this._raf) cancelAnimationFrame(this._raf);
+      this._raf = 0;
+      this._last = 0;
+      const up = this.sim.connected;
+      if (up) this.sim.s = this.sim.sEq.slice();
+      else {
+        // dead hang, settled numerically: the elbow detent keeps a hint of
+        // the bend even hanging, so the honest still pose keeps its character
+        const p = this.sim.p, hd = Object.assign({}, p, { d1: 0.5, d2: 0.35 });
+        let s = [0, 0, Math.PI, 0, Math.PI, 0];
+        for (let i = 0; i < 960; i++) s = rk4(hd, s, 0, p.dt);
+        s[1] = 0; s[3] = 0; s[5] = 0;
+        this.sim.s = s;
+      }
+      this.sim.mode = up ? "balance" : "limp";
+      if (this._gate) { this._gate.x = this._gate.rest; this._gate.settledAt = -1; this._gate.v = 0; this._gate.rv = 0; this.sim.xMax = this._gate.restM; }
+      this.trail.length = 0;
+      this._render();
+    }
+    // dynamic right gate. the moment balance is lost the physics bound leaps
+    // to the cap (the wall turns almost imaginary — mid-page by default — so
+    // the planner can run the cart out under the header instead of dying
+    // against the "e"), while the DRAWN gate only flees as the cart actually
+    // charges it — velocity-led, riding just `min` ahead of the envelope of
+    // the cart's excursions (fast out, slow back) and never letting the
+    // cart's edge within `min`; the phantom track fills in flush
+    // behind it. once the
+    // catch is verified and the cart has walked the letter home (a beat of
+    // dwell so a wobble can't flutter it), gate and track glide back to the
+    // end of the word, the physics bound riding them in.
+    _gateStep(dt) {
+      const gt = this._gate;
+      if (!gt) return;
+      dt = clamp(dt, 0, 0.05);   // mirror sim.step: a refocused tab must not teleport the gate
+      // a resize shrink that arrived mid-recovery applies as soon as the new
+      // cap wouldn't move the drawn gate
+      if (gt.pending != null && gt.x <= Math.max(gt.rest, gt.pending)) {
+        const px = gt.pending;
+        gt.pending = null;
+        this.setRailMax(px);
+      }
+      const S = this._geom.S, U = this._geom.U, sim = this.sim;
+      // the bound extends RELATIVE to restM by the gate's travel beyond rest,
+      // with `min` reserved so the drawn gate can always clear a cart parked
+      // on the extended hard stop without itself crossing `cap`
+      const capM = gt.restM + Math.max(0, gt.cap - gt.rest - gt.min) / (1.05 * S);
+      const cartEdge = sim.s[0] * S + 3.5 * U;
+      const home = sim.mode === "balance" && Math.abs(sim.s[0]) < 0.06 && Math.abs(sim.s[1]) < 0.3;
+      if (!home) gt.settledAt = -1;
+      else if (gt.settledAt < 0) gt.settledAt = sim.t;
+      if (sim.mode !== "balance") sim.xMax = capM;
+      if (gt.settledAt >= 0 && sim.t - gt.settledAt > 1.1) {
+        // verified catch + the letter stands at home: glide everything back.
+        // xMax is set even when the gate is already home — the escort below
+        // may have brought it in before the dwell elapsed, and the physics
+        // bound must still come home with it
+        if (gt.x > gt.rest) {
+          // stately ride home: the speed eases in from zero (velocity-
+          // continuous with the escort's gentle drift) and tracks
+          // distance/1.4 s clamped to [30, 200] px/s — the floor keeps a
+          // far gate from dawdling, the ceiling and ease-in keep a
+          // half-retracted one from snapping
+          const dist = gt.x - gt.rest;
+          const wantRate = clamp(dist / 1.4, 30, 200);
+          gt.rv += (wantRate - gt.rv) * (1 - Math.exp(-dt / 0.4));
+          gt.x -= Math.min(gt.rv * dt, dist);
+          if (gt.x - gt.rest < 0.5) gt.x = gt.rest;
+        }
+        sim.xMax = gt.restM + Math.max(0, gt.x - gt.rest - gt.min) / (1.05 * S);   // same min reserve as capM: xMax rides [restM, capM] exactly
+      } else {
+        gt.rv = 0;   // any new action re-arms the soft start of the ride home
+        // recovering, or walking the catch home: the gate stays put until
+        // the cart genuinely approaches, then rides just `min` ahead of it,
+        // leading further the faster the rightward charge — the velocity
+        // anticipation outruns the smoothing lag, so the hard floor below
+        // almost never has to snap (no bulldozing), and a cart nowhere near
+        // the gate never moves it at all (no lurch at recovery start).
+        // the charge is low-passed and the ease-back rate-capped below, so
+        // the gate rides the ENVELOPE of the swing instead of chasing each
+        // stroke out and back
+        const charge = Math.max(0, sim.s[1]) * S;   // rightward cart speed, px/s
+        gt.v += (charge - gt.v) * (1 - Math.exp(-dt / 0.35));
+        const want = clamp(cartEdge + gt.min + 0.45 * gt.v, gt.rest, gt.cap);
+        // fast out, slow back: the gate rides the envelope of the cart's
+        // excursions instead of flapping with every swing
+        let dx = (want - gt.x) * (1 - Math.exp(-dt / (want > gt.x ? 0.1 : 2.2)));
+        if (dx < 0) dx = Math.max(dx, -22 * dt);   // ease back gently: ride the envelope, don't chase the cart back in
+        gt.x += dx;
+      }
+      // the wall never exceeds the current allowance (a resize shrink can
+      // finish applying while balance holds, a window where no branch above
+      // rewrites xMax) — and never lands inside the cart itself
+      sim.xMax = Math.max(Math.min(sim.xMax, capM), sim.s[0] + 0.02);
+      gt.x = clamp(Math.max(gt.x, cartEdge + gt.min), gt.rest, gt.cap);
+    }
+    /** Re-cap the dynamic right gate (glyph mounts re-measure on resize).
+     *  The svg box tracks the cap BOTH ways — an oversized box left behind by
+     *  a window shrink would push a horizontal scrollbar. A cap below the
+     *  current gate position is held in gt.pending and applied by _gateStep
+     *  once the gate is back under it, so nothing on screen ever jumps. */
+    setRailMax(px) {
+      const gt = this._gate;
+      if (!gt || !isFinite(px)) return;
+      gt.pending = px < gt.x ? px : null;   // shrink while out: hold until the gate is back
+      gt.cap = Math.max(gt.rest, gt.x, px);
+      const vb = this.svg.viewBox.baseVal;
+      const need = Math.ceil(gt.cap + (this.sim.p.L1 + this.sim.p.L2) * this._geom.S + 4);
+      if (need !== vb.x + vb.width) {
+        this.svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + (need - vb.x) + " " + vb.height);
+        this.svg.setAttribute("width", need - vb.x);
+      }
+    }
+    /** Re-read connected()/reducedMotion() and start/stop the loop. */
+    sync() {
+      this.sim.setConnected(!!this.opts.connected());
+      if (this.opts.reducedMotion()) this._park();
+      else if (!this._raf) { this._last = 0; this._raf = requestAnimationFrame(this._frame); }
+    }
+    poke(k) {
+      if (!this.opts.reducedMotion()) this.sim.poke(k);
+    }
+    /** The cursor is weather: mousemoves over `el` become viscous brushes on
+     *  whichever link the pointer grazes — direction, speed and where along
+     *  the link it hits all shape the response (see PendulumSim.brush). */
+    attachPointer(el) {
+      if (this._ptrEl) this.detachPointer();
+      const move = (e) => {
+        if (this.opts.reducedMotion()) { this._ptrLast = null; return; }
+        const r = this.svg.getBoundingClientRect();
+        if (!r.width) return;
+        const vb = this.svg.viewBox.baseVal;
+        const S = this._geom.S, k = vb.width / r.width;
+        const px = ((e.clientX - r.left) * k + vb.x) / S;      // sim meters,
+        const py = -((e.clientY - r.top) * k + vb.y) / S;      // y up, pivot line = 0
+        const t = e.timeStamp / 1000;
+        const last = this._ptrLast;
+        this._ptrLast = { x: px, y: py, t: t };
+        if (!last || t - last.t > 0.1) return;                 // stroke start (or stall): no velocity yet
+        const dt = Math.max(1e-3, t - last.t);
+        this.sim.brush(last.x, last.y, px, py, dt, Math.max(0.06, 7 / S));
+      };
+      const leave = () => { this._ptrLast = null; };
+      this._ptrEl = el;
+      this._ptrFns = [["mousemove", move], ["mouseleave", leave]];
+      for (const nf of this._ptrFns) el.addEventListener(nf[0], nf[1]);
+    }
+    detachPointer() {
+      if (!this._ptrEl) return;
+      for (const nf of this._ptrFns) this._ptrEl.removeEventListener(nf[0], nf[1]);
+      this._ptrEl = null;
+      this._ptrFns = null;
+      this._ptrLast = null;
+    }
+    destroy() {
+      this.detachPointer();
+      if (this._raf) cancelAnimationFrame(this._raf);
+      this._raf = 0;
+      if (this.svg) this.svg.remove();
+    }
+  }
+
+  // ---- glyph mount: the pendulum stands in for a letter of the wordmark ----
+  // `slot` is an inline element wrapping the letter (the l of "cronstable").
+  // The glyph is measured (canvas TextMetrics) and the sim scaled so the
+  // balanced pendulum — cart pivot on the baseline, tip at the stem's top —
+  // spans the letter exactly, with the svg anchored to the letter's cell.
+  // The sim's equilibrium is x = 0, so the controller literally targets the
+  // letter's position, while the cart's track runs the full width of the
+  // surrounding word — the end gates are the wordmark's outer edges. The
+  // printed glyph stays in the DOM for copy/paste, screen readers and no-JS,
+  // and is only blanked here, once its live replacement is standing.
+  // During a hard recovery the right gate opens out toward mid-page and
+  // closes back to the wordmark's edge once the letter stands (railMax).
+  CronstableLogo.mountGlyph = function (slot, opts) {
+    const cs = getComputedStyle(slot);
+    // computed lengths are unzoomed CSS px (standardized zoom does not
+    // premultiply getComputedStyle values), so they are already the right
+    // measurement space: the UI zoom (Settings → scale) then scales the
+    // finished svg together with the text, keeping the l in register
+    const fpx = parseFloat(cs.fontSize) || 15;
+    const ctx = document.createElement("canvas").getContext("2d");
+    if (ctx) ctx.font = cs.fontStyle + " " + cs.fontWeight + " " + fpx + "px " + cs.fontFamily;
+    const m = ctx ? ctx.measureText(slot.textContent || "l") : null;
+    const stem = (m && m.actualBoundingBoxAscent) || fpx * 0.72;  // glyph height above the baseline
+    const asc = (m && m.fontBoundingBoxAscent) || fpx * 0.78;     // font box: locates the baseline
+    const desc = (m && m.fontBoundingBoxDescent) || fpx * 0.22;
+    const lh = parseFloat(cs.lineHeight) || fpx * 1.5;            // slot line-box height
+    const p = CronstableLogo.PARAMS;
+    const S = stem / (p.L1 + p.L2), U = S / 28;
+    // the track runs the full word: the text around the slot ("cronstab",
+    // "e") is measured with the same font, the gates sit at the wordmark's
+    // outer ends and the cart's hard stops just inside them — while the
+    // balance point stays x = 0, the l's cell.
+    let prefix = "", suffix = "";
+    for (let n = slot.previousSibling; n; n = n.previousSibling) prefix = (n.textContent || "") + prefix;
+    for (let n = slot.nextSibling; n; n = n.nextSibling) suffix += n.textContent || "";
+    const ls = parseFloat(cs.letterSpacing) || 0;
+    const adv = (t) => (m ? ctx.measureText(t).width + t.length * ls : t.length * fpx * 0.6);
+    const slotW = adv(slot.textContent || "l");
+    const pad = 3.5 * U + 0.8;   // gate → cart-center clearance (cart half-width + a hair)
+    // tuck the neighbors in: the live stem is a hairline, not a full bold
+    // glyph, so a whole printed cell reads loose around it. negative margins
+    // (applied only here, once the pendulum takes over, so the no-JS printed
+    // l keeps exact metrics) pull the flanking letters toward the stem; the
+    // slot's content box — and with it x = 0 — stays midway between them.
+    const tuck = slotW * 0.16;
+    const railL = prefix ? -(adv(prefix) + slotW / 2 - tuck) : -(p.trackHalf * 1.05 * S + pad);
+    const railR = suffix ? adv(suffix) + slotW / 2 - ls - tuck : p.trackHalf * 1.05 * S + pad;
+    // the dynamic right gate may open out to the middle of the page during
+    // a recovery (see _gateStep). Its cap is measured in the svg's own
+    // unzoomed px: the slot's rendered width against its measured advance
+    // cancels any host UI zoom (rects are zoomed, canvas metrics are not).
+    const midPage = () => {
+      const r = slot.getBoundingClientRect();
+      return r.width > 0 && slotW > 0
+        ? (window.innerWidth / 2 - (r.left + r.width / 2)) * (slotW / r.width)
+        : railR;
+    };
+    const logo = new CronstableLogo(slot, Object.assign({
+      scale: S,
+      ui: U,
+      railX: [railL, railR],
+      railMax: Math.max(railR, midPage()),
+      params: { trackMin: (railL + pad) / (1.05 * S), trackMax: (railR - pad) / (1.05 * S) },
+      decorative: true,                               // the wordmark itself already reads "cronstable"
+    }, opts));
+    slot.style.position = "relative";
+    slot.style.display = "inline-block";
+    const svg = logo.svg;
+    const vb = svg.viewBox.baseVal;
+    svg.style.position = "absolute";
+    svg.style.pointerEvents = "none";
+    svg.style.left = "calc(50% + " + vb.x + "px)";
+    svg.style.top = ((lh - asc - desc) / 2 + asc - vb.height / 2).toFixed(2) + "px";
+    slot.style.color = "transparent";   // the printed l yields to the live one
+    slot.style.textShadow = "none";     // (a transparent glyph still casts its text-shadow glow)
+    slot.style.margin = "0 " + (-tuck).toFixed(2) + "px";
+    // the mid-page cap follows the window; measured once more right away,
+    // because the tuck margins just shifted the slot under the first reading
+    const recap = () => logo.setRailMax(Math.max(railR, midPage()));
+    recap();
+    window.addEventListener("resize", recap);
+    const bye = logo.destroy.bind(logo);
+    logo.destroy = () => { window.removeEventListener("resize", recap); bye(); };
+    return logo;
+  };
+
+  CronstableLogo.Sim = PendulumSim;
+  CronstableLogo.PARAMS = DP;
+  window.CronstableLogo = CronstableLogo;
+})();
+</script>
+  <script>
+  (function(){
+    var root = document.documentElement, KEY = "cronstable.cmp.theme";
+    var sel = document.getElementById("themeSel");
+    try { var saved = localStorage.getItem(KEY); if (saved) root.setAttribute("data-theme", saved); } catch(e){}
+    if (sel) {
+      sel.value = root.getAttribute("data-theme") || "carolina";
+      sel.addEventListener("change", function(){
+        root.setAttribute("data-theme", sel.value);
+        try { localStorage.setItem(KEY, sel.value); } catch(e){}
+      });
+    }
+    // UTC clock: the dashboard header ticks the same way
+    function two(n){ return (n < 10 ? "0" : "") + n; }
+    var clk = document.getElementById("tbClock");
+    function tick(){ if(!clk) return; var d = new Date();
+      clk.textContent = two(d.getUTCHours())+":"+two(d.getUTCMinutes())+":"+two(d.getUTCSeconds())+" UTC"; }
+    setInterval(tick, 1000); tick();
+    // brand marks: each wordmark's l is a live self-balancing double pendulum
+    // — the same logo engine as the dashboard header (see the script above).
+    // reduced motion parks it in an honest upright still pose instead of
+    // animating; a marketing page is always "live", so it always balances.
+    var rm = function(){ return !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); };
+    var live = function(){ return true; };
+    var tbMark = document.getElementById("tbMark"), heroMark = document.getElementById("heroMark");
+    var tbLogo = null, heroLogo = null;
+    if (window.CronstableLogo) {
+      if (tbMark) tbLogo = CronstableLogo.mountGlyph(tbMark, { connected: live, reducedMotion: rm });
+      if (heroMark) {
+        heroLogo = CronstableLogo.mountGlyph(heroMark, { connected: live, reducedMotion: rm });
+        // the old mark's click-to-bump, in the new idiom: a click on the hero
+        // wordmark nudges the linkage...
+        var wm = heroMark.closest(".wordmark");
+        if (wm) wm.addEventListener("click", function(){ heroLogo.poke(1.6 + Math.random() * 0.9); });
+        // ...and the cursor is weather: sweeping it across the hero brushes
+        // the linkage, exactly like the dashboard header.
+        var hero = document.querySelector(".page .wrap > header");
+        if (hero) heroLogo.attachPointer(hero);
+      }
+      // follow live OS motion-preference flips: park/resume the pendulums
+      if (window.matchMedia) {
+        var mq = matchMedia("(prefers-reduced-motion: reduce)");
+        if (mq.addEventListener) mq.addEventListener("change", function(){
+          if (tbLogo) tbLogo.sync();
+          if (heroLogo) heroLogo.sync();
+        });
+      }
+    }
+  })();
+  </script>
+</body>
+</html>

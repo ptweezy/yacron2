@@ -31,7 +31,7 @@ ONLY = set(sys.argv[1:])
 
 # clean release-style version for the header (the local build carries a long
 # setuptools-scm dev string; a release install shows a clean one like this)
-VERSION = "1.2.8"
+VERSION = "1.2.14"
 
 # the full theme matrix (5 hues x dark/paper); the overview is shot under all
 # ten to drive the theme-row loop, other scenes take a tasteful subset
@@ -269,11 +269,15 @@ def main():
             "try{if(!localStorage.getItem('cronstable.bootWant'))"
             "localStorage.setItem('cronstable.boot','false');"
             "localStorage.setItem('cronstable.zen','false');}catch(e){}"
-            # pin the idle-cruising logo upright so no frame catches it askew
-            "document.addEventListener('DOMContentLoaded',()=>{"
-            "const s=document.createElement('style');"
-            "s.textContent='#mark{transform:none !important}';"
-            "document.head.appendChild(s)});"
+            # park the pendulum mark at exact upright at mount so every frame
+            # is pixel-identical across themes/fonts (see capture_dashboard.py)
+            "(()=>{let CL;Object.defineProperty(window,'CronstableLogo',{"
+            "configurable:true,get:()=>CL,set:(v)=>{const orig=v.mountGlyph;"
+            "v.mountGlyph=function(slot,opts){const L=orig.call(v,slot,opts);"
+            "L.sync=()=>{};if(L._raf)cancelAnimationFrame(L._raf);L._raf=0;"
+            "L.sim.opts.gusts=false;L.sim.setConnected(true);"
+            "L.sim.s=[0,0,0,0,0,0];L.sim.mode='balance';L.sim.a=0;"
+            "L._render();window.__pendLogo=L;return L;};CL=v;}});})();"
         )
         page = ctx.new_page()
         page.goto(BASE)
@@ -291,7 +295,15 @@ def main():
                 page.wait_for_selector(
                     "#bootScreen", state="visible", timeout=8000
                 )
-                page.wait_for_timeout(1600)
+                # shoot inside the READY hold (650 ms at full opacity, every
+                # POST line printed) — a fixed sleep races the fade-out
+                page.wait_for_selector("#bootLog .boot-ready", timeout=8000)
+                # pin the READY cursor on (its 1s blink is 50/50 at shot time)
+                page.add_style_tag(
+                    content=".boot-cur{animation:none!important;"
+                    "opacity:1!important}"
+                )
+                page.wait_for_timeout(150)
                 page.screenshot(path=str(OUT / "boot@carolina.png"))
                 manifest["boot"] = ["carolina"]
                 results["boot"] = "ok"
@@ -531,7 +543,9 @@ def main():
         if wants("wallboard"):
             try:
                 close_overlays(page)
-                page.keyboard.type("w")
+                # the toolbar button is deterministic; the "w" hotkey is
+                # swallowed if a closing overlay still holds focus
+                page.click("#tvBtn")
                 page.wait_for_selector(
                     "#wallboard", state="visible", timeout=4000
                 )

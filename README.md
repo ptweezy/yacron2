@@ -1,4 +1,4 @@
-# ![The cronstable mark, spinning the way it does so beautifully](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/logo-spin.gif)
+# ![The cronstable wordmark -- its l is a live self-balancing double pendulum: it sways through the theme glitches, collapses when the signal drops, and swings itself back upright](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/logo-balance.webp)
 
 [![PyPI version](https://img.shields.io/pypi/v/cronstable.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/cronstable/)
 [![Python versions](https://img.shields.io/pypi/pyversions/cronstable.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/cronstable/)
@@ -15,7 +15,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 # cronstable
-kraahn-stuh-bl, like constable
+/ kraahn-stuh-bl /
 
 A stability-focused, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-inlcuded, security-hardened, production-ready cron replacement.
 
@@ -572,9 +572,11 @@ be read comfortably by everyone (all remembered per browser):
 * **Colour-vision modes** — **deuteranopia-** and **tritanopia-safe** palettes
   re-ink the success/failure/pending status colours (and the paper themes get
   their own tuned variants) so state never rides on red-vs-green alone.
-* **Reduced motion** — the CRT glow, scanlines, flicker and logo spin all honor
-  `prefers-reduced-motion` (and a manual toggle), and status is always carried
-  by glyphs and text, not colour or animation alone.
+* **Reduced motion** — the CRT glow, scanlines, flicker and the pendulum mark
+  all honor `prefers-reduced-motion` (and a manual toggle; the mark parks into
+  a still pose that stays honest about daemon state -- upright when live,
+  hanging when not), and status is always carried by glyphs and text, not
+  colour or animation alone.
 
 And because a control room deserves a proper power-on: an optional (on by
 default, once per 12 hours) **BIOS-style boot self-test** that checks the
@@ -583,6 +585,16 @@ daemon, job set, cluster, and schedules for real while it types:
 | Settings | Startup self-test |
 | :---: | :---: |
 | [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png) |
+
+Even the wordmark is on duty: the `l` in the header's "cronstable" is a
+**live cart-and-double-pendulum simulation** balanced by a real LQR controller
+whose gains are computed in your browser at page load -- not a canned
+animation. While the daemon is live it stands upright, riding out little
+gusts; sweep your cursor through it to brush it aside, right-click to knock
+it clean over. Lose the daemon and its motor cuts: the letter collapses out
+of the word and swings, and when the signal returns a planner threads the
+swing-up back into a verified catch -- the word heals. Stability is the
+product; the logo has to earn it too.
 
 Run history and live logs are kept **in memory only** (unless you opt into the
 durable state store), and the page is served with a strict

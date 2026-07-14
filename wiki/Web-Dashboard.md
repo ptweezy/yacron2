@@ -214,7 +214,7 @@ the cluster panel header opens the **fleet view**, a jobs × nodes matrix that
 closes that gap: one row per job (the union of every node's advertised jobs,
 so a mid-deploy peer's new job shows up too), one column per node, each cell
 that node's state for the job: **▶ running**, the last outcome with its age
-(`● ok 3m`, `✗ failure 12s`), `◌ off` for disabled-there, `◔` for never ran
+(`● ok 3m`, `✕ failure 12s`), `◌ off` for disabled-there, `◔` for never ran
 there, `—` for not configured there, and `·` when the node has reported no
 data at all. Hovering a cell reveals the exit code, finish time, duration, and
 next fire; clicking a job name opens its drawer. A **failing only** filter
@@ -321,7 +321,7 @@ verdict bar's `▸ mitigate` button) acts on the failing set in bulk: guarded
 **start all** / **cancel all** actions fire the per-job
 [start/cancel endpoints](HTTP-API#post-jobsnamestart) staggered a few hundred
 milliseconds apart (gentle on the daemon), abortable mid-run, with a live
-per-job ✓/✗ result log and a final tally. It can also open a
+per-job ✓/✕ result log and a final tally. It can also open a
 [multi-tail](#merged-multi-tail) of the set, and copy a ready-made **Markdown
 incident summary** (timestamp, host, version, cluster state, and a per-job
 table) for your incident channel or ticket.
@@ -332,10 +332,25 @@ table) for your incident channel or ticket.
 
 Press `w` (or *Wallboard / TV mode* in the palette, or open the page with a
 `#tv` hash) for a full-screen kiosk view built for a wall monitor: every job as
-a large tile, sorted worst-first (failing, then running, then the rest), each
-with its status glyph, next-fire countdown, and sparkline, plus a footer tally
-and a live UTC clock. Clicking a tile exits to that job's drawer; `Esc` or `w`
-exits.
+a large tile, sorted worst-first (failing, then running, then the rest), plus a
+footer tally and a live UTC clock. Each tile leads with the fact a wall viewer
+actually glances for — a failing tile shows **when it failed and its exit
+code** (counting up live), a running tile shows **elapsed time** (turning amber
+once it runs well past its longest recent duration), and a healthy tile shows
+its next-fire countdown — with the status hue filling the whole tile, not just
+the glyph. When anything is failing, a full-width **verdict headline** distills
+scope and likely cause at TV scale (single job + exit code, correlated fleet
+event, or cluster alert — the same correlation verdict the dashboard's bar
+shows). Clicking a tile exits to that job's drawer; `Esc` or `w` exits.
+
+The grid also fits itself to the glass: a handful of jobs on a big screen get
+proportionally larger tiles and type, a crowded fleet scales full tiles down
+(names, glance lines and sparklines all kept) before stepping down to compact
+tiles — which keep the sparkline too whenever their rows have room for it —
+and if even that overflows, the healthiest tail is cut behind an explicit
+footer chip (`+22 offscreen · none failing`) — computed from what was
+actually cut, so the board never silently clips a failure behind a scrollbar
+nobody can reach.
 
 Because the normal header (and its connection indicator) is hidden, the
 wallboard judges its own freshness: if no successful poll lands for ~15 seconds

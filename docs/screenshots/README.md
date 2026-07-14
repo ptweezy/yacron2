@@ -37,11 +37,16 @@ clipping. To refresh them after a UI change:
    python docs/screenshots/capture_logs_closeup.py
    ```
 
-4. **The spinning-logo GIFs** (`logo-spin.gif` + `logo-spin-light.gif`) need
-   no daemon at all: the script serves the working tree itself and drives the
-   mark's angle frame-by-frame through an injected style, so the loop is
-   seamless and the replay speed tracks the page's `MARK_CRUISE` constant.
-   Needs Pillow alongside playwright:
+4. **The pendulum-logo loops** (`logo-balance` + `logo-balance-light`, each a
+   24-bit `.webp` primary with a `.gif` twin) need no daemon at all: the
+   script serves the working tree itself, unhooks the page's own animation
+   loop, and steps the mark's cart/double-pendulum simulation frame-by-frame
+   at an exact 50 fps, so the recording is deterministic, true-speed physics.
+   The choreography — theme-hop glitches that knock the mark, one full
+   signal-loss collapse with a verified catch on reconnect, and a calm
+   settle so the loop seam is invisible — is seed-searched headlessly
+   through the page's own sim before anything is captured. Needs Pillow
+   alongside playwright:
 
    ```shell
    python docs/screenshots/capture_logo_gif.py
@@ -108,3 +113,7 @@ Notes:
   (the page CSP has no `unsafe-eval`) and `reduced_motion: "no-preference"`
   (headless Chromium otherwise suppresses the boot POST screen and CRT
   animation).
+* The header mark is a live pendulum simulation, so the still-capture scripts
+  park it balanced at exact upright the moment it mounts (an init-script hook
+  around `CronstableLogo.mountGlyph` — see `capture_dashboard.py`); every
+  frame is then pixel-identical across themes, fonts, and reloads.

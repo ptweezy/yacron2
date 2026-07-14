@@ -406,8 +406,12 @@
     user-select: none;
   }
   .brand { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
-  .brand .mark { color: var(--fg); font-weight: 700; cursor: default;
-    display: inline-block; }
+  /* the mark is the wordmark's l: a live cart-and-double-pendulum simulation
+     (see the logo engine script) scaled to the glyph and overlaid on its cell,
+     so the balanced pendulum IS the letter. the svg is absolutely positioned
+     by CronstableLogo.mountGlyph — zero layout impact; the swing plays out
+     inside the header's padding band. without JS the span just prints its l. */
+  .brand .mark svg { display: block; filter: drop-shadow(0 0 5px var(--glow)); }
   .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; }
   .brand .tag { font-size: 11px; color: var(--fg-faint); cursor: default; }
   /* header text can't be selected, so these copy their value on click instead */
@@ -894,24 +898,56 @@
   .wb-tile { border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); padding: 12px 14px;
     display: flex; flex-direction: column; gap: 5px; cursor: pointer; overflow: hidden; }
   .wb-tile:hover { border-color: var(--border2); }
-  .wb-glyph { font-size: 30px; line-height: 1; }
-  .wb-name { font-weight: 700; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .wb-next { color: var(--fg-dim); font-size: 11.5px; font-variant-numeric: tabular-nums; margin-top: auto; }
-  .wb-tile.st-fail { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); }
+  /* tile type rides --wb-u, the fit governor's scale unit: sparse fleets on
+     big screens grow their type instead of huddling in a corner */
+  .wb-glyph { font-size: calc(30px * var(--wb-u, 1)); line-height: 1; }
+  .wb-name { font-weight: 700; color: var(--fg); font-size: calc(13px * var(--wb-u, 1)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* the glance line -- next fire (ok/pending), live elapsed (running), or
+     when-and-why it went wrong (fail/cancelled/unknown, .wb-last) -- is the
+     datum a wall viewer reads, so it gets the loudest text after the glyph */
+  .wb-next { color: var(--fg); font-weight: 700; font-size: calc(17px * var(--wb-u, 1)); font-variant-numeric: tabular-nums; margin-top: auto;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wb-next.run { color: var(--run); }
+  .wb-next.run.long { color: var(--pending); }
+  .wb-last { font-weight: 700; font-size: calc(15px * var(--wb-u, 1)); font-variant-numeric: tabular-nums; margin-top: auto;
+    display: flex; gap: 4px; min-width: 0; white-space: nowrap; overflow: hidden; }
+  /* on a tight tile the AGE yields, never the exit code -- "16s… · exit 69"
+     still answers "what broke"; "16s ago · exi…" answers nothing */
+  .wb-last .wb-ago { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+  .wb-last .wb-exit { flex: none; }
+  .wb-last.fail { color: var(--fail); }
+  .wb-last.cancelled { color: var(--cancelled); }
+  .wb-last.unknown { color: var(--unknown); }
+  .wb-spark { zoom: var(--wb-u, 1); }
+  /* status as surface, not just a 1px border and glyph interior: the hue
+     fills the tile so state reads at TV distance, and reusing the status
+     custom properties keeps the CVD remap and both themes working for free */
+  .wb-tile.st-fail { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); border-width: 2px;
+    background: color-mix(in srgb, var(--fail) 14%, var(--panel)); }
   .wb-tile.st-fail .wb-glyph { color: var(--fail); }
+  .wb-tile.st-run { background: color-mix(in srgb, var(--run) 8%, var(--panel)); }
   .wb-tile.st-run .wb-glyph { color: var(--run); }
   .wb-tile.st-ok .wb-glyph { color: var(--ok); }
+  .wb-tile.st-pending { background: color-mix(in srgb, var(--pending) 6%, var(--panel)); }
   .wb-tile.st-pending .wb-glyph { color: var(--pending); }
   .wb-tile.st-cancelled .wb-glyph { color: var(--cancelled); }
+  .wb-tile.st-unknown { background: color-mix(in srgb, var(--unknown) 8%, var(--panel)); }
+  .wb-tile.st-unknown .wb-glyph { color: var(--unknown); }
   .wb-tile.st-disabled { opacity: .55; }
   .wb-tile.st-disabled .wb-glyph { color: var(--disabled); }
   body.fx .wb-tile.st-fail { box-shadow: 0 0 16px color-mix(in srgb, var(--fail) 30%, transparent); }
   .wb-tile.flip { animation: wbflip .7s ease-out; }
-  @keyframes wbflip { 0% { background: var(--fail); } 100% { background: var(--panel); } }
+  /* no 100% frame: the flip settles to the tile's own (tinted) background */
+  @keyframes wbflip { 0% { background: var(--fail); } }
   .wb-foot { display: flex; align-items: center; gap: 16px; padding: 10px 18px; border-top: 1px solid var(--border);
     background: var(--panel); font-size: 13px; flex-wrap: wrap; }
   .wb-stat { color: var(--fg-dim); } .wb-stat b { color: var(--fg); font-size: 16px; margin-right: 4px; }
   .wb-stat.fail b { color: var(--fail); } .wb-stat.run b { color: var(--run); } .wb-stat.ok b { color: var(--ok); }
+  .wb-stat.pending b { color: var(--pending); } .wb-stat.unknown b { color: var(--unknown); } .wb-stat.cancelled b { color: var(--cancelled); }
+  /* fit-governor honesty chip: says what the truncated grid actually cut */
+  .wb-stat.more { color: var(--fg-dim); font-style: italic; }
+  .wb-stat.more.warn { color: var(--fail); font-style: normal; font-weight: 700; }
+  .wb-stat.more.warn b { color: var(--fail); }
   .wb-stat.cl { color: var(--fg-faint); }
   .wb-clock { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
   /* stale/no-signal treatment -- the header connection dot is hidden in TV
@@ -926,6 +962,28 @@
   .wallboard.stale .wb-nosignal { display: flex; }
   .wallboard.stale .wb-grid, .wallboard.stale .wb-foot { opacity: .45; }
   body.fx .wallboard.stale .wb-nosignal { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
+  /* verdict headline: the dashboard's correlation verdict at TV scale --
+     scope + likely cause in one sentence instead of "count the red tiles".
+     position/z-index lift it above the #wbAlarm vignette, like .wb-nosignal */
+  .wb-verdict { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 10px 18px;
+    position: relative; z-index: 5; text-align: center; border-bottom: 1px solid var(--border); }
+  .wb-verdict .head { font-weight: 700; letter-spacing: 1px; font-size: clamp(18px, 2.6vw, 34px); }
+  .wb-verdict .sub { color: var(--fg-dim); font-variant-numeric: tabular-nums; font-size: clamp(12px, 1.3vw, 18px); }
+  .wb-verdict.sev-warn { background: color-mix(in srgb, var(--pending) 10%, var(--bg)); border-bottom-color: color-mix(in srgb, var(--pending) 40%, var(--border)); }
+  .wb-verdict.sev-warn .head { color: var(--pending); }
+  .wb-verdict.sev-crit { background: color-mix(in srgb, var(--fail) 12%, var(--bg)); border-bottom-color: var(--fail); }
+  .wb-verdict.sev-crit .head { color: var(--fail); }
+  body.fx .wb-verdict.sev-crit .head { text-shadow: 0 0 10px color-mix(in srgb, var(--fail) 60%, transparent); }
+  /* compact tile mode (fit governor): denser tiles before anything has to be
+     cut. Compact rows stretch (1fr) to fill the glass, so the spark is only
+     dropped while the rows are actually tight -- wb-roomy (stretched rows
+     re-earn the spark's height) keeps the trail */
+  .wallboard.wb-compact .wb-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); grid-auto-rows: minmax(68px, 1fr); gap: 8px; padding: 12px; }
+  .wallboard.wb-compact .wb-tile { padding: 6px 9px; gap: 2px; }
+  .wallboard.wb-compact .wb-glyph { font-size: 15px; }
+  .wallboard.wb-compact .wb-name { font-size: 12px; }
+  .wallboard.wb-compact .wb-next, .wallboard.wb-compact .wb-last { font-size: 11px; }
+  .wallboard.wb-compact:not(.wb-roomy) .wb-spark { display: none; }
   body.tv > header, body.tv > main { display: none; }
   /* Surfaces the app can open while the wallboard is up -- the auto-opened 401
      token modal, the ⌘K palette, the drawer, toasts -- must stack ABOVE its
@@ -1174,7 +1232,11 @@
   #wbAlarm { position: absolute; inset: 0; z-index: 2; pointer-events: none; opacity: 0;
     background: radial-gradient(ellipse at center, transparent 40%, color-mix(in srgb, var(--fail) 70%, transparent) 100%);
     transition: opacity .8s ease; }
-  .wb-incident { position: absolute; top: 14px; left: 18px; z-index: 4; pointer-events: none;
+  /* a static flow strip between the banner and the grid: it can never cover
+     the worst (first) tile and never hides beneath the NO SIGNAL banner the
+     way the old absolutely-positioned stamp did */
+  .wb-incident { position: relative; z-index: 4; display: flex; align-items: center; justify-content: center;
+    padding: 6px 18px; border-bottom: 1px solid color-mix(in srgb, var(--fail) 40%, var(--border));
     color: var(--fail); font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
   body.fx .wb-incident { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
   .wb-incident.ackd { color: var(--pending); }
@@ -1316,8 +1378,7 @@
 
 <header>
   <div class="brand">
-    <span class="mark glow" id="mark">▚</span>
-    <h1 class="glow" id="brandName">cronstable</h1>
+    <h1 class="glow" id="brandName" title="the l is a self-balancing double pendulum — sweep your cursor through it to nudge it, right-click to knock it over">cronstab<span class="mark" id="mark">l</span>e</h1>
     <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
     <span class="ver" id="jobset" title=""></span>
@@ -1770,6 +1831,12 @@
        region announces only on a real change; the per-second age counter is
        aria-hidden (screen readers would otherwise hear it every tick). -->
   <div class="wb-nosignal" id="wbNoSignal" role="status"><span id="wbNoSignalMsg"></span><span id="wbNoSignalAge" aria-hidden="true"></span></div>
+  <!-- verdict headline: the dashboard's correlation verdict (scope + likely
+       cause) at TV scale; written only on a real change (renderWbVerdict) -->
+  <div class="wb-verdict" id="wbVerdict" style="display:none" role="status"><span class="head" id="wbVerdictHead"></span><span class="sub" id="wbVerdictSub"></span></div>
+  <!-- escalation incident stamp: a static flow strip (escalationTick toggles
+       it); aria-hidden because it re-renders every second -->
+  <div class="wb-incident" id="wbIncident" style="display:none" aria-hidden="true"></div>
   <div class="wb-grid" id="wbGrid"></div>
   <div class="wb-foot" id="wbFoot"></div>
   <!-- zen all-clear screensaver: appears over an idle, healthy wallboard -->
@@ -1787,6 +1854,862 @@
 </div>
 
 <script>
+/* =====================================================================
+ *  logo engine — a real self-balancing double pendulum on a cart.
+ *
+ *  This is not a canned animation. The header mark integrates the full
+ *  nonlinear cart/double-pendulum dynamics (RK4 at 240 Hz) and balances
+ *  itself with an LQR controller whose gains are computed at page load
+ *  from a numerical linearization (discrete Riccati iteration). While the
+ *  daemon is live it stands upright, riding out little gusts; lose the
+ *  signal and the motor cuts — it collapses and swings, pumping energy
+ *  (dE/dt = -a*G exactly) but held just short of the top. When the signal
+ *  returns, a receding-horizon cross-entropy planner threads the swing
+ *  into the balance controller's basin — every catch is verified by a
+ *  2-second closed-loop rollout before it is committed. A hard recovery
+ *  gets running room: the right end of the track swings open toward
+ *  mid-page — the physics bound leaps at once, while a phantom rail
+ *  and a fleeing end gate keep the picture honest — and eases back
+ *  to the end of the word once the letter stands at home. Stability isn't
+ *  a metaphor here; it is recomputed 240 times a second.
+ *
+ *  State s = [x, xd, th1, w1, th2, w2]; angles from upright; control is
+ *  cart acceleration. Tuned + Monte-Carlo-tested headlessly (recovery
+ *  median ~15 s, ~100% by 90 s, zero unverified catches in 10-min soak).
+ * ===================================================================== */
+"use strict";
+(function () {
+  const DP = {
+    g: 9.81,
+    L1: 0.34, L2: 0.26,      // link lengths (m)
+    m1: 0.14, m2: 0.09,      // point masses at link tips (kg)
+    d1: 0.005, d2: 0.002,    // joint viscous damping
+    trackHalf: 0.42,         // cart travel each side of center (m)
+    aMaxBalance: 18,         // accel authority while balancing (m/s^2)
+    aMaxCatch: 24,           // extra muscle in the first 1.2 s of a catch
+    aMaxSwing: 26,           // swing-up authority (escalates to 34)
+    dt: 1 / 240,             // physics step (s)
+  };
+  const LQR_Q = [4, 3.2, 120, 1.33, 162, 2], LQR_R = 0.12;
+  const SEG_N = 8, SEG_DT = 0.12;                  // CEM plan: 0.96 s horizon
+  const SEG_STEPS = Math.round(SEG_DT / (1 / 120));
+  const ENGAGE_GATE = 12000;                       // z'Pz gate before verifying
+  const VERIFY_COOLDOWN = 0.06;                    // s between catch rollouts
+
+  const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+  const wrapA = (a) => {
+    const T = 2 * Math.PI;
+    a = ((a % T) + T) % T;
+    return a > Math.PI ? a - T : a;
+  };
+  const mulberry32 = (seed) => {
+    let t = seed >>> 0;
+    return () => {
+      t += 0x6D2B79F5;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  // ---- dynamics: M(q) qdd = b, solved 2x2 per evaluation ----
+  function deriv(p, s, a) {
+    const xd = s[1], th1 = s[2], w1 = s[3], th2 = s[4], w2 = s[5];
+    const s1 = Math.sin(th1), c1 = Math.cos(th1);
+    const s2 = Math.sin(th2), c2 = Math.cos(th2);
+    const D = th1 - th2, sD = Math.sin(D), cD = Math.cos(D);
+    const M = p.m1 + p.m2;
+    const M11 = M * p.L1 * p.L1;
+    const M12 = p.m2 * p.L1 * p.L2 * cD;
+    const M22 = p.m2 * p.L2 * p.L2;
+    const Q1 = -p.d1 * w1 + p.d2 * (w2 - w1);
+    const Q2 = -p.d2 * (w2 - w1);
+    const b1 = -p.m2 * p.L1 * p.L2 * w2 * w2 * sD + p.g * M * p.L1 * s1 - M * p.L1 * c1 * a + Q1;
+    const b2 = p.m2 * p.L1 * p.L2 * w1 * w1 * sD + p.g * p.m2 * p.L2 * s2 - p.m2 * p.L2 * c2 * a + Q2;
+    const det = M11 * M22 - M12 * M12;
+    return [xd, a, w1, (M22 * b1 - M12 * b2) / det, w2, (M11 * b2 - M12 * b1) / det];
+  }
+  function rk4(p, s, a, dt) {
+    const k1 = deriv(p, s, a);
+    const s2 = s.map((v, i) => v + 0.5 * dt * k1[i]);
+    const k2 = deriv(p, s2, a);
+    const s3 = s.map((v, i) => v + 0.5 * dt * k2[i]);
+    const k3 = deriv(p, s3, a);
+    const s4 = s.map((v, i) => v + dt * k3[i]);
+    const k4 = deriv(p, s4, a);
+    return s.map((v, i) => v + (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+  }
+  // pendulum energy in the cart frame; upright = eUp
+  function energy(p, s) {
+    const th1 = s[2], w1 = s[3], th2 = s[4], w2 = s[5];
+    const M = p.m1 + p.m2;
+    return 0.5 * M * p.L1 * p.L1 * w1 * w1
+      + 0.5 * p.m2 * p.L2 * p.L2 * w2 * w2
+      + p.m2 * p.L1 * p.L2 * w1 * w2 * Math.cos(th1 - th2)
+      + p.g * (M * p.L1 * Math.cos(th1) + p.m2 * p.L2 * Math.cos(th2));
+  }
+  const eUp = (p) => p.g * ((p.m1 + p.m2) * p.L1 + p.m2 * p.L2);
+  // energy-flow coupling: dE/dt = -a * G(s); the pump pushes against G
+  const Gterm = (p, s) =>
+    (p.m1 + p.m2) * p.L1 * Math.cos(s[2]) * s[3] + p.m2 * p.L2 * Math.cos(s[4]) * s[5];
+
+  // ---- LQR gains from a numerical linearization at the upright ----
+  function computeLQR(p) {
+    const n = 6, eps = 1e-6, dtc = 0.002;
+    const mm = (A, B) => {
+      const rn = A.length, cm = B[0].length, kk = B.length;
+      const C = Array.from({ length: rn }, () => new Float64Array(cm));
+      for (let i = 0; i < rn; i++)
+        for (let t = 0; t < kk; t++) {
+          const a = A[i][t];
+          if (a === 0) continue;
+          for (let j = 0; j < cm; j++) C[i][j] += a * B[t][j];
+        }
+      return C;
+    };
+    const eye = (k) => Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) => (i === j ? 1 : 0)));
+    const s0 = [0, 0, 0, 0, 0, 0], f0 = deriv(p, s0, 0);
+    const A = eye(n).map((r) => r.map(() => 0));
+    for (let j = 0; j < n; j++) {
+      const sp = s0.slice(); sp[j] += eps;
+      const fp = deriv(p, sp, 0);
+      for (let i = 0; i < n; i++) A[i][j] = (fp[i] - f0[i]) / eps;
+    }
+    const fB = deriv(p, s0, eps);
+    const Bc = f0.map((v, i) => [(fB[i] - v) / eps]);
+    let Ad = eye(n), term = eye(n);
+    let Sint = eye(n).map((r) => r.map((v) => v * dtc)), termI = Sint.map((r) => r.slice());
+    for (let k = 1; k <= 8; k++) {
+      term = mm(term, A).map((r) => Array.from(r, (v) => v * dtc / k));
+      Ad = Ad.map((r, i) => r.map((v, j) => v + term[i][j]));
+      termI = mm(termI, A).map((r) => Array.from(r, (v) => v * dtc / (k + 1)));
+      Sint = Sint.map((r, i) => r.map((v, j) => v + termI[i][j]));
+    }
+    const Bd = mm(Sint, Bc);
+    const Q = eye(n).map((r, i) => r.map((v, j) => (i === j ? LQR_Q[i] : 0)));
+    let P = Q.map((r) => r.slice());
+    const T = (X) => X[0].map((_, j) => X.map((r) => r[j]));
+    for (let it = 0; it < 120000; it++) {
+      const PA = mm(P, Ad), PB = mm(P, Bd);
+      const AtPA = mm(T(Ad), PA), AtPB = mm(T(Ad), PB);
+      let BtPB = 0;
+      for (let i = 0; i < n; i++) BtPB += Bd[i][0] * PB[i][0];
+      const inv = 1 / (LQR_R + BtPB);
+      // re-symmetrized each pass: the naive recursion sheds symmetry via
+      // cancellation on this stiff system and diverges to NaN without it
+      let Pn = eye(n).map((r, i) => r.map((_, j) => Q[i][j] + AtPA[i][j] - AtPB[i][0] * inv * AtPB[j][0]));
+      Pn = Pn.map((r, i) => r.map((v, j) => 0.5 * (v + Pn[j][i])));
+      let diff = 0, pmax = 0;
+      for (let i = 0; i < n; i++)
+        for (let j = 0; j < n; j++) {
+          diff = Math.max(diff, Math.abs(Pn[i][j] - P[i][j]));
+          pmax = Math.max(pmax, Math.abs(Pn[i][j]));
+        }
+      P = Pn;
+      if (diff < 1e-12 * Math.max(1, pmax)) break;
+    }
+    const PB = mm(P, Bd), PA = mm(P, Ad);
+    let BtPB = 0;
+    for (let i = 0; i < n; i++) BtPB += Bd[i][0] * PB[i][0];
+    const K = [];
+    for (let j = 0; j < n; j++) {
+      let BtPA = 0;
+      for (let i = 0; i < n; i++) BtPA += Bd[i][0] * PA[i][j];
+      K.push(BtPA / (LQR_R + BtPB));
+    }
+    return { K, P };
+  }
+
+  // ---- simulator + supervisor: balance -> limp -> swing -> balance ----
+  class PendulumSim {
+    constructor(params, opts) {
+      this.p = Object.assign({}, DP, params || {});
+      this.opts = Object.assign({
+        catchWhileDisconnected: false,
+        limpDuration: 0.55,
+        disconnectedEnergyFrac: 0.94,  // strive, never top out, while offline
+        seed: 1,
+        gusts: true,
+      }, opts || {});
+      // track bounds (m, relative to the balance point x = 0). trackMin/
+      // trackMax params make the track asymmetric — the wordmark mount
+      // stretches it to the ends of "cronstable" while the equilibrium
+      // stays at the l's cell.
+      this.xMin = this.p.trackMin != null ? this.p.trackMin : -this.p.trackHalf;
+      this.xMax = this.p.trackMax != null ? this.p.trackMax : this.p.trackHalf;
+      this.rand = mulberry32(this.opts.seed);
+      const lq = computeLQR(this.p);
+      this.K = lq.K; this.P = lq.P;
+      this.s = [0, 0, 0, 0, 0, 0];
+      this.mode = "balance";
+      this.connected = true;
+      this.t = 0;
+      this.a = 0;
+      this.limpUntil = 0;
+      this.swingStart = 0;
+      this.catchT = -1;
+      this.plan = null;
+      this.planAge = 0;
+      this.cem = null;
+      this.lastVerify = -1;
+      this.onMode = null;
+      this.noise = { gustT: 3 + 4 * this.rand(), gust: 0, gustEnd: 0 };
+    }
+    setConnected(c) {
+      c = !!c;
+      if (c === this.connected) return;
+      this.connected = c;
+      if (!c && this.mode === "balance") this._toMode("limp");
+      // reconnect mid-swing: start the escalation clock warm — the user is
+      // watching a recovery, skip the most patient settings
+      if (c && this.mode === "swing") this.swingStart = this.t - 8;
+    }
+    poke(strength) {
+      const k = strength == null ? 3.5 : strength;
+      const dir = this.rand() < 0.5 ? -1 : 1;
+      this.s[3] += dir * k;
+      this.s[5] += dir * k * (0.6 + 0.8 * this.rand());
+    }
+    // a pointer sweeping through the linkage brushes it aside: quadratic
+    // ("wind") drag at the closest approach between the cursor's swept path
+    // (ax,ay)→(bx,by) and each link, projected through the point Jacobian
+    // onto the joint velocities — the lever arm and the angle of attack both
+    // shape the kick. Swept-path contact (not point sampling) so a fast
+    // flick can't tunnel between mousemove events; a slow hover barely
+    // stirs it. Args in sim units (m, s, m); per-event clamps keep
+    // teleporting cursors from exploding the state.
+    brush(ax, ay, bx, by, dt, R) {
+      const p = this.p, s = this.s;
+      const vx = (bx - ax) / dt, vy = (by - ay) / dt;
+      const v2 = vx * vx + vy * vy;
+      if (v2 < 1e-4) return;
+      const sp = Math.sqrt(v2);
+      const s1 = Math.sin(s[2]), c1 = Math.cos(s[2]);
+      const s2 = Math.sin(s[4]), c2 = Math.cos(s[4]);
+      const ex = s[0] + p.L1 * s1, ey = p.L1 * c1;
+      const tx = ex + p.L2 * s2, ty = ey + p.L2 * c2;
+      // closest approach between the path and a link segment (clamped
+      // projections, one refinement pass — exact enough for a brush)
+      const hit = (q0x, q0y, q1x, q1y) => {
+        const ux = bx - ax, uy = by - ay;
+        const wx = q1x - q0x, wy = q1y - q0y;
+        const rx = ax - q0x, ry = ay - q0y;
+        const A = ux * ux + uy * uy, B = ux * wx + uy * wy, C = wx * wx + wy * wy;
+        const D = ux * rx + uy * ry, E = wx * rx + wy * ry;
+        const den = A * C - B * B;
+        let sc = den > 1e-12 ? clamp((B * E - C * D) / den, 0, 1) : 0;
+        let tc = C > 1e-12 ? clamp((B * sc + E) / C, 0, 1) : 0;
+        sc = A > 1e-12 ? clamp((B * tc - D) / A, 0, 1) : 0;
+        tc = C > 1e-12 ? clamp((B * sc + E) / C, 0, 1) : 0;
+        const dx = (ax + sc * ux) - (q0x + tc * wx), dy = (ay + sc * uy) - (q0y + tc * wy);
+        return { t: tc, d: Math.hypot(dx, dy) };
+      };
+      const G1 = 0.09, G2 = 0.14;
+      const av1 = (vx * c1 - vy * s1) * sp;        // drag along link 1's swing direction
+      const h1 = hit(s[0], 0, ex, ey);
+      if (h1.d < R) s[3] += clamp(G1 * (1 - h1.d / R) * av1 * h1.t * dt, -0.5, 0.5);
+      const h2 = hit(ex, ey, tx, ty);
+      if (h2.d < R) {
+        const fall = 1 - h2.d / R;
+        s[5] += clamp(G2 * fall * (vx * c2 - vy * s2) * sp * h2.t * dt, -0.7, 0.7);
+        s[3] += clamp(0.6 * G1 * fall * av1 * dt, -0.4, 0.4);  // the elbow carries the blow too
+      }
+    }
+    _toMode(m) {
+      if (m === this.mode) return;
+      this.mode = m;
+      this.plan = null;
+      this.cem = null;
+      if (m === "limp") this.limpUntil = this.t + this.opts.limpDuration;
+      if (m === "swing") this.swingStart = this.t;
+      if (m === "balance") this.catchT = this.t;
+      if (this.onMode) this.onMode(m);
+    }
+    _wrapped(s) {
+      s = s || this.s;
+      return [s[0], s[1], wrapA(s[2]), s[3], wrapA(s[4]), s[5]];
+    }
+    _lqrAccel(z, aMax) {
+      let a = 0;
+      for (let i = 0; i < 6; i++) a -= this.K[i] * z[i];
+      return clamp(a, -aMax, aMax);
+    }
+    _vCost(s) {
+      const z = this._wrapped(s);
+      let c = 0;
+      for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) c += z[i] * this.P[i][j] * z[j];
+      return c;
+    }
+    _balanceAuthority() {
+      return this.catchT >= 0 && this.t - this.catchT < 1.2
+        ? (this.catchAuth != null ? this.catchAuth : this.p.aMaxCatch)
+        : this.p.aMaxBalance;
+    }
+    // patience buys muscle: swing + catch authority escalate over time
+    _swingCap() {
+      return Math.min(34, this.p.aMaxSwing + Math.floor((this.t - this.swingStart) / 8) * 2);
+    }
+    _catchAuthority() {
+      const tSw = this.mode === "swing" ? this.t - this.swingStart : 0;
+      return Math.min(32, this.p.aMaxCatch + Math.floor(tSw / 10) * 3);
+    }
+    _pumpTarget() {
+      if (!this.connected) return this.opts.disconnectedEnergyFrac;
+      const tSw = this.t - this.swingStart;
+      // periodic calm-down dumps excess energy and restarts the approach
+      // geometry, escaping unproductive limit cycles on stubborn recoveries
+      if (tSw > 25 && (tSw % 15) < 1.5) return 0.75;
+      return Math.min(1.35, 1.10 + Math.floor(tSw / 6) * 0.05);
+    }
+    _pumpAccel() {
+      const p = this.p, s = this.s, EUP = eUp(p);
+      const E = energy(p, s);
+      const dE = EUP * this._pumpTarget() - E;
+      let a;
+      if (E > EUP * (this._pumpTarget() - 0.03)) {
+        a = -30 * s[0] - 8 * s[1];                 // coast: recenter, wait
+      } else {
+        let pump = -10 * Math.tanh(2.5 * dE / EUP) * Math.tanh(Gterm(p, s) / 0.05);
+        if (Math.abs(s[3]) + Math.abs(s[5]) < 0.08 && Math.cos(s[2]) < 0) {
+          pump = 10 * Math.sin(2 * Math.PI * 0.9 * this.t); // bootstrap from dead hang
+        }
+        a = pump - 45 * s[0] - 6.5 * s[1];
+      }
+      return clamp(a, -p.aMaxSwing, p.aMaxSwing);
+    }
+    _rolloutCost(s0, segs, aCap) {
+      const p = this.p;
+      let s = s0.slice(), best = Infinity;
+      for (let i = 0; i < SEG_N * SEG_STEPS; i++) {
+        s = rk4(p, s, clamp(segs[(i / SEG_STEPS) | 0], -aCap, aCap), 1 / 120);
+        if (s[0] > this.xMax * 0.95 || s[0] < this.xMin * 0.95) return Infinity;
+        if ((i & 1) === 1) {
+          const c = this._vCost(s);
+          if (c < best) best = c;
+        }
+      }
+      return best;
+    }
+    // one anytime-CEM iteration per animation frame: (mean, sigma) carry
+    // across frames, mean shifted by the executed amount (fractional
+    // segments, blended) so the plan keeps phase. ~80 rollouts per call.
+    _cemFrame() {
+      const aCap = this._swingCap();
+      let c = this.cem;
+      if (!c) {
+        c = this.cem = { mean: new Array(SEG_N).fill(0), sigma: new Array(SEG_N).fill(aCap * 0.6) };
+      } else {
+        const off = this.planAge / 240 / SEG_DT;
+        c.mean = c.mean.map((_, i) => {
+          const q = i + off, i0 = Math.floor(q), f = q - i0;
+          const v0 = i0 < SEG_N ? c.mean[i0] : 0;
+          const v1 = i0 + 1 < SEG_N ? c.mean[i0 + 1] : 0;
+          return v0 * (1 - f) + v1 * f;
+        });
+        for (let i = 0; i < SEG_N; i++) c.sigma[i] = Math.min(aCap * 0.6, c.sigma[i] * 1.25 + 0.3);
+      }
+      const pop = [];
+      for (let k = 0; k < 80; k++) {
+        const segs = c.mean.map((m, i) =>
+          k === 0 ? clamp(m, -aCap, aCap)
+                  : clamp(m + (this.rand() * 2 - 1) * c.sigma[i] * 1.7, -aCap, aCap));
+        const cost = this._rolloutCost(this.s, segs, aCap);
+        if (cost < Infinity) pop.push({ segs: segs, cost: cost });
+      }
+      if (!pop.length) { this.plan = null; this.planAge = 0; return; }
+      pop.sort((a, b) => a.cost - b.cost);
+      const elite = pop.slice(0, Math.max(6, Math.floor(pop.length * 0.12)));
+      for (let i = 0; i < SEG_N; i++) {
+        let m = 0;
+        for (const e of elite) m += e.segs[i];
+        m /= elite.length;
+        let v = 0;
+        for (const e of elite) v += (e.segs[i] - m) * (e.segs[i] - m);
+        c.mean[i] = m;
+        c.sigma[i] = Math.sqrt(v / elite.length) + 0.5;
+      }
+      this.plan = { segs: elite[0].segs };
+      this.planAge = 0;
+    }
+    // candidate catch: near upright AND a full 2 s closed-loop rollout with
+    // the balance controller stabilizes — no catch is taken on faith
+    _tryCatch() {
+      if (!this.connected && !this.opts.catchWhileDisconnected) return false;
+      const p = this.p;
+      const z = this._wrapped();
+      if (Math.abs(z[2]) > 0.55 || Math.abs(z[4]) > 0.8) return false;
+      if (Math.abs(z[3]) > 4 || Math.abs(z[5]) > 5) return false;
+      const aCatch = this._catchAuthority(); // must match execution authority
+      let s = this.s.slice();
+      const dt = 1 / 240;
+      for (let i = 0; i < Math.round(2.0 / dt); i++) {
+        const zz = this._wrapped(s);
+        if (Math.abs(zz[2]) > 1.0 || Math.abs(zz[4]) > 1.25 || zz[0] > this.xMax || zz[0] < this.xMin) return false;
+        s = rk4(p, s, this._lqrAccel(zz, i * dt < 1.2 ? aCatch : p.aMaxBalance), dt);
+      }
+      const zf = this._wrapped(s);
+      this.catchAuth = aCatch;
+      return Math.abs(zf[2]) < 0.06 && Math.abs(zf[4]) < 0.08 &&
+             Math.abs(zf[3]) < 0.5 && Math.abs(zf[5]) < 0.6;
+    }
+    _swingFrame() {
+      const p = this.p, EUP = eUp(p);
+      const E = energy(p, this.s);
+      const z2 = wrapA(this.s[2]);
+      const inRegion = this.connected &&
+        E > EUP * 0.75 && E < EUP * 1.9 && Math.abs(z2) < 1.35 && Math.abs(this.s[3]) < 7;
+      if (!inRegion) { this.plan = null; this.cem = null; return; }
+      this._cemFrame();
+      if (this.t - this.lastVerify > VERIFY_COOLDOWN && this._vCost(this.s) < ENGAGE_GATE) {
+        this.lastVerify = this.t;
+        if (this._tryCatch()) this._toMode("balance");
+      }
+    }
+    // advance by real seconds; call once per animation frame (planning is
+    // amortized per call so the worst-case frame stays cheap)
+    step(elapsed) {
+      const p = this.p;
+      let remaining = clamp(elapsed, 0, 0.05);
+      if (this.mode === "swing") this._swingFrame();
+      while (remaining > 1e-9) {
+        const dt = Math.min(p.dt, remaining);
+        remaining -= dt;
+        this.t += dt;
+        let a = 0;
+        if (this.mode === "balance") {
+          const z = this._wrapped();
+          if (Math.abs(z[2]) > 1.0 || Math.abs(z[4]) > 1.3 || z[0] > this.xMax * 1.02 || z[0] < this.xMin * 1.02) {
+            this._toMode(this.connected ? "swing" : "limp");
+          } else {
+            a = this._lqrAccel(z, this._balanceAuthority());
+            if (this.opts.gusts) {
+              const n = this.noise;
+              if (this.t > n.gustT) {
+                n.gust = (this.rand() - 0.5) * 0.55;  // a whisper: the standing l should sway, not lurch
+                n.gustEnd = this.t + 0.25;
+                n.gustT = this.t + 2.5 + 5 * this.rand();
+              }
+              if (this.t < n.gustEnd) this.s[3] += n.gust * dt * 6;
+              a = clamp(a + (this.rand() - 0.5) * 0.5, -p.aMaxBalance, p.aMaxBalance);
+            }
+          }
+        } else if (this.mode === "limp") {
+          a = clamp(-2.0 * this.s[1], -3, 3); // motor dead; gentle rolling drag
+          if (this.t >= this.limpUntil) this._toMode("swing");
+        } else if (this.plan) {
+          a = this.plan.segs[Math.min(SEG_N - 1, (this.planAge / (SEG_DT * 240)) | 0)];
+          this.planAge++;
+        } else {
+          a = this._pumpAccel();
+        }
+        this.a = a;
+        this.s = rk4(p, this.s, a, dt);
+        if (this.s[0] > this.xMax * 1.05 || this.s[0] < this.xMin * 1.05) {  // hard end-stops
+          this.s[0] = clamp(this.s[0], this.xMin * 1.05, this.xMax * 1.05);
+          this.s[1] = 0;
+          if (this.mode === "balance") this._toMode("swing");
+        }
+      }
+    }
+    pose() {
+      const x = this.s[0], th1 = this.s[2], th2 = this.s[4];
+      const j2 = { x: x + this.p.L1 * Math.sin(th1), y: this.p.L1 * Math.cos(th1) };
+      return {
+        cart: x,
+        j2: j2,
+        tip: { x: j2.x + this.p.L2 * Math.sin(th2), y: j2.y + this.p.L2 * Math.cos(th2) },
+        mode: this.mode,
+        a: this.a,
+      };
+    }
+  }
+
+  // ---- renderer: builds an svg into `el` and drives the sim via rAF ----
+  class CronstableLogo {
+    constructor(el, opts) {
+      this.el = el;
+      this.opts = Object.assign({
+        connected: () => true,
+        reducedMotion: () => false,
+        scale: 28,                    // px per meter
+        ui: 1,                        // cart/bobs/rail are drawn for the 28px/m mark; ×ui rescales that chrome
+        railX: null,                  // rail gates override, signed [x1, x2] px (default: flush with the box edges)
+        railMax: null,                // dynamic right gate: how far (px) it may open during a recovery (null = fixed)
+        decorative: null,             // aria-hidden svg — for mounts where host text already names the logo
+        seed: (Math.random() * 1e9) | 0,
+      }, opts || {});
+      this.sim = new PendulumSim(this.opts.params, { seed: this.opts.seed });
+      this.trail = [];
+      this._raf = 0;
+      this._last = 0;
+      this._mode = "";
+      this._frame = this._frame.bind(this);
+      this._build();
+      this.sync();
+    }
+    _build() {
+      const NS = "http://www.w3.org/2000/svg";
+      const S = this.opts.scale, U = this.opts.ui, p = this.sim.p;
+      const reach = (p.L1 + p.L2) * S;
+      const wL = Math.ceil(-this.sim.xMin * S + reach + 4);  // box extent left of the balance point
+      // … and right (symmetric by default; a dynamic gate needs room to its cap)
+      const wR = Math.ceil(Math.max(this.sim.xMax * S, this.opts.railMax || 0) + reach + 4);
+      const hh = Math.ceil(reach + 5);
+      // by default the rail spans the full box so the end gates sit flush
+      // with the logo's edges. the cart's travel is shorter, and the tip's
+      // worst-case reach (|track bound| + L1 + L2, which sizes the box)
+      // stays ~2px inside the gates — nothing ever clips. a railX override
+      // ([x1, x2] px) places the gates explicitly instead: the glyph mount
+      // puts them at the outer ends of the wordmark.
+      const rx = this.opts.railX != null ? this.opts.railX : [2 - wL, wR - 2];
+      this._geom = { S: S, U: U, railY: 4.2 * U, railX: rx };
+      // dynamic right gate (opt-in via railMax): while the mark is recovering
+      // the physics bound opens out and the drawn gate flees ahead of the
+      // cart — state here, policy in _gateStep. gate travel is measured
+      // RELATIVE to rest, so the physics bound extends relative to restM and
+      // any railX/track pairing stays in register.
+      this._gate = this.opts.railMax == null ? null : {
+        x: rx[1], rest: rx[1],
+        cap: Math.max(this.opts.railMax, rx[1]),
+        min: 12 * U,            // drawn gate → cart-edge clearance
+        restM: this.sim.xMax,   // the word-edge physics bound to come home to
+        settledAt: -1,
+        pending: null,          // resize shrink arriving mid-recovery, held (see setRailMax)
+        v: 0,                   // low-passed rightward cart charge, px/s (see _gateStep)
+        rv: 0,                  // retract speed slew, px/s — eases the ride home in from zero
+      };
+      const mk = (t, at, parent) => {
+        const n = document.createElementNS(NS, t);
+        for (const k in at) n.setAttribute(k, at[k]);
+        (parent || this.svg).appendChild(n);
+        return n;
+      };
+      this.svg = document.createElementNS(NS, "svg");
+      const svgAt = {
+        viewBox: (-wL) + " " + (-hh) + " " + (wL + wR) + " " + (2 * hh),
+        width: wL + wR, height: 2 * hh,
+      };
+      if (this.opts.decorative) svgAt["aria-hidden"] = "true";
+      else {
+        svgAt.role = "img";
+        svgAt["aria-label"] = "cronstable logo: a self-balancing double pendulum on a cart";
+      }
+      for (const k in svgAt) this.svg.setAttribute(k, svgAt[k]);
+      const g = this._geom;
+      this.eTrail = mk("polyline", { class: "p-trail", fill: "none", stroke: "var(--accent)", "stroke-width": 1, opacity: 0.35, points: "" });
+      mk("line", { class: "p-rail", x1: g.railX[0], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
+      // phantom track: the temporary rail that fills in behind the fleeing
+      // right gate while the track is opened out (see _gateStep)
+      this.eGhost = !this._gate ? null : mk("line", { class: "p-rail-ext", x1: g.railX[1], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
+      mk("line", { class: "p-stop", x1: g.railX[0], y1: g.railY - 3 * U, x2: g.railX[0], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
+      this.eStopR = mk("line", { class: "p-stop", x1: g.railX[1], y1: g.railY - 3 * U, x2: g.railX[1], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
+      this.eL1 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
+      this.eL2 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
+      this.eCart = mk("rect", { class: "p-cart", width: 7 * U, height: 2.8 * U, rx: 0.9 * U, y: 0.7 * U, fill: "var(--fg)" });
+      this.ePivot = mk("circle", { class: "p-pivot", r: 0.85 * U, cy: 0, fill: "var(--fg)" });
+      this.eElbow = mk("circle", { class: "p-bob", r: 1.7 * U, fill: "var(--accent)" });
+      this.eTip = mk("circle", { class: "p-bob", r: 2.1 * U, fill: "var(--accent)" });
+      this.el.appendChild(this.svg);
+      this._render();
+    }
+    _render() {
+      const g = this._geom, S = g.S;
+      const w = this.sim.pose();
+      const cx = w.cart * S;
+      const j2x = w.j2.x * S, j2y = -w.j2.y * S;
+      const tx = w.tip.x * S, ty = -w.tip.y * S;
+      this.eCart.setAttribute("x", cx - 3.5 * g.U);
+      this.ePivot.setAttribute("cx", cx);
+      this.eL1.setAttribute("x1", cx); this.eL1.setAttribute("y1", 0);
+      this.eL1.setAttribute("x2", j2x); this.eL1.setAttribute("y2", j2y);
+      this.eL2.setAttribute("x1", j2x); this.eL2.setAttribute("y1", j2y);
+      this.eL2.setAttribute("x2", tx); this.eL2.setAttribute("y2", ty);
+      this.eElbow.setAttribute("cx", j2x); this.eElbow.setAttribute("cy", j2y);
+      this.eTip.setAttribute("cx", tx); this.eTip.setAttribute("cy", ty);
+      if (w.mode !== "balance") {
+        this.trail.push(tx.toFixed(1) + "," + ty.toFixed(1));
+        if (this.trail.length > 44) this.trail.shift();
+      } else if (this.trail.length) {
+        this.trail.splice(0, 2); // fade the trail out after a catch
+      }
+      this.eTrail.setAttribute("points", this.trail.join(" "));
+      const gt = this._gate;
+      if (gt && gt.x !== this._gateDrawn) {
+        this._gateDrawn = gt.x;
+        this.eStopR.setAttribute("x1", gt.x);
+        this.eStopR.setAttribute("x2", gt.x);
+        // the phantom rail runs flush to the fleeing gate at full rail
+        // strength — no fade: the line growing from zero length is its own
+        // smooth reveal (gate motion near rest is sub-px per frame), and any
+        // partial opacity reads as a gap against the solid rail
+        this.eGhost.setAttribute("x2", gt.x);
+      }
+      if (w.mode !== this._mode) {
+        this._mode = w.mode;
+        this.svg.setAttribute("data-mode", w.mode);
+        const bob = w.mode === "balance" ? "var(--accent)" : "var(--pending)";
+        this.eElbow.setAttribute("fill", bob);
+        this.eTip.setAttribute("fill", bob);
+      }
+    }
+    _frame(t) {
+      this._raf = 0;
+      if (this.opts.reducedMotion()) { this._park(); return; }
+      const dt = this._last ? (t - this._last) / 1000 : 1 / 60;
+      this._last = t;
+      this.sim.step(dt);
+      this._gateStep(dt);
+      this._render();
+      this._raf = requestAnimationFrame(this._frame);
+    }
+    // reduced motion: no animation at all — a still pose that is still
+    // honest about state (upright when live, hanging when not)
+    _park() {
+      if (this._raf) cancelAnimationFrame(this._raf);
+      this._raf = 0;
+      this._last = 0;
+      const up = this.sim.connected;
+      this.sim.s = up ? [0, 0, 0, 0, 0, 0] : [0, 0, Math.PI, 0, Math.PI, 0];
+      this.sim.mode = up ? "balance" : "limp";
+      if (this._gate) { this._gate.x = this._gate.rest; this._gate.settledAt = -1; this._gate.v = 0; this._gate.rv = 0; this.sim.xMax = this._gate.restM; }
+      this.trail.length = 0;
+      this._render();
+    }
+    // dynamic right gate. the moment balance is lost the physics bound leaps
+    // to the cap (the wall turns almost imaginary — mid-page by default — so
+    // the planner can run the cart out under the header instead of dying
+    // against the "e"), while the DRAWN gate only flees as the cart actually
+    // charges it — velocity-led, riding just `min` ahead of the envelope of
+    // the cart's excursions (fast out, slow back) and never letting the
+    // cart's edge within `min`; the phantom track fills in flush
+    // behind it. once the
+    // catch is verified and the cart has walked the letter home (a beat of
+    // dwell so a wobble can't flutter it), gate and track glide back to the
+    // end of the word, the physics bound riding them in.
+    _gateStep(dt) {
+      const gt = this._gate;
+      if (!gt) return;
+      dt = clamp(dt, 0, 0.05);   // mirror sim.step: a refocused tab must not teleport the gate
+      // a resize shrink that arrived mid-recovery applies as soon as the new
+      // cap wouldn't move the drawn gate
+      if (gt.pending != null && gt.x <= Math.max(gt.rest, gt.pending)) {
+        const px = gt.pending;
+        gt.pending = null;
+        this.setRailMax(px);
+      }
+      const S = this._geom.S, U = this._geom.U, sim = this.sim;
+      // the bound extends RELATIVE to restM by the gate's travel beyond rest,
+      // with `min` reserved so the drawn gate can always clear a cart parked
+      // on the extended hard stop without itself crossing `cap`
+      const capM = gt.restM + Math.max(0, gt.cap - gt.rest - gt.min) / (1.05 * S);
+      const cartEdge = sim.s[0] * S + 3.5 * U;
+      const home = sim.mode === "balance" && Math.abs(sim.s[0]) < 0.06 && Math.abs(sim.s[1]) < 0.3;
+      if (!home) gt.settledAt = -1;
+      else if (gt.settledAt < 0) gt.settledAt = sim.t;
+      if (sim.mode !== "balance") sim.xMax = capM;
+      if (gt.settledAt >= 0 && sim.t - gt.settledAt > 1.1) {
+        // verified catch + the letter stands at home: glide everything back.
+        // xMax is set even when the gate is already home — the escort below
+        // may have brought it in before the dwell elapsed, and the physics
+        // bound must still come home with it
+        if (gt.x > gt.rest) {
+          // stately ride home: the speed eases in from zero (velocity-
+          // continuous with the escort's gentle drift) and tracks
+          // distance/1.4 s clamped to [30, 200] px/s — the floor keeps a
+          // far gate from dawdling, the ceiling and ease-in keep a
+          // half-retracted one from snapping
+          const dist = gt.x - gt.rest;
+          const wantRate = clamp(dist / 1.4, 30, 200);
+          gt.rv += (wantRate - gt.rv) * (1 - Math.exp(-dt / 0.4));
+          gt.x -= Math.min(gt.rv * dt, dist);
+          if (gt.x - gt.rest < 0.5) gt.x = gt.rest;
+        }
+        sim.xMax = gt.restM + Math.max(0, gt.x - gt.rest - gt.min) / (1.05 * S);   // same min reserve as capM: xMax rides [restM, capM] exactly
+      } else {
+        gt.rv = 0;   // any new action re-arms the soft start of the ride home
+        // recovering, or walking the catch home: the gate stays put until
+        // the cart genuinely approaches, then rides just `min` ahead of it,
+        // leading further the faster the rightward charge — the velocity
+        // anticipation outruns the smoothing lag, so the hard floor below
+        // almost never has to snap (no bulldozing), and a cart nowhere near
+        // the gate never moves it at all (no lurch at recovery start).
+        // the charge is low-passed and the ease-back rate-capped below, so
+        // the gate rides the ENVELOPE of the swing instead of chasing each
+        // stroke out and back
+        const charge = Math.max(0, sim.s[1]) * S;   // rightward cart speed, px/s
+        gt.v += (charge - gt.v) * (1 - Math.exp(-dt / 0.35));
+        const want = clamp(cartEdge + gt.min + 0.45 * gt.v, gt.rest, gt.cap);
+        // fast out, slow back: the gate rides the envelope of the cart's
+        // excursions instead of flapping with every swing
+        let dx = (want - gt.x) * (1 - Math.exp(-dt / (want > gt.x ? 0.1 : 2.2)));
+        if (dx < 0) dx = Math.max(dx, -22 * dt);   // ease back gently: ride the envelope, don't chase the cart back in
+        gt.x += dx;
+      }
+      // the wall never exceeds the current allowance (a resize shrink can
+      // finish applying while balance holds, a window where no branch above
+      // rewrites xMax) — and never lands inside the cart itself
+      sim.xMax = Math.max(Math.min(sim.xMax, capM), sim.s[0] + 0.02);
+      gt.x = clamp(Math.max(gt.x, cartEdge + gt.min), gt.rest, gt.cap);
+    }
+    /** Re-cap the dynamic right gate (glyph mounts re-measure on resize).
+     *  The svg box tracks the cap BOTH ways — an oversized box left behind by
+     *  a window shrink would push a horizontal scrollbar. A cap below the
+     *  current gate position is held in gt.pending and applied by _gateStep
+     *  once the gate is back under it, so nothing on screen ever jumps. */
+    setRailMax(px) {
+      const gt = this._gate;
+      if (!gt || !isFinite(px)) return;
+      gt.pending = px < gt.x ? px : null;   // shrink while out: hold until the gate is back
+      gt.cap = Math.max(gt.rest, gt.x, px);
+      const vb = this.svg.viewBox.baseVal;
+      const need = Math.ceil(gt.cap + (this.sim.p.L1 + this.sim.p.L2) * this._geom.S + 4);
+      if (need !== vb.x + vb.width) {
+        this.svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + (need - vb.x) + " " + vb.height);
+        this.svg.setAttribute("width", need - vb.x);
+      }
+    }
+    /** Re-read connected()/reducedMotion() and start/stop the loop. */
+    sync() {
+      this.sim.setConnected(!!this.opts.connected());
+      if (this.opts.reducedMotion()) this._park();
+      else if (!this._raf) { this._last = 0; this._raf = requestAnimationFrame(this._frame); }
+    }
+    poke(k) {
+      if (!this.opts.reducedMotion()) this.sim.poke(k);
+    }
+    /** The cursor is weather: mousemoves over `el` become viscous brushes on
+     *  whichever link the pointer grazes — direction, speed and where along
+     *  the link it hits all shape the response (see PendulumSim.brush). */
+    attachPointer(el) {
+      if (this._ptrEl) this.detachPointer();
+      const move = (e) => {
+        if (this.opts.reducedMotion()) { this._ptrLast = null; return; }
+        const r = this.svg.getBoundingClientRect();
+        if (!r.width) return;
+        const vb = this.svg.viewBox.baseVal;
+        const S = this._geom.S, k = vb.width / r.width;
+        const px = ((e.clientX - r.left) * k + vb.x) / S;      // sim meters,
+        const py = -((e.clientY - r.top) * k + vb.y) / S;      // y up, pivot line = 0
+        const t = e.timeStamp / 1000;
+        const last = this._ptrLast;
+        this._ptrLast = { x: px, y: py, t: t };
+        if (!last || t - last.t > 0.1) return;                 // stroke start (or stall): no velocity yet
+        const dt = Math.max(1e-3, t - last.t);
+        this.sim.brush(last.x, last.y, px, py, dt, Math.max(0.06, 7 / S));
+      };
+      const leave = () => { this._ptrLast = null; };
+      this._ptrEl = el;
+      this._ptrFns = [["mousemove", move], ["mouseleave", leave]];
+      for (const nf of this._ptrFns) el.addEventListener(nf[0], nf[1]);
+    }
+    detachPointer() {
+      if (!this._ptrEl) return;
+      for (const nf of this._ptrFns) this._ptrEl.removeEventListener(nf[0], nf[1]);
+      this._ptrEl = null;
+      this._ptrFns = null;
+      this._ptrLast = null;
+    }
+    destroy() {
+      this.detachPointer();
+      if (this._raf) cancelAnimationFrame(this._raf);
+      this._raf = 0;
+      if (this.svg) this.svg.remove();
+    }
+  }
+
+  // ---- glyph mount: the pendulum stands in for a letter of the wordmark ----
+  // `slot` is an inline element wrapping the letter (the l of "cronstable").
+  // The glyph is measured (canvas TextMetrics) and the sim scaled so the
+  // balanced pendulum — cart pivot on the baseline, tip at the stem's top —
+  // spans the letter exactly, with the svg anchored to the letter's cell.
+  // The sim's equilibrium is x = 0, so the controller literally targets the
+  // letter's position, while the cart's track runs the full width of the
+  // surrounding word — the end gates are the wordmark's outer edges. The
+  // printed glyph stays in the DOM for copy/paste, screen readers and no-JS,
+  // and is only blanked here, once its live replacement is standing.
+  // During a hard recovery the right gate opens out toward mid-page and
+  // closes back to the wordmark's edge once the letter stands (railMax).
+  CronstableLogo.mountGlyph = function (slot, opts) {
+    const cs = getComputedStyle(slot);
+    // computed lengths are unzoomed CSS px (standardized zoom does not
+    // premultiply getComputedStyle values), so they are already the right
+    // measurement space: the UI zoom (Settings → scale) then scales the
+    // finished svg together with the text, keeping the l in register
+    const fpx = parseFloat(cs.fontSize) || 15;
+    const ctx = document.createElement("canvas").getContext("2d");
+    if (ctx) ctx.font = cs.fontStyle + " " + cs.fontWeight + " " + fpx + "px " + cs.fontFamily;
+    const m = ctx ? ctx.measureText(slot.textContent || "l") : null;
+    const stem = (m && m.actualBoundingBoxAscent) || fpx * 0.72;  // glyph height above the baseline
+    const asc = (m && m.fontBoundingBoxAscent) || fpx * 0.78;     // font box: locates the baseline
+    const desc = (m && m.fontBoundingBoxDescent) || fpx * 0.22;
+    const lh = parseFloat(cs.lineHeight) || fpx * 1.5;            // slot line-box height
+    const p = CronstableLogo.PARAMS;
+    const S = stem / (p.L1 + p.L2), U = S / 28;
+    // the track runs the full word: the text around the slot ("cronstab",
+    // "e") is measured with the same font, the gates sit at the wordmark's
+    // outer ends and the cart's hard stops just inside them — while the
+    // balance point stays x = 0, the l's cell.
+    let prefix = "", suffix = "";
+    for (let n = slot.previousSibling; n; n = n.previousSibling) prefix = (n.textContent || "") + prefix;
+    for (let n = slot.nextSibling; n; n = n.nextSibling) suffix += n.textContent || "";
+    const ls = parseFloat(cs.letterSpacing) || 0;
+    const adv = (t) => (m ? ctx.measureText(t).width + t.length * ls : t.length * fpx * 0.6);
+    const slotW = adv(slot.textContent || "l");
+    const pad = 3.5 * U + 0.8;   // gate → cart-center clearance (cart half-width + a hair)
+    // tuck the neighbors in: the live stem is a hairline, not a full bold
+    // glyph, so a whole printed cell reads loose around it. negative margins
+    // (applied only here, once the pendulum takes over, so the no-JS printed
+    // l keeps exact metrics) pull the flanking letters toward the stem; the
+    // slot's content box — and with it x = 0 — stays midway between them.
+    const tuck = slotW * 0.12;
+    const railL = prefix ? -(adv(prefix) + slotW / 2 - tuck) : -(p.trackHalf * 1.05 * S + pad);
+    const railR = suffix ? adv(suffix) + slotW / 2 - ls - tuck : p.trackHalf * 1.05 * S + pad;
+    // the dynamic right gate may open out to the middle of the page during
+    // a recovery (see _gateStep). Its cap is measured in the svg's own
+    // unzoomed px: the slot's rendered width against its measured advance
+    // cancels any host UI zoom (rects are zoomed, canvas metrics are not).
+    const midPage = () => {
+      const r = slot.getBoundingClientRect();
+      return r.width > 0 && slotW > 0
+        ? (window.innerWidth / 2 - (r.left + r.width / 2)) * (slotW / r.width)
+        : railR;
+    };
+    const logo = new CronstableLogo(slot, Object.assign({
+      scale: S,
+      ui: U,
+      railX: [railL, railR],
+      railMax: Math.max(railR, midPage()),
+      params: { trackMin: (railL + pad) / (1.05 * S), trackMax: (railR - pad) / (1.05 * S) },
+      decorative: true,                               // the wordmark itself already reads "cronstable"
+    }, opts));
+    slot.style.position = "relative";
+    slot.style.display = "inline-block";
+    const svg = logo.svg;
+    const vb = svg.viewBox.baseVal;
+    svg.style.position = "absolute";
+    svg.style.pointerEvents = "none";
+    svg.style.left = "calc(50% + " + vb.x + "px)";
+    svg.style.top = ((lh - asc - desc) / 2 + asc - vb.height / 2).toFixed(2) + "px";
+    slot.style.color = "transparent";   // the printed l yields to the live one
+    slot.style.textShadow = "none";     // (a transparent glyph still casts its text-shadow glow)
+    slot.style.margin = "0 " + (-tuck).toFixed(2) + "px";
+    // the mid-page cap follows the window; measured once more right away,
+    // because the tuck margins just shifted the slot under the first reading
+    const recap = () => logo.setRailMax(Math.max(railR, midPage()));
+    recap();
+    window.addEventListener("resize", recap);
+    const bye = logo.destroy.bind(logo);
+    logo.destroy = () => { window.removeEventListener("resize", recap); bye(); };
+    return logo;
+  };
+
+  CronstableLogo.Sim = PendulumSim;
+  CronstableLogo.PARAMS = DP;
+  window.CronstableLogo = CronstableLogo;
+})();
+</script>
+
+<script>
 "use strict";
 (function () {
   // ===================================================================
@@ -1796,7 +2719,7 @@
   const PREF_PREFIX = "cronstable.";             // localStorage prefs
   const MAX_LOG_LINES = 5000;                 // bound the in-memory log view
   const RE_SCAN_CAP = 5000;                   // cap chars scanned per line (ReDoS guard)
-  const GLYPH = { ok: "●", fail: "✗", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍" };
+  const GLYPH = { ok: "●", fail: "✕", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍" };
   // one place that maps a run outcome -> its CSS state class
   const outcomeCls = (o) => o === "failure" ? "fail" : o === "cancelled" ? "cancelled" : o === "unknown" ? "unknown" : "ok";
 
@@ -1884,8 +2807,14 @@
     mitigate: { open: false, running: false, abort: false, set: [] },
     sandbox: { open: false },
     failSince: {},             // name -> ms this browser first saw the job failing
+    runSince: {},              // name -> ms this browser first saw the job running (honest elapsed base)
+    runFin: {},                // name -> last_run.finished_at seen when runSince was stamped
+                               // (a newer finished_at while still running = a NEW run: re-stamp)
     lastAlarmAt: 0,            // adaptive-alarm gate (ms)
     zen: { on: false, idleSince: 0, sig: null },
+    wbSig: null,               // wallboard grid signature (skip rebuilds that restart animations)
+    wbFootSig: null,           // wallboard footer signature
+    wbVerdictSig: null,        // wallboard verdict-strip signature
   };
 
   // ===================================================================
@@ -2556,8 +3485,8 @@
     const wbStale = state.wallboard && wallboardStale();
     document.querySelectorAll("[data-next]").forEach((e) => {
       const job = state.byName[e.getAttribute("data-next")];
-      // running/disabled tiles keep their "—" (wallboard attaches data-next to
-      // every tile; the job table only attaches it to jobs with a live countdown)
+      // both surfaces attach data-next only to live-countdown cells now; the
+      // running/disabled guard catches a job that flipped state since render
       if (!job) return;
       if (job.running || !job.enabled) { e.textContent = "—"; return; }
       e.textContent = wbStale ? "stale" : fmtIn(nextRunSeconds(job));
@@ -2567,6 +3496,15 @@
     if (state.timeline.open) $("tlNow").textContent = utcClock();
     if (state.wallboard) {
       const wc = $("wbClock"); if (wc) wc.textContent = utcClock();
+      // running tiles: live elapsed + running-long tint. Scoped to the grid --
+      // [data-run-since] exists nowhere else.
+      $("wbGrid").querySelectorAll("[data-run-since]").forEach((e) => {
+        const name = e.getAttribute("data-run-since"), t0 = state.runSince[name], job = state.byName[name];
+        if (!t0 || !job) return;
+        const secs = (Date.now() - t0) / 1000;
+        e.textContent = "▶ " + fmtDuration(secs);
+        e.classList.toggle("long", runLong(job, secs));
+      });
       wallboardSignalTick();       // NO SIGNAL banner + dimming when polls stop landing
       zenGovernor();               // drift to / from the zen screensaver on idle
       if (state.zen.on) zenTick();  // pulse the field on real next-fire instants
@@ -2753,7 +3691,11 @@
   // ===================================================================
   //  wallboard / TV kiosk mode
   // ===================================================================
-  const WB_ORDER = { fail: 0, run: 1, pending: 2, cancelled: 3, ok: 4, disabled: 5 };
+  // worst-first tile order. Every health() key MUST appear here: a missing
+  // key makes the sort comparator return NaN, which leaves the whole ordering
+  // unspecified (unknown once had exactly that bug). Mirrors STATUS_ORDER's
+  // relative placement of unknown (after pending, before cancelled).
+  const WB_ORDER = { fail: 0, run: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, disabled: 6 };
   function utcClock() { const n = new Date(); return pad2(n.getUTCHours()) + ":" + pad2(n.getUTCMinutes()) + ":" + pad2(n.getUTCSeconds()) + " UTC"; }
   // The wallboard's staleness gate. TV mode hides the header (and with it the
   // #conn indicator), so the surface must judge freshness itself: stale when
@@ -2772,7 +3714,13 @@
   // cluster card's clusterStale() rather than freezing on a healthy frame.
   function wallboardSignalTick() {
     const stale = wallboardStale();
-    $("wallboard").classList.toggle("stale", stale);
+    const wb = $("wallboard");
+    const flipped = wb.classList.contains("stale") !== stale;
+    wb.classList.toggle("stale", stale);
+    // the banner is an in-flow strip: showing it resizes the grid, and during
+    // an outage no successful poll will re-run the fit governor -- do it on
+    // the flip itself (transition-guarded, so per-second ticks stay cheap)
+    if (flipped) fitWallboardGrid();
     if (!stale) return;
     // write the verdict span only on a real change so the role="status" live
     // region announces once; the age counter ticks every second inside an
@@ -2791,6 +3739,10 @@
     // (Visibility is not the issue -- body.tv stacks .drawer above the
     // wallboard, so overlays that DO open in TV mode are seen.)
     if (on && state.drawerJob) closeDrawer();
+    // the DAG drawer owns a #dag/... hash the same way; left open it would
+    // desync the #tv hash exactly like the job drawer (setHashTv below
+    // re-asserts #tv over the transient hash strip from closeDagDrawer)
+    if (on && state.dagDrawer && state.dagDrawer.dag) closeDagDrawer();
     state.wallboard = on;
     const wb = $("wallboard");
     wb.style.display = on ? "" : "none";
@@ -2799,7 +3751,35 @@
     $("tvBtn").classList.toggle("on", on);
     setHashTv(on);
     if (on) renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
-    else { $("wbGrid").innerHTML = ""; zenOff(); state.zen.idleSince = 0; }
+    else {
+      // symmetric teardown: escalationTick stops running the moment the
+      // wallboard is off, so anything it lit must be doused here or a
+      // re-entry after recovery flashes a stale INCIDENT stamp + vignette
+      // over a healthy grid until the next tick.
+      $("wbGrid").innerHTML = "";
+      state.wbSig = state.wbFootSig = state.wbVerdictSig = null;
+      $("wbVerdict").style.display = "none";
+      $("wbIncident").style.display = "none";
+      $("wbAlarm").style.opacity = "0";
+      zenOff(); state.zen.idleSince = 0;
+    }
+  }
+  // a run is "long" once it exceeds twice the longest recent duration (with
+  // 60s of slack so short jobs get breathing room) -- the tile goes visually
+  // wrong long before anyone would notice a missing finish
+  function runLong(job, secs) {
+    const est = jobDurEstimate(job);
+    return est != null && secs > Math.max(2 * est, est + 60);
+  }
+  // elapsed-so-far line for a running tile. state.runSince is an observed
+  // lower bound (stamped the poll this browser first saw the run), never an
+  // invented start time; tick() keeps the text live via [data-run-since].
+  function runElapsedHtml(job) {
+    const t0 = state.runSince[job.name];
+    const secs = t0 ? (Date.now() - t0) / 1000 : null;
+    return '<div class="wb-next run' + (secs != null && runLong(job, secs) ? " long" : "") +
+      '" data-run-since="' + escAttr(job.name) + '" title="elapsed as observed by this browser">▶ ' +
+      (secs == null ? "…" : esc(fmtDuration(secs))) + "</div>";
   }
   function renderWallboard() {
     if (!state.wallboard) return;
@@ -2807,40 +3787,203 @@
       const r = WB_ORDER[health(a).key] - WB_ORDER[health(b).key];
       return r !== 0 ? r : a.name.localeCompare(b.name);
     });
-    const stale = wallboardStale();
-    $("wbGrid").innerHTML = jobs.map((job) => {
-      const h = health(job);
-      const nextTxt = (job.running || !job.enabled) ? "—" : stale ? "stale" : fmtIn(nextRunSeconds(job));
-      const flip = state.justFailed && state.justFailed.has(job.name) ? " flip" : "";
-      return '<div class="wb-tile st-' + h.key + flip + '" data-job="' + escAttr(job.name) + '">' +
-        '<div class="wb-glyph">' + GLYPH[h.key] + "</div>" +
-        '<div class="wb-name" title="' + escAttr(job.name) + '">' + esc(job.name) + "</div>" +
-        '<div class="wb-next" data-next="' + escAttr(job.name) + '">' + esc(nextTxt) + "</div>" +
-        '<div class="wb-spark">' + sparkline(job) + "</div>" +
-      "</div>";
-    }).join("");
+    renderWbVerdict(verdictInfo());
+    // Signature skip: a rebuild replaces every tile, which restarts running
+    // CSS animations (tilebreathe, wbflip), strips .escalate for up to a
+    // tick, and kills focus on #wbExit. tick() owns every per-second cell
+    // ([data-next] / [data-ago] / [data-run-since]), so when the structure is
+    // unchanged the whole innerHTML swap is skipped -- the jobs table's
+    // lastRowSig contract, applied to the wallboard.
+    const sig = JSON.stringify(jobs.map((j) => [
+      j.name, health(j).key,
+      j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
+      j.last_run && j.last_run.exit_code,
+      (j.history || []).length,
+      state.justFailed && state.justFailed.has(j.name) ? 1 : 0,
+    ]));
+    if (sig !== state.wbSig) {
+      state.wbSig = sig;
+      const stale = wallboardStale();
+      $("wbGrid").innerHTML = jobs.map((job) => {
+        const h = health(job);
+        const lr = job.last_run;
+        const flip = state.justFailed && state.justFailed.has(job.name) ? " flip" : "";
+        let line;
+        if (h.key === "run") {
+          line = runElapsedHtml(job);
+        } else if (h.key === "fail" || h.key === "cancelled" || h.key === "unknown") {
+          // when it happened (and, for failures, why) beats a next-fire
+          // countdown on a red tile; the [data-ago] span rides tick()'s
+          // existing per-second pass, so the age stays live between polls
+          line = '<div class="wb-last ' + h.key + '">' +
+            (lr && lr.finished_at
+              ? '<span class="wb-ago" data-ago="' + escAttr(lr.finished_at) + '">' + esc(fmtAgo(lr.finished_at)) + "</span>"
+              : '<span class="wb-ago">' + (h.key === "unknown" ? "interrupted" : "—") + "</span>") +
+            (h.key === "fail" && lr && lr.exit_code != null ? '<span class="wb-exit">· exit ' + esc(lr.exit_code) + "</span>" : "") +
+            "</div>";
+        } else if (!job.enabled) {
+          line = '<div class="wb-next">—</div>';
+        } else {
+          line = '<div class="wb-next" data-next="' + escAttr(job.name) + '">' +
+            esc(stale ? "stale" : fmtIn(nextRunSeconds(job))) + "</div>";
+        }
+        return '<div class="wb-tile st-' + h.key + flip + '" data-job="' + escAttr(job.name) + '">' +
+          '<div class="wb-glyph">' + GLYPH[h.key] + "</div>" +
+          '<div class="wb-name" title="' + escAttr(job.name) + '">' + esc(job.name) + "</div>" +
+          line +
+          '<div class="wb-spark">' + sparkline(job) + "</div>" +
+        "</div>";
+      }).join("");
+    }
     renderWbFoot();
     // fresh paint = fresh verdict: a recovery poll clears the stale banner
-    // and dimming NOW rather than up to a second later at the next tick.
+    // and dimming NOW rather than up to a second later at the next tick --
+    // and a rebuilt grid regains .escalate in the same frame, not a tick
+    // late. Both run BEFORE the fit governor: the banner and incident are
+    // in-flow strips above the grid, so fit must measure the settled layout.
     wallboardSignalTick();
+    escalationTick();
+    fitWallboardGrid();
   }
   function renderWbFoot() {
     const j = state.jobs;
-    const fail = j.filter((x) => health(x).key === "fail").length;
-    const run = j.filter((x) => x.running).length;
-    const ok = j.filter((x) => health(x).key === "ok").length;
-    const off = j.filter((x) => !x.enabled).length;
+    const c = { fail: 0, run: 0, pending: 0, unknown: 0, cancelled: 0, ok: 0, disabled: 0 };
+    for (const x of j) c[health(x).key]++;
+    // every health bucket is represented (zero-count rarities are elided), so
+    // the tally adds up to the jobs total instead of silently dropping
+    // pending/unknown/cancelled jobs
+    const sig = j.length + "|" + c.fail + "|" + c.run + "|" + c.ok + "|" + c.pending + "|" + c.unknown + "|" + c.cancelled + "|" + c.disabled + "|" + (state.clusterLine || "");
+    if (sig === state.wbFootSig) return;   // keeps #wbExit alive (and focused) across polls
+    state.wbFootSig = sig;
     $("wbFoot").innerHTML =
       '<span class="wb-stat"><b>' + j.length + "</b>jobs</span>" +
-      '<span class="wb-stat fail"><b>' + fail + "</b>fail</span>" +
-      '<span class="wb-stat run"><b>' + run + "</b>run</span>" +
-      '<span class="wb-stat ok"><b>' + ok + "</b>ok</span>" +
-      '<span class="wb-stat off"><b>' + off + "</b>off</span>" +
+      '<span class="wb-stat fail"><b>' + c.fail + "</b>fail</span>" +
+      '<span class="wb-stat run"><b>' + c.run + "</b>run</span>" +
+      '<span class="wb-stat ok"><b>' + c.ok + "</b>ok</span>" +
+      (c.pending ? '<span class="wb-stat pending"><b>' + c.pending + "</b>pending</span>" : "") +
+      (c.unknown ? '<span class="wb-stat unknown"><b>' + c.unknown + "</b>unknown</span>" : "") +
+      (c.cancelled ? '<span class="wb-stat cancelled"><b>' + c.cancelled + "</b>cancelled</span>" : "") +
+      '<span class="wb-stat off"><b>' + c.disabled + "</b>off</span>" +
       (state.clusterLine ? '<span class="wb-stat cl">' + esc(state.clusterLine) + "</span>" : "") +
+      '<span class="wb-stat more" id="wbMore" style="display:none"></span>' +
       '<span class="grow"></span>' +
       '<span class="wb-hint">esc · w to exit</span>' +
       '<button class="btn wb-exit" id="wbExit" title="Exit wallboard (Esc / w)">✕ exit</button>' +
       '<span class="wb-clock" id="wbClock">' + esc(utcClock()) + "</span>";
+  }
+  // TV-scale verdict headline: same info as the dashboard's verdict bar
+  // (which body.tv hides), written only on a real change so the role=status
+  // region announces once per verdict, not once per poll.
+  function renderWbVerdict(v) {
+    const el = $("wbVerdict");
+    const sig = v ? v.sev + "|" + v.head + "|" + v.sub : "hidden";
+    if (sig === state.wbVerdictSig) return;
+    state.wbVerdictSig = sig;
+    if (!v) { el.className = "wb-verdict"; el.style.display = "none"; }
+    else {
+      el.className = "wb-verdict sev-" + v.sev;
+      el.style.display = "";
+      $("wbVerdictHead").textContent = v.glyph + " " + v.head;
+      // the ticking age lives in its own aria-hidden [data-ago] span (kept
+      // live by tick()) so the role=status region announces the verdict once,
+      // not on every age change
+      const sub = $("wbVerdictSub");
+      sub.textContent = v.sub + (v.ago ? " · " : "");
+      if (v.ago) {
+        const age = document.createElement("span");
+        age.setAttribute("data-ago", v.ago);
+        age.setAttribute("aria-hidden", "true");
+        age.textContent = fmtAgo(v.ago);
+        sub.appendChild(age);
+      }
+    }
+    // the strip is an in-flow sibling above the grid: any show/hide/reword
+    // changes the grid's height, so the fit governor must re-measure
+    if (state.wallboard) fitWallboardGrid();
+  }
+  // ---- fit-to-screen governor ---------------------------------------
+  // A TV has no one to scroll it, so the grid must never silently clip.
+  // Regimes, re-decided on every paint and resize:
+  //   sparse  -- fewer tiles than fill the screen at 190px: grow them (and
+  //              their type, via the --wb-u scale unit) to use the glass;
+  //   scaled  -- full tiles shrink to as little as WB_SPARSE_MIN before
+  //              giving anything up: a smaller tile that keeps its name,
+  //              glance line AND spark beats compact density, which buys
+  //              room a mid-size board then wastes as stretched dead space;
+  //   compact -- below the floor: denser 120px tiles. Compact rows stretch
+  //              (1fr) to fill the glass, so when the stretched height
+  //              re-earns the spark (roomyH) the trail comes back
+  //              (wb-roomy); only a truly tight board drops it;
+  //   cut     -- too many even compact: hide the tail (worst-first sorting
+  //              makes it the least interesting slice) behind an explicit
+  //              footer chip computed from what was ACTUALLY cut.
+  // A full tile's height at scale u is AFFINE, not proportional: padding,
+  // border and flex gaps (fixH) do not ride --wb-u, while the glyph + name +
+  // glance line + spark stack (varH, at u=1) does. Modelling rows as
+  // fixH + varH*u keeps height-bound fits from clipping the spark without
+  // over-penalizing dense boards the way a padded constant would.
+  // ch stays in lockstep with the .wb-compact grid-auto-rows rule; pad/cpad
+  // are per-regime model paddings (measuring the live padding would make the
+  // compact<->full decision depend on the regime already applied). roomyH is
+  // the compact tile's content stack including its 16px spark (~80px) plus
+  // breathing room, so a wb-roomy tile never clips the trail it re-admits.
+  const WB_TILE = { w: 190, fixH: 41, varH: 95, gap: 12, pad: 18, cw: 120, ch: 68, cgap: 8, cpad: 12, roomyH: 92 };
+  const WB_SPARSE_MIN = 0.7;    // full-tile floor: glance type ~12px, name ~9px -- small, but it keeps the trail
+  function fitWallboardGrid() {
+    if (!state.wallboard) return;
+    const g = $("wbGrid"), wb = $("wallboard"), chip = $("wbMore");
+    const tiles = g.children, n = tiles.length;
+    const W = g.clientWidth - 2 * WB_TILE.pad;
+    const H = g.clientHeight - 2 * WB_TILE.pad;
+    let compact = false, roomy = false, cap = n, u = 1, cols = 0;
+    if (n && W > 0 && H > 0) {
+      // the largest uniform scale that shows all n full-size tiles unclipped
+      let best = 0;
+      for (let c = 1; c <= n; c++) {
+        const rows = Math.ceil(n / c);
+        const uw = ((W - (c - 1) * WB_TILE.gap) / c) / WB_TILE.w;
+        const uh = ((H - (rows - 1) * WB_TILE.gap) / rows - WB_TILE.fixH) / WB_TILE.varH;
+        const s = Math.min(uw, uh);
+        if (s > best) { best = s; cols = c; }
+      }
+      if (best >= WB_SPARSE_MIN) u = Math.min(best, 2.8);
+      else {
+        compact = true;
+        cols = 0;   // let the .wb-compact auto-fill CSS drive the tracks
+        const W2 = g.clientWidth - 2 * WB_TILE.cpad, H2 = g.clientHeight - 2 * WB_TILE.cpad;
+        const cc = Math.max(1, Math.floor((W2 + WB_TILE.cgap) / (WB_TILE.cw + WB_TILE.cgap)));
+        const cr = Math.max(1, Math.floor((H2 + WB_TILE.cgap) / (WB_TILE.ch + WB_TILE.cgap)));
+        cap = cc * cr;
+        // 1fr stretches the rows actually shown to fill the glass: when the
+        // stretch re-earns the spark's height, keep the trail -- density
+        // that pays out as dead space is worse than the tiles it replaced
+        const rowsShown = Math.max(1, Math.ceil(Math.min(n, cap) / cc));
+        roomy = (H2 - (rowsShown - 1) * WB_TILE.cgap) / rowsShown >= WB_TILE.roomyH;
+      }
+    }
+    wb.classList.toggle("wb-compact", compact);
+    wb.classList.toggle("wb-roomy", roomy);
+    wb.style.setProperty("--wb-u", u.toFixed(2));
+    g.style.gridTemplateColumns = cols ? "repeat(" + cols + ", 1fr)" : "";
+    g.style.gridAutoRows = cols ? "minmax(" + Math.floor(WB_TILE.fixH + WB_TILE.varH * u) + "px, 1fr)" : "";
+    let hf = 0, hu = 0;
+    for (let i = 0; i < n; i++) {
+      const cut = i >= cap;
+      tiles[i].style.display = cut ? "none" : "";
+      if (cut) {
+        if (tiles[i].classList.contains("st-fail")) hf++;
+        else if (tiles[i].classList.contains("st-unknown")) hu++;
+      }
+    }
+    if (!chip) return;
+    const hidden = Math.max(0, n - cap);
+    if (!hidden) { chip.style.display = "none"; return; }
+    const warn = hf + hu > 0;   // never true unless failures overflow a whole screen
+    chip.classList.toggle("warn", warn);
+    chip.innerHTML = "<b>+" + hidden + "</b>offscreen · " + (warn
+      ? (hf ? hf + " failing" : "") + (hf && hu ? ", " : "") + (hu ? hu + " unknown" : "")
+      : "none failing");
+    chip.style.display = "";
   }
 
   // ===================================================================
@@ -3289,7 +4432,7 @@
     if (state.connected !== ok) {
       state.connected = ok;
       $("conn").innerHTML = '<span class="dot ' + (ok ? "live" : "dead") + '"></span><span>' + (ok ? "live" : "no signal") + "</span>";
-      kickMark();  // the logo's idle cruise follows the live state (parks at 0 while dead)
+      kickMark();  // the pendulum logo follows the live state (collapses when dead, recovers when live)
     }
     updateConnTooltip();
   }
@@ -4544,6 +5687,8 @@
     const cvd = cvdPref();
     if (cvd === "none") document.documentElement.removeAttribute("data-cvd");
     else document.documentElement.setAttribute("data-cvd", cvd);
+    // zoom changes the wallboard's effective viewport without a resize event
+    if (state.wallboard) fitWallboardGrid();
   }
   function setFont(v) { prefs.font = v === "sans" ? "sans" : "mono"; savePref("font"); applyA11y(); syncSettings(); }
   function setScale(v) { prefs.scale = UI_SCALES.includes(v) ? v : 100; savePref("scale"); applyA11y(); syncSettings(); }
@@ -4624,7 +5769,7 @@
 
   function toast(kind, msg) {
     const e = el("div", "toast " + kind);
-    const g = kind === "ok" ? "✓" : kind === "err" ? "✗" : "›";
+    const g = kind === "ok" ? "✓" : kind === "err" ? "✕" : "›";
     e.innerHTML = '<span class="g">' + g + '</span><span>' + esc(msg) + "</span>";
     $("toasts").appendChild(e);
     setTimeout(() => { e.style.opacity = "0"; e.style.transition = "opacity .3s"; setTimeout(() => e.remove(), 300); }, 3000);
@@ -4777,9 +5922,10 @@
       if (e.key === "Enter") { e.preventDefault(); jumpMatch(e.shiftKey ? -1 : 1); }
       return;
     }
-    // wallboard toggle + alarm-ack must work even while the wallboard is up, but
-    // not while typing in a field or with an overlay open.
-    if (!inField(e) && !anyOverlayOpen()) {
+    // wallboard toggle + alarm-ack must work even while the wallboard is up,
+    // but not while typing in a field, with an overlay open, or with a
+    // modifier held -- Ctrl+A is select-all, not a silent incident ack.
+    if (!inField(e) && !anyOverlayOpen() && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (e.key === "w") { e.preventDefault(); setWallboard(!state.wallboard); return; }
       if (e.key === "a") { e.preventDefault(); ackAlarm(); return; }
     }
@@ -4789,6 +5935,8 @@
     // palette, 401 token modal) stack above the wallboard via the body.tv
     // z-index overrides, so they are visible and keep their own key handling.
     if (inField(e) || anyOverlayOpen() || state.wallboard) return;
+    // browser/OS chords (Ctrl+C copy, Cmd+W close, ...) are not list shortcuts
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
 
     switch (e.key) {
       case "/": e.preventDefault(); $("search").focus(); break;
@@ -4818,7 +5966,7 @@
 
   // the 8 DAG task states get their OWN glyphs (never overloads the job set)
   const DST_GLYPH = {
-    pending: "◌", running: "▶", up_for_retry: "↻", success: "●", failed: "✗",
+    pending: "◌", running: "▶", up_for_retry: "↻", success: "●", failed: "✕",
     skipped: "⊘", upstream_failed: "⊗", expanded: "⋯", unknown: "◍", scheduled: "◔",
   };
   const DST_LABEL = {
@@ -5169,7 +6317,7 @@
       } else if (st === "running" && e.awaitingApproval) {
         bits.push('<span class="approw"><span class="pending">⏸ awaiting</span>' +
           '<button class="btn run" data-approve="' + escAttr(taskkey) + '">✓ Approve</button>' +
-          '<button class="btn cancel" data-reject="' + escAttr(taskkey) + '">✗ Reject</button></span>');
+          '<button class="btn cancel" data-reject="' + escAttr(taskkey) + '">✕ Reject</button></span>');
       }
     }
     if (spec && spec.type === "sensor" && e.pokeCount != null) {
@@ -5440,7 +6588,7 @@
       const res = await apiFetch("/dags/" + encodeURIComponent(dag) + "/runs/" + encodeURIComponent(rk) +
         "/tasks/" + encodeURIComponent(taskkey) + "/decision",
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: decision, by: "dashboard" }) });
-      if (res.ok) { toast("ok", (decision === "approve" ? "✓ approved " : "✗ rejected ") + taskkey); loadDagRun(); loadDags(); }
+      if (res.ok) { toast("ok", (decision === "approve" ? "✓ approved " : "✕ rejected ") + taskkey); loadDagRun(); loadDags(); }
       else if (res.status === 409) { toast("err", "already decided / not awaiting"); loadDagRun(); }
       else toast("err", "decision failed (HTTP " + res.status + ")");
     } catch (e) { if (e.message !== "unauthorized") toast("err", "decision failed"); }
@@ -5634,9 +6782,10 @@
   // ===================================================================
   //  wiring
   // ===================================================================
-  // restarts the logo's idle-cruise loop when it's parked; assigned the real
-  // implementation in wire(), but callable from anywhere (setConnected fires
-  // it when the live state flips, which happens well after wire() has run)
+  // re-syncs the pendulum mark (park/resume + connected state); assigned the
+  // real implementation in wire(), but callable from anywhere (setConnected
+  // fires it when the live state flips, which happens well after wire() has
+  // run)
   let kickMark = () => {};
   function wire() {
     $("rows").addEventListener("click", (e) => {
@@ -5675,43 +6824,34 @@
       applyCols();
     });
     document.addEventListener("click", () => toggleColsMenu(false));
-    const mark = $("mark");
-    // the mark idles at a steady cruise while the daemon is live; friction
-    // bleeds any nudge back toward the cruise speed rather than toward a
-    // standstill. losing the signal (or reduced-motion) drops the cruise
-    // target to 0 so it coasts to a natural stop; clicks still shove it.
-    const MARK_CRUISE = 345;                                  // resting spin rate, deg/s
-    const markCruise = () => (reduceMotion() || !state.connected ? 0 : MARK_CRUISE);
-    let markDeg = 0, markVel = markCruise(), markRaf = 0, markLast = 0;
-    const spinMark = (t) => {
-      const dt = Math.min((t - markLast) / 1000, 0.1);
-      markLast = t;
-      markDeg = (markDeg + markVel * dt) % 360;
-      const cruise = markCruise();
-      markVel = cruise + (markVel - cruise) * Math.pow(0.757822222, dt);
-      // magnitude of the excess, not its sign: a click coasts back down to
-      // cruise, a right-click coasts back up from spinning backwards
-      if (Math.abs(markVel - cruise) <= 3) markVel = cruise;
-      mark.style.transform = `rotate(${markDeg}deg)`;
-      if (markVel || cruise) { markRaf = requestAnimationFrame(spinMark); }
-      else { markRaf = 0; }  // parked: no signal / reduced motion, no nudge in flight
-    };
-    kickMark = () => {
-      if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
-    };
-    // one nudge = one click's worth of spin; the sign picks the direction
-    const nudgeMark = (d) => { markVel += d; kickMark(); };
-    const bumpMark = () => nudgeMark(360);
-    // right-click drives it the other way instead of popping the browser menu
-    const slowMark = (e) => { e.preventDefault(); nudgeMark(-360); };
-    mark.addEventListener("click", bumpMark);
-    mark.addEventListener("contextmenu", slowMark);
-    // clicking the wordmark spins the logo too; right-click there brakes it
-    $("brandName").addEventListener("click", bumpMark);
-    $("brandName").addEventListener("contextmenu", slowMark);
-    kickMark();                                               // start the idle cruise
+    // the wordmark's l is a live self-balancing double pendulum (see the logo
+    // engine script above the main script), scaled to the glyph and balanced
+    // over its cell — the controller's equilibrium IS the l's position. while
+    // the daemon is live it stands as the letter, riding out little gusts;
+    // losing the signal cuts its motor, so the l collapses out of the word
+    // and keeps swinging; on reconnect the cart swings it back upright and
+    // the balance controller catches it — the word heals. reduced-motion
+    // shows a still pose (the l when live, hanging when not).
+    const pendLogo = CronstableLogo.mountGlyph($("mark"), {
+      connected: () => !!state.connected,
+      reducedMotion: reduceMotion,
+    });
+    kickMark = () => pendLogo.sync();   // setConnected()/setMotion() call this
+    // the cursor is weather: sweeping the pointer anywhere across the header
+    // brushes the linkage — speed, direction and where you graze it all
+    // matter. right-click still knocks it clean over (instead of popping the
+    // browser menu) to watch a full recovery.
+    pendLogo.attachPointer(document.querySelector("header"));
+    // there is no hover on touch screens: a tap on the wordmark keeps the
+    // nudge alive there, while mouse users' clicks stay inert (they brush)
+    $("brandName").addEventListener("click", (e) => {
+      const touch = e.pointerType === "touch" ||
+        (window.matchMedia && window.matchMedia("(hover: none)").matches);
+      if (touch) pendLogo.poke(1.6 + Math.random() * 0.9);
+    });
+    $("brandName").addEventListener("contextmenu", (e) => { e.preventDefault(); pendLogo.poke(4.4); });
     // follow live OS motion-preference flips: resync the reduce-motion CSS
-    // class and restart the cruise if it was parked
+    // class and park/resume the pendulum
     if (window.matchMedia) {
       const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
       if (mq.addEventListener) mq.addEventListener("change", () => { applyA11y(); kickMark(); });
@@ -5743,6 +6883,8 @@
     $("heatBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job"), "history"); });
     $("wbGrid").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) { setWallboard(false); openDrawer(it.getAttribute("data-job")); } });
     $("wbFoot").addEventListener("click", (e) => { if (e.target.closest("#wbExit")) setWallboard(false); });
+    // the fit governor depends on the viewport, not just the data
+    window.addEventListener("resize", debounce(() => { if (state.wallboard) fitWallboardGrid(); }, 150));
     $("paletteBtn").addEventListener("click", openPalette);
     $("settingsBtn").addEventListener("click", openSettings);
     $("authBtn").addEventListener("click", () => openModal());
@@ -5923,7 +7065,21 @@
     $("modalWrap").addEventListener("click", (e) => { if (e.target === $("modalWrap")) closeModal(); });
     $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenSave").click(); });
 
-    window.addEventListener("hashchange", () => { if (!state.drawerJob) openFromHash(); });
+    window.addEventListener("hashchange", () => {
+      // openFromHash only ENTERS states, so leaving #tv by hash (URL edit,
+      // browser back, a kiosk script rewriting the URL) must exit the
+      // wallboard here -- and setWallboard(false) strips whatever hash was
+      // just navigated to (setHashTv), so capture and restore the target
+      // before dispatching, or a #tv -> #job/foo deep link would be dropped.
+      const h = location.hash;
+      if (state.wallboard && h !== "#tv") {
+        setWallboard(false);
+        if (h && location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
+      }
+      // #tv bypasses the drawer guard: setWallboard(true) closes the drawer
+      // itself, so navigating back INTO #tv must not be silently dropped
+      if (!state.drawerJob || h === "#tv") openFromHash();
+    });
   }
 
   function fillHelp() {
@@ -6440,8 +7596,10 @@
     }
     return best;
   }
-  function renderVerdict() {
-    const bar = $("verdictBar");
+  // Distill the fleet into the one headline an operator needs. Returns null
+  // when healthy, else {sev, glyph, head, sub}. Shared by the main verdict
+  // bar and the wallboard's TV-scale strip (body.tv hides the bar).
+  function verdictInfo() {
     const failing = state.jobs.filter((j) => health(j).key === "fail");
     const alert = state.clusterAlert;
     const corr = failing.length > 1 ? correlate(failing) : null;
@@ -6454,13 +7612,15 @@
         (failing.length ? failing.length + " job" + (failing.length > 1 ? "s" : "") + " also failing" : "leadership / quorum degraded");
     } else if (failing.length === 0) {
       state.incidentSet = [];
-      if (state.verdictSig !== "hidden") { state.verdictSig = "hidden"; bar.style.display = "none"; bar.className = "verdict"; }
-      return;
+      return null;
     } else if (failing.length === 1) {
       sev = "warn";
       const j = failing[0], lr = j.last_run || {};
       head = "JOB FAILING — " + j.name;
-      sub = "exit " + (lr.exit_code == null ? "?" : lr.exit_code) + (lr.fail_reason ? " · " + lr.fail_reason : "") + " · " + fmtAgo(lr.finished_at);
+      // the age is returned separately (ago) so render sigs stay stable while
+      // it ticks: callers give it a [data-ago] span instead of baking it in
+      sub = "exit " + (lr.exit_code == null ? "?" : lr.exit_code) + (lr.fail_reason ? " · " + lr.fail_reason : "");
+      return { sev: sev, glyph: glyph, head: head, sub: sub, ago: lr.finished_at };
     } else {
       sev = "crit";
       head = "FLEET EVENT — " + failing.length + " jobs failing";
@@ -6469,14 +7629,33 @@
           (corr.span <= CORR_WINDOW ? " within " + Math.max(1, Math.round(corr.span / 1000)) + "s" : "") + " — likely one cause"
         : "no shared failure signature — likely independent";
     }
-    const sig = sev + "|" + head + "|" + sub;
+    return { sev: sev, glyph: glyph, head: head, sub: sub };
+  }
+  function renderVerdict() {
+    const bar = $("verdictBar");
+    const v = verdictInfo();
+    if (state.wallboard) renderWbVerdict(v);   // cluster alerts land here too (loadCluster)
+    if (!v) {
+      if (state.verdictSig !== "hidden") { state.verdictSig = "hidden"; bar.style.display = "none"; bar.className = "verdict"; }
+      return;
+    }
+    const sig = v.sev + "|" + v.head + "|" + v.sub;
     if (sig === state.verdictSig) return;
     state.verdictSig = sig;
-    bar.className = "verdict sev-" + sev;
+    bar.className = "verdict sev-" + v.sev;
     bar.style.display = "";
-    $("vGlyph").textContent = glyph;
-    $("vHead").textContent = head;
-    $("vSub").textContent = sub;
+    $("vGlyph").textContent = v.glyph;
+    $("vHead").textContent = v.head;
+    const sub = $("vSub");
+    sub.textContent = v.sub + (v.ago ? " · " : "");
+    if (v.ago) {
+      // [data-ago] rides tick()'s per-second pass: the age stays live between
+      // polls instead of only refreshing when the verdict re-renders
+      const age = document.createElement("span");
+      age.setAttribute("data-ago", v.ago);
+      age.textContent = fmtAgo(v.ago);
+      sub.appendChild(age);
+    }
   }
 
   // ---- incident timeline overlay (hotkey i) ----
@@ -6577,11 +7756,11 @@
       try {
         const res = await apiFetch("/jobs/" + encodeURIComponent(n) + "/" + verb, { method: "POST" });
         if (res.ok) { done++; mitLog("  ✓ " + verb + " " + n); }
-        else { failed++; mitLog("  ✗ " + n + " (HTTP " + res.status + ")"); }
+        else { failed++; mitLog("  ✕ " + n + " (HTTP " + res.status + ")"); }
       } catch (e) {
         failed++;
         if (e.message === "unauthorized") { mitLog("  ! unauthorized — set a token"); break; }
-        mitLog("  ✗ " + n + " (error)");
+        mitLog("  ✕ " + n + " (error)");
       }
       await new Promise((r) => setTimeout(r, MIT_STAGGER));
     }
@@ -6782,12 +7961,26 @@
   // (motion gating uses the shared reduceMotion() from the accessibility section)
   function anyRunning() { return state.jobs.some((j) => j.running); }
 
-  // track when this browser first observed each job failing (honest age basis)
+  // track when this browser first observed each job failing / running (honest
+  // age basis: the /jobs payload has no run-start field, so elapsed times are
+  // an explicit observed-since lower bound, never an invented start time)
   function updateIncidents(jobs) {
-    const since = state.failSince, nowMs = Date.now();
-    const failing = {};
-    for (const j of jobs) if (health(j).key === "fail") { failing[j.name] = true; if (!since[j.name]) since[j.name] = nowMs; }
+    const since = state.failSince, run = state.runSince, fin = state.runFin, nowMs = Date.now();
+    const failing = {}, running = {};
+    for (const j of jobs) {
+      if (health(j).key === "fail") { failing[j.name] = true; if (!since[j.name]) since[j.name] = nowMs; }
+      if (j.running) {
+        running[j.name] = true;
+        // back-to-back runs can straddle two polls that both see running=true;
+        // a finished_at that advanced since the stamp proves the observed run
+        // ended, so re-stamp -- else elapsed would silently merge runs and the
+        // running-long tint would false-alarm forever.
+        const f = j.last_run ? j.last_run.finished_at : null;
+        if (!run[j.name] || fin[j.name] !== f) { run[j.name] = nowMs; fin[j.name] = f; }
+      }
+    }
     for (const n in since) if (!failing[n]) delete since[n];
+    for (const n in run) if (!running[n]) { delete run[n]; delete fin[n]; }
   }
   function incidentAge() {
     let oldest = 0, nowMs = Date.now();
@@ -6806,15 +7999,19 @@
     }
     if (nowMs - state.lastAlarmAt >= interval) { state.lastAlarmAt = nowMs; playCue("alarm"); }
   }
-  // per-second wallboard escalation visuals (vignette + incident timer + breathe)
+  // per-second wallboard escalation visuals (vignette + incident timer +
+  // breathe). #wbIncident is a static flow strip in the wallboard markup,
+  // display-toggled here; tile queries are scoped to the grid (the classes
+  // exist nowhere else, and the rest of the document is huge).
   function escalationTick() {
     if (!state.wallboard) return;
-    const alarm = $("wbAlarm");
-    let inc = $("wbIncident");
+    const alarm = $("wbAlarm"), inc = $("wbIncident"), grid = $("wbGrid");
+    const incShown = inc.style.display !== "none";   // the strip is in-flow: a flip resizes the grid
     if (!(state.anyFailing && prefs.escalate)) {
       if (alarm) alarm.style.opacity = "0";
-      document.querySelectorAll(".wb-tile.escalate").forEach((t) => t.classList.remove("escalate"));
-      if (inc) inc.remove();
+      grid.querySelectorAll(".wb-tile.escalate").forEach((t) => t.classList.remove("escalate"));
+      inc.style.display = "none";
+      if (incShown) fitWallboardGrid();
       return;
     }
     const age = incidentAge(), acked = state.alarmAck;
@@ -6822,10 +8019,11 @@
     let level = Math.min(1, (Math.min(count, 6) / 6) * 0.5 + Math.min(1, age / 600000) * 0.5);
     if (acked) level = Math.min(level, 0.22);
     if (alarm) alarm.style.opacity = reduceMotion() ? "0.16" : (0.12 + 0.55 * level).toFixed(2);
-    document.querySelectorAll(".wb-tile.st-fail").forEach((t) => t.classList.toggle("escalate", !acked && !reduceMotion()));
-    if (!inc) { inc = document.createElement("span"); inc.id = "wbIncident"; inc.className = "wb-incident"; $("wallboard").appendChild(inc); }
+    grid.querySelectorAll(".wb-tile.st-fail").forEach((t) => t.classList.toggle("escalate", !acked && !reduceMotion()));
+    inc.style.display = "";
     inc.classList.toggle("ackd", acked);
     inc.textContent = "◉ INCIDENT +" + fmtCountdown(age / 1000) + (acked ? " · ack" : "");
+    if (!incShown) fitWallboardGrid();
   }
   function zenOn() {
     if (state.zen.on) return;
@@ -6874,7 +8072,9 @@
     // the daemon unreachable the all-green frame is unverified, not nominal --
     // show the NO SIGNAL wallboard instead.
     if (wallboardStale()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
-    if (state.anyFailing || anyRunning()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
+    // a bad cluster (quorum lost, conflict) blocks zen like a failing job:
+    // "ALL SYSTEMS NOMINAL" under a CLUSTER ALERT strip would be a lie
+    if (state.anyFailing || anyRunning() || (state.clusterAlert && state.clusterAlert.bad)) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
     const nowMs = Date.now();
     if (!state.zen.idleSince) state.zen.idleSince = nowMs;
     if (!state.zen.on && nowMs - state.zen.idleSince >= (prefs.zenIdle || ZEN_IDLE)) zenOn();

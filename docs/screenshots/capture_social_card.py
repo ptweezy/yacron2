@@ -18,8 +18,18 @@ from PIL import Image
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[2]
+WEB = ROOT / "cronstable" / "web"
 OUT = Path(__file__).parent / "shots"
 PORT = 8125
+
+
+def engine_js():
+    """Lift the logo-engine <script> block out of the dashboard page, so the
+    card always wears the real mark (never a drifting copy)."""
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    i = html.index("logo engine — a real self-balancing")
+    start = html.rindex("<script>", 0, i) + len("<script>")
+    return html[start:html.index("</script>", i)]
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
@@ -39,6 +49,13 @@ def main():
         page.wait_for_function(
             "const i = document.querySelector('.shot');"
             "i.complete && i.naturalWidth > 0"
+        )
+        # mount the pendulum as the wordmark's l, parked balanced-upright
+        # (reducedMotion -> the engine's honest still pose for a live daemon)
+        page.add_script_tag(content=engine_js())
+        page.evaluate(
+            "CronstableLogo.mountGlyph(document.getElementById('mark'),"
+            " { connected: () => true, reducedMotion: () => true })"
         )
         png = page.screenshot()
         browser.close()

@@ -68,16 +68,16 @@ commit and, on a release, publishes it). Version numbers come from git tags via
 ### Cutting a release
 
 A release happens when **any commit in a push to `main`** has a release marker
-anywhere in its message:
+at the **start of its subject line** (the first line of the commit message):
 
-```
-Add retry backoff to the HTTP reporter
-
-[release:minor]
+```text
+[release:minor] Add retry backoff to the HTTP reporter
 ```
 
-It does not need to be the latest commit in the push, and the marker does not
-need to be on its own line.
+It does not need to be the latest commit in the push, but only subject lines
+are scanned, and only a marker that begins the subject counts. Prose that
+mentions a marker in a commit body (or anywhere else in a subject) never
+triggers or escalates a release.
 
 Valid markers (the bump level is optional; case is ignored):
 
@@ -88,14 +88,9 @@ Valid markers (the bump level is optional; case is ignored):
 | `[release:minor]`  | minor | 1.1.0   |
 | `[release:patch]`  | patch | 1.0.6   |
 
-If more than one marker appears across the pushed commits, the most significant
-bump wins (major > minor > patch).
-
-> **Caution:** the match is a plain substring, so writing a literal
-> `[release:patch]` (or `[release]`) anywhere in a commit message (even in prose
-> describing the release process) **will trigger a publish**. Don't quote the
-> marker verbatim in a commit message unless you mean it. (File contents like
-> this document are never scanned; only commit messages are.)
+If more than one commit in the push carries a marker, the **latest** such
+commit wins. (File contents like this document are never scanned; only commit
+subjects are.)
 
 You can also release manually without a marker: **Actions → release → Run
 workflow**, then pick the bump level from the dropdown.

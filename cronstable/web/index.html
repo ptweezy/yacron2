@@ -898,24 +898,52 @@
   .wb-tile { border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); padding: 12px 14px;
     display: flex; flex-direction: column; gap: 5px; cursor: pointer; overflow: hidden; }
   .wb-tile:hover { border-color: var(--border2); }
-  .wb-glyph { font-size: 30px; line-height: 1; }
-  .wb-name { font-weight: 700; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .wb-next { color: var(--fg-dim); font-size: 11.5px; font-variant-numeric: tabular-nums; margin-top: auto; }
-  .wb-tile.st-fail { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); }
+  /* tile type rides --wb-u, the fit governor's scale unit: sparse fleets on
+     big screens grow their type instead of huddling in a corner */
+  .wb-glyph { font-size: calc(30px * var(--wb-u, 1)); line-height: 1; }
+  .wb-name { font-weight: 700; color: var(--fg); font-size: calc(13px * var(--wb-u, 1)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* the glance line -- next fire (ok/pending), live elapsed (running), or
+     when-and-why it went wrong (fail/cancelled/unknown, .wb-last) -- is the
+     datum a wall viewer reads, so it gets the loudest text after the glyph */
+  .wb-next { color: var(--fg); font-weight: 700; font-size: calc(17px * var(--wb-u, 1)); font-variant-numeric: tabular-nums; margin-top: auto;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wb-next.run { color: var(--run); }
+  .wb-next.run.long { color: var(--pending); }
+  .wb-last { font-weight: 700; font-size: calc(15px * var(--wb-u, 1)); font-variant-numeric: tabular-nums; margin-top: auto;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wb-last.fail { color: var(--fail); }
+  .wb-last.cancelled { color: var(--cancelled); }
+  .wb-last.unknown { color: var(--unknown); }
+  .wb-spark { zoom: var(--wb-u, 1); }
+  /* status as surface, not just a 1px border and glyph interior: the hue
+     fills the tile so state reads at TV distance, and reusing the status
+     custom properties keeps the CVD remap and both themes working for free */
+  .wb-tile.st-fail { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); border-width: 2px;
+    background: color-mix(in srgb, var(--fail) 14%, var(--panel)); }
   .wb-tile.st-fail .wb-glyph { color: var(--fail); }
+  .wb-tile.st-run { background: color-mix(in srgb, var(--run) 8%, var(--panel)); }
   .wb-tile.st-run .wb-glyph { color: var(--run); }
   .wb-tile.st-ok .wb-glyph { color: var(--ok); }
+  .wb-tile.st-pending { background: color-mix(in srgb, var(--pending) 6%, var(--panel)); }
   .wb-tile.st-pending .wb-glyph { color: var(--pending); }
   .wb-tile.st-cancelled .wb-glyph { color: var(--cancelled); }
+  .wb-tile.st-unknown { background: color-mix(in srgb, var(--unknown) 8%, var(--panel)); }
+  .wb-tile.st-unknown .wb-glyph { color: var(--unknown); }
   .wb-tile.st-disabled { opacity: .55; }
   .wb-tile.st-disabled .wb-glyph { color: var(--disabled); }
   body.fx .wb-tile.st-fail { box-shadow: 0 0 16px color-mix(in srgb, var(--fail) 30%, transparent); }
   .wb-tile.flip { animation: wbflip .7s ease-out; }
-  @keyframes wbflip { 0% { background: var(--fail); } 100% { background: var(--panel); } }
+  /* no 100% frame: the flip settles to the tile's own (tinted) background */
+  @keyframes wbflip { 0% { background: var(--fail); } }
   .wb-foot { display: flex; align-items: center; gap: 16px; padding: 10px 18px; border-top: 1px solid var(--border);
     background: var(--panel); font-size: 13px; flex-wrap: wrap; }
   .wb-stat { color: var(--fg-dim); } .wb-stat b { color: var(--fg); font-size: 16px; margin-right: 4px; }
   .wb-stat.fail b { color: var(--fail); } .wb-stat.run b { color: var(--run); } .wb-stat.ok b { color: var(--ok); }
+  .wb-stat.pending b { color: var(--pending); } .wb-stat.unknown b { color: var(--unknown); } .wb-stat.cancelled b { color: var(--cancelled); }
+  /* fit-governor honesty chip: says what the truncated grid actually cut */
+  .wb-stat.more { color: var(--fg-dim); font-style: italic; }
+  .wb-stat.more.warn { color: var(--fail); font-style: normal; font-weight: 700; }
+  .wb-stat.more.warn b { color: var(--fail); }
   .wb-stat.cl { color: var(--fg-faint); }
   .wb-clock { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
   /* stale/no-signal treatment -- the header connection dot is hidden in TV
@@ -930,6 +958,26 @@
   .wallboard.stale .wb-nosignal { display: flex; }
   .wallboard.stale .wb-grid, .wallboard.stale .wb-foot { opacity: .45; }
   body.fx .wallboard.stale .wb-nosignal { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
+  /* verdict headline: the dashboard's correlation verdict at TV scale --
+     scope + likely cause in one sentence instead of "count the red tiles".
+     position/z-index lift it above the #wbAlarm vignette, like .wb-nosignal */
+  .wb-verdict { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 10px 18px;
+    position: relative; z-index: 5; text-align: center; border-bottom: 1px solid var(--border); }
+  .wb-verdict .head { font-weight: 700; letter-spacing: 1px; font-size: clamp(18px, 2.6vw, 34px); }
+  .wb-verdict .sub { color: var(--fg-dim); font-variant-numeric: tabular-nums; font-size: clamp(12px, 1.3vw, 18px); }
+  .wb-verdict.sev-warn { background: color-mix(in srgb, var(--pending) 10%, var(--bg)); border-bottom-color: color-mix(in srgb, var(--pending) 40%, var(--border)); }
+  .wb-verdict.sev-warn .head { color: var(--pending); }
+  .wb-verdict.sev-crit { background: color-mix(in srgb, var(--fail) 12%, var(--bg)); border-bottom-color: var(--fail); }
+  .wb-verdict.sev-crit .head { color: var(--fail); }
+  body.fx .wb-verdict.sev-crit .head { text-shadow: 0 0 10px color-mix(in srgb, var(--fail) 60%, transparent); }
+  /* compact tile mode (fit governor): trade the spark for density before
+     anything has to be cut */
+  .wallboard.wb-compact .wb-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); grid-auto-rows: minmax(68px, 1fr); gap: 8px; padding: 12px; }
+  .wallboard.wb-compact .wb-tile { padding: 6px 9px; gap: 2px; }
+  .wallboard.wb-compact .wb-glyph { font-size: 15px; }
+  .wallboard.wb-compact .wb-name { font-size: 12px; }
+  .wallboard.wb-compact .wb-next, .wallboard.wb-compact .wb-last { font-size: 11px; }
+  .wallboard.wb-compact .wb-spark { display: none; }
   body.tv > header, body.tv > main { display: none; }
   /* Surfaces the app can open while the wallboard is up -- the auto-opened 401
      token modal, the ⌘K palette, the drawer, toasts -- must stack ABOVE its
@@ -1178,7 +1226,11 @@
   #wbAlarm { position: absolute; inset: 0; z-index: 2; pointer-events: none; opacity: 0;
     background: radial-gradient(ellipse at center, transparent 40%, color-mix(in srgb, var(--fail) 70%, transparent) 100%);
     transition: opacity .8s ease; }
-  .wb-incident { position: absolute; top: 14px; left: 18px; z-index: 4; pointer-events: none;
+  /* a static flow strip between the banner and the grid: it can never cover
+     the worst (first) tile and never hides beneath the NO SIGNAL banner the
+     way the old absolutely-positioned stamp did */
+  .wb-incident { position: relative; z-index: 4; display: flex; align-items: center; justify-content: center;
+    padding: 6px 18px; border-bottom: 1px solid color-mix(in srgb, var(--fail) 40%, var(--border));
     color: var(--fail); font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
   body.fx .wb-incident { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
   .wb-incident.ackd { color: var(--pending); }
@@ -1773,6 +1825,12 @@
        region announces only on a real change; the per-second age counter is
        aria-hidden (screen readers would otherwise hear it every tick). -->
   <div class="wb-nosignal" id="wbNoSignal" role="status"><span id="wbNoSignalMsg"></span><span id="wbNoSignalAge" aria-hidden="true"></span></div>
+  <!-- verdict headline: the dashboard's correlation verdict (scope + likely
+       cause) at TV scale; written only on a real change (renderWbVerdict) -->
+  <div class="wb-verdict" id="wbVerdict" style="display:none" role="status"><span class="head" id="wbVerdictHead"></span><span class="sub" id="wbVerdictSub"></span></div>
+  <!-- escalation incident stamp: a static flow strip (escalationTick toggles
+       it); aria-hidden because it re-renders every second -->
+  <div class="wb-incident" id="wbIncident" style="display:none" aria-hidden="true"></div>
   <div class="wb-grid" id="wbGrid"></div>
   <div class="wb-foot" id="wbFoot"></div>
   <!-- zen all-clear screensaver: appears over an idle, healthy wallboard -->
@@ -2743,8 +2801,14 @@
     mitigate: { open: false, running: false, abort: false, set: [] },
     sandbox: { open: false },
     failSince: {},             // name -> ms this browser first saw the job failing
+    runSince: {},              // name -> ms this browser first saw the job running (honest elapsed base)
+    runFin: {},                // name -> last_run.finished_at seen when runSince was stamped
+                               // (a newer finished_at while still running = a NEW run: re-stamp)
     lastAlarmAt: 0,            // adaptive-alarm gate (ms)
     zen: { on: false, idleSince: 0, sig: null },
+    wbSig: null,               // wallboard grid signature (skip rebuilds that restart animations)
+    wbFootSig: null,           // wallboard footer signature
+    wbVerdictSig: null,        // wallboard verdict-strip signature
   };
 
   // ===================================================================
@@ -3415,8 +3479,8 @@
     const wbStale = state.wallboard && wallboardStale();
     document.querySelectorAll("[data-next]").forEach((e) => {
       const job = state.byName[e.getAttribute("data-next")];
-      // running/disabled tiles keep their "—" (wallboard attaches data-next to
-      // every tile; the job table only attaches it to jobs with a live countdown)
+      // both surfaces attach data-next only to live-countdown cells now; the
+      // running/disabled guard catches a job that flipped state since render
       if (!job) return;
       if (job.running || !job.enabled) { e.textContent = "—"; return; }
       e.textContent = wbStale ? "stale" : fmtIn(nextRunSeconds(job));
@@ -3426,6 +3490,15 @@
     if (state.timeline.open) $("tlNow").textContent = utcClock();
     if (state.wallboard) {
       const wc = $("wbClock"); if (wc) wc.textContent = utcClock();
+      // running tiles: live elapsed + running-long tint. Scoped to the grid --
+      // [data-run-since] exists nowhere else.
+      $("wbGrid").querySelectorAll("[data-run-since]").forEach((e) => {
+        const name = e.getAttribute("data-run-since"), t0 = state.runSince[name], job = state.byName[name];
+        if (!t0 || !job) return;
+        const secs = (Date.now() - t0) / 1000;
+        e.textContent = "▶ " + fmtDuration(secs);
+        e.classList.toggle("long", runLong(job, secs));
+      });
       wallboardSignalTick();       // NO SIGNAL banner + dimming when polls stop landing
       zenGovernor();               // drift to / from the zen screensaver on idle
       if (state.zen.on) zenTick();  // pulse the field on real next-fire instants
@@ -3612,7 +3685,11 @@
   // ===================================================================
   //  wallboard / TV kiosk mode
   // ===================================================================
-  const WB_ORDER = { fail: 0, run: 1, pending: 2, cancelled: 3, ok: 4, disabled: 5 };
+  // worst-first tile order. Every health() key MUST appear here: a missing
+  // key makes the sort comparator return NaN, which leaves the whole ordering
+  // unspecified (unknown once had exactly that bug). Mirrors STATUS_ORDER's
+  // relative placement of unknown (after pending, before cancelled).
+  const WB_ORDER = { fail: 0, run: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, disabled: 6 };
   function utcClock() { const n = new Date(); return pad2(n.getUTCHours()) + ":" + pad2(n.getUTCMinutes()) + ":" + pad2(n.getUTCSeconds()) + " UTC"; }
   // The wallboard's staleness gate. TV mode hides the header (and with it the
   // #conn indicator), so the surface must judge freshness itself: stale when
@@ -3631,7 +3708,13 @@
   // cluster card's clusterStale() rather than freezing on a healthy frame.
   function wallboardSignalTick() {
     const stale = wallboardStale();
-    $("wallboard").classList.toggle("stale", stale);
+    const wb = $("wallboard");
+    const flipped = wb.classList.contains("stale") !== stale;
+    wb.classList.toggle("stale", stale);
+    // the banner is an in-flow strip: showing it resizes the grid, and during
+    // an outage no successful poll will re-run the fit governor -- do it on
+    // the flip itself (transition-guarded, so per-second ticks stay cheap)
+    if (flipped) fitWallboardGrid();
     if (!stale) return;
     // write the verdict span only on a real change so the role="status" live
     // region announces once; the age counter ticks every second inside an
@@ -3650,6 +3733,10 @@
     // (Visibility is not the issue -- body.tv stacks .drawer above the
     // wallboard, so overlays that DO open in TV mode are seen.)
     if (on && state.drawerJob) closeDrawer();
+    // the DAG drawer owns a #dag/... hash the same way; left open it would
+    // desync the #tv hash exactly like the job drawer (setHashTv below
+    // re-asserts #tv over the transient hash strip from closeDagDrawer)
+    if (on && state.dagDrawer && state.dagDrawer.dag) closeDagDrawer();
     state.wallboard = on;
     const wb = $("wallboard");
     wb.style.display = on ? "" : "none";
@@ -3658,7 +3745,35 @@
     $("tvBtn").classList.toggle("on", on);
     setHashTv(on);
     if (on) renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
-    else { $("wbGrid").innerHTML = ""; zenOff(); state.zen.idleSince = 0; }
+    else {
+      // symmetric teardown: escalationTick stops running the moment the
+      // wallboard is off, so anything it lit must be doused here or a
+      // re-entry after recovery flashes a stale INCIDENT stamp + vignette
+      // over a healthy grid until the next tick.
+      $("wbGrid").innerHTML = "";
+      state.wbSig = state.wbFootSig = state.wbVerdictSig = null;
+      $("wbVerdict").style.display = "none";
+      $("wbIncident").style.display = "none";
+      $("wbAlarm").style.opacity = "0";
+      zenOff(); state.zen.idleSince = 0;
+    }
+  }
+  // a run is "long" once it exceeds twice the longest recent duration (with
+  // 60s of slack so short jobs get breathing room) -- the tile goes visually
+  // wrong long before anyone would notice a missing finish
+  function runLong(job, secs) {
+    const est = jobDurEstimate(job);
+    return est != null && secs > Math.max(2 * est, est + 60);
+  }
+  // elapsed-so-far line for a running tile. state.runSince is an observed
+  // lower bound (stamped the poll this browser first saw the run), never an
+  // invented start time; tick() keeps the text live via [data-run-since].
+  function runElapsedHtml(job) {
+    const t0 = state.runSince[job.name];
+    const secs = t0 ? (Date.now() - t0) / 1000 : null;
+    return '<div class="wb-next run' + (secs != null && runLong(job, secs) ? " long" : "") +
+      '" data-run-since="' + escAttr(job.name) + '" title="elapsed as observed by this browser">▶ ' +
+      (secs == null ? "…" : esc(fmtDuration(secs))) + "</div>";
   }
   function renderWallboard() {
     if (!state.wallboard) return;
@@ -3666,40 +3781,188 @@
       const r = WB_ORDER[health(a).key] - WB_ORDER[health(b).key];
       return r !== 0 ? r : a.name.localeCompare(b.name);
     });
-    const stale = wallboardStale();
-    $("wbGrid").innerHTML = jobs.map((job) => {
-      const h = health(job);
-      const nextTxt = (job.running || !job.enabled) ? "—" : stale ? "stale" : fmtIn(nextRunSeconds(job));
-      const flip = state.justFailed && state.justFailed.has(job.name) ? " flip" : "";
-      return '<div class="wb-tile st-' + h.key + flip + '" data-job="' + escAttr(job.name) + '">' +
-        '<div class="wb-glyph">' + GLYPH[h.key] + "</div>" +
-        '<div class="wb-name" title="' + escAttr(job.name) + '">' + esc(job.name) + "</div>" +
-        '<div class="wb-next" data-next="' + escAttr(job.name) + '">' + esc(nextTxt) + "</div>" +
-        '<div class="wb-spark">' + sparkline(job) + "</div>" +
-      "</div>";
-    }).join("");
+    renderWbVerdict(verdictInfo());
+    // Signature skip: a rebuild replaces every tile, which restarts running
+    // CSS animations (tilebreathe, wbflip), strips .escalate for up to a
+    // tick, and kills focus on #wbExit. tick() owns every per-second cell
+    // ([data-next] / [data-ago] / [data-run-since]), so when the structure is
+    // unchanged the whole innerHTML swap is skipped -- the jobs table's
+    // lastRowSig contract, applied to the wallboard.
+    const sig = JSON.stringify(jobs.map((j) => [
+      j.name, health(j).key,
+      j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
+      j.last_run && j.last_run.exit_code,
+      (j.history || []).length,
+      state.justFailed && state.justFailed.has(j.name) ? 1 : 0,
+    ]));
+    if (sig !== state.wbSig) {
+      state.wbSig = sig;
+      const stale = wallboardStale();
+      $("wbGrid").innerHTML = jobs.map((job) => {
+        const h = health(job);
+        const lr = job.last_run;
+        const flip = state.justFailed && state.justFailed.has(job.name) ? " flip" : "";
+        let line;
+        if (h.key === "run") {
+          line = runElapsedHtml(job);
+        } else if (h.key === "fail" || h.key === "cancelled" || h.key === "unknown") {
+          // when it happened (and, for failures, why) beats a next-fire
+          // countdown on a red tile; the [data-ago] span rides tick()'s
+          // existing per-second pass, so the age stays live between polls
+          line = '<div class="wb-last ' + h.key + '">' +
+            (lr && lr.finished_at
+              ? '<span data-ago="' + escAttr(lr.finished_at) + '">' + esc(fmtAgo(lr.finished_at)) + "</span>"
+              : "<span>" + (h.key === "unknown" ? "interrupted" : "—") + "</span>") +
+            (h.key === "fail" && lr && lr.exit_code != null ? " · exit " + esc(lr.exit_code) : "") +
+            "</div>";
+        } else if (!job.enabled) {
+          line = '<div class="wb-next">—</div>';
+        } else {
+          line = '<div class="wb-next" data-next="' + escAttr(job.name) + '">' +
+            esc(stale ? "stale" : fmtIn(nextRunSeconds(job))) + "</div>";
+        }
+        return '<div class="wb-tile st-' + h.key + flip + '" data-job="' + escAttr(job.name) + '">' +
+          '<div class="wb-glyph">' + GLYPH[h.key] + "</div>" +
+          '<div class="wb-name" title="' + escAttr(job.name) + '">' + esc(job.name) + "</div>" +
+          line +
+          '<div class="wb-spark">' + sparkline(job) + "</div>" +
+        "</div>";
+      }).join("");
+    }
     renderWbFoot();
     // fresh paint = fresh verdict: a recovery poll clears the stale banner
-    // and dimming NOW rather than up to a second later at the next tick.
+    // and dimming NOW rather than up to a second later at the next tick --
+    // and a rebuilt grid regains .escalate in the same frame, not a tick
+    // late. Both run BEFORE the fit governor: the banner and incident are
+    // in-flow strips above the grid, so fit must measure the settled layout.
     wallboardSignalTick();
+    escalationTick();
+    fitWallboardGrid();
   }
   function renderWbFoot() {
     const j = state.jobs;
-    const fail = j.filter((x) => health(x).key === "fail").length;
-    const run = j.filter((x) => x.running).length;
-    const ok = j.filter((x) => health(x).key === "ok").length;
-    const off = j.filter((x) => !x.enabled).length;
+    const c = { fail: 0, run: 0, pending: 0, unknown: 0, cancelled: 0, ok: 0, disabled: 0 };
+    for (const x of j) c[health(x).key]++;
+    // every health bucket is represented (zero-count rarities are elided), so
+    // the tally adds up to the jobs total instead of silently dropping
+    // pending/unknown/cancelled jobs
+    const sig = j.length + "|" + c.fail + "|" + c.run + "|" + c.ok + "|" + c.pending + "|" + c.unknown + "|" + c.cancelled + "|" + c.disabled + "|" + (state.clusterLine || "");
+    if (sig === state.wbFootSig) return;   // keeps #wbExit alive (and focused) across polls
+    state.wbFootSig = sig;
     $("wbFoot").innerHTML =
       '<span class="wb-stat"><b>' + j.length + "</b>jobs</span>" +
-      '<span class="wb-stat fail"><b>' + fail + "</b>fail</span>" +
-      '<span class="wb-stat run"><b>' + run + "</b>run</span>" +
-      '<span class="wb-stat ok"><b>' + ok + "</b>ok</span>" +
-      '<span class="wb-stat off"><b>' + off + "</b>off</span>" +
+      '<span class="wb-stat fail"><b>' + c.fail + "</b>fail</span>" +
+      '<span class="wb-stat run"><b>' + c.run + "</b>run</span>" +
+      '<span class="wb-stat ok"><b>' + c.ok + "</b>ok</span>" +
+      (c.pending ? '<span class="wb-stat pending"><b>' + c.pending + "</b>pending</span>" : "") +
+      (c.unknown ? '<span class="wb-stat unknown"><b>' + c.unknown + "</b>unknown</span>" : "") +
+      (c.cancelled ? '<span class="wb-stat cancelled"><b>' + c.cancelled + "</b>cancelled</span>" : "") +
+      '<span class="wb-stat off"><b>' + c.disabled + "</b>off</span>" +
       (state.clusterLine ? '<span class="wb-stat cl">' + esc(state.clusterLine) + "</span>" : "") +
+      '<span class="wb-stat more" id="wbMore" style="display:none"></span>' +
       '<span class="grow"></span>' +
       '<span class="wb-hint">esc · w to exit</span>' +
       '<button class="btn wb-exit" id="wbExit" title="Exit wallboard (Esc / w)">✕ exit</button>' +
       '<span class="wb-clock" id="wbClock">' + esc(utcClock()) + "</span>";
+  }
+  // TV-scale verdict headline: same info as the dashboard's verdict bar
+  // (which body.tv hides), written only on a real change so the role=status
+  // region announces once per verdict, not once per poll.
+  function renderWbVerdict(v) {
+    const el = $("wbVerdict");
+    const sig = v ? v.sev + "|" + v.head + "|" + v.sub : "hidden";
+    if (sig === state.wbVerdictSig) return;
+    state.wbVerdictSig = sig;
+    if (!v) { el.className = "wb-verdict"; el.style.display = "none"; }
+    else {
+      el.className = "wb-verdict sev-" + v.sev;
+      el.style.display = "";
+      $("wbVerdictHead").textContent = v.glyph + " " + v.head;
+      // the ticking age lives in its own aria-hidden [data-ago] span (kept
+      // live by tick()) so the role=status region announces the verdict once,
+      // not on every age change
+      const sub = $("wbVerdictSub");
+      sub.textContent = v.sub + (v.ago ? " · " : "");
+      if (v.ago) {
+        const age = document.createElement("span");
+        age.setAttribute("data-ago", v.ago);
+        age.setAttribute("aria-hidden", "true");
+        age.textContent = fmtAgo(v.ago);
+        sub.appendChild(age);
+      }
+    }
+    // the strip is an in-flow sibling above the grid: any show/hide/reword
+    // changes the grid's height, so the fit governor must re-measure
+    if (state.wallboard) fitWallboardGrid();
+  }
+  // ---- fit-to-screen governor ---------------------------------------
+  // A TV has no one to scroll it, so the grid must never silently clip.
+  // Three regimes, re-decided on every paint and resize:
+  //   sparse  -- fewer tiles than fill the screen at 190px: grow them (and
+  //              their type, via the --wb-u scale unit) to use the glass;
+  //   compact -- too many for full tiles: denser 120px tiles, spark dropped;
+  //   cut     -- too many even compact: hide the tail (worst-first sorting
+  //              makes it the least interesting slice) behind an explicit
+  //              footer chip computed from what was ACTUALLY cut.
+  // A full tile's height at scale u is AFFINE, not proportional: padding,
+  // border and flex gaps (fixH) do not ride --wb-u, while the glyph + name +
+  // glance line + spark stack (varH, at u=1) does. Modelling rows as
+  // fixH + varH*u keeps height-bound fits from clipping the spark without
+  // over-penalizing dense boards the way a padded constant would.
+  // ch stays in lockstep with the .wb-compact grid-auto-rows rule; pad/cpad
+  // are per-regime model paddings (measuring the live padding would make the
+  // compact<->full decision depend on the regime already applied).
+  const WB_TILE = { w: 190, fixH: 41, varH: 95, gap: 12, pad: 18, cw: 120, ch: 68, cgap: 8, cpad: 12 };
+  const WB_SPARSE_MIN = 0.85;   // below this scale full tiles read worse than compact density
+  function fitWallboardGrid() {
+    if (!state.wallboard) return;
+    const g = $("wbGrid"), wb = $("wallboard"), chip = $("wbMore");
+    const tiles = g.children, n = tiles.length;
+    const W = g.clientWidth - 2 * WB_TILE.pad;
+    const H = g.clientHeight - 2 * WB_TILE.pad;
+    let compact = false, cap = n, u = 1, cols = 0;
+    if (n && W > 0 && H > 0) {
+      // the largest uniform scale that shows all n full-size tiles unclipped
+      let best = 0;
+      for (let c = 1; c <= n; c++) {
+        const rows = Math.ceil(n / c);
+        const uw = ((W - (c - 1) * WB_TILE.gap) / c) / WB_TILE.w;
+        const uh = ((H - (rows - 1) * WB_TILE.gap) / rows - WB_TILE.fixH) / WB_TILE.varH;
+        const s = Math.min(uw, uh);
+        if (s > best) { best = s; cols = c; }
+      }
+      if (best >= WB_SPARSE_MIN) u = Math.min(best, 2.8);
+      else {
+        compact = true;
+        cols = 0;   // let the .wb-compact auto-fill CSS drive the tracks
+        const W2 = g.clientWidth - 2 * WB_TILE.cpad, H2 = g.clientHeight - 2 * WB_TILE.cpad;
+        const cc = Math.max(1, Math.floor((W2 + WB_TILE.cgap) / (WB_TILE.cw + WB_TILE.cgap)));
+        const cr = Math.max(1, Math.floor((H2 + WB_TILE.cgap) / (WB_TILE.ch + WB_TILE.cgap)));
+        cap = cc * cr;
+      }
+    }
+    wb.classList.toggle("wb-compact", compact);
+    wb.style.setProperty("--wb-u", u.toFixed(2));
+    g.style.gridTemplateColumns = cols ? "repeat(" + cols + ", 1fr)" : "";
+    g.style.gridAutoRows = cols ? "minmax(" + Math.floor(WB_TILE.fixH + WB_TILE.varH * u) + "px, 1fr)" : "";
+    let hf = 0, hu = 0;
+    for (let i = 0; i < n; i++) {
+      const cut = i >= cap;
+      tiles[i].style.display = cut ? "none" : "";
+      if (cut) {
+        if (tiles[i].classList.contains("st-fail")) hf++;
+        else if (tiles[i].classList.contains("st-unknown")) hu++;
+      }
+    }
+    if (!chip) return;
+    const hidden = Math.max(0, n - cap);
+    if (!hidden) { chip.style.display = "none"; return; }
+    const warn = hf + hu > 0;   // never true unless failures overflow a whole screen
+    chip.classList.toggle("warn", warn);
+    chip.innerHTML = "<b>+" + hidden + "</b>offscreen · " + (warn
+      ? (hf ? hf + " failing" : "") + (hf && hu ? ", " : "") + (hu ? hu + " unknown" : "")
+      : "none failing");
+    chip.style.display = "";
   }
 
   // ===================================================================
@@ -5403,6 +5666,8 @@
     const cvd = cvdPref();
     if (cvd === "none") document.documentElement.removeAttribute("data-cvd");
     else document.documentElement.setAttribute("data-cvd", cvd);
+    // zoom changes the wallboard's effective viewport without a resize event
+    if (state.wallboard) fitWallboardGrid();
   }
   function setFont(v) { prefs.font = v === "sans" ? "sans" : "mono"; savePref("font"); applyA11y(); syncSettings(); }
   function setScale(v) { prefs.scale = UI_SCALES.includes(v) ? v : 100; savePref("scale"); applyA11y(); syncSettings(); }
@@ -5636,9 +5901,10 @@
       if (e.key === "Enter") { e.preventDefault(); jumpMatch(e.shiftKey ? -1 : 1); }
       return;
     }
-    // wallboard toggle + alarm-ack must work even while the wallboard is up, but
-    // not while typing in a field or with an overlay open.
-    if (!inField(e) && !anyOverlayOpen()) {
+    // wallboard toggle + alarm-ack must work even while the wallboard is up,
+    // but not while typing in a field, with an overlay open, or with a
+    // modifier held -- Ctrl+A is select-all, not a silent incident ack.
+    if (!inField(e) && !anyOverlayOpen() && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (e.key === "w") { e.preventDefault(); setWallboard(!state.wallboard); return; }
       if (e.key === "a") { e.preventDefault(); ackAlarm(); return; }
     }
@@ -5648,6 +5914,8 @@
     // palette, 401 token modal) stack above the wallboard via the body.tv
     // z-index overrides, so they are visible and keep their own key handling.
     if (inField(e) || anyOverlayOpen() || state.wallboard) return;
+    // browser/OS chords (Ctrl+C copy, Cmd+W close, ...) are not list shortcuts
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
 
     switch (e.key) {
       case "/": e.preventDefault(); $("search").focus(); break;
@@ -6594,6 +6862,8 @@
     $("heatBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job"), "history"); });
     $("wbGrid").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) { setWallboard(false); openDrawer(it.getAttribute("data-job")); } });
     $("wbFoot").addEventListener("click", (e) => { if (e.target.closest("#wbExit")) setWallboard(false); });
+    // the fit governor depends on the viewport, not just the data
+    window.addEventListener("resize", debounce(() => { if (state.wallboard) fitWallboardGrid(); }, 150));
     $("paletteBtn").addEventListener("click", openPalette);
     $("settingsBtn").addEventListener("click", openSettings);
     $("authBtn").addEventListener("click", () => openModal());
@@ -6774,7 +7044,21 @@
     $("modalWrap").addEventListener("click", (e) => { if (e.target === $("modalWrap")) closeModal(); });
     $("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenSave").click(); });
 
-    window.addEventListener("hashchange", () => { if (!state.drawerJob) openFromHash(); });
+    window.addEventListener("hashchange", () => {
+      // openFromHash only ENTERS states, so leaving #tv by hash (URL edit,
+      // browser back, a kiosk script rewriting the URL) must exit the
+      // wallboard here -- and setWallboard(false) strips whatever hash was
+      // just navigated to (setHashTv), so capture and restore the target
+      // before dispatching, or a #tv -> #job/foo deep link would be dropped.
+      const h = location.hash;
+      if (state.wallboard && h !== "#tv") {
+        setWallboard(false);
+        if (h && location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
+      }
+      // #tv bypasses the drawer guard: setWallboard(true) closes the drawer
+      // itself, so navigating back INTO #tv must not be silently dropped
+      if (!state.drawerJob || h === "#tv") openFromHash();
+    });
   }
 
   function fillHelp() {
@@ -7291,8 +7575,10 @@
     }
     return best;
   }
-  function renderVerdict() {
-    const bar = $("verdictBar");
+  // Distill the fleet into the one headline an operator needs. Returns null
+  // when healthy, else {sev, glyph, head, sub}. Shared by the main verdict
+  // bar and the wallboard's TV-scale strip (body.tv hides the bar).
+  function verdictInfo() {
     const failing = state.jobs.filter((j) => health(j).key === "fail");
     const alert = state.clusterAlert;
     const corr = failing.length > 1 ? correlate(failing) : null;
@@ -7305,13 +7591,15 @@
         (failing.length ? failing.length + " job" + (failing.length > 1 ? "s" : "") + " also failing" : "leadership / quorum degraded");
     } else if (failing.length === 0) {
       state.incidentSet = [];
-      if (state.verdictSig !== "hidden") { state.verdictSig = "hidden"; bar.style.display = "none"; bar.className = "verdict"; }
-      return;
+      return null;
     } else if (failing.length === 1) {
       sev = "warn";
       const j = failing[0], lr = j.last_run || {};
       head = "JOB FAILING — " + j.name;
-      sub = "exit " + (lr.exit_code == null ? "?" : lr.exit_code) + (lr.fail_reason ? " · " + lr.fail_reason : "") + " · " + fmtAgo(lr.finished_at);
+      // the age is returned separately (ago) so render sigs stay stable while
+      // it ticks: callers give it a [data-ago] span instead of baking it in
+      sub = "exit " + (lr.exit_code == null ? "?" : lr.exit_code) + (lr.fail_reason ? " · " + lr.fail_reason : "");
+      return { sev: sev, glyph: glyph, head: head, sub: sub, ago: lr.finished_at };
     } else {
       sev = "crit";
       head = "FLEET EVENT — " + failing.length + " jobs failing";
@@ -7320,14 +7608,33 @@
           (corr.span <= CORR_WINDOW ? " within " + Math.max(1, Math.round(corr.span / 1000)) + "s" : "") + " — likely one cause"
         : "no shared failure signature — likely independent";
     }
-    const sig = sev + "|" + head + "|" + sub;
+    return { sev: sev, glyph: glyph, head: head, sub: sub };
+  }
+  function renderVerdict() {
+    const bar = $("verdictBar");
+    const v = verdictInfo();
+    if (state.wallboard) renderWbVerdict(v);   // cluster alerts land here too (loadCluster)
+    if (!v) {
+      if (state.verdictSig !== "hidden") { state.verdictSig = "hidden"; bar.style.display = "none"; bar.className = "verdict"; }
+      return;
+    }
+    const sig = v.sev + "|" + v.head + "|" + v.sub;
     if (sig === state.verdictSig) return;
     state.verdictSig = sig;
-    bar.className = "verdict sev-" + sev;
+    bar.className = "verdict sev-" + v.sev;
     bar.style.display = "";
-    $("vGlyph").textContent = glyph;
-    $("vHead").textContent = head;
-    $("vSub").textContent = sub;
+    $("vGlyph").textContent = v.glyph;
+    $("vHead").textContent = v.head;
+    const sub = $("vSub");
+    sub.textContent = v.sub + (v.ago ? " · " : "");
+    if (v.ago) {
+      // [data-ago] rides tick()'s per-second pass: the age stays live between
+      // polls instead of only refreshing when the verdict re-renders
+      const age = document.createElement("span");
+      age.setAttribute("data-ago", v.ago);
+      age.textContent = fmtAgo(v.ago);
+      sub.appendChild(age);
+    }
   }
 
   // ---- incident timeline overlay (hotkey i) ----
@@ -7633,12 +7940,26 @@
   // (motion gating uses the shared reduceMotion() from the accessibility section)
   function anyRunning() { return state.jobs.some((j) => j.running); }
 
-  // track when this browser first observed each job failing (honest age basis)
+  // track when this browser first observed each job failing / running (honest
+  // age basis: the /jobs payload has no run-start field, so elapsed times are
+  // an explicit observed-since lower bound, never an invented start time)
   function updateIncidents(jobs) {
-    const since = state.failSince, nowMs = Date.now();
-    const failing = {};
-    for (const j of jobs) if (health(j).key === "fail") { failing[j.name] = true; if (!since[j.name]) since[j.name] = nowMs; }
+    const since = state.failSince, run = state.runSince, fin = state.runFin, nowMs = Date.now();
+    const failing = {}, running = {};
+    for (const j of jobs) {
+      if (health(j).key === "fail") { failing[j.name] = true; if (!since[j.name]) since[j.name] = nowMs; }
+      if (j.running) {
+        running[j.name] = true;
+        // back-to-back runs can straddle two polls that both see running=true;
+        // a finished_at that advanced since the stamp proves the observed run
+        // ended, so re-stamp -- else elapsed would silently merge runs and the
+        // running-long tint would false-alarm forever.
+        const f = j.last_run ? j.last_run.finished_at : null;
+        if (!run[j.name] || fin[j.name] !== f) { run[j.name] = nowMs; fin[j.name] = f; }
+      }
+    }
     for (const n in since) if (!failing[n]) delete since[n];
+    for (const n in run) if (!running[n]) { delete run[n]; delete fin[n]; }
   }
   function incidentAge() {
     let oldest = 0, nowMs = Date.now();
@@ -7657,15 +7978,19 @@
     }
     if (nowMs - state.lastAlarmAt >= interval) { state.lastAlarmAt = nowMs; playCue("alarm"); }
   }
-  // per-second wallboard escalation visuals (vignette + incident timer + breathe)
+  // per-second wallboard escalation visuals (vignette + incident timer +
+  // breathe). #wbIncident is a static flow strip in the wallboard markup,
+  // display-toggled here; tile queries are scoped to the grid (the classes
+  // exist nowhere else, and the rest of the document is huge).
   function escalationTick() {
     if (!state.wallboard) return;
-    const alarm = $("wbAlarm");
-    let inc = $("wbIncident");
+    const alarm = $("wbAlarm"), inc = $("wbIncident"), grid = $("wbGrid");
+    const incShown = inc.style.display !== "none";   // the strip is in-flow: a flip resizes the grid
     if (!(state.anyFailing && prefs.escalate)) {
       if (alarm) alarm.style.opacity = "0";
-      document.querySelectorAll(".wb-tile.escalate").forEach((t) => t.classList.remove("escalate"));
-      if (inc) inc.remove();
+      grid.querySelectorAll(".wb-tile.escalate").forEach((t) => t.classList.remove("escalate"));
+      inc.style.display = "none";
+      if (incShown) fitWallboardGrid();
       return;
     }
     const age = incidentAge(), acked = state.alarmAck;
@@ -7673,10 +7998,11 @@
     let level = Math.min(1, (Math.min(count, 6) / 6) * 0.5 + Math.min(1, age / 600000) * 0.5);
     if (acked) level = Math.min(level, 0.22);
     if (alarm) alarm.style.opacity = reduceMotion() ? "0.16" : (0.12 + 0.55 * level).toFixed(2);
-    document.querySelectorAll(".wb-tile.st-fail").forEach((t) => t.classList.toggle("escalate", !acked && !reduceMotion()));
-    if (!inc) { inc = document.createElement("span"); inc.id = "wbIncident"; inc.className = "wb-incident"; $("wallboard").appendChild(inc); }
+    grid.querySelectorAll(".wb-tile.st-fail").forEach((t) => t.classList.toggle("escalate", !acked && !reduceMotion()));
+    inc.style.display = "";
     inc.classList.toggle("ackd", acked);
     inc.textContent = "◉ INCIDENT +" + fmtCountdown(age / 1000) + (acked ? " · ack" : "");
+    if (!incShown) fitWallboardGrid();
   }
   function zenOn() {
     if (state.zen.on) return;
@@ -7725,7 +8051,9 @@
     // the daemon unreachable the all-green frame is unverified, not nominal --
     // show the NO SIGNAL wallboard instead.
     if (wallboardStale()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
-    if (state.anyFailing || anyRunning()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
+    // a bad cluster (quorum lost, conflict) blocks zen like a failing job:
+    // "ALL SYSTEMS NOMINAL" under a CLUSTER ALERT strip would be a lie
+    if (state.anyFailing || anyRunning() || (state.clusterAlert && state.clusterAlert.bad)) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
     const nowMs = Date.now();
     if (!state.zen.idleSince) state.zen.idleSince = nowMs;
     if (!state.zen.on && nowMs - state.zen.idleSince >= (prefs.zenIdle || ZEN_IDLE)) zenOn();

@@ -332,10 +332,23 @@ table) for your incident channel or ticket.
 
 Press `w` (or *Wallboard / TV mode* in the palette, or open the page with a
 `#tv` hash) for a full-screen kiosk view built for a wall monitor: every job as
-a large tile, sorted worst-first (failing, then running, then the rest), each
-with its status glyph, next-fire countdown, and sparkline, plus a footer tally
-and a live UTC clock. Clicking a tile exits to that job's drawer; `Esc` or `w`
-exits.
+a large tile, sorted worst-first (failing, then running, then the rest), plus a
+footer tally and a live UTC clock. Each tile leads with the fact a wall viewer
+actually glances for — a failing tile shows **when it failed and its exit
+code** (counting up live), a running tile shows **elapsed time** (turning amber
+once it runs well past its longest recent duration), and a healthy tile shows
+its next-fire countdown — with the status hue filling the whole tile, not just
+the glyph. When anything is failing, a full-width **verdict headline** distills
+scope and likely cause at TV scale (single job + exit code, correlated fleet
+event, or cluster alert — the same correlation verdict the dashboard's bar
+shows). Clicking a tile exits to that job's drawer; `Esc` or `w` exits.
+
+The grid also fits itself to the glass: a handful of jobs on a big screen get
+proportionally larger tiles and type, a crowded fleet steps down to compact
+tiles, and if even that overflows, the healthiest tail is cut behind an
+explicit footer chip (`+22 offscreen · none failing`) — computed from what was
+actually cut, so the board never silently clips a failure behind a scrollbar
+nobody can reach.
 
 Because the normal header (and its connection indicator) is hidden, the
 wallboard judges its own freshness: if no successful poll lands for ~15 seconds

@@ -2655,7 +2655,7 @@
   const PREF_PREFIX = "cronstable.";             // localStorage prefs
   const MAX_LOG_LINES = 5000;                 // bound the in-memory log view
   const RE_SCAN_CAP = 5000;                   // cap chars scanned per line (ReDoS guard)
-  const GLYPH = { ok: "●", fail: "✗", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍" };
+  const GLYPH = { ok: "●", fail: "✕", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍" };
   // one place that maps a run outcome -> its CSS state class
   const outcomeCls = (o) => o === "failure" ? "fail" : o === "cancelled" ? "cancelled" : o === "unknown" ? "unknown" : "ok";
 
@@ -5483,7 +5483,7 @@
 
   function toast(kind, msg) {
     const e = el("div", "toast " + kind);
-    const g = kind === "ok" ? "✓" : kind === "err" ? "✗" : "›";
+    const g = kind === "ok" ? "✓" : kind === "err" ? "✕" : "›";
     e.innerHTML = '<span class="g">' + g + '</span><span>' + esc(msg) + "</span>";
     $("toasts").appendChild(e);
     setTimeout(() => { e.style.opacity = "0"; e.style.transition = "opacity .3s"; setTimeout(() => e.remove(), 300); }, 3000);
@@ -5677,7 +5677,7 @@
 
   // the 8 DAG task states get their OWN glyphs (never overloads the job set)
   const DST_GLYPH = {
-    pending: "◌", running: "▶", up_for_retry: "↻", success: "●", failed: "✗",
+    pending: "◌", running: "▶", up_for_retry: "↻", success: "●", failed: "✕",
     skipped: "⊘", upstream_failed: "⊗", expanded: "⋯", unknown: "◍", scheduled: "◔",
   };
   const DST_LABEL = {
@@ -6028,7 +6028,7 @@
       } else if (st === "running" && e.awaitingApproval) {
         bits.push('<span class="approw"><span class="pending">⏸ awaiting</span>' +
           '<button class="btn run" data-approve="' + escAttr(taskkey) + '">✓ Approve</button>' +
-          '<button class="btn cancel" data-reject="' + escAttr(taskkey) + '">✗ Reject</button></span>');
+          '<button class="btn cancel" data-reject="' + escAttr(taskkey) + '">✕ Reject</button></span>');
       }
     }
     if (spec && spec.type === "sensor" && e.pokeCount != null) {
@@ -6299,7 +6299,7 @@
       const res = await apiFetch("/dags/" + encodeURIComponent(dag) + "/runs/" + encodeURIComponent(rk) +
         "/tasks/" + encodeURIComponent(taskkey) + "/decision",
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: decision, by: "dashboard" }) });
-      if (res.ok) { toast("ok", (decision === "approve" ? "✓ approved " : "✗ rejected ") + taskkey); loadDagRun(); loadDags(); }
+      if (res.ok) { toast("ok", (decision === "approve" ? "✓ approved " : "✕ rejected ") + taskkey); loadDagRun(); loadDags(); }
       else if (res.status === 409) { toast("err", "already decided / not awaiting"); loadDagRun(); }
       else toast("err", "decision failed (HTTP " + res.status + ")");
     } catch (e) { if (e.message !== "unauthorized") toast("err", "decision failed"); }
@@ -7428,11 +7428,11 @@
       try {
         const res = await apiFetch("/jobs/" + encodeURIComponent(n) + "/" + verb, { method: "POST" });
         if (res.ok) { done++; mitLog("  ✓ " + verb + " " + n); }
-        else { failed++; mitLog("  ✗ " + n + " (HTTP " + res.status + ")"); }
+        else { failed++; mitLog("  ✕ " + n + " (HTTP " + res.status + ")"); }
       } catch (e) {
         failed++;
         if (e.message === "unauthorized") { mitLog("  ! unauthorized — set a token"); break; }
-        mitLog("  ✗ " + n + " (error)");
+        mitLog("  ✕ " + n + " (error)");
       }
       await new Promise((r) => setTimeout(r, MIT_STAGGER));
     }

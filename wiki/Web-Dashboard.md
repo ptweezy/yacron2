@@ -214,7 +214,7 @@ the cluster panel header opens the **fleet view**, a jobs × nodes matrix that
 closes that gap: one row per job (the union of every node's advertised jobs,
 so a mid-deploy peer's new job shows up too), one column per node, each cell
 that node's state for the job: **▶ running**, the last outcome with its age
-(`● ok 3m`, `✗ failure 12s`), `◌ off` for disabled-there, `◔` for never ran
+(`● ok 3m`, `✕ failure 12s`), `◌ off` for disabled-there, `◔` for never ran
 there, `—` for not configured there, and `·` when the node has reported no
 data at all. Hovering a cell reveals the exit code, finish time, duration, and
 next fire; clicking a job name opens its drawer. A **failing only** filter
@@ -321,7 +321,7 @@ verdict bar's `▸ mitigate` button) acts on the failing set in bulk: guarded
 **start all** / **cancel all** actions fire the per-job
 [start/cancel endpoints](HTTP-API#post-jobsnamestart) staggered a few hundred
 milliseconds apart (gentle on the daemon), abortable mid-run, with a live
-per-job ✓/✗ result log and a final tally. It can also open a
+per-job ✓/✕ result log and a final tally. It can also open a
 [multi-tail](#merged-multi-tail) of the set, and copy a ready-made **Markdown
 incident summary** (timestamp, host, version, cluster state, and a per-job
 table) for your incident channel or ticket.

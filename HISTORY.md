@@ -5,6 +5,23 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.17 (2026-07-14)
+
+A docs-and-examples release: no functional changes -- the package, the CLI,
+and every shipped binary behave exactly as in 1.2.16.
+
+- **Each example owns its compose file.** The eight `docker-compose-*.yml`
+  files that lived in the repo root now sit in the example they belong to, as
+  `example/<name>/docker-compose.yml`, next to that example's config and
+  README.  Commands change accordingly -- `docker compose -f
+  example/cluster/docker-compose.yml up` instead of `docker compose -f
+  docker-compose-cluster.yml up` -- and the READMEs, wiki, and in-file comments
+  are updated to match.  The root `docker-compose.yml` is untouched: `docker
+  compose up` still boots the `demo` quickstart from a fresh clone.
+
+- **The MCP example joins the gallery.** `example/mcp` -- an agent driving the
+  scheduler over `POST /mcp` -- was missing from the README's example table.
+
 ## 1.2.16 (2026-07-14)
 
 The dashboard's public-face release.  The wallboard is redesigned around what

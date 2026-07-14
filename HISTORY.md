@@ -35,8 +35,9 @@ docs to match.
   *body* that merely discussed the bare `[release]` marker out-bumped the
   intended `[release:patch]`. `1.3.0` is withdrawn (yanked on PyPI, its GitHub
   release and container tags removed) and contains exactly what ships here as
-  `1.2.15`. The trigger now scans only commit subject lines and only honors a
-  marker at the very start of the subject.
+  `1.2.15`. The trigger now scans only commit subject lines, only honors a
+  marker at the very start of the subject, and when several commits carry one,
+  the latest commit's marker wins.
 
 - **Contributor docs.** `CONTRIBUTING.md` and the "Contributing and Releasing"
   wiki page are rewritten for the single-pipeline flow.

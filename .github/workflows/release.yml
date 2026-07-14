@@ -16,10 +16,11 @@ name: CI
 #         [release:major]    -> major
 #         [release:minor]    -> minor
 #         [release:patch]    -> patch
-#     (most significant marker across the push wins; bodies are never scanned,
-#     so prose that merely mentions a marker cannot trigger or escalate a
-#     release -- 1.3.0 shipped off a [release:patch] push because a commit
-#     body discussing the bare [release] marker out-bumped it), or
+#     (if several pushed commits carry a marker, the LATEST such commit wins;
+#     bodies are never scanned, so prose that merely mentions a marker cannot
+#     trigger or escalate a release -- 1.3.0 shipped off a [release:patch]
+#     push because a commit body discussing the bare [release] marker
+#     out-bumped it), or
 #   - it is started via workflow_dispatch (bump from the dropdown, or an exact
 #     `tag` to release a specific X.Y.Z; the `tag` input wins over `bump`).
 #
@@ -135,21 +136,20 @@ jobs:
             # merely mentions a marker (a changelog quote, a commit that
             # documents this very syntax, dependabot notes) must not trigger
             # or escalate a release -- that is exactly how 1.3.0 shipped from
-            # a [release:patch] push.
-            markers="$(printf '%s\n' "$subjects" \
+            # a [release:patch] push. If several commits carry a marker, the
+            # LATEST one wins (git log lists newest first); a bare [release]
+            # counts as minor.
+            marker="$(printf '%s\n' "$subjects" \
               | grep -oiE '^\[release(:(major|minor|patch))?\]' \
+              | head -n1 \
               | tr '[:upper:]' '[:lower:]' || true)"
-            if [ -n "$markers" ]; then
+            if [ -n "$marker" ]; then
               release=true
-              # If several markers appear, the most significant bump wins
-              # (major > minor > patch); a bare [release] counts as minor.
-              if printf '%s\n' "$markers" | grep -q '\[release:major\]'; then
-                bump=major
-              elif printf '%s\n' "$markers" | grep -qE '\[release(:minor)?\]'; then
-                bump=minor
-              else
-                bump=patch
-              fi
+              case "$marker" in
+                "[release:major]") bump=major ;;
+                "[release:patch]") bump=patch ;;
+                *)                 bump=minor ;;
+              esac
             fi
           fi
           # else: a PR or a non-main push -> build + test only, never release.

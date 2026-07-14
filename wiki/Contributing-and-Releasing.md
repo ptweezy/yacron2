@@ -106,9 +106,9 @@ Valid markers (case-insensitive; the bump level is optional):
 | `[release:minor]` | minor | 1.1.0 |
 | `[release:patch]` | patch | 1.0.6 |
 
-If several markers appear across the pushed commits, the **most significant bump wins** (major > minor > patch); a bare `[release]` counts as minor.
+If several pushed commits carry a marker, the **latest such commit wins**; a bare `[release]` counts as minor.
 
-The marker match is performed in the `decide` job with `grep -oiE '^\[release(:(major|minor|patch))?\]'` over the commit **subject lines** (`git log --pretty=%s`).
+The marker match is performed in the `decide` job with `grep -oiE '^\[release(:(major|minor|patch))?\]'` over the commit **subject lines** (`git log --pretty=%s`), taking the newest matching commit.
 
 > **Why subjects only, anchored:** the original trigger substring-matched whole commit messages, so a commit *body* that merely discussed the bare `[release]` marker out-bumped an explicit `[release:patch]` and shipped 1.3.0 instead of 1.2.15. Bodies are no longer scanned at all, and a marker only counts when it begins the subject line. File contents are never scanned (this page can name the markers freely).
 

@@ -70,7 +70,7 @@ commit and, on a release, publishes it). Version numbers come from git tags via
 A release happens when **any commit in a push to `main`** has a release marker
 at the **start of its subject line** (the first line of the commit message):
 
-```
+```text
 [release:minor] Add retry backoff to the HTTP reporter
 ```
 
@@ -88,9 +88,9 @@ Valid markers (the bump level is optional; case is ignored):
 | `[release:minor]`  | minor | 1.1.0   |
 | `[release:patch]`  | patch | 1.0.6   |
 
-If more than one marker appears across the pushed commits, the most significant
-bump wins (major > minor > patch). (File contents like this document are never
-scanned; only commit subjects are.)
+If more than one commit in the push carries a marker, the **latest** such
+commit wins. (File contents like this document are never scanned; only commit
+subjects are.)
 
 You can also release manually without a marker: **Actions → release → Run
 workflow**, then pick the bump level from the dropdown.

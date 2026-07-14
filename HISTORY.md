@@ -5,6 +5,120 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.16 (2026-07-14)
+
+The dashboard's public-face release.  The wallboard is redesigned around what
+a wall viewer actually glances for, the header wordmark becomes a live
+control system, and the project gains a feature-comparison chart plus a
+zero-install live demo of the dashboard.  Every product change is contained
+to the dashboard page (`cronstable/web/index.html`); the daemon, scheduler,
+CLI, configuration, and APIs are untouched.
+
+- **Wallboard tiles lead with the glanceable fact.** Instead of showing every
+  job the same next-fire countdown, each tile now leads with the datum its
+  state makes urgent: a failing tile shows **when it failed and its exit
+  code**, with the age counting up live between polls; a running tile shows
+  **elapsed time**, turning amber once the run exceeds twice its longest
+  recent duration (with 60 s of slack for short jobs); healthy tiles keep the
+  countdown.  Elapsed times are an honest observed-since lower bound (stamped
+  when this browser first saw the run -- the `/jobs` payload has no start
+  field), never an invented start time.  The status hue now fills the whole
+  tile rather than just a glyph and a 1 px border, so state reads at TV
+  distance, and the footer tally represents every health bucket -- pending,
+  unknown, and cancelled jobs are counted instead of silently dropped.
+
+- **A verdict headline at TV scale.** The dashboard's correlation verdict
+  (single failing job + exit code, correlated fleet event, or cluster alert)
+  used to vanish on the wallboard along with the header that carries it.  It
+  now renders as a full-width headline strip above the grid, distilling scope
+  and likely cause into one sentence instead of "count the red tiles".  The
+  strip is rewritten only on a real change, so its screen-reader status
+  region announces each verdict once, not once per poll, and its age ticks
+  live between polls (the main verdict bar's age now ticks too).
+
+- **The grid fits itself to the glass.** A TV has no one to scroll it, so a
+  new fit governor re-decides the layout on every paint, resize, and zoom
+  change: a handful of jobs on a big screen grows its tiles and type
+  proportionally to use the glass; a crowded fleet first scales full tiles
+  down -- name, glance line, and run-history sparkline all kept -- before
+  conceding anything; only past the readability floor does it step down to
+  compact tiles, and even those keep the sparkline whenever their stretched
+  rows leave it room; and if even compact overflows, the healthiest tail is
+  cut behind an explicit footer chip computed from what was actually cut
+  (`+22 offscreen . none failing`, turning red with exact counts if failing
+  or unknown tiles ever overflow a whole screen).  The board never silently
+  clips a failure behind a scrollbar nobody can reach.
+
+- **Wallboard correctness fixes.** The `unknown` state was missing from the
+  worst-first sort order, which left the entire tile ordering unspecified
+  whenever an interrupted job was on the board -- fixed.  Grid rebuilds are
+  now skipped when the structure is unchanged, so tile animations no longer
+  restart on every poll and the exit button keeps keyboard focus.  The
+  escalation INCIDENT stamp moved from an absolutely-positioned overlay --
+  which could cover the worst (first) tile or hide beneath the NO SIGNAL
+  banner -- to an in-flow strip that can do neither, and leaving the
+  wallboard now tears escalation state down symmetrically, so re-entering
+  after a recovery no longer flashes a stale stamp and vignette over a
+  healthy grid.  Navigating away from `#tv` by URL (back button, address-bar
+  edit, kiosk script) actually exits the wallboard and preserves the target
+  deep link, and a DAG drawer left open can no longer desync the `#tv` hash.
+  Keyboard shortcuts ignore modifier chords -- Ctrl+A is select-all again,
+  not a silent alarm acknowledgement.
+
+- **The l balances itself now.** The block glyph that used to spin beside the
+  wordmark is retired: the `l` in the header's "cronstable" is a **live
+  cart-and-double-pendulum simulation** -- the full nonlinear dynamics
+  integrated at 240 Hz (RK4) and balanced by an LQR controller whose gains
+  are computed in your browser at page load from a numerical linearization.
+  Not a canned animation: while the daemon is live the letter stands upright,
+  riding out little gusts; sweep your cursor through the header to brush it
+  aside, right-click to knock it clean over.  Lose the daemon and its motor
+  cuts -- the letter collapses out of the word and swings.  When the signal
+  returns, an energy-shaping swing-up threaded by a receding-horizon
+  cross-entropy planner carries it back into the balance controller's basin,
+  and every catch is verified by a two-second closed-loop rollout before it
+  is committed; a hard recovery gets running room (the right end of the track
+  swings open toward mid-page, then eases home once the letter stands).
+  Reduced motion parks a still pose that stays honest about daemon state --
+  upright when live, hanging when not; without JavaScript the span prints a
+  plain roman l; the SVG is absolutely positioned, so none of this moves the
+  layout.  Tuned and Monte-Carlo-tested headlessly: recovery median ~15 s,
+  ~100% by 90 s, zero unverified catches in a 10-minute soak.
+
+- **How cronstable compares.** A new `docs/comparison.md` scores 24
+  capabilities -- AI and agent control, scheduling core, orchestration,
+  distribution and fault tolerance, observability, platform -- against
+  yacron, supercronic, Ofelia, dkron, Cronicle, Kubernetes CronJob, and
+  Apache Airflow.  Every competitor cell was checked against that project's
+  official docs and adversarially re-verified; the MCP server remains the row
+  nothing else in the field ships natively, Airflow included.
+  `docs/comparison.html` is the same chart as a standalone styled page ("As
+  simple as cron, as capable as Airflow, in one daemon") with an MCP
+  spotlight and a path into the live demo.
+
+- **A live demo with nothing to install.** `docs/demo/index.html` is the real
+  dashboard page with a synthetic backend injected ahead of it: it patches
+  `window.fetch`, so the untouched SPA runs against a deterministic nine-node
+  "meridian" fleet derived from the wall clock -- countdowns tick,
+  long-runners stay running, a staged incident flares and self-clears, and
+  every view works (jobs, drawers, DAGs, cluster, fleet, wallboard, state,
+  boot self-test).  No network request ever leaves the page, and it serves
+  from GitHub Pages or any static host.
+
+- **Assets, docs, and capture tooling.** The README wears the new mark:
+  `logo-balance.gif` replaces `logo-spin.gif`, recorded by stepping the real
+  simulation deterministically at 50 fps, so the loop plays the product story
+  with the real controller -- theme glitches physically knock the pendulum,
+  the big one cuts the signal, and the word heals through a verified catch.
+  The social card lifts the logo engine straight out of the dashboard page so
+  it can never drift from the shipped mark, the still-capture scripts park
+  the pendulum at exact upright so screenshots stay pixel-identical across
+  themes, and a new `docs/logo-lab.html` preserves the standalone harness the
+  mark was tuned in.  The wiki's wallboard section is rewritten for the new
+  tiles, the failure glyph across the dashboard and docs swaps the heavy
+  ballot cross for a symmetric one that sits better next to the check mark,
+  and the full screenshot set is regenerated.
+
 ## 1.2.15 (2026-07-14)
 
 A maintenance release: no functional changes to cronstable itself -- the

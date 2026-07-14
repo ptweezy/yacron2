@@ -26,17 +26,20 @@ def main():
             lambda route: route.fulfill(
                 status=200,
                 content_type="text/plain; charset=utf-8",
-                body="1.2.8",
+                body="1.2.14",
             ),
         )
         ctx.add_init_script(
             "try{localStorage.setItem('cronstable.boot','false');"
             "localStorage.setItem('cronstable.zen','false');}catch(e){}"
-            # pin the idle-cruising logo upright (see capture_dashboard.py)
-            "document.addEventListener('DOMContentLoaded',()=>{"
-            "const s=document.createElement('style');"
-            "s.textContent='#mark{transform:none !important}';"
-            "document.head.appendChild(s)});"
+            # park the pendulum mark at exact upright (see capture_dashboard.py)
+            "(()=>{let CL;Object.defineProperty(window,'CronstableLogo',{"
+            "configurable:true,get:()=>CL,set:(v)=>{const orig=v.mountGlyph;"
+            "v.mountGlyph=function(slot,opts){const L=orig.call(v,slot,opts);"
+            "L.sync=()=>{};if(L._raf)cancelAnimationFrame(L._raf);L._raf=0;"
+            "L.sim.opts.gusts=false;L.sim.setConnected(true);"
+            "L.sim.s=[0,0,0,0,0,0];L.sim.mode='balance';L.sim.a=0;"
+            "L._render();window.__pendLogo=L;return L;};CL=v;}});})();"
         )
         page = ctx.new_page()
         page.goto(BASE)

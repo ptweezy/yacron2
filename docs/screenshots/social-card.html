@@ -34,16 +34,17 @@
       rgba(0,0,0,0) 0 2px, rgba(0,0,0,.16) 2px 4px);
   }
   .left { position: absolute; left: 72px; top: 72px; width: 620px; }
-  .brandline { display: flex; align-items: baseline; gap: 30px; white-space: nowrap; }
-  .mark {
-    font-size: 88px; font-weight: 700; line-height: 1;
-    text-shadow: 0 0 26px var(--glow), 0 0 8px var(--glow);
-    display: inline-block; transform: rotate(-12deg); transform-origin: 50% 55%;
-  }
+  .brandline { white-space: nowrap; }
   h1 {
-    font-size: 82px; font-weight: 700; letter-spacing: 2px;
+    font-size: 82px; font-weight: 700; letter-spacing: 2px; line-height: 1.2;
     text-shadow: 0 0 22px var(--glow);
   }
+  /* the wordmark's l is the pendulum mark, exactly as on the dashboard:
+     capture_social_card.py lifts the logo engine out of
+     cronstable/web/index.html and mounts it over the slot below, parked
+     balanced-upright (the engine's reduced-motion still pose). line-height is
+     explicit because the mount math needs a resolvable line box. */
+  .mark svg { filter: drop-shadow(0 0 20px var(--glow)) drop-shadow(0 0 7px var(--glow)); }
   .tag { margin-top: 14px; font-size: 25px; color: var(--fg-faint); letter-spacing: 1px; }
   .pitch { margin-top: 30px; font-size: 29px; line-height: 1.45; color: var(--accent); width: 590px; }
   .chips { margin-top: 28px; display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
@@ -73,7 +74,7 @@
 <body>
 <div class="card">
   <div class="left">
-    <div class="brandline"><span class="mark">&#9626;</span><h1>cronstable</h1></div>
+    <div class="brandline"><h1>cronstab<span class="mark" id="mark">l</span>e</h1></div>
     <div class="tag">// job scheduler</div>
     <div class="pitch">The modern, container-native cron replacement.</div>
     <div class="chips">

@@ -2336,7 +2336,7 @@
       mk("line", { class: "p-rail", x1: g.railX[0], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
       // phantom track: the temporary rail that fills in behind the fleeing
       // right gate while the track is opened out (see _gateStep)
-      this.eGhost = !this._gate ? null : mk("line", { class: "p-rail-ext", x1: g.railX[1], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2, opacity: 0 });
+      this.eGhost = !this._gate ? null : mk("line", { class: "p-rail-ext", x1: g.railX[1], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
       mk("line", { class: "p-stop", x1: g.railX[0], y1: g.railY - 3 * U, x2: g.railX[0], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
       this.eStopR = mk("line", { class: "p-stop", x1: g.railX[1], y1: g.railY - 3 * U, x2: g.railX[1], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
       this.eL1 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
@@ -2374,11 +2374,11 @@
         this._gateDrawn = gt.x;
         this.eStopR.setAttribute("x1", gt.x);
         this.eStopR.setAttribute("x2", gt.x);
-        // the phantom rail runs flush to the fleeing gate, so the track's
-        // bottom edge visibly extends with it; it fades in over the first
-        // few px of travel instead of blinking
+        // the phantom rail runs flush to the fleeing gate at full rail
+        // strength — no fade: the line growing from zero length is its own
+        // smooth reveal (gate motion near rest is sub-px per frame), and any
+        // partial opacity reads as a gap against the solid rail
         this.eGhost.setAttribute("x2", gt.x);
-        this.eGhost.setAttribute("opacity", Math.min(1, (gt.x - gt.rest) / (6 * g.U)).toFixed(3));
       }
       if (w.mode !== this._mode) {
         this._mode = w.mode;

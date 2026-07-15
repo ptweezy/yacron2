@@ -29,6 +29,26 @@ def _cfg(yaml):
     return parse_config_string(yaml, "")
 
 
+def _break_record_reads(monkeypatch, backend, stream):
+    """Make every record file of ``stream`` transiently unreadable."""
+    stream_dir = backend._stream_dir(stream)
+    victims = {
+        os.path.normpath(os.path.join(stream_dir, n))
+        for n in os.listdir(stream_dir)
+        if n.endswith(".json")
+    }
+    assert victims
+    real_open = open
+
+    def flaky_open(path, *args, **kwargs):
+        if os.path.normpath(str(path)) in victims:
+            raise PermissionError(13, "transient hold", str(path))
+        return real_open(path, *args, **kwargs)
+
+    # shadow the module's open, the seam tests/test_state.py already patches.
+    monkeypatch.setattr(state, "open", flaky_open, raising=False)
+
+
 # --------------------------------------------------------------------------
 # Config: state.jobApi + per-job secrets
 # --------------------------------------------------------------------------
@@ -618,6 +638,41 @@ async def test_artifact_missing_returns_none(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()
     assert await jobstate.artifact_get(backend, "s", "nope") is None
+    await backend.stop()
+
+
+async def test_artifact_get_strict_propagates_a_transient_read_error(
+    tmp_path, monkeypatch
+):
+    # Non-strict, an unreadable record is SKIPPED -- so a published artifact
+    # reads back as never published. That silent lie is fatal wherever absence
+    # is acted on as PERMANENT: the DAG mapped expansion records the empty
+    # fan-out once and never recomputes it, so one NFS blip silently skips the
+    # whole task's work. strict=True must surface the error instead, exactly
+    # as referenced_blob_digests(strict=True) already does for the blob sweep.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.artifact_put(backend, "s", "items", b'["a"]')
+    _break_record_reads(
+        monkeypatch, backend, jobstate.ARTIFACT_STREAM_PREFIX + "s"
+    )
+
+    # best-effort: indistinguishable from "never published" (the bug)
+    assert await jobstate.artifact_get_record(backend, "s", "items") is None
+    assert await jobstate.artifact_get(backend, "s", "items") is None
+    # strict: the environment's failure is the caller's to see and retry
+    with pytest.raises(OSError):
+        await jobstate.artifact_get_record(backend, "s", "items", strict=True)
+    with pytest.raises(OSError):
+        await jobstate.artifact_get(backend, "s", "items", strict=True)
+
+    # and once the blip clears the record reads back intact, proving strict
+    # only ever reported the read, never damaged the stream.
+    monkeypatch.undo()
+    rec = await jobstate.artifact_get_record(backend, "s", "items", strict=True)
+    assert rec["name"] == "items"
+    got = await jobstate.artifact_get(backend, "s", "items", strict=True)
+    assert got is not None and got[1] == b'["a"]'
     await backend.stop()
 
 

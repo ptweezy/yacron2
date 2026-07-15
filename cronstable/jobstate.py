@@ -344,12 +344,31 @@ async def artifact_put(
 
 
 async def artifact_get_record(
-    backend: StateBackend, scope: str, name: str
+    backend: StateBackend, scope: str, name: str, *, strict: bool = False
 ) -> Optional[Dict[str, Any]]:
-    """The newest artifact record published under ``name``, or ``None``."""
+    """The newest artifact record published under ``name``, or ``None``.
+
+    The scan is best-effort by default: a record that cannot be read *right
+    now* -- a transient I/O error on a shared mount (ESTALE/EIO), or one
+    written by a NEWER node's schema -- is skipped, so a blip can make a
+    published name read back as never published, or resolve it to a STALE
+    older version of itself.  ``strict=True`` makes such a record PROPAGATE
+    instead, exactly as :func:`referenced_blob_digests` does: pass it wherever
+    "absent" is acted on as PERMANENT and irreversible -- the DAG
+    mapped-expansion read, where it becomes a vacuously-successful empty
+    fan-out that silently skips the whole task's work -- so the caller can
+    tell "nothing published" from "could not read" and retry the latter.
+
+    Strictness necessarily spans the scope's whole stream, not just the
+    records carrying ``name``: until a record has been read there is no
+    telling which name it holds, and the unreadable one could be the newest
+    publish of exactly this one.  (A record with *bad content* is skipped even
+    under ``strict``: it is unrecoverable, and failing closed on it forever
+    would wedge the caller permanently.)
+    """
     scope = _require_scope(scope)
     records = await backend.list_records(
-        ARTIFACT_STREAM_PREFIX + scope, newest_first=True
+        ARTIFACT_STREAM_PREFIX + scope, newest_first=True, strict=strict
     )
     for record in records:
         if record.get("name") == name:
@@ -358,15 +377,17 @@ async def artifact_get_record(
 
 
 async def artifact_get(
-    backend: StateBackend, scope: str, name: str
+    backend: StateBackend, scope: str, name: str, *, strict: bool = False
 ) -> Optional[Tuple[Dict[str, Any], bytes]]:
     """The newest ``(record, payload)`` published under ``name``, or ``None``.
 
     ``None`` if the name was never published.  A record whose blob has since
     been swept raises :class:`JobStateError` (410 gone) rather than silently
-    returning empty bytes.
+    returning empty bytes.  ``strict`` is passed through to
+    :func:`artifact_get_record`: see there for when an unreadable record must
+    raise rather than read back as absent.
     """
-    record = await artifact_get_record(backend, scope, name)
+    record = await artifact_get_record(backend, scope, name, strict=strict)
     if record is None:
         return None
     digest = record.get("sha256")

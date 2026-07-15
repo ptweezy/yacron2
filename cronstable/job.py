@@ -72,6 +72,14 @@ def fixup_pyinstaller_env(env: Dict[str, str]) -> None:
 # failure reports); this only bounds the in-memory buffer the UI streams from.
 LIVE_LOG_LIMIT = 1000
 
+# How long a forcibly-terminated run waits for its stdout/stderr to reach EOF
+# before the readers are cancelled and whatever they captured is kept (see
+# RunningJob._read_job_streams). Only ever reached when a descendant escaped
+# the process-group kill, so it costs nothing on a healthy run; a fixed bound
+# rather than killTimeout, which is legitimately configured to 0 (kill at
+# once) by jobs that would then lose output they had already produced.
+KILLED_STREAM_DRAIN_TIMEOUT = 30.0
+
 
 class JobOutputStream:
     """In-memory, broadcastable view of a job run's captured output.
@@ -203,8 +211,32 @@ class StreamReader:
             else:
                 self.discarded_lines += 1
 
-    async def join(self) -> Tuple[str, int]:
-        await self._reader
+    async def join(self, timeout: Optional[float] = None) -> Tuple[str, int]:
+        """Drain to end-of-file; return ``(output, discarded_lines)``.
+
+        ``timeout`` bounds the wait. The read loop only ends on EOF, which
+        arrives when *every* write-end of the pipe is closed -- including any
+        a descendant of the job inherited -- so a caller that has just killed
+        the job passes a bound rather than trusting the pipe to close (see
+        RunningJob._read_job_streams). On expiry the read loop is cancelled
+        and the output captured so far is returned: the lines already read are
+        held here, not in the pipe, so nothing collected is lost.
+        """
+        if timeout is None:
+            await self._reader
+        else:
+            try:
+                await asyncio.wait_for(self._reader, timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "job %s: %s did not reach end-of-file within %.1f seconds "
+                    "of the job being killed -- a descendant that outlived it "
+                    "still holds the pipe open; keeping the output captured "
+                    "so far",
+                    self.job_name,
+                    self.stream_name,
+                    timeout,
+                )
         if self.save_bottom:
             middle = (
                 [
@@ -459,15 +491,59 @@ class ShellReporter(Reporter):
         )
 
         logger.debug("Executing shell report cmd: %s", cmd)
+        # Same process-group isolation as the job itself, so the timeout kill
+        # below reaches the reporter's descendants as a unit (see
+        # platform.new_process_group_kwargs).
+        kwargs = platform.new_process_group_kwargs()
         try:
-            proc = await create(*cmd, env=env)
-        except subprocess.SubprocessError:
+            proc = await create(*cmd, env=env, **kwargs)
+        # OSError for the same reason RunningJob.start catches it: a missing
+        # reporter binary (FileNotFoundError) or a spawn-time resource failure
+        # (EMFILE/ENOMEM/EAGAIN) is not a SubprocessError subclass, and a
+        # reporting problem must be logged, never propagated.
+        except (subprocess.SubprocessError, OSError):
             logger.exception(
                 "Error executing shell reporter of job %s", job.config.name
             )
             return
 
-        retcode = await proc.wait()
+        # Bounded: report() runs INLINE on the reaper, the daemon's single
+        # job-completion loop, so a reporter that never exits (curl with no
+        # --max-time, a script reading stdin) would otherwise freeze
+        # completion handling for EVERY job daemon-wide -- Forbid jobs stop
+        # firing, shutdown never finishes. On expiry the reporter's whole
+        # process group is killed and the run's handling proceeds.
+        timeout = shell_config.get("timeout") or 60
+        try:
+            retcode = await asyncio.wait_for(proc.wait(), timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Shell reporter of job %s did not finish within %.1f "
+                "seconds; killing it",
+                job.config.name,
+                timeout,
+            )
+            if not await platform.kill_process_group(proc.pid, force=True):
+                # group already gone or unsignallable: fall back to the
+                # direct child, guarded like RunningJob.cancel.
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+            # reap the killed child so it does not linger as a zombie. The
+            # direct child is dead after the kill above, so this returns at
+            # once; the extra bound only guarantees the reaper can never be
+            # wedged here no matter what.
+            try:
+                await asyncio.wait_for(proc.wait(), 10)
+            except asyncio.TimeoutError:  # pragma: no cover - defensive
+                logger.error(
+                    "Shell reporter of job %s could not be reaped after "
+                    "being killed",
+                    job.config.name,
+                )
+            return
         if retcode != 0:
             # not in an except block: a nonzero exit is not an exception, so
             # logger.exception would log a bogus "NoneType: None" traceback.
@@ -632,6 +708,11 @@ class RunningJob:
         self.start_failed = False
         # guards against _on_stop running twice (cancel() racing wait())
         self._stopped = False
+        # set by cancel(): this run was forcibly terminated (executionTimeout,
+        # Replace, a user cancel) rather than left to exit on its own. Read by
+        # _read_job_streams, which then bounds its wait for pipe EOF instead of
+        # trusting a killed process tree to close its output.
+        self._terminated = False
         # set by the scheduler when this run is deliberately cancelled to make
         # way for a newer instance (concurrencyPolicy=Replace). Such a forced
         # termination is not a job failure and must not be reported or retried.
@@ -705,7 +786,10 @@ class RunningJob:
         if self.proc is not None:
             raise RuntimeError("process already running")
         self.started_at = datetime.now(timezone.utc)
-        kwargs = {}  # type: Dict[str, Any]
+        # Isolate the job in its own process group, so cancel() can take its
+        # whole descendant tree down as a unit rather than only the process we
+        # spawned -- see cronstable.platform.new_process_group_kwargs.
+        kwargs = platform.new_process_group_kwargs()  # type: Dict[str, Any]
         if isinstance(self.config.command, list):
             create = asyncio.create_subprocess_exec  # type: Any
             cmd = self.config.command
@@ -900,19 +984,45 @@ class RunningJob:
         await self._read_job_streams()
 
     async def _read_job_streams(self):
+        # The readers end on pipe EOF, which needs EVERY write-end closed --
+        # including any a descendant of the job inherited. cancel() takes the
+        # job's whole process group down, so on a killed run EOF normally
+        # follows at once; but a descendant that escaped the group (it called
+        # setsid itself, or Windows could not reach it once orphaned) would
+        # hold the pipe open indefinitely. This await is what the reaper is
+        # parked on, and it has no outer bound, so that would strand the run in
+        # running_jobs forever. Bound the drain on a killed run: the slot is
+        # then always released, at the cost of the output we never saw anyway.
+        # An untouched run is left unbounded -- it owns its own lifetime, and
+        # its output is not ours to cut short.
+        timeout = KILLED_STREAM_DRAIN_TIMEOUT if self._terminated else None
         if self._stderr_reader:
             (
                 self.stderr,
                 self.stderr_discarded,
-            ) = await self._stderr_reader.join()
+            ) = await self._stderr_reader.join(timeout)
         if self._stdout_reader:
             (
                 self.stdout,
                 self.stdout_discarded,
-            ) = await self._stdout_reader.join()
+            ) = await self._stdout_reader.join(timeout)
         # signal end-of-output to any live web log subscribers; their read
         # loops terminate on the sentinel this delivers.
         self.output.close()
+        # Close our end of the subprocess pipes now that both readers have been
+        # joined above. A run that reached EOF normally already had its
+        # transport closed by asyncio, so this is a no-op; but a KILLED run
+        # whose descendant escaped the group (see the bounded drain above)
+        # never reaches EOF, so without this its stdout/stderr pipe transport
+        # lingers unclosed until garbage collection -- leaking the read-end fd
+        # in a long-lived daemon, and, under the test harness, surfacing as a
+        # ProactorEventLoop "unclosed transport" finalizer error ("Event loop
+        # is closed") once the per-test loop is torn down. Closing here runs
+        # the transport's connection-lost on the live loop instead. close() is
+        # idempotent and, after the joins above, can lose no captured output.
+        transport = getattr(self.proc, "_transport", None)
+        if transport is not None:
+            transport.close()
 
     @property
     def failed(self) -> bool:
@@ -937,13 +1047,45 @@ class RunningJob:
         return None
 
     async def cancel(self) -> None:
+        """Terminate this run and everything it spawned.
+
+        Signals the job's whole process group, not just the process we
+        spawned: a job's descendants (``sh -c 'helper & main'``) inherit its
+        stdout/stderr write-ends, so a helper that outlives a killed shell
+        holds the pipe open forever -- the run never finishes draining, never
+        leaves ``running_jobs``, and under ``concurrencyPolicy: Forbid`` the
+        job never runs again. Killing the group also makes ``executionTimeout``
+        mean what it says: a bound on the run's work, not on its root process.
+
+        A run with no process (the spawn failed, so it registered with
+        ``proc=None`` and ``start_failed``) is a NO-OP, not an error: callers
+        cancel whatever ``running_jobs`` holds (the Replace branch of
+        ``maybe_launch_job``, the cluster slot-renewer), and several of those
+        paths run outside ``run()``'s try/except -- a raise here would escape
+        them and take down the whole scheduler over a job that never even
+        launched. The reaper still completes such a run through ``wait()``'s
+        ``start_failed`` path, so nothing is left stranded.
+        """
         if self.proc is None:
-            raise RuntimeError("process is not running")
-        if self.proc.returncode is None:
-            try:
-                self.proc.terminate()
-            except ProcessLookupError:
-                pass
+            logger.info(
+                "Job %s: cancel is a no-op, no process was ever spawned "
+                "(start_failed=%s)",
+                self.config.name,
+                self.start_failed,
+            )
+            return
+        self._terminated = True
+        # Graceful first: SIGTERM the group. This reaches the descendants even
+        # once the leader itself has exited, which is exactly the case that
+        # wedges the run. Where the group cannot be signalled (Windows has no
+        # graceful kill, and no group to aim one at) fall back to the direct
+        # child, as before.
+        if not await platform.kill_process_group(self.proc.pid, force=False):
+            if self.proc.returncode is None:
+                try:
+                    self.proc.terminate()
+                except ProcessLookupError:
+                    pass
         try:
             await asyncio.wait_for(self.proc.wait(), self.config.killTimeout)
         except asyncio.TimeoutError:
@@ -953,6 +1095,11 @@ class RunningJob:
                 self.config.name,
                 self.config.killTimeout,
             )
+        # Unconditionally, whether or not the leader made its killTimeout: it
+        # exiting says nothing about the descendants sharing its group, and
+        # those are what hold the pipes open. A group that is already empty
+        # reports back as "not signalled" and this is a no-op.
+        if not await platform.kill_process_group(self.proc.pid, force=True):
             # The process may already be gone: on Python <=3.11
             # asyncio.wait_for can spuriously time out even though
             # proc.wait() completed (the timeout race fixed in 3.12),

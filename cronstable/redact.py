@@ -81,8 +81,15 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
         re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{8,})"),
         lambda m: m.group(1) + REDACTED,
     ),
+    # The separator is "a colon (spaces optional on either side) OR at least
+    # one space": HTTP's optional whitespace means "Authorization:Basic x"
+    # (no space after the colon) is just as valid -- and as leaky -- as the
+    # spaced form, while still requiring SOME separator so an unbroken
+    # "authorizationbasic" in random text cannot match.
     (
-        re.compile(r"(?i)(authorization\s*:?\s+basic\s+)([A-Za-z0-9+/=]{8,})"),
+        re.compile(
+            r"(?i)(authorization(?:\s*:\s*|\s+)basic\s+)([A-Za-z0-9+/=]{8,})"
+        ),
         lambda m: m.group(1) + REDACTED,
     ),
     # Recognisable cloud/service token formats (the whole match is the secret).

@@ -955,3 +955,190 @@ def test_holder_from_txn_response_malformed_base64_raises_valueerror():
     }
     with pytest.raises(ValueError):
         holder_from_txn_response(resp, "node-a")
+
+
+# --- @reboot-ran conservative gate (failover double-fire guard) -------------
+#
+# Leadership and the reboot-ran key live at SEPARATE etcd keys, read by
+# separate requests -- unlike kubernetes, where the ran-set rides the Lease
+# annotations of the very read that wins leadership. So a failover leader
+# whose reboot-ran read blips used to answer reboot_ran() "not ran" from its
+# stale cache and re-run a one-shot the previous leader marked moments before
+# dying. The gate mirrors FilesystemBackend: between gaining leadership (or a
+# known lease loss) and a completed read-back, reboot_ran() raises
+# RebootRanUnknownError and cron keeps the one-shot pending.
+
+
+def test_reboot_ran_raises_while_leader_unsynced():
+    from cronstable.leadership import RebootRanUnknownError
+
+    b = _backend()
+    b._is_leader = True
+    assert b._reboot_ran_synced is False  # False from construction
+    with pytest.raises(RebootRanUnknownError):
+        b.reboot_ran("boot-job")
+
+
+def test_reboot_ran_positive_answer_is_safe_while_unsynced():
+    # marks are append-only within a job set: a stale cache can only be
+    # MISSING marks, never carry false ones, so True is always safe.
+    b = _backend()
+    b._is_leader = True
+    b._reboot_ran_local = {"mine"}
+    b._reboot_ran_local_job_set_id = "v1:job"
+    assert b.reboot_ran("mine") is True
+
+
+def test_reboot_ran_follower_answers_false_while_unsynced():
+    # a non-leader never launches the one-shot (cron gates on ownership after
+    # this check), so it may answer False without the conservative raise.
+    b = _backend()
+    assert b.reboot_ran("boot-job") is False
+
+
+@pytest.mark.asyncio
+async def test_completed_read_back_opens_reboot_gate(monkeypatch):
+    b = _backend()
+    b._is_leader = True
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        assert path == "/v3/kv/range"
+        return {"kvs": []}  # absent key: a completed, authoritative read
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    await b._cas_write_reboot_ran()
+    assert b._reboot_ran_synced is True
+    assert b.reboot_ran("boot-job") is False  # now safe to answer
+
+
+@pytest.mark.asyncio
+async def test_failed_read_back_keeps_reboot_gate_closed(monkeypatch):
+    from cronstable.leadership import RebootRanUnknownError
+
+    b = _backend()
+    b._is_leader = True
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        raise aiohttp.ClientError("etcd unreachable")
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    await b._sync_reboot_ran()  # swallowed, as on any renew round
+    assert b._reboot_ran_synced is False
+    with pytest.raises(RebootRanUnknownError):
+        b.reboot_ran("boot-job")
+
+
+@pytest.mark.asyncio
+async def test_mark_reboot_ran_eager_persist_opens_gate(monkeypatch):
+    # the eager mark-persist path reads the key back too (CAS read-modify-
+    # write), so a leader that just recorded its own one-shot is synced.
+    b = _backend()
+    b._is_leader = True
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        return {"succeeded": True}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    await b.mark_reboot_ran("mine")
+    assert b._reboot_ran_synced is True
+    assert b.reboot_ran("mine") is True
+
+
+@pytest.mark.asyncio
+async def test_renew_gain_syncs_before_leadership_applies(monkeypatch):
+    # on a takeover the forced read-back runs BEFORE _apply_round, so a
+    # healthy gain never exposes is_leader()==True next to a stale set (and
+    # a deferred one-shot is not delayed a round); a FAILED read-back still
+    # applies leadership -- reboot_ran() just keeps deferring.
+    from cronstable.leadership import RebootRanUnknownError
+
+    b = _backend()
+    sync_calls = []
+
+    async def grant():
+        return "222", 15
+
+    async def campaign(lease_id):
+        return "node-a", True
+
+    async def sync():
+        sync_calls.append(("leader-at-sync", b._is_leader))
+        # simulate the read-back failing: synced stays False
+
+    monkeypatch.setattr(b, "_grant_lease", grant)
+    monkeypatch.setattr(b, "_campaign", campaign)
+    monkeypatch.setattr(b, "_sync_reboot_ran", sync)
+    await b._renew_once()
+
+    assert sync_calls == [("leader-at-sync", False)]  # sync BEFORE apply
+    assert b._is_leader is True  # failed read-back still applied leadership
+    with pytest.raises(RebootRanUnknownError):
+        b.reboot_ran("boot-job")
+
+
+@pytest.mark.asyncio
+async def test_renew_steady_state_syncs_after_apply(monkeypatch):
+    # an established leader (no gain) keeps the old order: apply, then the
+    # best-effort sync; an open gate stays open across the round.
+    b = _backend()
+    b._is_leader = True
+    b._lease_id = "111"
+    b._reboot_ran_synced = True
+    sync_calls = []
+
+    async def keepalive(lease_id):
+        return 15
+
+    async def campaign(lease_id):
+        return "node-a", True
+
+    async def sync():
+        sync_calls.append(("leader-at-sync", b._is_leader))
+
+    monkeypatch.setattr(b, "_keepalive", keepalive)
+    monkeypatch.setattr(b, "_campaign", campaign)
+    monkeypatch.setattr(b, "_sync_reboot_ran", sync)
+    await b._renew_once()
+
+    assert sync_calls == [("leader-at-sync", True)]
+    assert b._reboot_ran_synced is True
+    assert b.reboot_ran("boot-job") is False
+
+
+@pytest.mark.asyncio
+async def test_known_lease_loss_closes_reboot_gate(monkeypatch):
+    # a lost lease can be re-won within a single round with _is_leader never
+    # observed False -- another node may have led, run and marked a one-shot
+    # entirely between our two rounds. The loss itself must force a fresh
+    # read-back before "not ran" may be answered again.
+    from cronstable.leadership import RebootRanUnknownError
+
+    b = _backend()
+    b._is_leader = True
+    b._lease_id = "111"
+    b._reboot_ran_synced = True  # was synced while leading
+
+    async def keepalive(lease_id):
+        return 0  # lease already expired server-side
+
+    async def grant():
+        return "222", 15
+
+    async def campaign(lease_id):
+        return "node-a", True  # immediately re-won
+
+    async def sync():
+        pass  # read-back does NOT complete this round
+
+    monkeypatch.setattr(b, "_keepalive", keepalive)
+    monkeypatch.setattr(b, "_grant_lease", grant)
+    monkeypatch.setattr(b, "_campaign", campaign)
+    monkeypatch.setattr(b, "_sync_reboot_ran", sync)
+    await b._renew_once()
+
+    assert b._is_leader is True
+    assert b._reboot_ran_synced is False
+    with pytest.raises(RebootRanUnknownError):
+        b.reboot_ran("boot-job")

@@ -321,6 +321,11 @@ DEFAULT_WEBHOOK_BODY_TEMPLATE = (
     + "{% endfilter %}}"
 )
 
+# Named (not inlined below) because cronstable.fingerprint compares against it
+# to keep the reporter timeout out of a job's identity while it holds the
+# default -- see canonical_job's omit-when-default rule.
+DEFAULT_REPORT_SHELL_TIMEOUT = 60
+
 _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
@@ -350,6 +355,12 @@ _REPORT_DEFAULTS = {
     "shell": {
         "shell": platform.DEFAULT_SHELL,
         "command": None,
+        # hard bound (seconds) on the reporter command. Reports run INLINE on
+        # the reaper -- the daemon's single job-completion loop -- so a notify
+        # script that never exits (curl with no --max-time, a read from stdin)
+        # would otherwise freeze completion handling for every job in the
+        # daemon. On expiry the reporter's whole process group is killed.
+        "timeout": DEFAULT_REPORT_SHELL_TIMEOUT,
     },
     "webhook": {
         # resolved like sentry "dsn": value / fromFile / fromEnvVar. Treated
@@ -500,6 +511,9 @@ _report_schema = Map(
             {
                 Opt("shell"): Str(),
                 "command": Str() | Seq(Str()),
+                # seconds the reporter command may run before its process
+                # group is killed (default 60; it runs inline on the reaper).
+                Opt("timeout"): Float(),
             }
         ),
         Opt("webhook"): Map(
@@ -731,6 +745,14 @@ CONFIG_SCHEMA = EmptyDict() | Map(
             {
                 "listen": Seq(Str()),
                 Opt("headers"): MapPattern(Str(), Str()),
+                # extra exact-match browser Origins allowed to call the
+                # MUTATING web endpoints (start/cancel/trigger/...). Same-
+                # origin requests (the served dashboard) and clients that
+                # send no Origin (curl, monitoring) always pass; a foreign
+                # Origin is refused (403) as a CSRF/DNS-rebinding defense,
+                # mirroring mcp.allowedOrigins. See
+                # cronstable.cron.Cron._make_origin_middleware.
+                Opt("allowedOrigins"): Seq(Str()),
                 # optional opt-in bearer-token auth for the web API
                 Opt("authToken"): Map(
                     {
@@ -2255,7 +2277,12 @@ def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
         try:
             with open(spec["fromFile"], "rt") as secret_file:
                 secret = secret_file.read().strip()
-        except OSError as ex:
+        # UnicodeDecodeError alongside OSError: a fromFile pointing at binary
+        # data (a .p12 bundle, a gzip, a key with a stray high byte) raises it
+        # from read(), and callers only handle ConfigError -- on the job-secret
+        # staging path (cron._prepare_job_api_run) anything else escapes the
+        # scheduler loop and crash-loops the daemon at every fire of that job.
+        except (OSError, UnicodeDecodeError) as ex:
             raise ConfigError(
                 "{}.fromFile could not be read: {}".format(what, ex)
             ) from ex

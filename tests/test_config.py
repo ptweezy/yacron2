@@ -1084,3 +1084,33 @@ def test_web_node_history_points_range():
         _web_config("  nodeHistory:\n    points: 5\n")
     with pytest.raises(ConfigError, match="nodeHistory.points"):
         _web_config("  nodeHistory:\n    points: 999999\n")
+
+
+# ---- _resolve_secret hardening ----------------------------------------------
+
+
+def test_resolve_secret_binary_file_is_config_error(tmp_path):
+    # A fromFile pointing at binary data (a .p12 bundle, a gzip, a key with a
+    # stray high byte) raises UnicodeDecodeError from read(). It must surface
+    # as ConfigError -- the only exception callers handle: the job-secret
+    # staging path (cron._prepare_job_api_run) then skips the secret with a
+    # warning, instead of the raw UnicodeDecodeError escaping the scheduler
+    # loop and crash-looping the daemon at every fire of that job.
+    blob = tmp_path / "secret.bin"
+    # invalid in UTF-8 (lone continuation bytes), cp1252 (0x9d undefined) and,
+    # via the dangling 0xff lead at EOF, the common CJK multibyte codecs too.
+    blob.write_bytes(b"\x9d\x80\x00\xff")
+    with pytest.raises(ConfigError, match="could not be read"):
+        config._resolve_secret({"fromFile": str(blob)}, "job j secret s")
+
+
+def test_resolve_secret_missing_file_is_config_error(tmp_path):
+    with pytest.raises(ConfigError, match="could not be read"):
+        config._resolve_secret(
+            {"fromFile": str(tmp_path / "nope")}, "job j secret s"
+        )
+
+
+def test_web_allowed_origins_parse():
+    cfg = _web_config("  allowedOrigins:\n    - https://dash.example\n")
+    assert cfg["allowedOrigins"] == ["https://dash.example"]

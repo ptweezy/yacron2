@@ -314,6 +314,41 @@ async def test_concurrency_policy(policy):
                 await rj.cancel()
 
 
+FAILED_SPAWN_REPLACE_JOB = (
+    "jobs:\n  - name: test\n"
+    + yaml_command(["cronstable-no-such-binary-xyz"])
+    + """
+    schedule: "@reboot"
+    concurrencyPolicy: Replace
+"""
+)
+
+
+@pytest.mark.asyncio
+async def test_replace_policy_survives_failed_spawn():
+    # A spawn failure registers the instance with proc=None (start_failed);
+    # the next fire's Replace branch then cancels whatever running_jobs holds.
+    # cancel() raising RuntimeError("process is not running") there used to
+    # escape maybe_launch_job -- which spawn_jobs runs OUTSIDE run()'s
+    # try/except -- and kill the whole scheduler on the second fire after a
+    # bad deploy. (The cluster slot-renewer cancels through the same method,
+    # so this guards that path too.)
+    cron = cronstable.cron.Cron(None, config_yaml=FAILED_SPAWN_REPLACE_JOB)
+    job = cron.cron_jobs["test"]
+
+    await cron.maybe_launch_job(job)
+    first = cron.running_jobs["test"][0]
+    assert first.proc is None
+    assert first.start_failed is True
+
+    await cron.maybe_launch_job(job)  # Replace branch: must not raise
+    assert first.replaced is True
+
+    # the reaper still completes the never-spawned instance normally
+    await first.wait()
+    assert first.retcode == 127
+
+
 @pytest.mark.asyncio
 async def test_handle_finished_job_skips_replaced(monkeypatch):
     # a job cancelled to make way for a replacement must not be reported as a
@@ -591,7 +626,8 @@ async def test_schedule_retry_job_survives_transient_gate_blip(monkeypatch):
     )
     launched = []
     monkeypatch.setattr(
-        cron, "maybe_launch_job",
+        cron,
+        "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
@@ -640,7 +676,8 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
     assert cron._cluster_owner_moved(job) is False
     launched = []
     monkeypatch.setattr(
-        cron, "maybe_launch_job",
+        cron,
+        "maybe_launch_job",
         lambda job: launched.append(job.name) or _noop(),
     )
     monkeypatch.setattr(cronstable.cron, "RETRY_GATE_RECHECK_FLOOR", 0.01)
@@ -664,9 +701,7 @@ async def test_schedule_retry_job_defers_during_unsettled_view(
     deferred = [r for r in caplog.records if "deferred" in r.message]
     assert len(deferred) > 1  # the loop really re-checked several times
     assert [r.levelno for r in deferred].count(logging.INFO) == 1
-    assert all(
-        r.levelno in (logging.INFO, logging.DEBUG) for r in deferred
-    )
+    assert all(r.levelno in (logging.INFO, logging.DEBUG) for r in deferred)
     # (a settled view where the gate STAYS False is the genuine move case,
     # covered by test_schedule_retry_job_abandoned_when_no_longer_owner)
 
@@ -863,6 +898,133 @@ async def test_auth_middleware():
         await middleware(FakeRequest("Bearer wrong"), handler)
     with pytest.raises(web.HTTPUnauthorized):
         await middleware(FakeRequest(None), handler)
+    # a non-ASCII token must be a clean 401: compare_digest raises TypeError
+    # (-> 500 + traceback) on any non-ASCII str operand.
+    with pytest.raises(web.HTTPUnauthorized):
+        await middleware(FakeRequest("Bearer café"), handler)
+    # surrogates (raw header bytes that never decoded) cannot even encode --
+    # and can never match a real token; still a 401, not a 500.
+    with pytest.raises(web.HTTPUnauthorized):
+        await middleware(FakeRequest("Bearer t\udc80k"), handler)
+
+
+def test_origin_matches_host():
+    m = cronstable.cron._origin_matches_host
+    assert m("http://localhost:8021", "localhost:8021")
+    # default ports: a browser omits them in BOTH headers of a same-origin
+    # request, so both sides normalize from the Origin's scheme
+    assert m("https://cron.example.com", "cron.example.com")
+    assert m("http://cron.example.com", "cron.example.com")
+    # hostname case-insensitivity (urlparse lowercases both sides)
+    assert m("HTTP://LOCALHOST:8021", "LocalHost:8021")
+    # bracketed IPv6 authority
+    assert m("http://[::1]:8021", "[::1]:8021")
+    # scheme deliberately ignored: a TLS-terminating proxy shows the daemon
+    # plain http while the browser's Origin says https
+    assert m("https://localhost:8021", "localhost:8021")
+    assert not m("http://localhost:9999", "localhost:8021")
+    assert not m("http://evil.example", "localhost:8021")
+    # "null" (sandboxed iframe / redirect chain) and garbage fail closed
+    assert not m("null", "localhost:8021")
+    assert not m("garbage", "localhost:8021")
+    assert not m("http://localhost:8021", None)
+    assert not m("http://localhost:8021", "")
+    # a malformed port on either side can never match (urlparse defers the
+    # ValueError to .port; the helper must swallow it, not 500)
+    assert not m("http://localhost:notaport", "localhost:8021")
+    assert not m("http://localhost:8021", "localhost:notaport")
+
+
+@pytest.mark.asyncio
+async def test_origin_middleware_blocks_cross_site_mutations():
+    from aiohttp import web
+
+    middleware = cronstable.cron.Cron._make_origin_middleware(
+        frozenset({"https://dash.example"})
+    )
+
+    async def handler(request):
+        return web.Response(text="ok")
+
+    class FakeRequest:
+        def __init__(
+            self,
+            method="POST",
+            origin=None,
+            host="localhost:8021",
+            path="/jobs/x/start",
+        ):
+            self.method = method
+            self.headers = {} if origin is None else {"Origin": origin}
+            self.host = host
+            self.path = path
+
+    # non-browser clients (curl, monitoring) send no Origin: unaffected
+    resp = await middleware(FakeRequest(), handler)
+    assert resp.text == "ok"
+    # the served dashboard: same-origin POST passes
+    resp = await middleware(
+        FakeRequest(origin="http://localhost:8021"), handler
+    )
+    assert resp.text == "ok"
+    # operator-trusted extra origin (web.allowedOrigins) passes
+    resp = await middleware(
+        FakeRequest(origin="https://dash.example"), handler
+    )
+    assert resp.text == "ok"
+    # any other page the operator happens to visit: refused before the
+    # handler runs -- the CSRF this middleware exists to stop
+    with pytest.raises(web.HTTPForbidden):
+        await middleware(FakeRequest(origin="https://evil.example"), handler)
+    # "null" Origin fails closed
+    with pytest.raises(web.HTTPForbidden):
+        await middleware(FakeRequest(origin="null"), handler)
+    # safe methods pass untouched (reads mutate nothing; the browser's
+    # same-origin policy already hides their responses cross-site)
+    resp = await middleware(
+        FakeRequest(method="GET", origin="https://evil.example"), handler
+    )
+    assert resp.text == "ok"
+    # /mcp enforces its own allow-list (mcp.allowedOrigins) and must stay
+    # reachable for origins allow-listed THERE: exempt from this gate
+    resp = await middleware(
+        FakeRequest(origin="https://evil.example", path="/mcp"), handler
+    )
+    assert resp.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_web_app_origin_gate_end_to_end():
+    # the gate is wired into the real app even with NO authToken configured
+    # (the default posture the CSRF gate exists for): a cross-site POST is
+    # refused before the handler, while same-origin and Origin-less requests
+    # reach it (409 -- the job is disabled -- proves the handler answered).
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=DISABLED_JOB)
+    await cron.start_stop_web_app({"listen": ["http://127.0.0.1:0"]})
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                base + "/jobs/test/start",
+                headers={"Origin": "https://evil.example"},
+            ) as resp:
+                assert resp.status == 403
+            async with session.post(
+                base + "/jobs/test/start", headers={"Origin": base}
+            ) as resp:
+                assert resp.status == 409
+            async with session.post(base + "/jobs/test/start") as resp:
+                assert resp.status == 409
+    finally:
+        await cron.start_stop_web_app(None)
+        # let the Proactor's connection transports finish closing before the
+        # loop is torn down (the aiohttp-documented Windows grace period);
+        # otherwise their GC-time repr can raise "I/O operation on closed
+        # pipe" as a PytestUnraisableExceptionWarning.
+        await asyncio.sleep(0.25)
 
 
 def test_web_site_from_url_bad_scheme():
@@ -4475,6 +4637,38 @@ def test_reload_drops_disabled_job(tmp_path, monkeypatch):
     cfg.write_text(_ONE_MINUTE_JOB.rstrip() + "\n    enabled: false\n")
     cron.update_config()
     assert "m" not in cron._next_fire  # disabled -> not scheduled
+
+
+def test_reload_prunes_finished_run_maps(tmp_path, monkeypatch):
+    # _apply_reload prunes _last_run_slot and the metric series of removed
+    # jobs; last_run and run_history must go with them. A removed job's
+    # display data is unreachable (every payload guards on cron_jobs
+    # membership first), so keeping it is a pure leak -- worst under classic
+    # crontabs, whose <file>:<line> job names are reminted by every line
+    # added or removed above them.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_BEFORE)
+    cron = cronstable.cron.Cron(str(cfg))
+    for name in ("keep", "drop"):
+        info = cronstable.cron.JobRunInfo(
+            outcome="success",
+            exit_code=0,
+            started_at=DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC),
+            finished_at=DT(2020, 1, 1, 0, 0, 1, tzinfo=UTC),
+            fail_reason=None,
+            output=JobOutputStream(),
+        )
+        cron.last_run[name] = info
+        cron.run_history[name].append(info)
+
+    cfg.write_text(_RELOAD_AFTER)
+    cron.update_config()
+    assert "drop" not in cron.last_run  # removed job's data pruned
+    assert "drop" not in cron.run_history
+    assert "keep" in cron.last_run  # surviving job's data kept
+    assert len(cron.run_history["keep"]) == 1
 
 
 def _count_crontab_calls(monkeypatch):

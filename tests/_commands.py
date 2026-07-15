@@ -90,6 +90,27 @@ def cmd_hang(first, seconds):
     return _py(code)
 
 
+def cmd_spawn_helper_then_sleep(seconds):
+    """argv that leaves a helper holding the job's stdout, then sleeps.
+
+    The Python analog of ``sh -c 'helper & main'``: the spawned helper
+    inherits the job's stdout write-end and outlives its parent, so killing
+    only the process cronstable spawned never reaches EOF on the job's pipe --
+    the case :meth:`cronstable.job.RunningJob.cancel`'s process-group kill
+    exists for.  The helper's pid is written to stdout so a test can assert
+    whether it was reaped along with the group.
+    """
+    code = (
+        "import subprocess, sys, time; "
+        "p = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep({0})']); "
+        "sys.stdout.buffer.write(('%d\\n' % p.pid).encode()); "
+        "sys.stdout.buffer.flush(); "
+        "time.sleep({0})"
+    ).format(seconds)
+    return _py(code)
+
+
 def cmd_write_env(path):
     """argv that appends the CRONSTABLE_* report env vars to ``path``.
 

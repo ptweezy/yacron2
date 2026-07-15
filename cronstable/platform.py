@@ -10,6 +10,8 @@ platform and only this module needs a per-OS branch:
 * :data:`DEFAULT_CONFIG_PATH` -- where ``-c`` looks by default;
 * :func:`supports_unix_sockets` -- whether ``unix://`` web listeners work;
 * :func:`encode_argv` -- the argv form the platform's subprocess layer wants;
+* :func:`new_process_group_kwargs` / :func:`kill_process_group` -- spawning a
+  job so its descendants are reachable as one unit, and taking that unit down;
 * :func:`install_shutdown_handlers` -- wiring Ctrl-C / termination to a
   graceful-shutdown callback on whichever event loop the platform provides.
 
@@ -26,7 +28,7 @@ import os
 import signal
 import sys
 import time
-from typing import Callable, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 # Platform-specific file-locking primitive, imported behind a ``sys.platform``
 # guard so each OS pulls in only the module it has (``fcntl`` is Unix-only,
@@ -94,6 +96,110 @@ def encode_argv(argv: List[str]) -> List[Union[str, bytes]]:
     if IS_WINDOWS:
         return list(argv)
     return [arg.encode() for arg in argv]
+
+
+# --- Subprocess process groups -------------------------------------------
+#: How long :func:`kill_process_group` waits for a Windows ``taskkill`` to
+#: report back before giving up on it.  Generous: the caller's fallback is to
+#: kill the direct child only, so a slow-but-working taskkill is worth waiting
+#: for -- but it must never park the job runner indefinitely.
+TASKKILL_TIMEOUT = 10.0
+
+
+def new_process_group_kwargs() -> Dict[str, Any]:
+    """Subprocess kwargs that isolate a job in its own process group.
+
+    A job command routinely leaves descendants behind (``sh -c 'helper &
+    main'``), and each one inherits the write-end of the job's stdout/stderr
+    pipe.  Signalling only the direct child on an ``executionTimeout`` --
+    which is all ``Popen.terminate`` can do -- kills the shell but not the
+    helper, so the pipe never reaches EOF, the run never finishes draining,
+    and the job's slot is held forever (see
+    :meth:`cronstable.job.RunningJob._read_job_streams`).
+
+    On POSIX ``start_new_session`` puts the child in a brand-new session, so
+    it and every descendant share one process-group id -- the child's own pid
+    -- which :func:`kill_process_group` can then signal as a unit.  Windows
+    has no equivalent at spawn time; descendants are reached through the
+    process tree instead, so no creation flag is needed there.
+    """
+    if IS_WINDOWS:
+        return {}
+    return {"start_new_session": True}
+
+
+async def kill_process_group(pid: int, *, force: bool) -> bool:
+    """Signal the whole process group / tree rooted at ``pid``.
+
+    ``force`` selects an unconditional kill (POSIX ``SIGKILL``) over a
+    graceful request to exit (``SIGTERM``).  Returns whether the group was
+    signalled: ``False`` means the caller should fall back to signalling the
+    direct child on its own (:meth:`asyncio.subprocess.Process.terminate`),
+    which is all this module could do before.
+
+    ``pid`` must be the child spawned with :func:`new_process_group_kwargs`,
+    whose pid is by construction its own pgid.  Signalling the *group* rather
+    than the pid is what reaches an orphaned descendant, and it keeps working
+    after the leader itself has exited: a process group lives as long as any
+    member does, and the kernel will not recycle a pid that is still in use as
+    a pgid, so there is no risk of hitting an unrelated group.
+
+    Windows has no process group to signal, and no graceful equivalent at all
+    (``TerminateProcess`` is unconditional), so a non-forced call reports
+    ``False`` there and leaves the caller's direct-child terminate as the
+    graceful step.  A forced call shells out to ``taskkill /T``, which walks
+    the live parent/child tree.  Honest bound: a descendant already orphaned
+    when taskkill runs (its parent exited first) is no longer in that tree and
+    survives -- which is why the stream drain is separately bounded rather
+    than trusting this to always succeed.
+    """
+    if IS_WINDOWS:  # pragma: no cover - Windows-only path
+        if not force:
+            return False
+        return await _taskkill_tree(pid)
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        return False  # the whole group is already gone: nothing to signal
+    except OSError as ex:
+        logger.warning(
+            "could not signal the process group of pid %s (%s); "
+            "falling back to signalling that process alone",
+            pid,
+            ex,
+        )
+        return False
+    return True
+
+
+async def _taskkill_tree(pid: int) -> bool:  # pragma: no cover - Windows-only
+    """Kill ``pid`` and its process tree via ``taskkill /F /T``."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "taskkill",
+            "/F",
+            "/T",
+            "/PID",
+            str(pid),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as ex:
+        logger.warning("could not run taskkill for pid %s (%s)", pid, ex)
+        return False
+    try:
+        retcode = await asyncio.wait_for(proc.wait(), TASKKILL_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "taskkill for pid %s did not finish; abandoning it", pid
+        )
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return False
+    # 128 is taskkill's "process not found": the tree is already gone, so
+    # nothing was signalled and the caller's fallback is a no-op either way.
+    return retcode == 0
 
 
 # --- Graceful shutdown signalling ----------------------------------------

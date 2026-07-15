@@ -5,6 +5,113 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.18 (2026-07-15)
+
+A reliability release: correctness and hardening fixes across the job runner,
+the cluster backends, the DAG scheduler, and the web API, with no config
+migrations and no behavior change for a healthy single-node install.  Two
+scheduler-crash paths are closed, a clustered `@reboot` failover double-fire is
+sealed on etcd, the control API gains an always-on cross-site defense, and a
+family of unbounded or undecodable inputs can no longer wedge the daemon.
+
+- **Jobs run in their own process group, and cancellation takes the whole tree
+  down.** A job that leaves a helper behind (`sh -c 'helper & main'`) used to
+  strand its run forever: terminating only the process cronstable spawned left
+  the helper holding the job's stdout/stderr write-ends, so the pipe never
+  reached EOF, `wait()` never returned, the slot was never released, and under
+  `concurrencyPolicy: Forbid` the job never ran again.  Jobs now spawn in a
+  fresh session/process group (`start_new_session` on POSIX; the process tree
+  is walked by `taskkill /T` on Windows), and `cancel()` signals the **group** --
+  `SIGTERM`, then an unconditional `SIGKILL` after `killTimeout` -- so
+  descendants that outlive a killed shell go down with it and `executionTimeout`
+  bounds the run's work rather than just its root process.  As defense in depth
+  for a descendant that escaped the group (it called `setsid` itself, or Windows
+  lost the orphan from the tree), the post-kill stream drain is now bounded, so
+  the run always leaves `running_jobs` -- at the cost only of output already
+  lost -- and cronstable closes its end of the job's stdout/stderr pipe once
+  that drain returns, so such a run does not leak the pipe's read-end file
+  descriptor until garbage collection.
+
+- **Cancelling a never-spawned run is a no-op, not a scheduler crash.** A job
+  whose command failed to spawn registers with `proc=None`; the next fire's
+  `Replace` branch -- and the cluster slot-renewer -- then cancel whatever
+  `running_jobs` holds, and both run *outside* the scheduler loop's
+  `try/except`.  `cancel()` raising `RuntimeError("process is not running")`
+  there could take down the whole daemon on the second fire after a bad deploy;
+  it now logs and returns, and the reaper still completes the run through its
+  `start_failed` path.
+
+- **A clustered `@reboot` can no longer double-fire across an etcd failover.**
+  Leadership and the persisted `@reboot-ran` record live at separate etcd keys
+  read by separate requests, so a failover leader whose ran-set read blipped
+  could answer "not run yet" from a stale cache and re-run a one-shot the
+  previous leader had already marked.  The etcd backend now applies the same
+  conservative read-side gate the filesystem backend uses: between gaining
+  leadership (or a known lease loss) and the first completed read-back, it
+  answers `@reboot-ran` queries by deferring -- the one-shot stays pending and
+  is re-asked next wakeup -- rather than risking a second run.  The shared
+  `RebootRanUnknownError` moves to `cronstable.leadership` (re-exported from
+  `backends.filesystem` for compatibility); Kubernetes needs no gate, since its
+  ran-set rides the very Lease read that wins leadership.
+
+- **A transient store blip no longer freezes a mapped DAG task into an empty
+  fan-out.** A mapped task's expansion is recorded once and never recomputed, so
+  reading its upstream list at an instant the store could not answer (an
+  `ESTALE`/`EIO` on a shared NFS/EFS mount) used to be indistinguishable from
+  "published nothing" -- silently skipping the task's entire fan-out while
+  reporting success downstream.  `artifact_get`/`artifact_get_record` gain a
+  `strict=` mode that propagates an unreadable record instead of skipping it,
+  and the expansion read now maps a store error to **unknown** (stay unexpanded,
+  retry next pass), reserving the empty fan-out for a definitively absent,
+  non-list, or blob-gone (`410`) result.
+
+- **Cross-site request defense for the control API.** An always-on middleware
+  refuses cross-site browser requests to the mutating endpoints
+  (`POST /jobs/{name}/start`, `/cancel`, `/dags/{name}/trigger`, `/backfill`,
+  task decisions).  Those POSTs are CORS "simple requests" -- sent without a
+  preflight -- so without this any web page an operator happened to visit could
+  fire them at a localhost-bound daemon (classic CSRF, and the DNS-rebinding
+  variant).  Same-origin requests, and clients that send no `Origin` (curl,
+  monitoring), always pass; a foreign `Origin` is refused `403`.  A new
+  `web.allowedOrigins` allow-lists trusted cross-origin dashboards, a specific
+  `Access-Control-Allow-Origin` response header is folded in automatically, and
+  `Access-Control-Allow-Origin: *` disables the gate (logged loudly).  `/mcp`
+  keeps enforcing its own `mcp.allowedOrigins`.  The gate complements, not
+  replaces, `web.authToken`, and is the default posture when no token is set.
+
+- **The shell reporter is bounded.** Reports run inline on the reaper -- the
+  daemon's single job-completion loop -- so a notify command that never exits
+  (`curl` with no `--max-time`, a script that reads stdin) would freeze
+  completion handling for *every* job daemon-wide.  A new `report.shell.timeout`
+  (default 60 s) kills the reporter's whole process group on expiry and lets
+  completion proceed.
+
+- **Undecodable secret and token files fail cleanly instead of crash-looping.**
+  A `fromFile` secret pointing at binary data (a `.p12` bundle, a gzip, a key
+  with a stray high byte) raised `UnicodeDecodeError` from the read, which only
+  `ConfigError` callers handle -- so it escaped the scheduler loop and
+  crash-looped the daemon at every fire of that job, or 500'd web startup.
+  `config._resolve_secret` and `web.authToken.fromFile` now surface a clean
+  `ConfigError`.
+
+- **Smaller hardening across the surface.**  Bearer-token comparison now runs on
+  bytes, so a non-ASCII `Authorization` header is a clean `401` rather than a
+  `500`; secret redaction now catches the space-less `Authorization:Basic <b64>`
+  form (still requiring a separator, so ordinary prose is untouched); the
+  job-state base URL brackets IPv6 literals so `CRONSTABLE_STATE_URL` is
+  parseable (`http://[::1]:8080`); the semaphore `acquire` endpoint caps
+  `permits` at 1024, rejecting an absurd count up front instead of launching up
+  to a billion sequential store probes; the state CLI's binary artifact/xcom
+  verbs tolerate a non-JSON error body (a bare plaintext `401`) instead of
+  printing a `JSONDecodeError` traceback.
+
+- **Two in-memory leaks pruned.**  A reload now drops the `last_run` /
+  `run_history` display data of removed jobs -- unreachable once the job is gone,
+  and worst under classic crontabs, whose `<file>:<line>` job names are reminted
+  by every line added or removed above them -- and the DAG scheduler sweeps the
+  per-run advance locks it accumulated for every run it ever touched, keeping
+  only those still owned, held, or awaited.
+
 ## 1.2.17 (2026-07-14)
 
 A docs-and-examples release: no functional changes -- the package, the CLI,

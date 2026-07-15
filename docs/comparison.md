@@ -1,6 +1,6 @@
 # How cronstable compares
 
-**cronstable is the only cron-family scheduler with a built-in [MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** — so an AI agent (Claude, Cursor, Copilot) can observe every job, DAG and node, and act on them when you opt in. Nothing else in the field ships one natively — not even Apache Airflow. And it lands alongside durable state, a real DAG engine, leader-elected clustering and a live dashboard, in a single hardened, dependency-free daemon.
+**cronstable is the only cron-family scheduler with a built-in [MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)**. AI agents (Claude, Cursor, Copilot) can observe your cronstable state and act on them when you opt in. All alongside durable state, a real DAG engine, leader-elected clustering and a live dashboard, in a single hardened, dependency-free daemon.
 
 **Legend:** ✅ native · 🟡 partial / limited · ➕ requires an add-on · — not available
 

@@ -1009,6 +1009,20 @@ class RunningJob:
         # signal end-of-output to any live web log subscribers; their read
         # loops terminate on the sentinel this delivers.
         self.output.close()
+        # Close our end of the subprocess pipes now that both readers have been
+        # joined above. A run that reached EOF normally already had its
+        # transport closed by asyncio, so this is a no-op; but a KILLED run
+        # whose descendant escaped the group (see the bounded drain above)
+        # never reaches EOF, so without this its stdout/stderr pipe transport
+        # lingers unclosed until garbage collection -- leaking the read-end fd
+        # in a long-lived daemon, and, under the test harness, surfacing as a
+        # ProactorEventLoop "unclosed transport" finalizer error ("Event loop
+        # is closed") once the per-test loop is torn down. Closing here runs
+        # the transport's connection-lost on the live loop instead. close() is
+        # idempotent and, after the joins above, can lose no captured output.
+        transport = getattr(self.proc, "_transport", None)
+        if transport is not None:
+            transport.close()
 
     @property
     def failed(self) -> bool:

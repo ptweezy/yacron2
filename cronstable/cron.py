@@ -251,6 +251,62 @@ TREND_SCAN_LIMIT = 5000
 # browser then authenticates every data request with the token the user enters.
 WEB_PUBLIC_PATHS = frozenset({"/"})
 
+# HTTP methods the cross-site Origin gate waves through: none of the web API's
+# reads mutate anything, and the browser's same-origin policy already keeps a
+# foreign page from READING their responses (no CORS headers are set unless
+# the operator adds them). Everything else (the POST control endpoints) is a
+# state change and gets the Origin check. OPTIONS passes so the /mcp CORS
+# preflight handler keeps answering for its own allow-list.
+WEB_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# Paths that enforce their OWN Origin allow-list and are therefore exempt from
+# the app-wide gate: /mcp validates Origin against mcp.allowedOrigins and
+# answers CORS preflight itself (see cronstable.mcp.MCPHandler.handle_http);
+# gating it here too would 403 a browser MCP client the operator explicitly
+# allow-listed there.
+WEB_ORIGIN_EXEMPT_PATHS = frozenset({"/mcp"})
+
+
+def _origin_matches_host(origin: str, host: Optional[str]) -> bool:
+    """Whether a browser ``Origin`` header names this request's own ``Host``.
+
+    The same-origin test behind the web API's CSRF/DNS-rebinding gate
+    (:meth:`Cron._make_origin_middleware`): a page served by this daemon
+    posts with an Origin whose authority is exactly the URL the operator is
+    browsing -- the ``Host`` header -- while a foreign page's Origin names
+    the attacker's site.  ``Host`` cannot be chosen by the attacker's page
+    (the browser sets both headers), so equality is a trustworthy
+    same-origin signal.
+
+    Compares authority only (hostname + port, default ports normalized from
+    the Origin's scheme -- for a same-origin request both headers come from
+    one URL, so their implicit ports agree).  The scheme is deliberately NOT
+    compared: behind a TLS-terminating reverse proxy the browser's Origin
+    says ``https`` while the daemon speaks plain http, and a strict scheme
+    compare would 403 the operator's own dashboard.  ``Origin: null``
+    (sandboxed iframes, some redirect chains) and anything unparsable never
+    match -- fail closed.
+    """
+    if not host:
+        return False
+    try:
+        parsed = urlparse(origin)
+        if not parsed.scheme or not parsed.hostname:
+            return False  # "null", garbage, or a scheme-less token
+        default_port = 443 if parsed.scheme == "https" else 80
+        origin_port = parsed.port if parsed.port is not None else default_port
+        # the Host header is an authority, not a URL; give urlparse a
+        # netloc-shaped string so bracketed IPv6 hosts parse correctly.
+        hparsed = urlparse("//" + host)
+        if not hparsed.hostname:
+            return False
+        host_port = hparsed.port if hparsed.port is not None else default_port
+    except ValueError:
+        # urlparse defers port validation to .port; a malformed port in
+        # either header can never match anything.
+        return False
+    # .hostname lowercases both sides already
+    return parsed.hostname == hparsed.hostname and origin_port == host_port
+
 
 class ApiActionError(Exception):
     """A read/control action that failed with a client-facing reason.
@@ -726,6 +782,13 @@ class Cron:
         # forward-only next-fire index below is what actually de-duplicates
         # launches, so this no longer gates firing. See _launch_plan.
         self._last_run_slot = {}  # type: Dict[str, datetime.datetime]
+        # name -> most recent finished run, for the web UI (in-memory only)
+        # name -> bounded history of recent finished runs, oldest first, for
+        # the web UI's history/stats view (in-memory only, like last_run).
+        # Both pruned on reload like _last_run_slot; initialized HERE, before
+        # the update_config() below runs _apply_reload the first time.
+        self.last_run = {}  # type: Dict[str, JobRunInfo]
+        self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         # The next-fire index: name -> the aware-UTC instant the job next
         # fires, for every enabled CronTab job (a @reboot/string schedule or a
         # disabled job is absent). _fire_heap is a min-heap of (when, name)
@@ -767,11 +830,6 @@ class Cron:
         self._stop_event = asyncio.Event()
         self._jobs_running = asyncio.Event()
         self.retry_state = {}  # type: Dict[str, JobRetryState]
-        # name -> most recent finished run, for the web UI (in-memory only)
-        self.last_run = {}  # type: Dict[str, JobRunInfo]
-        # name -> bounded history of recent finished runs, oldest first, for
-        # the web UI's history/stats view (in-memory only, like last_run)
-        self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
         # the optional MCP server config and its handler. Both track the web
@@ -1333,6 +1391,16 @@ class Cron:
             for name, slot in self._last_run_slot.items()
             if name in keep
         }
+        # Prune the finished-run display data the same way. A removed job's
+        # last_run/run_history is unreachable (jobs_payload and the /runs
+        # endpoints iterate cron_jobs only), so keeping it is pure leaked
+        # memory -- worst under classic crontabs, whose <file>:<line> job
+        # names are reminted by every line added or removed above them.
+        self.last_run = {
+            name: info for name, info in self.last_run.items() if name in keep
+        }
+        for name in [n for n in self.run_history if n not in keep]:
+            del self.run_history[name]
         # Bring the next-fire index in step with the new job set: drop removed
         # / now-unscheduled jobs, reseed jobs whose schedule changed, and keep
         # the existing next-fire for jobs whose schedule is unchanged (a reseed
@@ -2628,6 +2696,37 @@ class Cron:
             ui_enabled = web_config.get("ui", True)
             metrics_config = resolve_metrics_config(web_config)
             middlewares = []
+            # Cross-site request defense for the mutating endpoints, ALWAYS
+            # installed -- with authToken unset this is the only thing between
+            # a localhost-bound daemon and any web page the operator visits
+            # (see _make_origin_middleware). Outermost, so a foreign page is
+            # refused before auth or handlers run. An operator who explicitly
+            # published the API cross-origin via a wildcard
+            # Access-Control-Allow-Origin response header keeps that (loudly);
+            # a specific ACAO origin is folded into the allow-list so an
+            # existing deliberate cross-origin dashboard survives the upgrade.
+            allowed_origins = set(web_config.get("allowedOrigins") or [])
+            custom_headers = web_config.get("headers") or {}
+            acao = next(
+                (
+                    value
+                    for key, value in custom_headers.items()
+                    if key.lower() == "access-control-allow-origin"
+                ),
+                None,
+            )
+            if acao == "*":
+                logger.warning(
+                    "web: headers set Access-Control-Allow-Origin: '*'; "
+                    "honouring it and NOT enforcing the cross-site Origin "
+                    "check on mutating endpoints"
+                )
+            else:
+                if acao:
+                    allowed_origins.add(acao)
+                middlewares.append(
+                    self._make_origin_middleware(frozenset(allowed_origins))
+                )
             token = self._resolve_web_token(web_config)
             if token is not None:
                 logger.info("web: requiring bearer-token authentication")
@@ -3652,7 +3751,11 @@ class Cron:
             try:
                 with open(auth["fromFile"], "rt") as token_file:
                     token = token_file.read().strip()
-            except OSError as ex:
+            # UnicodeDecodeError alongside OSError: a binary token file
+            # raises it from read(), and only ConfigError gets the clean
+            # "not starting the web API" handling (see run()); anything else
+            # is logged as an internal bug. Mirrors config._resolve_secret.
+            except (OSError, UnicodeDecodeError) as ex:
                 raise ConfigError(
                     "web.authToken.fromFile could not be read: {}".format(ex)
                 ) from ex
@@ -3671,6 +3774,8 @@ class Cron:
     def _make_auth_middleware(
         token: str, public_paths: "frozenset[str]" = frozenset()
     ):
+        token_bytes = token.encode("utf-8")
+
         @web.middleware
         async def auth_middleware(request, handler):
             if public_paths and request.path in public_paths:
@@ -3680,13 +3785,79 @@ class Cron:
             # RFC 7235: the auth scheme is case-insensitive (Bearer/bearer).
             # Compare only the token, in constant time, to avoid leaking it via
             # timing (the scheme is not secret).
-            if scheme.lower() != "bearer" or not hmac.compare_digest(
-                presented, token
-            ):
+            if scheme.lower() != "bearer":
+                raise web.HTTPUnauthorized()
+            try:
+                # compare as bytes: compare_digest raises TypeError on any
+                # non-ASCII str (turning a garbage token into a 500, not a
+                # 401), and a header that cannot even encode (surrogates
+                # from raw header bytes) can never match a real token.
+                presented_bytes = presented.encode("utf-8")
+            except UnicodeEncodeError:
+                raise web.HTTPUnauthorized() from None
+            if not hmac.compare_digest(presented_bytes, token_bytes):
                 raise web.HTTPUnauthorized()
             return await handler(request)
 
         return auth_middleware
+
+    @staticmethod
+    def _make_origin_middleware(allowed_origins: "frozenset[str]"):
+        """Refuse cross-site browser requests to the mutating endpoints.
+
+        The CSRF/DNS-rebinding gate for the control API, mirroring the
+        Origin allow-list /mcp already enforces (see
+        :meth:`cronstable.mcp.MCPHandler.handle_http`): the POST control
+        routes (``/jobs/{name}/start``, ``/jobs/{name}/cancel``,
+        ``/dags/{name}/trigger``, ...) are CORS "simple requests" -- no
+        preflight -- so without this any web page the operator happens to
+        visit can fire them at a localhost-bound daemon.  ``web.authToken``
+        also defeats that (a foreign page cannot attach the bearer header),
+        but the token is opt-in, and the default posture of an enabled
+        dashboard must not be "any website may start and cancel my jobs".
+
+        The rule, per request:
+
+        * safe methods (:data:`WEB_SAFE_METHODS`) pass -- nothing they hit
+          mutates, and CORS preflight must keep reaching /mcp's handler;
+        * paths enforcing their own list (:data:`WEB_ORIGIN_EXEMPT_PATHS`)
+          pass -- /mcp 403s foreign Origins itself;
+        * no ``Origin`` header passes -- curl/CLI/monitoring clients (every
+          current browser sends Origin on cross-site POSTs, which are the
+          attack this defends against);
+        * an Origin naming this daemon's own authority
+          (:func:`_origin_matches_host`) or on the operator's
+          ``web.allowedOrigins`` list passes;
+        * anything else is a 403.
+
+        Honest residual: a DNS-rebinding page served on the daemon's OWN
+        port (so Origin and Host genuinely agree after the rebind) passes
+        the equality test -- Origin-vs-Host cannot distinguish it from the
+        real dashboard. Cross-port and cross-host rebinds are refused, and
+        ``web.authToken`` closes the residual completely (a rebound page
+        holds no token).
+        """
+
+        @web.middleware
+        async def origin_middleware(request, handler):
+            if request.method in WEB_SAFE_METHODS:
+                return await handler(request)
+            if request.path in WEB_ORIGIN_EXEMPT_PATHS:
+                return await handler(request)
+            origin = request.headers.get("Origin")
+            if origin is None:
+                return await handler(request)
+            if origin in allowed_origins or _origin_matches_host(
+                origin, request.host
+            ):
+                return await handler(request)
+            raise web.HTTPForbidden(
+                text="Origin not allowed: cross-site requests to the "
+                "cronstable control API are refused; add the origin to "
+                "web.allowedOrigins if it is trusted"
+            )
+
+        return origin_middleware
 
     @staticmethod
     def _apply_socket_mode(addr: str, socket_mode: str) -> None:

@@ -100,6 +100,25 @@ def decode_reboot_ran(raw: Optional[str]) -> Tuple[Optional[str], Set[str]]:
     )
 
 
+class RebootRanUnknownError(RuntimeError):
+    """The @reboot-ran answer is not yet safe to give.
+
+    Raised by a lease backend's ``reboot_ran`` between GAINING leadership
+    and the first completed re-read of the persisted ran-set: until that
+    read lands, "not ran" may just mean "not read back yet", and the
+    consumer launches the deferred one-shot on a ``False`` -- the failover
+    double-fire the persisted set exists to prevent.  The one consumer,
+    ``cron._process_pending_reboots``, treats any raise from ``reboot_ran``
+    as "not known to have run" and keeps the one-shot PENDING -- never
+    launched, never retired -- re-evaluating on the next wakeup.  That is
+    the fail-safe direction: delaying an ``@reboot`` is acceptable;
+    re-running one the previous leader marked moments before failover is
+    not.  Shared by the filesystem and etcd backends (kubernetes needs no
+    gate: its ran-set rides the Lease annotations, so the very read that
+    wins leadership delivers it).
+    """
+
+
 class LeadershipBackend(abc.ABC):
     """The seam each leader-gating call in :mod:`cronstable.cron` goes through.
 

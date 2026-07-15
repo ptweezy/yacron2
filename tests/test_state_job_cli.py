@@ -346,6 +346,27 @@ def test_artifact_list(monkeypatch, capsys):
     assert capsys.readouterr().out == "x\n"
 
 
+def test_artifact_get_plaintext_error_body_clean_error(monkeypatch, capsys):
+    # a daemon that restarted mid-run no longer knows the run token; its
+    # bare 401 renders as PLAINTEXT "401: Unauthorized", not JSON. That must
+    # surface as the endpoint's HTTP error (a clean _CliError), never a
+    # JSONDecodeError traceback -- the binary artifact/xcom verbs used to
+    # parse error bodies unguarded, unlike every _json-routed verb.
+    http = _FakeHTTP({"/v1/artifact/get": (401, b"401: Unauthorized")})
+    assert _cli(monkeypatch, ["artifact", "get", "a"], http) == 1
+    assert "HTTP 401" in capsys.readouterr().err
+
+
+def test_artifact_put_plaintext_error_body_clean_error(
+    monkeypatch, capsys, tmp_path
+):
+    src = tmp_path / "a.txt"
+    src.write_bytes(b"payload")
+    http = _FakeHTTP({"/v1/artifact/put": (401, b"401: Unauthorized")})
+    assert _cli(monkeypatch, ["artifact", "put", "a.txt", str(src)], http) == 1
+    assert "HTTP 401" in capsys.readouterr().err
+
+
 def test_secret_get(monkeypatch, capsys):
     http = _FakeHTTP({"/v1/secret/get": (200, {"value": "sekret"})})
     assert _cli(monkeypatch, ["secret", "get", "TOKEN"], http) == 0

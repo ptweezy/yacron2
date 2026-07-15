@@ -20,7 +20,13 @@ import aiohttp
 
 from cronstable.config import parse_config_string
 from cronstable.cron import Cron
-from cronstable.jobapi import JobStateAPI, RunContext, run_environment
+from cronstable.jobapi import (
+    MAX_LOCK_PERMITS,
+    JobStateAPI,
+    RunContext,
+    _bracket_host,
+    run_environment,
+)
 from tests.test_state import _backend, _state_cfg
 
 _ONE_JOB = (
@@ -586,6 +592,36 @@ async def test_lock_acquire_non_numeric_fields_400(tmp_path):
     finally:
         await api.stop()
         await backend.stop()
+
+
+async def test_lock_acquire_permits_over_cap_400(tmp_path):
+    # permits comes straight from the request body, and every permit is a
+    # SEQUENTIALLY probed lease per acquire pass: an absurd count
+    # (--permits 1000000000) must be the caller's clean 400 up front, not a
+    # store-hammering scan.
+    api, backend = await _make_api(tmp_path)
+    api.register_run(_ctx())
+    try:
+        async with aiohttp.ClientSession(headers=_auth()) as s:
+            body = {"name": "L", "permits": MAX_LOCK_PERMITS + 1}
+            r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
+            assert r.status == 400
+            # the ceiling itself is accepted (slot 0 is free: instant grant).
+            body = {"name": "L", "permits": MAX_LOCK_PERMITS}
+            r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
+            assert (await r.json())["acquired"] is True
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
+def test_bracket_host_formats_ipv6_authority():
+    # the bound host goes into CRONSTABLE_STATE_URL: an IPv6 literal must be
+    # bracketed or "http://::1:8080" is unparseable to every consumer.
+    assert _bracket_host("127.0.0.1") == "127.0.0.1"
+    assert _bracket_host("localhost") == "localhost"
+    assert _bracket_host("::1") == "[::1]"
+    assert _bracket_host("fe80::1%eth0") == "[fe80::1%eth0]"
 
 
 async def test_idempotency_claim_non_numeric_ttl_400(tmp_path):

@@ -25,8 +25,9 @@ import sys
 
 import pytest
 
-from cronstable import dag, dagrun
+from cronstable import dag, dagrun, jobstate
 from cronstable.cron import Cron
+from tests.test_state_job_primitives import _break_record_reads
 
 _PY = sys.executable
 _UTC = datetime.timezone.utc
@@ -321,6 +322,47 @@ async def test_mapped_upstream_publishes_nothing_expands_empty(tmp_path):
         assert body["state"] == dag.SUCCESS, _states(body)
         assert body["mapped"]["work"]["items"] == []
         assert body["tasks"]["after"]["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_mapped_expansion_transient_read_error_is_not_an_empty_fanout(
+    tmp_path, monkeypatch
+):
+    # The counterpart to the test above: an upstream that DID publish its list,
+    # read at an instant the store cannot answer for (an ESTALE/EIO blip on a
+    # shared NFS/EFS mount). Expansion is recorded once and never recomputed,
+    # so reading that blip as "published nothing" would freeze it into a
+    # vacuously-successful empty fan-out -- the whole task's work silently
+    # skipped, with downstream tasks seeing success. It must read as UNKNOWN
+    # (None), leaving the task unexpanded to retry on a later pass.
+    yaml = (
+        "dags:\n  - name: tr\n    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: work\n        command: 'x'\n        dependsOn:\n"
+        "          - gen\n        expand:\n"
+        "          fromTask: gen\n          key: items\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        backend = cron.state_backend
+        scope = dag.xcom_scope("tr", "run-1")
+        await jobstate.artifact_put(
+            backend, scope, dag.xcom_name("gen", "items"), b'["a", "b"]'
+        )
+        read = cron._dag._read_xcom_list
+        assert await read("run-1", "tr", "gen", "items") == ["a", "b"]
+
+        _break_record_reads(
+            monkeypatch, backend, jobstate.ARTIFACT_STREAM_PREFIX + scope
+        )
+        # the fix: None (unknown -> retry), NOT [] (empty -> permanent)
+        assert await read("run-1", "tr", "gen", "items") is None
+
+        # the blip clears and the real fan-out is still there to be found: the
+        # run resumes with its work intact rather than having skipped it.
+        monkeypatch.undo()
+        assert await read("run-1", "tr", "gen", "items") == ["a", "b"]
     finally:
         await _teardown(cron)
 
@@ -749,6 +791,45 @@ async def test_decision_on_unowned_run_does_not_pin_wake(tmp_path):
         assert delay is not None and delay > 0
         body = await cron._dag.get_run("ap2", run_key)
         assert body["tasks"]["gate"]["approval"]["by"] == "bob"
+    finally:
+        await _teardown(cron)
+
+
+async def test_next_wake_delay_prunes_stale_advance_locks(tmp_path):
+    # regression: advance_one setdefaults a per-ref Lock -- including for
+    # peer-owned runs reached via an approval or a recorded completion --
+    # and nothing pruned the map, so a long-lived daemon accumulated one
+    # Lock per run it ever touched.  The sweep must also never drop a lock
+    # that is held, awaited, or owned: a waiter resumes holding the OLD
+    # object, and a fresh setdefault would advance the same run twice.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        stale = ("lin", "manual-stale")
+        held = ("lin", "manual-held")
+        cron._dag._locks.setdefault(stale, asyncio.Lock())
+        held_lock = cron._dag._locks.setdefault(held, asyncio.Lock())
+        await held_lock.acquire()
+        cron._dag.next_wake_delay()
+        assert stale not in cron._dag._locks  # unowned + idle: swept
+        assert held in cron._dag._locks  # held: kept
+
+        # the release window: a waiter has been woken (its future resolved)
+        # but has not resumed -- the lock reads unlocked, yet dropping it now
+        # would strand the waiter on the old object while a newcomer mints a
+        # fresh one.  The sweep must skip it.
+        async def _waiter():
+            async with held_lock:
+                pass
+
+        task = asyncio.ensure_future(_waiter())
+        await asyncio.sleep(0)  # _waiter registers itself as a waiter
+        held_lock.release()  # wakes the waiter; it has not run yet
+        assert not held_lock.locked()
+        cron._dag.next_wake_delay()
+        assert held in cron._dag._locks  # waiter pending: kept
+        await task  # the waiter acquires + releases the SURVIVING lock
+        cron._dag.next_wake_delay()
+        assert held not in cron._dag._locks  # now truly idle: swept
     finally:
         await _teardown(cron)
 

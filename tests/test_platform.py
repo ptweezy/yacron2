@@ -42,6 +42,35 @@ def test_supports_unix_sockets_matches_platform():
     assert platform.supports_unix_sockets() == (not platform.IS_WINDOWS)
 
 
+def test_new_process_group_kwargs_matches_platform():
+    kwargs = platform.new_process_group_kwargs()
+    if platform.IS_WINDOWS:
+        # no session to create at spawn time; the tree is walked at kill time.
+        assert kwargs == {}
+    else:
+        assert kwargs == {"start_new_session": True}
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="killpg / process groups are POSIX-only"
+)
+@pytest.mark.asyncio
+async def test_kill_process_group_signals_the_group_then_reports_it_gone():
+    import sys
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        **platform.new_process_group_kwargs(),
+    )
+    assert await platform.kill_process_group(proc.pid, force=True)
+    await asyncio.wait_for(proc.wait(), 10)
+    # the group is empty now: nothing was signalled, so the caller is told to
+    # fall back rather than being left thinking the kill landed.
+    assert not await platform.kill_process_group(proc.pid, force=True)
+
+
 def test_config_uses_platform_default_shell():
     conf = cronstable.config.parse_config_string(
         """

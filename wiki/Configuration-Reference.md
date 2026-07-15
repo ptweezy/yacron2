@@ -67,6 +67,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | --- | --- | --- | --- |
 | `listen` | `Seq(Str)` | required | Listen URLs, e.g. `http://127.0.0.1:8080` or `unix:///tmp/cronstable.sock`. `http://` listeners work everywhere; `unix://` listeners are not supported on Windows (the Proactor loop lacks `create_unix_server`) and are skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`. Use an `http://` listener instead. See [Running on Windows](Running-on-Windows). |
 | `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. |
+| `allowedOrigins` | `Seq(Str)` | `[]` | Extra exact-match browser `Origin`s allowed to call the **mutating** endpoints (`POST /jobs/{name}/start`, `/jobs/{name}/cancel`, `/dags/{name}/trigger`, `/dags/{name}/backfill`, task decisions). Cross-site browser requests to those endpoints are refused `403` as a CSRF/DNS-rebinding defense; same-origin requests (the served dashboard) and clients that send no `Origin` (curl, monitoring) always pass, and `/mcp` keeps enforcing its own `mcp.allowedOrigins`. Setting `headers` with `Access-Control-Allow-Origin: <origin>` implicitly allow-lists that origin; `Access-Control-Allow-Origin: "*"` disables the check (logged loudly). |
 | `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, cronstable refuses to start. |
 | `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. Only ever applies to unix sockets, so it is irrelevant on Windows (where `unix://` listeners are unsupported). |
 | `metrics` | `Bool \| Map` with `enabled` / `public` (each `Bool`) and `durationBuckets` (`Seq(Float)`) | enabled | The Prometheus `GET /metrics` endpoint, served by default whenever the web API is on. `metrics: false` (bool shorthand) disables it; the map form sets `enabled` (default `true`), `public` (default `false`; exempts only `/metrics` from `authToken`), and `durationBuckets` (histogram bounds in seconds; must be finite, positive, and strictly increasing, else a `ConfigError`). See [Metrics with Prometheus](Metrics-with-Prometheus). |
@@ -543,6 +544,7 @@ Defaults from `_REPORT_DEFAULTS["sentry"]`:
 | --- | --- | --- | --- |
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used to run the reporter command. The default is platform-specific, same as the per-job `shell` field: on Windows the default is empty (the reporter command runs via cmd.exe through `%ComSpec%`). Set `shell:` explicitly for another interpreter, or pass `command` as a list. See [Running on Windows](Running-on-Windows). |
 | `command` | `Str` or `Seq(Str)` | `None` | Reporter command (required key). Receives `CRONSTABLE_*` environment variables. |
+| `timeout` | `Float` | `60` | Hard bound, in seconds, on the reporter command; on expiry its whole process group is killed. Reports run inline on the daemon's job-completion loop, so a reporter that never exits would otherwise stall completion handling for every job. |
 
 #### `report.webhook`
 

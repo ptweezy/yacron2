@@ -153,6 +153,24 @@ def _http(
         ) from ex
 
 
+def _parse_body(body: bytes) -> Dict[str, Any]:
+    """A response body as a dict, tolerating non-JSON.
+
+    Error bodies are not always JSON: a daemon that restarted mid-run no
+    longer knows the run token, and its bare 401 renders as the plaintext
+    ``401: Unauthorized``.  A parse failure must degrade to ``{}`` so the
+    caller's ``_ok`` raises the endpoint's HTTP status as a clean
+    ``_CliError``, never a ``JSONDecodeError`` traceback.
+    """
+    try:
+        parsed = json.loads(body) if body else {}
+    except ValueError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {"value": parsed}
+    return parsed
+
+
 def _json(
     method: str,
     path: str,
@@ -169,13 +187,7 @@ def _json(
     status, _headers, body = _http(
         method, path, query=query, json_body=json_body, **kwargs
     )
-    try:
-        parsed = json.loads(body) if body else {}
-    except ValueError:
-        parsed = {}
-    if not isinstance(parsed, dict):
-        parsed = {"value": parsed}
-    return status, parsed
+    return status, _parse_body(body)
 
 
 def _ok(status: int, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -362,7 +374,7 @@ def _cmd_artifact(args: argparse.Namespace) -> int:
             query={"scope": scope, "name": args.name},
             data=payload,
         )
-        data = _ok(status, json.loads(body) if body else {})
+        data = _ok(status, _parse_body(body))
         sys.stdout.write(str(data.get("sha256", "")) + "\n")
         return 0
     if args.artifact_command == "get":
@@ -375,7 +387,7 @@ def _cmd_artifact(args: argparse.Namespace) -> int:
             print("artifact not found: {}".format(args.name), file=sys.stderr)
             return EXIT_NOT_FOUND
         if status >= 400:
-            _ok(status, json.loads(body) if body else {})
+            _ok(status, _parse_body(body))
         if args.output in (None, "-"):
             sys.stdout.buffer.write(body)
         else:
@@ -427,7 +439,7 @@ def _cmd_xcom(args: argparse.Namespace) -> int:
             query={"scope": scope, "name": my + "/" + args.key},
             data=payload,
         )
-        _ok(status, json.loads(body) if body else {})
+        _ok(status, _parse_body(body))
         return 0
     if args.xcom_command == "pull":
         upstream = args.task
@@ -445,7 +457,7 @@ def _cmd_xcom(args: argparse.Namespace) -> int:
             )
             return EXIT_NOT_FOUND
         if status >= 400:
-            _ok(status, json.loads(body) if body else {})
+            _ok(status, _parse_body(body))
         _write_output(args.output, body)
         return 0
     if args.xcom_command == "list":

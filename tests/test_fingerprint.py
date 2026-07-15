@@ -533,6 +533,64 @@ def test_job_set_id_golden_value():
     assert job_digest(jobs[0]) == GOLDEN_ALPHA_DIGEST
 
 
+# The golden above is the strongest tripwire for an accidental identity change,
+# but it is POSIX-only (the report block's default shell is platform-scoped), so
+# a Windows-only test run reports green while CI's Linux row fails. These lock
+# the omit-when-default rule for the *nested* report keys on every platform:
+# they assert on the presence/absence of the key and on relative digests, never
+# on a platform-scoped literal. A new entry in config._REPORT_DEFAULTS merges
+# into every job's report block and reaches identity without fingerprint.py
+# changing at all -- which is exactly how the reporter `timeout` first shipped
+# into every job's digest, repointing the persisted retry ladders and @reboot
+# markers keyed by job_digest.
+_REPORT_TIMEOUT_JOB = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        shell:
+          command: "true"
+{timeout}
+"""
+
+
+def _report_timeout_job(timeout=None):
+    line = "" if timeout is None else "          timeout: {}".format(timeout)
+    (job,) = _jobs(_REPORT_TIMEOUT_JOB.format(timeout=line))
+    return job
+
+
+def test_default_report_timeout_stays_out_of_identity():
+    # inherited-from-defaults: the key must not appear anywhere in identity, or
+    # every pre-existing job's digest changes on upgrade.
+    canon = canonical_job(_report_timeout_job())
+    for action in ("onFailure", "onPermanentFailure", "onSuccess"):
+        shell = canon[action]["report"]["shell"]
+        assert "timeout" not in shell, action
+
+
+def test_explicit_default_report_timeout_matches_inherited():
+    # the inline-vs-defaults guarantee, at the default value: writing the
+    # default out longhand must not fork the identity. `Float()` parses it to
+    # 60.0 where the inherited default is the int 60, so this also pins that
+    # the two spellings agree (cf. _normalize_numbers).
+    assert job_digest(_report_timeout_job(60)) == job_digest(
+        _report_timeout_job()
+    )
+
+
+def test_non_default_report_timeout_enters_identity():
+    # the other half of omit-when-default: a job that actually sets the field
+    # gets a new identity, so replicas disagreeing on it show as drift.
+    default = _report_timeout_job()
+    tightened = _report_timeout_job(5)
+    canon = canonical_job(tightened)
+    assert canon["onFailure"]["report"]["shell"]["timeout"] == 5
+    assert job_digest(tightened) != job_digest(default)
+
+
 EXPECTED_CANONICAL_FIELDS = frozenset(
     {
         "name",

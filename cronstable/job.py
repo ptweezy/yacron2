@@ -491,15 +491,59 @@ class ShellReporter(Reporter):
         )
 
         logger.debug("Executing shell report cmd: %s", cmd)
+        # Same process-group isolation as the job itself, so the timeout kill
+        # below reaches the reporter's descendants as a unit (see
+        # platform.new_process_group_kwargs).
+        kwargs = platform.new_process_group_kwargs()
         try:
-            proc = await create(*cmd, env=env)
-        except subprocess.SubprocessError:
+            proc = await create(*cmd, env=env, **kwargs)
+        # OSError for the same reason RunningJob.start catches it: a missing
+        # reporter binary (FileNotFoundError) or a spawn-time resource failure
+        # (EMFILE/ENOMEM/EAGAIN) is not a SubprocessError subclass, and a
+        # reporting problem must be logged, never propagated.
+        except (subprocess.SubprocessError, OSError):
             logger.exception(
                 "Error executing shell reporter of job %s", job.config.name
             )
             return
 
-        retcode = await proc.wait()
+        # Bounded: report() runs INLINE on the reaper, the daemon's single
+        # job-completion loop, so a reporter that never exits (curl with no
+        # --max-time, a script reading stdin) would otherwise freeze
+        # completion handling for EVERY job daemon-wide -- Forbid jobs stop
+        # firing, shutdown never finishes. On expiry the reporter's whole
+        # process group is killed and the run's handling proceeds.
+        timeout = shell_config.get("timeout") or 60
+        try:
+            retcode = await asyncio.wait_for(proc.wait(), timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Shell reporter of job %s did not finish within %.1f "
+                "seconds; killing it",
+                job.config.name,
+                timeout,
+            )
+            if not await platform.kill_process_group(proc.pid, force=True):
+                # group already gone or unsignallable: fall back to the
+                # direct child, guarded like RunningJob.cancel.
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+            # reap the killed child so it does not linger as a zombie. The
+            # direct child is dead after the kill above, so this returns at
+            # once; the extra bound only guarantees the reaper can never be
+            # wedged here no matter what.
+            try:
+                await asyncio.wait_for(proc.wait(), 10)
+            except asyncio.TimeoutError:  # pragma: no cover - defensive
+                logger.error(
+                    "Shell reporter of job %s could not be reaped after "
+                    "being killed",
+                    job.config.name,
+                )
+            return
         if retcode != 0:
             # not in an except block: a nonzero exit is not an exception, so
             # logger.exception would log a bogus "NoneType: None" traceback.
@@ -998,9 +1042,24 @@ class RunningJob:
         leaves ``running_jobs``, and under ``concurrencyPolicy: Forbid`` the
         job never runs again. Killing the group also makes ``executionTimeout``
         mean what it says: a bound on the run's work, not on its root process.
+
+        A run with no process (the spawn failed, so it registered with
+        ``proc=None`` and ``start_failed``) is a NO-OP, not an error: callers
+        cancel whatever ``running_jobs`` holds (the Replace branch of
+        ``maybe_launch_job``, the cluster slot-renewer), and several of those
+        paths run outside ``run()``'s try/except -- a raise here would escape
+        them and take down the whole scheduler over a job that never even
+        launched. The reaper still completes such a run through ``wait()``'s
+        ``start_failed`` path, so nothing is left stranded.
         """
         if self.proc is None:
-            raise RuntimeError("process is not running")
+            logger.info(
+                "Job %s: cancel is a no-op, no process was ever spawned "
+                "(start_failed=%s)",
+                self.config.name,
+                self.start_failed,
+            )
+            return
         self._terminated = True
         # Graceful first: SIGTERM the group. This reaches the descendants even
         # once the leader itself has exited, which is exactly the case that

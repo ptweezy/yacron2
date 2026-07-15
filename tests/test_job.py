@@ -3,6 +3,7 @@ import logging
 import os
 import signal
 import tempfile
+import time
 from unittest.mock import Mock, patch
 
 import aiosmtplib
@@ -1126,6 +1127,11 @@ async def test_error2():
 
 @pytest.mark.asyncio
 async def test_error3():
+    # cancel() with no process is a NO-OP, not a RuntimeError: callers cancel
+    # whatever running_jobs holds (a failed spawn registers with proc=None),
+    # and several of those paths run outside run()'s try/except -- a raise
+    # here used to take the whole scheduler down (see
+    # test_cancel_with_no_process_is_noop for the spawn-failed variant).
     conf = cronstable.config.parse_config_string(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(5))
@@ -1135,8 +1141,8 @@ async def test_error3():
     job_config = conf.jobs[0]
     job = cronstable.job.RunningJob(job_config, None)
 
-    with pytest.raises(RuntimeError):
-        await job.cancel()
+    await job.cancel()  # never started: must not raise
+    assert job.proc is None
 
 
 @pytest.mark.parametrize(
@@ -1686,6 +1692,97 @@ async def test_report_shell_truncates_large_output(
     assert env["CRONSTABLE_STDERR_TRUNCATED"] == exp_err_trunc
     assert len(env["CRONSTABLE_STDOUT"]) == exp_out_len
     assert len(env["CRONSTABLE_STDERR"]) == exp_err_len
+
+
+# --- cancel() on a run that never spawned -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_no_process_is_noop():
+    # A job whose command fails to spawn registers with proc=None and
+    # start_failed (see start()). The Replace branch of maybe_launch_job and
+    # the cluster slot-renewer then await cancel() on whatever running_jobs
+    # holds -- both OUTSIDE run()'s try/except -- so cancel() raising
+    # RuntimeError("process is not running") here used to take down the whole
+    # scheduler. It must be a no-op, and the reaper's wait() must still
+    # complete the run afterwards.
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(["cronstable-no-such-binary-xyz"])
+        + """
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    await job.start()
+    assert job.proc is None
+    assert job.start_failed is True
+
+    await job.cancel()  # must not raise
+    await job.cancel()  # idempotent
+
+    # the reaper path still pairs the finish: conventional 127 exit
+    await job.wait()
+    assert job.retcode == 127
+
+
+# --- shell reporter timeout --------------------------------------------------
+
+
+_SHELL_REPORTER_HANG_JOB = (
+    """
+jobs:
+  - name: test
+    command: echo the-command
+    schedule: "*/5 * * * *"
+    onFailure:
+      report:
+        shell:
+"""
+    + yaml_command(cmd_sleep(120), indent=10)
+    + """
+          timeout: 0.5
+"""
+)
+
+
+@pytest.mark.asyncio
+async def test_report_shell_hanging_reporter_is_killed():
+    # report() runs INLINE on the reaper -- the daemon's only job-completion
+    # loop -- so a reporter command that never exits used to freeze completion
+    # handling for every job daemon-wide. The configured timeout must kill the
+    # reporter's process group and let report() return.
+    conf = cronstable.config.parse_config_string(_SHELL_REPORTER_HANG_JOB, "")
+    job_config = conf.jobs[0]
+    assert job_config.onFailure["report"]["shell"]["timeout"] == 0.5
+    job = Mock(
+        config=job_config,
+        stdout="",
+        stderr="",
+        retcode=1,
+        fail_reason="boom",
+        failed=True,
+        resource_usage=None,
+    )
+    started = time.monotonic()
+    await asyncio.wait_for(
+        cronstable.job.ShellReporter().report(
+            False, job, job_config.onFailure["report"]
+        ),
+        60,
+    )
+    # returned because the 0.5s timeout killed the 120s sleeper, not because
+    # the sleeper finished (generous bound: process spawn + kill + reap).
+    assert time.monotonic() - started < 60
+
+
+def test_report_shell_timeout_defaults_to_60():
+    # the bound must exist even when the config never mentions it -- an
+    # unbounded default is exactly the reaper-wedging posture this guards.
+    conf = cronstable.config.parse_config_string(_SHELL_REPORTER_JOB, "")
+    report = conf.jobs[0].onFailure["report"]
+    assert report["shell"]["timeout"] == 60
 
 
 @pytest.mark.asyncio

@@ -78,7 +78,11 @@ import uuid
 from typing import Any, Callable, Dict, Optional, Set
 
 from cronstable.config import ClusterConfig, ConfigError, StateConfig
-from cronstable.leadership import LeaseBackend
+
+# RebootRanUnknownError is re-exported here for compatibility: it was born in
+# this module and is documented/imported as its conservative-gate error; it
+# now lives in cronstable.leadership so the etcd backend can share the gate.
+from cronstable.leadership import LeaseBackend, RebootRanUnknownError
 from cronstable.platform import IS_WINDOWS
 from cronstable.state import FilesystemStateBackend, Lease
 
@@ -173,21 +177,6 @@ def display_name(holder: Optional[str]) -> Optional[str]:
         return None
     name = holder.rsplit("#", 1)[0]
     return name or _UNKNOWN_HOLDER
-
-
-class RebootRanUnknownError(RuntimeError):
-    """The @reboot-ran answer is not yet safe to give.
-
-    Raised by :meth:`FilesystemBackend.reboot_ran` between GAINING
-    leadership and the first completed re-read of the persisted ran-set
-    (see ``_reboot_ran_synced``).  The one consumer,
-    ``cron._process_pending_reboots``, treats any raise from
-    ``reboot_ran`` as "not known to have run" and keeps the one-shot
-    PENDING -- never launched, never retired -- re-evaluating on the next
-    wakeup.  That is the fail-safe direction: delaying an ``@reboot`` is
-    acceptable; re-running one the previous leader marked moments before
-    failover is not.
-    """
 
 
 class FilesystemBackend(LeaseBackend):

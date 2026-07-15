@@ -49,6 +49,7 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `cronstable/con
 | --- | --- | --- | --- |
 | `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port` or `unix:///path`. An empty list disables the server. |
 | `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response (all routes, including `/cluster` and `/job-set-id`) and to the 409 conflict body, but not the 404 or 401. |
+| `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [Cross-site request defense](#cross-site-request-defense)). |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes (see [Authentication](#authentication)). |
 | `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
 
@@ -983,6 +984,49 @@ web:
 $ http get http://127.0.0.1:8080/status "Authorization:Bearer s3cr3t"
 $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 ```
+
+### Cross-site request defense
+
+Independently of `authToken`, an always-on middleware refuses **cross-site
+browser requests to the mutating endpoints** (`POST /jobs/{name}/start`,
+`POST /jobs/{name}/cancel`, `POST /dags/{name}/trigger`,
+`POST /dags/{name}/backfill`, and the task decision route). Those POSTs are
+CORS "simple requests" -- the browser sends them without a preflight -- so
+without this gate any web page an operator happens to visit could fire them
+at a localhost-bound daemon (classic CSRF, and the DNS-rebinding variant).
+The rule, per request:
+
+- Requests without an `Origin` header pass untouched: curl, monitoring
+  agents, and other non-browser clients are unaffected (every current
+  browser sends `Origin` on cross-site POSTs, which is the attack this
+  defends against).
+- An `Origin` whose authority matches the request's own `Host` passes: the
+  served dashboard keeps working, including behind a TLS-terminating reverse
+  proxy (the scheme is deliberately not compared, only hostname and port).
+- An `Origin` on `web.allowedOrigins` (exact match) passes -- for a trusted
+  dashboard served from another origin.
+- Anything else, including `Origin: null`, is refused `403`.
+
+`GET`/`HEAD`/`OPTIONS` are never gated (no read here mutates, and the
+browser's same-origin policy already hides their responses cross-site), and
+`/mcp` is exempt because it enforces its own `mcp.allowedOrigins` list with
+CORS preflight support (see [MCP](MCP)).
+
+Two escape hatches for deliberate cross-origin deployments: a specific
+origin in a `web.headers` `Access-Control-Allow-Origin` header is treated as
+allow-listed, and `Access-Control-Allow-Origin: "*"` disables the gate
+entirely (logged as a warning at startup).
+
+Note the gate complements, not replaces, `authToken`: with a bearer token
+configured a cross-site page could not authenticate anyway; without one, the
+gate is what keeps a browsing operator's localhost daemon from being driven
+by arbitrary web pages. Anyone who can reach the listen address directly
+(off-browser) is still governed only by `authToken` and network policy. One
+honest residual: a DNS-rebinding page served on the daemon's *own port* (so
+`Origin` and `Host` genuinely agree after the rebind) is indistinguishable
+from the real dashboard by header comparison alone -- cross-port and
+cross-host rebinds are refused, and `authToken` closes that residual
+completely.
 
 ### Fail-closed behavior
 

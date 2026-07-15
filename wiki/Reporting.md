@@ -258,6 +258,7 @@ variables.
 | --- | --- | --- | --- |
 | `shell` | str (Opt) | `/bin/sh` (POSIX); empty (Windows) | Shell used when `command` is a string. The default is platform-specific (`platform.DEFAULT_SHELL`), mirroring the job-level `shell` default: `/bin/sh` on POSIX, but empty (`""`) on Windows, where an empty default routes a string `command` through the native command processor (%ComSpec% / cmd.exe). See [Running on Windows](Running-on-Windows). |
 | `command` | str or list of str (required in block) | `None` | The command to run. A list is executed directly (argv); a string is run via `shell -c` when `shell` is set, or through the system default shell when `shell` is empty (the Windows default - see the execution model below). Required key when a `shell` block is present; reporting is skipped if it resolves to nothing. |
+| `timeout` | float (Opt) | `60` | Hard bound, in seconds, on the reporter command. Reports run inline on the daemon's single job-completion loop, so a notify script that never exits (`curl` with no `--max-time`, a script that reads stdin) would otherwise freeze completion handling for *every* job in the daemon. On expiry the reporter's whole process group is killed (descendants included) and the timeout is logged at `ERROR` level. |
 
 Execution model:
 
@@ -276,6 +277,9 @@ Execution model:
 - The reporter does not fail the job. A failure to launch the command is logged
   (with traceback) and the reporter returns; a nonzero exit code from the command
   is logged at `ERROR` level (without a spurious traceback).
+- The reporter command runs in its own process group and is killed -- together
+  with anything it spawned -- if it exceeds `timeout` (default 60 seconds), so
+  a hung notify script cannot stall the daemon's job-completion handling.
 
 ### Environment variables
 

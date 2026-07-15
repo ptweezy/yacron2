@@ -617,7 +617,15 @@ The cross-node "already ran" record that gossip advertises peer-to-peer is
 **persisted in the lease store** instead (a Kubernetes Lease annotation, an etcd
 sibling key, append-only records in the filesystem store's `cluster/reboot-ran`
 stream), scoped to the current [job-set id](#the-job-set-id-foundation), so
-a failover holder does not re-run the one-shot. Because the store outlives the
+a failover holder does not re-run the one-shot. That guarantee is closed from
+the read side too: a node that just **gained** leadership answers "did this
+one-shot already run?" conservatively -- pending `@reboot` one-shots stay
+deferred -- until it has completed a fresh read-back of the persisted record
+(on Kubernetes the ran-set rides the very Lease read that wins leadership; the
+filesystem and etcd backends force the re-read before a new holder may answer
+"not ran"). A store that cannot answer therefore *delays* a one-shot rather
+than risking a second run of one the previous leader marked moments before
+failing over. Because the store outlives the
 processes, this shifts the semantics: a `Leader` `@reboot` runs **once per job
 configuration**, not once per boot. Restarting the whole fleet with an unchanged
 config does *not* re-fire it -- every node reads the record back and retires the

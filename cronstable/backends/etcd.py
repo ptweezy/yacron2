@@ -37,6 +37,7 @@ import aiohttp
 from cronstable.config import ClusterConfig, _redact_userinfo
 from cronstable.leadership import (
     LeaseBackend,
+    RebootRanUnknownError,
     decode_reboot_ran,
     encode_reboot_ran,
 )
@@ -338,6 +339,21 @@ class EtcdBackend(LeaseBackend):
         # (the single writer of leadership state) once a round re-establishes
         # it.
         self._lease_lost = False
+        # INVARIANT (failover double-fire guard, mirroring FilesystemBackend):
+        # False from construction, from every leadership GAIN, and from every
+        # KNOWN lease loss, until a read-back of the persisted @reboot-ran key
+        # completes; while False, a holder answers reboot_ran() conservatively
+        # (raises RebootRanUnknownError instead of "not ran") because the
+        # cache may predate a one-shot the previous leader marked moments
+        # before failover. Set True ONLY by a completed read in
+        # _cas_write_reboot_ran. The lease-loss clear matters because a lost
+        # lease can be re-won within a single round with the raw _is_leader
+        # flag never observed False -- another node may have led, run and
+        # marked a one-shot entirely between our two rounds.
+        self._reboot_ran_synced = False
+        # rate-limits the holder's "deferring @reboot one-shots" warning in
+        # _sync_reboot_ran to once per outage (reset by a completed sync).
+        self._reboot_ran_warned = False
         self._holder: Optional[str] = None
         self._lease_id: Optional[str] = None
         # wall-clock expiry, for the dashboard/lease_detail display ONLY
@@ -944,6 +960,13 @@ class EtcdBackend(LeaseBackend):
                 # cycle instead of dropping to zero-run if the re-grant/re-
                 # campaign below raises before _apply_round runs.
                 self._lease_lost = True
+                # A KNOWN lease loss also invalidates the @reboot-ran cache:
+                # another node may win, run a deferred one-shot, mark it and
+                # yield back before our re-campaign below -- which would not
+                # read as a leadership GAIN here (_is_leader never observed
+                # False). Force a completed read-back before reboot_ran()
+                # may answer "not ran" again.
+                self._reboot_ran_synced = False
                 lease_mono = None  # re-anchored before the grant POST below
             else:
                 # honour the TTL etcd refreshed to (may be < requested)
@@ -963,8 +986,26 @@ class EtcdBackend(LeaseBackend):
         # the server lease's expiry. See _apply_round.
         now = _utcnow()
         mono = _monotonic()
+        gaining = won and not self._is_leader
+        if gaining:
+            # Takeover (or first win): the cached @reboot-ran set may predate
+            # a one-shot the old leader marked moments ago, so close the
+            # double-fire window from BOTH sides, as the filesystem backend
+            # does. The synced flag is cleared first, with no await in
+            # between, so reboot_ran() answers conservatively from this
+            # instant; the forced read-back then runs BEFORE leadership is
+            # applied, so a healthy takeover never exposes is_leader()==True
+            # next to a stale set (and one-shots are not delayed a round). A
+            # failed read-back still applies leadership below (the lease IS
+            # held; other leader-gated work must proceed) -- reboot_ran()
+            # keeps deferring, and the next round retries the sync. now/mono/
+            # lease_mono were sampled above, so the sync's own latency can
+            # extend neither the quorum freshness window nor the fence.
+            self._reboot_ran_synced = False
+            await self._sync_reboot_ran()
         self._apply_round(holder, won, now, mono, lease_mono)
-        await self._sync_reboot_ran()
+        if not gaining:
+            await self._sync_reboot_ran()
 
     # --- @reboot-ran persistence (H2: no peer set, so persist to the store) --
 
@@ -999,7 +1040,26 @@ class EtcdBackend(LeaseBackend):
             AttributeError,
             TypeError,
         ) as ex:
-            logger.debug("cluster: etcd reboot-ran sync failed: %s", ex)
+            if self._is_leader and not self._reboot_ran_synced:
+                # a holder that cannot read the ran-set back IS deferring its
+                # pending @reboot one-shots (see reboot_ran) -- surface that,
+                # once per outage (the latch resets on a completed sync).
+                if not self._reboot_ran_warned:
+                    self._reboot_ran_warned = True
+                    logger.warning(
+                        "cluster: could not read the @reboot-ran key (%s); "
+                        "deferring pending @reboot one-shots until a "
+                        "read-back completes",
+                        ex,
+                    )
+                else:
+                    logger.debug(
+                        "cluster: etcd reboot-ran sync failed: %s "
+                        "(still deferring pending @reboot one-shots)",
+                        ex,
+                    )
+            else:
+                logger.debug("cluster: etcd reboot-ran sync failed: %s", ex)
 
     async def _cas_write_reboot_ran(self) -> None:  # pragma: no cover
         """Read-modify-write the @reboot-ran key with optimistic concurrency.
@@ -1040,6 +1100,13 @@ class EtcdBackend(LeaseBackend):
                 mod_revision = "0"  # absent key: compare MOD == 0 succeeds
             stored_jsid, stored_jobs = decode_reboot_ran(raw)
             self._observe_reboot_ran(stored_jsid, stored_jobs)
+            # a COMPLETED read-back: the cache now reflects the store, so the
+            # conservative reboot_ran() gate opens (see __init__). Set here --
+            # not in the callers -- so BOTH the periodic sync and the eager
+            # mark-persist path open it, and a CAS that later contends out
+            # still counts (every retry re-read and re-folded the key).
+            self._reboot_ran_synced = True
+            self._reboot_ran_warned = False
             combined = self._reboot_ran | self._reboot_ran_local
             if not (combined - self._reboot_ran):
                 # the store already holds every mark we would write (after
@@ -1082,6 +1149,33 @@ class EtcdBackend(LeaseBackend):
             TypeError,
         ) as ex:
             logger.debug("cluster: etcd reboot-ran persist failed: %s", ex)
+
+    def reboot_ran(self, job_name: str) -> bool:
+        """The base answer, made conservative while a new leader is blind.
+
+        A positive answer is always safe to give (marks are append-only
+        within a job set, so a stale cache can only be MISSING marks, never
+        carry false ones).  A negative one is not: between GAINING leadership
+        (or a known lease loss) and the first completed read-back of the
+        persisted ran-set, "not ran" may just mean "not read back yet", and
+        cron launches the deferred one-shot on a False -- the failover
+        double-fire the persisted key exists to prevent.  So while
+        ``_reboot_ran_synced`` is False, any node still holding (or believing
+        to hold) the election key -- the raw win flag, which also covers the
+        never-skip self-demotion window -- raises
+        :class:`~cronstable.leadership.RebootRanUnknownError` instead; cron
+        keeps the one-shot pending and re-asks next wakeup, and the renew
+        loop retries the read-back every round until one completes.  Mirrors
+        :meth:`cronstable.backends.filesystem.FilesystemBackend.reboot_ran`.
+        """
+        if super().reboot_ran(job_name):
+            return True
+        if self._is_leader and not self._reboot_ran_synced:
+            raise RebootRanUnknownError(
+                "@reboot-ran key not read back since gaining leadership; "
+                "deferring {!r}".format(job_name)
+            )
+        return False
 
     async def stop(self) -> None:  # pragma: no cover - network
         self._stop.set()

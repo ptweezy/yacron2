@@ -321,6 +321,11 @@ DEFAULT_WEBHOOK_BODY_TEMPLATE = (
     + "{% endfilter %}}"
 )
 
+# Named (not inlined below) because cronstable.fingerprint compares against it
+# to keep the reporter timeout out of a job's identity while it holds the
+# default -- see canonical_job's omit-when-default rule.
+DEFAULT_REPORT_SHELL_TIMEOUT = 60
+
 _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
@@ -355,7 +360,7 @@ _REPORT_DEFAULTS = {
         # script that never exits (curl with no --max-time, a read from stdin)
         # would otherwise freeze completion handling for every job in the
         # daemon. On expiry the reporter's whole process group is killed.
-        "timeout": 60,
+        "timeout": DEFAULT_REPORT_SHELL_TIMEOUT,
     },
     "webhook": {
         # resolved like sentry "dsn": value / fromFile / fromEnvVar. Treated

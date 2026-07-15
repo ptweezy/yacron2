@@ -45,7 +45,11 @@ import hashlib
 import json
 from typing import Any, Dict, Iterable, List, Union
 
-from cronstable.config import JobConfig, schedule_object_to_crontab
+from cronstable.config import (
+    DEFAULT_REPORT_SHELL_TIMEOUT,
+    JobConfig,
+    schedule_object_to_crontab,
+)
 
 # Canonicalization scheme version.  Prefixes the emitted ID and is folded into
 # the hash input, so a future change to what/how we canonicalize can bump this
@@ -146,6 +150,34 @@ def _redact_report(report: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _omit_default_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop report fields that post-date the v1 scheme while still at default.
+
+    The omit-when-default rule (see :func:`canonical_job`) applies to nested
+    report keys too, and is easier to get wrong here: a new entry in
+    ``config._REPORT_DEFAULTS`` merges into every job's report block and lands
+    in identity without anything in this module changing, silently repointing
+    every job's digest.
+
+    ``report`` must be a dict the caller owns -- it is: ``_redact_report``
+    always returns a fresh top-level copy. Untouched subtrees are still shared
+    by reference with the live JobConfig, so ``shell`` is replaced, never
+    mutated in place (see test_canonical_job_is_json_safe_and_pure).
+
+    An inline ``timeout: 60`` parses to ``60.0`` via ``Float()`` while the
+    default inherited from ``_REPORT_DEFAULTS`` stays the int ``60``; ``==``
+    spans both, so the two spell the same identity -- consistent with what
+    ``_normalize_numbers`` guarantees for every other numeric field.
+    """
+    shell = report.get("shell")
+    if (
+        isinstance(shell, dict)
+        and shell.get("timeout") == DEFAULT_REPORT_SHELL_TIMEOUT
+    ):
+        report["shell"] = {k: v for k, v in shell.items() if k != "timeout"}
+    return report
+
+
 def _redact_action(action: Dict[str, Any]) -> Dict[str, Any]:
     """Copy an on{Failure,PermanentFailure,Success} block, redacting secrets.
 
@@ -153,7 +185,9 @@ def _redact_action(action: Dict[str, Any]) -> Dict[str, Any]:
     """
     out = dict(action)
     if "report" in out and isinstance(out["report"], dict):
-        out["report"] = _redact_report(out["report"])
+        out["report"] = _omit_default_report_fields(
+            _redact_report(out["report"])
+        )
     return out
 
 

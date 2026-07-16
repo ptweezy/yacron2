@@ -436,7 +436,7 @@
     <p class="lede">Point cronstable at the crontab you already run and <strong>it behaves like plain cron</strong>. Reach for DAGs, durable state, leader-elected clustering and a live dashboard only when you need them, all from one dependency-free daemon. And when you want it, a built-in Model Context Protocol server lets an AI agent drive the whole thing.</p>
 
     <div class="chips">
-      <span class="chip green"><span class="cd"></span><b>24 / 24</b><span>native features</span></span>
+      <span class="chip green"><span class="cd"></span><b>35 / 35</b><span>native features</span></span>
       <span class="chip"><span class="cd"></span><b>5-in-1</b><span>scheduler &middot; DAGs &middot; state &middot; cluster &middot; console</span></span>
       <span class="chip brass"><span class="cd"></span><b>23</b><span>MCP tools</span></span>
       <span class="chip"><span class="cd"></span><b>0</b><span>new dependencies</span></span>
@@ -500,15 +500,15 @@
           <th class="cs" scope="col">
             <span class="th-name">cronstable</span>
             <div class="meter"><i style="width:100%"></i></div>
-            <div class="th-count">24 native</div>
+            <div class="th-count">35 native</div>
           </th>
-          <th scope="col"><span class="th-name">yacron</span><div class="th-sub">Python · YAML</div><div class="meter"><i style="width:29%"></i></div><div class="th-count">7 native</div></th>
-          <th scope="col"><span class="th-name">supercronic</span><div class="th-sub">Go · crontab</div><div class="meter"><i style="width:21%"></i></div><div class="th-count">5 native</div></th>
-          <th scope="col"><span class="th-name">Ofelia</span><div class="th-sub">Go · Docker</div><div class="meter"><i style="width:13%"></i></div><div class="th-count">3 native</div></th>
-          <th scope="col"><span class="th-name">dkron</span><div class="th-sub">Go · distributed</div><div class="meter"><i style="width:33%"></i></div><div class="th-count">8 native</div></th>
-          <th scope="col"><span class="th-name">Cronicle</span><div class="th-sub">Node · master/worker</div><div class="meter"><i style="width:38%"></i></div><div class="th-count">9 native</div></th>
-          <th scope="col"><span class="th-name">K8s CronJob</span><div class="th-sub">native resource</div><div class="meter"><i style="width:25%"></i></div><div class="th-count">6 native</div></th>
-          <th class="orch" scope="col"><span class="th-name">Airflow</span><div class="th-sub">Python · orchestrator</div><div class="meter"><i style="width:54%"></i></div><div class="th-count">13 native</div><span class="th-tag orch">Diff. class</span></th>
+          <th scope="col"><span class="th-name">yacron</span><div class="th-sub">Python · YAML</div><div class="meter"><i style="width:26%"></i></div><div class="th-count">9 native</div></th>
+          <th scope="col"><span class="th-name">supercronic</span><div class="th-sub">Go · crontab</div><div class="meter"><i style="width:20%"></i></div><div class="th-count">7 native</div></th>
+          <th scope="col"><span class="th-name">Ofelia</span><div class="th-sub">Go · Docker</div><div class="meter"><i style="width:11%"></i></div><div class="th-count">4 native</div></th>
+          <th scope="col"><span class="th-name">dkron</span><div class="th-sub">Go · distributed</div><div class="meter"><i style="width:26%"></i></div><div class="th-count">9 native</div></th>
+          <th scope="col"><span class="th-name">Cronicle</span><div class="th-sub">Node · master/worker</div><div class="meter"><i style="width:26%"></i></div><div class="th-count">9 native</div></th>
+          <th scope="col"><span class="th-name">K8s CronJob</span><div class="th-sub">native resource</div><div class="meter"><i style="width:23%"></i></div><div class="th-count">8 native</div></th>
+          <th class="orch" scope="col"><span class="th-name">Airflow</span><div class="th-sub">Python · orchestrator</div><div class="meter"><i style="width:51%"></i></div><div class="th-count">18 native</div><span class="th-tag orch">Diff. class</span></th>
         </tr>
       </thead>
       <tbody>
@@ -568,6 +568,42 @@
         </tr>
 
         <tr>
+          <td class="feat"><div class="f-name">Sub-minute schedules</div><div class="f-sub">second-level, 7-field</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">7-field &middot; down to 1s</span></td>
+          <td class="no" title="Schedule keys stop at minute and the loop sleeps on a fixed 1-minute WAKEUP_INTERVAL aligned to second 0, so a seconds column never ticks."><span class="mk">–</span></td>
+          <td class="yes" title="Second-resolution schedules via the cronexpr package; the README ships */2 * * * * * * running every 2 seconds."><span class="mk">✓</span></td>
+          <td class="yes" title="robfig/cron with an optional leading seconds field, plus @every 10s durations; seconds were mandatory in 0.3.x."><span class="mk">✓</span></td>
+          <td class="yes" title="Six-field spec with a mandatory leading seconds column (0-59), plus @every 10s durations parsed by time.ParseDuration."><span class="mk">✓</span></td>
+          <td class="no" title="The event Timing object stops at minutes with no seconds key, so one minute is the finest granularity."><span class="mk">–</span></td>
+          <td class="no" title="Five-field .spec.schedule with no seconds column; one minute is the floor and @hourly is the finest macro."><span class="mk">–</span></td>
+          <td class="partial orch" title="schedule=timedelta(seconds=30) fires sub-minute, but the cron path is croniter five-field with no seconds column."><span class="mk">◐</span><span class="cap">timedelta only</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Extended cron dialect</div><div class="f-sub">L &middot; L5 &middot; year column</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">last-day &middot; last-Fri &middot; year</span></td>
+          <td class="yes" title="parse-crontab supplies L, L5 and a 1970-2099 year column on string schedules, and adds Z1/Z2 month-end offsets cronstable lacks; the dict schedule form silently drops year."><span class="mk">✓</span></td>
+          <td class="yes" title="Vendors gorhill/cronexpr: L and W in day-of-month, 5L for last Friday, and an optional 1970-2099 year column."><span class="mk">✓</span></td>
+          <td class="no" title="robfig/cron permits only * / , - and ? across five fields; no L, no W, no # and no year column."><span class="mk">–</span></td>
+          <td class="no" title="The cron spec allows only * / , - ? and ~; no L or #, and the extra field is seconds rather than a year."><span class="mk">–</span></td>
+          <td class="partial" title="The Timing object has a first-class years key, but every field is a numeric array with no last-day or last-weekday keyword."><span class="mk">◐</span><span class="cap">year, no L</span></td>
+          <td class="no" title="robfig/cron/v3 has no L, W or # and no year field; last-day-of-month (kubernetes#121088) was closed as not planned."><span class="mk">–</span></td>
+          <td class="yes orch" title="croniter, a required dependency, supplies L and L5 plus a 1970-2099 year column, though as a 7th field after its seconds slot."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">@reboot once per OS boot</div><div class="f-sub">durable boot marker</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">per boot, not per restart</span></td>
+          <td class="partial" title="@reboot runs when the process is executed, with no persisted boot marker, so it re-fires on every daemon restart."><span class="mk">◐</span><span class="cap">per process start</span></td>
+          <td class="no" title="The cronexpr shortcut table lists @reboot as Not supported; the feature request (issue #30) has been open since 2018."><span class="mk">–</span></td>
+          <td class="no" title="robfig/cron rejects @reboot as an unrecognized descriptor; the run-on-startup PR #184 is still unmerged."><span class="mk">–</span></td>
+          <td class="no" title="Predefined schedules span @yearly to @minutely plus @every, @at and @manually, with no @reboot and no boot-scoped state."><span class="mk">–</span></td>
+          <td class="no" title="Event Timing is a selector over years down to minutes only; no boot or server-startup timing option exists."><span class="mk">–</span></td>
+          <td class="no" title="Only the @yearly through @hourly macros; Jobs are scheduled onto arbitrary nodes with no per-node boot identity."><span class="mk">–</span></td>
+          <td class="no orch" title="Cron presets stop at @once and @continuous through @yearly; no timetable keys off host boot identity."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
           <td class="feat"><div class="f-name">Arbitrary per-job timezones</div></td>
           <td class="cs yes"><span class="mk">✓</span><span class="cap">any IANA zone, per job</span></td>
           <td class="yes" title="Per-job timezone attribute since v0.11 (pytz), plus utc flag."><span class="mk">✓</span></td>
@@ -592,6 +628,18 @@
         </tr>
 
         <tr>
+          <td class="feat"><div class="f-name">Configurable failure conditions</div><div class="f-sub">stdout &middot; stderr &middot; exit code</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">failsWhen &middot; stderr default</span></td>
+          <td class="yes" title="Identical failsWhen block with producesStdout, producesStderr, nonzeroReturn and always, deep-merged from defaults."><span class="mk">✓</span></td>
+          <td class="no" title="Failure is the exit status alone; stderr is drained to a log channel and never fails the run, and no flag changes it."><span class="mk">–</span></td>
+          <td class="no" title="Failure comes from the exit status; stderr is buffered for logs and mail only, with no key to make output fail the job."><span class="mk">–</span></td>
+          <td class="partial" title="The HTTP executor fails unless the status matches expectCode or the body matches expectBody, but the shell executor keys off exit status alone."><span class="mk">◐</span><span class="cap">HTTP jobs only</span></td>
+          <td class="partial" title="The HTTP Request plugin has Success Match and Error Match regexes, but the Shell Plugin keys off the exit code alone."><span class="mk">◐</span><span class="cap">HTTP jobs only</span></td>
+          <td class="partial" title="podFailurePolicy matches onExitCodes with FailJob/Ignore/Count actions, but no rule can match stdout or stderr content."><span class="mk">◐</span><span class="cap">exit codes only</span></td>
+          <td class="partial orch" title="BashOperator skip_on_exit_code remaps exit codes, but failing on stream content needs a custom output_processor callable."><span class="mk">◐</span><span class="cap">exit codes only</span></td>
+        </tr>
+
+        <tr>
           <td class="feat"><div class="f-name">Retries with exponential backoff</div></td>
           <td class="cs yes"><span class="mk">✓</span><span class="cap">backoff · survives restart</span></td>
           <td class="yes" title="onFailure retry: maximumRetries, initialDelay, maximumDelay, backoffMultiplier (exponential)."><span class="mk">✓</span></td>
@@ -601,6 +649,18 @@
           <td class="partial" title="Up to 32 retries with fixed retry delay, not exponential backoff."><span class="mk">◐</span><span class="cap">fixed delay</span></td>
           <td class="yes" title="Job backoffLimit (default 6), exponential backoff 10s to 6min cap."><span class="mk">✓</span></td>
           <td class="yes orch" title="Per-task retries with retry_delay, retry_exponential_backoff, and max_retry_delay cap."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Depends-on-past gate</div><div class="f-sub">skip while the last run fails</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">onlyIfLastSucceeded</span></td>
+          <td class="no" title="Job options top out at concurrencyPolicy, retry, failsWhen and onFailure; none read the previous run's outcome."><span class="mk">–</span></td>
+          <td class="no" title="Serializes a job against its own running instance and logs return codes, but keeps no cross-run state to gate on."><span class="mk">–</span></td>
+          <td class="no" title="Job params cover schedule, command, user, tty and no-overlap; nothing consults the prior run's exit status."><span class="mk">–</span></td>
+          <td class="no" title="The Job model persists last_success and last_error, but isRunnable() only checks concurrency, never the last outcome."><span class="mk">–</span></td>
+          <td class="no" title="Concurrency, Retries, Timeout and Chain Reaction exist, but none gate a scheduled fire on the last run's result."><span class="mk">–</span></td>
+          <td class="no" title="concurrencyPolicy Forbid skips only while the previous Job is unfinished; a completed failed Job never blocks the next."><span class="mk">–</span></td>
+          <td class="yes orch" title="depends_on_past holds a task until the same task in the prior data interval succeeds, and wait_for_downstream extends it; it blocks the run rather than skipping the fire."><span class="mk">✓</span></td>
         </tr>
 
         <tr>
@@ -640,6 +700,30 @@
           <td class="yes" title="chain_data passes arbitrary JSON to the next chained event."><span class="mk">✓</span></td>
           <td class="addon" title="Not in CronJob; Argo Workflows passes parameters/artifacts between steps."><span class="mk">+</span><span class="cap">Argo</span></td>
           <td class="yes orch" title="XCom passes data between tasks; pluggable custom XCom backends supported. (cronstable borrows the name.)"><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Dynamic task mapping</div><div class="f-sub">fan-out over a list, then fan-in</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">expand: over upstream list</span></td>
+          <td class="no" title="The job schema covers schedule, command, concurrencyPolicy, retry and timeouts; no dependency, DAG or list-expansion key."><span class="mk">–</span></td>
+          <td class="no" title="Executes crontab lines independently; the flag set has no dependency or fan-out mechanism."><span class="mk">–</span></td>
+          <td class="no" title="All four job types accept schedule, command and no-overlap; no dependency, DAG or list-expansion key."><span class="mk">–</span></td>
+          <td class="no" title="parent_job/dependent_jobs is a static 1:1 dependency with no data passed from parent to child and no list-driven instantiation."><span class="mk">–</span></td>
+          <td class="no" title="Chain Reaction launches one successor per job and Multiplexing fans out per targeted server, not per item in an upstream list; no fan-in."><span class="mk">–</span></td>
+          <td class="no" title="One singular jobTemplate with no upstream task to map over; Indexed completions only shard a fixed count inside a single Job."><span class="mk">–</span></td>
+          <td class="yes orch" title="expand() and expand_kwargs() map a task over an upstream XCom list with partial() constants and a lazy fan-in, capped by max_map_length; it also permits mapping over a mapped task, which cronstable rejects."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Sensors</div><div class="f-sub">poll-until-true tasks</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">durable poke schedule</span></td>
+          <td class="no" title="Job keys are schedule, retry, concurrencyPolicy and timeouts; no dependency, wait or poll-until-true option exists."><span class="mk">–</span></td>
+          <td class="no" title="A crontab runner whose flags are -overlapping, -inotify, -test and -split-logs; no wait-for-condition mode."><span class="mk">–</span></td>
+          <td class="no" title="All four job types fire on a cron schedule; there is no wait-for-condition job type."><span class="mk">–</span></td>
+          <td class="no" title="parent_job chains dependents on exit status, but the shell, http and kafka executors offer no poll-until-true task type."><span class="mk">–</span></td>
+          <td class="no" title="Chain Reaction, Retries and Timeout exist, but there is no sensor event type; polling would live inside a custom Plugin."><span class="mk">–</span></td>
+          <td class="no" title="The batch/v1 spec is schedule, jobTemplate, concurrencyPolicy, startingDeadlineSeconds, suspend and timeZone; no wait-for-condition field."><span class="mk">–</span></td>
+          <td class="yes orch" title="BaseSensorOperator adds poke_interval, timeout, exponential_backoff and soft_fail, and reschedule mode plus deferrable triggers persist the next poke across a restart."><span class="mk">✓</span></td>
         </tr>
 
         <tr>
@@ -691,6 +775,30 @@
           <td class="no" title="Single-primary scheduler; no fenced-lease / etcd exactly-once guarantee."><span class="mk">–</span></td>
           <td class="no" title="Docs: two Jobs or none may be created; jobs must be idempotent."><span class="mk">–</span></td>
           <td class="partial orch" title="Scheduler DB row-locks dedupe scheduling; no fencing token, zombie/duplicate runs possible."><span class="mk">◐</span><span class="cap">no fencing</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Cluster-wide concurrency scope</div><div class="f-sub">Forbid / Replace across the fleet</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">concurrencyScope: cluster</span></td>
+          <td class="no" title="concurrencyPolicy is evaluated inside one asyncio process; with no shared store or lease, two hosts double-run."><span class="mk">–</span></td>
+          <td class="no" title="Serial-by-default and the -overlapping opt-in are per-process only; no shared store, so each instance schedules independently."><span class="mk">–</span></td>
+          <td class="no" title="no-overlap guards a single daemon's in-memory job state; there is no distributed lock across Ofelia hosts."><span class="mk">–</span></td>
+          <td class="partial" title="isRunnable() reads replicated execution state but takes no lock; dkron's own FAQ says forbid can still double-run and suggests your own Redis/etcd lock. No Replace."><span class="mk">◐</span><span class="cap">forbid, race-prone</span></td>
+          <td class="partial" title="The elected primary enforces per-event concurrency across all workers over shared storage, but it is a max-N limit that skips or queues."><span class="mk">◐</span><span class="cap">max-N, no Replace</span></td>
+          <td class="yes" title="spec.concurrencyPolicy Allow/Forbid/Replace is enforced by the controller against Job objects in etcd, cluster-wide by construction."><span class="mk">✓</span></td>
+          <td class="partial orch" title="max_active_runs is enforced deployment-wide via SELECT ... FOR UPDATE row locks across HA schedulers, but it queues the run rather than skipping it, and has no Replace."><span class="mk">◐</span><span class="cap">queues, no Replace</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Crash-resume of in-flight runs</div><div class="f-sub">a peer adopts the orphan</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">peer adopts the run</span></td>
+          <td class="no" title="No execution store anywhere; job status is built from the live pid of a single asyncio process."><span class="mk">–</span></td>
+          <td class="no" title="Stateless by design: no run ledger or pid records, so a kill or power loss leaves no durable record a run was in flight."><span class="mk">–</span></td>
+          <td class="no" title="Execution.IsRunning is an in-memory bool driving one scheduler, with no execution store and no second instance to take over."><span class="mk">–</span></td>
+          <td class="partial" title="Running executions are durable in the Raft store and orphans are marked failed at leader startup, but only past a 4h threshold, and no peer resumes the run."><span class="mk">◐</span><span class="cap">4h stale threshold</span></td>
+          <td class="partial" title="A dead worker's jobs are failed and retried within a 60s ping timeout, but after an unclean primary shutdown the docs state it cannot know a job was running."><span class="mk">◐</span><span class="cap">primary crash loses it</span></td>
+          <td class="yes" title="Job and Pod state lives in etcd behind a job-tracking finalizer; a replacement Pod starts on node failure and --leader-elect hands the loop to a standby controller-manager."><span class="mk">✓</span></td>
+          <td class="yes orch" title="A scheduler detected as dead has its running and queued task instances adopted by another via try_adopt_task_instances, swept on orphaned_tasks_check_interval."><span class="mk">✓</span></td>
         </tr>
 
         <tr class="spot">
@@ -768,6 +876,18 @@
           <td class="yes orch" title="Native email_on_failure and Sentry integration; Slack/PagerDuty via provider packages."><span class="mk">✓</span></td>
         </tr>
 
+        <tr>
+          <td class="feat"><div class="f-name">Secret redaction in output</div><div class="f-sub">archived logs &middot; on by default</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">on by default</span></td>
+          <td class="no" title="captureStdout/captureStderr buffer output in memory for mail and Sentry reports only; no archive and no redaction key."><span class="mk">–</span></td>
+          <td class="no" title="Job output is streamed to stdout/stderr; -split-logs and -passthrough-logs merely route it, and no flag redacts it."><span class="mk">–</span></td>
+          <td class="no" title="The save middleware writes raw stdout/stderr reports to save-folder; no redaction option exists in save-*, slack-* or mail-*."><span class="mk">–</span></td>
+          <td class="no" title="The file, log and syslog processors persist execution output verbatim; forward is their only parameter and none mask values."><span class="mk">–</span></td>
+          <td class="no" title="Plugin STDOUT/STDERR is appended verbatim to the per-job log; secret_key signs server-to-server calls and does not mask output."><span class="mk">–</span></td>
+          <td class="addon" title="The kubelet writes container stdout to node logs verbatim; redaction requires a downstream Fluent Bit or OTel Collector filter."><span class="mk">+</span><span class="cap">log pipeline only</span></td>
+          <td class="partial orch" title="SecretsMasker redacts registered Connection and Variable values from task logs by matching the literal value, so an unregistered key printed by a script is never detected."><span class="mk">◐</span><span class="cap">known values only</span></td>
+        </tr>
+
         <!-- GROUP: PLATFORM -->
         <tr class="group"><td colspan="9"><span class="g-label">Platform &amp; deployment</span></td></tr>
 
@@ -817,6 +937,18 @@
           <td class="no" title="Requires the Node.js runtime plus roughly 24 npm packages."><span class="mk">–</span></td>
           <td class="no" title="Requires a full cluster: etcd, apiserver, controller-manager, scheduler, kubelet, runtime."><span class="mk">–</span></td>
           <td class="no orch" title="Heavy: needs Python plus a metadata DB, scheduler, API server, workers, and a triggerer."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">State backup &middot; restore &middot; migrate</div><div class="f-sub">live-safe admin verbs</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">live-safe backup verb</span></td>
+          <td class="no" title="No state store to administer; the YAML config is the only input and no database or history is persisted."><span class="mk">–</span></td>
+          <td class="no" title="Stateless: reads only the crontab file, and the flag set has no backup, restore or migrate verb."><span class="mk">–</span></td>
+          <td class="no" title="Stateless: INI config or Docker labels only, with the save driver's reports the sole disk output; nothing to back up."><span class="mk">–</span></td>
+          <td class="partial" title="GET /v1/jobs plus POST /v1/restore covers job definitions only; the docs state it is not a cluster snapshot and skips Raft state and execution history."><span class="mk">◐</span><span class="cap">job defs only</span></td>
+          <td class="partial" title="control.sh export/import/migrate covers all three verbs, but export omits completions and logs, and import and migrate require Cronicle stopped everywhere."><span class="mk">◐</span><span class="cap">offline only</span></td>
+          <td class="partial" title="etcdctl snapshot save/restore works on the whole etcd keyspace rather than a CronJob, restore requires every API server stopped, and object-scoped backup needs Velero."><span class="mk">◐</span><span class="cap">etcd-wide, offline</span></td>
+          <td class="partial orch" title="airflow db migrate, downgrade, check and clean cover schema and GC, but no backup or restore verb exists; docs direct you to dump the metadata DB after shutdown."><span class="mk">◐</span><span class="cap">no backup/restore</span></td>
         </tr>
 
       </tbody>

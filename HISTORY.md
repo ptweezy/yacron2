@@ -5,6 +5,51 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.19 (2026-07-17)
+
+A docs-website-and-CI release: no functional changes -- the package, the CLI,
+and every shipped binary behave exactly as in 1.2.18.  The feature-comparison
+chart grows to cover the orchestration and fault-tolerance surface the daemon
+already ships, and the wiki stops drifting by hand -- CI now publishes it.
+
+- **The comparison chart expands from 24 capabilities to 35.** The matrix now
+  scores the rows that were cronstable's strongest differentiators and simply
+  went unlisted: sub-minute schedules, the extended cron dialect, `@reboot`,
+  configurable failure conditions, and the depends-on-past gate under
+  scheduling; dynamic task mapping and poll-until-true sensors under
+  orchestration; cluster-wide concurrency scope and crash-resume of in-flight
+  runs under fault-tolerance; archived-output secret redaction; and state-store
+  backup/restore/migrate.  cronstable is native on all 35; the runner-up
+  (Airflow) is at 18.  The `— not available` legend entry is dropped -- a blank
+  cell already reads as "no" -- and both renders (`docs/comparison.md` and the
+  `docs/comparison.html` page) carry the identical 35-row matrix.
+
+- **The wiki is published by CI instead of by hand.** A new ungated `wiki` job
+  in the pipeline mirrors `wiki/*.md` onto the project's GitHub wiki (a
+  separate `.wiki.git` repo) on **every push to `develop`**, making `wiki/` in
+  this repo the single source of truth.  The previous manual clone-copy-push
+  had drifted -- pages a week stale -- exactly the way an unautomated step
+  always does.  The mirror is authoritative, so it deletes: a page edited from
+  the wiki's web UI is reverted on the next `develop` push, and the job prints
+  every add/modify/delete to the run log.  It publishes from `develop` (never
+  `main`, whose merges would race the per-branch `concurrency` key), is guarded
+  to the canonical repo so forks don't redden, and needs no PAT -- a
+  `GITHUB_TOKEN` with `contents: write` can push a repo's own wiki.
+  `CONTRIBUTING.md` and the releasing wiki page gain an **Editing the wiki**
+  section documenting the flow and the deliberately-dead bare `[Page](Page)`
+  links.
+
+- **The pendulum-logo tooltip drops its interaction hints.** The header
+  wordmark's hover title no longer spells out "sweep your cursor through it to
+  nudge it, right-click to knock it over"; it now just names the mark ("the
+  cronstable logo, the l is a self-balancing double pendulum").  The physics is
+  unchanged -- only the tooltip copy -- and the edit is applied identically to
+  the dashboard (`cronstable/web/index.html`) and its demo mirror
+  (`docs/demo/index.html`).
+
+- **CI housekeeping.** Dependabot bumped `softprops/action-gh-release` from
+  `v3.0.1` to `v3.0.2` in the release job.
+
 ## 1.2.18 (2026-07-15)
 
 A reliability release: correctness and hardening fixes across the job runner,

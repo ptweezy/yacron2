@@ -117,6 +117,13 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
 
     mcpcli.add_mcp_command(sub)
 
+    # `cronstable tui`: the terminal dashboard. Registering it is cheap
+    # (cronstable.tui defers its aiohttp import until the app actually
+    # starts), keeping every other CLI invocation as light as before.
+    from cronstable import tui
+
+    tui.add_tui_command(sub)
+
 
 def main_loop(loop):
     parser = argparse.ArgumentParser(prog="cronstable")
@@ -204,6 +211,15 @@ def main_loop(loop):
         from cronstable import mcpcli
 
         sys.exit(mcpcli.dispatch(args))
+
+    if command == "tui":
+        # the terminal dashboard: a client of the running daemon's web
+        # listener, dispatched before the Cron import below so its startup
+        # pays for aiohttp only (inside cronstable.tui), never the daemon
+        # graph.
+        from cronstable import tui
+
+        sys.exit(tui.dispatch(args))
 
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(

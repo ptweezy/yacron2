@@ -66,7 +66,25 @@ clipping. To refresh them after a UI change:
    Social preview** (1 MB limit). That image is what link unfurls on Slack,
    Discord, Teams, and X/Twitter show for the repo URL.
 
-6. Review the PNGs, then copy the keepers over `docs/img/` (re-saving with
+6. **The terminal-dashboard set** (`docs/img/tui-*.png`) comes off the same
+   running grand-tour fleet, staged the same way: the real
+   `cronstable.tui.TuiApp` is driven headless against meridian-a (a scripted
+   key queue and an in-memory terminal stand in for the tty), and the
+   captured ANSI frames are rasterized to PNG through Playwright's Chromium
+   at deviceScaleFactor 2, in a terminal-window card set in Cascadia Mono:
+
+   ```shell
+   python docs/screenshots/capture_tui.py                 # everything
+   python docs/screenshots/capture_tui.py tui-overview    # one shot
+   ```
+
+   The incident shots (`tui-incident*`, `tui-wallboard`) wait for the
+   fleet's simulated outage window (the `db-health-*` jobs only fail while
+   the UTC minute is 15-19), so a full run can idle up to ~55 minutes
+   before shooting them — run those three when the window is close, or let
+   it wait.
+
+7. Review the PNGs, then copy the keepers over `docs/img/` (re-saving with
    Pillow's `optimize=True` shaves a few percent).
 
 ## Regenerating the animated hero reel + theme row

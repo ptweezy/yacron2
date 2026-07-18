@@ -25,6 +25,7 @@
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)
   - [Web Dashboard](Web-Dashboard)
+  - [Terminal Dashboard](Terminal-Dashboard)
 - **Reference and Development**
   - [Architecture and Internals](Architecture-and-Internals)
   - [Contributing and Releasing](Contributing-and-Releasing)

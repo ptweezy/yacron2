@@ -100,7 +100,8 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   tail its logs in real time, run or cancel jobs on demand, review run history
   and success rates, drive DAG runs and approvals, and keep an eye on the whole
   cluster, from one self-contained page with ten themes and a shortcut for
-  everything
+  everything and a **[terminal twin](#terminal-dashboard)**
+  (`cronstable tui`) with the same keys
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, and the accessibility options — a colour-vision-safe palette and larger UI scale](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
 
@@ -605,6 +606,103 @@ in the wiki is the full walkthrough, and
 enable it.
 
 **Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
+
+## Terminal dashboard
+
+The dashboard has a **TUI sibling**: `cronstable tui` opens the board in
+your terminal, over SSH, in a tmux pane, or on a box where a browser is
+not an option. It is a client of the same HTTP control API (nothing extra
+to enable on the daemon), and it keeps the web page's muscle memory --
+the shortcut table is the same one: `j`/`k` move, `Enter` opens a job's
+drawer, `r` runs, `x` cancels, `/` filters, `g` refreshes, `i` opens the
+incident timeline, `w` the wallboard, `Ctrl-K` the fuzzy command
+palette, and `?` lists everything (terminal-only extras -- quit,
+sort/filter cycling, drawer tabs -- are grouped separately in that
+overlay). It is hand-rolled on the stdlib + the core aiohttp dependency,
+so it adds nothing to the install. Every screenshot below is the real
+TUI against the same live 9-node [grand tour](example/grand-tour) fleet
+the web-dashboard shots use -- same staged incident and all:
+
+[![The cronstable TUI: a live 59-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the verdict bar correlating a staged failure](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)
+
+Press `Enter` on any job for its drawer -- the same three tabs as the
+web page, plus resources for monitored jobs:
+
+| Live log tail | Run history | Schedule, explained |
+| :---: | :---: | :---: |
+| [![The Logs tab: a live SSE tail with per-line timestamps, in-log search with match highlighting, and end-of-run markers between runs](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-logs.png) | [![The History tab: success rate, duration stats, and per-run rows with duration bars and CPU seconds](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-history.png) | [![The Schedule tab: the cron expression in plain English with the exact next fire instants from the daemon's own engine](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-schedule.png) |
+| The **same SSE stream** the browser tails: ANSI colors re-inked per theme, `/` search with `n`/`N`, follow/wrap/timestamps toggles, `d` saves to a file. | Success rate and duration stats over the retained history; monitored jobs add **CPU time and peak memory** per run. | The plain-English reading and next-run preview come from the **daemon's own cron engine**, so the TUI can never disagree with the scheduler. |
+
+| Fuzzy command palette | Keyboard-first, with the web page's keys |
+| :---: | :---: |
+| [![The command palette fuzzy-matching "run": global actions plus per-job and per-DAG commands](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-palette.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-palette.png) | [![The shortcut overlay: the web dashboard's shortcut table verbatim, with terminal extras grouped below](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-shortcuts.png) |
+
+DAGs get the same drawer as the browser -- runs, a task graph, per-task
+states, XCom, task logs, trigger and backfill -- and **approval gates
+are decided with a keypress**:
+
+| The task graph, mid-flight | A human approval gate |
+| :---: | :---: |
+| [![The DAG drawer's graph tab: the data-quality-gate diamond as topological layers, states coloring as the run advances](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-graph.png) | [![The DAG drawer's tasks tab: release-train parked on its approval gate, with a approve / R reject armed](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-dag-approval.png) |
+| The `data-quality-gate` diamond as **topological layers with edges**, each node colored by its state as the run advances. | A release train **parked on a human**: the build succeeded, the gate is `awaiting`, and `a` approves / `R` rejects without leaving the keyboard. |
+
+With clustering on, the cluster panel and the full **fleet matrix**
+render in the terminal too -- every node's state for every job:
+
+| Cluster panel | Fleet view |
+| :---: | :---: |
+| [![The cluster panel: nine gossiping peers, all agreed, with per-node load and the lease detail](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-cluster.png) | [![The fleet view: a 59-job by 9-node matrix of live cells — ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-fleet.png) |
+
+When things break, the same incident kit leans in -- the verdict bar's
+correlation headline, the timeline, the mitigate console's bulk
+start/cancel with a Markdown writeup, and a **multi-tail** that merges
+up to four live logs:
+
+| Incident timeline | Merged multi-tail |
+| :---: | :---: |
+| [![The incident timeline: every job's most recent finish, newest first, with failure reasons, exit codes, and the blast-radius set flagged](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-multitail.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-multitail.png) |
+
+`w` flips the whole terminal into the **wallboard** (worst-first tiles,
+a `NO SIGNAL` banner when data goes stale, the zen screensaver when all
+is calm); the **heatmap** turns history into a punchcard and the
+**state inspector** opens the durable store:
+
+| Wallboard / TV mode | Activity heatmap | Durable-state inspector |
+| :---: | :---: | :---: |
+| [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-state.png) |
+
+The **same ten themes** as the browser -- `t` cycles the hue, `T` flips
+phosphor ↔ paper -- with the same colour-vision-safe remaps and an
+`--ascii` glyph mode:
+
+| Amber phosphor | Green phosphor |
+| :---: | :---: |
+| [![The TUI in the amber phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-amber.png) | [![The TUI in the green phosphor theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-green.png) |
+
+| Flat modern | Carolina, on paper (light) |
+| :---: | :---: |
+| [![The TUI in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-modern.png) | [![The TUI in the carolina light paper theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-carolina-light.png) |
+
+And yes, the control room still gets its power-on: the same **BIOS-style
+boot self-test**, probing the daemon for real, next to the settings
+sheet where the theme, refresh, zen, and cues live:
+
+| Startup self-test | Settings |
+| :---: | :---: |
+| [![The TUI boot self-test: link latency, firmware, job set, schedules, and cluster probed live, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-boot.png) | [![The TUI settings panel: theme, color vision, refresh interval, log toggles, zen, and the boot self-test](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-settings.png) |
+
+```shell
+cronstable tui                            # local daemon on :8080
+cronstable tui --url http://prod-node:8080 --token-env CRONSTABLE_WEB_TOKEN
+cronstable tui --tv                       # straight to the wallboard
+cronstable tui --job nightly-backup       # deep-link a job's drawer
+```
+
+Web-only physics (CRT glow, scanlines, the pendulum wordmark) stay in
+the browser; the terminal gets honest glyphs, the same status colours,
+and a bell instead of desktop notifications. The
+[**Terminal Dashboard**](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard)
+wiki page is the full reference (options, every key, the panel tour).
 
 ## Tutorials
 

@@ -34,7 +34,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cronstable import _json, dag, platform
 from cronstable.cronexpr import CronTab
@@ -135,6 +135,9 @@ class DagScheduler:
         self._owned: Dict[RunRef, Lease] = {}
         self._renewers: Dict[RunRef, asyncio.Task] = {}
         self._locks: Dict[RunRef, asyncio.Lock] = {}
+        # refs whose in-flight advance must run once more before its lock
+        # is released: the burst-coalescing latch (see advance_one).
+        self._advance_again: Set[RunRef] = set()
         # soonest wall-clock instant an owned run wants another advance (a due
         # sensor poke or task retry); drives the loop's sleep cap.
         self._wake: Dict[RunRef, float] = {}
@@ -620,6 +623,7 @@ class DagScheduler:
     def _drop_owned(self, ref: RunRef) -> None:
         self._owned.pop(ref, None)
         self._wake.pop(ref, None)
+        self._advance_again.discard(ref)
         renewer = self._renewers.pop(ref, None)
         if renewer is not None and not renewer.done():
             renewer.cancel()
@@ -682,40 +686,63 @@ class DagScheduler:
                 await self.advance_one(ref)
 
     async def advance_one(self, ref: RunRef) -> None:
+        """Advance ``ref`` once, coalescing concurrent requests.
+
+        Completions arrive in bursts (a mapped fan-in can finish many
+        instances near-simultaneously) and each spawns an advance.
+        Queueing them all behind the per-ref lock would still run one
+        full reconcile+claim pass per completion against the same
+        document, most finding nothing left to claim.  Instead, a call
+        that finds an advance already in flight latches a rerun flag and
+        returns; the in-flight holder loops one more time when the flag
+        was set while it worked.  A burst of any size therefore costs at
+        most the pass already running plus one fresh pass that observes
+        everything the burst recorded.
+        """
         lock = self._locks.setdefault(ref, asyncio.Lock())
+        if lock.locked():
+            # No await between this check and the holder's own re-check
+            # under the lock, so the flag cannot be missed.
+            self._advance_again.add(ref)
+            return
         async with lock:
-            lease = self._owned.get(ref)
-            if lease is None:
-                # not ours to advance (e.g. a decision/completion recorded
-                # here for a run a peer owns): drop the wake hint too, or
-                # next_wake_delay() would return 0.0 forever and busy-spin
-                # the main loop.  The durable record itself is safe -- the
-                # owner picks it up via its own poll/advance wakes.
-                self._wake.pop(ref, None)
-                return
-            dagcfg = self._dags().get(ref[0])
-            if dagcfg is None:
-                await self._release(ref)  # dag removed on reload
-                return
-            if not await self._lease_usable(ref, lease):
-                if ref in self._owned:
-                    # unverifiable (store unreachable) or expired-but-untaken:
-                    # skip this advance and re-check shortly; the renew loop
-                    # re-establishes a live TTL or learns of the takeover.
-                    self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
-                return
-            try:
-                await self._do_advance(dagcfg, ref)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - never kill the loop
-                logger.exception(
-                    "dag run %s/%s: advance failed", ref[0], ref[1]
-                )
-                if ref in self._owned:
-                    # a due wake left in place would retry instantly every
-                    # loop pass against a fast-failing store; back off a bit.
-                    self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
+            while True:
+                self._advance_again.discard(ref)
+                await self._advance_locked(ref)
+                if ref not in self._advance_again:
+                    return
+
+    async def _advance_locked(self, ref: RunRef) -> None:
+        lease = self._owned.get(ref)
+        if lease is None:
+            # not ours to advance (e.g. a decision/completion recorded
+            # here for a run a peer owns): drop the wake hint too, or
+            # next_wake_delay() would return 0.0 forever and busy-spin
+            # the main loop.  The durable record itself is safe -- the
+            # owner picks it up via its own poll/advance wakes.
+            self._wake.pop(ref, None)
+            return
+        dagcfg = self._dags().get(ref[0])
+        if dagcfg is None:
+            await self._release(ref)  # dag removed on reload
+            return
+        if not await self._lease_usable(ref, lease):
+            if ref in self._owned:
+                # unverifiable (store unreachable) or expired-but-untaken:
+                # skip this advance and re-check shortly; the renew loop
+                # re-establishes a live TTL or learns of the takeover.
+                self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
+            return
+        try:
+            await self._do_advance(dagcfg, ref)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - never kill the loop
+            logger.exception("dag run %s/%s: advance failed", ref[0], ref[1])
+            if ref in self._owned:
+                # a due wake left in place would retry instantly every
+                # loop pass against a fast-failing store; back off a bit.
+                self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
 
     async def _lease_usable(self, ref: RunRef, lease: Lease) -> bool:
         """Whether our advance lease still plausibly gates ``ref``.
@@ -760,11 +787,12 @@ class DagScheduler:
     async def _do_advance(self, dagcfg: Any, ref: RunRef) -> None:
         spec = dagcfg.spec
         # 1. reconcile first: fail any task a crash left running with a dead
-        # process (protects our own live tasks by proc token).
-        await self._reconcile_run(dagcfg, ref)
-        # 2. read the doc to see which mapped tasks are ready to expand, and
-        # pre-read their upstream XCom lists (outside the RMW).
-        body = await self._read(ref[0], ref[1])
+        # process (protects our own live tasks by proc token).  Its RMW
+        # already observed the document body, so reuse that observation to
+        # see which mapped tasks are ready to expand, and pre-read their
+        # upstream XCom lists (outside the claim RMW), instead of paying a
+        # separate second read of the same document on every advance.
+        body = await self._reconcile_run(dagcfg, ref)
         if body is None:
             await self._release(ref)
             return
@@ -1343,7 +1371,17 @@ class DagScheduler:
                     continue
                 await self._try_own(dagcfg, (name, run_key))
 
-    async def _reconcile_run(self, dagcfg: Any, ref: RunRef) -> None:
+    async def _reconcile_run(
+        self, dagcfg: Any, ref: RunRef
+    ) -> Optional[Dict[str, Any]]:
+        """Fail tasks a crash left running; return the observed document.
+
+        The RMW already read the run document under its lock (and
+        ``mutate_document`` hands the current body back even on a kept
+        document), so the caller reuses the returned body instead of
+        paying a second full read of the same document right after.
+        ``None`` when the document does not exist (or no backend).
+        """
         transform = self._wrap(
             dag.reconcile_crashed(
                 dagcfg.spec,
@@ -1353,7 +1391,7 @@ class DagScheduler:
                 platform.pid_alive,
             )
         )
-        _stored, changed = await self._mutate(ref[0], ref[1], transform)
+        stored, changed = await self._mutate(ref[0], ref[1], transform)
         if changed:
             logger.info(
                 "dag run %s/%s: reconciled %d interrupted task(s)",
@@ -1361,6 +1399,7 @@ class DagScheduler:
                 ref[1],
                 changed,
             )
+        return stored
 
     # =====================================================================
     # Control-API surface: approvals, introspection, manual trigger, backfill
@@ -1590,17 +1629,25 @@ class DagScheduler:
                 "at": rec.get("at"),
             }
             if isinstance(size, int) and 0 <= size <= max_value_bytes:
-                try:
-                    got = await asyncio.wait_for(
-                        jobstate.artifact_get(backend, scope, full),
-                        timeout=STATE_OP_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - value unreadable; skip it
-                    got = None
-                if got is not None:
-                    _rec, data = got
+                # fetch the payload by the digest this record already
+                # carries: an artifact_get here would re-list and re-parse
+                # the run's whole artifact stream per entry (quadratic in
+                # the stream), only to resolve the very record in hand.
+                # A swept blob reads back as None and is skipped, exactly
+                # like any other unreadable value.
+                digest = rec.get("sha256")
+                data = None
+                if digest:
+                    try:
+                        data = await asyncio.wait_for(
+                            backend.get_blob(str(digest)),
+                            timeout=STATE_OP_TIMEOUT,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - unreadable; skip it
+                        data = None
+                if data is not None:
                     try:
                         entry["value"] = data.decode("utf-8")
                     except UnicodeDecodeError:

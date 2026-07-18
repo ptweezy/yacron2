@@ -114,6 +114,18 @@ if orjson is not None:
         """Parse JSON from ``bytes`` or ``str``."""
         return orjson.loads(data)
 
+    def deepcopy_json(obj: Any) -> Any:
+        """Deep-copy a JSON-shaped value via a serialize+parse round trip.
+
+        For in-process copies only (a transform needing a mutable working
+        copy of a document already read from the store): the bytes never
+        leave the process, so the fleet-portability gate that guards
+        :func:`dumps_bytes` does not apply and is skipped.  Several times
+        faster than both ``copy.deepcopy`` and a stdlib ``json`` round
+        trip when orjson is installed.
+        """
+        return orjson.loads(orjson.dumps(obj))
+
 else:
 
     def dumps_bytes(obj: Any, *, sort_keys: bool = False) -> bytes:
@@ -125,3 +137,15 @@ else:
     def loads(data: Union[bytes, str]) -> Any:
         """Parse JSON from ``bytes`` or ``str``."""
         return _stdlib.loads(data)
+
+    def deepcopy_json(obj: Any) -> Any:
+        """Deep-copy a JSON-shaped value via a serialize+parse round trip.
+
+        For in-process copies only (a transform needing a mutable working
+        copy of a document already read from the store): the bytes never
+        leave the process, so the fleet-portability gate that guards
+        :func:`dumps_bytes` does not apply and is skipped.  Several times
+        faster than both ``copy.deepcopy`` and a stdlib ``json`` round
+        trip when orjson is installed.
+        """
+        return _stdlib.loads(_stdlib.dumps(obj))

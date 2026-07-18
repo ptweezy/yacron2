@@ -27,10 +27,11 @@ recomputed, so a crash-resumed run reconstructs the identical mapped set rather
 than re-deriving it from a possibly-changed upstream output.
 """
 
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+from cronstable import _json
 
 # --------------------------------------------------------------------------
 # Durable namespaces (under the backend's docs/ and records/ trees)
@@ -540,7 +541,11 @@ def plan_and_claim(
         result = AdvanceResult()
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, result
-        working = json.loads(json.dumps(body))  # deep copy; pure & retryable
+        # deep copy, so the transform stays pure and retryable.  This runs
+        # inside the document flock on every advance; the orjson-backed
+        # round trip keeps the in-lock copy cost of a large run document
+        # (up to MAX_MAPPED_ITEMS task entries) low.
+        working = _json.deepcopy_json(body)
         _apply_expansions(spec, working, expansions, now, result)
         _propagate_and_claim(spec, working, now, proc, host, result)
         _maybe_terminalise(spec, working, now, result)
@@ -654,10 +659,21 @@ def _propagate_and_claim(
             # pending here for the next pass).
             _propagate_placeholder(spec, body, task, now, result)
             continue
+        # The deps verdict is a function of the TASK (all map instances
+        # share the same upstreams), and nothing this task's own instance
+        # loop does can change it (a claim mutates only the instance's
+        # entry, and a task cannot depend on itself).  Resolve it once per
+        # task instead of once per instance: with N instances over a
+        # mapped upstream of M instances that is the difference between
+        # O(M) and O(N*M) state reductions per pass.  Computed lazily so
+        # a task with no pending instance skips it entirely.
+        verdict: Optional[str] = None
         for taskkey, map_index, item in _instances_of(spec, body, task):
             entry = body["tasks"].get(taskkey)
             if entry is None:
                 continue
+            if verdict is None and entry.get("state") == PENDING:
+                verdict = _deps_verdict(spec, body, task)
             _advance_task(
                 spec,
                 body,
@@ -670,6 +686,7 @@ def _propagate_and_claim(
                 proc,
                 host,
                 result,
+                verdict,
             )
 
 
@@ -710,6 +727,7 @@ def _advance_task(
     proc,
     host,
     result,
+    verdict=None,
 ) -> None:
     state = entry.get("state")
     if state in TERMINAL_STATES or state == EXPANDED:
@@ -727,7 +745,10 @@ def _advance_task(
         return
     if state != PENDING:
         return
-    verdict = _deps_verdict(spec, body, task)
+    if verdict is None:
+        # defensive: _propagate_and_claim passes the task-level verdict in
+        # for every pending instance, so this only fires for a direct call
+        verdict = _deps_verdict(spec, body, task)
     if verdict == "wait":
         return
     if verdict == "fail":

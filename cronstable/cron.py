@@ -1653,7 +1653,7 @@ class Cron:
                         if runjob.proc is not None
                     ],
                 }  # type: Dict[str, Any]
-                if self._schedule_never_fires(job):
+                if self._schedule_never_fires(name, job):
                     # a running job with a dead schedule still never fires
                     # again; flag it here exactly as /jobs does, so the two
                     # surfaces agree (the text renderer keeps saying
@@ -1666,9 +1666,8 @@ class Cron:
                 out.append({"job": name, "status": "disabled"})
             else:
                 crontab = job.schedule  # type: Union[CronTab, str]
-                now = get_now(job.timezone)
                 scheduled_in = (
-                    crontab.next(now=now, default_utc=job.utc)
+                    self._scheduled_in(name, job, False)
                     if isinstance(crontab, CronTab)
                     else str(crontab)
                 )
@@ -2414,35 +2413,62 @@ class Cron:
             headers=self._security_headers(),
         )
 
-    def _scheduled_in(self, job: JobConfig, running: bool) -> Optional[float]:
+    def _scheduled_in(
+        self, name: str, job: JobConfig, running: bool
+    ) -> Optional[float]:
         """Seconds until the job's next scheduled run.
 
-        ``None`` when not applicable: disabled, currently running, or a
-        one-off ``@reboot`` schedule (a string, not a crontab).
+        ``None`` when not applicable: disabled, currently running, a
+        one-off ``@reboot`` schedule (a string, not a crontab), or a
+        schedule with no future occurrence.  Steady state reads the
+        loop's own next-fire index (the same source prometheus.py's
+        next-run gauge reads) rather than re-walking the crontab: this
+        runs per job on every /jobs poll, every /status call, and every
+        gossiped fleet summary.  The engine search survives only as the
+        fallback for the startup window before the loop's first pass
+        seeds the index.
         """
         if not job.enabled or running:
             return None
         crontab = job.schedule  # type: Union[CronTab, str]
         if not isinstance(crontab, CronTab):
             return None
-        now = get_now(job.timezone)
-        seconds: Optional[float] = crontab.next(now=now, default_utc=job.utc)
+        when = self._next_fire.get(name)
+        if when is not None:
+            # clamped at zero: a job due this very instant reads as
+            # marginally past until the pass advances it beyond its slot
+            now = get_now(datetime.timezone.utc)
+            return max(0.0, (when - now).total_seconds())
+        if name in self._dead_schedules:
+            # no future occurrence; the engine's answer would be None too,
+            # found only after walking the remaining horizon
+            return None
+        seconds: Optional[float] = crontab.next(
+            now=get_now(job.timezone), default_utc=job.utc
+        )
         return seconds
 
-    def _schedule_never_fires(self, job: JobConfig) -> bool:
+    def _schedule_never_fires(self, name: str, job: JobConfig) -> bool:
         """True when an enabled cron job's schedule has no future instant.
 
-        Computed from the schedule alone, so it holds for running jobs
-        too (a running job with a dead schedule still never fires
-        again).  Shared by the /jobs and /status payloads so the two
-        surfaces cannot drift.  Runs a full engine search: callers that
-        already hold a fresh :meth:`_scheduled_in` result for a
-        non-running job should derive the answer from that instead.
+        Holds for running jobs too (a running job with a dead schedule
+        still never fires again).  Shared by the /jobs and /status
+        payloads so the two surfaces cannot drift.  Steady state is two
+        set probes: once seeded, an enabled CronTab job is either in the
+        next-fire index (fires again) or in the dead-schedules latch
+        (never does).  The full engine search survives only as the
+        unseeded-startup fallback, which is the worst place for it: a
+        dead schedule is precisely the one that walks the whole horizon,
+        and it used to do so per running job per poll.
         """
+        if not (job.enabled and isinstance(job.schedule, CronTab)):
+            return False
+        if name in self._next_fire:
+            return False
+        if name in self._dead_schedules:
+            return True
         return (
-            job.enabled
-            and isinstance(job.schedule, CronTab)
-            and job.schedule.next(
+            job.schedule.next(
                 now=get_now(job.timezone), default_utc=job.utc
             )
             is None
@@ -2467,7 +2493,7 @@ class Cron:
             out[name] = {
                 "running": running,
                 "enabled": job.enabled,
-                "scheduled_in": self._scheduled_in(job, running),
+                "scheduled_in": self._scheduled_in(name, job, running),
                 "last": (
                     None
                     if last is None
@@ -2485,17 +2511,17 @@ class Cron:
         running = self.running_jobs.get(name) or []
         # next scheduled run, in seconds; None when not applicable (disabled,
         # currently running, or a one-off @reboot schedule).
-        scheduled_in = self._scheduled_in(job, bool(running))
+        scheduled_in = self._scheduled_in(name, job, bool(running))
         # a dead schedule's None means NEVER, which the dashboards must be
         # able to tell apart from the running/disabled Nones above.  For a
-        # job that is not running, _scheduled_in above already ran the
-        # exact engine search this needs (enabled + cron + no next instant
-        # is precisely "never fires"), so reuse its answer instead of
-        # searching twice per job on every /jobs poll.  Only a running job
-        # (whose scheduled_in is None by design) needs the direct probe:
-        # a running job with a dead schedule still never fires again.
+        # job that is not running, _scheduled_in above already answered
+        # this (enabled + cron + no next instant is precisely "never
+        # fires"), so reuse its answer instead of asking twice per job on
+        # every /jobs poll.  Only a running job (whose scheduled_in is
+        # None by design) needs the direct probe: a running job with a
+        # dead schedule still never fires again.
         if running:
-            never_fires = self._schedule_never_fires(job)
+            never_fires = self._schedule_never_fires(name, job)
         else:
             never_fires = (
                 job.enabled
@@ -5383,8 +5409,23 @@ class Cron:
                 self._set_next_fire(name, new_next)
             else:
                 # no further occurrence (a fixed past year now behind us):
-                # drop it from the index so it is not revisited.
+                # drop it from the index so it is not revisited, and latch
+                # the dead-schedules set so the status surfaces keep
+                # reporting never_fires from the latch instead of each
+                # re-walking the schedule's whole remaining horizon per
+                # poll (the latch is what _scheduled_in and
+                # _schedule_never_fires consult).
                 self._next_fire.pop(name, None)
+                if name not in self._dead_schedules:
+                    self._dead_schedules.add(name)
+                    logger.warning(
+                        "job %r: schedule %r has no further occurrence "
+                        "and will NEVER fire again; fix the schedule or "
+                        "disable the job (its status reports "
+                        "never_fires)",
+                        name,
+                        schedule_str(job),
+                    )
             plan.append((job, fires))
         await self._launch_plan(plan)
 

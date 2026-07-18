@@ -48,9 +48,10 @@ documentation):
   ``H * * * *`` jobs spreads across the hour instead of stampeding at :00
   while each job keeps ONE predictable slot (random jitter would break
   late-run detection; a hashed slot does not).  Forms: bare ``H`` (whole
-  field range; in day-of-month it hashes over 1-28 so a short month is
-  never silently skipped), ``H(a-b)`` (a numeric range), ``H/n`` and
-  ``H(a-b)/n`` (every ``n`` starting at a hashed offset).  The seed is the
+  field range), ``H(a-b)`` (a numeric range), ``H/n`` and ``H(a-b)/n``
+  (every ``n`` starting at a hashed offset); in day-of-month the rangeless
+  forms (bare ``H`` and ``H/n``) hash over 1-28 so a short month is never
+  silently skipped.  The seed is the
   ``hash_key`` handed to :class:`CronTab` (the job name everywhere
   cronstable constructs one), salted per field so ``H H * * *`` picks
   uncorrelated minute and hour; renaming a job re-hashes its slots.  A
@@ -155,10 +156,11 @@ _QUARTZ_W = re.compile(r"(?:l|\d+)w\Z")
 #: weekday name starts with an ``h``).
 _HASH_ITEM = re.compile(r"h(?:\((\d+)-(\d+)\))?(?:/(\d+))?\Z")
 
-#: bare ``H`` in day-of-month hashes over this range, not 1-31: a hashed
-#: day of 29, 30 or 31 would silently skip the months too short to reach
-#: it, which is exactly the surprise ``H`` exists to avoid.  An explicit
-#: ``H(1-31)`` still opts in to the full range.
+#: a rangeless ``H`` form (bare ``H`` or ``H/n``) in day-of-month hashes
+#: over this range, not 1-31: a hashed day of 29, 30 or 31 would silently
+#: skip the months too short to reach it, which is exactly the surprise
+#: ``H`` exists to avoid.  An explicit ``H(1-31)`` still opts in to the
+#: full range.
 _HASH_DOM_END = 28
 
 
@@ -888,9 +890,7 @@ class CronTab:
         now_utc = now.astimezone(utc)
         anchor = self._prev_civil(civil)
         while anchor is not None:
-            resolved = (
-                anchor.replace(tzinfo=tz).astimezone(utc).astimezone(tz)
-            )
+            resolved = anchor.replace(tzinfo=tz).astimezone(utc).astimezone(tz)
             if resolved.replace(tzinfo=None) == anchor:
                 last: Optional[datetime.datetime] = None
                 start = (anchor - datetime.timedelta(seconds=1)).replace(

@@ -91,22 +91,42 @@ jobs:
   # Decide + version (run on every event; feed both the gate and the publish).
   # ---------------------------------------------------------------------------
 
-  # Decide whether this run is a release and at what level. Kept separate (and
-  # strict) so the trigger logic lives in a real script, never a fuzzy
-  # `contains()` match. A release requires a workflow_dispatch OR a push to main
-  # with a [release] marker -- a marker on any other branch, or a PR, never
-  # releases (this file triggers on all branches + PRs, so `decide` itself must
-  # enforce the main-only rule the old push:branches:[main] filter used to).
-  decide:
+  # Decide whether this run is a release (and at what level), then compute the
+  # version: two steps in ONE job. They ran as separate serial jobs before, but
+  # each needed the same full-history checkout and every builder waited on both
+  # runner spin-ups, so merging them starts the whole fan-out sooner.
+  #
+  # The decide step is kept strict so the trigger logic lives in a real script,
+  # never a fuzzy `contains()` match. A release requires a workflow_dispatch OR
+  # a push to main with a [release] marker -- a marker on any other branch, or a
+  # PR, never releases (this file triggers on all branches + PRs, so the decide
+  # step itself must enforce the main-only rule the old push:branches:[main]
+  # filter used to).
+  #
+  # The version step computes the version ONCE so every builder pins the same
+  # number via SETUPTOOLS_SCM_PRETEND_VERSION. It always runs (the gate builds
+  # always need a version): on a release it computes the next X.Y.Z (or the
+  # explicit `tag` override) and refuses if that tag already exists; otherwise
+  # it emits the natural setuptools_scm dev version (e.g. 1.2.9.devN+g<sha>),
+  # exactly as the old build.yml did for its per-commit builds.
+  version:
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.d.outputs.release }}
       bump: ${{ steps.d.outputs.bump }}
+      new: ${{ steps.ver.outputs.new }}
     steps:
       - uses: actions/checkout@v7.0.0
         with:
-          fetch-depth: 0
-      - id: d
+          fetch-depth: 0  # full history + tags: the marker scan walks BEFORE..AFTER and setuptools_scm / tag math resolve
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.26"
+      - name: Decide release
+        id: d
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
@@ -158,33 +178,11 @@ jobs:
           echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "bump=$bump" >> "$GITHUB_OUTPUT"
           echo "::notice::release=$release bump=$bump (event=$EVENT ref=$REF)"
-
-  # Compute the version ONCE so every builder pins the same number via
-  # SETUPTOOLS_SCM_PRETEND_VERSION. Runs unconditionally (the gate builds always
-  # need a version): on a release it computes the next X.Y.Z (or the explicit
-  # `tag` override) and refuses if that tag already exists; otherwise it emits
-  # the natural setuptools_scm dev version (e.g. 1.2.9.devN+g<sha>), exactly as
-  # the old build.yml did for its per-commit builds.
-  version:
-    needs: decide
-    runs-on: ubuntu-latest
-    outputs:
-      new: ${{ steps.ver.outputs.new }}
-    steps:
-      - uses: actions/checkout@v7.0.0
-        with:
-          fetch-depth: 0  # full history + tags so setuptools_scm / tag math resolve
-      - uses: actions/setup-python@v6.3.0
-        with:
-          python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8.3.2
-        with:
-          version: "0.11.26"
       - name: Compute version
         id: ver
         env:
-          RELEASE: ${{ needs.decide.outputs.release }}
-          BUMP: ${{ needs.decide.outputs.bump }}
+          RELEASE: ${{ steps.d.outputs.release }}
+          BUMP: ${{ steps.d.outputs.bump }}
           OVERRIDE: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
@@ -236,26 +234,17 @@ jobs:
   # parallel. The publish jobs below need every one of these to succeed.
   # ---------------------------------------------------------------------------
 
-  tox-lint:
+  # lint + mypy in one job: each env finishes in well under a minute, so a
+  # second runner spin-up costs more wall clock than running them serially.
+  tox-static:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: actions/setup-python@v6.3.0
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
-      - run: pip install --upgrade pip
       - run: pip install tox tox-uv
-      - run: tox -e lint
-
-  tox-mypy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-python@v6.3.0
-      - run: pip install --upgrade pip
-      - run: pip install tox tox-uv
-      - run: tox -e mypy
+      - run: tox -e lint,mypy
 
   tox:
     strategy:
@@ -286,7 +275,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
-      - run: pip install --upgrade pip
       - run: pip install tox tox-uv
       - run: tox -e py
       # Every matrix cell uploads its own coverage.xml; Codecov merges them by
@@ -573,7 +561,7 @@ jobs:
   # `ship` picks the shipped rows; `asset` names the artifact (the shipped ones
   # keep the bare `macos-<arch>` names the Release + Homebrew formula expect).
   binaries-macos:
-    needs: [decide, version]
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -643,7 +631,7 @@ jobs:
       # Renaming after signing is safe -- the notarization ticket is keyed to the
       # code signature (cdhash), not the filename -- so this runs before the `mv`.
       - name: Sign and notarize
-        if: ${{ needs.decide.outputs.release == 'true' && matrix.ship }}
+        if: ${{ needs.version.outputs.release == 'true' && matrix.ship }}
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -823,11 +811,9 @@ jobs:
 
   release:
     needs:
-      - decide
       - version
       - tox
-      - tox-lint
-      - tox-mypy
+      - tox-static
       - dist
       - binaries
       - binaries-musl
@@ -835,7 +821,7 @@ jobs:
       - binaries-macos
       - binaries-windows
       - docker
-    if: needs.decide.outputs.release == 'true'
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write   # push the tag and create the GitHub Release
@@ -991,8 +977,8 @@ jobs:
   # the DOCKERHUB_* secrets are set); the Debian image owns the bare
   # `latest`/`<version>` tags, the variants get `-<distro>` suffixes.
   docker-push:
-    needs: [decide, version, release]
-    if: needs.decide.outputs.release == 'true'
+    needs: [version, release]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1128,8 +1114,8 @@ jobs:
   # repo secret HOMEBREW_TAP_TOKEN to a PAT (fine-grained, Contents: read/write
   # on ptweezy/homebrew-tap is enough). If it is unset the job warns and skips.
   homebrew:
-    needs: [decide, version, release]
-    if: needs.decide.outputs.release == 'true'
+    needs: [version, release]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0    # for the formula template + render script
@@ -1190,8 +1176,8 @@ jobs:
   # the job fails loudly rather than silently leaving the manifest stale (see the
   # homebrew job above for why silent-skip is the wrong default here).
   winget:
-    needs: [decide, version, release]
-    if: needs.decide.outputs.release == 'true'
+    needs: [version, release]
+    if: needs.version.outputs.release == 'true'
     runs-on: windows-latest
     defaults:
       run:

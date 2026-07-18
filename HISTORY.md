@@ -106,6 +106,14 @@ also the working idiom for parking a job).
   `cron_schedule_duplicates`, `cron_suggest_slot`) serve the same
   payloads to agents.
 
+### Packaging
+
+- **winget**: `winget install ptweezy.cronstable` installs the self-contained
+  Windows release binary (`amd64` or `arm64`), no Python required. A new
+  `winget` release job updates the manifest in `microsoft/winget-pkgs`
+  automatically on every release, the same way the existing `homebrew` job
+  keeps the Homebrew tap current.
+
 ## 1.2.20 (2026-07-17)
 
 This release gives the web dashboard a **terminal twin**: `cronstable tui`

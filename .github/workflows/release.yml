@@ -1176,6 +1176,47 @@ jobs:
           git commit -m "cronstable ${VERSION}"
           git push
 
+  # Update the winget manifest (ptweezy.cronstable) in microsoft/winget-pkgs so
+  # `winget install ptweezy.cronstable` / `winget upgrade` track releases with no
+  # manual step. Unlike the Homebrew formula, there is no template to render here:
+  # wingetcreate fetches the previous manifest from winget-pkgs itself, bumps the
+  # version, and re-detects each installer's architecture straight from the PE
+  # header of the downloaded .exe (not from the filename), then opens a PR.
+  # windows-latest is required -- wingetcreate.exe is a native Windows tool.
+  #
+  # Cross-repo PRs need a token the default GITHUB_TOKEN can't provide: set a repo
+  # secret WINGET_TOKEN to a PAT (classic, public_repo scope is enough) that can
+  # fork microsoft/winget-pkgs and open a PR under that account. If it is unset
+  # the job fails loudly rather than silently leaving the manifest stale (see the
+  # homebrew job above for why silent-skip is the wrong default here).
+  winget:
+    needs: [decide, version, release]
+    if: needs.decide.outputs.release == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Update winget manifest
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WINGET_TOKEN:-}" ]; then
+            echo "::error::WINGET_TOKEN is not set; cannot update the winget manifest. Add it as a repo secret (a GitHub PAT with public_repo scope) and re-run this release." >&2
+            exit 1
+          fi
+          curl -fsSL -o wingetcreate.exe \
+            https://github.com/microsoft/winget-create/releases/latest/download/wingetcreate.exe
+          ./wingetcreate.exe update ptweezy.cronstable \
+            --version "$VERSION" \
+            --urls \
+              "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-amd64.exe" \
+              "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-arm64.exe" \
+            --submit --no-open --token "$WINGET_TOKEN" \
+            --prtitle "New version: ptweezy.cronstable version ${VERSION}"
+
   # ---------------------------------------------------------------------------
   # Docs. Runs on an ordinary commit and is NOT gated on the build+test matrix:
   # a wiki page is not a build artifact, so it neither waits on a release nor

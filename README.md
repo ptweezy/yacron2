@@ -259,6 +259,18 @@ This installs the self-contained release binary for your platform (signed and
 notarized on macOS; glibc `amd64`/`arm64` on Linux via Homebrew on Linux), so no
 Python is required. Upgrade later with `brew upgrade cronstable`.
 
+### Install using winget
+
+On Windows, install the [winget package](https://github.com/microsoft/winget-pkgs/tree/master/manifests/p/ptweezy/cronstable):
+
+```shell
+winget install ptweezy.cronstable
+```
+
+This installs the self-contained release binary (`amd64` or `arm64`, matching
+your system), so no Python is required. Upgrade later with
+`winget upgrade ptweezy.cronstable`.
+
 ### Install using binary
 
 Alternatively, a self-contained binary can be downloaded

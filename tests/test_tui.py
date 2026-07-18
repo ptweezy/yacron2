@@ -1264,3 +1264,53 @@ async def test_schedule_pressure_overlay(tmp_path):
         assert not app.is_open("press")
     finally:
         await h.stop()
+
+
+async def test_week_calendar_overlay(tmp_path):
+    # the TUI sibling of the web week calendar: business-day fires make
+    # the agenda, a minutely job summarizes into the background hum
+    h = Harness()
+    h.daemon.jobs = [
+        _job("monthly-close", schedule="30 1 LW * *", outcome="success"),
+        _job("daily-report", schedule="0 6 * * *", outcome="success"),
+        _job("heartbeat", schedule="* * * * *", outcome="success"),
+    ]
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 3)
+        app._toggle("week")
+        await _wait_for(lambda: app.week is not None)
+        await h.settle()
+        screen = h.term.screen()
+        assert "week calendar (UTC)" in screen
+        assert "upcoming fires" in screen
+        assert "daily-report" in screen
+        # the minutely job is hum, not agenda: named once, in the strip
+        assert "background hum" in screen
+        assert "heartbeat" in screen
+        data = app.week
+        agenda_names = {name for _when, name in data["items"]}
+        assert "daily-report" in agenda_names
+        assert "heartbeat" not in agenda_names
+        assert any(name == "heartbeat" for name, _n, _c in data["frequent"])
+        # the LW job's fire (if this 7-day window holds one) matches the
+        # engine's own answer exactly
+        from cronstable.cronexpr import CronTab
+        import datetime as _dt
+
+        start = data["start"]
+        probe = start - _dt.timedelta(seconds=1)
+        expected = [
+            when
+            for when in __import__("itertools").islice(
+                CronTab("30 1 LW * *").occurrences(probe), 3
+            )
+            if when < start + _dt.timedelta(days=7)
+        ]
+        got = [when for when, name in data["items"] if name == "monthly-close"]
+        assert got == expected
+        h.keys.send("esc")
+        await h.settle()
+        assert not app.is_open("week")
+    finally:
+        await h.stop()

@@ -113,6 +113,14 @@ Everything an operator drives from the web page:
   the `/jobs` snapshot with the daemon's own shared analyzers (see
   [Schedule Pressure](Schedule-Pressure)), so it works against older
   daemons too;
+- the **week calendar** overlay (`Ctrl-K` → "Toggle week calendar"): the
+  web dashboard's seven-day view, terminal-shaped: a day-by-hour shaded
+  fire grid, a chronological agenda of the calendar-worthy fires (all
+  labels UTC, the TUI's frame everywhere), and the same background-hum
+  rule, so a minutely job summarizes to one name-and-count line instead
+  of flooding the agenda; computed locally like pressure, and the same
+  data the daemon serves as an iCal feed (see
+  [Calendar Export](Calendar-Export));
 - the **state inspector** for the durable store (inventory, document
   namespaces, record streams);
 - the **cron sandbox** (`Ctrl-K` → "Cron sandbox"), evaluating

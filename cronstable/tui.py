@@ -72,6 +72,7 @@ from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-compat)
     Finding,
     ScheduleEntry,
+    _local_tzinfo,
     describe_cron,
     duplicate_schedules,
     lint_schedule,
@@ -959,6 +960,13 @@ def sparkline(history: List[Dict[str, Any]], width: int = 10) -> str:
 
 
 _SPARK_BARS = "▁▂▃▄▅▆▇█"
+
+#: week calendar bounds: the hum threshold matches the web panel (a job
+#: firing more often than ~8x/day is background hum, summarized instead of
+#: charted); the enumeration cap bounds the hum count this panel displays
+#: ("x200+"), which the web strip does not show
+WEEK_PER_JOB_CAP = 200
+WEEK_FREQ_MAX = 56
 
 
 def spark_cells(
@@ -2000,6 +2008,7 @@ ESC_PRIORITY = [
     "fleet",
     "heat",
     "press",
+    "week",
     "radar",
     "node",
 ]
@@ -2134,6 +2143,10 @@ class App:
         self.press_suggest: Dict[str, Dict[str, Any]] = {}
         self.press_computed = 0.0
         self._press_busy = False
+        # week calendar: 7-day fire outlook computed locally, like pressure
+        self.week: Optional[Dict[str, Any]] = None
+        self.week_computed = 0.0
+        self._week_busy = False
         self.state_tab = "view"
         self.state_detail: Optional[Dict[str, Any]] = None
         self.state_sel = 0
@@ -2391,6 +2404,12 @@ class App:
             time.monotonic() - self.press_computed > 60
         ):
             await self._recompute_pressure_bg()
+        # same cadence as pressure, so the panel tracks reloads and rolls
+        # its 7-day window past midnight without a manual refresh
+        if self.is_open("week") and (
+            time.monotonic() - self.week_computed > 60
+        ):
+            await self._recompute_week_bg()
 
     def _fleet_sound(self, first: bool) -> None:
         """Poll-diff for failure cues + the standing alarm (web port)."""
@@ -2579,6 +2598,71 @@ class App:
             self.press_computed = time.monotonic()
         except Exception:  # noqa: BLE001 - an analyzer bug must not kill
             logger.exception("schedule pressure recompute failed")
+        self.mark()
+
+    async def _recompute_week_bg(self) -> None:
+        """The week-calendar walk on a worker thread, like pressure's."""
+        if self._week_busy:
+            return
+        self._week_busy = True
+        try:
+            await asyncio.to_thread(self._recompute_week)
+        finally:
+            self._week_busy = False
+
+    def _recompute_week(self) -> None:
+        """Refresh the week calendar's data, locally.
+
+        The TUI sibling of the web dashboard's week calendar: every fire
+        over the next 7 UTC days, enumerated per job in its own zone by
+        the engine itself (the same rows as the pressure panel).  Jobs
+        firing more than WEEK_FREQ_MAX times in the window are background
+        hum, summarized by name and count instead of flooding the agenda,
+        exactly like the web panel's strip.
+        """
+        try:
+            entries = self._pressure_entries()
+            now = datetime.datetime.now(datetime.timezone.utc)
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = start + datetime.timedelta(days=7)
+            local_tz = _local_tzinfo()
+            grid = [[0] * 24 for _ in range(7)]
+            items: List[Tuple[datetime.datetime, str]] = []
+            frequent: List[Tuple[str, int, bool]] = []
+            # from one second before midnight, so a fire exactly at 00:00
+            # lands in the window (occurrences() is strictly-after), the
+            # same rule as the web panel
+            probe = start - datetime.timedelta(seconds=1)
+            for entry in entries:
+                zone = entry.timezone or local_tz
+                fires: List[datetime.datetime] = []
+                capped = False
+                for when in entry.tab.occurrences(probe.astimezone(zone)):
+                    utc = when.astimezone(datetime.timezone.utc)
+                    if utc >= end:
+                        break
+                    if len(fires) >= WEEK_PER_JOB_CAP:
+                        capped = True
+                        break
+                    fires.append(utc)
+                if len(fires) > WEEK_FREQ_MAX:
+                    frequent.append((entry.name, len(fires), capped))
+                    continue
+                for utc in fires:
+                    items.append((utc, entry.name))
+                    grid[(utc - start).days][utc.hour] += 1
+            items.sort(key=lambda item: (item[0], item[1]))
+            frequent.sort()
+            self.week = {
+                "start": start,
+                "grid": grid,
+                "items": items,
+                "frequent": frequent,
+                "schedules": len(entries),
+            }
+            self.week_computed = time.monotonic()
+        except Exception:  # noqa: BLE001 - an analyzer bug must not kill
+            logger.exception("week calendar recompute failed")
         self.mark()
 
     async def _load_drawer_runs(self) -> None:
@@ -3159,6 +3243,7 @@ class AppPalette(AppActions):
             ("⌁", "Toggle next-fire radar", lambda: self._toggle("radar")),
             ("▦", "Toggle activity heatmap", lambda: self._toggle("heat")),
             ("▥", "Toggle schedule pressure", lambda: self._toggle("press")),
+            ("◫", "Toggle week calendar", lambda: self._toggle("week")),
             ("⊞", "Toggle fleet view", lambda: self._toggle("fleet")),
             ("◉", "Toggle cluster panel", lambda: self._toggle("cluster")),
             ("▤", "Toggle node resources", lambda: self._toggle("node")),
@@ -3291,6 +3376,8 @@ class AppPalette(AppActions):
             self._spawn(self._load_heat())
         elif name == "press":
             self._spawn(self._recompute_pressure_bg())
+        elif name == "week":
+            self._spawn(self._recompute_week_bg())
         elif name == "node":
             self._spawn(self._refresh_json("node_history", "/node/history"))
 
@@ -3737,6 +3824,12 @@ class AppKeys(AppPalette):
     async def _key_press(self, key: str) -> None:
         if key == "r":
             await self._recompute_pressure_bg()
+        else:
+            await self._panel_scroll_key(key)
+
+    async def _key_week(self, key: str) -> None:
+        if key == "r":
+            await self._recompute_week_bg()
         else:
             await self._panel_scroll_key(key)
 
@@ -5548,6 +5641,110 @@ class AppOverlays(AppRender):
         return panel_frame(
             paint,
             "schedule pressure",
+            body,
+            width,
+            "j/k scroll · r refresh · esc close",
+        )
+
+    # ---- week calendar ----------------------------------------------
+    def render_week(self, paint: Painter, cols: int, lines: int) -> List[str]:
+        """The web week calendar, terminal-shaped: a 7-day by 24-hour
+        shaded fire grid, a chronological agenda of the calendar-worthy
+        fires, and the background-hum summary of jobs too frequent to
+        chart.  All labels UTC, the TUI's frame everywhere else."""
+        width = min(96, cols - 4)
+        data = self.week
+        if not data:
+            return panel_frame(
+                paint,
+                "week calendar (UTC)",
+                [paint.style("  enumerating the week…", "dim")],
+                width,
+                "r refresh · esc close",
+            )
+        body: List[str] = []
+        items = data["items"]
+        frequent = data["frequent"]
+        start = data["start"]
+        body.append(
+            paint.style(
+                " next 7 days: %d fires from %d schedules"
+                % (len(items), data["schedules"])
+                + (
+                    " · %d frequent jobs summarized below" % len(frequent)
+                    if frequent
+                    else ""
+                ),
+                "dim",
+            )
+        )
+        # day x hour grid, shaded like the pressure grid
+        grid = data["grid"]
+        grid_max = max((c for row in grid for c in row), default=0) or 1
+        shades = " ░▒▓█"
+        axis = [paint.style(" " * 13, "dim")]
+        for hour in range(0, 24, 3):
+            axis.append(paint.style("%02d " % hour, "dim"))
+        body.append("".join(axis))
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        for day in range(7):
+            date = (start + datetime.timedelta(days=day)).date()
+            label = "today" if date == today else date.strftime("%a")
+            spans = [
+                paint.style(
+                    " %-5s %s " % (label, date.strftime("%m-%d")),
+                    "accent" if date == today else "dim",
+                )
+            ]
+            for hour in range(24):
+                count = grid[day][hour]
+                if not count:
+                    spans.append(paint.style("·", "off"))
+                    continue
+                shade = shades[max(1, min(4, 1 + int(3 * count / grid_max)))]
+                spans.append(paint.style(shade, "run"))
+            body.append("".join(spans))
+        if items:
+            body.append("")
+            body.append(paint.style(" upcoming fires (UTC)", "dim"))
+            now = datetime.datetime.now(datetime.timezone.utc)
+            for when, name in items:
+                past = when < now
+                body.append(
+                    paint.style(
+                        "  %s  " % when.strftime("%a %m-%d %H:%M"),
+                        "dim" if past else "accent",
+                    )
+                    + paint.style(
+                        truncate(name, width - 24),
+                        "off" if past else "fg",
+                    )
+                )
+        elif not frequent:
+            body.append("")
+            body.append(
+                paint.style("  no scheduled fires in the next 7 days", "dim")
+            )
+        if frequent:
+            body.append("")
+            body.append(
+                paint.style(" background hum (too frequent to chart):", "dim")
+            )
+            for name, count, capped in frequent:
+                body.append(
+                    paint.style("  %s" % truncate(name, width - 16), "fg")
+                    + paint.style(
+                        "  x%d%s" % (count, "+" if capped else ""), "dim"
+                    )
+                )
+        visible = max(6, lines - 6)
+        self.panel_scroll = max(
+            0, min(self.panel_scroll, max(0, len(body) - visible))
+        )
+        body = body[self.panel_scroll : self.panel_scroll + visible]
+        return panel_frame(
+            paint,
+            "week calendar (UTC)",
             body,
             width,
             "j/k scroll · r refresh · esc close",

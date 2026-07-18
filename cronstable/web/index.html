@@ -890,6 +890,38 @@
   .rt-mk { position: absolute; top: 3px; bottom: 15px; width: 2px; margin-left: -1px; background: var(--accent); cursor: pointer; border-radius: 1px; }
   .rt-mk:hover { background: var(--fg); box-shadow: 0 0 6px var(--glow); }
 
+  /* ---------- week calendar (upcoming fires on a browser-local grid) ---------- */
+  .wk-grid { display: grid; grid-template-columns: 34px repeat(7, minmax(0, 1fr)); gap: 4px; }
+  .wk-gutter { position: relative; margin-top: 22px; height: 432px; }
+  .wk-gutter span { position: absolute; right: 5px; font-size: 9px; color: var(--fg-faint); transform: translateY(-50%); font-variant-numeric: tabular-nums; }
+  .wk-day { min-width: 0; }
+  .wk-head { display: flex; gap: 5px; align-items: baseline; padding: 2px 4px; font-size: 11px; height: 22px; box-sizing: border-box; }
+  .wk-head b { color: var(--fg); font-weight: 700; }
+  .wk-head span { color: var(--fg-faint); }
+  .wk-day.today .wk-head b { color: var(--accent); }
+  /* hour rules drawn by gradient so the lane needs no 24 child divs */
+  .wk-lane { position: relative; height: 432px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg2); overflow: hidden;
+    background-image: repeating-linear-gradient(to bottom, transparent, transparent calc(100% / 24 - 1px), var(--border) calc(100% / 24 - 1px), var(--border) calc(100% / 24)); }
+  .wk-day.today .wk-lane { border-color: var(--border2); }
+  /* one hue per job (--jh, hashed from the name) as a translucent wash, so
+     chips separate without fighting the theme in either light or dark */
+  .wk-ev { position: absolute; height: 15px; padding: 0 4px; font-size: 10px; line-height: 15px; border-radius: 3px;
+    background: hsl(var(--jh) 45% 50% / .22); border-left: 2px solid hsl(var(--jh) 55% 52% / .9);
+    color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; box-sizing: border-box; }
+  .wk-ev:hover { background: hsl(var(--jh) 45% 50% / .4); color: var(--fg); z-index: 3; }
+  .wk-ev.past { opacity: .42; }
+  .wk-more { position: absolute; bottom: 2px; left: 2px; right: 2px; font-size: 9px; color: var(--fg-faint); text-align: center; }
+  .wk-empty { color: var(--fg-faint); font-style: italic; padding: 8px 4px; }
+  .wk-freq { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px; margin-top: 7px; }
+  .wk-fq-label { font-size: 10px; color: var(--fg-faint); }
+  .wk-fq { font-size: 10px; padding: 1px 7px; border-radius: var(--radius); cursor: pointer; color: var(--fg-dim);
+    background: hsl(var(--jh) 45% 50% / .16); border: 1px solid hsl(var(--jh) 45% 50% / .35); }
+  .wk-fq:hover { color: var(--fg); background: hsl(var(--jh) 45% 50% / .3); }
+  .wk-now { position: absolute; left: 0; right: 0; height: 0; border-top: 1px dashed var(--accent); z-index: 2; pointer-events: none; }
+  .wk-now::before { content: ""; position: absolute; left: -1px; top: -3px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+  .icslink { text-decoration: none; color: var(--fg-dim); border: 1px solid var(--border); border-radius: var(--radius); padding: 1px 7px; font-size: 10px; }
+  .icslink:hover { color: var(--fg); border-color: var(--border2); background: var(--hover); }
+
   /* ---------- wallboard / TV kiosk ---------- */
   .wallboard { position: fixed; inset: 0; z-index: 8000; background: var(--bg); display: flex; flex-direction: column; }
   body.fx .wallboard { background: radial-gradient(ellipse at center, var(--bg2) 0%, var(--bg) 82%); }
@@ -1444,6 +1476,7 @@
     <button class="ghostbtn" id="radarBtn" title="Next-fire radar">⌁ radar</button>
     <button class="ghostbtn" id="heatBtn" title="Activity heatmap">▦ heat</button>
     <button class="ghostbtn" id="pressBtn" title="Schedule pressure: upcoming fire collisions">▥ pressure</button>
+    <button class="ghostbtn" id="weekBtn" title="Week calendar: the next 7 days of fires, browser time">◫ week</button>
     <button class="ghostbtn" id="tailBtn" title="Merged multi-tail console">≋ tail</button>
     <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
@@ -1475,6 +1508,14 @@
       <ul class="radar-feed" id="radarFeed"></ul>
       <div class="radar-track" id="radarTrack"></div>
     </div>
+  </div>
+
+  <div class="card weekcal" id="weekCard" style="display:none">
+    <div class="card-label"><span>┌─ week calendar</span><span class="grow"></span>
+      <a class="icslink" id="icsLink" href="/calendar.ics" title="Subscribe to these fires as an iCal feed (.ics)">⤓ .ics feed</a>
+      <span class="faint" id="weekMeta"></span>
+    </div>
+    <div class="weekcal-body" id="weekBody"></div>
   </div>
 
   <div class="card heat" id="heatCard" style="display:none">
@@ -2786,7 +2827,7 @@
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
-    press: false, pressTz: "utc",
+    press: false, pressTz: "utc", week: false,
     // node-resources history card + live resource-chart refresh cadence (ms)
     nodeCard: false, resMs: 2000,
     boot: true,   // BIOS-style boot self-test on load
@@ -2831,6 +2872,7 @@
     justFailed: null,          // Set of names that flipped to failure THIS poll (wallboard flicker)
     anyFailing: false, alarmAck: false,
     radar: { items: [], sig: null },   // next-fire radar: [{name, t, c}] sorted by instant (+ render signature)
+    week: { items: [], bounds: null, sig: null, inputSig: null, dirty: false },  // week calendar: fires over the next 7 local days
     wallboard: false,          // TV kiosk mode active
     heat: { cache: {}, loading: false },   // activity heatmap: name -> {at, runs:[{t,o}]}
     // schedule pressure: the daemon's /schedule/pressure + /duplicates
@@ -2974,10 +3016,15 @@
     if (/^\d+$/.test(tok)) return parseInt(tok, 10);
     return null;
   }
-  // returns { restricted, has(v), values:[sorted] }  — throws on malformed
+  // returns { restricted, has(v), values:[sorted] }  — throws on malformed.
+  // In day-of-week, star and bare-start-with-step expansions run to 6 while
+  // an explicit 7 (Sunday again) stays legal, and a range ending in 0 wraps
+  // its end to 7 (so sat-sun and 6-0 work; 0-0 is every day, a preserved
+  // engine quirk); both mirror cronexpr's step_end/wrap rules.
   function parseField(spec, min, max, names, isDow) {
     spec = String(spec).trim().toLowerCase();
     if (spec === "*" || spec === "?") return { restricted: false, has: () => true, values: null };
+    const stepMax = isDow ? 6 : max;
     const set = new Set();
     for (const part of spec.split(",")) {
       let body = part, step = 1;
@@ -2986,15 +3033,90 @@
       if (!Number.isFinite(step) || step < 1) throw new Error("bad step: " + part);
       let lo, hi;
       const rng = body.match(/^([^-]+)-(.+)$/);
-      if (body === "*") { lo = min; hi = max; }
-      else if (rng) { lo = nameToNum(rng[1], names); hi = nameToNum(rng[2], names); }
-      else { lo = nameToNum(body, names); hi = (slash >= 0) ? max : lo; }
+      if (body === "*") { lo = min; hi = stepMax; }
+      else if (rng) {
+        lo = nameToNum(rng[1], names); hi = nameToNum(rng[2], names);
+        if (isDow && hi === 0) hi = 7;
+      }
+      else { lo = nameToNum(body, names); hi = (slash >= 0) ? stepMax : lo; }
       if (lo == null || hi == null) throw new Error("bad field: " + part);
       const add = (v) => { if (isDow && v === 7) v = 0; set.add(v); };
       if (lo <= hi) { for (let v = lo; v <= hi; v += step) add(v); }
       else { for (let v = lo; v <= max; v += step) add(v); for (let v = min; v <= hi; v += step) add(v); }
     }
     return { restricted: true, has: (v) => set.has(v), values: [...set].sort((a, b) => a - b) };
+  }
+  // day-of-month: plain values plus L / L-n / nW / LW, mirroring the
+  // daemon's cronexpr._parse_dom. `has`/`values` stay plain-only; the
+  // special forms carry month-shaped matching in domSideMatches below.
+  function parseDayOfMonth(spec) {
+    spec = String(spec).trim().toLowerCase();
+    const lastOffsets = new Set(), nearest = [];
+    let lastWeekday = false;
+    const plain = [];
+    if (spec !== "*" && spec !== "?") {
+      for (const item of spec.split(",")) {
+        let m;
+        if (item === "l") lastOffsets.add(0);
+        else if (item === "lw") lastWeekday = true;
+        else if ((m = item.match(/^l-(\d+)$/))) {
+          const off = parseInt(m[1], 10);
+          if (off < 1 || off > 30) throw new Error("bad L- offset: " + item);
+          lastOffsets.add(off);
+        } else if ((m = item.match(/^(\d+)w$/))) {
+          const day = parseInt(m[1], 10);
+          if (day < 1 || day > 31) throw new Error("bad W day: " + item);
+          nearest.push(day);
+        } else if (/^l/.test(item)) {
+          throw new Error("bad L item: " + item);
+        } else plain.push(item);
+      }
+    }
+    const special = lastOffsets.size > 0 || nearest.length > 0 || lastWeekday;
+    const base = (plain.length || !special)
+      ? parseField(plain.join(",") || spec, 1, 31, null, false)
+      : { restricted: true, has: () => false, values: [] };
+    return { restricted: base.restricted || special, has: base.has,
+             values: base.values, lastOffsets, nearest, lastWeekday };
+  }
+  // day-of-week: plain values plus L<n> (the month's last such weekday)
+  // and d#n (its n-th), mirroring cronexpr._parse_dow; 7 folds to 0, and
+  // a reversed L range stays legal and matches nothing (preserved quirk)
+  function parseDayOfWeek(spec) {
+    spec = String(spec).trim().toLowerCase();
+    const last = new Set(), nth = new Set();
+    const plain = [];
+    // a reversed L range (l7-3) is legal and matches nothing, so the item
+    // must still count as special even though it adds no set members
+    let sawSpecial = false;
+    if (spec !== "*" && spec !== "?") {
+      for (const item of spec.split(",")) {
+        let m;
+        if ((m = item.match(/^l(\d+)(?:-(\d+))?$/))) {
+          const lo = parseInt(m[1], 10);
+          const hi = m[2] != null ? parseInt(m[2], 10) : lo;
+          if (lo > 7 || hi > 7) throw new Error("bad L day: " + item);
+          sawSpecial = true;
+          for (let d = lo; d <= hi; d++) last.add(d % 7);
+        } else if (item.indexOf("#") >= 0) {
+          const at = item.indexOf("#");
+          const day = nameToNum(item.slice(0, at), DOW_NAMES);
+          const nText = item.slice(at + 1);
+          if (day == null || day > 7 || !/^\d+$/.test(nText)) throw new Error("bad # item: " + item);
+          const n = parseInt(nText, 10);
+          if (n < 1 || n > 5) throw new Error("bad # ordinal: " + item);
+          sawSpecial = true;
+          nth.add((day % 7) + "#" + n);
+        } else if (/^l/.test(item)) {
+          throw new Error("bad L item: " + item);
+        } else plain.push(item);
+      }
+    }
+    const base = (plain.length || !sawSpecial)
+      ? parseField(plain.join(",") || spec, 0, 7, DOW_NAMES, true)
+      : { restricted: true, has: () => false, values: [] };
+    return { restricted: base.restricted || sawSpecial, has: base.has,
+             values: base.values, last, nth };
   }
   const _cronCache = new Map();   // schedule string -> parsed (static per job)
   function parseCron(expr) {
@@ -3018,15 +3140,20 @@
     else if (f.length === 6) { core = f.slice(0, 5); yr = f[5]; }
     else if (f.length === 7) { sec = f[0]; core = f.slice(1, 6); yr = f[6]; }
     else return { type: "unknown", raw: expr };
+    // '?' is the Quartz day-field spelling of '*': only day-of-month and
+    // day-of-week accept it (mirroring the daemon's engine); anywhere else
+    // the expression is invalid, not silently unrestricted
+    if ([sec, core[0], core[1], core[3], yr].some((t) => t.indexOf("?") >= 0))
+      return { type: "unknown", raw: expr };
     try {
       return {
         type: "fields", raw: expr, hasSeconds: f.length === 7,
         second: parseField(sec, 0, 59, null, false),
         minute: parseField(core[0], 0, 59, null, false),
         hour:   parseField(core[1], 0, 23, null, false),
-        dom:    parseField(core[2], 1, 31, null, false),
+        dom:    parseDayOfMonth(core[2]),
         month:  parseField(core[3], 1, 12, MON_NAMES, false),
-        dow:    parseField(core[4], 0, 7, DOW_NAMES, true),
+        dow:    parseDayOfWeek(core[4]),
         year:   parseField(yr, 1970, 2099, null, false),
       };
     } catch (_) { return { type: "unknown", raw: expr }; }
@@ -3036,11 +3163,36 @@
     // AND rule between day-of-month and day-of-week, mirroring the daemon's
     // engine (cronexpr._day_matches), unlike standard cron's OR:
     // '0 0 13 * 5' is Friday the 13th, not every Friday plus every 13th.
-    const domR = p.dom.restricted, dowR = p.dow.restricted;
-    if (domR && dowR) return p.dom.has(c.D) && p.dow.has(c.dow);
-    if (domR) return p.dom.has(c.D);
-    if (dowR) return p.dow.has(c.dow);
+    // Each side also carries its special day forms (L / L-n / nW / LW and
+    // L<n> / d#n), month-shaped exactly like the server's.
+    if (p.dom.restricted && !domSideMatches(p.dom, c)) return false;
+    if (p.dow.restricted && !dowSideMatches(p.dow, c)) return false;
     return true;
+  }
+  function domSideMatches(dom, c) {
+    if (dom.has(c.D)) return true;
+    const end = daysInMonth(c.Y, c.Mo);
+    if (dom.lastOffsets.size && dom.lastOffsets.has(end - c.D)) return true;
+    if (dom.lastWeekday && c.D === shiftToWeekday(c.Y, c.Mo, end, end)) return true;
+    for (const target of dom.nearest) {
+      if (target <= end && c.D === shiftToWeekday(c.Y, c.Mo, target, end)) return true;
+    }
+    return false;
+  }
+  function dowSideMatches(dow, c) {
+    if (dow.has(c.dow)) return true;
+    const end = daysInMonth(c.Y, c.Mo);
+    if (dow.last.size && dow.last.has(c.dow) && c.D > end - 7) return true;
+    return dow.nth.size > 0 && dow.nth.has(c.dow + "#" + (Math.floor((c.D - 1) / 7) + 1));
+  }
+  // the day a W item fires on: the weekday nearest `target`, a Saturday
+  // resolving backward and a Sunday forward, flipped inward at the month's
+  // edges so the fire never leaves the month (cronexpr._shift_to_weekday)
+  function shiftToWeekday(y, mo, target, end) {
+    const wd = dowOf(y, mo, target);            // Sun=0..Sat=6
+    if (wd === 6) return target > 1 ? target - 1 : target + 2;
+    if (wd === 0) return target < end ? target + 1 : target - 2;
+    return target;
   }
   function daysInMonth(y, m) { return [31, (y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0)) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]; }
   function dowOf(y, m, d) { return new Date(Date.UTC(y, m - 1, d)).getUTCDay(); }
@@ -3092,8 +3244,10 @@
   // since parseCron knows no H. Display keeps job.schedule (what the user
   // wrote); computation uses this.
   function schedOf(job) { return job.schedule_resolved || job.schedule; }
-  // next N fire times as {c: components, t: instant ms}
-  function nextRuns(parsed, n, frame, fromMs) {
+  // next N fire times as {c: components, t: instant ms}; untilMs (optional)
+  // bounds the walk itself, so a sparse schedule stops at the window's end
+  // instead of hunting fires toward the year ceiling
+  function nextRuns(parsed, n, frame, fromMs, untilMs) {
     if (parsed.type !== "fields") return [];
     const start = wallParts(new Date(fromMs), frame);
     let c = { Y: start.Y, Mo: start.Mo, D: start.D, h: start.h, mi: start.mi, se: start.se, dow: start.dow };
@@ -3118,24 +3272,70 @@
       if (c.se > 59) { c.se = 0; c.mi++; if (c.mi > 59) { c.mi = 0; c.h++; if (c.h > 23) { c.h = 0; advDay(); } } }
     };
     incSec();
+    // untilMs as wall parts in this frame: a walk date past that civil date
+    // can only yield instants at or past the bound (each same-date hit is
+    // still checked exactly against untilMs below)
+    const bnd = untilMs == null ? null : wallParts(new Date(untilMs), frame);
     const out = [];
     let guard = 0;
     while (out.length < n && guard++ < 500000) {
       if (c.Y > 2099) break;   // the engine's year ceiling; nothing matches beyond it
+      if (bnd && (c.Y > bnd.Y || (c.Y === bnd.Y && (c.Mo > bnd.Mo || (c.Mo === bnd.Mo && c.D > bnd.D))))) break;
       if (parsed.year.restricted && !parsed.year.has(c.Y)) { advYear(); continue; }
       if (!parsed.month.has(c.Mo)) { advMonth(); continue; }
       if (!dayMatches(parsed, c)) { advDay(); continue; }
       if (!parsed.hour.has(c.h)) { c.h++; c.mi = 0; c.se = 0; if (c.h > 23) { c.h = 0; advDay(); } continue; }
       if (!parsed.minute.has(c.mi)) { c.mi++; c.se = 0; if (c.mi > 59) { c.mi = 0; c.h++; if (c.h > 23) { c.h = 0; advDay(); } } continue; }
       if (!parsed.second.has(c.se)) { incSec(); continue; }
-      out.push({ c: Object.assign({}, c), t: instantOf(c, frame) });
+      const t = instantOf(c, frame);
+      if (untilMs != null && t >= untilMs) break;
+      out.push({ c: Object.assign({}, c), t });
       incSec();
     }
     return out;
   }
+  // prose phrases for the special day forms, in source order and deduped
+  // (L0-7 folds both ends to Sunday; the engine's sets dedupe, so the
+  // prose must too); the wording mirrors the server describer
+  // (croninfo._split_special_dom / _dow via _finish_split)
+  function dedupePhrases(out) { return out.filter((ph, i) => out.indexOf(ph) === i); }
+  function domPhrases(spec) {
+    const out = [];
+    for (const item of String(spec).trim().toLowerCase().split(",")) {
+      let m;
+      if (item === "l") out.push("the last day of the month");
+      else if (item === "lw") out.push("the last weekday of the month");
+      else if ((m = item.match(/^l-(\d+)$/))) {
+        const off = parseInt(m[1], 10);
+        out.push(off === 1 ? "the day before the last day of the month"
+                           : off + " days before the last day of the month");
+      } else if ((m = item.match(/^(\d+)w$/))) {
+        out.push("the weekday nearest the " + ordinal(parseInt(m[1], 10)));
+      }
+    }
+    return dedupePhrases(out);
+  }
+  function dowPhrases(spec) {
+    const out = [];
+    for (const item of String(spec).trim().toLowerCase().split(",")) {
+      let m;
+      if ((m = item.match(/^l(\d+)(?:-(\d+))?$/))) {
+        const lo = parseInt(m[1], 10);
+        const hi = m[2] != null ? parseInt(m[2], 10) : lo;
+        for (let d = lo; d <= hi && d <= 7; d++) out.push("the last " + DOWN[d % 7] + " of the month");
+      } else if (item.indexOf("#") >= 0) {
+        const at = item.indexOf("#");
+        const day = nameToNum(item.slice(0, at), DOW_NAMES);
+        const n = parseInt(item.slice(at + 1), 10);
+        if (day != null) out.push("the " + ordinal(n) + " " + DOWN[day % 7] + " of the month");
+      }
+    }
+    return dedupePhrases(out);
+  }
   // plain-English description
   function describeCron(expr) {
-    const low = String(expr || "").trim().toLowerCase();
+    expr = String(expr || "").trim();
+    const low = expr.toLowerCase();
     if (low === "@reboot") return "Once, when cronstable starts (@reboot)";
     const macroText = {
       "@yearly": "Once a year, at midnight on 1 January",
@@ -3156,7 +3356,9 @@
     else if (f.length === 7) { sec = f[0]; core = f.slice(1, 6); yr = f[6]; }
     else core = f;
     const [mi, h, dom, mon, dow] = core;
-    const everyMin = mi === "*", everyHr = h === "*", everyDom = dom === "*", everyMon = mon === "*", everyDow = dow === "*";
+    // '?' reads as '*' in the day fields (Quartz spelling), like the engine
+    const unres = (t) => t === "*" || t === "?";
+    const everyMin = mi === "*", everyHr = h === "*", everyDom = unres(dom), everyMon = mon === "*", everyDow = unres(dow);
     const stepM = mi.match(/^\*\/(\d+)$/), stepH = h.match(/^\*\/(\d+)$/);
     // "*/n" only reads as a true fixed interval when n divides the field's span
     // (60 minutes / 24 hours); otherwise the last gap before the boundary is
@@ -3182,15 +3384,36 @@
     // engine (dayMatches, mirroring the daemon's cronexpr._day_matches)
     // keeps parse-crontab's AND rule ('0 0 13 * 5' is Friday the 13th),
     // unlike standard cron's OR, so the prose must say so too; the
-    // wording mirrors the server describer (croninfo.describe_cron).
+    // wording mirrors the server describer (croninfo.describe_cron),
+    // including the special day-form phrases in source order.
+    // A star among the plain items ("*,L" or "1,*,L") already covers
+    // every day; the phrases would overstate the restriction, so punt.
+    const starItem = (t) => String(t).trim().toLowerCase().split(",").some((s) => s === "*" || s === "?");
+    const dowPhr = everyDow ? [] : dowPhrases(dow);
+    const domPhr = everyDom ? [] : domPhrases(dom);
+    if ((!everyDom && (p.dom.values === null || (domPhr.length && starItem(dom)))) ||
+        (!everyDow && (p.dow.values === null || (dowPhr.length && starItem(dow)))))
+      return "Custom schedule: " + expr;
+    const dowVals = everyDow ? [] : (p.dow.values || []);
+    const domVals = everyDom ? [] : (p.dom.values || []);
+    // restricted but nothing usable (a reversed L range): no honest prose
+    if ((!everyDow && !dowVals.length && !dowPhr.length) ||
+        (!everyDom && !domVals.length && !domPhr.length))
+      return "Custom schedule: " + expr;
     const dayClauses = [];
-    if (!everyDow) dayClauses.push("on " + listJoin(p.dow.values.map((d) => DOWN[d])));
-    if (!everyDom) dayClauses.push("on the " + listJoin(p.dom.values.map((d) => ordinal(d))) + (everyDow ? " of the month" : ""));
+    if (dowVals.length || dowPhr.length)
+      dayClauses.push("on " + listJoin(dowVals.map((d) => DOWN[d]).concat(dowPhr)));
+    if (domVals.length || domPhr.length) {
+      if (domPhr.length)
+        dayClauses.push("on " + listJoin(domVals.map((d) => "the " + ordinal(d)).concat(domPhr)));
+      else
+        dayClauses.push("on the " + listJoin(domVals.map((d) => ordinal(d))) + ((dowVals.length || dowPhr.length) ? "" : " of the month"));
+    }
     const clauses = [];
     if (dayClauses.length === 2) clauses.push(dayClauses[1] + ", and only " + dayClauses[0]);
     else if (dayClauses.length === 1) clauses.push(dayClauses[0]);
     if (!everyMon) clauses.push("in " + listJoin(p.month.values.map((m) => MONTHS[m])));
-    else if (everyDom && everyDow) clauses.push("every day");
+    else if (!dayClauses.length) clauses.push("every day");
     // restrict to specific year(s) when a year column is present (6-/7-field)
     if (yr !== "*") clauses.push("in " + listJoin(p.year.values.map(String)));
     let base = [timePart, ...clauses].join(", ");
@@ -3550,6 +3773,7 @@
     });
     $("clock").textContent = utcClock();
     if (prefs.radar) renderRadar();
+    if (prefs.week) renderWeek();   // cheap: only the now-line moves per tick
     if (state.timeline.open) $("tlNow").textContent = utcClock();
     if (state.wallboard) {
       const wc = $("wbClock"); if (wc) wc.textContent = utcClock();
@@ -3744,6 +3968,158 @@
     $("radarMeta").textContent = upcoming.length + " upcoming";
   }
   function setRadar(v) { prefs.radar = v; savePref("radar"); $("radarBtn").classList.toggle("on", v); if (v) computeRadar(); renderRadar(); }
+
+  // ===================================================================
+  //  week calendar: the next 7 days of fires on a browser-local grid
+  // ===================================================================
+  // The same data as the .ics feed, drawn instead of subscribed: fires are
+  // enumerated by the client engine in each job's own frame (real instants,
+  // so DST is right by construction) and PLACED by their browser-local wall
+  // time, since a week grid needs one display frame and the on-call reader
+  // thinks in theirs.
+  const WEEK_DAY_CAP = 80;        // chips drawn per day before "+N more"
+  // a job firing more often than ~8x/day is background hum, not a calendar
+  // event: it leaves the grid for the summary strip below it, where its
+  // cadence reads better than dozens of sliver chips ever could; one fire
+  // past the threshold is all the walk needs to prove it
+  const WEEK_FREQ_MAX = 56;
+  function jobHue(name) {
+    let h = 0;
+    for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    return h % 360;
+  }
+  function weekDayBounds() {
+    const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+    const bounds = [];
+    for (let i = 0; i <= 7; i++) bounds.push(new Date(d0.getFullYear(), d0.getMonth(), d0.getDate() + i).getTime());
+    return bounds;  // 8 local-midnight instants; DST days keep true lengths
+  }
+  function computeWeek() {
+    const bounds = weekDayBounds();
+    const tEnd = bounds[7];
+    // the walk below is deterministic in (day window, enabled schedules,
+    // frames); skip it when none of those changed since the last poll,
+    // which is nearly every 3s tick
+    const inputSig = bounds[0] + "&" + state.jobs.map(
+      (j) => (j.enabled ? j.name + "|" + schedOf(j) + "|" + frameOf(j) : "")).join(";");
+    if (inputSig === state.week.inputSig) return;
+    state.week.inputSig = inputSig;
+    const items = [];
+    const frequent = [];
+    for (const j of state.jobs) {
+      if (!j.enabled) continue;
+      const parsed = parseCron(schedOf(j));
+      if (parsed.type !== "fields") continue;
+      // from one second before today's local midnight, so a fire exactly at
+      // 00:00 lands in the grid; past fires today render dimmed. The walk
+      // is bounded by the window's end and needs at most one fire past the
+      // hum threshold, so sparse and dense schedules both stay cheap.
+      const fires = nextRuns(
+        parsed, WEEK_FREQ_MAX + 1, frameOf(j), bounds[0] - 1000, tEnd
+      ).map((r) => r.t);
+      if (fires.length > WEEK_FREQ_MAX) {
+        frequent.push({ name: j.name });
+      } else {
+        for (const t of fires) items.push({ name: j.name, t });
+      }
+    }
+    items.sort((a, b) => a.t - b.t || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    frequent.sort((a, b) => (a.name < b.name ? -1 : 1));
+    const sig = bounds[0] + "#" + items.map((x) => x.name + "@" + x.t).join("|") +
+      "##" + frequent.map((f) => f.name).join("|");
+    if (sig !== state.week.sig) { state.week.sig = sig; state.week.dirty = true; }
+    state.week.items = items;
+    state.week.frequent = frequent;
+    state.week.bounds = bounds;
+  }
+  function updateIcsLink() {
+    const a = $("icsLink");
+    if (!a) return;
+    const t = token();
+    a.href = "/calendar.ics" + (t ? "?token=" + encodeURIComponent(t) : "");
+  }
+  function renderWeek() {
+    const card = $("weekCard");
+    if (!prefs.week) { card.style.display = "none"; return; }
+    card.style.display = "";
+    const now = Date.now();
+    if (!state.week.bounds || now >= state.week.bounds[1]) computeWeek();  // first paint or day rollover
+    const bounds = state.week.bounds, items = state.week.items;
+    if (state.week.dirty) {
+      state.week.dirty = false;
+      const perDay = Array.from({ length: 7 }, () => []);
+      for (const x of items) {
+        let d = 0;
+        while (d < 6 && x.t >= bounds[d + 1]) d++;
+        if (x.t >= bounds[d] && x.t < bounds[d + 1]) perDay[d].push(x);
+      }
+      const gutter = '<div class="wk-gutter">' + [0, 6, 12, 18].map((h) =>
+        '<span style="top:' + (h / 24 * 100) + '%">' + pad2(h) + '</span>').join("") + "</div>";
+      const cols = perDay.map((list, i) => {
+        const date = new Date(bounds[i]);
+        const label = i === 0 ? "today" : date.toLocaleDateString(undefined, { weekday: "short" });
+        const dnum = date.toLocaleDateString(undefined, { month: "numeric", day: "numeric" });
+        const shown = list.slice(0, WEEK_DAY_CAP);
+        // chips sharing a 15-minute bucket split the lane's width instead of
+        // stacking invisibly on top of each other
+        const buckets = {};
+        for (const x of shown) {
+          const dt = new Date(x.t);
+          const b = dt.getHours() * 4 + Math.floor(dt.getMinutes() / 15);
+          (buckets[b] = buckets[b] || []).push(x);
+        }
+        let chips = "";
+        for (const b of Object.keys(buckets)) {
+          const group = buckets[b];
+          const width = 100 / group.length;
+          group.forEach((x, k) => {
+            const dt = new Date(x.t);
+            const top = ((dt.getHours() * 60 + dt.getMinutes()) / 1440 * 100).toFixed(2);
+            const pos = group.length === 1
+              ? "left:2px;right:2px"
+              : "left:calc(" + (k * width).toFixed(2) + "% + 2px);width:calc(" + width.toFixed(2) + "% - 4px)";
+            chips += '<span class="wk-ev' + (x.t < now ? " past" : "") + '" data-job="' + escAttr(x.name) +
+              '" style="top:' + top + "%;" + pos + ";--jh:" + jobHue(x.name) +
+              '" title="' + escAttr(x.name + " · " + fmtAt(x.t)) + '">' + esc(x.name) + "</span>";
+          });
+        }
+        const more = list.length > shown.length ? '<span class="wk-more">+' + (list.length - shown.length) + " more</span>" : "";
+        const nowLine = i === 0 ? '<i class="wk-now" id="weekNow"></i>' : "";
+        return '<div class="wk-day' + (i === 0 ? " today" : "") + '"><div class="wk-head"><b>' + esc(label) +
+          "</b><span>" + esc(dnum) + '</span></div><div class="wk-lane">' + nowLine + chips + more + "</div></div>";
+      });
+      const frequent = state.week.frequent || [];
+      let strip = "";
+      if (frequent.length) {
+        strip = '<div class="wk-freq"><span class="wk-fq-label">background hum (too frequent to chart):</span>' +
+          frequent.map((f) => {
+            const j = state.byName[f.name];
+            const cadence = j ? describeCron(schedOf(j)) : "";
+            return '<span class="wk-fq" data-job="' + escAttr(f.name) + '" title="' + escAttr(cadence) + '"' +
+              ' style="--jh:' + jobHue(f.name) + '">' + esc(f.name) + "</span>";
+          }).join("") + "</div>";
+      }
+      $("weekBody").innerHTML = items.length || frequent.length
+        ? '<div class="wk-grid">' + gutter + cols.join("") + "</div>" + strip
+        : '<div class="wk-empty">no scheduled fires in the next 7 days</div>';
+      $("weekMeta").textContent = items.length + " fire" + (items.length === 1 ? "" : "s") +
+        (frequent.length ? " + " + frequent.length + " frequent job" + (frequent.length === 1 ? "" : "s") : "") +
+        " / 7 days · browser time";
+      updateIcsLink();
+    }
+    const nowEl = $("weekNow");
+    if (nowEl) {
+      const dt = new Date(now);
+      nowEl.style.top = ((dt.getHours() * 60 + dt.getMinutes() + dt.getSeconds() / 60) / 1440 * 100).toFixed(3) + "%";
+    }
+  }
+  function setWeek(v) {
+    prefs.week = v; savePref("week");
+    $("weekBtn").classList.toggle("on", v);
+    if (v) { computeWeek(); state.week.dirty = true; }
+    renderWeek();
+    if (v) $("weekCard").scrollIntoView({ block: "nearest" });
+  }
 
   // ===================================================================
   //  wallboard / TV kiosk mode
@@ -4603,6 +4979,7 @@
       if (state.timeline.open) renderTimeline();
       if (state.mitigate.open) renderMitList();
       if (prefs.radar) { computeRadar(); renderRadar(); }
+      if (prefs.week) { computeWeek(); renderWeek(); }
       if (state.wallboard) renderWallboard();
       zenGovernor();
       loadCluster();
@@ -5196,11 +5573,15 @@
     // (e.g. "31 of February") — say so instead of a confident-but-wrong prose.
     const impossible = parsed.type === "fields" && !runs.length;
     const desc = impossible ? "This schedule can never occur (impossible date)." : describeCron(schedOf(job));
+    const t = token();
+    const icsHref = "/jobs/" + encodeURIComponent(name) + "/calendar.ics" +
+      (t ? "?token=" + encodeURIComponent(t) : "");
     let html =
       '<p class="sched-desc">' + esc(desc) + "</p>" +
       '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + "</span>" +
       (job.schedule_resolved ? ' <span class="faint">(H resolves to</span> <span class="chip">' + esc(job.schedule_resolved) + '</span><span class="faint">)</span>' : "") +
-      ' · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b></div>";
+      ' · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b>" +
+      ' · <a class="icslink" href="' + escAttr(icsHref) + '" title="Subscribe to this job\'s fires as an iCal feed">⤓ .ics</a></div>';
 
     // foot-gun advisories: self-overlap, thundering-herd collisions, DST
     const warns = scheduleWarnings(job);
@@ -5759,6 +6140,7 @@
       { ic: "✦", lbl: "Toggle desktop notifications", run: () => setNotify(!prefs.notify) },
       { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
       { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
+      { ic: "◫", lbl: "Toggle week calendar", run: () => setWeek(!prefs.week) },
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
       { ic: "▥", lbl: "Toggle schedule pressure", sub: "upcoming fire collisions + duplicates", run: () => setPressure(!prefs.press) },
       { ic: "⊞", lbl: "Toggle fleet view", sub: "every node's runs", run: () => setFleet(!prefs.fleet) },
@@ -7085,6 +7467,7 @@
     $("refreshBtn").addEventListener("click", loadJobs);
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
+    $("weekBtn").addEventListener("click", () => setWeek(!prefs.week));
     $("heatBtn").addEventListener("click", () => setHeat(!prefs.heat));
     $("pressBtn").addEventListener("click", () => setPressure(!prefs.press));
     $("pressTz").addEventListener("change", (e) => {
@@ -7117,6 +7500,7 @@
     });
     $("heatWindow").addEventListener("change", (e) => { prefs.heatWindow = e.target.value; savePref("heatWindow"); renderHeatmap(); });
     $("radarPanel").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job")); });
+    $("weekBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job"), "schedule"); });
     $("heatBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job"), "history"); });
     $("wbGrid").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) { setWallboard(false); openDrawer(it.getAttribute("data-job")); } });
     $("wbFoot").addEventListener("click", (e) => { if (e.target.closest("#wbExit")) setWallboard(false); });
@@ -8529,6 +8913,7 @@
   wire();
   // reflect persisted add-on-panel prefs onto their toggles + initial render
   $("radarBtn").classList.toggle("on", prefs.radar);
+  $("weekBtn").classList.toggle("on", prefs.week);
   $("heatBtn").classList.toggle("on", prefs.heat);
   $("pressBtn").classList.toggle("on", prefs.press);
   $("pressTz").value = prefs.pressTz;
@@ -8536,6 +8921,7 @@
   $("stateBtn").classList.toggle("on", prefs.stateInsp);
   $("heatWindow").value = prefs.heatWindow;
   if (prefs.radar) renderRadar();
+  if (prefs.week) renderWeek();
   if (prefs.heat) { renderHeatmap(); loadHeatmap(true); }
   if (prefs.press) { renderPressure(); loadPressure(true); }
   if (prefs.nodeCard) setNodeCard(true);

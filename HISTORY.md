@@ -5,6 +5,67 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.22 (2026-07-18)
+
+The schedule dialect learns to speak business days, and the scheduler's own
+fire enumeration becomes something you can put on a calendar.
+
+### Business-day schedule forms
+
+- **Four additive day forms**, straight from the Quartz family the dialect
+  already borrows `?` from: `L-<n>` in day-of-month counts back from the
+  month's final day (`L-3` = three days before it), `<n>W` fires on the
+  weekday nearest day `n` (a Saturday 15th resolves to Friday the 14th, a
+  Sunday 15th to Monday the 16th, flipped inward at the month's edges so the
+  fire never leaves the month), `LW` is the month's last weekday, and
+  `<d>#<n>` in day-of-week is the month's n-th such weekday (`5#3` = third
+  Friday, the sibling `L5` always wanted).  The golden compatibility
+  corpus pins the new forms from the engine's own recorded vectors
+  (flagged `"extension": true`) alongside the legacy ones.
+- **Every schedule surface understands them from parsed ground truth**: the
+  plain-English describers (server and dashboard), the linter (month
+  reachability generalizes: `31W` warns about April, `L-28` in February
+  earns the leap-day-only note), the no-run explainer, semantic duplicate
+  grouping (`fri#3` equals `5#3`), pressure, previews, and the MCP schedule
+  authoring tools.  Wrong-field uses keep the hint machinery: `#` outside
+  day-of-week and `W` outside day-of-month name the right field, and
+  Quartz's trailing-L (`5L`) points at the `L5` spelling.
+- **The dashboard's client engine reaches full parity with the daemon's**:
+  it now parses the whole day-form family (including the legacy `L` and
+  `L<n>` forms it never previewed before), and a differential test replays
+  the entire golden corpus through both engines instant-for-instant.  Two
+  degenerate-quirk gaps fixed on the way: a day-of-week range ending in 0
+  now wraps like the engine (`sun-sun` fires daily), and bare-start steps
+  in day-of-week expand over 0-6.
+
+### Calendar export and the week calendar
+
+- **`GET /calendar.ics` and `GET /jobs/{name}/calendar.ics`** serve upcoming
+  fires as standard iCalendar feeds: one event per fire from the scheduler's
+  own occurrence walk in each job's timezone, emitted as UTC instants with
+  stable UIDs (subscribed clients update in place), block lengths from run
+  history (5-minute floor), `TRANSP:TRANSPARENT` so maintenance windows do
+  not mark on-call busy, and descriptions that carry the schedule and its
+  plain-English reading but never the command line.  `?days=` (default 14,
+  max 60) and `?per_job=` bound the feed; truncation is announced in-band.
+- **Calendar clients cannot send bearer headers**, so with `web.authToken`
+  set the `.ics` paths (only) accept the token as a `token` query
+  parameter, the secret-address model calendar services use; every other
+  path still refuses query tokens.
+- **A week calendar in the dashboard** (the `◫ week` toolbar button): seven
+  browser-local day columns of hue-keyed fire chips with a live now-line,
+  quarter-hour collision splitting, and click-through to each job's
+  Schedule tab, which now links the per-job `.ics` feed.  Jobs firing more
+  than ~8x/day summarize into a "background hum" strip under the grid
+  instead of flooding it.  The demo mirror carries the full view, and its
+  synthetic fleet gained business-day showcase jobs.
+- **The terminal dashboard keeps feature parity**: the same panel under
+  the same palette command ("Toggle week calendar"), terminal-shaped: a
+  seven-day by 24-hour shaded fire grid, a scrollable UTC agenda of the
+  calendar-worthy fires, and the identical background-hum rule, computed
+  locally from the `/jobs` snapshot like the pressure panel, so it works
+  against older daemons too.
+
 ## 1.2.21 (2026-07-18)
 
 The in-house cron engine grows a safety net and a toolbox.  A schedule that

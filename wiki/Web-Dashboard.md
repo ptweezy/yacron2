@@ -496,6 +496,22 @@ browser by the same cron engine as the
 [cron sandbox](#cron-sandbox); disabled jobs, and schedules the engine cannot
 preview (such as `@reboot`), are omitted.
 
+## Week calendar
+
+The **`◫ week`** toolbar button (or *Toggle week calendar* in the palette)
+opens a seven-day grid of upcoming fires, starting today: one hue-keyed chip
+per fire, placed at its **browser-local** wall time (fires are computed in
+each job's own frame by the client engine, then plotted in yours), with a
+dashed now-line in today's column. Chips sharing a quarter-hour split the
+column side by side, past fires today render dimmed, and clicking a chip
+opens the job's drawer on its
+[Schedule tab](#schedule-in-plain-english-in-the-right-timezone). Jobs that
+fire more than about eight times a day summarize into a **background hum**
+strip below the grid instead of flooding it with sliver chips. The card
+header links the fleet's **iCal feed** (`⤓ .ics feed`), and each drawer's
+Schedule tab links the per-job feed, so the same data lands in a real
+calendar app; see [Calendar Export](Calendar-Export).
+
 ## Activity heatmap
 
 [![The activity heatmap punchcard: one row per job, cells colored by worst outcome in the bucket and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png)

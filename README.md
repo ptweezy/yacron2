@@ -41,6 +41,12 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
   (see [Classic crontab files](#classic-crontab-files))
+* **Business-day schedules**: `LW` (the month's last weekday), `L-3` (three
+  days before month-end), `15W` (the weekday nearest the 15th), and `5#3`
+  (the third Friday) express payroll/billing-style cadences directly, and
+  Quartz day expressions largely paste straight in (see the
+  [Business-Day Schedules](https://github.com/ptweezy/cronstable/wiki/Business-Day-Schedules)
+  wiki page)
 * Built-in **schedule linting**: dead schedules that can never fire again are
   called out loudly (never silently dropped), and common footguns (AND day
   semantics, uneven `*/n` steps, day-31-in-April, schedules that DST skips or
@@ -78,6 +84,13 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   wiki page)
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
+  (or one job's `/jobs/{name}/calendar.ics`) and the fleet's upcoming fires,
+  enumerated by the scheduler's own engine, land on the on-call engineer's
+  calendar; the dashboard draws the same data as a seven-day **week
+  calendar** (see the
+  [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)
+  wiki page)
 * Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
   AI agents (Claude, Cursor, VS Code Copilot). An agent can **observe**
   cronstable, **author and debug schedules** with the daemon's own engine
@@ -1900,6 +1913,31 @@ event: end
 data: {}
 ```
 
+#### Subscribe to the schedule as an iCal calendar
+
+`GET /calendar.ics` serves the fleet's upcoming fires as a standard
+iCalendar feed (one event per fire, enumerated by the scheduler's own
+engine in each job's timezone), and `GET /jobs/{name}/calendar.ics` serves
+one job's. Subscribe a calendar app to the URL and overnight maintenance
+jobs show up on the on-call engineer's week; the dashboard's **`◫ week`**
+button draws the same data as a seven-day calendar in the browser.
+`?days=` widens the window (default 14, max 60) and `?per_job=` caps
+events per job. Event descriptions carry the schedule, its plain-English
+reading, and the typical runtime, never the command line. With
+`web.authToken` set, the `.ics` paths (only) also accept the token as
+`?token=<value>`, since calendar clients cannot send a bearer header. See
+[Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export).
+
+```shell
+$ curl "http://127.0.0.1:8080/calendar.ics?days=30" | head -6
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//cronstable//1.2.22//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+X-WR-CALNAME:cronstable
+```
+
 ### Job-set id
 
 The **job-set id** is an order-independent fingerprint of the set of jobs a
@@ -2103,6 +2141,7 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
 * **Configure it**:
   [Configuration Reference](https://github.com/ptweezy/cronstable/wiki/Configuration-Reference) ·
   [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) ·
+  [Business-Day Schedules](https://github.com/ptweezy/cronstable/wiki/Business-Day-Schedules) ·
   [Schedule Linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting) ·
   [Classic Crontabs](https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs) ·
   [Includes and Defaults](https://github.com/ptweezy/cronstable/wiki/Includes-and-Defaults) ·
@@ -2117,6 +2156,7 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
 * **Watch it**:
   [Web Dashboard](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard) ·
   [Terminal Dashboard](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard) ·
+  [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export) ·
   [HTTP API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) ·
   [MCP Server](https://github.com/ptweezy/cronstable/wiki/MCP) ·
   [Metrics with Prometheus](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Prometheus) ·

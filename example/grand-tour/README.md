@@ -81,6 +81,7 @@ or task that demonstrates it. The big ones:
 | **Scheduling** | cron strings, object form (named fields), `@reboot`, `@daily`, `utc:false` | throughout |
 | | **second-level** (object `second:` and 7-field string) | `pulse-liveness`, `pulse-latency` |
 | | the trailing **year** field | `fiscal-year-open` |
+| | **business-day forms**: `LW`, `L-3`, `15W`, nth weekday `5#3` | `monthly-close-prep`, `payroll-file-transmit`, `invoice-day-run`, `board-pack-render` |
 | | timezones (New York / London / Tokyo) + DST advisory | `finance-eod-close`, `eu-/apac-open-report` |
 | **Execution** | string vs **argv-list** command, `environment`, **`env_file`** | `orders-ingest`, `pulse-*`, `backup-warehouse` |
 | | `streamPrefix` **templating** (`{job_name}`/`{stream_name}`) + empty prefix | `orders-ingest`, `sla-rollup` |
@@ -113,6 +114,7 @@ or task that demonstrates it. The big ones:
 | | DAG approval **`onReject: fail`** (failure cascade) | `hotfix-release` |
 | **Metrics/API** | **statsd** push, native **Prometheus** `/metrics` (map form: public + custom buckets), `web.headers` | `etl-build-facts`, `queue-depth-probe`; every node |
 | | opt-in bearer **`authToken`** | `web.authToken` (see *Things to try*) |
+| | **iCal feed** (`/calendar.ics`, per-job `.ics`) + the dashboard **week calendar** | any node (see *Things to try*) |
 | **Config** | **`include:`**, custom **`logging:`**, a **classic crontab** | `_defaults.yaml`, `legacy.crontab` |
 
 ## Self-driving dashboard demos (UTC, no clicks)
@@ -218,6 +220,24 @@ their own:
 11. **Poke the control API.** `curl http://localhost:8080/status`,
     `/jobs`, `/cluster`, `/job-set-id`, `/metrics`, and
     `curl -X POST http://localhost:8080/jobs/run-schema-migration/start`.
+12. **Put the fleet on your calendar.** Every node serves the schedule as an
+    iCal feed; subscribe from any calendar app and the overnight maintenance
+    jobs land on the on-call engineer's week:
+
+    ```console
+    curl http://localhost:8080/calendar.ics                       # the fleet, next 14 days
+    curl "http://localhost:8080/calendar.ics?days=30&per_job=20"  # wider window
+    curl http://localhost:8080/jobs/monthly-close-prep/calendar.ics   # one job
+    ```
+
+    With `web.authToken` on, calendar apps cannot send a bearer header, so the
+    `.ics` routes (only) also accept the token in the URL, the same
+    secret-address model calendar services use:
+    `curl "http://localhost:8080/calendar.ics?token=s3cret"`. The dashboard's
+    **◫ week** button draws the same data as a 7-day calendar: the
+    business-day jobs (`LW`, `L-3`, `15W`, `5#3`) land where the engine
+    says, and the per-minute hum is summarized below the grid instead of
+    flooding it.
 
 ## Alternate leadership backends (config only)
 

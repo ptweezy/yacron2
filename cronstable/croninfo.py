@@ -170,6 +170,12 @@ def _field_values(
             start_v, end_v = resolve(a), resolve(b)
             if start_v is None or end_v is None:
                 raise ValueError("bad field: %s" % part)
+            if hi == 6 and end_v == 0:
+                # a day-of-week range ending in 0 reads its end as
+                # Sunday-as-7, unconditionally, exactly like the engine
+                # (sat-sun works; 0-0 is every day, a preserved quirk),
+                # so the prose cannot claim "Sunday" for a daily schedule
+                end_v = 7
             start, end = start_v, end_v
         else:
             v = resolve(body)
@@ -218,6 +224,108 @@ _DOW_NAMES = {
 }
 
 
+def _finish_split(
+    spec: str, plain: List[str], phrases: List[str]
+) -> Tuple[str, List[str]]:
+    """Shared epilogue of the two special-form splitters below.
+
+    Rejects splits :func:`describe_cron` cannot phrase honestly, and
+    dedupes repeated phrases (``L0-7`` folds both ends to Sunday; the
+    engine's sets dedupe, so the prose must too).
+    """
+    if phrases:
+        if any(p in ("*", "?") for p in plain):
+            # "*,L" (or a star hiding among values, "1,*,L") is legal but
+            # the star already covers every day; the phrases would
+            # overstate the restriction, so punt to Custom
+            raise ValueError("special forms beside a star: %s" % spec)
+    elif not plain:
+        raise ValueError("no usable items: %s" % spec)
+    deduped: List[str] = []
+    for phrase in phrases:
+        if phrase not in deduped:
+            deduped.append(phrase)
+    return ",".join(plain), deduped
+
+
+def _split_special_dom(spec: str) -> Tuple[str, List[str]]:
+    """Partition a day-of-month field into plain items and L/W phrases.
+
+    Returns the comma-joined plain items (possibly empty when only
+    special forms remain) and one prose phrase per ``L``/``L-n``/``nW``/
+    ``LW`` item, shaped to read after "on ".  Malformed or pointless
+    forms raise, so :func:`describe_cron` degrades to its Custom line,
+    matching the engine's own rejections.
+    """
+    plain: List[str] = []
+    phrases: List[str] = []
+    for item in spec.strip().lower().split(","):
+        if item == "l":
+            phrases.append("the last day of the month")
+        elif item == "lw":
+            phrases.append("the last weekday of the month")
+        elif item.startswith("l-"):
+            offset_text = item[2:]
+            if not offset_text.isdigit() or not 1 <= int(offset_text) <= 30:
+                raise ValueError("bad L- offset: %s" % item)
+            offset = int(offset_text)
+            # "N days before the last day", never an ordinal: "3rd-to-last"
+            # invites an off-by-one reading (is the last day itself the
+            # 1st-to-last?), and this phrase cannot be miscounted
+            phrases.append(
+                "the day before the last day of the month"
+                if offset == 1
+                else "%d days before the last day of the month" % offset
+            )
+        elif len(item) > 1 and item.endswith("w") and item[:-1].isdigit():
+            day = int(item[:-1])
+            if not 1 <= day <= 31:
+                raise ValueError("bad W day: %s" % item)
+            phrases.append("the weekday nearest the %s" % _ordinal(day))
+        else:
+            plain.append(item)
+    return _finish_split(spec, plain, phrases)
+
+
+def _split_special_dow(spec: str) -> Tuple[str, List[str]]:
+    """Partition a day-of-week field into plain items and L/# phrases.
+
+    The mirror of :func:`_split_special_dom` for ``L<n>`` (and its
+    range form) and ``<d>#<n>`` items.
+    """
+    plain: List[str] = []
+    phrases: List[str] = []
+    for item in spec.strip().lower().split(","):
+        if item.startswith("l") and len(item) > 1:
+            a, dash, b = item[1:].partition("-")
+            if not a.isdigit() or (dash and not b.isdigit()):
+                raise ValueError("bad L day-of-week: %s" % item)
+            lo, hi = int(a), int(b) if dash else int(a)
+            if not (0 <= lo <= 7 and 0 <= hi <= 7):
+                raise ValueError("out of range: %s" % item)
+            phrases.extend(
+                "the last %s of the month" % _DOWN[d % 7]
+                for d in range(lo, hi + 1)
+            )
+        elif "#" in item:
+            day_text, _, nth_text = item.partition("#")
+            if day_text in _DOW_NAMES:
+                day = _DOW_NAMES[day_text]
+            elif day_text.isdigit() and 0 <= int(day_text) <= 7:
+                day = int(day_text) % 7
+            else:
+                raise ValueError("bad '#' weekday: %s" % item)
+            if not nth_text.isdigit() or not 1 <= int(nth_text) <= 5:
+                raise ValueError("bad '#' ordinal: %s" % item)
+            phrases.append(
+                "the %s %s of the month"
+                % (_ordinal(int(nth_text)), _DOWN[day])
+            )
+        else:
+            plain.append(item)
+    return _finish_split(spec, plain, phrases)
+
+
 #: cheap gate for "does this expression use the H hash form?": an ``h``
 #: opening an item (start of a field or after a comma) followed by one of
 #: the delimiters an H item can continue with.  Weekday and month names
@@ -260,11 +368,15 @@ def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
         else:
             return "Custom schedule: %s" % expr
         mi, hr, dom, mon, dow = core
+        dom_plain, dom_phrases = _split_special_dom(dom)
+        dow_plain, dow_phrases = _split_special_dow(dow)
         minutes = _field_values(mi, 0, 59)
         hours = _field_values(hr, 0, 23)
-        doms = _field_values(dom, 1, 31)
+        # an empty plain remainder means the field held ONLY special
+        # forms: restricted, but with no plain values to enumerate
+        doms = _field_values(dom_plain, 1, 31) if dom_plain else []
         months = _field_values(mon, 1, 12, _MON_NAMES)
-        dows = _field_values(dow, 0, 6, _DOW_NAMES)
+        dows = _field_values(dow_plain, 0, 6, _DOW_NAMES) if dow_plain else []
         seconds = _field_values(sec_spec, 0, 59)
         years = (
             _field_values(year_spec, 1970, 2099) if year_spec != "*" else None
@@ -275,14 +387,24 @@ def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
     time_part = _describe_time(mi, hr, minutes, hours)
 
     day_clauses = []
-    if dows is not None:
-        day_clauses.append("on " + _list_join([_DOWN[d] for d in dows]))
-    if doms is not None:
+    if dows or dow_phrases:
         day_clauses.append(
-            "on the "
-            + _list_join([_ordinal(d) for d in doms])
-            + (" of the month" if dows is None else "")
+            "on " + _list_join([_DOWN[d] for d in dows or []] + dow_phrases)
         )
+    if doms or dom_phrases:
+        if dom_phrases:
+            day_clauses.append(
+                "on "
+                + _list_join(
+                    ["the " + _ordinal(d) for d in doms or []] + dom_phrases
+                )
+            )
+        else:
+            day_clauses.append(
+                "on the "
+                + _list_join([_ordinal(d) for d in doms or []])
+                + (" of the month" if not (dows or dow_phrases) else "")
+            )
     clauses = []
     if len(day_clauses) == 2:
         # dom and dow must BOTH match when both are restricted: the
@@ -294,7 +416,7 @@ def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
         clauses.append(day_clauses[0])
     if months is not None:
         clauses.append("in " + _list_join([_MONTHS[m] for m in months]))
-    elif doms is None and dows is None:
+    elif not day_clauses:
         clauses.append("every day")
     if years is not None:
         clauses.append("in " + _list_join([str(y) for y in years]))
@@ -559,9 +681,10 @@ def _lint_day_fields(tab: CronTab) -> List[Finding]:
     there.  Say so whenever the combination appears.
     """
     # a field whose plain values already cover the whole range matches
-    # every day whatever else (an L form) rides along, so only the
-    # subset test decides restriction; a bare L leaves the plain set
-    # empty, which the same test correctly reads as restricted.
+    # every day whatever else (an L or W form) rides along, so only the
+    # subset test decides restriction; a field of only special forms
+    # leaves the plain set empty, which the same test correctly reads
+    # as restricted.
     dom_restricted = not (_FULL_DOM <= tab.days_of_month)
     dow_restricted = not (_FULL_DOW <= tab.days_of_week)
     if dom_restricted and dow_restricted:
@@ -651,21 +774,48 @@ def _lint_steps(expression: str) -> List[Finding]:
 
 
 def _lint_month_lengths(tab: CronTab) -> List[Finding]:
-    """Selected days that no selected month is long enough to reach."""
+    """Selected days that no selected month is long enough to reach.
+
+    Plain days and ``nW`` targets miss any month shorter than the day
+    they name; an ``L-n`` offset misses any month whose final day it
+    counts back past (``L-30`` reaches day 1 only in 31-day months).
+    A bare ``L`` and ``LW`` land in every month, so they exempt the
+    whole check.
+    """
+    if tab.last_day_of_month or tab.last_weekday_of_month:
+        return []
     dom = tab.days_of_month
-    if tab.last_day_of_month or not dom or _FULL_DOM <= dom:
+    day_like = dom | tab.nearest_weekday_days
+    offsets = tab.last_day_offsets
+    if (not day_like and not offsets) or _FULL_DOM <= dom:
         return []
     findings: List[Finding] = []
-    dmin = min(dom)
-    skipped = [m for m in sorted(tab.months) if dmin > _MONTH_MAX[m]]
+    dmin = min(day_like) if day_like else None
+    omin = min(offsets) if offsets else None
+
+    def reachable(month: int) -> bool:
+        longest = _MONTH_MAX[month]
+        if dmin is not None and dmin <= longest:
+            return True
+        return omin is not None and omin <= longest - 1
+
+    skipped = [m for m in sorted(tab.months) if not reachable(m)]
     if skipped:
+        reasons = []
+        if dmin is not None:
+            reasons.append(
+                "the smallest selected day of month is {}".format(dmin)
+            )
+        if omin is not None:
+            reasons.append(
+                "the smallest 'L-' offset counts back {} days".format(omin)
+            )
         findings.append(
             Finding(
                 "skipped-months",
                 LEVEL_WARNING,
-                "the smallest selected day of month is {}, which never "
-                "occurs in {}; {} skipped entirely".format(
-                    dmin,
+                "{}, which never lands in {}; {} skipped entirely".format(
+                    " and ".join(reasons),
                     _list_join([_MONTHS[m] for m in skipped]),
                     "that month is"
                     if len(skipped) == 1
@@ -674,14 +824,19 @@ def _lint_month_lengths(tab: CronTab) -> List[Finding]:
             )
         )
     if 2 in tab.months and 2 not in skipped:
-        feb_days = [d for d in dom if d <= _MONTH_MAX[2]]
-        if feb_days and min(feb_days) == 29:
+        # fires in a leap February but never a common one: day 29, and
+        # L-28 (which needs a 29th to count back from)
+        fires_common = (dmin is not None and dmin <= 28) or (
+            omin is not None and omin <= 27
+        )
+        if not fires_common:
             findings.append(
                 Finding(
                     "leap-day-only",
                     LEVEL_NOTE,
-                    "in February only day 29 can match, so February runs "
-                    "occur only in leap years",
+                    "in February only the leap 29th makes the selected "
+                    "days land, so February runs occur only in leap "
+                    "years",
                 )
             )
     return findings
@@ -844,23 +999,40 @@ def _compact_values(
 
 
 def _allowed_dom(tab: CronTab) -> str:
-    """The day-of-month constraint as prose (explicit days plus ``L``)."""
+    """The day-of-month constraint as prose (explicit days plus L/W)."""
     if _FULL_DOM <= tab.days_of_month:
         return "any"
     parts = _value_runs(tab.days_of_month)
-    if tab.last_day_of_month:
-        parts.append("the month's last day (L)")
+    parts.extend(
+        "the weekday nearest day {0} ({0}W)".format(target)
+        for target in sorted(tab.nearest_weekday_days)
+    )
+    for offset in sorted(tab.last_day_offsets):
+        if offset == 0:
+            parts.append("the month's last day (L)")
+        else:
+            parts.append(
+                "{0} day{1} before the month's last (L-{0})".format(
+                    offset, "" if offset == 1 else "s"
+                )
+            )
+    if tab.last_weekday_of_month:
+        parts.append("the month's last weekday (LW)")
     return _list_join(parts)
 
 
 def _allowed_dow(tab: CronTab) -> str:
-    """The day-of-week constraint as prose (plain days plus ``L<n>``)."""
+    """The day-of-week constraint as prose (plain days plus L<n>/#)."""
     if _FULL_DOW <= tab.days_of_week:
         return "any"
     parts = _value_runs(tab.days_of_week, _DOWN)
     parts.extend(
         "the month's last {}".format(_DOWN[dow])
         for dow in sorted(tab.last_days_of_week)
+    )
+    parts.extend(
+        "the month's {} {}".format(_ordinal(nth), _DOWN[dow])
+        for dow, nth in sorted(tab.nth_days_of_week)
     )
     return _list_join(parts)
 
@@ -895,12 +1067,10 @@ def why_no_run(
     """
     month_end = calendar.monthrange(when.year, when.month)[1]
     dow = (datetime.date(when.year, when.month, when.day).weekday() + 1) % 7
-    dom_ok = when.day in tab.days_of_month or (
-        tab.last_day_of_month and when.day == month_end
-    )
-    dow_ok = dow in tab.days_of_week or (
-        dow in tab.last_days_of_week and when.day > month_end - 7
-    )
+    # the engine's own per-side predicates, so this decomposition can
+    # never disagree with what the scheduler computes
+    dom_ok = tab._dom_matches(when.year, when.month, when.day, month_end)
+    dow_ok = tab._dow_matches(dow, when.day, month_end)
     checks = [
         {
             "field": "second",
@@ -1223,10 +1393,13 @@ def _semantic_key(tab: CronTab) -> Tuple[Any, ...]:
         tab.minutes,
         tab.hours,
         tab.days_of_month,
-        tab.last_day_of_month,
+        tab.last_day_offsets,
+        tab.nearest_weekday_days,
+        tab.last_weekday_of_month,
         tab.months,
         tab.days_of_week,
         tab.last_days_of_week,
+        tab.nth_days_of_week,
         tab.years,
     )
 

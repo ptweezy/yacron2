@@ -76,10 +76,12 @@ and only executes on `dry_run: false` **and** `confirm: true`.
 The three schedule-authoring tools make an agent a competent schedule
 **author**, not just a reader, with the daemon's own engine as the
 authority: `cron_validate_schedule` parses and lints any expression
-before it becomes a job (the engine's exact error with its Quartz
-dialect hints, [lint findings](Schedule-Linting), the first upcoming
+before it becomes a job (the engine's exact error with its dialect
+hints, [lint findings](Schedule-Linting), the first upcoming
 fire, and prospective [`H` slot](Hashed-Schedules) resolution via
-`seed`), `cron_explain_schedule` adds the next N fires in a chosen zone
+`seed`; the dialect includes the
+[business-day forms](Business-Day-Schedules) `L-n`, `nW`, `LW` and
+`d#n`), `cron_explain_schedule` adds the next N fires in a chosen zone
 so the agent can round-trip a plain-English description of a proposed
 schedule to you before it ships, and `cron_why_no_run` explains field by
 field why a job's schedule did or did not fire at a timestamp (see

@@ -722,11 +722,22 @@ async def test_validate_schedule_rejects_with_engine_error():
     assert data["valid"] is False
     assert "day-of-week" in data["error"]
     assert result["content"][0]["text"].startswith("INVALID")
-    # a Quartz expression gets the dialect hint through unchanged
+    # a 7-field Quartz expression with '?' and an nth weekday now parses
+    # verbatim (the '#' family is dialect); its description proves the
+    # meaning came through
     result = await _call(
         h, "cron_validate_schedule", {"expression": "0 0 12 ? * MON#2 *"}
     )
-    assert "Quartz" in result["structuredContent"]["error"]
+    data = result["structuredContent"]
+    assert data["valid"] is True
+    assert "2nd Monday" in data["description"]
+    # a Quartz form the dialect still spells differently keeps its hint
+    result = await _call(
+        h, "cron_validate_schedule", {"expression": "0 0 * * 5L"}
+    )
+    data = result["structuredContent"]
+    assert data["valid"] is False
+    assert "Quartz" in data["error"] and "L5" in data["error"]
 
 
 async def test_validate_schedule_seed_resolves_hash_slots():

@@ -627,6 +627,38 @@ jobs:
     clusterPolicy: Leader
     command: echo "fiscal-year-open opened the new fiscal year on $HOSTNAME"
 
+  # [feature: LW, last weekday of the month] the month-close staging run:
+  # fires on the final Mon-Fri of every month (Jan 30 2026, Feb 27, ...),
+  # never a weekend, no month-length bookkeeping in the schedule.
+  - name: monthly-close-prep
+    command: echo "monthly-close-prep staged the books on the last weekday of the month"
+    schedule: "30 1 LW * *"
+    clusterPolicy: Leader
+
+  # [feature: L-<n>, offset from month end] the payroll cutoff: three days
+  # before the month's final day, whatever length the month has (Jan 28,
+  # Feb 25/26, Apr 27). The Schedule tab describes it in plain English.
+  - name: payroll-file-transmit
+    command: echo "payroll-file-transmit sent the payroll file (month-end minus 3)"
+    schedule: "0 7 L-3 * *"
+    clusterPolicy: Leader
+
+  # [feature: nth weekday, <d>#<n>] the third Friday, every month (options
+  # expiry in the US): 5#3 by number, or spell it fri#3. The sibling of L5
+  # (the month's LAST Friday), and Quartz pastes of this form now parse.
+  - name: board-pack-render
+    command: echo "board-pack-render rendered the board pack on the third Friday"
+    schedule: "0 6 * * 5#3"
+    clusterPolicy: Leader
+
+  # [feature: nearest weekday, <n>W] invoice day is the 15th, shifted to the
+  # weekday nearest it: a Saturday 15th runs Friday the 14th, a Sunday 15th
+  # runs Monday the 16th, always inside the same month.
+  - name: invoice-day-run
+    command: echo "invoice-day-run billed on the weekday nearest the 15th"
+    schedule: "0 8 15W * *"
+    clusterPolicy: Leader
+
   # [feature: executionTimeout + killTimeout] Sleeps 30s but is capped at 10s,
   # so cronstable terminates it (SIGTERM, then SIGKILL after killTimeout) and
   # records a timeout failure — the classic exit≈137/143 the dashboard explains.

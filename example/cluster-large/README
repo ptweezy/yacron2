@@ -16,10 +16,10 @@ Files
   docker-compose.yml   The ten nodes plus the one-shot `certgen`; `distribution:
                        spread` is on by default here.
   jobs.yaml            The shared job set, mounted IDENTICALLY into all ten
-                       nodes (14 jobs: 12 Leader/PreferLeader, of which six are
-                       CPU-heavy, plus two EveryNode). The job-set id is a
-                       fingerprint of this file, so it must be identical on every
-                       node for them to agree.
+                       nodes (17 jobs: 15 Leader/PreferLeader, of which six are
+                       CPU-heavy and three run on business-day forms, plus two
+                       EveryNode). The job-set id is a fingerprint of this file,
+                       so it must be identical on every node for them to agree.
   node-entrypoint.sh   Generates each node's `cluster` section from environment
                        variables at start, so the compose file needs no
                        hand-written per-node peer lists. See the env contract
@@ -47,6 +47,17 @@ defaults above are what you get unless you override them in the environment.
 Dashboards: cronstable-a .. cronstable-j on host ports 8080 .. 8089 (e.g.
 http://localhost:8080/). Scroll to the "cluster" panel on any dashboard to watch
 attestation, leadership, and per-job ownership.
+
+The month-close / payroll-cutoff / third-friday-report jobs use the
+business-day schedule forms (LW = last weekday of the month, L-3 = three days
+before month-end, 5#3 = the third Friday). Open the week calendar (the ◫ week
+toolbar button) to see them plotted while the minutely herd summarizes into
+the "background hum" strip, or subscribe any calendar app to the fleet's iCal
+feed:
+
+    curl http://localhost:8080/calendar.ics
+    curl "http://localhost:8080/calendar.ics?days=60"     # wider window
+    curl http://localhost:8080/jobs/month-close/calendar.ics
 
 Spread vs single-leader
 -----------------------

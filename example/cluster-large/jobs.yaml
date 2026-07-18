@@ -129,6 +129,27 @@ jobs:
     schedule: "*/2 * * * *"
     clusterPolicy: PreferLeader
 
+  # ---- Business-day cadence: the extension day forms (LW, L-<n>, <d>#<n>).
+  #      Monthly jobs get owners under spread exactly like the minutely herd,
+  #      and they are what the dashboard's week calendar (the ◫ week button)
+  #      and the iCal feed (GET /calendar.ics) put on the on-call engineer's
+  #      calendar; the minutely jobs above summarize into the calendar's
+  #      "background hum" strip instead of flooding the grid. ---------------
+  - name: month-close
+    command: echo "[Leader] month-close ran on the month's last weekday on $HOSTNAME"
+    schedule: "30 1 LW * *"
+    clusterPolicy: Leader
+
+  - name: payroll-cutoff
+    command: echo "[Leader] payroll-cutoff ran three days before month-end on $HOSTNAME"
+    schedule: "0 7 L-3 * *"
+    clusterPolicy: Leader
+
+  - name: third-friday-report
+    command: echo "[Leader] third-friday-report ran on the third Friday on $HOSTNAME"
+    schedule: "0 6 * * 5#3"
+    clusterPolicy: Leader
+
   # ---- Manual only: scheduled ~never, run it with "Run now" on any node;
   #      manual triggers are not leader-gated, so the clusterPolicy below is
   #      irrelevant for the manual run (it would only gate the ~never schedule);

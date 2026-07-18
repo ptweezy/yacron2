@@ -405,6 +405,15 @@ def test_why_agrees_with_the_engine_everywhere():
         "15 0 9 * * mon-fri *",
         "0 0 29 2 *",
         "5,10 8-10 1-15 mar,jun 1-5",
+        # the extension day forms: the decomposition must track the
+        # engine through W shifts, L offsets and nth-weekday ordinals
+        "0 0 LW * *",
+        "0 0 15W * *",
+        "0 0 1W,31W * *",
+        "0 0 L-3 * *",
+        "0 0 * * 5#3",
+        "0 0 15W * fri",
+        "0 0 1,15W,L * mon#1,L5",
     ]
     base = datetime.datetime(2026, 1, 1)
     probes = [
@@ -556,3 +565,107 @@ def test_why_dst_notes_skip_fixed_offset_zones_and_misses():
     got = _why("0 5 * * *", datetime.datetime(2026, 3, 8, 2, 30), tz=_NY)
     assert got["matches"] is False
     assert got["notes"] == []
+
+
+# ---------------------------------------------------------------------------
+# the extension day forms (L-<n>, <n>W / LW, <d>#<n>) across the surfaces
+# ---------------------------------------------------------------------------
+
+
+def test_describe_extension_forms():
+    assert describe_cron("0 0 L * *") == (
+        "At 00:00, on the last day of the month"
+    )
+    assert describe_cron("0 0 LW * *") == (
+        "At 00:00, on the last weekday of the month"
+    )
+    assert describe_cron("0 0 15W * *") == (
+        "At 00:00, on the weekday nearest the 15th"
+    )
+    assert describe_cron("0 0 L-3 * *") == (
+        "At 00:00, on 3 days before the last day of the month"
+    )
+    assert describe_cron("0 0 L-1 * *") == (
+        "At 00:00, on the day before the last day of the month"
+    )
+    assert describe_cron("0 0 * * 5#3") == (
+        "At 00:00, on the 3rd Friday of the month"
+    )
+    assert describe_cron("0 0 * * L5") == (
+        "At 00:00, on the last Friday of the month"
+    )
+    assert describe_cron("0 0 1,15W,L * *") == (
+        "At 00:00, on the 1st, the weekday nearest the 15th and the last "
+        "day of the month"
+    )
+    # the AND rule keeps its "and only" phrasing with special forms
+    assert describe_cron("0 0 15W * fri") == (
+        "At 00:00, on the weekday nearest the 15th, and only on Friday"
+    )
+    # plain-day prose is untouched
+    assert describe_cron("0 0 1,15 * *") == (
+        "At 00:00, on the 1st and 15th of the month"
+    )
+
+
+def test_describe_extension_forms_degrade_to_custom_when_malformed():
+    for expr in ("0 0 L-0 * *", "0 0 32W * *", "0 0 * * 5#6"):
+        assert describe_cron(expr).startswith("Custom schedule"), expr
+
+
+def test_lint_nearest_weekday_targets_month_lengths():
+    finding = _by_code("0 0 31W 1,4 *", "skipped-months")
+    assert finding.level == "warning"
+    assert "April" in finding.message and "January" not in finding.message
+    # LW and bare L land in every month: exempt
+    assert _codes("0 0 LW 2 *") == []
+
+
+def test_lint_l_offsets_month_lengths():
+    # L-30 reaches day 1 only in 31-day months; Feb and Apr are skipped
+    message = _by_code("0 0 L-30 2,4,5 *", "skipped-months").message
+    assert "February" in message and "April" in message
+    assert "May" not in message
+    # L-28 in February lands only when the leap 29th exists
+    finding = _by_code("0 0 L-28 2 *", "leap-day-only")
+    assert finding.level == "note"
+    assert "leap years" in finding.message
+    assert "leap-day-only" not in _codes("0 0 L-27 2 *")
+
+
+def test_lint_day_fields_and_rule_with_extension_forms():
+    codes = _codes("0 0 15W * fri")
+    assert "day-fields-both-restricted" in codes
+    codes = _codes("0 0 * * 5#3")
+    assert "day-fields-both-restricted" not in codes
+
+
+def test_why_allowed_prose_for_extension_forms():
+    got = _why("0 0 15W * *", datetime.datetime(2026, 1, 16))
+    dom = got["checks"][3]
+    assert dom["allowed"] == "the weekday nearest day 15 (15W)"
+    assert dom["matched"] is False  # the 15th is a Thursday, in place
+    got = _why("0 0 L-3,LW * *", datetime.datetime(2026, 1, 28))
+    assert got["checks"][3]["allowed"] == (
+        "3 days before the month's last (L-3) and the month's last "
+        "weekday (LW)"
+    )
+    assert got["matches"] is True
+    got = _why("0 0 * * 5#3", datetime.datetime(2026, 1, 9))
+    dow = got["checks"][5]
+    assert dow["allowed"] == "the month's 3rd Friday"
+    assert dow["matched"] is False
+    assert got["failed"] == ["day-of-week"]
+
+
+def test_duplicate_schedules_distinguish_extension_forms():
+    entries = [
+        _entry("a", "0 0 LW * *"),
+        _entry("b", "0 0 lw * *"),
+        _entry("c", "0 0 L-1 * *"),
+        _entry("d", "0 0 * * 5#3"),
+        _entry("e", "0 0 * * fri#3"),
+    ]
+    groups = duplicate_schedules(entries)
+    grouped = {g["jobs"][0]: g["jobs"] for g in groups}
+    assert grouped == {"a": ["a", "b"], "d": ["d", "e"]}

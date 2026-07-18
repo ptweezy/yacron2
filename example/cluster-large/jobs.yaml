@@ -133,7 +133,7 @@ jobs:
   #      Monthly jobs get owners under spread exactly like the minutely herd,
   #      and they are what the dashboard's week calendar (the ◫ week button)
   #      and the iCal feed (GET /calendar.ics) put on the on-call engineer's
-  #      calendar -- the minutely jobs above summarize into the calendar's
+  #      calendar; the minutely jobs above summarize into the calendar's
   #      "background hum" strip instead of flooding the grid. ---------------
   - name: month-close
     command: echo "[Leader] month-close ran on the month's last weekday on $HOSTNAME"

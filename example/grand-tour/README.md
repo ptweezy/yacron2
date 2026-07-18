@@ -234,10 +234,10 @@ their own:
     `.ics` routes (only) also accept the token in the URL, the same
     secret-address model calendar services use:
     `curl "http://localhost:8080/calendar.ics?token=s3cret"`. The dashboard's
-    **◫ week** button draws the same data as a 7-day calendar (the
-    business-day jobs — `LW`, `L-3`, `15W`, `5#3` — land where the engine
+    **◫ week** button draws the same data as a 7-day calendar: the
+    business-day jobs (`LW`, `L-3`, `15W`, `5#3`) land where the engine
     says, and the per-minute hum is summarized below the grid instead of
-    flooding it).
+    flooding it.
 
 ## Alternate leadership backends (config only)
 

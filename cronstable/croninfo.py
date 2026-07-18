@@ -52,7 +52,7 @@ from typing import (
     Tuple,
 )
 
-from cronstable.cronexpr import CronTab, _shift_to_weekday
+from cronstable.cronexpr import CronTab
 
 __all__ = [
     "Finding",
@@ -224,6 +224,30 @@ _DOW_NAMES = {
 }
 
 
+def _finish_split(
+    spec: str, plain: List[str], phrases: List[str]
+) -> Tuple[str, List[str]]:
+    """Shared epilogue of the two special-form splitters below.
+
+    Rejects splits :func:`describe_cron` cannot phrase honestly, and
+    dedupes repeated phrases (``L0-7`` folds both ends to Sunday; the
+    engine's sets dedupe, so the prose must too).
+    """
+    if phrases:
+        if any(p in ("*", "?") for p in plain):
+            # "*,L" (or a star hiding among values, "1,*,L") is legal but
+            # the star already covers every day; the phrases would
+            # overstate the restriction, so punt to Custom
+            raise ValueError("special forms beside a star: %s" % spec)
+    elif not plain:
+        raise ValueError("no usable items: %s" % spec)
+    deduped: List[str] = []
+    for phrase in phrases:
+        if phrase not in deduped:
+            deduped.append(phrase)
+    return ",".join(plain), deduped
+
+
 def _split_special_dom(spec: str) -> Tuple[str, List[str]]:
     """Partition a day-of-month field into plain items and L/W phrases.
 
@@ -260,14 +284,7 @@ def _split_special_dom(spec: str) -> Tuple[str, List[str]]:
             phrases.append("the weekday nearest the %s" % _ordinal(day))
         else:
             plain.append(item)
-    if phrases and (not plain or all(p in ("*", "?") for p in plain)):
-        if plain:
-            # "*,L" is legal but the star already covers every day; the
-            # phrases would overstate the restriction, so punt to Custom
-            raise ValueError("special forms beside a star: %s" % spec)
-    elif not plain:
-        raise ValueError("no usable items: %s" % spec)
-    return ",".join(plain), phrases
+    return _finish_split(spec, plain, phrases)
 
 
 def _split_special_dow(spec: str) -> Tuple[str, List[str]]:
@@ -306,12 +323,7 @@ def _split_special_dow(spec: str) -> Tuple[str, List[str]]:
             )
         else:
             plain.append(item)
-    if phrases and (not plain or all(p in ("*", "?") for p in plain)):
-        if plain:
-            raise ValueError("special forms beside a star: %s" % spec)
-    elif not plain:
-        raise ValueError("no usable items: %s" % spec)
-    return ",".join(plain), phrases
+    return _finish_split(spec, plain, phrases)
 
 
 #: cheap gate for "does this expression use the H hash form?": an ``h``
@@ -1055,26 +1067,10 @@ def why_no_run(
     """
     month_end = calendar.monthrange(when.year, when.month)[1]
     dow = (datetime.date(when.year, when.month, when.day).weekday() + 1) % 7
-    dom_ok = (
-        when.day in tab.days_of_month
-        or (month_end - when.day) in tab.last_day_offsets
-        or (
-            tab.last_weekday_of_month
-            and when.day
-            == _shift_to_weekday(when.year, when.month, month_end, month_end)
-        )
-        or any(
-            target <= month_end
-            and when.day
-            == _shift_to_weekday(when.year, when.month, target, month_end)
-            for target in tab.nearest_weekday_days
-        )
-    )
-    dow_ok = (
-        dow in tab.days_of_week
-        or (dow in tab.last_days_of_week and when.day > month_end - 7)
-        or (dow, (when.day - 1) // 7 + 1) in tab.nth_days_of_week
-    )
+    # the engine's own per-side predicates, so this decomposition can
+    # never disagree with what the scheduler computes
+    dom_ok = tab._dom_matches(when.year, when.month, when.day, month_end)
+    dow_ok = tab._dow_matches(dow, when.day, month_end)
     checks = [
         {
             "field": "second",

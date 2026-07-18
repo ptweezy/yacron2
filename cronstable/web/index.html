@@ -2872,7 +2872,7 @@
     justFailed: null,          // Set of names that flipped to failure THIS poll (wallboard flicker)
     anyFailing: false, alarmAck: false,
     radar: { items: [], sig: null },   // next-fire radar: [{name, t, c}] sorted by instant (+ render signature)
-    week: { items: [], bounds: null, sig: null, dirty: false },  // week calendar: fires over the next 7 local days
+    week: { items: [], bounds: null, sig: null, inputSig: null, dirty: false },  // week calendar: fires over the next 7 local days
     wallboard: false,          // TV kiosk mode active
     heat: { cache: {}, loading: false },   // activity heatmap: name -> {at, runs:[{t,o}]}
     // schedule pressure: the daemon's /schedule/pressure + /duplicates
@@ -3020,7 +3020,7 @@
   // In day-of-week, star and bare-start-with-step expansions run to 6 while
   // an explicit 7 (Sunday again) stays legal, and a range ending in 0 wraps
   // its end to 7 (so sat-sun and 6-0 work; 0-0 is every day, a preserved
-  // engine quirk) — both mirroring cronexpr's step_end/wrap rules.
+  // engine quirk); both mirror cronexpr's step_end/wrap rules.
   function parseField(spec, min, max, names, isDow) {
     spec = String(spec).trim().toLowerCase();
     if (spec === "*" || spec === "?") return { restricted: false, has: () => true, values: null };
@@ -3244,8 +3244,10 @@
   // since parseCron knows no H. Display keeps job.schedule (what the user
   // wrote); computation uses this.
   function schedOf(job) { return job.schedule_resolved || job.schedule; }
-  // next N fire times as {c: components, t: instant ms}
-  function nextRuns(parsed, n, frame, fromMs) {
+  // next N fire times as {c: components, t: instant ms}; untilMs (optional)
+  // bounds the walk itself, so a sparse schedule stops at the window's end
+  // instead of hunting fires toward the year ceiling
+  function nextRuns(parsed, n, frame, fromMs, untilMs) {
     if (parsed.type !== "fields") return [];
     const start = wallParts(new Date(fromMs), frame);
     let c = { Y: start.Y, Mo: start.Mo, D: start.D, h: start.h, mi: start.mi, se: start.se, dow: start.dow };
@@ -3270,23 +3272,33 @@
       if (c.se > 59) { c.se = 0; c.mi++; if (c.mi > 59) { c.mi = 0; c.h++; if (c.h > 23) { c.h = 0; advDay(); } } }
     };
     incSec();
+    // untilMs as wall parts in this frame: a walk date past that civil date
+    // can only yield instants at or past the bound (each same-date hit is
+    // still checked exactly against untilMs below)
+    const bnd = untilMs == null ? null : wallParts(new Date(untilMs), frame);
     const out = [];
     let guard = 0;
     while (out.length < n && guard++ < 500000) {
       if (c.Y > 2099) break;   // the engine's year ceiling; nothing matches beyond it
+      if (bnd && (c.Y > bnd.Y || (c.Y === bnd.Y && (c.Mo > bnd.Mo || (c.Mo === bnd.Mo && c.D > bnd.D))))) break;
       if (parsed.year.restricted && !parsed.year.has(c.Y)) { advYear(); continue; }
       if (!parsed.month.has(c.Mo)) { advMonth(); continue; }
       if (!dayMatches(parsed, c)) { advDay(); continue; }
       if (!parsed.hour.has(c.h)) { c.h++; c.mi = 0; c.se = 0; if (c.h > 23) { c.h = 0; advDay(); } continue; }
       if (!parsed.minute.has(c.mi)) { c.mi++; c.se = 0; if (c.mi > 59) { c.mi = 0; c.h++; if (c.h > 23) { c.h = 0; advDay(); } } continue; }
       if (!parsed.second.has(c.se)) { incSec(); continue; }
-      out.push({ c: Object.assign({}, c), t: instantOf(c, frame) });
+      const t = instantOf(c, frame);
+      if (untilMs != null && t >= untilMs) break;
+      out.push({ c: Object.assign({}, c), t });
       incSec();
     }
     return out;
   }
-  // prose phrases for the special day forms, in source order; the wording
-  // mirrors the server describer (croninfo._split_special_dom / _dow)
+  // prose phrases for the special day forms, in source order and deduped
+  // (L0-7 folds both ends to Sunday; the engine's sets dedupe, so the
+  // prose must too); the wording mirrors the server describer
+  // (croninfo._split_special_dom / _dow via _finish_split)
+  function dedupePhrases(out) { return out.filter((ph, i) => out.indexOf(ph) === i); }
   function domPhrases(spec) {
     const out = [];
     for (const item of String(spec).trim().toLowerCase().split(",")) {
@@ -3301,7 +3313,7 @@
         out.push("the weekday nearest the " + ordinal(parseInt(m[1], 10)));
       }
     }
-    return out;
+    return dedupePhrases(out);
   }
   function dowPhrases(spec) {
     const out = [];
@@ -3318,7 +3330,7 @@
         if (day != null) out.push("the " + ordinal(n) + " " + DOWN[day % 7] + " of the month");
       }
     }
-    return out;
+    return dedupePhrases(out);
   }
   // plain-English description
   function describeCron(expr) {
@@ -3374,12 +3386,14 @@
     // unlike standard cron's OR, so the prose must say so too; the
     // wording mirrors the server describer (croninfo.describe_cron),
     // including the special day-form phrases in source order.
-    // A star hiding beside a special form ("*,L") already covers every
-    // day; the phrases would overstate the restriction, so punt.
-    if ((!everyDom && p.dom.values === null) || (!everyDow && p.dow.values === null))
-      return "Custom schedule: " + expr;
+    // A star among the plain items ("*,L" or "1,*,L") already covers
+    // every day; the phrases would overstate the restriction, so punt.
+    const starItem = (t) => String(t).trim().toLowerCase().split(",").some((s) => s === "*" || s === "?");
     const dowPhr = everyDow ? [] : dowPhrases(dow);
     const domPhr = everyDom ? [] : domPhrases(dom);
+    if ((!everyDom && (p.dom.values === null || (domPhr.length && starItem(dom)))) ||
+        (!everyDow && (p.dow.values === null || (dowPhr.length && starItem(dow)))))
+      return "Custom schedule: " + expr;
     const dowVals = everyDow ? [] : (p.dow.values || []);
     const domVals = everyDom ? [] : (p.dom.values || []);
     // restricted but nothing usable (a reversed L range): no honest prose
@@ -3963,11 +3977,11 @@
   // so DST is right by construction) and PLACED by their browser-local wall
   // time, since a week grid needs one display frame and the on-call reader
   // thinks in theirs.
-  const WEEK_PER_JOB_CAP = 200;   // fires enumerated per job over the week
   const WEEK_DAY_CAP = 80;        // chips drawn per day before "+N more"
   // a job firing more often than ~8x/day is background hum, not a calendar
   // event: it leaves the grid for the summary strip below it, where its
-  // cadence reads better than 200 sliver chips ever could
+  // cadence reads better than dozens of sliver chips ever could; one fire
+  // past the threshold is all the walk needs to prove it
   const WEEK_FREQ_MAX = 56;
   function jobHue(name) {
     let h = 0;
@@ -3983,6 +3997,13 @@
   function computeWeek() {
     const bounds = weekDayBounds();
     const tEnd = bounds[7];
+    // the walk below is deterministic in (day window, enabled schedules,
+    // frames); skip it when none of those changed since the last poll,
+    // which is nearly every 3s tick
+    const inputSig = bounds[0] + "&" + state.jobs.map(
+      (j) => (j.enabled ? j.name + "|" + schedOf(j) + "|" + frameOf(j) : "")).join(";");
+    if (inputSig === state.week.inputSig) return;
+    state.week.inputSig = inputSig;
     const items = [];
     const frequent = [];
     for (const j of state.jobs) {
@@ -3990,15 +4011,14 @@
       const parsed = parseCron(schedOf(j));
       if (parsed.type !== "fields") continue;
       // from one second before today's local midnight, so a fire exactly at
-      // 00:00 lands in the grid; past fires today render dimmed
-      const runs = nextRuns(parsed, WEEK_PER_JOB_CAP, frameOf(j), bounds[0] - 1000);
-      const fires = [];
-      for (const r of runs) {
-        if (r.t >= tEnd) break;
-        fires.push(r.t);
-      }
+      // 00:00 lands in the grid; past fires today render dimmed. The walk
+      // is bounded by the window's end and needs at most one fire past the
+      // hum threshold, so sparse and dense schedules both stay cheap.
+      const fires = nextRuns(
+        parsed, WEEK_FREQ_MAX + 1, frameOf(j), bounds[0] - 1000, tEnd
+      ).map((r) => r.t);
       if (fires.length > WEEK_FREQ_MAX) {
-        frequent.push({ name: j.name, capped: fires.length >= WEEK_PER_JOB_CAP });
+        frequent.push({ name: j.name });
       } else {
         for (const t of fires) items.push({ name: j.name, t });
       }

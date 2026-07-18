@@ -2172,12 +2172,49 @@ class Cron:
         return web.json_response(payload, headers=headers)
 
     def _avg_duration(self, name: str) -> Optional[float]:
-        """Mean runtime in seconds over retained history, or ``None``."""
+        """Mean runtime in seconds over retained history, or ``None``.
+
+        The dashboard's own definition (:func:`_run_stats`), so the .ics
+        feed's event lengths can never disagree with the run drawer.
+        """
         runs = list(self.run_history.get(name) or [])
-        durations = [r.duration for r in runs if r.duration is not None]
-        if not durations:
-            return None
-        return sum(durations) / len(durations)
+        avg = _run_stats(runs)["avg_duration"]
+        return float(avg) if avg is not None else None
+
+    def _calendar_entries(
+        self, name: Optional[str] = None
+    ) -> Optional[List[CalendarEntry]]:
+        """The calendar renderer's rows: the fleet, or one job when ``name``.
+
+        ``None`` for an unknown job name; a known job with no timetable
+        (``@reboot``, disabled) or a fleet of none is an empty list.  The
+        single-job feed filters the same :meth:`_schedule_entries` snapshot
+        the fleet feed uses, so the two can never disagree about
+        eligibility.  Reads live scheduler state, so this runs on the
+        event loop; the render then walks the immutable result on an
+        executor (see :meth:`_web_calendar_response`).
+        """
+        if name is None:
+            schedule_entries = sorted(
+                self._schedule_entries(), key=lambda entry: entry.name
+            )
+        else:
+            if self._job_or_dag_schedule(name) is None:
+                return None
+            schedule_entries = [
+                entry
+                for entry in self._schedule_entries()
+                if entry.name == name
+            ]
+        return [
+            CalendarEntry(
+                entry.name,
+                entry.tab,
+                entry.timezone,
+                self._avg_duration(entry.name),
+            )
+            for entry in schedule_entries
+        ]
 
     def calendar_payload(
         self,
@@ -2186,6 +2223,7 @@ class Cron:
         per_job: int = 100,
         start: Optional[datetime.datetime] = None,
         now: Optional[datetime.datetime] = None,
+        entries: Optional[List[CalendarEntry]] = None,
     ) -> Optional[str]:
         """The iCalendar feed text: the fleet, or one job when ``name``.
 
@@ -2195,33 +2233,17 @@ class Cron:
         :mod:`cronstable.ical`).  ``None`` for an unknown job name; a known
         job with no timetable (``@reboot``) or a fleet of none renders as
         a valid, empty calendar.  ``start``/``now`` pin the window and
-        DTSTAMP for tests.
+        DTSTAMP for tests.  ``entries`` is an optional pre-built
+        :meth:`_calendar_entries` snapshot (see the async handler); when
+        None it is built here.
         """
-        if name is None:
-            schedule_entries = sorted(
-                self._schedule_entries(), key=lambda entry: entry.name
-            )
-            calname = "cronstable"
-        else:
-            job = self._job_or_dag_schedule(name)
-            if job is None:
-                return None
-            calname = "cronstable: {}".format(name)
-            if isinstance(job.schedule, CronTab) and job.enabled:
-                schedule_entries = [
-                    ScheduleEntry(job.name, job.schedule, job.timezone)
-                ]
-            else:
-                schedule_entries = []
-        entries = [
-            CalendarEntry(
-                entry.name,
-                entry.tab,
-                entry.timezone,
-                self._avg_duration(entry.name),
-            )
-            for entry in schedule_entries
-        ]
+        if entries is None:
+            entries = self._calendar_entries(name)
+        if entries is None:
+            return None
+        calname = (
+            "cronstable" if name is None else "cronstable: {}".format(name)
+        )
         if start is None:
             start = get_now(datetime.timezone.utc)
         return render_calendar(
@@ -2242,13 +2264,19 @@ class Cron:
         per_job = self._web_int_query(
             request, "per_job", default=100, lo=1, hi=1000
         )
-        # the fleet walk is CPU-bound work (jobs x fires); off the loop,
-        # like the pressure/suggest builders
-        text = await asyncio.get_running_loop().run_in_executor(
-            None, partial(self.calendar_payload, name, days, per_job)
-        )
-        if text is None:
+        # the entries snapshot reads live state, so it is taken on the
+        # loop; the walk (jobs x fires, pure CPU) then runs on the
+        # executor over the immutable snapshot, like the pressure/suggest
+        # builders
+        entries = self._calendar_entries(name)
+        if entries is None:
             raise web.HTTPNotFound()
+        text = await asyncio.get_running_loop().run_in_executor(
+            None,
+            partial(
+                self.calendar_payload, name, days, per_job, entries=entries
+            ),
+        )
         headers = dict(self.web_config.get("headers") or {})
         headers["Content-Disposition"] = 'inline; filename="cronstable.ics"'
         return web.Response(
@@ -4418,12 +4446,14 @@ class Cron:
             # timing (the scheme is not secret).
             if scheme.lower() != "bearer":
                 # Calendar clients subscribing to an .ics feed cannot attach
-                # a bearer header, so for exactly those paths the token may
-                # ride a `token` query parameter instead (the secret-address
-                # model calendar services use).  Same token, same
-                # constant-time compare; every other path keeps the token
-                # out of URLs (and so out of logs and referrers).
-                if request.path.endswith(".ics"):
+                # a bearer header, so for exactly the calendar-feed paths
+                # the token may ride a `token` query parameter instead (the
+                # secret-address model calendar services use).  Same token,
+                # same constant-time compare; every other path keeps the
+                # token out of URLs (and so out of logs and referrers).
+                # Matched precisely so no future route gains URL-token auth
+                # by accident of its name.
+                if request.path.endswith("/calendar.ics"):
                     presented = request.query.get("token", "")
                 else:
                     raise web.HTTPUnauthorized()

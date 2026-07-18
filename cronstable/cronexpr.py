@@ -878,6 +878,10 @@ class CronTab:
             return False
         # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
         dow = (datetime.date(year, month, day).weekday() + 1) % 7
+        return self._dow_matches(dow, day, month_end)
+
+    def _dow_matches(self, dow: int, day: int, month_end: int) -> bool:
+        """The day-of-week side: plain values, the L family, the # family."""
         if dow in self._dow:
             return True
         if (

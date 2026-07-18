@@ -129,7 +129,7 @@ def test_per_job_cap_truncates_loudly():
     entry = CalendarEntry("minutely", CronTab("* * * * *"), _UTC)
     text = _render([entry], days=1, per_job_cap=5)
     assert text.count("BEGIN:VEVENT") == 5
-    assert "X-CRONSTABLE-TRUNCATED:minutely;CAP=5" in text
+    assert "X-CRONSTABLE-TRUNCATED;CAP=5:minutely" in text
 
 
 def test_description_names_schedule_but_never_commands():

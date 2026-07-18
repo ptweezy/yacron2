@@ -34,7 +34,7 @@ import math
 from typing import List, NamedTuple, Optional, Sequence
 
 from cronstable.cronexpr import CronTab
-from cronstable.croninfo import describe_cron
+from cronstable.croninfo import _local_tzinfo, describe_cron
 
 __all__ = ["CalendarEntry", "render_calendar"]
 
@@ -168,7 +168,7 @@ def render_calendar(
         "REFRESH-INTERVAL;VALUE=DURATION:PT1H",
         "X-PUBLISHED-TTL:PT1H",
     ]
-    local_tz = datetime.datetime.now().astimezone().tzinfo
+    local_tz = _local_tzinfo()
     for entry in entries:
         zone = entry.timezone or local_tz
         block = _block_seconds(entry.avg_duration)
@@ -186,18 +186,20 @@ def render_calendar(
         count = 0
         truncated = False
         for fire in entry.tab.occurrences(start.astimezone(zone)):
-            if fire.astimezone(datetime.timezone.utc) >= end_utc:
+            fire_utc = fire.astimezone(datetime.timezone.utc)
+            if fire_utc >= end_utc:
                 break
             if count >= per_job_cap:
                 truncated = True
                 break
             count += 1
+            stamp = fire_utc.strftime("%Y%m%dT%H%M%SZ")
             lines.extend(
                 [
                     "BEGIN:VEVENT",
-                    "UID:{}-{}@cronstable".format(uid_ns, _stamp(fire)),
+                    "UID:{}-{}@cronstable".format(uid_ns, stamp),
                     "DTSTAMP:" + dtstamp,
-                    "DTSTART:" + _stamp(fire),
+                    "DTSTART:" + stamp,
                     "DURATION:" + duration,
                     "SUMMARY:" + _escape(entry.name),
                     "DESCRIPTION:" + _escape(description),
@@ -207,9 +209,12 @@ def render_calendar(
                 ]
             )
         if truncated:
+            # the cap rides as a property parameter, not in the value: a
+            # raw ';' inside a TEXT value is illegal per RFC 5545, and the
+            # job name (the value) must stay unambiguous
             lines.append(
-                "X-CRONSTABLE-TRUNCATED:{};CAP={}".format(
-                    _escape(entry.name), per_job_cap
+                "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(
+                    per_job_cap, _escape(entry.name)
                 )
             )
     lines.append("END:VCALENDAR")

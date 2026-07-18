@@ -72,6 +72,7 @@ from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-compat)
     Finding,
     ScheduleEntry,
+    _local_tzinfo,
     describe_cron,
     duplicate_schedules,
     lint_schedule,
@@ -960,9 +961,10 @@ def sparkline(history: List[Dict[str, Any]], width: int = 10) -> str:
 
 _SPARK_BARS = "▁▂▃▄▅▆▇█"
 
-#: week calendar bounds, matching the web panel: fires enumerated per job
-#: over the 7-day window, and a job firing more often than ~8x/day is
-#: background hum (summarized by name), not calendar events
+#: week calendar bounds: the hum threshold matches the web panel (a job
+#: firing more often than ~8x/day is background hum, summarized instead of
+#: charted); the enumeration cap bounds the hum count this panel displays
+#: ("x200+"), which the web strip does not show
 WEEK_PER_JOB_CAP = 200
 WEEK_FREQ_MAX = 56
 
@@ -2143,6 +2145,7 @@ class App:
         self._press_busy = False
         # week calendar: 7-day fire outlook computed locally, like pressure
         self.week: Optional[Dict[str, Any]] = None
+        self.week_computed = 0.0
         self._week_busy = False
         self.state_tab = "view"
         self.state_detail: Optional[Dict[str, Any]] = None
@@ -2401,6 +2404,12 @@ class App:
             time.monotonic() - self.press_computed > 60
         ):
             await self._recompute_pressure_bg()
+        # same cadence as pressure, so the panel tracks reloads and rolls
+        # its 7-day window past midnight without a manual refresh
+        if self.is_open("week") and (
+            time.monotonic() - self.week_computed > 60
+        ):
+            await self._recompute_week_bg()
 
     def _fleet_sound(self, first: bool) -> None:
         """Poll-diff for failure cues + the standing alarm (web port)."""
@@ -2616,7 +2625,7 @@ class App:
             now = datetime.datetime.now(datetime.timezone.utc)
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             end = start + datetime.timedelta(days=7)
-            local_tz = datetime.datetime.now().astimezone().tzinfo
+            local_tz = _local_tzinfo()
             grid = [[0] * 24 for _ in range(7)]
             items: List[Tuple[datetime.datetime, str]] = []
             frequent: List[Tuple[str, int, bool]] = []
@@ -2651,6 +2660,7 @@ class App:
                 "frequent": frequent,
                 "schedules": len(entries),
             }
+            self.week_computed = time.monotonic()
         except Exception:  # noqa: BLE001 - an analyzer bug must not kill
             logger.exception("week calendar recompute failed")
         self.mark()

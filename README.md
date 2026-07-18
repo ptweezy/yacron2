@@ -1932,7 +1932,7 @@ reading, and the typical runtime, never the command line. With
 $ curl "http://127.0.0.1:8080/calendar.ics?days=30" | head -6
 BEGIN:VCALENDAR
 VERSION:2.0
-PRODID:-//cronstable//1.2.21//EN
+PRODID:-//cronstable//1.2.22//EN
 CALSCALE:GREGORIAN
 METHOD:PUBLISH
 X-WR-CALNAME:cronstable

@@ -6,10 +6,13 @@ parsed, ``next()`` from fixed naive and timezone-aware instants, ``test()``
 over fixed datetimes, and semantic-equality verdicts.  These tests replay
 every vector against :mod:`cronstable.cronexpr` -- a full compatibility proof
 that needs no copy of the old package (the vectors are program OUTPUT, not
-code).  One deliberate exception: the ``aware_next`` vectors pin the
+code).  Two deliberate exceptions: the ``aware_next`` vectors pin the
 in-house engine's real-instant DST policy, because at a DST edge the legacy
-library can answer a NEGATIVE delay.  Regenerate/extend the vectors with
-``tests/gen_cron_golden.py``.
+library can answer a NEGATIVE delay; and entries flagged ``"extension"``
+hold the ``L-n``, ``nW``/``LW`` and ``d#n`` day forms the legacy library
+rejected, their vectors recorded from the in-house engine, so the replay
+pins the extended dialect the same way.  Regenerate/extend the vectors
+with ``tests/gen_cron_golden.py``.
 
 If the old package happens to be importable (a dev machine, never CI), a live
 differential test ALSO cross-checks every vector directly, so corpus edits
@@ -145,9 +148,12 @@ def test_live_differential_against_old_library():
         try:
             old_ct = old.CronTab(expr)
         except ValueError:
-            assert not entry["ok"], expr
+            # The old library must reject exactly the entries recorded as
+            # errors PLUS the flagged dialect extensions (whose vectors
+            # came from the in-house engine; test_golden covers them).
+            assert not entry["ok"] or entry.get("extension"), expr
             continue
-        assert entry["ok"], expr
+        assert entry["ok"] and not entry.get("extension"), expr
         new_ct = CronTab(expr)
         for now_s in _G["naive_next_nows"]:
             now = datetime.datetime.fromisoformat(now_s)
@@ -371,13 +377,28 @@ def test_quartz_six_field_layout_gets_a_conversion_hint():
         CronTab("0 15 10 ? * *")
 
 
-def test_quartz_hash_and_w_keep_raising_with_hints():
-    with pytest.raises(ValueError, match="nth-weekday"):
-        CronTab("0 0 * * 1#2")
-    with pytest.raises(ValueError, match="nearest-weekday"):
-        CronTab("0 0 15w * *")
-    with pytest.raises(ValueError, match="nearest-weekday"):
-        CronTab("0 0 lw * *")
+def test_wrong_field_hash_and_w_raise_with_wrong_field_hints():
+    # '#' and 'W' are dialect now, but each is valid in exactly one field;
+    # anywhere else the error names the right one
+    with pytest.raises(ValueError, match="day-of-week field"):
+        CronTab("0 0 1#2 * *")
+    with pytest.raises(ValueError, match="day-of-week field"):
+        CronTab("1#2 0 * * *")
+    with pytest.raises(ValueError, match="day-of-month field"):
+        CronTab("0 0 * * 15w")
+    with pytest.raises(ValueError, match="day-of-month field"):
+        CronTab("0 0 * * lw")
+    with pytest.raises(ValueError, match="day-of-month field"):
+        CronTab("0 0 * 15w *")
+
+
+def test_quartz_trailing_l_gets_a_spelling_hint():
+    with pytest.raises(ValueError, match=r"L<n>"):
+        CronTab("0 0 * * 5L")
+    # 'jul' is a month name, not a trailing-L weekday; no hint noise
+    with pytest.raises(ValueError) as excinfo:
+        CronTab("0 0 * * jul")
+    assert "last-weekday" not in str(excinfo.value)
 
 
 def test_weekday_names_do_not_trip_the_w_hint():
@@ -386,6 +407,151 @@ def test_weekday_names_do_not_trip_the_w_hint():
     with pytest.raises(ValueError) as excinfo:
         CronTab("0 0 * * wde")  # a typo, not Quartz
     assert "Quartz" not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# the extension day forms: L-<n>, <n>W / LW, <d>#<n>
+# ---------------------------------------------------------------------------
+# Fixed 2026 anchors: Jan 1 is a Thursday, so Jan has Fridays 2/9/16/23/30
+# and its 31st is a Saturday; Feb 1 is a Sunday; May 31 and Aug 1 fall on
+# Sunday and Saturday.  The golden extension vectors sweep the grids; these
+# spell out the semantics on hand-checked dates.
+
+
+def _matches(expr, *ymd):
+    return CronTab(expr).test(datetime.datetime(*ymd))
+
+
+def test_nth_weekday_matches_only_that_occurrence():
+    assert _matches("0 0 * * 5#3", 2026, 1, 16)  # third Friday
+    assert not _matches("0 0 * * 5#3", 2026, 1, 9)
+    assert not _matches("0 0 * * 5#3", 2026, 1, 23)
+    assert _matches("0 0 * * 1#2", 2026, 1, 12)  # second Monday
+    assert _matches("0 0 * * fri#3", 2026, 1, 16)  # names resolve too
+
+
+def test_nth_weekday_fifth_occurrence_and_fold():
+    # five Sundays in Mar 2026 (1/8/15/22/29); Jan has only four
+    assert _matches("0 0 * * 0#5", 2026, 3, 29)
+    assert not _matches("0 0 * * 0#5", 2026, 1, 25)
+    assert CronTab("0 0 * * 7#1") == CronTab("0 0 * * 0#1")
+    assert CronTab("0 0 * * fri#3") == CronTab("0 0 * * 5#3")
+
+
+def test_nearest_weekday_stays_put_on_weekdays():
+    assert _matches("0 0 15W * *", 2026, 1, 15)  # a Thursday
+    assert not _matches("0 0 15W * *", 2026, 1, 14)
+
+
+def test_nearest_weekday_saturday_resolves_to_friday():
+    assert _matches("0 0 17W * *", 2026, 1, 16)  # Sat 17th -> Fri 16th
+    assert not _matches("0 0 17W * *", 2026, 1, 17)
+
+
+def test_nearest_weekday_sunday_resolves_to_monday():
+    assert _matches("0 0 1W 2 *", 2026, 2, 2)  # Sun the 1st -> Mon the 2nd
+    assert not _matches("0 0 1W 2 *", 2026, 2, 1)
+
+
+def test_nearest_weekday_flips_inward_at_month_edges():
+    # Sat Aug 1: backward would leave the month, so Monday the 3rd
+    assert _matches("0 0 1W 8 *", 2026, 8, 3)
+    assert not _matches("0 0 1W 8 *", 2026, 8, 1)
+    # Sun May 31 is the final day: forward would leave, so Friday the 29th
+    assert _matches("0 0 31W 5 *", 2026, 5, 29)
+    assert not _matches("0 0 31W 5 *", 2026, 5, 31)
+
+
+def test_nearest_weekday_day_beyond_month_never_fires():
+    assert (
+        CronTab("0 0 31W 4 *").next(
+            now=datetime.datetime(2026, 1, 1), default_utc=True
+        )
+        is None
+    )
+
+
+def test_last_weekday_of_month():
+    assert _matches("0 0 LW * *", 2026, 1, 30)  # Jan 31 is a Saturday
+    assert not _matches("0 0 LW * *", 2026, 1, 31)
+    assert _matches("0 0 LW 8 *", 2026, 8, 31)  # a Monday, stays put
+    assert _matches("0 0 LW 5 *", 2026, 5, 29)  # May 31 is a Sunday
+
+
+def test_last_day_offsets():
+    assert _matches("0 0 L-3 * *", 2026, 1, 28)
+    assert _matches("0 0 L-3 2 *", 2026, 2, 25)
+    assert _matches("0 0 L-30 * *", 2026, 1, 1)
+    # 28 - 30 < 1: no such day in February
+    assert not any(
+        CronTab("0 0 L-30 2 *").test(datetime.datetime(2026, 2, d))
+        for d in range(1, 29)
+    )
+
+
+def test_extension_forms_are_ordinary_list_items():
+    assert _matches("0 0 1,15W,L * *", 2026, 1, 1)
+    assert _matches("0 0 1,15W,L * *", 2026, 1, 15)
+    assert _matches("0 0 1,15W,L * *", 2026, 1, 31)
+    assert _matches("0 0 * * mon#1,L5", 2026, 1, 5)
+    assert _matches("0 0 * * mon#1,L5", 2026, 1, 30)
+
+
+def test_extension_forms_respect_the_day_and_rule():
+    # 15W AND Friday: first hit from Jan 2026 is Fri May 15
+    fires = CronTab("0 0 15W * fri").occurrences(
+        datetime.datetime(2026, 1, 1)
+    )
+    assert next(fires) == datetime.datetime(2026, 5, 15)
+
+
+def test_extension_prev_and_occurrences_agree():
+    tab = CronTab("0 0 * * 5#3")
+    ago = tab.prev(now=datetime.datetime(2026, 2, 1), default_utc=True)
+    assert ago == (
+        datetime.datetime(2026, 2, 1) - datetime.datetime(2026, 1, 16)
+    ).total_seconds()
+    first = next(iter(tab.occurrences(datetime.datetime(2026, 1, 1))))
+    assert first == datetime.datetime(2026, 1, 16)
+
+
+def test_extension_properties_expose_parsed_forms():
+    ct = CronTab("0 0 1,15W,L,l-3,LW * mon#1,L5,tue")
+    assert ct.days_of_month == frozenset({1})
+    assert ct.last_day_offsets == frozenset({0, 3})
+    assert ct.last_day_of_month is True
+    assert ct.nearest_weekday_days == frozenset({15})
+    assert ct.last_weekday_of_month is True
+    assert ct.nth_days_of_week == frozenset({(1, 1)})
+    assert ct.last_days_of_week == frozenset({5})
+    assert ct.days_of_week == frozenset({2})
+    # legacy spellings unchanged
+    assert CronTab("0 0 l * *").last_day_offsets == frozenset({0})
+    assert CronTab("0 0 1 * *").last_day_of_month is False
+
+
+def test_extension_errors():
+    for bad in (
+        "0 0 * * 5#0",
+        "0 0 * * 5#6",
+        "0 0 * * 1-2#3",
+        "0 0 * * #3",
+        "0 0 * * 5#",
+        "0 0 * * 5#3#4",
+        "0 0 * * 5#3/2",
+        "0 0 * * mon#fri",
+        "0 0 L-0 * *",
+        "0 0 L-31 * *",
+        "0 0 0W * *",
+        "0 0 32W * *",
+        "0 0 W * *",
+        "0 0 15W/2 * *",
+        "0 0 1-15W * *",
+        "0 0 LW-3 * *",
+        "0 0 l-x * *",
+    ):
+        with pytest.raises(ValueError):
+            CronTab(bad)
 
 
 # ---------------------------------------------------------------------------

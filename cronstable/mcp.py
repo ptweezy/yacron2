@@ -695,12 +695,15 @@ class MCPHandler:
                 "Validate a schedule",
                 "Parse and lint a cron expression BEFORE it becomes a job: "
                 "valid true/false with the engine's exact error (including "
-                "Quartz dialect hints), the plain-English description, the "
-                "normalized form, advisory lint findings and the first "
-                "upcoming fire, all from the daemon's own scheduling engine. "
-                "`tz` (IANA zone the job will run in) enables the DST "
-                "checks; `seed` (the prospective job name) resolves "
-                "Jenkins-style H slots.",
+                "wrong-field hints for Quartz-style forms), the "
+                "plain-English description, the normalized form, advisory "
+                "lint findings and the first upcoming fire, all from the "
+                "daemon's own scheduling engine. The dialect includes L "
+                "(last day), L-n (n days before it), nW / LW (nearest / "
+                "last weekday) and Ln / d#n (last / nth weekday: L5 = last "
+                "Friday, 5#3 = third Friday). `tz` (IANA zone the job will "
+                "run in) enables the DST checks; `seed` (the prospective "
+                "job name) resolves Jenkins-style H slots.",
                 obj(
                     {"expression": _STR, "tz": _STR, "seed": _STR},
                     ["expression"],

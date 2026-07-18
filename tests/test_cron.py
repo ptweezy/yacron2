@@ -890,6 +890,10 @@ async def test_auth_middleware():
     class FakeRequest:
         def __init__(self, auth):
             self.headers = {"Authorization": auth} if auth else {}
+            # the middleware consults these on non-bearer requests (the
+            # .ics query-token carve-out); a real request always has them
+            self.path = "/jobs"
+            self.query = {}
 
     resp = await middleware(FakeRequest("Bearer secret"), handler)
     assert resp.text == "ok"

@@ -10,6 +10,13 @@ exactly the same.  The vectors are committed, so neither CI nor the install
 needs the old package; this script is only for regenerating or extending
 them.
 
+One carve-out: the in-house dialect EXTENDS the legacy one with the ``L-n``,
+``nW``/``LW`` and ``d#n`` day forms, every one of which the old library
+rejected.  An expression the old library refuses but the new engine parses
+is recorded from the NEW engine and flagged ``"extension": true``, so the
+extended behavior is pinned by the same replay while the legacy vectors
+keep proving nothing pre-existing moved.
+
 Usage (needs the old library, which is NOT a cronstable dependency anymore)::
 
     pip install "crontab>=1,<2"
@@ -207,6 +214,57 @@ EXPRESSIONS = [
     "0 0 13 * 5",
     "0 0 13 * *",
     "30 4 1,15 * 5",
+    # -- dialect extensions: the W family (day-of-month) --
+    "0 0 1W * *",
+    "0 0 31W * *",
+    "0 0 1w,15w * *",
+    "0 0 lw * *",
+    "0 0 lw,l * *",
+    "0 0 15W,l * *",
+    "0 0 15W 2 *",
+    "30 4 LW * mon-fri",
+    "0 0 15W * fri",
+    "0 0 W * *",
+    "0 0 0W * *",
+    "0 0 32W * *",
+    "0 0 15W/2 * *",
+    "0 0 1-15W * *",
+    "0 0 LW-3 * *",
+    "0 0 wL * *",
+    "0 0 * 15W *",
+    "15W 0 * * *",
+    # -- dialect extensions: L-<n> offsets (day-of-month) --
+    "0 0 L-1 * *",
+    "0 0 L-30 * *",
+    "0 0 l-3 1,3 *",
+    "0 0 L-3 * * 2027",
+    "0 0 L-0 * *",
+    "0 0 L-31 * *",
+    "0 0 l-w * *",
+    # -- dialect extensions: nth weekday '#' (day-of-week) --
+    "0 0 * * 5#3",
+    "0 0 * * fri#3",
+    "0 0 * * FRI#1",
+    "0 0 * * 7#1",
+    "0 0 * * 0#5",
+    "0 0 * * mon#1,fri#3",
+    "0 0 * * 1#2,L5",
+    "0 0 13 * 5#3",
+    "0 0 * * 5#3 2027",
+    "0 * * * 1#1",
+    "0 0 0 15W * 5#3 *",
+    "0 0 * * 5#0",
+    "0 0 * * 5#6",
+    "0 0 * * 1-2#3",
+    "0 0 * * #3",
+    "0 0 * * 5#",
+    "0 0 * * 5#3#4",
+    "0 0 * * */2#1",
+    "0 0 * * mon#fri",
+    "5#3 * * * *",
+    "0 0 5#3 * *",
+    "0 0 * 3#1 *",
+    "0 0 * * LW",
     # -- year field forms --
     "0 0 1 1 * 2027",
     "0 0 1 1 * 2027,2029",
@@ -317,6 +375,13 @@ TEST_DTS = [
     "2026-06-15T04:00:00",
     "2026-06-15T18:30:00",
     "2150-01-01T00:00:00",  # beyond the year-field cap
+    "2026-01-15T00:00:00",  # Thu: 15W fires in place; also 4#3
+    "2026-02-02T00:00:00",  # Mon: 1W of Feb 2026 (the 1st is a Sunday)
+    "2026-05-29T00:00:00",  # Fri: LW and 31W of May 2026 (31st a Sunday)
+    "2026-08-03T00:00:00",  # Mon: 1W of Aug 2026 (the 1st is a Saturday)
+    "2026-08-31T00:00:00",  # Mon: LW and 31W of Aug 2026, in place
+    "2026-03-29T00:00:00",  # the fifth Sunday of Mar 2026 (0#5)
+    "2026-01-28T00:00:00",  # L-3 in a 31-day month
 ]
 
 
@@ -325,23 +390,50 @@ def _aware(spec):
     return dt.replace(tzinfo=ZoneInfo(spec["tz"]), fold=spec["fold"])
 
 
+def _next_vectors(ct):
+    return [
+        ct.next(now=datetime.datetime.fromisoformat(s), default_utc=True)
+        for s in NAIVE_NEXT_NOWS
+    ]
+
+
+def _aware_vectors(ct):
+    return [
+        ct.next(now=_aware(spec), default_utc=False)
+        for spec in AWARE_NEXT_NOWS
+    ]
+
+
+def _test_vectors(ct):
+    return [ct.test(datetime.datetime.fromisoformat(s)) for s in TEST_DTS]
+
+
 def main() -> None:
     exprs = {}
     for expr in EXPRESSIONS:
         try:
             ct = CronTab(expr)
         except ValueError:
-            exprs[expr] = {"ok": False}
+            # The in-house dialect extends the legacy one: a form the old
+            # library rejects but the new engine parses (L-n, nW/LW, d#n)
+            # is recorded from the NEW engine, flagged, so the replay pins
+            # the extension's behavior just like the legacy vectors.
+            try:
+                new_only = NewCronTab(expr)
+            except ValueError:
+                exprs[expr] = {"ok": False}
+                continue
+            exprs[expr] = {
+                "ok": True,
+                "extension": True,
+                "next": _next_vectors(new_only),
+                "aware_next": _aware_vectors(new_only),
+                "test": _test_vectors(new_only),
+            }
             continue
         entry = {"ok": True}
-        entry["next"] = [
-            ct.next(now=datetime.datetime.fromisoformat(s), default_utc=True)
-            for s in NAIVE_NEXT_NOWS
-        ]
-        entry["aware_next"] = [
-            ct.next(now=_aware(spec), default_utc=False)
-            for spec in AWARE_NEXT_NOWS
-        ]
+        entry["next"] = _next_vectors(ct)
+        entry["aware_next"] = _aware_vectors(ct)
         # Aware vectors pin the IN-HOUSE engine's real-instant policy, not
         # the legacy library's: at a DST edge the old package does naive
         # civil arithmetic and can answer with a NEGATIVE delay (-3300 for
@@ -355,13 +447,8 @@ def main() -> None:
         except ValueError:
             pass
         else:
-            entry["aware_next"] = [
-                new_ct.next(now=_aware(spec), default_utc=False)
-                for spec in AWARE_NEXT_NOWS
-            ]
-        entry["test"] = [
-            ct.test(datetime.datetime.fromisoformat(s)) for s in TEST_DTS
-        ]
+            entry["aware_next"] = _aware_vectors(new_ct)
+        entry["test"] = _test_vectors(ct)
         exprs[expr] = entry
 
     # Semantic equality pairs: the old CronTab compares by expansion, not by
@@ -390,9 +477,12 @@ def main() -> None:
             "Golden vectors recorded from the legacy `crontab` "
             "(parse-crontab) package, except aware_next, which pins the "
             "in-house engine's real-instant DST policy (the legacy "
-            "library can answer a negative delay at a DST edge). "
-            "Regenerate with tests/gen_cron_golden.py; do not edit by "
-            "hand."
+            "library can answer a negative delay at a DST edge), and "
+            "except entries flagged 'extension': true, whose expressions "
+            "the legacy library rejected and whose vectors are recorded "
+            "from the in-house engine (the L-n, nW/LW and d#n day "
+            "forms). Regenerate with tests/gen_cron_golden.py; do not "
+            "edit by hand."
         ),
         "naive_next_nows": NAIVE_NEXT_NOWS,
         "aware_next_nows": AWARE_NEXT_NOWS,
@@ -405,12 +495,15 @@ def main() -> None:
         json.dump(out, f, indent=1, sort_keys=True)
         f.write("\n")
     n_ok = sum(1 for e in exprs.values() if e["ok"])
+    n_ext = sum(1 for e in exprs.values() if e.get("extension"))
     print(
-        "wrote {}: {} expressions ({} valid, {} invalid), "
-        "{} next-instants, {} aware-instants, {} test-instants".format(
+        "wrote {}: {} expressions ({} valid, {} of those extensions, "
+        "{} invalid), {} next-instants, {} aware-instants, "
+        "{} test-instants".format(
             OUT,
             len(exprs),
             n_ok,
+            n_ext,
             len(exprs) - n_ok,
             len(NAIVE_NEXT_NOWS),
             len(AWARE_NEXT_NOWS),

@@ -480,6 +480,21 @@ def main():
             except Exception as e:
                 results["dashboard-heatmap"] = f"FAIL {e}"
 
+        # ---- week calendar (business-day chips + the background-hum strip) ----
+        if wants("dashboard-week"):
+            try:
+                close_overlays(page)
+                page.click("#weekBtn")
+                page.wait_for_selector(
+                    "#weekCard", state="visible", timeout=8000
+                )
+                page.wait_for_selector("#weekBody .wk-ev", timeout=8000)
+                scroll_card(page, "#weekCard")
+                shot(page, "dashboard-week")
+                page.click("#weekBtn")
+            except Exception as e:
+                results["dashboard-week"] = f"FAIL {e}"
+
         # ---- LAST: stage a correlated multi-job failure (incident tools) ----
         if (
             wants("dashboard-incident")

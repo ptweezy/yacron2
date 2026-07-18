@@ -770,3 +770,167 @@ def test_jobs_payload_ships_schedule_resolved_only_for_h():
     assert "hashed-slot" in [
         f["code"] for f in jobs["spread"]["schedule_findings"]
     ]
+
+
+# ---------------------------------------------------------------------------
+# the iCal feed: /calendar.ics and /jobs/{name}/calendar.ics
+# ---------------------------------------------------------------------------
+
+_CAL_YAML = """
+jobs:
+  - name: monthly-close
+    command: "true"
+    schedule: "30 1 LW * *"
+    utc: true
+  - name: third-friday-report
+    command: "true"
+    schedule: "0 2 * * 5#3"
+    utc: true
+  - name: parked
+    command: "true"
+    schedule: "0 0 * * *"
+    enabled: false
+  - name: boot
+    command: "true"
+    schedule: "@reboot"
+"""
+
+_CAL_START = datetime.datetime(2026, 7, 1, tzinfo=_UTC)
+_CAL_NOW = datetime.datetime(2026, 7, 18, 12, 0, tzinfo=_UTC)
+
+
+def test_calendar_payload_fleet_content_and_determinism():
+    cron = _cron(_CAL_YAML)
+    text = cron.calendar_payload(days=35, start=_CAL_START, now=_CAL_NOW)
+    assert text.startswith("BEGIN:VCALENDAR\r\n")
+    assert text.endswith("END:VCALENDAR\r\n")
+    assert "\n" not in text.replace("\r\n", "")  # CRLF-only
+    # July 2026: LW is Friday the 31st, the 3rd Friday is the 17th; both
+    # engine-enumerated, both in UTC
+    assert "DTSTART:20260731T013000Z" in text
+    assert "DTSTART:20260717T020000Z" in text
+    # disabled and @reboot jobs never become events
+    assert "SUMMARY:parked" not in text
+    assert "SUMMARY:boot" not in text
+    # a regenerated feed is byte-identical (stable UIDs, pinned DTSTAMP),
+    # so subscribed clients update in place instead of duplicating
+    again = cron.calendar_payload(days=35, start=_CAL_START, now=_CAL_NOW)
+    assert again == text
+
+
+def test_calendar_payload_per_job_feed_and_unknown():
+    cron = _cron(_CAL_YAML)
+    text = cron.calendar_payload(
+        "monthly-close", days=35, start=_CAL_START, now=_CAL_NOW
+    )
+    assert "X-WR-CALNAME:cronstable: monthly-close" in text
+    assert text.count("BEGIN:VEVENT") == 1
+    assert "SUMMARY:third-friday-report" not in text
+    assert cron.calendar_payload("nope", start=_CAL_START) is None
+    # a known job with no timetable renders as a valid, empty calendar
+    boot = cron.calendar_payload("boot", start=_CAL_START, now=_CAL_NOW)
+    assert boot.count("BEGIN:VEVENT") == 0
+    assert boot.startswith("BEGIN:VCALENDAR\r\n")
+
+
+def test_calendar_payload_uses_run_history_for_block_length():
+    cron = _cron(_CAL_YAML)
+    cron.run_history["monthly-close"] = [_run("success", dur=520.0)]
+    text = cron.calendar_payload(
+        "monthly-close", days=35, start=_CAL_START, now=_CAL_NOW
+    )
+    assert "DURATION:PT9M" in text
+    assert "Typical runtime: 9m" in text.replace("\r\n ", "")
+
+
+async def test_calendar_endpoint_headers_and_status():
+    cron = _cron(_CAL_YAML)
+    resp = await cron._web_calendar(Req(query={}))
+    assert resp.status == 200
+    assert resp.content_type == "text/calendar"
+    assert resp.charset == "utf-8"
+    assert (
+        resp.headers["Content-Disposition"]
+        == 'inline; filename="cronstable.ics"'
+    )
+    assert "BEGIN:VCALENDAR" in resp.text
+
+
+async def test_job_calendar_endpoint_and_404():
+    cron = _cron(_CAL_YAML)
+    # 60 days always contains a next "third Friday", whatever today is
+    resp = await cron._web_job_calendar(
+        Req(query={"days": "60"}, match={"name": "third-friday-report"})
+    )
+    assert resp.status == 200
+    assert "SUMMARY:third-friday-report" in resp.text
+    assert resp.text.count("BEGIN:VEVENT") >= 1
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_job_calendar(Req(match={"name": "nope"}))
+
+
+async def test_calendar_query_params_are_clamped():
+    cron = _cron(_CAL_YAML)
+    # junk and out-of-range values fall back / clamp instead of erroring
+    resp = await cron._web_calendar(
+        Req(query={"days": "junk", "per_job": "999999"})
+    )
+    assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# bearer auth: the .ics query-token carve-out
+# ---------------------------------------------------------------------------
+
+
+class _AuthReq:
+    def __init__(self, path, headers=None, query=None):
+        self.path = path
+        self.headers = headers or {}
+        self.query = query or {}
+
+
+async def _run_auth(middleware, request):
+    async def handler(_request):
+        return "ok"
+
+    return await middleware(request, handler)
+
+
+async def test_auth_middleware_accepts_query_token_on_ics_only():
+    mw = Cron._make_auth_middleware("sekrit", frozenset())
+    # the normal path: bearer header
+    assert (
+        await _run_auth(
+            mw,
+            _AuthReq("/jobs", headers={"Authorization": "Bearer sekrit"}),
+        )
+        == "ok"
+    )
+    # calendar clients: ?token= on .ics paths
+    assert (
+        await _run_auth(
+            mw, _AuthReq("/calendar.ics", query={"token": "sekrit"})
+        )
+        == "ok"
+    )
+    assert (
+        await _run_auth(
+            mw,
+            _AuthReq(
+                "/jobs/backup/calendar.ics", query={"token": "sekrit"}
+            ),
+        )
+        == "ok"
+    )
+    # a wrong or missing query token still refuses
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run_auth(
+            mw, _AuthReq("/calendar.ics", query={"token": "wrong"})
+        )
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run_auth(mw, _AuthReq("/calendar.ics"))
+    # the carve-out is for .ics ONLY: query tokens on API paths refuse,
+    # keeping tokens out of URLs everywhere else
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run_auth(mw, _AuthReq("/jobs", query={"token": "sekrit"}))

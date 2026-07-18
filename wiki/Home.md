@@ -16,6 +16,7 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [Configuration Reference](Configuration-Reference): The full YAML schema: top-level sections and per-job options.
 - [Classic Crontabs](Classic-Crontabs): Running plain Vixie-style crontab files as-is, how entries map onto cronstable's standard defaults, and the documented deviations from cron.
 - [Schedules and Timezones](Schedules-and-Timezones): Crontab strings, schedule objects, `@reboot`, UTC vs. local, and arbitrary timezones.
+- [Business-Day Schedules](Business-Day-Schedules): The month-shaped day forms: `L-n` offsets from month-end, `nW` nearest-weekday, `LW` last weekday, and `d#n` nth-weekday (`5#3` = third Friday), with Quartz porting notes.
 - [Schedule Linting](Schedule-Linting): Advisory findings for legal-but-suspect schedules: dead never-fires schedules, AND day semantics, uneven steps, skipped months, and DST anomalies.
 - [Hashed Schedules (H)](Hashed-Schedules): Jenkins-style `H` fields that hash the job name to a stable slot, spreading a fleet across the hour while keeping every job's fire time predictable.
 - [Commands and Environment](Commands-and-Environment): Shell vs. argv commands, environment variables, env files, and per-job user/group.
@@ -41,6 +42,7 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [HTTP Control API](HTTP-API): The optional REST interface: job status, on-demand start and cancel, run history, live log streaming, DAG and state-inspection routes, and cluster/fleet views.
 - [Web Dashboard](Web-Dashboard): The built-in browser dashboard: live status and log tailing, run history and resource charts, timezone-aware schedule previews, incident tools, cluster and fleet views, and a wallboard/TV mode, in one self-contained page.
 - [Terminal Dashboard](Terminal-Dashboard): `cronstable tui`, the dashboard's TUI sibling — the same board and the same keyboard shortcuts, in a terminal over SSH.
+- [Calendar Export (iCal)](Calendar-Export): The scheduler's upcoming fires as subscribable `.ics` feeds (fleet-wide and per job) and the dashboard's seven-day week calendar, with token-in-URL auth for calendar clients.
 - [Schedule Pressure](Schedule-Pressure): The fleet's forward-looking collision heatmap: every fire over the next 24 hours, bucketed hour by minute, on the API, the dashboard, and the wallboard.
 - [Duplicate Schedule Detection](Duplicate-Schedule-Detection): Groups of jobs whose schedules fire on the identical instants, by the engine's own semantic equality.
 - [Suggest a Slot](Suggest-a-Slot): The least-loaded minute or hour:minute for a new job, recommended from the fleet's real fires.

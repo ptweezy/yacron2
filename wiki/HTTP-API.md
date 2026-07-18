@@ -89,8 +89,10 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/schedule/duplicates` | `_web_schedule_duplicates` | `200` |
 | `GET` | `/schedule/suggest` | `_web_schedule_suggest` | `200` (`400` for a bad `period` or unknown `tz`) |
 | `GET` | `/schedule/why` | `_web_schedule_why` | `200` (`400` for a missing `job`/`at` or an unparseable `at`; `404` for an unknown job) |
+| `GET` | `/calendar.ics` | `_web_calendar` | `200` (`text/calendar`) |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
+| `GET` | `/jobs/{name}/calendar.ics` | `_web_job_calendar` | `200` (`text/calendar`; `404` for an unknown job) |
 | `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
 | `GET` | `/jobs/{name}/trends` | `_web_job_trends` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
@@ -302,6 +304,27 @@ jobs answer `reboot: true` with no checks; a disabled job still explains
 its timetable and reports `enabled: false`. The `cron_why_no_run`
 [MCP tool](MCP) serves the same payload to agents. See
 [Why Didn't It Run?](Why-No-Run) for a walkthrough.
+
+### `GET /calendar.ics` and `GET /jobs/{name}/calendar.ics`
+
+The upcoming fires as a standard iCalendar (RFC 5545) feed, fleet-wide or
+per job, `Content-Type: text/calendar`: one `VEVENT` per fire, enumerated by
+the scheduler's own engine in each job's resolved timezone and emitted as
+UTC instants with stable UIDs, so subscribed calendar apps update in place.
+Query parameters `days` (window, default 14, clamped 1 to 60) and `per_job`
+(event cap per job, default 100, clamped 1 to 1000) are clamped rather than
+erroring. Disabled and `@reboot` jobs carry no events; an unknown job name
+on the per-job route is a `404`.
+
+With [`web.authToken`](#authentication) set, the `.ics`
+paths (only) also accept the token as a `token` query parameter, because
+calendar clients cannot send a bearer header. Full event anatomy, privacy
+rationale, and subscription notes: [Calendar Export](Calendar-Export).
+
+```shell
+curl "http://localhost:8080/calendar.ics?days=30"
+curl http://localhost:8080/jobs/nightly-backup/calendar.ics
+```
 
 ### `GET /cluster`
 
@@ -1106,6 +1129,13 @@ The one configurable exception: setting `web.metrics.public: true` exempts
 `/metrics` (and only `/metrics`) from the bearer token, for scrapers that
 cannot send credentials; every other route stays gated (see
 [`GET /metrics`](#get-metrics)).
+
+One built-in carve-out: paths ending in `.ics` (the
+[calendar feeds](Calendar-Export)) also accept the same token as a `token`
+query parameter, compared in the same constant time, because calendar
+clients subscribing to a feed cannot attach a bearer header. Every other
+path refuses query tokens, keeping the token out of URLs, access logs, and
+referrers where a header will do.
 
 ```yaml
 web:

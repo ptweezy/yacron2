@@ -100,7 +100,8 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   tail its logs in real time, run or cancel jobs on demand, review run history
   and success rates, drive DAG runs and approvals, and keep an eye on the whole
   cluster, from one self-contained page with ten themes and a shortcut for
-  everything
+  everything and a **[terminal twin](#terminal-dashboard)**
+  (`cronstable tui`) with the same keys
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, and the accessibility options — a colour-vision-safe palette and larger UI scale](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
 
@@ -605,6 +606,39 @@ in the wiki is the full walkthrough, and
 enable it.
 
 **Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
+
+## Terminal dashboard
+
+The dashboard has a **TUI sibling**: `cronstable tui` opens the board in
+your terminal, over SSH, in a tmux pane, or on a box where a browser is
+not an option. It is a client of the same HTTP control API (nothing extra
+to enable on the daemon), and it keeps the web page's muscle memory --
+the shortcut table is the same one: `j`/`k` move, `Enter` opens a job's
+drawer (live SSE log tail, run history, plain-English schedule), `r`
+runs, `x` cancels, `/` filters, `g` refreshes, `t`/`T` cycle the same
+theme family (carolina/amber/green/modern/standard, phosphor or paper),
+`i` opens the incident timeline, `w` the wallboard, `Ctrl-K` the fuzzy
+command palette, and `?` lists everything (terminal-only extras -- quit,
+sort/filter cycling, drawer tabs -- are grouped separately in that
+overlay). The verdict bar, incident timeline, mitigate console,
+multi-tail, DAG drawer with approval gates, cluster panel, fleet matrix,
+heatmap, cron sandbox, and the BIOS-style boot self-test all made the
+trip; it is hand-rolled on the stdlib + the core aiohttp dependency, so
+it adds nothing to the install.
+
+```shell
+cronstable tui                            # local daemon on :8080
+cronstable tui --url http://prod-node:8080 --token-env CRONSTABLE_WEB_TOKEN
+cronstable tui --tv                       # straight to the wallboard
+cronstable tui --job nightly-backup       # deep-link a job's drawer
+```
+
+Web-only physics (CRT glow, scanlines, the pendulum wordmark) stay in
+the browser; the terminal gets honest glyphs, the same status colours
+(with the same colour-vision-safe remaps), and a bell instead of desktop
+notifications. The
+[**Terminal Dashboard**](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard)
+wiki page is the full reference (options, every key, the panel tour).
 
 ## Tutorials
 

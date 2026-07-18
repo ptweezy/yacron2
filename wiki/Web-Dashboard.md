@@ -496,6 +496,7 @@ cleanly on restart.
 
 ## See also
 
+- [Terminal Dashboard](Terminal-Dashboard): `cronstable tui`, this dashboard's TUI sibling — the same board and the same shortcuts, rendered in a terminal over the same API.
 - [HTTP Control API](HTTP-API): the REST endpoints, configuration schema, authentication, and Unix-socket options the dashboard is built on.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the cluster panel, per-job `clusterPolicy`, and the `GET /cluster` view it polls.
 - [Output Capturing](Output-Capturing): `captureStdout` / `captureStderr`, which control what the Logs tab can show.

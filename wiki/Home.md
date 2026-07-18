@@ -34,6 +34,7 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [Metrics with Prometheus](Metrics-with-Prometheus): The `/metrics` endpoint on the web API, with job, scheduler, and cluster metrics in Prometheus or OpenMetrics format.
 - [HTTP Control API](HTTP-API): The optional REST interface for status and on-demand job starts.
 - [Web Dashboard](Web-Dashboard): The built-in browser dashboard: live status, live log tailing, run history, and timezone-aware schedule previews.
+- [Terminal Dashboard](Terminal-Dashboard): `cronstable tui`, the dashboard's TUI sibling — the same board and the same keyboard shortcuts, in a terminal over SSH.
 
 ### Reference and Development
 

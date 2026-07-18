@@ -1112,6 +1112,31 @@ def pad_to(text: str, width: int) -> str:
     return text + " " * (width - w)
 
 
+#: C0 controls that must never reach a painted frame (ESC survives for
+#: :func:`rewrite_sgr`; \\r and \\t are handled semantically below).
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]")
+
+
+def sanitize_log_line(line: str) -> str:
+    """Make raw job output safe to paint into a terminal row.
+
+    A stray ``\\r`` would yank the cursor to column 1 mid-row (cmd.exe
+    jobs emit CRLF; progress bars emit many), so carriage returns get
+    log-viewer overwrite semantics: keep the last non-empty segment.
+    Tabs expand, and the remaining C0 controls are dropped -- except
+    ``ESC``, which :func:`rewrite_sgr` re-inks or strips.
+    """
+    if "\r" in line:
+        segments = line.split("\r")
+        kept = ""
+        for segment in reversed(segments):
+            if segment:
+                kept = segment
+                break
+        line = kept
+    return _CTRL_RE.sub("", line.replace("\t", "    "))
+
+
 #: The 8 basic + 8 bright ANSI palette positions, re-inked per theme so a
 #: job's coloured log output stays legible on every background (the web
 #: page does the same with its log-ANSI palette).
@@ -1917,7 +1942,9 @@ class LogTail:
                         self.lines.append(
                             (
                                 str(payload.get("stream", "")),
-                                str(payload.get("line", "")),
+                                sanitize_log_line(
+                                    str(payload.get("line", ""))
+                                ),
                                 time.time(),
                             )
                         )

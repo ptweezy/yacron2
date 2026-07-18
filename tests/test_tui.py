@@ -354,6 +354,20 @@ def test_rewrite_sgr_reinks_log_colors():
     assert strip_ansi(out) == "X"
 
 
+def test_sanitize_log_line_defuses_control_chars():
+    from cronstable.tui import sanitize_log_line
+
+    # cmd.exe CRLF tail: the stray \r must not reach a painted row
+    assert sanitize_log_line("heartbeat ok\r") == "heartbeat ok"
+    # mid-line \r gets log-viewer overwrite semantics (progress bars)
+    assert sanitize_log_line("10%\r55%\r100%") == "100%"
+    assert sanitize_log_line("busy\r") == "busy"
+    assert sanitize_log_line("\ttabbed") == "    tabbed"
+    assert sanitize_log_line("a\x00b\x07c") == "abc"
+    # ESC survives so rewrite_sgr can re-ink colours
+    assert "\x1b[31m" in sanitize_log_line("\x1b[31mred")
+
+
 def test_spark_cells_scale_and_color():
     history = [
         {"outcome": "success", "duration": 1.0},

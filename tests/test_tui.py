@@ -144,11 +144,13 @@ def test_compute_view_filters_and_sorts():
         _job("bravo", running=True, scheduled_in=None),
     ]
     # text filter matches name OR command, lowercased
-    assert [j["name"] for j in compute_view(jobs, "DELT", "all",
-                                            "name", 1)] == ["charlie"]
+    assert [
+        j["name"] for j in compute_view(jobs, "DELT", "all", "name", 1)
+    ] == ["charlie"]
     # status segments; "off" = disabled
-    assert [j["name"] for j in compute_view(jobs, "", "fail",
-                                            "name", 1)] == ["alpha"]
+    assert [j["name"] for j in compute_view(jobs, "", "fail", "name", 1)] == [
+        "alpha"
+    ]
     # status sort: run < fail < ... ; ties break on name
     by_status = compute_view(jobs, "", "all", "status", 1)
     assert [j["name"] for j in by_status] == ["bravo", "alpha", "charlie"]
@@ -156,16 +158,13 @@ def test_compute_view_filters_and_sorts():
     by_dur = compute_view(jobs, "", "all", "duration", 1)
     assert by_dur[0]["name"] == "alpha"
     # direction flip reverses
-    assert compute_view(jobs, "", "all", "name", -1)[0]["name"] == (
-        "charlie"
-    )
+    assert compute_view(jobs, "", "all", "name", -1)[0]["name"] == ("charlie")
 
 
 def test_verdict_single_failure_is_a_warn():
     jobs = [
         _job("ok-1", outcome="success"),
-        _job("bad-1", outcome="failure", exit_code=69,
-             fail_reason="boom"),
+        _job("bad-1", outcome="failure", exit_code=69, fail_reason="boom"),
     ]
     verdict, incident = verdict_info(jobs, None)
     assert verdict is not None
@@ -205,8 +204,11 @@ def test_verdict_uncorrelated_failures():
 
 def test_verdict_cluster_alert_outranks_everything():
     jobs = [_job("a", outcome="failure")]
-    alert = {"bad": True, "reason": "no quorum — Leader jobs paused",
-             "node": "n1"}
+    alert = {
+        "bad": True,
+        "reason": "no quorum — Leader jobs paused",
+        "node": "n1",
+    }
     verdict, _ = verdict_info(jobs, alert)
     assert verdict is not None
     assert verdict["sev"] == "crit"
@@ -242,9 +244,7 @@ def test_describe_cron_common_shapes():
     assert describe_cron("0 3 * * *") == "At 03:00, every day"
     assert describe_cron("30 * * * *") == "Every hour at :30, every day"
     assert describe_cron("0 0 * * 0") == "At 00:00, on Sunday"
-    assert describe_cron("0 12 1 * *") == (
-        "At 12:00, on the 1st of the month"
-    )
+    assert describe_cron("0 12 1 * *") == ("At 12:00, on the 1st of the month")
     # dom + dow combine with OR, like standard cron
     text = describe_cron("0 0 1 * 1")
     assert "on Monday or on the 1st" in text
@@ -345,8 +345,8 @@ def test_rewrite_sgr_reinks_log_colors():
     theme = Theme("carolina", light=False)
     out = rewrite_sgr("\x1b[31mred\x1b[0m plain", theme)
     assert "red" in strip_ansi(out)
-    assert theme.fg("fail") in out           # 31 -> the theme's fail ink
-    assert "\x1b[31m" not in out             # raw palette gone
+    assert theme.fg("fail") in out  # 31 -> the theme's fail ink
+    assert "\x1b[31m" not in out  # raw palette gone
     # OSC and other non-SGR escapes are stripped entirely
     assert strip_ansi(rewrite_sgr("\x1b]0;title\x07text", theme)) == "text"
     # 256-color foregrounds collapse to the bright ink, not garbage
@@ -451,13 +451,41 @@ def test_help_overlay_carries_the_web_table():
 #  the app, headless against a fake daemon
 # ===================================================================
 class FakeDaemon:
-    """A loopback daemon: the endpoints the TUI touches, scriptable."""
+    """A loopback daemon: the endpoints the TUI touches, scriptable.
+
+    Every payload attribute defaults to the feature-off shape, so tests
+    opt panels in by assigning the richer fixtures (see test_tui_tour
+    for the full-fleet ones, whose shapes were verified against a live
+    grand-tour daemon).
+    """
 
     def __init__(self) -> None:
         self.jobs: List[Dict[str, Any]] = []
         self.token: Optional[str] = None
         self.posts: List[str] = []
+        self.post_bodies: List[Any] = []
         self.log_lines: Dict[str, List[Dict[str, str]]] = {}
+        self.fail_logs_for: set = set()  # names whose SSE 500s
+        self.cluster: Dict[str, Any] = {"enabled": False, "peers": []}
+        self.fleet: Dict[str, Any] = {"enabled": False, "nodes": []}
+        self.dags_list: List[Dict[str, Any]] = []
+        self.dag_runs: Dict[str, List[Dict[str, Any]]] = {}
+        self.dag_docs: Dict[str, Dict[str, Any]] = {}  # runKey -> doc
+        self.dag_xcom: Dict[str, Dict[str, Any]] = {}  # runKey -> body
+        self.state: Dict[str, Any] = {"enabled": False}
+        self.state_documents: Dict[str, List[Any]] = {}
+        self.state_records: Dict[str, List[Any]] = {}
+        self.node: Dict[str, Any] = {
+            "node_name": "test-node",
+            "resources": None,
+        }
+        self.node_history: Dict[str, Any] = {
+            "node_name": "test-node",
+            "enabled": False,
+            "interval": None,
+            "points": [],
+        }
+        self.job_resources: Dict[str, Dict[str, Any]] = {}
         self.runner: Optional[web.AppRunner] = None
         self.url = ""
 
@@ -467,9 +495,27 @@ class FakeDaemon:
         app.router.add_get("/job-set-id", self._job_set_id)
         app.router.add_get("/jobs", self._jobs)
         app.router.add_get("/cluster", self._cluster)
+        app.router.add_get("/fleet", self._fleet)
         app.router.add_get("/node", self._node)
+        app.router.add_get("/node/history", self._node_history)
         app.router.add_get("/dags", self._dags)
+        app.router.add_get("/dags/{name}/runs", self._dag_runs)
+        app.router.add_get("/dags/{name}/runs/{rk}", self._dag_doc)
+        app.router.add_get("/dags/{name}/runs/{rk}/xcom", self._dag_xcom)
+        app.router.add_get(
+            "/dags/{name}/runs/{rk}/tasks/{task}/logs", self._task_logs
+        )
+        app.router.add_post("/dags/{name}/trigger", self._dag_trigger)
+        app.router.add_post("/dags/{name}/backfill", self._dag_backfill)
+        app.router.add_post(
+            "/dags/{name}/runs/{rk}/tasks/{task}/decision",
+            self._dag_decision,
+        )
+        app.router.add_get("/state", self._state)
+        app.router.add_get("/state/documents", self._state_documents)
+        app.router.add_get("/state/records", self._state_records)
         app.router.add_get("/jobs/{name}/runs", self._runs)
+        app.router.add_get("/jobs/{name}/resources", self._resources)
         app.router.add_get("/jobs/{name}/logs", self._logs)
         app.router.add_post("/jobs/{name}/{verb}", self._verb)
         self.runner = web.AppRunner(app)
@@ -501,15 +547,107 @@ class FakeDaemon:
         return web.json_response(self.jobs)
 
     async def _cluster(self, request):
-        return web.json_response({"enabled": False, "peers": []})
+        return web.json_response(self.cluster)
+
+    async def _fleet(self, request):
+        return web.json_response(self.fleet)
 
     async def _node(self, request):
-        return web.json_response(
-            {"node_name": "test-node", "resources": None}
-        )
+        return web.json_response(self.node)
+
+    async def _node_history(self, request):
+        return web.json_response(self.node_history)
 
     async def _dags(self, request):
-        return web.json_response([])
+        return web.json_response(self.dags_list)
+
+    async def _dag_runs(self, request):
+        name = request.match_info["name"]
+        if not any(d.get("name") == name for d in self.dags_list):
+            return web.Response(status=404)
+        return web.json_response(
+            {"dag": name, "runs": self.dag_runs.get(name, [])}
+        )
+
+    async def _dag_doc(self, request):
+        doc = self.dag_docs.get(request.match_info["rk"])
+        if doc is None:
+            return web.Response(status=404)
+        return web.json_response(doc)
+
+    async def _dag_xcom(self, request):
+        return web.json_response(
+            self.dag_xcom.get(request.match_info["rk"], {})
+        )
+
+    async def _task_logs(self, request):
+        task = request.match_info["task"]
+        resp = web.StreamResponse(
+            headers={"Content-Type": "text/event-stream"}
+        )
+        await resp.prepare(request)
+        frame = "event: line\ndata: %s\n\n" % json.dumps(
+            {"stream": "stdout", "line": "task %s says hi" % task}
+        )
+        await resp.write(frame.encode("utf-8"))
+        await resp.write(b"event: end\ndata: {}\n\n")
+        return resp
+
+    async def _dag_trigger(self, request):
+        name = request.match_info["name"]
+        self.posts.append("dag/%s/trigger" % name)
+        return web.json_response({"dag": name, "runKey": "manual-new"})
+
+    async def _dag_backfill(self, request):
+        name = request.match_info["name"]
+        self.posts.append("dag/%s/backfill" % name)
+        self.post_bodies.append(await request.json())
+        return web.json_response({"dag": name, "queued": 2})
+
+    async def _dag_decision(self, request):
+        self.posts.append(
+            "dag/%s/%s/%s/decision"
+            % (
+                request.match_info["name"],
+                request.match_info["rk"],
+                request.match_info["task"],
+            )
+        )
+        self.post_bodies.append(await request.json())
+        return web.json_response({"ok": True})
+
+    async def _state(self, request):
+        return web.json_response(self.state)
+
+    async def _state_documents(self, request):
+        ns = request.query.get("ns", "")
+        return web.json_response(
+            {
+                "namespace": ns,
+                "documents": self.state_documents.get(ns, []),
+            }
+        )
+
+    async def _state_records(self, request):
+        stream = request.query.get("stream", "")
+        return web.json_response(
+            {"stream": stream, "records": self.state_records.get(stream, [])}
+        )
+
+    async def _resources(self, request):
+        name = request.match_info["name"]
+        payload = self.job_resources.get(name)
+        if payload is None:
+            return web.json_response(
+                {
+                    "name": name,
+                    "monitored": False,
+                    "interval": None,
+                    "live": [],
+                    "runs": [],
+                }
+            )
+        return web.json_response(payload)
 
     async def _runs(self, request):
         name = request.match_info["name"]
@@ -519,12 +657,8 @@ class FakeDaemon:
         runs = [job["last_run"]] if job.get("last_run") else []
         stats = {
             "total": len(runs),
-            "success": sum(
-                1 for r in runs if r["outcome"] == "success"
-            ),
-            "failure": sum(
-                1 for r in runs if r["outcome"] == "failure"
-            ),
+            "success": sum(1 for r in runs if r["outcome"] == "success"),
+            "failure": sum(1 for r in runs if r["outcome"] == "failure"),
             "cancelled": 0,
             "unknown": 0,
             "success_rate": 1.0 if runs else None,
@@ -533,12 +667,12 @@ class FakeDaemon:
             "max_duration": 1.0,
             "last_duration": 1.0,
         }
-        return web.json_response(
-            {"name": name, "runs": runs, "stats": stats}
-        )
+        return web.json_response({"name": name, "runs": runs, "stats": stats})
 
     async def _logs(self, request):
         name = request.match_info["name"]
+        if name in self.fail_logs_for:
+            return web.Response(status=500)
         resp = web.StreamResponse(
             headers={
                 "Content-Type": "text/event-stream",
@@ -556,6 +690,15 @@ class FakeDaemon:
         name = request.match_info["name"]
         verb = request.match_info["verb"]
         self.posts.append("%s/%s" % (name, verb))
+        # mirror the daemon's semantics: 404 unknown job, 409 for a
+        # disabled start or a cancel with nothing running
+        job = next((j for j in self.jobs if j["name"] == name), None)
+        if job is None:
+            return web.Response(status=404)
+        if verb == "start" and not job.get("enabled"):
+            return web.Response(status=409)
+        if verb == "cancel" and not job.get("running"):
+            return web.Response(status=409)
         return web.Response(status=200)
 
 
@@ -590,9 +733,7 @@ class Harness:
             prefs_file=str(tmp_path / "prefs.json"),
             **app_kwargs,
         )
-        self._task = asyncio.get_running_loop().create_task(
-            self.app.run()
-        )
+        self._task = asyncio.get_running_loop().create_task(self.app.run())
         return self.app
 
     async def settle(self):
@@ -615,8 +756,12 @@ async def test_app_boots_and_paints_the_board(tmp_path):
     h = Harness()
     h.daemon.jobs = [
         _job("heartbeat", outcome="success"),
-        _job("north-beacon", outcome="failure", exit_code=69,
-             fail_reason="exited with code 69"),
+        _job(
+            "north-beacon",
+            outcome="failure",
+            exit_code=69,
+            fail_reason="exited with code 69",
+        ),
     ]
     try:
         app = await h.start(tmp_path)
@@ -625,10 +770,10 @@ async def test_app_boots_and_paints_the_board(tmp_path):
         screen = h.term.screen()
         assert "heartbeat" in screen
         assert "north-beacon" in screen
-        assert "9.9-test" in screen           # version chip
+        assert "9.9-test" in screen  # version chip
         assert "2 jobs" in screen
         assert "JOB FAILING — north-beacon" in screen  # verdict bar
-        assert "live" in screen               # connection dot
+        assert "live" in screen  # connection dot
     finally:
         await h.stop()
 
@@ -678,8 +823,7 @@ async def test_drawer_logs_and_esc_priority(tmp_path):
         h.keys.send("enter")
         await _wait_for(lambda: app.is_open("drawer"))
         await _wait_for(
-            lambda: app.log_tail is not None
-            and len(app.log_tail.lines) >= 2
+            lambda: app.log_tail is not None and len(app.log_tail.lines) >= 2
         )
         await h.settle()
         screen = h.term.screen()
@@ -700,7 +844,9 @@ async def test_drawer_logs_and_esc_priority(tmp_path):
 async def test_filter_focus_and_typing(tmp_path):
     h = Harness()
     h.daemon.jobs = [
-        _job("north-beacon"), _job("south-beacon"), _job("pulse-check"),
+        _job("north-beacon"),
+        _job("south-beacon"),
+        _job("pulse-check"),
     ]
     try:
         app = await h.start(tmp_path)
@@ -708,7 +854,8 @@ async def test_filter_focus_and_typing(tmp_path):
         h.keys.send("/", "b", "e", "a", "c")
         await _wait_for(lambda: app.filter_text == "beac")
         assert [j["name"] for j in app.view] == [
-            "north-beacon", "south-beacon",
+            "north-beacon",
+            "south-beacon",
         ]
         # while the field is focused, list keys type instead of acting
         h.keys.send("j")
@@ -735,8 +882,10 @@ async def test_palette_runs_a_job_action(tmp_path):
         for ch in "run: dep":
             h.keys.send(ch)
         await _wait_for(
-            lambda: app.palette_matches()
-            and app.palette_matches()[0][1] == "Run: deploy"
+            lambda: (
+                app.palette_matches()
+                and app.palette_matches()[0][1] == "Run: deploy"
+            )
         )
         h.keys.send("enter")
         await _wait_for(lambda: "deploy/start" in h.daemon.posts)
@@ -747,8 +896,10 @@ async def test_palette_runs_a_job_action(tmp_path):
 
 async def test_wallboard_and_stale_banner(tmp_path):
     h = Harness()
-    h.daemon.jobs = [_job("tile-a", outcome="success"),
-                     _job("tile-b", outcome="failure")]
+    h.daemon.jobs = [
+        _job("tile-a", outcome="success"),
+        _job("tile-b", outcome="failure"),
+    ]
     try:
         app = await h.start(tmp_path)
         await _wait_for(lambda: len(app.jobs) == 2)
@@ -791,7 +942,7 @@ async def test_incident_timeline_overlay(tmp_path):
         screen = h.term.screen()
         assert "incident timeline" in screen
         assert "bad-a" in screen
-        assert "ok-b" in screen      # every job's most recent finish
+        assert "ok-b" in screen  # every job's most recent finish
         # f narrows to failures only
         h.keys.send("f")
         await _wait_for(lambda: app.timeline_fail_only)

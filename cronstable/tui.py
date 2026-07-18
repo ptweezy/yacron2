@@ -2175,6 +2175,13 @@ ESC_PRIORITY = [
     "sandbox",
     "timeline",
     "tail",
+    "dag",
+    "drawer",
+    # the card-panels (web cards adapted to overlay screens) close
+    # after the drawers: a drawer opened FROM a panel (the DAGs index
+    # -> a DAG's drawer) stacks on top of it, so Esc must peel the
+    # drawer first, exactly like the web page's close order does for
+    # its own surfaces
     "dags",
     "state",
     "cluster",
@@ -2182,8 +2189,6 @@ ESC_PRIORITY = [
     "heat",
     "radar",
     "node",
-    "dag",
-    "drawer",
 ]
 
 #: Text inputs and the overlay each belongs to (focus routing).

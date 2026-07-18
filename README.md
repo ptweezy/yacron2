@@ -42,9 +42,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
   (see [Classic crontab files](#classic-crontab-files))
 * Built-in **schedule linting**: dead schedules that can never fire again are
-  called out loudly (never silently dropped), and common footguns — AND day
+  called out loudly (never silently dropped), and common footguns (AND day
   semantics, uneven `*/n` steps, day-31-in-April, schedules that DST skips or
-  repeats — are flagged at config load, in the dashboards, and over the API
+  repeats) are flagged at config load, in the dashboards, and over the API
   (see [Schedule linting](#schedule-linting))
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail

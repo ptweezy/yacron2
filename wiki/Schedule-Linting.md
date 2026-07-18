@@ -1,8 +1,8 @@
 # Schedule Linting
 
-cronstable lints every cron schedule it loads. The linter only looks at schedules the engine already *accepts* — rejecting bad syntax is the parser's job — and flags legal expressions that probably do not mean what the author intended, or that behave in a way worth knowing about. A dead schedule (one that can never fire again) is the loudest case: it used to vanish silently, and now announces itself everywhere.
+cronstable lints every cron schedule it loads. The linter only looks at schedules the engine already *accepts* (rejecting bad syntax is the parser's job) and flags legal expressions that probably do not mean what the author intended, or that behave in a way worth knowing about. A dead schedule (one that can never fire again) is the loudest case: it used to vanish silently, and now announces itself everywhere.
 
-The rules live in `cronstable/croninfo.py` (`lint_schedule`), the same module that computes plain-English descriptions and fire previews, so every surface — config load, the HTTP API, the [terminal dashboard](Terminal-Dashboard) — reports identical findings.
+The rules live in `cronstable/croninfo.py` (`lint_schedule`), the same module that computes plain-English descriptions and fire previews, so every surface (config load, the HTTP API, the [terminal dashboard](Terminal-Dashboard)) reports identical findings.
 
 ## Findings
 
@@ -11,7 +11,7 @@ Each finding has a stable `code`, a `level`, and a one-line `message`. `warning`
 | Code | Level | What it means |
 |------|-------|---------------|
 | `never-fires` | warning | The schedule has no future occurrence: a fixed year in the past, or a date that never exists (`0 0 30 2 *`). The job stays loaded but will never run. |
-| `day-fields-both-restricted` | warning | Day-of-month and day-of-week are both restricted. cronstable requires a day to satisfy **both** (`0 0 13 * 5` is Friday the 13th), while classic Vixie cron fires when *either* matches — so a schedule imported from a system crontab fires less often here than it did there. See [Schedules and Timezones](Schedules-and-Timezones). |
+| `day-fields-both-restricted` | warning | Day-of-month and day-of-week are both restricted. cronstable requires a day to satisfy **both** (`0 0 13 * 5` is Friday the 13th), while classic Vixie cron fires when *either* matches, so a schedule imported from a system crontab fires less often here than it did there. See [Schedules and Timezones](Schedules-and-Timezones). |
 | `uneven-step` | warning | A `*/n` step where `n` does not divide the field's span. `*/7` in the minute field fires at :56 and then :00 four minutes later, because star steps restart at the wrap. |
 | `uneven-step` (day-of-month) | note | Any `*/n` day-of-month step: values restart at day 1 every month and month lengths differ, so `*/2` is not "every 48 hours". |
 | `skipped-months` | warning | The smallest selected day of month never occurs in one of the selected months (`0 0 31 1,4 *` never fires in April), so that month is skipped entirely. |
@@ -23,7 +23,7 @@ The DST rules need a resolvable zone, so they run only for jobs with an explicit
 
 ## Where findings appear
 
-- **Config load.** Every finding is logged when the job parses — `warning` findings at WARNING, `note` findings at INFO — so the load or reload that introduces a footgun says so immediately:
+- **Config load.** Every finding is logged when the job parses (`warning` findings at WARNING, `note` findings at INFO), so the load or reload that introduces a footgun says so immediately:
 
   ```
   WARNING:cronstable.config:job 'parked': schedule '0 0 1 1 * 2020': [never-fires] no future occurrence: the year column ends at 2020, so this schedule will never fire again
@@ -40,8 +40,8 @@ A `never-fires` schedule stays a warning rather than a config error, deliberatel
 WARNING:cronstable:job 'parked': schedule '0 0 1 1 * 2020' has no future occurrence and will NEVER fire; fix the schedule or disable the job (its status reports never_fires)
 ```
 
-and every status surface reports `never_fires` until the schedule changes. If a job should not run, prefer `enabled: false` — it says what it means.
+and every status surface reports `never_fires` until the schedule changes. If a job should not run, prefer `enabled: false`, which says what it means.
 
 ## Linting expressions before they become jobs
 
-`GET /schedule/preview?expr=<expression>&tz=<zone>&count=<n>` parses, describes, previews and lints any expression with the daemon's own engine — the single source of truth behind the sandboxes. See [HTTP API](HTTP-API) for the full response shape.
+`GET /schedule/preview?expr=<expression>&tz=<zone>&count=<n>` parses, describes, previews and lints any expression with the daemon's own engine, the single source of truth behind the sandboxes. See [HTTP API](HTTP-API) for the full response shape.

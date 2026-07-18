@@ -158,7 +158,7 @@ schedule, `scheduled_in` is the literal string `"@reboot"`.
 A `scheduled` job whose crontab has **no future occurrence** (a fixed past
 year, an impossible date) reports `scheduled_in: null` plus `never_fires:
 true`, and the text form says `never fires (schedule has no future
-occurrence)` — see [Schedule Linting](Schedule-Linting).
+occurrence)`; see [Schedule Linting](Schedule-Linting).
 
 The `disabled` status is reported honestly instead of an inapplicable
 `scheduled (in N seconds)`.
@@ -196,7 +196,7 @@ Content-Type: application/json; charset=utf-8
 ### `GET /schedule/preview`
 
 Parses, describes, previews and lints one cron expression with the daemon's
-own engine — the single source of truth behind the dashboards' sandboxes, so
+own engine, the single source of truth behind the dashboards' sandboxes, so
 a preview can never disagree with what the scheduler will actually do.
 
 Query parameters:
@@ -538,7 +538,7 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `running`, `pids` | Whether any instance is currently running, and the PIDs of running instances whose subprocess has started. |
 | `running_resources` | Present only while a [`monitorResources`](Resource-Monitoring) job has a running instance: the **live** CPU/memory of the running instance(s), summed — `{cpu_percent, cpu_seconds, rss_bytes, instances}`. Omitted otherwise. `cpu_percent` is usage since the last sample and can exceed 100 across cores. |
 | `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, currently running, or a one-off `@reboot` schedule). |
-| `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date) — distinguishing the dead-schedule `null` above from the running/disabled ones. See [Schedule Linting](Schedule-Linting). |
+| `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date), distinguishing the dead-schedule `null` above from the running/disabled ones. See [Schedule Linting](Schedule-Linting). |
 | `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this job's crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own timezone. |
 | `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |

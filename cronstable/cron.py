@@ -13,7 +13,7 @@ import ssl
 import zlib
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import (  # noqa
     TYPE_CHECKING,
     Any,
@@ -29,6 +29,7 @@ from typing import (  # noqa
     Union,
 )
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
     from cronstable.jobapi import JobStateAPI
@@ -55,6 +56,16 @@ from cronstable.config import (
     schedule_object_to_crontab,
 )
 from cronstable.cronexpr import CronTab
+from cronstable.croninfo import (
+    ScheduleEntry,
+    describe_cron,
+    duplicate_schedules,
+    lint_schedule,
+    next_fires,
+    schedule_pressure,
+    suggest_slot,
+    why_no_run,
+)
 from cronstable.dagrun import DagScheduler
 from cronstable.fingerprint import job_digest, job_set_id
 from cronstable.job import JobOutputStream, JobRetryState, RunningJob
@@ -799,6 +810,10 @@ class Cron:
         # sleeps until the soonest fire and only touches jobs actually due.
         self._next_fire = {}  # type: Dict[str, datetime.datetime]
         self._fire_heap = []  # type: List[tuple[datetime.datetime, str]]
+        # names already warned about a schedule with no future occurrence,
+        # so the seeding pass says it loudly ONCE instead of every minute;
+        # pruned on reload so a changed schedule re-warns if still dead.
+        self._dead_schedules = set()  # type: Set[str]
         # wall-clock minute of the last housekeeping pass (config reload,
         # cluster/web (re)start, logging). Gates that work to once per minute
         # even while a second-level job wakes the loop far more often. run().
@@ -1628,17 +1643,22 @@ class Cron:
         for name, job in self.cron_jobs.items():
             running = self.running_jobs.get(name, None)
             if running:
-                out.append(
-                    {
-                        "job": name,
-                        "status": "running",
-                        "pid": [
-                            runjob.proc.pid
-                            for runjob in running
-                            if runjob.proc is not None
-                        ],
-                    }
-                )
+                row = {
+                    "job": name,
+                    "status": "running",
+                    "pid": [
+                        runjob.proc.pid
+                        for runjob in running
+                        if runjob.proc is not None
+                    ],
+                }  # type: Dict[str, Any]
+                if self._schedule_never_fires(job):
+                    # a running job with a dead schedule still never fires
+                    # again; flag it here exactly as /jobs does, so the two
+                    # surfaces agree (the text renderer keeps saying
+                    # "running": only the JSON row gains the field).
+                    row["never_fires"] = True
+                out.append(row)
             elif not job.enabled:
                 # disabled jobs never run on schedule; report that honestly
                 # instead of an inapplicable "scheduled (in N seconds)".
@@ -1646,17 +1666,21 @@ class Cron:
             else:
                 crontab = job.schedule  # type: Union[CronTab, str]
                 now = get_now(job.timezone)
-                out.append(
-                    {
-                        "job": name,
-                        "status": "scheduled",
-                        "scheduled_in": (
-                            crontab.next(now=now, default_utc=job.utc)
-                            if isinstance(crontab, CronTab)
-                            else str(crontab)
-                        ),
-                    }
+                scheduled_in = (
+                    crontab.next(now=now, default_utc=job.utc)
+                    if isinstance(crontab, CronTab)
+                    else str(crontab)
                 )
+                row = {
+                    "job": name,
+                    "status": "scheduled",
+                    "scheduled_in": scheduled_in,
+                }
+                if isinstance(crontab, CronTab) and scheduled_in is None:
+                    # "scheduled" with no instant means NEVER; say so
+                    # instead of leaving a null for consumers to guess at
+                    row["never_fires"] = True
+                out.append(row)
         return out
 
     async def _web_get_status(self, request: web.Request) -> web.Response:
@@ -1675,6 +1699,8 @@ class Cron:
                     )
                 elif jobstat["status"] == "disabled":
                     status = "disabled"
+                elif jobstat.get("never_fires"):
+                    status = "never fires (schedule has no future occurrence)"
                 else:
                     status = "scheduled ({})".format(
                         (
@@ -1692,6 +1718,457 @@ class Cron:
                 text="\n".join(lines),
                 headers=self.web_config.get("headers", None),
             )
+
+    @staticmethod
+    def _zone_from_name(tz_name: Optional[str]) -> datetime.tzinfo:
+        """A ``?tz=`` query value as a tzinfo (UTC when absent).
+
+        Raises ValueError for an unknown name; the handlers turn that
+        into a 400.
+        """
+        if not tz_name:
+            return datetime.timezone.utc
+        try:
+            return ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            raise ValueError("unknown timezone: {}".format(tz_name)) from None
+
+    @staticmethod
+    def _parse_probe_timestamp(text: str) -> datetime.datetime:
+        """An ``at=`` timestamp as a datetime (aware when it has an offset).
+
+        Accepts ISO 8601 as :func:`datetime.datetime.fromisoformat` does,
+        plus the ubiquitous trailing ``Z`` (which the py310 parser still
+        rejects).  Raises ValueError, with the accepted forms in the
+        message, for anything else; the handlers turn that into a 400.
+        """
+        raw = (text or "").strip()
+        iso = raw
+        if iso.endswith(("Z", "z")):
+            iso = iso[:-1] + "+00:00"
+        try:
+            return datetime.datetime.fromisoformat(iso)
+        except ValueError:
+            raise ValueError(
+                "invalid timestamp {!r}: pass ISO 8601, e.g. "
+                "2026-07-14T09:00, 2026-07-14T09:00:00+02:00 or "
+                "2026-07-14T09:00:00Z".format(raw)
+            ) from None
+
+    def schedule_preview_payload(
+        self,
+        expr: str,
+        tz_name: Optional[str] = None,
+        count: int = 12,
+        seed: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Parse, describe, preview and lint one schedule expression.
+
+        The data behind ``GET /schedule/preview``: the single source of
+        truth for sandboxes, computed by the same engine, describer and
+        linter the scheduler itself runs, so a preview can never disagree
+        with what the daemon will do (the web page's client-side preview is
+        a convenience, not an authority).  Raises ValueError for an unknown
+        timezone name; the handler turns that into a 400.  ``seed`` is the
+        hash key for the ``H`` form (a job name, real or prospective);
+        without it an ``H`` expression comes back invalid, with the
+        engine's own error saying a hash key is needed.
+        """
+        zone = self._zone_from_name(tz_name)
+        text = (expr or "").strip()
+        payload = {
+            "expression": text,
+            "timezone": str(zone),
+        }  # type: Dict[str, Any]
+        if seed is not None:
+            payload["seed"] = seed
+        if text.lower() == "@reboot":
+            payload.update(
+                {
+                    "valid": True,
+                    "reboot": True,
+                    "description": describe_cron(text),
+                    "fires": [],
+                    "never_fires": False,
+                    "lint": [],
+                }
+            )
+            return payload
+        try:
+            tab = CronTab(text, hash_key=seed)
+        except (ValueError, KeyError) as err:
+            payload.update({"valid": False, "error": str(err)})
+            return payload
+        fires = next_fires(text, count, tz=zone, hash_key=seed)
+        payload.update(
+            {
+                "valid": True,
+                "reboot": False,
+                "normalized": str(tab),
+                "description": describe_cron(text, hash_key=seed),
+                "fires": [when.isoformat() for when in fires],
+                "never_fires": not fires,
+                "lint": [
+                    finding._asdict()
+                    for finding in lint_schedule(
+                        text, timezone=zone, hash_key=seed
+                    )
+                ],
+            }
+        )
+        if tab.resolved_source != str(tab):
+            payload["resolved"] = tab.resolved_source
+        return payload
+
+    async def _web_schedule_preview(
+        self, request: web.Request
+    ) -> web.Response:
+        """Decode an arbitrary expression for the dashboards' sandboxes."""
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        expr = request.query.get("expr", "")
+        if not expr.strip():
+            return web.json_response(
+                {"error": "missing ?expr= query parameter"},
+                status=400,
+                headers=headers,
+            )
+        count = self._web_int_query(request, "count", default=12, lo=1, hi=60)
+        try:
+            payload = self.schedule_preview_payload(
+                expr,
+                request.query.get("tz") or None,
+                count,
+                request.query.get("seed"),
+            )
+        except ValueError as err:
+            return web.json_response(
+                {"error": str(err)}, status=400, headers=headers
+            )
+        return web.json_response(payload, headers=headers)
+
+    def _job_or_dag_schedule(self, name: str) -> Optional[JobConfig]:
+        """The named job, or a DAG's synthetic ``dag:<name>`` schedule job.
+
+        DAG schedule jobs launch real work on real instants, so "why did
+        this not run?" is as answerable for them as for any job; they are
+        just not in ``cron_jobs``.
+        """
+        job = self.cron_jobs.get(name)
+        if job is not None:
+            return job
+        for dag in self.cron_dags.values():
+            sched = dag.schedule_job
+            if sched is not None and sched.name == name:
+                return sched
+        return None
+
+    def schedule_why_payload(
+        self, name: str, at: str
+    ) -> Optional[Dict[str, Any]]:
+        """Why a job's schedule did (not) select a timestamp
+        (``GET /schedule/why``, MCP ``cron_why_no_run``).
+
+        Decomposes the engine's own match test field by field via
+        :func:`cronstable.croninfo.why_no_run`, in the job's OWN resolved
+        timezone: an aware ``at`` is converted into that zone, a naive one
+        reads as wall time there.  The payload adds the job-level facts an
+        answer needs (``enabled``, the ``@reboot`` case) and the nearest
+        real fire on each side of the probe, from the same occurrence walk
+        the scheduler runs.  Returns ``None`` for an unknown job; raises
+        ValueError for an unparseable timestamp.
+        """
+        job = self._job_or_dag_schedule(name)
+        if job is None:
+            return None
+        zone = job.timezone or datetime.datetime.now().astimezone().tzinfo
+        payload: Dict[str, Any] = {
+            "job": name,
+            "enabled": job.enabled,
+            "timezone": (
+                str(job.timezone) if job.timezone is not None else "local"
+            ),
+            "at": at,
+        }
+        if not isinstance(job.schedule, CronTab):
+            # "@reboot": no timetable exists for any timestamp to match.
+            payload.update(
+                {
+                    "expression": str(job.schedule),
+                    "reboot": True,
+                    "description": describe_cron(str(job.schedule)),
+                    "matches": False,
+                    "checks": [],
+                    "failed": [],
+                    "notes": [
+                        {
+                            "code": "reboot",
+                            "level": "note",
+                            "message": "@reboot runs once when the daemon "
+                            "starts; it never fires on a timetable, so no "
+                            "timestamp can match",
+                        }
+                    ],
+                    "previous_fire": None,
+                    "next_fire": None,
+                }
+            )
+            return payload
+        tab = job.schedule
+        probe = self._parse_probe_timestamp(at)
+        if probe.tzinfo is not None:
+            aware = probe.astimezone(zone)
+            civil = aware.replace(tzinfo=None)
+        else:
+            civil = probe
+            # fold=0, the engine's own rule for resolving a wall time.
+            aware = probe.replace(tzinfo=zone)
+        payload.update(
+            {
+                "expression": str(tab),
+                "reboot": False,
+                "description": describe_cron(str(tab), hash_key=job.name),
+                "at_in_zone": aware.isoformat(),
+            }
+        )
+        if tab.resolved_source != str(tab):
+            payload["resolved"] = tab.resolved_source
+        payload.update(why_no_run(tab, civil, timezone=zone))
+        next_fire = next(iter(tab.occurrences(aware)), None)
+        prev_delta = tab.prev(now=aware)
+        previous_fire = None
+        if prev_delta is not None:
+            fire_utc = aware.astimezone(
+                datetime.timezone.utc
+            ) - datetime.timedelta(seconds=prev_delta)
+            # fires are whole seconds; round away float/microsecond residue
+            # from the elapsed-seconds reconstruction.
+            if fire_utc.microsecond >= 500000:
+                fire_utc += datetime.timedelta(seconds=1)
+            previous_fire = (
+                fire_utc.replace(microsecond=0).astimezone(zone).isoformat()
+            )
+        payload["previous_fire"] = previous_fire
+        payload["next_fire"] = (
+            next_fire.isoformat() if next_fire is not None else None
+        )
+        return payload
+
+    async def _web_schedule_why(self, request: web.Request) -> web.Response:
+        """Explain one job's schedule against one timestamp."""
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        name = request.query.get("job", "").strip()
+        at = request.query.get("at", "").strip()
+        if not name or not at:
+            return web.json_response(
+                {"error": "missing ?job= or ?at= query parameter"},
+                status=400,
+                headers=headers,
+            )
+        try:
+            payload = self.schedule_why_payload(name, at)
+        except ValueError as err:
+            return web.json_response(
+                {"error": str(err)}, status=400, headers=headers
+            )
+        if payload is None:
+            raise web.HTTPNotFound()
+        return web.json_response(payload, headers=headers)
+
+    def _schedule_entries(self) -> List[ScheduleEntry]:
+        """The analyzable fleet: every enabled, cron-scheduled job.
+
+        DAG schedules ride along as their synthetic ``dag:<name>`` job
+        (they launch real work on real instants, so they belong in the
+        collision picture).  @reboot jobs and disabled jobs are excluded:
+        neither fires on a schedule, so neither can collide.
+        """
+        entries = [
+            ScheduleEntry(name, job.schedule, job.timezone)
+            for name, job in self.cron_jobs.items()
+            if job.enabled and isinstance(job.schedule, CronTab)
+        ]
+        for dag in self.cron_dags.values():
+            sched = dag.schedule_job
+            if (
+                sched is not None
+                and sched.enabled
+                and isinstance(sched.schedule, CronTab)
+            ):
+                entries.append(
+                    ScheduleEntry(sched.name, sched.schedule, sched.timezone)
+                )
+        return entries
+
+    def schedule_pressure_payload(
+        self,
+        hours: int = 24,
+        tz_name: Optional[str] = None,
+        entries: Optional[List[ScheduleEntry]] = None,
+    ) -> Dict[str, Any]:
+        """The fleet collision heatmap (``GET /schedule/pressure``).
+
+        Every enabled schedule's fires over the next ``hours``, bucketed
+        into the hour-by-minute grid by :func:`schedule_pressure`, plus
+        how many jobs were excluded as disabled or @reboot.  Raises
+        ValueError for an unknown timezone name.  ``entries`` is an
+        optional pre-built fleet snapshot (see
+        :meth:`schedule_pressure_payload_async`); when None it is built
+        here.
+        """
+        if entries is None:
+            entries = self._schedule_entries()
+        payload = schedule_pressure(
+            entries,
+            hours=hours,
+            tz=self._zone_from_name(tz_name),
+        )
+        # a plain-list snapshot: this builder can run on an executor thread
+        # (see the async wrapper), so do not iterate the live mapping from
+        # off the loop.
+        jobs = list(self.cron_jobs.values())
+        payload["excluded"] = {
+            "disabled": sum(1 for job in jobs if not job.enabled),
+            "reboot": sum(
+                1
+                for job in jobs
+                if job.enabled and not isinstance(job.schedule, CronTab)
+            ),
+        }
+        return payload
+
+    def schedule_duplicates_payload(
+        self, entries: Optional[List[ScheduleEntry]] = None
+    ) -> Dict[str, Any]:
+        """Semantically identical schedules (``GET /schedule/duplicates``).
+
+        Groups via the engine's own equality (``*/5`` == ``0-59/5``), so
+        the answer can never disagree with how the scheduler itself
+        compares schedules across reloads.  ``entries`` is an optional
+        pre-built fleet snapshot (see
+        :meth:`schedule_duplicates_payload_async`); when None it is
+        built here.
+        """
+        if entries is None:
+            entries = self._schedule_entries()
+        return {
+            "jobs": len(entries),
+            "groups": duplicate_schedules(entries),
+        }
+
+    def schedule_suggest_payload(
+        self,
+        period: str = "hourly",
+        tz_name: Optional[str] = None,
+        entries: Optional[List[ScheduleEntry]] = None,
+    ) -> Dict[str, Any]:
+        """The least-loaded slot for a new job (``GET /schedule/suggest``).
+
+        Raises ValueError for an unknown period or timezone name.
+        ``entries`` is an optional pre-built fleet snapshot (see
+        :meth:`schedule_suggest_payload_async`); when None it is built
+        here.
+        """
+        if entries is None:
+            entries = self._schedule_entries()
+        return suggest_slot(
+            entries,
+            period=period,
+            tz=self._zone_from_name(tz_name),
+        )
+
+    # The three payload builders above walk up to 168 hours of fire
+    # instants for every schedule in the fleet: pure CPU that can take
+    # seconds at fleet scale.  The wrappers below take the (cheap) entries
+    # snapshot on the loop, then run the walk on the default executor over
+    # that immutable snapshot, keeping the scheduler's event loop free to
+    # dispatch jobs while a dashboard or MCP client asks for analysis.
+    # Both the web handlers and the MCP tools go through these, so the
+    # offload lives in exactly one place.  Exceptions (ValueError for an
+    # unknown timezone or period) propagate to the await unchanged.
+
+    async def schedule_pressure_payload_async(
+        self, hours: int = 24, tz_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Executor-offloaded :meth:`schedule_pressure_payload`."""
+        entries = self._schedule_entries()
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            partial(
+                self.schedule_pressure_payload,
+                hours=hours,
+                tz_name=tz_name,
+                entries=entries,
+            ),
+        )
+
+    async def schedule_duplicates_payload_async(self) -> Dict[str, Any]:
+        """Executor-offloaded :meth:`schedule_duplicates_payload`."""
+        entries = self._schedule_entries()
+        return await asyncio.get_running_loop().run_in_executor(
+            None, partial(self.schedule_duplicates_payload, entries=entries)
+        )
+
+    async def schedule_suggest_payload_async(
+        self, period: str = "hourly", tz_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Executor-offloaded :meth:`schedule_suggest_payload`."""
+        entries = self._schedule_entries()
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            partial(
+                self.schedule_suggest_payload,
+                period=period,
+                tz_name=tz_name,
+                entries=entries,
+            ),
+        )
+
+    async def _web_schedule_pressure(
+        self, request: web.Request
+    ) -> web.Response:
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        hours = self._web_int_query(request, "hours", default=24, lo=1, hi=168)
+        try:
+            # run_in_executor surfaces the builder's exceptions at the
+            # await, so the unknown-timezone ValueError still lands here.
+            payload = await self.schedule_pressure_payload_async(
+                hours, request.query.get("tz") or None
+            )
+        except ValueError as err:
+            return web.json_response(
+                {"error": str(err)}, status=400, headers=headers
+            )
+        return web.json_response(payload, headers=headers)
+
+    async def _web_schedule_duplicates(
+        self, request: web.Request
+    ) -> web.Response:
+        assert self.web_config is not None
+        return web.json_response(
+            await self.schedule_duplicates_payload_async(),
+            headers=self.web_config.get("headers", None),
+        )
+
+    async def _web_schedule_suggest(
+        self, request: web.Request
+    ) -> web.Response:
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        try:
+            # exceptions propagate from the executor to the await, so the
+            # unknown-period/timezone ValueError still lands here.
+            payload = await self.schedule_suggest_payload_async(
+                request.query.get("period") or "hourly",
+                request.query.get("tz") or None,
+            )
+        except ValueError as err:
+            return web.json_response(
+                {"error": str(err)}, status=400, headers=headers
+            )
+        return web.json_response(payload, headers=headers)
 
     async def start_job_by_name(self, name: str) -> None:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
@@ -1826,6 +2303,25 @@ class Cron:
         seconds: Optional[float] = crontab.next(now=now, default_utc=job.utc)
         return seconds
 
+    def _schedule_never_fires(self, job: JobConfig) -> bool:
+        """True when an enabled cron job's schedule has no future instant.
+
+        Computed from the schedule alone, so it holds for running jobs
+        too (a running job with a dead schedule still never fires
+        again).  Shared by the /jobs and /status payloads so the two
+        surfaces cannot drift.  Runs a full engine search: callers that
+        already hold a fresh :meth:`_scheduled_in` result for a
+        non-running job should derive the answer from that instead.
+        """
+        return (
+            job.enabled
+            and isinstance(job.schedule, CronTab)
+            and job.schedule.next(
+                now=get_now(job.timezone), default_utc=job.utc
+            )
+            is None
+        )
+
     def fleet_job_summaries(self) -> Dict[str, Any]:
         """Compact per-job snapshot gossiped to peers for the fleet view.
 
@@ -1864,6 +2360,22 @@ class Cron:
         # next scheduled run, in seconds; None when not applicable (disabled,
         # currently running, or a one-off @reboot schedule).
         scheduled_in = self._scheduled_in(job, bool(running))
+        # a dead schedule's None means NEVER, which the dashboards must be
+        # able to tell apart from the running/disabled Nones above.  For a
+        # job that is not running, _scheduled_in above already ran the
+        # exact engine search this needs (enabled + cron + no next instant
+        # is precisely "never fires"), so reuse its answer instead of
+        # searching twice per job on every /jobs poll.  Only a running job
+        # (whose scheduled_in is None by design) needs the direct probe:
+        # a running job with a dead schedule still never fires again.
+        if running:
+            never_fires = self._schedule_never_fires(job)
+        else:
+            never_fires = (
+                job.enabled
+                and isinstance(job.schedule, CronTab)
+                and scheduled_in is None
+            )
 
         last = self.last_run.get(name)
         last_run = last.to_dict() if last is not None else None
@@ -1902,9 +2414,23 @@ class Cron:
                 if runjob.proc is not None
             ],
             "scheduled_in": scheduled_in,
+            "never_fires": never_fires,
+            # advisory lint from config load (see JobConfig), so the
+            # dashboards can badge footguns without re-deriving them
+            "schedule_findings": [
+                finding._asdict() for finding in job.schedule_findings
+            ],
             "last_run": last_run,
             "history": recent,
         }  # type: Dict[str, Any]
+        if isinstance(
+            job.schedule, CronTab
+        ) and job.schedule.resolved_source != str(job.schedule):
+            # the H hash form: also ship the plain-dialect spelling it
+            # resolved to, so the dashboards display the H the user wrote
+            # while their client-side engines (which know no H) compute
+            # previews from this. Omitted for every other schedule.
+            result["schedule_resolved"] = job.schedule.resolved_source
         # live CPU/memory of the currently-running instances (monitorResources
         # jobs only). Summed across instances so a job running N copies shows
         # its aggregate footprint; omitted entirely when nothing is monitored
@@ -2749,6 +3275,11 @@ class Cron:
                 web.get("/node", self._web_get_node),
                 web.get("/node/history", self._web_node_history),
                 web.get("/status", self._web_get_status),
+                web.get("/schedule/preview", self._web_schedule_preview),
+                web.get("/schedule/pressure", self._web_schedule_pressure),
+                web.get("/schedule/duplicates", self._web_schedule_duplicates),
+                web.get("/schedule/suggest", self._web_schedule_suggest),
+                web.get("/schedule/why", self._web_schedule_why),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
                 web.get("/jobs/{name}/resources", self._web_job_resources),
@@ -3948,6 +4479,19 @@ class Cron:
                 nxt = self._compute_next_fire(job, now)
                 if nxt is not None:
                     self._set_next_fire(name, nxt)
+                    self._dead_schedules.discard(name)
+                elif name not in self._dead_schedules:
+                    # without this, a schedule with no future occurrence
+                    # (Feb 30, a past year) would just never enter the fire
+                    # index and vanish without a trace
+                    self._dead_schedules.add(name)
+                    logger.warning(
+                        "job %r: schedule %r has no future occurrence and "
+                        "will NEVER fire; fix the schedule or disable the "
+                        "job (its status reports never_fires)",
+                        name,
+                        schedule_str(job),
+                    )
 
     @staticmethod
     def _same_schedule(a: JobConfig, b: JobConfig) -> bool:
@@ -3991,6 +4535,16 @@ class Cron:
                 or not self._same_schedule(old, job)
             ):
                 del self._next_fire[name]
+        # keep the never-fires warning latch only for jobs whose schedule
+        # survived the reload unchanged; anything removed or edited gets a
+        # fresh chance to warn (or to seed) in _ensure_seeded below
+        self._dead_schedules = {
+            name
+            for name in self._dead_schedules
+            if name in self.cron_jobs
+            and (old := old_jobs.get(name)) is not None
+            and self._same_schedule(old, self.cron_jobs[name])
+        }
         self._ensure_seeded(now)
 
     def _peek_soonest_fire(self) -> Optional[datetime.datetime]:

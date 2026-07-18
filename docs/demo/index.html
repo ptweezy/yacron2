@@ -1014,6 +1014,32 @@
   .heat-cell.unknown { background: var(--unknown); }
   .heat-cell.act { cursor: pointer; }
 
+  /* schedule pressure: forward-looking fleet collision heatmap */
+  .press-summary { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; margin: 2px 0 8px; font-size: 11.5px; color: var(--fg-dim); }
+  .press-summary b { color: var(--fg); }
+  .press-grid { display: grid; grid-template-columns: 30px 1fr; gap: 2px 8px; min-width: 520px; }
+  .press-hlabel { font-size: 9px; color: var(--fg-faint); text-align: right; align-self: center; }
+  .press-cells { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 1px; height: 7px; }
+  .press-cell { border-radius: 1px; background: color-mix(in srgb, var(--fg-faint) 10%, transparent); }
+  .press-cell.p { background: var(--run); }
+  .press-cell.hot { background: var(--fail); }
+  .press-axis { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 1px; font-size: 9px; color: var(--fg-faint); margin-bottom: 3px; }
+  .press-axis span { overflow: visible; white-space: nowrap; }
+  .press-hist { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 1px; align-items: end; height: 30px; margin: 10px 0 2px; }
+  .press-hist i { display: block; min-height: 1px; background: var(--run); opacity: .85; border-radius: 1px 1px 0 0; }
+  .press-hist i.hot { background: var(--fail); }
+  .press-hist i.zero { background: color-mix(in srgb, var(--fg-faint) 18%, transparent); }
+  .press-sect { margin-top: 10px; }
+  .press-dup { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; padding: 5px 0; border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); font-size: 11.5px; }
+  .press-dup .chip { cursor: pointer; }
+  .press-suggest { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .press-suggest .out { font-size: 11.5px; color: var(--fg-dim); }
+  .press-suggest .out .chip { cursor: pointer; }
+  /* wallboard strip variant */
+  .wb-press { display: flex; gap: 14px; align-items: center; padding: 4px 14px 0; }
+  .wb-press .press-hist { flex: 1; height: 26px; margin: 0; }
+  .wb-press .lbl { font-size: 11px; color: var(--fg-faint); white-space: nowrap; }
+
   /* ---------- cluster peer swimlane ---------- */
   #swimPanel { border-top: 1px solid var(--border); padding: 10px 12px; }
   #swimPanel .swim-note { color: var(--fg-faint); font-style: italic; font-size: 11px; }
@@ -1417,6 +1443,7 @@
     <span class="grow"></span>
     <button class="ghostbtn" id="radarBtn" title="Next-fire radar">⌁ radar</button>
     <button class="ghostbtn" id="heatBtn" title="Activity heatmap">▦ heat</button>
+    <button class="ghostbtn" id="pressBtn" title="Schedule pressure: upcoming fire collisions">▥ pressure</button>
     <button class="ghostbtn" id="tailBtn" title="Merged multi-tail console">≋ tail</button>
     <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
@@ -1460,6 +1487,17 @@
       <span class="faint" id="heatMeta"></span>
     </div>
     <div class="heat-body" id="heatBody"></div>
+  </div>
+
+  <div class="card press" id="pressureCard" style="display:none">
+    <div class="card-label"><span>┌─ schedule pressure</span><span class="grow"></span>
+      <select class="mini" id="pressTz" title="display timezone">
+        <option value="utc">UTC</option>
+        <option value="browser">local</option>
+      </select>
+      <span class="faint" id="pressMeta"></span>
+    </div>
+    <div id="pressBody"></div>
   </div>
 
   <div class="card" id="nodeCard" style="display:none">
@@ -1837,6 +1875,9 @@
   <!-- escalation incident stamp: a static flow strip (escalationTick toggles
        it); aria-hidden because it re-renders every second -->
   <div class="wb-incident" id="wbIncident" style="display:none" aria-hidden="true"></div>
+  <!-- forward-looking schedule-pressure strip (shown when the pressure
+       panel pref is on and a /schedule/pressure payload has landed) -->
+  <div class="wb-press" id="wbPressure" style="display:none" aria-hidden="true"></div>
   <div class="wb-grid" id="wbGrid"></div>
   <div class="wb-foot" id="wbFoot"></div>
   <!-- zen all-clear screensaver: appears over an idle, healthy wallboard -->
@@ -1922,7 +1963,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (c.domStar && c.dowStar) return true;
     if (c.domStar) return dowOk;
     if (c.dowStar) return domOk;
-    return domOk || dowOk;                            // Vixie OR semantics
+    return domOk && dowOk;               // engine AND rule (cronexpr._day_matches)
   }
   // previous fire times (newest-first), not before `floor` ms, capped
   function prevFires(expr, from, count, floor) {
@@ -1944,6 +1985,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   // J(name, schedule, {p:policy, o:owner, run:seconds, mem:MiB, cpu:%, mon,
   //                     fail:profile, cap0, tz, disabled, sub, manual, cmd})
   function J(name, schedule, o) { o = o || {}; o.name = name; o.schedule = schedule; return o; }
+  function sched(j) { return j.resolved || j.schedule; }   // H jobs carry their hashed plain form
   var EN = "EveryNode", LD = "Leader", PL = "PreferLeader";
   var host = "$HOSTNAME";
   var ROSTER = [
@@ -2001,6 +2043,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     J("queue-depth-probe", "*/2 * * * *", { p: EN, cmd: 'echo "queue depth 142"  # statsd meridian.queue.depth' }),
     // second-level SLA
     J("pulse-liveness", "*/5 * * * * *", { p: EN, sub: 1, cmd: 'python3 -c "..."  # GET /status, Forbid, timeout 4' }),
+    J("spread-probe", "H * * * *", { p: EN, resolved: "9 * * * *", cmd: 'echo "spread-probe checked the metrics pipeline on ' + host + '"' }),
     J("sla-rollup", "* * * * *", { p: EN, cmd: 'echo "{\\"kind\\":\\"sla-rollup\\",\\"minute\\":\\"$(date -u +%H:%M)\\",\\"node\\":\\"' + host + '\\"}"' }),
     // housekeeping
     J("log-rotate", "*/15 * * * *", { p: LD, o: "meridian-h", cmd: 'echo "rotated and gzipped logs"' }),
@@ -2052,14 +2095,15 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     var d = { name: job.name, enabled: !job.disabled, schedule: job.schedule, command: job.cmd,
       captureStdout: !job.cap0, captureStderr: !job.cap0, utc: job.tz !== "local", timezone: job.tz && job.tz !== "local" ? job.tz : null,
       running: false, pids: [], scheduled_in: null, last_run: null, history: [] };
+    if (job.resolved) d.schedule_resolved = job.resolved;
     if (job.disabled) { d.history = []; return d; }
     if (job.p && job.p !== EN) d.clusterPolicy = job.p;
     if (job.o) d.clusterOwner = job.o;
     if (job.name === "inventory-sync") { d.concurrencyScope = "cluster"; }
 
     var floor = T0;
-    var fires = prevFires(job.schedule, now, 26, floor);      // newest-first
-    var next = nextFire(job.schedule, now);
+    var fires = prevFires(sched(job), now, 26, floor);      // newest-first
+    var next = nextFire(sched(job), now);
     if (job.manual) { d.scheduled_in = null; d.last_run = null; return d; }   // pending until triggered
 
     // currently running?  long-runners occupy the window after their last fire
@@ -2176,7 +2220,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
 
   function buildJobRuns(name) {
     var job = BYNAME[name]; if (!job) return null;
-    var now = nowMs(), fires = prevFires(job.schedule, now, 40, T0).reverse(), runs = [];
+    var now = nowMs(), fires = prevFires(sched(job), now, 40, T0).reverse(), runs = [];
     fires.forEach(function (t) { var oc = outcomeFor(job, t), du = runDur(job, t);
       var res = job.mon ? { cpu_user_seconds: +(du * 0.8).toFixed(2), cpu_system_seconds: +(du * 0.2).toFixed(2), cpu_total_seconds: +du.toFixed(2), max_rss_bytes: Math.round((job.mem || 60) * 1048576), samples: Math.max(2, Math.round(du / 2)) } : null;
       runs.push({ outcome: oc.outcome, exit_code: oc.exit_code, started_at: iso(t), finished_at: iso(t + du * 1000), duration: +du.toFixed(3), fail_reason: oc.fail_reason, resources: res }); });
@@ -2201,7 +2245,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (jd.running && jd.running_resources) { var rr = jd.running_resources, series = [], st = now - jd.running_resources.cpu_seconds / (rr.cpu_percent / 100) * 1000;
       for (var k = 0; k <= 8; k++) { var tt = k * 2; series.push([tt, +(rr.cpu_percent * (0.7 + 0.4 * hash(name + k))).toFixed(1), Math.round(rr.rss_bytes * (0.5 + 0.06 * k))]); }
       live.push({ started_at: iso(now - 10000), pid: jd.pids[0], current: { cpu_seconds: rr.cpu_seconds, cpu_percent: rr.cpu_percent, rss_bytes: rr.rss_bytes }, series: series }); }
-    var fires = prevFires(job.schedule, now, 12, T0).reverse(), runs = [];
+    var fires = prevFires(sched(job), now, 12, T0).reverse(), runs = [];
     fires.forEach(function (t) { var du = runDur(job, t), oc = outcomeFor(job, t), series = [];
       for (var k = 0; k * 2 <= du; k++) series.push([k * 2, +((job.cpu || 30) * (0.5 + 0.6 * hash(name + t + k))).toFixed(1), Math.round((job.mem || 60) * 1048576 * (0.4 + 0.5 * Math.min(1, k * 2 / du)))]);
       runs.push({ outcome: oc.outcome, exit_code: oc.exit_code, started_at: iso(t), finished_at: iso(t + du * 1000), duration: +du.toFixed(3), fail_reason: oc.fail_reason,
@@ -2436,7 +2480,115 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   function J200(body) { return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }); }
   function T200(text) { return new Response(String(text), { status: 200, headers: { "Content-Type": "text/plain" } }); }
   function E(code, msg) { return new Response(msg || "", { status: code }); }
+  function J400(msg) { return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } }); }
   function wantsJSON(opts) { var h = (opts && opts.headers) || {}; var acc = (h instanceof Headers) ? h.get("Accept") : (h.Accept || h.accept || ""); return /application\/json/.test(acc || ""); }
+
+
+  // ---- fleet schedule analyzers (mirror /schedule/*) ---------------
+  // Mirror of the daemon's _zone_from_name: a ?tz= query value as an
+  // Intl formatter (null when absent, meaning UTC); throws a flagged
+  // error for an unknown name, which the router turns into the same
+  // 400 {"error": "unknown timezone: <name>"} payload the real daemon
+  // sends for /schedule/pressure and /schedule/suggest.
+  function zoneFmt(tz) {
+    if (!tz) return null;
+    try {
+      return new Intl.DateTimeFormat("en-US", { timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit" });
+    } catch (err) {
+      var e = new Error("unknown timezone: " + tz); e.badTz = true; throw e;
+    }
+  }
+  // hour/minute labels of an instant in the requested zone (UTC when fmt
+  // is null); some ICU builds render midnight as "24" under hour12:false,
+  // hence the % 24
+  function hmIn(fmt, d) {
+    if (!fmt) return { h: d.getUTCHours(), m: d.getUTCMinutes() };
+    var h = 0, m = 0;
+    fmt.formatToParts(d).forEach(function (p) {
+      if (p.type === "hour") h = (+p.value) % 24;
+      else if (p.type === "minute") m = +p.value;
+    });
+    return { h: h, m: m };
+  }
+  function pressureGrid(fmt) {
+    var grid = [], mJobs = [], h, m;
+    for (h = 0; h < 24; h++) { var row = []; for (m = 0; m < 60; m++) row.push(0); grid.push(row); }
+    for (m = 0; m < 60; m++) mJobs.push({});
+    var jobs = 0, t0 = (Math.floor(nowMs() / 60000) + 1) * 60000;
+    ROSTER.forEach(function (job) {
+      if (job.disabled || job.schedule === "@reboot") return;
+      var c = parseCron(sched(job)); if (!c || c.reboot) return;
+      jobs++;
+      var weight = c.sub ? 12 : 1, cc = c.sub ? parseCron("* * * * *") : c;
+      for (var i = 0; i < 1440; i++) {
+        var d = new Date(t0 + i * 60000);
+        if (!matches(cc, d)) continue;
+        var hm = hmIn(fmt, d);
+        grid[hm.h][hm.m] += weight;
+        mJobs[hm.m][job.name] = 1;
+      }
+    });
+    return { grid: grid, mJobs: mJobs, jobs: jobs, t0: t0 };
+  }
+  function buildPressure(tz) {
+    var fmt = zoneFmt(tz);
+    var p = pressureGrid(fmt), grid = p.grid, m, h;
+    var bmf = [], bmj = [], byHour = [], total = 0;
+    for (m = 0; m < 60; m++) { var s = 0; for (h = 0; h < 24; h++) s += grid[h][m]; bmf.push(s); bmj.push(Object.keys(p.mJobs[m]).length); total += s; }
+    for (h = 0; h < 24; h++) { var hs = 0; for (m = 0; m < 60; m++) hs += grid[h][m]; byHour.push(hs); }
+    var busiest = 0; for (m = 1; m < 60; m++) if (bmj[m] > bmj[busiest] || (bmj[m] === bmj[busiest] && bmf[m] > bmf[busiest])) busiest = m;
+    var empty = []; for (m = 0; m < 60; m++) if (!bmf[m]) empty.push(m);
+    return { start: iso(p.t0), hours: 24, timezone: tz || "UTC", jobs: p.jobs, total_fires: total,
+             grid: grid, by_minute_fires: bmf, by_minute_jobs: bmj, by_hour: byHour,
+             busiest_minute: { minute: busiest, jobs: bmj[busiest], fires: bmf[busiest] },
+             empty_minutes: empty, top_cells: [],
+             excluded: { disabled: ROSTER.filter(function (j) { return j.disabled; }).length,
+                         reboot: ROSTER.filter(function (j) { return !j.disabled && j.schedule === "@reboot"; }).length } };
+  }
+  function buildDuplicates() {
+    var groups = {}, count = 0;
+    ROSTER.forEach(function (job) {
+      if (job.disabled || job.schedule === "@reboot") return;
+      count++;
+      var norm = (MAC[sched(job)] || sched(job)) + "|" + (job.tz || "UTC");
+      if (!groups[norm]) groups[norm] = { expr: job.schedule, names: [] };
+      groups[norm].names.push(job.name);
+    });
+    var out = [];
+    Object.keys(groups).forEach(function (key) {
+      var g = groups[key];
+      if (g.names.length < 2) return;
+      out.push({ expression: g.expr, description: "", timezone: key.split("|")[1],
+                 count: g.names.length, jobs: g.names.slice().sort() });
+    });
+    out.sort(function (a, b) { return b.count - a.count || (a.expression < b.expression ? -1 : 1); });
+    return { jobs: count, groups: out };
+  }
+  function circDist(a, b, n) { var d = Math.abs(a - b) % n; return Math.min(d, n - d); }
+  function buildSuggest(period, tz) {
+    var fmt = zoneFmt(tz);
+    var p = pressureGrid(fmt), grid = p.grid, m, h;
+    if (period === "daily") {
+      var busiest = { h: 0, m: 0, c: grid[0][0] }, best = null;
+      for (h = 0; h < 24; h++) for (m = 0; m < 60; m++) if (grid[h][m] > busiest.c) busiest = { h: h, m: m, c: grid[h][m] };
+      var bmod = busiest.h * 60 + busiest.m;
+      for (h = 0; h < 24; h++) for (m = 0; m < 60; m++) {
+        var cand = { h: h, m: m, c: grid[h][m], d: circDist(h * 60 + m, bmod, 1440) };
+        if (!best || cand.c < best.c || (cand.c === best.c && cand.d > best.d)) best = cand;
+      }
+      return { period: "daily", timezone: tz || "UTC", hour: best.h, minute: best.m,
+               expression: best.m + " " + best.h + " * * *", fires_in_window: best.c,
+               busiest: { hour: busiest.h, minute: busiest.m, fires_in_window: busiest.c },
+               alternatives: [], hash_hint: "H H * * *" };
+    }
+    var loads = []; for (m = 0; m < 60; m++) { var s = 0; for (h = 0; h < 24; h++) s += grid[h][m]; loads.push(s); }
+    var bus = 0; for (m = 1; m < 60; m++) if (loads[m] > loads[bus]) bus = m;
+    var bm = 0;
+    for (m = 1; m < 60; m++) if (loads[m] < loads[bm] || (loads[m] === loads[bm] && circDist(m, bus, 60) > circDist(bm, bus, 60))) bm = m;
+    return { period: "hourly", timezone: tz || "UTC", minute: bm, expression: bm + " * * * *",
+             fires_in_window: loads[bm], busiest: { minute: bus, fires_in_window: loads[bus] },
+             alternatives: [], hash_hint: "H * * * *" };
+  }
 
   function route(path, opts) {
     var method = (opts && opts.method || "GET").toUpperCase();
@@ -2452,6 +2604,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (url === "/node/history") return J200(buildNodeHistory());
     if (url === "/status") return wantsJSON(opts) ? J200(buildStatus()) : T200(buildStatus().map(function (r) { return r.job + ": " + r.status; }).join("\n"));
     if (url === "/jobs") return J200(buildJobs());
+    if (url === "/schedule/pressure") { try { return J200(buildPressure(qs.tz)); } catch (e) { if (e && e.badTz) return J400(e.message); throw e; } }
+    if (url === "/schedule/duplicates") return J200(buildDuplicates());
+    if (url === "/schedule/suggest") { try { return J200(buildSuggest(qs.period || "hourly", qs.tz)); } catch (e) { if (e && e.badTz) return J400(e.message); throw e; } }
     if (url === "/dags") return J200(buildDags());
     if (url === "/state") return J200(buildState());
     if (url === "/state/documents") return qs.ns ? J200(buildStateDocs(qs.ns)) : E(400, "ns required");
@@ -3403,6 +3558,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
+    press: false, pressTz: "utc",
     // node-resources history card + live resource-chart refresh cadence (ms)
     nodeCard: false, resMs: 2000,
     boot: true,   // BIOS-style boot self-test on load
@@ -3449,6 +3605,10 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     radar: { items: [], sig: null },   // next-fire radar: [{name, t, c}] sorted by instant (+ render signature)
     wallboard: false,          // TV kiosk mode active
     heat: { cache: {}, loading: false },   // activity heatmap: name -> {at, runs:[{t,o}]}
+    // schedule pressure: the daemon's /schedule/pressure + /duplicates
+    // payloads, cached with a TTL (the fleet forecast only moves by the
+    // minute, so per-poll refetching would be waste)
+    press: { data: null, dups: null, at: 0, loading: false, suggestHtml: "" },
     swim: { key: null, buf: [] },          // cluster peer swimlane ring buffer
     fleet: { data: null, failOnly: false },    // fleet view: last /fleet payload + failing-only filter
     // merged multi-tail console: tailed job names, per-job stream state,
@@ -3644,9 +3804,12 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     } catch (_) { return { type: "unknown", raw: expr }; }
   }
   function dayMatches(p, c) {
-    // standard cron OR-semantics between day-of-month and day-of-week
+    // Both restricted: BOTH must match. This dialect keeps parse-crontab's
+    // AND rule between day-of-month and day-of-week, mirroring the daemon's
+    // engine (cronexpr._day_matches), unlike standard cron's OR:
+    // '0 0 13 * 5' is Friday the 13th, not every Friday plus every 13th.
     const domR = p.dom.restricted, dowR = p.dow.restricted;
-    if (domR && dowR) return p.dom.has(c.D) || p.dow.has(c.dow);
+    if (domR && dowR) return p.dom.has(c.D) && p.dow.has(c.dow);
     if (domR) return p.dom.has(c.D);
     if (dowR) return p.dow.has(c.dow);
     return true;
@@ -3696,6 +3859,11 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (job.timezone) return job.timezone;       // IANA name (incl. "UTC")
     return job.utc ? "UTC" : "LOCAL";
   }
+  // The schedule text the CLIENT engine should parse: an H (hashed-slot)
+  // schedule ships the plain values it resolved to as schedule_resolved,
+  // since parseCron knows no H. Display keeps job.schedule (what the user
+  // wrote); computation uses this.
+  function schedOf(job) { return job.schedule_resolved || job.schedule; }
   // next N fire times as {c: components, t: instant ms}
   function nextRuns(parsed, n, frame, fromMs) {
     if (parsed.type !== "fields") return [];
@@ -3782,13 +3950,16 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       timePart = "At " + mp + " past " + hp;
     }
 
-    // day-of-month and day-of-week combine with OR when BOTH are restricted
-    // (standard cron) — reflect that in the prose with "or", not a comma.
+    // dom and dow must BOTH match when both are restricted: the client
+    // engine (dayMatches, mirroring the daemon's cronexpr._day_matches)
+    // keeps parse-crontab's AND rule ('0 0 13 * 5' is Friday the 13th),
+    // unlike standard cron's OR, so the prose must say so too; the
+    // wording mirrors the server describer (croninfo.describe_cron).
     const dayClauses = [];
     if (!everyDow) dayClauses.push("on " + listJoin(p.dow.values.map((d) => DOWN[d])));
     if (!everyDom) dayClauses.push("on the " + listJoin(p.dom.values.map((d) => ordinal(d))) + (everyDow ? " of the month" : ""));
     const clauses = [];
-    if (dayClauses.length === 2) clauses.push(dayClauses.join(" or "));
+    if (dayClauses.length === 2) clauses.push(dayClauses[1] + ", and only " + dayClauses[0]);
     else if (dayClauses.length === 1) clauses.push(dayClauses[0]);
     if (!everyMon) clauses.push("in " + listJoin(p.month.values.map((m) => MONTHS[m])));
     else if (everyDom && everyDow) clauses.push("every day");
@@ -4278,7 +4449,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     const items = [];
     for (const j of state.jobs) {
       if (!j.enabled) continue;
-      const parsed = parseCron(j.schedule);
+      const parsed = parseCron(schedOf(j));
       if (parsed.type !== "fields") continue;
       const runs = nextRuns(parsed, 1, frameOf(j), now);
       if (runs.length) items.push({ name: j.name, t: runs[0].t, c: runs[0].c });
@@ -4312,7 +4483,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       $("radarFeed").innerHTML = feed.length
         ? feed.map((x) => {
             const j = state.byName[x.name];
-            const title = fmtWall(x.c, j && parseCron(j.schedule).hasSeconds) + (j ? " · " + describeCron(j.schedule) : "");
+            const title = fmtWall(x.c, j && parseCron(schedOf(j)).hasSeconds) + (j ? " · " + describeCron(schedOf(j)) : "");
             return '<li data-job="' + escAttr(x.name) + '" title="' + escAttr(title) + '">' +
               '<span class="cd">' + fmtCountdown((x.t - now) / 1000) + "</span>" +
               '<span class="nm">' + esc(x.name) + "</span></li>";
@@ -4408,14 +4579,19 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     document.body.classList.toggle("tv", on);
     $("tvBtn").classList.toggle("on", on);
     setHashTv(on);
-    if (on) renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
+    if (on) {
+      renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
+      if (prefs.press) loadPressure(false);   // hydrate the pressure strip on entry
+    }
     else {
       // symmetric teardown: escalationTick stops running the moment the
       // wallboard is off, so anything it lit must be doused here or a
       // re-entry after recovery flashes a stale INCIDENT stamp + vignette
       // over a healthy grid until the next tick.
       $("wbGrid").innerHTML = "";
-      state.wbSig = state.wbFootSig = state.wbVerdictSig = null;
+      $("wbPressure").innerHTML = "";
+      $("wbPressure").style.display = "none";
+      state.wbSig = state.wbFootSig = state.wbVerdictSig = state.wbPressSig = null;
       $("wbVerdict").style.display = "none";
       $("wbIncident").style.display = "none";
       $("wbAlarm").style.opacity = "0";
@@ -4494,6 +4670,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       }).join("");
     }
     renderWbFoot();
+    renderWbPressure();
     // fresh paint = fresh verdict: a recovery poll clears the stale banner
     // and dimming NOW rather than up to a second later at the next tick --
     // and a rebuilt grid regains .escalate in the same frame, not a tick
@@ -4733,6 +4910,163 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   function setHeat(v) {
     prefs.heat = v; savePref("heat"); $("heatBtn").classList.toggle("on", v);
     if (v) { renderHeatmap(); loadHeatmap(true); } else $("heatCard").style.display = "none";
+  }
+
+  // ===================================================================
+  //  schedule pressure: forward-looking fleet collision heatmap
+  // ===================================================================
+  // The daemon enumerates every enabled schedule's fires over the next 24h
+  // with its own engine (/schedule/pressure), so this panel shows what WILL
+  // fire, timezone- and DST-exact, where the activity heatmap shows what
+  // DID run. Cached with a TTL: the forecast only moves by the minute.
+  const PRESS_TTL = 55 * 1000;
+  function pressTzParam() {
+    if (prefs.pressTz !== "browser") return null;   // null: server default (UTC)
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; }
+    catch (_) { return null; }
+  }
+  async function loadPressure(force) {
+    const st = state.press;
+    if (!prefs.press || st.loading) return;
+    if (!force && st.data && (performance.now() - st.at) < PRESS_TTL) { renderPressure(); return; }
+    st.loading = true;
+    try {
+      const tz = pressTzParam();
+      const q = tz ? "?tz=" + encodeURIComponent(tz) : "";
+      const [pr, dr] = await Promise.all([
+        apiFetch("/schedule/pressure" + q),
+        apiFetch("/schedule/duplicates"),
+      ]);
+      if (pr.ok) st.data = await pr.json();
+      if (dr.ok) st.dups = await dr.json();
+      st.at = performance.now();
+    } catch (e) { if (e.message === "unauthorized") return; }
+    finally { st.loading = false; }
+    renderPressure();
+    renderWbPressure();
+  }
+  function pressBars(byMinuteFires, byMinuteJobs, tall) {
+    const hmax = Math.max(1, ...byMinuteFires);
+    let bars = "";
+    for (let m = 0; m < 60; m++) {
+      const v = byMinuteFires[m] || 0;
+      const jn = byMinuteJobs ? (byMinuteJobs[m] || 0) : null;
+      const h = v ? Math.max(6, Math.round(100 * v / hmax)) : 2;
+      const tip = ":" + pad2(m) + " · " + v + " fire" + (v === 1 ? "" : "s") +
+        (jn == null ? "" : " · " + jn + " job" + (jn === 1 ? "" : "s"));
+      bars += '<i class="' + (v ? (v >= hmax * 0.7 ? "hot" : "") : "zero") +
+        '" style="height:' + h + '%" title="' + escAttr(tip) + '"></i>';
+    }
+    return '<div class="press-hist"' + (tall ? "" : ' style="height:26px"') + ">" + bars + "</div>";
+  }
+  function renderPressure() {
+    if (!prefs.press) { $("pressureCard").style.display = "none"; return; }
+    $("pressureCard").style.display = "";
+    const d = state.press.data;
+    const body = $("pressBody");
+    if (!d) {
+      body.innerHTML = '<div class="tlempty">Loading the fleet fire forecast…</div>';
+      return;
+    }
+    const grid = d.grid || [];
+    let max = 1;
+    for (const row of grid) for (const c of row) if (c > max) max = c;
+    const hot = Math.max(5, Math.ceil(max * 0.7));
+    const bm = d.busiest_minute || {};
+    const excl = d.excluded || {};
+    let html = '<div class="press-summary">' +
+      "<span><b>" + esc(d.total_fires) + "</b> fires in the next " + esc(d.hours) + "h from <b>" + esc(d.jobs) + "</b> schedules</span>" +
+      "<span>busiest minute <b>:" + pad2(bm.minute || 0) + "</b> (" + esc(bm.jobs || 0) + " jobs)</span>" +
+      "<span><b>" + esc((d.empty_minutes || []).length) + "</b> of 60 minutes empty</span>" +
+      ((excl.disabled || excl.reboot)
+        ? '<span class="faint">not counting ' +
+          [excl.disabled ? excl.disabled + " disabled" : "", excl.reboot ? excl.reboot + " @reboot" : ""].filter(Boolean).join(", ") + "</span>"
+        : "") +
+      "</div>";
+    // the 24h x 60min grid, hour rows in the selected display zone
+    html += '<div class="press-grid"><span></span><div class="press-axis">';
+    for (let m = 0; m < 60; m++) html += "<span>" + (m % 10 === 0 ? ":" + pad2(m) : "") + "</span>";
+    html += "</div>";
+    for (let h = 0; h < 24; h++) {
+      const row = grid[h] || [];
+      html += '<span class="press-hlabel">' + (h % 3 === 0 ? pad2(h) : "") + '</span><div class="press-cells">';
+      for (let m = 0; m < 60; m++) {
+        const c = row[m] || 0;
+        if (!c) { html += '<span class="press-cell"></span>'; continue; }
+        const op = (0.3 + 0.7 * (c / max)).toFixed(2);
+        html += '<span class="press-cell ' + (c >= hot ? "hot" : "p") + '" style="opacity:' + op +
+          '" title="' + escAttr(pad2(h) + ":" + pad2(m) + " · " + c + " fire" + (c === 1 ? "" : "s")) + '"></span>';
+      }
+      html += "</div>";
+    }
+    html += "</div>";
+    html += '<div class="card-label" style="padding-left:0;border:0">fires by minute of hour · whole window</div>';
+    html += pressBars(d.by_minute_fires || [], d.by_minute_jobs || [], true);
+    // duplicate schedules (semantic grouping, from the daemon's own engine)
+    const dups = state.press.dups;
+    if (dups && dups.groups && dups.groups.length) {
+      const groups = dups.groups;
+      html += '<div class="press-sect"><div class="card-label" style="padding-left:0;border:0">duplicate schedules · ' +
+        groups.length + " group" + (groups.length === 1 ? "" : "s") + "</div>";
+      for (const g of groups.slice(0, 6)) {
+        html += '<div class="press-dup"><span class="chip" title="' + escAttr(g.description || "") + '">' + esc(g.expression) + "</span>" +
+          '<span class="faint">× ' + esc(g.count) + (g.timezone && g.timezone !== "UTC" ? " · " + esc(g.timezone) : "") + "</span>" +
+          g.jobs.slice(0, 6).map((n) => '<span class="chip" data-job="' + escAttr(n) + '">' + esc(n) + "</span>").join("") +
+          (g.jobs.length > 6 ? '<span class="faint">+' + (g.jobs.length - 6) + " more</span>" : "") +
+          "</div>";
+      }
+      if (groups.length > 6) html += '<div class="faint">… ' + (groups.length - 6) + " more group(s)</div>";
+      html += "</div>";
+    } else if (dups) {
+      html += '<div class="press-sect faint">no duplicate schedules: every enabled job fires on its own set of instants</div>';
+    }
+    html += '<div class="press-suggest">' +
+      '<button class="ghostbtn mini" data-suggest="hourly">◴ suggest an hourly slot</button>' +
+      '<button class="ghostbtn mini" data-suggest="daily">◴ suggest a daily slot</button>' +
+      '<span class="out" id="pressSuggestOut">' + (state.press.suggestHtml || "") + "</span></div>";
+    body.innerHTML = html;
+    $("pressMeta").textContent = "next " + (d.hours || 24) + "h · " + (d.timezone || "UTC");
+  }
+  async function suggestSlot(period) {
+    const tz = pressTzParam();
+    const q = "?period=" + encodeURIComponent(period) + (tz ? "&tz=" + encodeURIComponent(tz) : "");
+    let s;
+    try {
+      const r = await apiFetch("/schedule/suggest" + q);
+      if (!r.ok) return;
+      s = await r.json();
+    } catch (_) { return; }
+    state.press.suggestHtml =
+      "least loaded " + esc(s.period) + ': <span class="chip" data-expr="' + escAttr(s.expression) + '" title="click to copy">' + esc(s.expression) + "</span> " +
+      '<span class="faint">(' + esc(s.fires_in_window) + " fires there now; or let each job spread itself: " +
+      '</span><span class="chip" data-expr="' + escAttr(s.hash_hint) + '" title="H hashes the job name to a stable slot · click to copy">' + esc(s.hash_hint) + '</span><span class="faint">)</span>';
+    const out = $("pressSuggestOut");
+    if (out) out.innerHTML = state.press.suggestHtml;
+  }
+  function setPressure(v) {
+    prefs.press = v; savePref("press"); $("pressBtn").classList.toggle("on", v);
+    if (v) { renderPressure(); loadPressure(true); }
+    else { $("pressureCard").style.display = "none"; renderWbPressure(); }
+  }
+  // compact wallboard strip: the 60-bin minute histogram + the headline
+  function renderWbPressure() {
+    const el = $("wbPressure");
+    if (!el) return;
+    const d = prefs.press ? state.press.data : null;
+    if (!state.wallboard || !d) {
+      el.style.display = "none"; el.innerHTML = ""; state.wbPressSig = null;
+      return;
+    }
+    const bmf = d.by_minute_fires || [];
+    const bm = d.busiest_minute || {};
+    const sig = bmf.join(",") + "|" + (bm.minute || 0);
+    if (sig !== state.wbPressSig) {
+      state.wbPressSig = sig;
+      el.innerHTML = '<span class="lbl">24h pressure</span>' +
+        pressBars(bmf, d.by_minute_jobs || [], false) +
+        '<span class="lbl">busiest :' + pad2(bm.minute || 0) + " · " + esc(bm.jobs || 0) + " jobs</span>";
+    }
+    el.style.display = "";
   }
 
   // ===================================================================
@@ -5628,15 +5962,17 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (!job) { box.innerHTML = ""; return; }
     const frame = frameOf(job);
     const frameLabel = frame === "LOCAL" ? "your local time (server local — approximate)" : frame;
-    const parsed = parseCron(job.schedule);
+    const parsed = parseCron(schedOf(job));
     const runs = parsed.type === "fields" ? nextRuns(parsed, 6, frame, Date.now()) : [];
     // a field schedule that yields no upcoming runs is an impossible date
     // (e.g. "31 of February") — say so instead of a confident-but-wrong prose.
     const impossible = parsed.type === "fields" && !runs.length;
-    const desc = impossible ? "This schedule can never occur (impossible date)." : describeCron(job.schedule);
+    const desc = impossible ? "This schedule can never occur (impossible date)." : describeCron(schedOf(job));
     let html =
       '<p class="sched-desc">' + esc(desc) + "</p>" +
-      '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + '</span> · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b></div>";
+      '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + "</span>" +
+      (job.schedule_resolved ? ' <span class="faint">(H resolves to</span> <span class="chip">' + esc(job.schedule_resolved) + '</span><span class="faint">)</span>' : "") +
+      ' · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b></div>";
 
     // foot-gun advisories: self-overlap, thundering-herd collisions, DST
     const warns = scheduleWarnings(job);
@@ -6196,6 +6532,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
       { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
+      { ic: "▥", lbl: "Toggle schedule pressure", sub: "upcoming fire collisions + duplicates", run: () => setPressure(!prefs.press) },
       { ic: "⊞", lbl: "Toggle fleet view", sub: "every node's runs", run: () => setFleet(!prefs.fleet) },
       { ic: "≋", lbl: "Multi-tail console", run: () => openTail([]) },
       { ic: "≋", lbl: "Multi-tail: failing jobs", run: () => tailPreset("fail") },
@@ -7521,6 +7858,20 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
     $("heatBtn").addEventListener("click", () => setHeat(!prefs.heat));
+    $("pressBtn").addEventListener("click", () => setPressure(!prefs.press));
+    $("pressTz").addEventListener("change", (e) => {
+      prefs.pressTz = e.target.value; savePref("pressTz");
+      state.press.suggestHtml = "";        // computed in the old zone
+      loadPressure(true);
+    });
+    $("pressBody").addEventListener("click", (e) => {
+      const sug = e.target.closest("[data-suggest]");
+      if (sug) { suggestSlot(sug.getAttribute("data-suggest")); return; }
+      const ex = e.target.closest("[data-expr]");
+      if (ex) { copyText(ex.getAttribute("data-expr"), "schedule"); return; }
+      const it = e.target.closest("[data-job]");
+      if (it) openDrawer(it.getAttribute("data-job"), "schedule");
+    });
     $("nodeMeter").addEventListener("click", () => setNodeCard(!prefs.nodeCard));
     $("tailBtn").addEventListener("click", () => { if (state.tail.open) closeTail(); else openTail([]); });
     $("tvBtn").addEventListener("click", () => setWallboard(!state.wallboard));
@@ -8487,6 +8838,34 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     return '<div class="sbx-uses"><span class="faint">recent:</span><div class="sbx-recent">' +
       list.map((x) => '<span class="chip" data-expr="' + escAttr(x) + '">' + esc(x) + "</span>").join("") + "</div></div>";
   }
+  // True only when the expression is valid APART from its H items: H is
+  // opaque to parseCron, so substitute each H item with the plain form it
+  // resolves into (H -> *, H/n -> */n, H(a-b) -> a-b, H(a-b)/n -> a-b/n)
+  // and require the rebuilt expression to parse. A backwards H(a-b) range
+  // or an H in the year column (the trailing field of the 6-/7-field
+  // forms) is invalid, the daemon's engine rejects both, so those fall
+  // through to the normal invalid-expression error instead of the
+  // reassuring H info message.
+  function sbxLooksHashed(expr) {
+    const fields = expr.split(/\s+/);
+    if (fields.length < 5 || fields.length > 7) return false;
+    const yearIdx = fields.length === 5 ? -1 : fields.length - 1;
+    let sawH = false;
+    const rebuilt = [];
+    for (let i = 0; i < fields.length; i++) {
+      const items = [];
+      for (const item of fields[i].split(",")) {
+        const m = item.match(/^[hH](?:\((\d+)-(\d+)\))?(?:\/(\d+))?$/);
+        if (!m) { items.push(item); continue; }
+        sawH = true;
+        if (i === yearIdx) return false;
+        if (m[1] != null && +m[1] > +m[2]) return false;
+        items.push((m[1] != null ? m[1] + "-" + m[2] : "*") + (m[3] != null ? "/" + m[3] : ""));
+      }
+      rebuilt.push(items.join(","));
+    }
+    return sawH && parseCron(rebuilt.join(" ")).type === "fields";
+  }
   function renderSandbox() {
     const expr = $("sbxInput").value.trim();
     const frame = $("sbxFrame").value || "UTC";
@@ -8497,7 +8876,10 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (parsed.type === "reboot") {
       html += '<p class="sbx-desc">Runs once, when cronstable starts (@reboot).</p>';
     } else if (parsed.type !== "fields") {
-      html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';
+      if (sbxLooksHashed(expr))
+        html += '<p class="sbx-desc">An <b>H</b> slot is a stable hash of the job name, so it resolves per job, not in this sandbox. Open a job\'s <b>schedule</b> tab to see the values its H resolved to.</p>';
+      else
+        html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';
     } else {
       const runs = nextRuns(parsed, 12, frame, Date.now());
       const impossible = !runs.length;
@@ -8558,7 +8940,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     for (const j of state.jobs) {
       if (j.name === job.name || !j.enabled) continue;
       if (scanned++ > 200) break;                 // hard cap on the fan-out
-      const p = parseCron(j.schedule);
+      const p = parseCron(schedOf(j));
       if (p.type !== "fields") continue;
       const r = nextRuns(p, 1, frameOf(j), Date.now());
       if (r.length && minuteOf(r[0].t) === target) others.push(j.name);
@@ -8588,7 +8970,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     return null;
   }
   function scheduleWarnings(job) {
-    const parsed = parseCron(job.schedule);
+    const parsed = parseCron(schedOf(job));
     if (parsed.type !== "fields") return [];
     const frame = frameOf(job);
     const out = [];
@@ -8920,11 +9302,14 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   // reflect persisted add-on-panel prefs onto their toggles + initial render
   $("radarBtn").classList.toggle("on", prefs.radar);
   $("heatBtn").classList.toggle("on", prefs.heat);
+  $("pressBtn").classList.toggle("on", prefs.press);
+  $("pressTz").value = prefs.pressTz;
   $("dagsBtn").classList.toggle("on", prefs.dags);
   $("stateBtn").classList.toggle("on", prefs.stateInsp);
   $("heatWindow").value = prefs.heatWindow;
   if (prefs.radar) renderRadar();
   if (prefs.heat) { renderHeatmap(); loadHeatmap(true); }
+  if (prefs.press) { renderPressure(); loadPressure(true); }
   if (prefs.nodeCard) setNodeCard(true);
   // opt-in run ledger: hydrate the in-memory mirror from IndexedDB before the
   // first poll so anomaly baselines + the History note are ready immediately.
@@ -8953,6 +9338,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   setInterval(tick, 1000);
   setInterval(alarmTick, 1000);                               // adaptive failure alarm (self-gates its cadence)
   setInterval(() => { if (prefs.heat) loadHeatmap(false); }, 60000);  // slow heatmap refresh
+  setInterval(() => { if (prefs.press) loadPressure(false); }, 60000); // pressure forecast refresh
   tick();
   if (prefs.boot && !reduceMotion() && bootDue()) {
     runBootSequence(startApp);          // POST screen types out, then starts the app

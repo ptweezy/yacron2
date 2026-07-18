@@ -59,7 +59,7 @@ When the job stops (normal exit, timeout, or cancellation), cronstable computes 
 - `<prefix>.success:<1|0>|g`: gauge. `1` if the job did **not** fail, `0` if it failed. The value comes from `0 if job.failed else 1`, where `job.failed` is the [failure-detection](Failure-Detection-and-Retries) result (`failsWhen`). A nonzero exit code, output on a watched stream, or `failsWhen: always` therefore reports `success:0`.
 - `<prefix>.duration:<ms>|ms|@0.1`: timer (`|ms`) with a sample rate suffix of `@0.1`. The numeric value is the integer wall-clock duration in milliseconds, measured with `perf_counter` between start and stop. The `@0.1` sample-rate flag is sent literally on every datagram; cronstable does not actually sample (it sends one duration per run), so the flag instructs the statsd server to scale the metric accordingly. Configure your statsd/dashboards to account for this.
 
-When the job has [`monitorResources`](Configuration-Reference#metrics) on, the same stop datagram also carries the run's resource accounting:
+When the job has [`monitorResources`](Configuration-Reference#metrics) on (see [resource monitoring](Resource-Monitoring)), the same stop datagram also carries the run's resource accounting:
 
 ```text
 <prefix>.cpu:<ms>|ms|@0.1
@@ -109,6 +109,7 @@ This matters for `concurrencyPolicy: Replace`, where the scheduler may cancel a 
 ## See also
 
 - [Metrics with Prometheus](Metrics-with-Prometheus): the pull-side sibling; a scrapeable `/metrics` endpoint on the web API.
+- [Resource Monitoring](Resource-Monitoring): the `monitorResources` sampling behind the `cpu` / `max_rss` lines.
 - [Configuration Reference](Configuration-Reference): full per-job option list.
 - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting): the other outbound notification channels.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): how `job.failed` (and thus `success:0`/`success:1`) is determined.

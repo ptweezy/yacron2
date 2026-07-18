@@ -16,9 +16,11 @@
 - **Job Behavior**
   - [Concurrency and Timeouts](Concurrency-and-Timeouts)
   - [Failure Detection and Retries](Failure-Detection-and-Retries)
+  - [Resource Monitoring](Resource-Monitoring)
   - [Durable State](Durable-State)
   - [Orchestration and DAGs](Orchestration-and-DAGs)
   - [Clustering and Leader Election](Clustering-and-Leader-Election)
+  - [Job-Set ID](Job-Set-ID)
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
   - [Metrics with Prometheus](Metrics-with-Prometheus)
@@ -26,8 +28,10 @@
   - [HTTP Control API](HTTP-API)
   - [Web Dashboard](Web-Dashboard)
   - [Terminal Dashboard](Terminal-Dashboard)
+  - [MCP Server (Model Context Protocol)](MCP)
 - **Reference and Development**
   - [Architecture and Internals](Architecture-and-Internals)
+  - [MCP Server Design](MCP-Server-Design)
   - [Contributing and Releasing](Contributing-and-Releasing)
   - [Migration from yacron](Migration-from-yacron)
   - [Troubleshooting and FAQ](Troubleshooting)

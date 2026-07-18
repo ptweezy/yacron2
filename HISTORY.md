@@ -5,6 +5,164 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.21 (2026-07-18)
+
+The in-house cron engine grows a safety net and a toolbox.  A schedule that
+can never fire again (a fixed past year, `0 0 30 2 *`) used to vanish
+silently: it simply never entered the fire index.  Now it is loud everywhere:
+config load logs a `never-fires` warning, the scheduler warns once when it
+drops the job, `/status` and `/jobs` report `never_fires`, and the dashboards
+badge it.  It stays a warning rather than an error on purpose (a past year is
+also the working idiom for parking a job).
+
+### The schedule linter
+
+- **Advisory findings for legal-but-suspect schedules**, computed by the new
+  shared `cronstable/croninfo.py` and reported identically by config-load
+  logging, `GET /jobs` (`schedule_findings`), the TUI cron sandbox, and the
+  TUI job drawer's schedule tab (which renders the daemon-computed findings
+  straight from the payload): `never-fires`, whose message tells an
+  exhausted year column apart from a date that never exists;
+  `day-fields-both-restricted` (this dialect's AND rule vs. Vixie's OR, the
+  classic crontab-import surprise); `uneven-step` (`*/7` minutes fires at
+  :56 then :00 four minutes later); `skipped-months` (day 31 never occurs in
+  April); `leap-day-only`; and DST notes (`dst-skipped-time`,
+  `dst-repeated-time`) with the actual transition dates, computed in the
+  job's own timezone.
+
+### One engine behind every preview
+
+- **`GET /schedule/preview`** parses, describes, previews and lints any
+  expression with the daemon's own engine, so tooling can ask the daemon
+  itself instead of re-implementing cron.  `describe_cron`/`next_fires`
+  moved from the TUI into `cronstable/croninfo.py` (the TUI re-exports
+  them), so the terminal sandboxes compute with literally the scheduler's
+  code.  The web page's client-side preview stays a convenience, but it
+  now applies the engine's AND day rule when day-of-month and day-of-week
+  are both restricted (it used to preview Vixie's OR: fire days the
+  daemon would never run) and phrases its description the way the daemon
+  does.
+
+### Engine additions (`cronstable/cronexpr.py`)
+
+- **`CronTab.prev()`**: the backward mirror of `next()`: seconds since the
+  most recent occurrence strictly before now, for missed-run and late-run
+  reasoning without replaying the schedule forward.  Both `prev()` and the
+  timezone-aware `next()` resolve DST edges through real instants (the
+  `occurrences()` policy below), so neither reports a negative delay
+  across a spring-forward gap nor mishandles the second leg of a
+  fall-back hour.  The naive golden vectors against the replaced
+  parse-crontab library still pass byte-for-byte; the aware DST-edge
+  vectors are deliberately corrected, because the legacy library answers
+  those with civil arithmetic (in the worst case, a negative delay).
+- **`CronTab.occurrences()`**: iterate the exact instants the scheduler
+  would fire.  Steps through real instants across DST: a spring-forward
+  wall time is yielded once at its shifted label, a fall-back repeat fires
+  its first occurrence only.  `next_fires` previews now ride this iterator.
+- **Read-only field-set properties** (`minutes`, `hours`, `days_of_month`,
+  `last_day_of_month`, `months`, `days_of_week`, `last_days_of_week`,
+  `years`, `seconds`), so tooling works from the engine's ground truth
+  instead of re-parsing expression text.
+- **`?` accepted** standing alone in the day fields (the Quartz spelling of
+  "unrestricted"; a 7-field Quartz expression now parses verbatim), and
+  parse errors that smell of Quartz (`#`, `W`, the seconds-first 6-field
+  layout) carry a hint naming the dialect and how to convert.
+
+### Hashed schedules: `H * * * *`
+
+- **Jenkins-style `H` fields** (`H`, `H(a-b)`, `H/n`, `H(a-b)/n`, any field
+  but the year) hash the job's name to a stable slot, killing the `:00`
+  thundering herd without random jitter, which would break the "was this
+  run late?" question a monitoring product must keep answerable.  The hash
+  is a per-field-salted SHA-256 of the job name: identical across
+  restarts, reloads, replicas and versions (the concrete slots are pinned
+  by tests), so `H H * * *` picks an uncorrelated minute and hour, and a
+  job's bare `H` minute agrees with its `H/15` phase.  In day-of-month,
+  every rangeless `H` form (bare `H` and `H/n` alike) hashes over 1 to
+  28, never skipping short months; `H(1-31)` opts back in.  Renaming a
+  job re-hashes its slots.  Resolution happens at parse time, so
+  matching, the next-fire search and semantic equality see plain values;
+  the linter attaches a `hashed-slot` note naming the resolved
+  expression, `GET /jobs` serves it as `schedule_resolved`, and
+  `GET /schedule/preview` grew a `seed` parameter so sandboxes can
+  resolve prospective `H` schedules.  Classic crontab files accept `H`
+  lines too (seeded by their line-derived names).  Both sandboxes know
+  the form: the web page explains a valid `H` schedule while still
+  flagging an invalid one, the TUI does the same instead of claiming the
+  daemon would reject it, and the TUI job drawer analyzes the resolved
+  spelling from the payload, so an `H` job gets the same description,
+  preview and lint as any other.
+
+### Fleet-level schedule analysis
+
+- **`GET /schedule/pressure`**, the collision heatmap: every enabled
+  schedule's fires over the next 24h (up to 168h), enumerated with the
+  scheduler's own engine (timezone- and DST-exact, sub-minute schedules
+  weighted, DAG schedules included) and bucketed into an hour-by-minute
+  grid with per-minute histograms, the busiest-minute headline, the empty
+  minutes, and the heaviest cells with their jobs.  Disabled and @reboot
+  jobs are excluded and counted.  The walk runs on a worker thread over
+  an immutable snapshot, so a big fleet's enumeration cannot stall the
+  scheduler loop.
+- **`GET /schedule/duplicates`**: groups of jobs whose schedules fire on
+  the identical instants, by the engine's own semantic equality (`*/5`
+  equals `0-59/5`, `@hourly` equals `0 * * * *`) and the resolved
+  timezone, so two midnight jobs in different zones are not called
+  duplicates.
+- **`GET /schedule/suggest`**: the least-loaded minute (`period=hourly`)
+  or minute and hour (`period=daily`) for a new job, scored on the same
+  24h fire walk, deterministic ties breaking circularly away from the
+  busiest slot (an idle fleet is told `:30`, not `:00`), with runners-up
+  and the `H` spelling that keeps future jobs spreading themselves.
+- **The web dashboard** grew a schedule-pressure card (grid heatmap,
+  minute histogram, duplicate groups as clickable chips, suggest-a-slot
+  buttons, UTC/local display toggle) plus a compact pressure strip on the
+  wallboard; the job drawer shows what an `H` schedule resolved to, and
+  every client-side preview computes from the resolved form.  **The TUI**
+  has the same panel as an overlay, computed on a worker thread from its
+  `/jobs` and `/dags` snapshots with the identical shared analyzers (one
+  fire walk feeds the heatmap and both suggestions), so it works against
+  older daemons.  **Three read-only MCP tools** (`cron_schedule_pressure`,
+  `cron_schedule_duplicates`, `cron_suggest_slot`) serve the same
+  payloads to agents.
+
+### Schedule authoring and debugging for agents
+
+- **`GET /schedule/why`** answers "why didn't this job run at 09:00?"
+  from ground truth: given a job and a timestamp, the new
+  `croninfo.why_no_run` decomposes the engine's own match test field by
+  field ("minute matched; day-of-week Tuesday is not in Monday and
+  Friday"), renders each field's accepted values in prose (ranges
+  collapse, weekday and month names, the `L` forms spelled out), and
+  brackets the probe with the nearest real fire on each side.  Notes
+  call out the two semantics that make a miss genuinely confusing: the
+  dialect's day-field AND rule (when exactly one restricted day field
+  matched, classic Vixie cron would have fired) and DST transitions (a
+  skipped wall time fired at its shifted label instead; a repeated one
+  fired once).  Aware timestamps convert into the job's own timezone,
+  naive ones read as wall time there; `@reboot` and disabled jobs
+  answer honestly, and a DAG's `dag:<name>` schedule job resolves too.
+- **Three more read-only MCP tools** make an agent a schedule author,
+  not just a reader: `cron_validate_schedule` (parse and lint an
+  expression before it becomes a job: the engine's exact error with its
+  Quartz dialect hints, advisory lint findings, the first upcoming
+  fire, and prospective `H` resolution via `seed`),
+  `cron_explain_schedule` (plain-English description plus the next N
+  fires in a chosen zone plus lint, for round-tripping a proposed
+  schedule to a human before it ships), and `cron_why_no_run` (the
+  explainer above, with a one-line verdict that points at
+  `cron_list_runs` when the schedule DID select the instant).  All
+  three ride the `observe` toolset; the server's `initialize`
+  instructions steer agents to validate before proposing.
+
+### Packaging
+
+- **winget**: `winget install ptweezy.cronstable` installs the self-contained
+  Windows release binary (`amd64` or `arm64`), no Python required. A new
+  `winget` release job updates the manifest in `microsoft/winget-pkgs`
+  automatically on every release, the same way the existing `homebrew` job
+  keeps the Homebrew tap current.
+
 ## 1.2.20 (2026-07-17)
 
 This release gives the web dashboard a **terminal twin**: `cronstable tui`

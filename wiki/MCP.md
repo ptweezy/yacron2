@@ -62,7 +62,7 @@ default) strips every mutating tool regardless of toolset.
 
 | Toolset | Tools |
 | --- | --- |
-| `observe` (read) | `cron_get_status`, `cron_list_jobs`, `cron_get_job`, `cron_list_runs`, `cron_get_job_trends`, `cron_get_job_resources`, `cron_get_cluster`, `cron_get_fleet`, `cron_get_node`, `cron_query_metrics`, `cron_get_version`, `cron_tail_job_logs` |
+| `observe` (read) | `cron_get_status`, `cron_list_jobs`, `cron_get_job`, `cron_list_runs`, `cron_get_job_trends`, `cron_get_job_resources`, `cron_get_cluster`, `cron_get_fleet`, `cron_get_node`, `cron_query_metrics`, `cron_get_version`, `cron_tail_job_logs`, `cron_schedule_pressure`, `cron_schedule_duplicates`, `cron_suggest_slot`, `cron_validate_schedule`, `cron_explain_schedule`, `cron_why_no_run` |
 | `dags` (read) | `cron_list_dags`, `cron_list_dag_runs`, `cron_get_dag_run`, `cron_get_dag_xcom`, `cron_tail_dag_task_logs` |
 | `state` (read) | `cron_inspect_state` (store overview / a namespace's documents / a stream's records; KV values and secrets redacted) |
 | `act` (**mutating**) | `cron_run_job`, `cron_cancel_job` |
@@ -72,6 +72,18 @@ Mutating tools require an explicit `confirm: true` argument, carry honest
 `destructiveHint` annotations, and re-check the same authorization as the REST
 API. `cron_backfill_dag` defaults to `dry_run: true`. It previews the range
 and only executes on `dry_run: false` **and** `confirm: true`.
+
+The three schedule-authoring tools make an agent a competent schedule
+**author**, not just a reader, with the daemon's own engine as the
+authority: `cron_validate_schedule` parses and lints any expression
+before it becomes a job (the engine's exact error with its Quartz
+dialect hints, [lint findings](Schedule-Linting), the first upcoming
+fire, and prospective [`H` slot](Hashed-Schedules) resolution via
+`seed`), `cron_explain_schedule` adds the next N fires in a chosen zone
+so the agent can round-trip a plain-English description of a proposed
+schedule to you before it ships, and `cron_why_no_run` explains field by
+field why a job's schedule did or did not fire at a timestamp (see
+[Why Didn't It Run?](Why-No-Run)).
 
 ### Resources (read-only context)
 
@@ -86,14 +98,19 @@ uneven. Resources are an optimization, never the only path.
 
 ### Prompts (canned triage playbooks)
 
-Enabled by default (`prompts: true`). Slash-command workflows that chain the
-read tools:
+Enabled by default (`prompts: true`), and scoped by the same toolsets as
+resources. Slash-command workflows that chain the read tools:
 
 - `triage_job_failure(job)`: root-cause a failing job
-- `why_did_dag_run_fail(dag, run_key)`: walk a failed DAG run
+- `why_did_dag_run_fail(dag, run_key)`: walk a failed DAG run (needs the
+  `dags` toolset)
 - `blast_radius(target)`: scope what else is at risk
 - `fleet_health_summary()`: a wallboard-style digest
 - `backfill_plan(dag, from, to)`: reason about a backfill before running it
+  (needs the `dags` toolset)
+
+With the default `toolsets: [observe]`, only the three `observe` prompts are
+served.
 
 ## Wiring a client to it
 
@@ -140,12 +157,17 @@ ops tool. Flags:
 - `--url` (default `http://127.0.0.1:8080`): the daemon's web base URL
 - `--token` / `--token-env`: the bearer token (defaults to the
   `CRONSTABLE_WEB_TOKEN` env var if set)
+- `--protocol-version`: pin the `MCP-Protocol-Version` header the bridge
+  sends before `initialize` completes (default `2025-11-25`); once
+  `initialize` returns, the bridge adopts the server's negotiated version
+- `--timeout` (default `30.0`): per-request deadline, in seconds, for each
+  forwarded frame
 - `--check`: handshake the endpoint (`initialize` + `tools/list`) and exit,
   a quick "is it wired up?" test
 
 ```shell
 $ cronstable mcp --url http://127.0.0.1:8080 --token-env CRONSTABLE_WEB_TOKEN --check
-mcp check: ok - protocol 2025-11-25, 23 tool(s) at http://127.0.0.1:8080/mcp
+mcp check: ok - protocol 2025-11-25, 29 tool(s) at http://127.0.0.1:8080/mcp
 ```
 
 ## Security
@@ -190,6 +212,8 @@ CRONSTABLE_WEB_TOKEN=dev-token \
 - [`mcp` configuration reference](Configuration-Reference#mcp): every field.
 - [HTTP Control API](HTTP-API): the REST endpoints the tools project, and the
   `POST /mcp` entry.
+- [MCP Server Design](MCP-Server-Design): the design document this server was
+  built from, with notes on where the implementation diverged.
 - The [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25)
   and the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector)
   for debugging a server.

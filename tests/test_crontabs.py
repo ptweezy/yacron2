@@ -323,3 +323,14 @@ def test_yaml_can_include_a_crontab(tmp_path):
         "legacy.crontab:1",
         "native",
     ]
+
+
+def test_h_schedules_parse_with_the_line_derived_name(tmp_path):
+    # the classic loader validates each line with its would-be job name as
+    # the hash key, so H entries load; and the sniffer accepts H lines too
+    jobs = crontabs.parse_crontab(
+        "H * * * * /usr/local/bin/spread-me\n", "legacy.crontab"
+    )
+    assert jobs[0]["name"] == "legacy.crontab:1"
+    assert jobs[0]["schedule"] == "H * * * *"
+    assert crontabs.looks_like_crontab("H 4 * * * /bin/backup") is True

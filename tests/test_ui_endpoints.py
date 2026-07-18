@@ -429,3 +429,344 @@ async def test_web_node_history_endpoint():
         assert all(len(p) == 3 for p in body["points"])
     finally:
         await cron._node_sampler.stop_history()
+
+
+# ---------------------------------------------------------------------------
+# dead-schedule surfacing: never_fires + schedule_findings
+# ---------------------------------------------------------------------------
+
+_DEAD_JOB = """
+jobs:
+  - name: parked
+    command: echo hi
+    schedule: "0 0 1 1 * 2020"
+  - name: live
+    command: echo hi
+    schedule: "*/5 * * * *"
+  - name: footgun
+    command: echo hi
+    schedule: "0 0 13 * 5"
+"""
+
+
+def test_job_to_dict_never_fires_and_findings():
+    cron = _cron(_DEAD_JOB)
+    dead = cron._job_to_dict("parked", cron.cron_jobs["parked"])
+    assert dead["never_fires"] is True
+    assert [f["code"] for f in dead["schedule_findings"]] == ["never-fires"]
+    live = cron._job_to_dict("live", cron.cron_jobs["live"])
+    assert live["never_fires"] is False
+    assert live["schedule_findings"] == []
+    # advisory findings ride along for live-but-suspect schedules too
+    footgun = cron._job_to_dict("footgun", cron.cron_jobs["footgun"])
+    assert footgun["never_fires"] is False
+    codes = [f["code"] for f in footgun["schedule_findings"]]
+    assert codes == ["day-fields-both-restricted"]
+    # and the payload is JSON-serializable end to end
+    json.dumps(footgun["schedule_findings"])
+
+
+def test_status_payload_marks_dead_schedules():
+    cron = _cron(_DEAD_JOB)
+    rows = {row["job"]: row for row in cron.status_payload()}
+    assert rows["parked"]["status"] == "scheduled"
+    assert rows["parked"]["scheduled_in"] is None
+    assert rows["parked"]["never_fires"] is True
+    assert "never_fires" not in rows["live"]
+    assert rows["live"]["scheduled_in"] > 0
+
+
+def test_status_payload_running_dead_schedule_keeps_never_fires():
+    # /status and /jobs must agree: a RUNNING job whose schedule has no
+    # future occurrence keeps its never_fires flag (the two surfaces used
+    # to drift for exactly this case).
+    class _Run:
+        proc = None
+
+    cron = _cron(_DEAD_JOB)
+    cron.running_jobs["parked"] = [_Run()]
+    cron.running_jobs["live"] = [_Run()]
+    rows = {row["job"]: row for row in cron.status_payload()}
+    assert rows["parked"]["status"] == "running"
+    assert rows["parked"]["never_fires"] is True
+    assert rows["live"]["status"] == "running"
+    assert "never_fires" not in rows["live"]
+
+
+async def test_web_status_text_says_never_fires():
+    cron = _cron(_DEAD_JOB)
+    resp = await cron._web_get_status(Req())
+    lines = resp.text.splitlines()
+    parked = next(line for line in lines if line.startswith("parked:"))
+    assert "never fires" in parked
+
+
+def test_dead_schedule_never_enters_the_fire_index_but_warns(caplog):
+    import logging as _logging
+
+    cron = _cron(_DEAD_JOB)
+    now = datetime.datetime.now(_UTC)
+    with caplog.at_level(_logging.WARNING, logger="cronstable"):
+        cron._ensure_seeded(now)
+        cron._ensure_seeded(now)  # the warning latches: once, not per pass
+    assert "parked" not in cron._next_fire
+    assert "live" in cron._next_fire
+    warned = [
+        rec
+        for rec in caplog.records
+        if "NEVER fire" in rec.getMessage() and "'parked'" in rec.getMessage()
+    ]
+    assert len(warned) == 1
+
+
+# ---------------------------------------------------------------------------
+# GET /schedule/preview: the sandboxes' single source of truth
+# ---------------------------------------------------------------------------
+
+
+async def test_schedule_preview_valid_expression():
+    cron = _cron(_RETRY_JOB)
+    resp = await cron._web_schedule_preview(
+        Req(query={"expr": "*/15 * * * *", "count": "3"})
+    )
+    body = json.loads(resp.text)
+    assert body["valid"] is True
+    assert body["normalized"] == "*/15 * * * *"
+    assert body["description"] == "Every 15 minutes, every day"
+    assert body["timezone"] == "UTC"
+    assert len(body["fires"]) == 3
+    assert body["never_fires"] is False
+    assert body["lint"] == []
+    # ISO instants, parseable and strictly increasing
+    fires = [datetime.datetime.fromisoformat(f) for f in body["fires"]]
+    assert fires == sorted(fires)
+
+
+async def test_schedule_preview_lint_and_never_fires():
+    cron = _cron(_RETRY_JOB)
+    resp = await cron._web_schedule_preview(
+        Req(query={"expr": "0 0 30 2 *"})
+    )
+    body = json.loads(resp.text)
+    assert body["valid"] is True
+    assert body["fires"] == []
+    assert body["never_fires"] is True
+    assert [f["code"] for f in body["lint"]] == ["never-fires"]
+
+
+async def test_schedule_preview_timezone_carries_dst_notes():
+    cron = _cron(_RETRY_JOB)
+    resp = await cron._web_schedule_preview(
+        Req(query={"expr": "30 2 * * *", "tz": "America/New_York"})
+    )
+    body = json.loads(resp.text)
+    assert body["timezone"] == "America/New_York"
+    assert "dst-skipped-time" in [f["code"] for f in body["lint"]]
+    # fires come back in the requested frame
+    first = datetime.datetime.fromisoformat(body["fires"][0])
+    assert first.utcoffset() != datetime.timedelta(0)
+
+
+async def test_schedule_preview_invalid_expression_and_reboot():
+    cron = _cron(_RETRY_JOB)
+    body = json.loads(
+        (
+            await cron._web_schedule_preview(
+                Req(query={"expr": "0 */5 * * * ?"})
+            )
+        ).text
+    )
+    assert body["valid"] is False
+    assert "Quartz" in body["error"]
+    body = json.loads(
+        (
+            await cron._web_schedule_preview(Req(query={"expr": "@reboot"}))
+        ).text
+    )
+    assert body["valid"] is True and body["reboot"] is True
+    assert body["fires"] == []
+
+
+async def test_schedule_preview_bad_requests_are_400s():
+    cron = _cron(_RETRY_JOB)
+    resp = await cron._web_schedule_preview(Req(query={}))
+    assert resp.status == 400
+    resp = await cron._web_schedule_preview(
+        Req(query={"expr": "* * * * *", "tz": "Not/AZone"})
+    )
+    assert resp.status == 400
+    assert "unknown timezone" in json.loads(resp.text)["error"]
+
+
+# ---------------------------------------------------------------------------
+# GET /schedule/why: the per-instant no-run explainer
+# ---------------------------------------------------------------------------
+
+_WHY_YAML = """
+jobs:
+  - name: weekday
+    command: echo hi
+    schedule: "0 9 * * mon,fri"
+    utc: true
+dags:
+  - name: pipe
+    schedule: "0 4 * * *"
+    utc: true
+    tasks:
+      - id: a
+        command: 'true'
+"""
+
+
+async def test_schedule_why_explains_a_miss_field_by_field():
+    cron = _cron(_WHY_YAML)
+    resp = await cron._web_schedule_why(
+        Req(query={"job": "weekday", "at": "2026-07-14T09:00:00"})
+    )
+    body = json.loads(resp.text)
+    assert body["matches"] is False
+    assert body["failed"] == ["day-of-week"]
+    dow = body["checks"][5]
+    assert (dow["label"], dow["allowed"]) == ("Tuesday", "Monday and Friday")
+    assert body["previous_fire"] == "2026-07-13T09:00:00+00:00"
+    assert body["next_fire"] == "2026-07-17T09:00:00+00:00"
+    assert body["timezone"] == "UTC"
+
+
+async def test_schedule_why_resolves_dag_schedule_jobs():
+    cron = _cron(_WHY_YAML)
+    resp = await cron._web_schedule_why(
+        Req(query={"job": "dag:pipe", "at": "2026-07-14T04:00:00"})
+    )
+    body = json.loads(resp.text)
+    assert body["job"] == "dag:pipe"
+    assert body["expression"] == "0 4 * * *"
+    assert body["matches"] is True
+
+
+async def test_schedule_why_bad_requests():
+    cron = _cron(_WHY_YAML)
+    resp = await cron._web_schedule_why(Req(query={"job": "weekday"}))
+    assert resp.status == 400
+    resp = await cron._web_schedule_why(
+        Req(query={"job": "weekday", "at": "not-a-time"})
+    )
+    assert resp.status == 400
+    assert "ISO 8601" in json.loads(resp.text)["error"]
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_schedule_why(
+            Req(query={"job": "ghost", "at": "2026-07-14T09:00:00"})
+        )
+
+
+# ---------------------------------------------------------------------------
+# fleet schedule analysis: /schedule/pressure, /duplicates, /suggest
+# ---------------------------------------------------------------------------
+
+_FLEET_YAML = """
+jobs:
+  - name: herd-a
+    command: "true"
+    schedule: "0 * * * *"
+  - name: herd-b
+    command: "true"
+    schedule: "0 * * * *"
+  - name: herd-c
+    command: "true"
+    schedule: "@hourly"
+  - name: spread
+    command: "true"
+    schedule: "H * * * *"
+  - name: parked
+    command: "true"
+    schedule: "0 0 * * *"
+    enabled: false
+  - name: boot
+    command: "true"
+    schedule: "@reboot"
+"""
+
+
+async def test_schedule_pressure_endpoint_counts_and_excludes():
+    cron = _cron(_FLEET_YAML)
+    resp = await cron._web_schedule_pressure(Req(query={}))
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["hours"] == 24
+    assert body["timezone"] == "UTC"
+    assert body["jobs"] == 4  # parked + boot excluded
+    assert body["excluded"] == {"disabled": 1, "reboot": 1}
+    assert body["by_minute_jobs"][0] == 3  # the herd (semantic @hourly too)
+    assert len(body["grid"]) == 24 and len(body["grid"][0]) == 60
+    # the H job fired somewhere: total fires exceed the herd's own
+    assert body["total_fires"] > body["by_minute_fires"][0]
+    resp = await cron._web_schedule_pressure(Req(query={"tz": "Nope/Zone"}))
+    assert resp.status == 400
+
+
+async def test_schedule_pressure_hours_are_clamped():
+    cron = _cron(_FLEET_YAML)
+    resp = await cron._web_schedule_pressure(Req(query={"hours": "9999"}))
+    assert json.loads(resp.text)["hours"] == 168
+    resp = await cron._web_schedule_pressure(Req(query={"hours": "junk"}))
+    assert json.loads(resp.text)["hours"] == 24
+
+
+async def test_schedule_duplicates_endpoint_groups_semantically():
+    cron = _cron(_FLEET_YAML)
+    resp = await cron._web_schedule_duplicates(Req())
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["jobs"] == 4
+    assert len(body["groups"]) == 1
+    group = body["groups"][0]
+    assert group["count"] == 3
+    assert group["jobs"] == ["herd-a", "herd-b", "herd-c"]
+    assert group["timezone"] == "UTC"
+    assert group["description"]
+
+
+async def test_schedule_suggest_endpoint_and_validation():
+    cron = _cron(_FLEET_YAML)
+    resp = await cron._web_schedule_suggest(Req(query={}))
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["period"] == "hourly"
+    assert body["minute"] != 0  # never lands on the herd
+    assert body["hash_hint"] == "H * * * *"
+    resp = await cron._web_schedule_suggest(Req(query={"period": "daily"}))
+    assert json.loads(resp.text)["period"] == "daily"
+    resp = await cron._web_schedule_suggest(Req(query={"period": "weekly"}))
+    assert resp.status == 400
+    resp = await cron._web_schedule_suggest(Req(query={"tz": "Nope/Zone"}))
+    assert resp.status == 400
+
+
+async def test_schedule_preview_seed_resolves_h():
+    cron = _cron(_RETRY_JOB)
+    resp = await cron._web_schedule_preview(
+        Req(query={"expr": "H H * * *", "seed": "report-gen"})
+    )
+    body = json.loads(resp.text)
+    assert body["valid"] is True
+    assert body["seed"] == "report-gen"
+    assert body["resolved"] == "43 9 * * *"  # pinned by test_cronexpr
+    assert "hashed from the job name" in body["description"]
+    assert "hashed-slot" in [f["code"] for f in body["lint"]]
+    # without a seed the engine's own error explains what is missing
+    resp = await cron._web_schedule_preview(Req(query={"expr": "H * * * *"}))
+    body = json.loads(resp.text)
+    assert body["valid"] is False
+    assert "hash key" in body["error"]
+
+
+def test_jobs_payload_ships_schedule_resolved_only_for_h():
+    cron = _cron(_FLEET_YAML)
+    jobs = {j["name"]: j for j in cron.jobs_payload()}
+    assert jobs["spread"]["schedule"] == "H * * * *"
+    resolved = jobs["spread"]["schedule_resolved"]
+    assert resolved.endswith(" * * * *") and resolved[0].isdigit()
+    assert "schedule_resolved" not in jobs["herd-a"]
+    assert "hashed-slot" in [
+        f["code"] for f in jobs["spread"]["schedule_findings"]
+    ]

@@ -135,6 +135,7 @@ also returned as the file's `job_defaults`.
 | Both values are mappings | Recurse (deep merge). |
 | `dict1` value is a mapping, `dict2` value is `None` | Keep `dict1`'s mapping (treat `None` as "not overridden"). |
 | Both values are lists, key is `environment` | **Merge by key** (see below). |
+| Both values are lists, key is `secrets` | **Merge by name** (see below). |
 | Both values are lists, key is `fingerprint` | **Replace** with `dict2`'s list (no concatenation). |
 | Both values are lists, any other key | **Concatenate** (`v1 + v2`). |
 | Otherwise (scalars, type mismatch) | Take `dict2`'s value. |
@@ -171,6 +172,16 @@ jobs:
 
 The job above runs with `FOO=xpto`, `BAR=bar`, `ZBR=blah`.
 
+### `secrets` merges by name
+
+Run-scoped `secrets` are a list of `{name, ...}` mappings and merge the same
+way `environment` does: entries are keyed by `name` (default entries first,
+then the job's), so a job's secret **overrides** a same-named default instead
+of staging two secrets under one name. The job's entry wins wholesale,
+including its `value`/`fromFile`/`fromEnvVar` source. See
+[Durable State](Durable-State#run-scoped-secrets) for what a secret block
+does and how a job reads one.
+
 ### `fingerprint` replaces, does not append
 
 The Sentry `fingerprint` (a list of strings, default
@@ -180,7 +191,8 @@ replace-not-append setting: a job or `defaults` block that supplies its own
 would silently prepend the three default entries, making custom Sentry issue
 grouping impossible. See [Reporting](Reporting) for the Sentry reporter.
 
-All other list-valued options concatenate.
+`environment`, `secrets`, and `fingerprint` are the only exceptions; all
+other list-valued options concatenate.
 
 ## The `include` directive
 
@@ -263,6 +275,7 @@ file in the directory is parsed with its own fresh cycle-detection state.
   built-in defaults.
 - [Commands and Environment](Commands-and-Environment): `environment` and
   `env_file`.
+- [Durable State](Durable-State#run-scoped-secrets): run-scoped `secrets`.
 - [Reporting](Reporting): Sentry `fingerprint` and the report blocks.
 - [Logging Configuration](Logging-Configuration): the `logging` section.
 - [CLI Reference](CLI-Reference): the `-c` argument and `--validate-config`.

@@ -111,7 +111,9 @@ All metrics are prefixed `cronstable_`. Per-job metrics carry the job name in a 
 
 The four resource families above require the job to opt into
 [`monitorResources`](Configuration-Reference#metrics); they are sampled and
-best-effort. Like the run counters, `cronstable_job_cpu_seconds_total` and
+best-effort -- see [resource monitoring](Resource-Monitoring) for the sampling
+model and every other surface the numbers reach. Like the run counters,
+`cronstable_job_cpu_seconds_total` and
 `cronstable_job_peak_rss_bytes` are made restart-durable by a `state:` store (see
 [Semantics and guarantees](#semantics-and-guarantees)).
 
@@ -192,6 +194,7 @@ The [Clustering monitoring guide](Clustering-and-Leader-Election#monitoring-and-
 
 - [HTTP Control API](HTTP-API): the web server `/metrics` is part of -- listeners, `authToken`, headers, reload behavior.
 - [Metrics with statsd](Metrics-with-Statsd): the push-side alternative; both can be enabled at once.
+- [Resource Monitoring](Resource-Monitoring): the `monitorResources` sampling behind the per-job CPU/RSS families.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): what the cluster gauges mean and when they change.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): how run outcomes, retries, and permanent failures are determined.
 - [Configuration Reference](Configuration-Reference): the full `web` section.

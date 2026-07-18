@@ -30,10 +30,13 @@ The crontab dialect is implemented by cronstable's own built-in engine (`cronsta
 
 - **Day-of-week** accepts `0`–`7`, with both `0` and `7` meaning Sunday; a range ending in `0` wraps its end to Sunday-as-7, so `sat-sun` and `6-0` mean Saturday+Sunday.
 - **`L`** alone in day-of-month is the month's last day (`0 0 L * *`); `L<n>` in day-of-week is the month's *last* such weekday (`L5` = last Friday). No other field takes an `L`.
-- **Day-of-month AND day-of-week**: when both are restricted, a day must satisfy *both* (`0 0 13 * 5` fires only on Friday the 13th). Vixie cron fires when *either* matches; cronstable deliberately keeps the AND rule its schedules have always had.
-- **`year`** accepts 1970–2099, and `next()` never searches past 2099: a schedule with no remaining occurrence (`year: "2020"`, or an impossible date like Feb 30) simply never fires.
+- **`?`** standing alone in day-of-month or day-of-week reads as `*` (the Quartz spelling of "unrestricted"), so a seven-field Quartz expression (whose column layout matches cronstable's) parses verbatim. `?` anywhere else is an error.
+- **Day-of-month AND day-of-week**: when both are restricted, a day must satisfy *both* (`0 0 13 * 5` fires only on Friday the 13th). Vixie cron fires when *either* matches; cronstable deliberately keeps the AND rule its schedules have always had. The [schedule linter](Schedule-Linting) warns whenever a schedule uses the combination.
+- **`year`** accepts 1970–2099, and `next()` never searches past 2099: a schedule with no remaining occurrence (`year: "2020"`, or an impossible date like Feb 30) never fires. It is legal (a fixed past year is a working idiom for parking a job) but it is no longer silent: config load logs a `never-fires` warning, the scheduler warns once at seed time, and `/status` and `/jobs` report `never_fires` (see [Schedule Linting](Schedule-Linting)).
 
 Earlier releases delegated this dialect to the third-party parse-crontab library; the built-in engine is behavior-compatible with it, vector-by-vector — see `tests/gen_cron_golden.py` and `tests/data/cron_golden.json` for the recorded compatibility corpus.
+
+Expressions in **other dialects** fail with a hint instead of a bare field error: Quartz's `#` (nth weekday) and `W` (nearest weekday) name the unsupported feature, and a six-field seconds-first Quartz layout (`0 */5 * * * ?`) explains that cronstable's sixth field is a year and how to convert (append a trailing `*`).
 
 Schedules do not have to live in YAML at all: cronstable also loads whole
 classic crontab files (`*.crontab`, `*.cron`, or a file named `crontab`),
@@ -62,6 +65,8 @@ The engine reads **extra columns from the ends**, so the field count selects the
 | 7 | `second minute hour dayOfMonth month dayOfWeek year` | adds a leading **second** column too |
 
 So a seven-field string schedules at **second granularity** (see [Second-level schedules](#second-level-schedules) below), while a six-field string pins a `year`. A six-field string is *not* seconds — the extra column is the year.
+
+Any field except the year also takes the Jenkins-style **`H` hash form** (`H`, `H(a-b)`, `H/n`, `H(a-b)/n`), which resolves to a slot hashed from the job's name: stable across restarts, reloads, and replicas, so a fleet of `H * * * *` jobs spreads across the hour without stampeding at `:00` while each job keeps one predictable fire time. See [Hashed Schedules](Hashed-Schedules) for the forms, the guarantees, and the rename caveat.
 
 ## Second-level schedules
 

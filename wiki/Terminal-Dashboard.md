@@ -9,9 +9,10 @@ extra to enable on the daemon: if the dashboard works, so does the TUI.
 
 [![The cronstable TUI against a live 9-node fleet: 59 jobs with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, the cluster owner column, and the verdict bar](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)
 
-*(Every screenshot on this page's README section is the real TUI driven
-against the running [grand tour](https://github.com/ptweezy/cronstable/tree/develop/example/grand-tour)
-fleet — the same one the web dashboard's screenshots use.)*
+*(This screenshot — like the larger gallery in the README's Terminal
+dashboard section — is the real TUI driven against the running
+[grand tour](https://github.com/ptweezy/cronstable/tree/develop/example/grand-tour)
+fleet, the same one the web dashboard's screenshots use.)*
 
 ```shell
 cronstable tui                              # local daemon on :8080
@@ -23,7 +24,13 @@ cronstable tui --job nightly-backup         # deep-link a job's drawer
 It is hand-rolled on the standard library plus the core `aiohttp`
 dependency (the same zero-new-dependency rule as the
 [MCP server](MCP)), works on Linux, macOS and Windows, and ships in the
-same package and binaries as the daemon.
+same package and binaries as the daemon. It does need a real terminal:
+if stdin or stdout is not a tty (a pipe, a redirect, a CI runner), it
+refuses to start, printing `cronstable tui needs an interactive
+terminal (stdin/stdout are not a tty)` to stderr and exiting with
+code 2. On Windows it turns on the console's ANSI/VT processing
+itself, so a stock Command Prompt or PowerShell window works; for
+fonts missing the status glyphs there is `--ascii`.
 
 ## Options
 
@@ -65,7 +72,9 @@ Terminal-only extras (grouped separately in the `?` overlay): `q` quits,
 `m` opens the multi-tail console, `←`/`→` (or `Tab`) switch drawer
 tabs, `PgUp`/`PgDn` scroll, and inside the Logs tab `f`/`t`/`w` toggle
 follow/timestamps/wrap, `/` searches with `n`/`N` for next/previous
-match, and `d` saves the log to a file.
+match, and `d` saves the log to your home directory as
+`cronstable-<job>-<YYYYmmdd-HHMMSS>.log` (a toast confirms the exact
+path).
 
 ## What made the trip
 
@@ -85,7 +94,9 @@ Everything an operator drives from the web page:
 - the **verdict bar** and **incident timeline** with the same
   failure-correlation logic ("×4 share exit=69 — likely one cause"),
   and the **mitigate console** with staggered bulk start/cancel, abort,
-  and a Markdown **incident writeup** (saved to a file and copied);
+  and a Markdown **incident writeup**, copied to the clipboard and
+  saved to `~/cronstable-incident-<YYYYmmdd-HHMMSS>.md` (if the file
+  write fails, the clipboard copy still stands);
 - the **multi-tail console** — up to four jobs' live logs merged with
   identity-colored prefixes;
 - the **DAG drawer** — runs, an ASCII task graph, per-task states and
@@ -94,16 +105,38 @@ Everything an operator drives from the web page:
 - the **cluster panel**, **fleet matrix** (jobs × nodes, failing-only
   filter), **node resources**, **activity heatmap** punchcard, and
   **next-fire radar**;
+- the **schedule pressure** overlay (`Ctrl-K` → "Toggle schedule
+  pressure"): the next 24 hours of fires as an hour-by-minute collision
+  grid with a minute histogram, the fleet's
+  [duplicate-schedule groups](Duplicate-Schedule-Detection), and the
+  [least-loaded-slot suggestions](Suggest-a-Slot), computed locally from
+  the `/jobs` snapshot with the daemon's own shared analyzers (see
+  [Schedule Pressure](Schedule-Pressure)), so it works against older
+  daemons too;
 - the **state inspector** for the durable store (inventory, document
   namespaces, record streams);
 - the **cron sandbox** (`Ctrl-K` → "Cron sandbox"), evaluating
-  expressions live against the daemon's own engine;
+  expressions live against the daemon's own engine, with the
+  [schedule linter's](Schedule-Linting) advisory findings inline (a
+  job's schedule drawer shows the same findings in the job's own
+  timezone, so DST notes carry real dates);
 - the **wallboard** (`w`) with worst-first tiles, the tally foot, a
   `NO SIGNAL` banner when data goes stale, and the zen screensaver on an
   idle, healthy board;
 - the **BIOS-style boot self-test**, probing the daemon for real, once
   per 12 hours (skippable with any key, `--no-boot`, or a settings
   toggle).
+
+Everything painted into the terminal is sanitized first. Raw log
+lines get log-viewer carriage-return semantics — only the last
+non-empty `\r` segment of a line is kept, so progress bars and
+cmd.exe's CRLF output collapse cleanly — tabs expand, and other
+control characters are dropped. Every escape sequence except SGR
+styling is scrubbed from job output and from API-derived strings such
+as job and node names (under clustering those arrive from other
+machines over gossip): untrusted output can color a line, but it can
+never move the cursor, retitle your window, or write your clipboard
+via OSC 52.
 
 Web-only physics stay in the browser: CRT glow, scanlines, desktop
 notifications (the TUI rings the terminal bell instead, off by
@@ -121,6 +154,45 @@ plain ASCII. Preferences (theme, refresh, toggles) persist in a small
 JSON file — `%APPDATA%\cronstable\tui.json` on Windows,
 `$XDG_CONFIG_HOME/cronstable/tui.json` (or `~/.config/...`) elsewhere —
 the TUI's analogue of the page's `localStorage`.
+
+## Settings
+
+The settings panel is opened from the command palette (`Ctrl-K` →
+"Open settings"); it has no dedicated key. `j`/`k` (or the arrow keys)
+select a row; `Enter`, `Space`, `←` or `→` cycle or toggle the
+selected value; every change saves immediately to the prefs file,
+whose path the panel's footer shows. Twelve rows: **Theme**,
+**Light / dark**, **Color vision**, and **ASCII glyphs** (the
+[knobs above](#themes-and-accessibility)); **Refresh interval** (the
+`--poll` cadence, 1s–10s or paused); **Wrap log lines** and
+**Log timestamps** (the Logs tab's `w`/`t` toggles); **Audible cues
+(bell)** (off by default); **Boot self-test**; and two that live only
+here:
+
+- **Compact density** drops the schedule and sparkline columns from
+  the jobs board so the rest fits a narrower terminal (also in the
+  palette as "Toggle compact density");
+- **Zen screensaver** and **Zen idle** govern the wallboard's
+  screensaver: on a healthy board (nothing failing or running, data
+  fresh) it engages once the keyboard has been idle for the **Zen
+  idle** interval — 30, 60, 90, 120, or 300 seconds, default 90 — and
+  any key wakes it without acting.
+
+## Clipboard
+
+Every copy action — `c` on a job, the palette's "Copy version" and
+"Copy job set id", the incident writeup — takes two paths at once: an
+OSC 52 escape asking the terminal emulator itself to set the system
+clipboard, plus the platform's copy tool (`clip.exe` on Windows,
+`pbcopy` on macOS, `wl-copy` or `xclip` on Linux, whichever is
+installed). Over SSH the platform tool runs on the remote box, so
+OSC 52 is the only path that can reach your local clipboard — it
+needs an emulator that supports it (most modern ones do; tmux only
+passes it through when its `set-clipboard` option allows). A failed
+copy is silent: the TUI cannot see whether the OSC 52 escape landed,
+so it reports success either way. If pastes come up empty in a remote
+session, check the emulator's OSC 52 support; the incident writeup is
+the one copy that also lands in a file.
 
 ## Authentication
 

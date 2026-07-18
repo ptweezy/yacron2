@@ -40,6 +40,7 @@ from strictyaml.ruamel.error import YAMLError
 
 from cronstable import crontabs, dag, platform
 from cronstable.cronexpr import CronTab
+from cronstable.croninfo import Finding, lint_schedule
 from cronstable.resources import MONITOR_HISTORY_DEFAULT, SAMPLE_INTERVAL
 
 logger = logging.getLogger("cronstable.config")
@@ -1141,6 +1142,7 @@ class JobConfig:
         "command",
         "schedule_unparsed",
         "schedule",
+        "schedule_findings",
         "has_seconds",
         "shell",
         "concurrencyPolicy",
@@ -1232,6 +1234,34 @@ class JobConfig:
         self.timezone: Optional[datetime.tzinfo] = self._resolve_timezone(
             config.pop("timezone")
         )
+        # Advisory schedule lint (never-fires, AND day semantics, uneven
+        # steps, skipped months, DST notes), computed once per parse in the
+        # job's resolved frame.  Logged here so the load or reload that
+        # introduces a footgun says so immediately, and kept on the job so
+        # the status payloads can carry the findings to the dashboards.  A
+        # dead schedule stays a WARNING rather than an error: a fixed past
+        # year is also the working idiom for parking a job, and failing the
+        # whole config load over it would turn an upgrade into an outage.
+        self.schedule_findings: List[Finding] = (
+            lint_schedule(
+                str(self.schedule),
+                timezone=self.timezone,
+                hash_key=self.name,
+            )
+            if isinstance(self.schedule, CronTab)
+            else []
+        )
+        for finding in self.schedule_findings:
+            logger.log(
+                logging.WARNING
+                if finding.level == "warning"
+                else logging.INFO,
+                "job %r: schedule %r: [%s] %s",
+                self.name,
+                str(self.schedule),
+                finding.code,
+                finding.message,
+            )
 
         self.failsWhen = config.pop("failsWhen")
         self.onFailure = config.pop("onFailure")
@@ -1276,9 +1306,11 @@ class JobConfig:
         # out-of-range second, the wrong field count). Surface it as a
         # ConfigError naming the offending expression, so a bad schedule fails
         # the config load with a clear message the reload loop can log, rather
-        # than as an anonymous traceback.
+        # than as an anonymous traceback.  The job's name seeds the H hash
+        # form (self.name is assigned before the schedule parses), so an
+        # H slot is stable across restarts, reloads and replicas.
         try:
-            return CronTab(tab)
+            return CronTab(tab, hash_key=self.name)
         except ValueError as err:
             raise ConfigError(
                 "invalid schedule {!r}: {}".format(tab, err)

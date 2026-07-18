@@ -11,7 +11,7 @@ is **no new coordination service, no new backend, no client library**:
   [state store](Durable-State), holding every task's state;
 - a **task** is an ordinary job invocation -- the same command/shell/env/
   timeout machinery, launched the same way, with the same
-  [loopback state endpoint](Durable-State#state-as-a-job-primitive) injected,
+  [loopback state endpoint](Durable-State#job-facing-state) injected,
   so a task can call `cronstable xcom|artifact|state|lock|...`;
 - **cross-task data** (XCom) rides the artifact store, scoped per dag_run;
 - the scheduler advances each run under a single **lease**, so across a fleet a
@@ -72,11 +72,13 @@ A task's readiness is governed by its `triggerRule`:
 
 Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `captureStderr`, `executionTimeout`, `killTimeout`, `user` / `group`,
-`failsWhen`, run-scoped `secrets`, and `monitorResources` (a monitored task
-instance's sampled CPU time and peak RSS land in the `resources` object of its
-task record in the `dag_run` document, and in the task's statsd sink if one is
-configured; task instances do not appear in the per-job Prometheus families).
-Per-task **retries** are DAG-owned
+`failsWhen`, run-scoped `secrets`, `monitorResources`, and the rest of the
+shared launch keys; the complete list, with types and defaults, is in the
+[configuration reference](Configuration-Reference#dags). A monitored task
+instance's sampled CPU time and peak RSS land in the `resources` object of
+its task record in the `dag_run` document, and in the task's statsd sink if
+one is configured; task instances do not appear in the per-job Prometheus
+families. Per-task **retries** are DAG-owned
 (independent of a job's `onFailure.retry`):
 
 ```yaml
@@ -151,6 +153,23 @@ The expanded item set is recorded **once** in the dag_run and never recomputed,
 so a crash-resumed run reconstructs the identical set of mapped instances
 rather than re-deriving it from a possibly-changed upstream output.
 
+Because the expansion is permanent, the read that derives it is **strict**
+about store trouble. A store that cannot answer -- an I/O error or timeout on
+a shared mount, a record only a newer node's schema can read -- leaves the
+fan-out **unknown**: the task stays unexpanded and the scheduler retries the
+read on a later pass, regardless of
+[`onStoreUnavailable`](Durable-State#when-the-store-is-unavailable-onstoreunavailable)
+(this deliberately overrides the store's usual
+[skip-on-read-error](Durable-State#the-store-model) rule -- one blip must not
+freeze the task into a permanently empty, vacuously successful fan-out). The
+empty fan-out is reserved for a *definitive* answer: the upstream finished
+without publishing the key; the published value is not a usable JSON list
+(invalid JSON, not a list, or carrying a non-portable value); or the record
+survives but its payload blob is gone (`410` -- possible only through external
+interference with the store, such as a partial restore, since GC never sweeps
+a blob a surviving record references). A warning names each mapping-to-empty
+that indicates a problem.
+
 A fan-out is capped at **1000 items**: a larger XCom list fails the mapped
 task with an explanatory reason instead of materialising the flood (its
 `all_success` downstream sees `upstream_failed`). A single scheduler pass
@@ -181,7 +200,7 @@ polling on time rather than restarting the timeout window.
 
 A `type: approval` task blocks the graph until a human or an API call decides
 it. It runs no command. Approve or reject it over the
-[control API](HTTP-API#dag-endpoints) (or the dashboard):
+[control API](HTTP-API#dag-endpoints) (or the [dashboard](Web-Dashboard)):
 
 ```bash
 curl -X POST .../dags/nightly-etl/runs/<run_key>/tasks/publish-gate/decision \
@@ -229,11 +248,11 @@ the durable state: a task recorded `running` whose process is gone (a dead pid,
 or a foreign owner proven dead by the lease lapse) is retried if attempts
 remain, else failed; a sensor mid-poke is re-poked; an approval gate keeps
 waiting. This mirrors the job-level
-[crash reconciliation](Durable-State#crash-reconciliation) seam. Like every
-cronstable coordination primitive it is **at-least-once**, not exactly-once: a
-task whose process outlives a crashed daemon may run again on resume, so a task
-that must be exactly-once should guard its side effect with an
-[idempotency key](Durable-State#idempotency-keys).
+[crash reconciliation](Durable-State#in-flight-runs-and-crash-reconciliation)
+seam. Like every cronstable coordination primitive it is **at-least-once**,
+not exactly-once: a task whose process outlives a crashed daemon may run again
+on resume, so a task that must be exactly-once should guard its side effect
+with an [idempotency key](Durable-State#idempotency-keys).
 
 ## Retention and GC
 
@@ -260,6 +279,11 @@ Over the [HTTP control API](HTTP-API#dag-endpoints):
 - `POST /dags/{name}/trigger` — start a manual run now
 - `POST /dags/{name}/backfill` — replay a date range
 - `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision` — approve/reject a gate
+
+The [Web Dashboard](Web-Dashboard) drives the same endpoints from a DAG
+orchestration UI -- a DAG card and a per-DAG drawer (runs, tasks, graph, XCom,
+logs) with trigger, backfill, and approval decisions; its page documents that
+UI.
 
 See [example/dag/](https://github.com/ptweezy/cronstable/tree/develop/example/dag)
 for a complete configuration exercising every node type.

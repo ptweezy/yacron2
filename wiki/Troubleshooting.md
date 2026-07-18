@@ -582,18 +582,22 @@ retried) and starts a new one.
 and possibly `Job <name> did not gracefully terminate after <n> seconds, killing it…`.
 
 **Cause.** `executionTimeout` (default unset/`None`) cancels a job still running after
-N seconds (recorded internally as retcode `-100`). Cancellation sends `SIGTERM`, then
-`SIGKILL` if the process is still alive after `killTimeout` seconds (default `30`).
+N seconds (recorded internally as retcode `-100`). Cancellation signals the job's
+whole process group (each job runs in its own session): `SIGTERM` to the group, then
+after `killTimeout` seconds (default `30`) an unconditional `SIGKILL` to the group --
+sent even if the main process already exited, so background helpers the command left
+behind go down with it.
 
-**Windows note.** The `SIGTERM`-then-`SIGKILL` escalation is POSIX behavior
-(`terminate()` = `SIGTERM`, graceful and trappable; `kill()` = `SIGKILL`, forceful).
-Windows has no POSIX signals: both `terminate()` and `kill()` call `TerminateProcess`,
-an immediate ungraceful stop. The child is not notified to clean up, so the
-terminate->kill escalation is effectively moot (`killTimeout` still bounds the wait,
-but the outcome is the same hard kill). See [Running on Windows](Running-on-Windows).
+**Windows note.** The group signalling is POSIX behavior. Windows has no POSIX
+signals and no process group: the graceful step is `TerminateProcess` on the direct
+child (immediate, not trappable), and the forced step is a `taskkill /F /T` kill of
+the job's live process tree. `killTimeout` still bounds the wait between the two.
+See [Running on Windows](Running-on-Windows).
 
 **Fix.** Raise `executionTimeout`, or give the process more graceful-shutdown time via
-`killTimeout`. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
+`killTimeout`. See
+[Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
+on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
 ## Reference: exit codes used internally
 

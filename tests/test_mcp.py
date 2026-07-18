@@ -597,3 +597,304 @@ def test_mcpcli_import_is_featherweight():
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == ""
+
+
+async def test_schedule_analysis_tools_registered_and_callable():
+    h = _handler()
+    names = await _tool_names(h)
+    for expected in (
+        "cron_schedule_pressure",
+        "cron_schedule_duplicates",
+        "cron_suggest_slot",
+    ):
+        assert expected in names
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_schedule_pressure", "arguments": {"hours": 24}},
+    )
+    data = resp["result"]["structuredContent"]
+    assert data["hours"] == 24
+    assert len(data["grid"]) == 24
+    assert "busiest minute" in resp["result"]["content"][0]["text"]
+    resp = await _req(
+        h, "tools/call", {"name": "cron_schedule_duplicates", "arguments": {}}
+    )
+    assert "groups" in resp["result"]["structuredContent"]
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_suggest_slot", "arguments": {"period": "daily"}},
+    )
+    assert resp["result"]["structuredContent"]["period"] == "daily"
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_schedule_pressure", "arguments": {"tz": "Nope/Zone"}},
+    )
+    assert resp["result"]["isError"] is True
+
+
+async def test_schedule_pressure_engine_clamps_hours():
+    # the tool no longer clamps hours itself; the engine's authoritative
+    # [1, 168] clamp must still reach the payload through the offload path
+    h = _handler()
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_schedule_pressure", "arguments": {"hours": 9999}},
+    )
+    assert resp["result"]["structuredContent"]["hours"] == 168
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_schedule_pressure", "arguments": {"hours": -3}},
+    )
+    assert resp["result"]["structuredContent"]["hours"] == 1
+
+
+# ---------------------------------------------------------------------------
+# schedule authoring/debugging tools: validate, explain, why-no-run
+# ---------------------------------------------------------------------------
+
+_SCHED_YAML = """
+jobs:
+  - name: weekday-report
+    command: echo hi
+    schedule: "0 9 * * mon,fri"
+    utc: true
+  - name: friday13
+    command: echo spooky
+    schedule: "0 0 13 * 5"
+    utc: true
+  - name: nightly
+    command: backup
+    schedule: "0 3 * * *"
+    enabled: false
+    utc: true
+  - name: boot
+    command: echo boot
+    schedule: "@reboot"
+  - name: ny-early
+    command: echo dst
+    schedule: "30 2 * * *"
+    timezone: America/New_York
+"""
+
+
+async def _call(handler, name, arguments):
+    resp = await _req(
+        handler, "tools/call", {"name": name, "arguments": arguments}
+    )
+    return resp["result"]
+
+
+async def test_schedule_authoring_tools_registered():
+    names = await _tool_names(_handler())
+    for expected in (
+        "cron_validate_schedule",
+        "cron_explain_schedule",
+        "cron_why_no_run",
+    ):
+        assert expected in names
+
+
+async def test_validate_schedule_accepts_and_lints():
+    h = _handler()
+    result = await _call(
+        h, "cron_validate_schedule", {"expression": "*/7 * * * *"}
+    )
+    data = result["structuredContent"]
+    assert data["valid"] is True
+    assert data["description"].startswith("At minutes")
+    assert [f["code"] for f in data["lint"]] == ["uneven-step"]
+    # the gate returns exactly one confirmation fire
+    assert len(data["fires"]) == 1
+    assert "valid" in result["content"][0]["text"]
+
+
+async def test_validate_schedule_rejects_with_engine_error():
+    h = _handler()
+    result = await _call(
+        h, "cron_validate_schedule", {"expression": "0 9 * * mon-fry"}
+    )
+    data = result["structuredContent"]
+    assert data["valid"] is False
+    assert "day-of-week" in data["error"]
+    assert result["content"][0]["text"].startswith("INVALID")
+    # a Quartz expression gets the dialect hint through unchanged
+    result = await _call(
+        h, "cron_validate_schedule", {"expression": "0 0 12 ? * MON#2 *"}
+    )
+    assert "Quartz" in result["structuredContent"]["error"]
+
+
+async def test_validate_schedule_seed_resolves_hash_slots():
+    h = _handler()
+    # H without a seed is invalid, with the engine's own explanation
+    result = await _call(
+        h, "cron_validate_schedule", {"expression": "H 3 * * *"}
+    )
+    assert result["structuredContent"]["valid"] is False
+    assert "hash key" in result["structuredContent"]["error"]
+    result = await _call(
+        h,
+        "cron_validate_schedule",
+        {"expression": "H 3 * * *", "seed": "newjob"},
+    )
+    data = result["structuredContent"]
+    assert data["valid"] is True
+    assert data["resolved"].endswith("3 * * *")
+    assert [f["code"] for f in data["lint"]] == ["hashed-slot"]
+
+
+async def test_validate_schedule_never_fires_is_loud():
+    h = _handler()
+    result = await _call(
+        h, "cron_validate_schedule", {"expression": "0 0 30 2 *"}
+    )
+    assert result["structuredContent"]["never_fires"] is True
+    assert "never fires" in result["content"][0]["text"]
+
+
+async def test_explain_schedule_counts_and_frames_fires():
+    h = _handler()
+    result = await _call(
+        h,
+        "cron_explain_schedule",
+        {"expression": "0 9 * * mon,fri", "count": 3, "tz": "Europe/Berlin"},
+    )
+    data = result["structuredContent"]
+    assert data["valid"] is True
+    assert len(data["fires"]) == 3
+    assert all(f.endswith(("+02:00", "+01:00")) for f in data["fires"])
+    assert data["description"] == "At 09:00, on Monday and Friday"
+    # default count is 5; the clamp caps at 60
+    result = await _call(
+        h, "cron_explain_schedule", {"expression": "* * * * *"}
+    )
+    assert len(result["structuredContent"]["fires"]) == 5
+    result = await _call(
+        h, "cron_explain_schedule", {"expression": "* * * * *", "count": 999}
+    )
+    assert len(result["structuredContent"]["fires"]) == 60
+
+
+async def test_explain_and_validate_bad_inputs():
+    h = _handler()
+    for name in ("cron_explain_schedule", "cron_validate_schedule"):
+        result = await _call(h, name, {})
+        assert result["isError"] is True
+        result = await _call(
+            h, name, {"expression": "* * * * *", "tz": "Nope/Zone"}
+        )
+        assert result["isError"] is True
+        assert "unknown timezone" in result["content"][0]["text"]
+
+
+async def test_why_no_run_names_the_failing_field():
+    h = _handler(yaml=_SCHED_YAML)
+    # Tuesday 2026-07-14 against a Monday/Friday schedule
+    result = await _call(
+        h,
+        "cron_why_no_run",
+        {"name": "weekday-report", "at": "2026-07-14T09:00:00"},
+    )
+    data = result["structuredContent"]
+    assert data["matches"] is False
+    assert data["failed"] == ["day-of-week"]
+    dow = data["checks"][5]
+    assert (dow["label"], dow["allowed"]) == ("Tuesday", "Monday and Friday")
+    text = result["content"][0]["text"]
+    assert text.startswith("NO")
+    assert "day-of-week Tuesday is not in Monday and Friday" in text
+    # the nearest real fires bracket the probe
+    assert data["previous_fire"] == "2026-07-13T09:00:00+00:00"
+    assert data["next_fire"] == "2026-07-17T09:00:00+00:00"
+
+
+async def test_why_no_run_matching_instant_points_at_execution():
+    h = _handler(yaml=_SCHED_YAML)
+    result = await _call(
+        h,
+        "cron_why_no_run",
+        {"name": "weekday-report", "at": "2026-07-17T09:00:00Z"},
+    )
+    data = result["structuredContent"]
+    assert data["matches"] is True
+    assert data["failed"] == []
+    assert "cron_list_runs" in result["content"][0]["text"]
+
+
+async def test_why_no_run_reads_aware_timestamps_in_the_job_zone():
+    h = _handler(yaml=_SCHED_YAML)
+    # 11:00+02:00 is 09:00 in the job's UTC frame
+    result = await _call(
+        h,
+        "cron_why_no_run",
+        {"name": "weekday-report", "at": "2026-07-17T11:00:00+02:00"},
+    )
+    data = result["structuredContent"]
+    assert data["at_in_zone"] == "2026-07-17T09:00:00+00:00"
+    assert data["matches"] is True
+
+
+async def test_why_no_run_and_rule_note():
+    h = _handler(yaml=_SCHED_YAML)
+    # Monday the 13th: dom matched, dow did not; Vixie would have fired
+    result = await _call(
+        h, "cron_why_no_run", {"name": "friday13", "at": "2026-07-13T00:00"}
+    )
+    data = result["structuredContent"]
+    assert [n["code"] for n in data["notes"]] == ["day-fields-and-rule"]
+    assert "Vixie" in data["notes"][0]["message"]
+
+
+async def test_why_no_run_disabled_job_is_called_out():
+    h = _handler(yaml=_SCHED_YAML)
+    result = await _call(
+        h, "cron_why_no_run", {"name": "nightly", "at": "2026-07-18T03:00:00"}
+    )
+    assert result["structuredContent"]["matches"] is True
+    assert result["structuredContent"]["enabled"] is False
+    assert "disabled" in result["content"][0]["text"]
+
+
+async def test_why_no_run_reboot_job():
+    h = _handler(yaml=_SCHED_YAML)
+    result = await _call(
+        h, "cron_why_no_run", {"name": "boot", "at": "2026-07-18T03:00"}
+    )
+    data = result["structuredContent"]
+    assert data["reboot"] is True
+    assert data["matches"] is False
+    assert data["previous_fire"] is None
+    assert "@reboot" in result["content"][0]["text"]
+
+
+async def test_why_no_run_dst_gap_reaches_the_summary():
+    h = _handler(yaml=_SCHED_YAML)
+    # 2026-03-08 02:30 does not exist in America/New_York
+    result = await _call(
+        h, "cron_why_no_run", {"name": "ny-early", "at": "2026-03-08T02:30"}
+    )
+    data = result["structuredContent"]
+    assert data["matches"] is True
+    assert [n["code"] for n in data["notes"]] == ["dst-skipped-time"]
+    assert "did not exist" in result["content"][0]["text"]
+
+
+async def test_why_no_run_unknown_job_and_bad_timestamp():
+    h = _handler(yaml=_SCHED_YAML)
+    result = await _call(
+        h, "cron_why_no_run", {"name": "nope", "at": "2026-07-18T03:00"}
+    )
+    assert result["isError"] is True
+    assert "not found" in result["content"][0]["text"]
+    result = await _call(
+        h, "cron_why_no_run", {"name": "weekday-report", "at": "yesterday"}
+    )
+    assert result["isError"] is True
+    assert "ISO 8601" in result["content"][0]["text"]
+    result = await _call(h, "cron_why_no_run", {"name": "weekday-report"})
+    assert result["isError"] is True

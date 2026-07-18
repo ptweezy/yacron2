@@ -188,25 +188,36 @@ in the [Command-Line Reference](CLI-Reference).
 
 When cronstable stops a job (because its `executionTimeout` expired, because of
 `concurrencyPolicy: Replace`, or because of a cancel request through the
-[HTTP Control API](HTTP-API)) it calls `proc.terminate()`, waits up to
-`killTimeout` seconds, then escalates to `proc.kill()`. The meaning of those two
-calls differs by platform:
+[HTTP Control API](HTTP-API)) it performs a graceful step, waits up to
+`killTimeout` seconds, then force-kills the run. The scope and meaning of the
+two steps differ by platform:
 
-| Platform | `terminate()` | `kill()` | Escalation |
-| --- | --- | --- | --- |
-| POSIX | `SIGTERM` (graceful, trappable) | `SIGKILL` (forceful) | Real: a child can trap `SIGTERM` to clean up before `SIGKILL`. |
-| Windows | `TerminateProcess` | `TerminateProcess` | Moot: both calls are the same immediate, ungraceful stop. |
+| Platform | Graceful step | Forced step (after `killTimeout`) |
+| --- | --- | --- |
+| POSIX | `SIGTERM` to the job's whole process group (trappable; each job is spawned in its own session) | `SIGKILL` to the whole group, sent unconditionally |
+| Windows | `TerminateProcess` on the direct child (immediate, ungraceful) | `taskkill /F /T` on the job's live process tree |
 
-On Windows there are no POSIX signals: both `terminate()` and `kill()` map to
-`TerminateProcess`, an immediate, ungraceful stop. The child is **not** notified
-to clean up, so the `terminate()` → `kill()` escalation is effectively moot.
-`killTimeout` still bounds how long cronstable waits between the two calls, but the
-outcome is the same hard kill either way. A job cannot trap a "please shut down"
-signal on Windows the way it can trap `SIGTERM` on POSIX.
+On Windows there are no POSIX signals and no process group at spawn time, so
+the "graceful" step is `TerminateProcess` on the direct child: an immediate,
+ungraceful stop. The child is **not** notified to clean up, and a job cannot
+trap a "please shut down" signal on Windows the way it can trap `SIGTERM` on
+POSIX. The forced step is nevertheless a real escalation in *scope*: cronstable
+shells out to `taskkill /F /T /PID <pid>`, which walks the job's live
+parent/child process tree, so descendants the command left behind go down with
+it. `killTimeout` still bounds how long cronstable waits between the two steps.
 
-For the full cancellation sequence, the `-100` timeout return code, and how
-`concurrencyPolicy: Replace` cancels the outgoing instance, see
-[Concurrency and Timeouts](Concurrency-and-Timeouts).
+Two honest bounds on the tree kill: the `taskkill` run itself is given 10
+seconds before cronstable abandons it and falls back to killing the direct child
+alone, and a descendant that was already orphaned when `taskkill` ran (its
+parent exited first) is no longer in the tree and survives. A survivor cannot
+strand the run, though: a killed run's wait for its output pipes to drain is
+separately bounded.
+
+For the full cancellation sequence (the process-group signalling, the
+unconditional force kill, the bounded drain), the `-100` timeout return code,
+and how `concurrencyPolicy: Replace` cancels the outgoing instance, see
+[Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
+on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
 ## Features not supported on Windows
 
@@ -311,8 +322,9 @@ Apart from the differences above, cronstable behaves the same on Windows as on
 POSIX. The YAML crontab, schedules and timezones, environment variables and env
 files, output capturing, concurrency, failure detection and retries, reporting
 (mail / Sentry / shell / webhook), statsd metrics, the Prometheus `/metrics` endpoint,
-the HTTP control API, and the web dashboard all work exactly as documented
-elsewhere in this wiki:
+the HTTP control API, the web dashboard, and the `cronstable tui` terminal
+dashboard (which enables VT mode on the Windows console and reads keys via
+`msvcrt`) all work exactly as documented elsewhere in this wiki:
 
 - [Schedules and Timezones](Schedules-and-Timezones)
 - [Commands and Environment](Commands-and-Environment)
@@ -323,6 +335,7 @@ elsewhere in this wiki:
 - [Metrics with statsd](Metrics-with-Statsd) and
   [Metrics with Prometheus](Metrics-with-Prometheus)
 - [HTTP Control API](HTTP-API) and [Web Dashboard](Web-Dashboard)
+- [Terminal Dashboard](Terminal-Dashboard)
 
 See [Installation](Installation) and the
 [Command-Line Reference](CLI-Reference) to get started, and

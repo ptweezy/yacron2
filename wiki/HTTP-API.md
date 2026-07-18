@@ -52,6 +52,9 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `cronstable/con
 | `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [Cross-site request defense](#cross-site-request-defense)). |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes (see [Authentication](#authentication)). |
 | `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
+| `ui` | bool | `true` | Serve the [Web Dashboard](Web-Dashboard) page at `/` (see [`GET /`](#get--the-dashboard-page)); `ui: false` exposes only the REST endpoints. |
+| `metrics` | bool or map | `true` | Serve the Prometheus exposition at `/metrics`; the map form tunes buckets or exempts the endpoint from `authToken` (see [`GET /metrics`](#get-metrics)). |
+| `nodeHistory` | bool or map | `true` | Background node CPU/memory sampling that feeds [`GET /node/history`](#get-nodehistory); the map form tunes cadence and window size (see [`web.nodeHistory`](Configuration-Reference#web)). |
 
 ### `listen` URL forms
 
@@ -81,6 +84,11 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/node` | `_web_get_node` | `200` |
 | `GET` | `/node/history` | `_web_node_history` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
+| `GET` | `/schedule/preview` | `_web_schedule_preview` | `200` (`400` for a missing `expr` or unknown `tz`) |
+| `GET` | `/schedule/pressure` | `_web_schedule_pressure` | `200` (`400` for an unknown `tz`) |
+| `GET` | `/schedule/duplicates` | `_web_schedule_duplicates` | `200` |
+| `GET` | `/schedule/suggest` | `_web_schedule_suggest` | `200` (`400` for a bad `period` or unknown `tz`) |
+| `GET` | `/schedule/why` | `_web_schedule_why` | `200` (`400` for a missing `job`/`at` or an unparseable `at`; `404` for an unknown job) |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
@@ -99,12 +107,16 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/state` | `_web_state` | `200` |
 | `GET` | `/state/documents` | `_web_state_documents` | `200` |
 | `GET` | `/state/records` | `_web_state_records` | `200` |
+| `POST` | `/mcp` | `MCPHandler.handle_http` | `200` (JSON-RPC response; `202` for a notification; omitted unless `mcp.enabled`) |
+| `GET` | `/mcp` | `MCPHandler.handle_http_get` | `405` (always, with `Allow: POST, OPTIONS`; omitted unless `mcp.enabled`) |
+| `OPTIONS` | `/mcp` | `MCPHandler.handle_options` | `204` (CORS preflight for an allow-listed `Origin`; omitted unless `mcp.enabled`) |
 | `GET` | `/metrics` | `_web_metrics` | `200` (Prometheus exposition; omitted when `metrics: false`) |
 | `GET` | `/` | `_web_index` | `200` (dashboard page; omitted when `ui: false`) |
 
-The `/dags/...` routes are documented under [DAG endpoints](#dag-endpoints)
-and the `/state...` routes under
-[State inspector endpoints](#state-inspector-endpoints).
+The `/dags/...` routes are documented under [DAG endpoints](#dag-endpoints),
+the `/state...` routes under
+[State inspector endpoints](#state-inspector-endpoints), and the `/mcp`
+routes under [`POST /mcp`](#post-mcp-the-mcp-server).
 
 The configured `headers` map is applied to every `200` success response across
 all routes (including `/cluster` and `/job-set-id`) and to the `409` conflict
@@ -147,6 +159,11 @@ For `scheduled` jobs, `scheduled_in` is the number of seconds until the next run
 (a float, computed from the job's crontab in the job's timezone). For an `@reboot`
 schedule, `scheduled_in` is the literal string `"@reboot"`.
 
+A `scheduled` job whose crontab has **no future occurrence** (a fixed past
+year, an impossible date) reports `scheduled_in: null` plus `never_fires:
+true`, and the text form says `never fires (schedule has no future
+occurrence)`; see [Schedule Linting](Schedule-Linting).
+
 The `disabled` status is reported honestly instead of an inapplicable
 `scheduled (in N seconds)`.
 
@@ -180,6 +197,112 @@ Content-Type: application/json; charset=utf-8
 ]
 ```
 
+### `GET /schedule/preview`
+
+Parses, describes, previews and lints one cron expression with the daemon's
+own engine, the single source of truth behind the dashboards' sandboxes, so
+a preview can never disagree with what the scheduler will actually do.
+
+Query parameters:
+
+| Parameter | Meaning |
+| --- | --- |
+| `expr` | **Required.** The expression to decode (URL-encoded). `400` when missing or blank. |
+| `tz` | Optional IANA zone for the preview frame and the DST lint checks (default `UTC`). `400` for an unknown name. |
+| `count` | Optional number of upcoming fires to return, clamped to 1–60 (default 12). |
+| `seed` | Optional hash key (a job name, real or prospective) that resolves [`H` items](Hashed-Schedules). Without it an `H` expression comes back `valid: false` with the engine's own error; with it the response echoes `seed` and adds `resolved`, the expression with every `H` replaced by its hashed values. |
+
+For an expression the engine accepts, the response carries `valid: true`,
+the whitespace-`normalized` form, the plain-English `description`, the next
+`fires` as ISO-8601 instants in the requested frame, `never_fires` (no
+remaining occurrence), and the [schedule linter's](Schedule-Linting)
+findings. For a rejected expression it carries `valid: false` and the
+parser's `error` (including the Quartz dialect hints). `@reboot` returns
+`valid: true, reboot: true` with no fires. The `cron_validate_schedule`
+and `cron_explain_schedule` [MCP tools](MCP) serve this same payload to
+agents.
+
+```shell
+$ http get "http://127.0.0.1:8080/schedule/preview?expr=*/7 * * * *&count=2"
+{
+    "expression": "*/7 * * * *",
+    "timezone": "UTC",
+    "valid": true,
+    "reboot": false,
+    "normalized": "*/7 * * * *",
+    "description": "At minutes 00, 07, 14, 21, 28, 35, 42, 49, 56 past every hour, every day",
+    "fires": ["2026-07-18T15:42:00+00:00", "2026-07-18T15:49:00+00:00"],
+    "never_fires": false,
+    "lint": [
+        {
+            "code": "uneven-step",
+            "level": "warning",
+            "message": "'*/7' in the minute field: 7 does not divide the field's span of 60, so one interval at the wrap is only 4 minutes"
+        }
+    ]
+}
+```
+
+### `GET /schedule/pressure`
+
+The fleet's forward-looking collision heatmap: every enabled schedule's
+fires over the next `hours` (1 to 168, default 24), enumerated with the
+scheduler's own engine and bucketed by civil hour and minute in `tz`
+(default `UTC`; `400` for an unknown name). The payload carries the 24x60
+`grid`, the 60-bin `by_minute_fires`/`by_minute_jobs` histograms,
+`by_hour`, the `busiest_minute` headline, `empty_minutes`, `top_cells`
+(each naming up to ten jobs), and an `excluded` count of disabled and
+`@reboot` jobs. Full field reference on the
+[Schedule Pressure](Schedule-Pressure) page.
+
+### `GET /schedule/duplicates`
+
+Groups of jobs whose schedules fire on the identical instants, by the
+engine's semantic equality (`*/5` equals `0-59/5`; grouping includes the
+resolved timezone). Each group carries the most common source
+`expression`, a plain-English `description`, `timezone`, `count`, and the
+member `jobs`, sorted largest group first. See
+[Duplicate Schedule Detection](Duplicate-Schedule-Detection).
+
+### `GET /schedule/suggest`
+
+The least-loaded slot for a new job, scored on the same 24-hour fire walk
+as `/schedule/pressure`. `period` is `hourly` (pick a minute) or `daily`
+(pick a minute and hour; `400` otherwise), `tz` frames the daily pick.
+Returns the winning `expression`, its `fires_in_window`, the `busiest`
+slot for contrast, two `alternatives`, and a `hash_hint` naming the
+[`H` spelling](Hashed-Schedules) that spreads jobs without this endpoint.
+See [Suggest a Slot](Suggest-a-Slot).
+
+### `GET /schedule/why`
+
+Explains field by field why one job's schedule did or did not select one
+timestamp, decomposing the same match test the scheduler runs.
+
+Query parameters:
+
+| Parameter | Meaning |
+| --- | --- |
+| `job` | **Required.** The job name; a DAG's synthetic `dag:<name>` schedule job resolves too. `404` for an unknown name. |
+| `at` | **Required.** An ISO-8601 timestamp. With a UTC offset (`2026-07-14T09:00:00+02:00`, trailing `Z` accepted) it converts into the job's resolved timezone; a naive timestamp reads as wall time there. `400` when missing or unparseable. |
+
+The response carries one `checks` row per cron field (`field`, the
+probed `value` with its human `label`, the field's accepted values as
+prose in `allowed`, and `matched`), the overall `matches` verdict with
+the `failed` field names in field order, and the nearest real
+`previous_fire` / `next_fire` around the probe, computed with the
+scheduler's own occurrence walk in the job's zone. `notes` flags the
+semantics that make an answer genuinely surprising: `day-fields-and-rule`
+(both day fields restricted, exactly one matched, so classic Vixie cron
+would have fired; see [Schedule Linting](Schedule-Linting)) and
+`dst-skipped-time` / `dst-repeated-time` for a matching wall time a DST
+transition skips or repeats. An [`H` schedule](Hashed-Schedules) reports
+its `resolved` spelling and checks against the resolved slots. `@reboot`
+jobs answer `reboot: true` with no checks; a disabled job still explains
+its timetable and reports `enabled: false`. The `cron_why_no_run`
+[MCP tool](MCP) serves the same payload to agents. See
+[Why Didn't It Run?](Why-No-Run) for a walkthrough.
+
 ### `GET /cluster`
 
 Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
@@ -187,7 +310,7 @@ When no `cluster` section is configured, it returns
 `{"enabled": false, "peers": []}`. When a cluster section is present it returns
 `enabled: true` plus a `backend` field naming the active leadership backend
 (`gossip`, `kubernetes`, `etcd`, or `filesystem`) and the node's view: its
-`node_name` and `job_set_id`, the computed `cluster_size` and `quorum`, whether
+`node_name` and [`job_set_id`](Job-Set-ID), the computed `cluster_size` and `quorum`, whether
 `elect_leader` is on, the `distribution` mode (`single-leader` or `spread`),
 whether any conflict is pausing `Leader` jobs (`conflict`, the umbrella flag),
 whether this node is `quorate`, the elected `leader`
@@ -480,8 +603,11 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `captureStdout`, `captureStderr` | Which output streams the job captures, and therefore which are available from `/jobs/{name}/logs`. |
 | `utc`, `timezone` | The schedule's reference frame: `utc` (default `true`) and the IANA `timezone` name, or `null`. |
 | `running`, `pids` | Whether any instance is currently running, and the PIDs of running instances whose subprocess has started. |
-| `running_resources` | Present only while a [`monitorResources`](Configuration-Reference#metrics) job has a running instance: the **live** CPU/memory of the running instance(s), summed — `{cpu_percent, cpu_seconds, rss_bytes, instances}`. Omitted otherwise. `cpu_percent` is usage since the last sample and can exceed 100 across cores. |
+| `running_resources` | Present only while a [`monitorResources`](Resource-Monitoring) job has a running instance: the **live** CPU/memory of the running instance(s), summed — `{cpu_percent, cpu_seconds, rss_bytes, instances}`. Omitted otherwise. `cpu_percent` is usage since the last sample and can exceed 100 across cores. |
 | `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, currently running, or a one-off `@reboot` schedule). |
+| `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date), distinguishing the dead-schedule `null` above from the running/disabled ones. See [Schedule Linting](Schedule-Linting). |
+| `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this job's crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own timezone. |
+| `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
 | `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |
@@ -501,6 +627,8 @@ $ http get http://127.0.0.1:8080/jobs
         "running": false,
         "pids": [],
         "scheduled_in": 42.1,
+        "never_fires": false,
+        "schedule_findings": [],
         "last_run": {
             "outcome": "success",
             "exit_code": 0,
@@ -528,7 +656,7 @@ aggregate statistics. Returns `404 Not Found` for an unknown job.
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
 `fail_reason`, and `resources`). `resources` is `null` unless the job opted
-into [`monitorResources`](Configuration-Reference#metrics), in which case it is
+into [`monitorResources`](Resource-Monitoring), in which case it is
 `{cpu_user_seconds, cpu_system_seconds, cpu_total_seconds, max_rss_bytes,
 samples}` for that run. Besides `success`, `failure`, and `cancelled`, `outcome` can
 be `unknown`: a crash-reconciled run, recorded when the daemon exited or lost
@@ -542,7 +670,7 @@ with no `started_at` or `duration` (`fail_reason` explains the interruption).
 | `total`, `success`, `failure`, `cancelled` | Counts by outcome over the retained history. |
 | `success_rate` | Success rate over runs that ran to completion. Cancellations are user-initiated, not a verdict on the job, so they are excluded; `null` when no run has completed. |
 | `avg_duration`, `min_duration`, `max_duration`, `last_duration` | Duration aggregates in seconds, over runs with a recorded duration; `null` when there are none. |
-| `avg_cpu_seconds`, `max_cpu_seconds`, `last_cpu_seconds` | CPU-time aggregates over the [`monitorResources`](Configuration-Reference#metrics) runs in the window; `null` when none were monitored. |
+| `avg_cpu_seconds`, `max_cpu_seconds`, `last_cpu_seconds` | CPU-time aggregates over the [`monitorResources`](Resource-Monitoring) runs in the window; `null` when none were monitored. |
 | `avg_rss_bytes`, `max_rss_bytes`, `last_rss_bytes` | Peak-RSS aggregates (bytes) over the monitored runs; `null` when none were monitored. |
 
 ```shell
@@ -578,7 +706,9 @@ $ http get http://127.0.0.1:8080/jobs/test-01/runs
 Chart-grade CPU/RSS time series for one job — the heavyweight sibling of the
 summary numbers that ride `GET /jobs` and `GET /jobs/{name}/runs`. The
 dashboard fetches it lazily when a job's **Resources** tab is opened, never on
-the poll loop. Returns `404 Not Found` for an unknown job.
+the poll loop. The sampler behind these series is documented on
+[resource monitoring](Resource-Monitoring). Returns `404 Not Found` for an
+unknown job.
 
 ```shell
 $ http get http://127.0.0.1:8080/jobs/test-01/resources runs==5
@@ -620,7 +750,7 @@ Content-Type: application/json; charset=utf-8
 
 A `series` is a list of `[t, cpu_percent, rss_bytes]` points, oldest first,
 with `t` in epoch seconds. Points are recorded every
-[`monitorResources.interval`](Configuration-Reference#metrics) seconds and
+[`monitorResources.interval`](Resource-Monitoring) seconds and
 downsampled in place once a run exceeds its configured `history` cap (mean
 CPU%, **peak** RSS per merged bucket, so spikes survive), so a series is
 bounded no matter how long the run. `live` carries the run-so-far series of
@@ -755,7 +885,9 @@ Recent dag_runs (newest first), each with its state and a per-state task count:
    "taskStates": {"success": 3}}]}
 ```
 
-`404` if the DAG is not configured.
+The `limit` query parameter caps the number of runs returned (default 50,
+max 500); a missing or unparseable value falls back to the default rather
+than erroring. `404` if the DAG is not configured.
 
 #### `GET /dags/{name}/runs/{run_key}`
 
@@ -815,20 +947,23 @@ store degrades to health-only rather than erroring.
 The documents of one `kv/`, `cursor/`, or `idem/` namespace (`400` for any
 other namespace). KV values are redacted to a `valueSize` / `valueType`
 summary; cursor watermarks and idempotency claim metadata are returned
-verbatim.
+verbatim. Unlike `GET /state`, which degrades to `{"enabled": false}` on a
+stateless install, this route (and `/state/records`) returns `404`
+(`state store is not configured`) when no `state:` section is configured.
 
 #### `GET /state/records?stream=<stream>&limit=<n>`
 
 The newest records of one stream, newest first (default 100, max 500).
 Archived-output `logs/` streams are refused with `403`: they carry raw job
-output, which the metadata-only stance keeps off this surface.
+output, which the metadata-only stance keeps off this surface. A missing or
+empty `stream` parameter is a `400`; a stateless install is a `404`
+(`state store is not configured`), as for `/state/documents`.
 
 ### `GET /job-set-id`
 
 Returns this instance's job-set id: the order-independent fingerprint of every
 job's effective configuration that replicas compare to confirm they hold the
-same set of jobs (see
-[the job-set id foundation](Clustering-and-Leader-Election#the-job-set-id-foundation)).
+same set of jobs (see [job-set id](Job-Set-ID)).
 The response is `text/plain` by default; with `Accept: application/json` it is
 a JSON object that also carries the job count.
 
@@ -920,7 +1055,7 @@ token when one is configured), and additionally validates the `Origin` header
 (`413`). If `mcp.enabled` is set with no `web.authToken` on a routable
 listener, cronstable **fails closed** at config load (raises a `ConfigError`)
 unless `mcp.allowUnauthenticated: true`. Desktop MCP clients reach it over the
-`cronstable mcp` stdio bridge. Full tool catalog and configuration:
+`cronstable mcp` stdio bridge. Full tool catalog: [MCP](MCP); configuration:
 [`mcp`](Configuration-Reference#mcp).
 
 ## Response headers
@@ -1211,7 +1346,9 @@ positive `ttl` bounds the dedupe window (`0` is a permanent claim).
 The lock is a fleet-wide mutex (or a semaphore, with `permits > 1`) held as a TTL
 lease that the daemon renews for as long as the job holds it and releases the
 instant the job releases it or the run ends -- so a job that crashes or forgets
-to unlock never leaks a lock. `wait: true` retries for up to `blockSeconds`
+to unlock never leaks a lock. `permits` outside `1`-`1024` is rejected up
+front with a `400`: the acquire pass probes permits sequentially, so the cap
+keeps a fully-contended pass bounded. `wait: true` retries for up to `blockSeconds`
 before giving up; without it the call makes a single pass over the permits and
 returns `{acquired: false}` when they are all taken. Like every cronstable
 coordination primitive the lock is at-least-once, not exactly-once (the `fence`

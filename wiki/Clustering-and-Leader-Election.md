@@ -189,18 +189,16 @@ semantics in [Per-job policy](#per-job-policy), however, apply to every backend.
 A **job-set id** is an order-independent fingerprint of the set of jobs an
 instance is running: two instances produce the *same* id if and only if they
 hold the same set of jobs. It is taken over the *effective* (post-merge)
-configuration of every job, normalises equivalent schedule spellings,
-fingerprints `user`/`group` as configured (not as a resolved uid/gid), and
-embeds no secret material. The scheme is versioned with a `v1:` prefix so ids
-are only ever compared within one scheme.
+configuration of every job, embeds no secret material, and is versioned with a
+`v1:` prefix so ids are only ever compared within one scheme. The full
+treatment (exactly which fields it covers, the no-secrets guarantees, and
+every surface it appears on) is on the [job-set id](Job-Set-ID) page.
 
 The id is what the cluster compares: agreement means "we are running the same
 jobs". It is available on the standalone [`GET /job-set-id`](HTTP-API) endpoint,
 in the dashboard header, and is logged at startup and whenever a reload changes
 it. `clusterPolicy` (below) is part of the id, so two replicas that disagree on
 a job's policy show up as drift rather than silently coordinating differently.
-The full treatment of the job-set id lives in the
-[project README](https://github.com/ptweezy/cronstable#job-set-id).
 
 ## Cluster peer attestation
 
@@ -229,7 +227,14 @@ cluster:
 
 Run `cronstable --validate-config` before deploying to catch a bad `cluster`
 section (peer list, TLS paths, lease ordering) at rest rather than at startup;
-see the [Command-Line Reference](CLI-Reference).
+see the [Command-Line Reference](CLI-Reference). Address formats are part of
+that load-time validation: `listen` and every `peers[].host` must be
+`host:port` with a port in 1-65535, and an IPv6 literal must be written
+bracketed (`[2001:db8::1]:8443`); the bare form is rejected with a
+`ConfigError` up front rather than mis-splitting at the last colon and
+failing opaquely at connect time. The same checks apply to the
+[`cluster.observability`](Configuration-Reference#observability-overlay)
+mesh addresses.
 
 The trust model is deliberately small and keeps no shared state:
 
@@ -354,6 +359,10 @@ defer-vs-abandon-vs-handoff lifecycle is documented in
   stops all `Leader` jobs cluster-wide), which cronstable flags at runtime with a
   prominent WARNING. Remove the self entry rather than relying on the
   exclusion.
+* An exact duplicate `peers` entry is likewise dropped at config load (the
+  first occurrence is kept): the cluster size, and therefore the quorum, is
+  derived from the peer list, so a copy-pasted peer would otherwise inflate
+  `N` and cost fault tolerance.
 * The computed size, quorum, elected leader, and whether this node is the leader
   are all shown at `GET /cluster` and in the dashboard panel.
 
@@ -1200,6 +1209,14 @@ cluster:
   requested (its `--min-lease-ttl` setting, or server load), which the backend
   honours: a smaller server-granted TTL narrows the effective leader window
   accordingly.
+* **Small TTLs and etcd latency.** The renew round budgets its per-request
+  timeout from the TTL (roughly `(ttl - ttl/3 keepalive - 1s skew margin) / 5`
+  per POST), so a `ttl` below 9 leaves each renew POST less than about one
+  second. Config load then logs a one-time, non-fatal advisory: if a single
+  round-trip to etcd is slower than that budget (e.g. a cross-AZ/region
+  endpoint), every renew round times out and the node treats a reachable etcd
+  as unreachable, so its `Leader` jobs fail closed. Raise `cluster.etcd.ttl`
+  unless etcd is local and low-latency.
 
 ### Filesystem (`backend: filesystem`)
 
@@ -1431,6 +1448,7 @@ has the RBAC + `Deployment` to apply against any cluster (k3d/kind for local).
 
 ## See also
 
+- [job-set id](Job-Set-ID): the fingerprint the cluster compares (exact field coverage, no-secrets guarantees, every surface it appears on).
 - [Configuration Reference](Configuration-Reference): the `cluster` section and `clusterPolicy` option schema.
 - [HTTP Control API](HTTP-API): the `GET /cluster` endpoint.
 - [Web Dashboard](Web-Dashboard): the cluster panel and per-job policy display.

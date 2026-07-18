@@ -56,7 +56,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `dags` | `Seq(Map)` of DAG definitions | No | Durable orchestration workflows: each DAG is a graph of tasks with `dependsOn` edges, run on a schedule. Requires a `state` section with `jobApi` enabled. See [Orchestration and DAGs](Orchestration-and-DAGs). |
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
-| `mcp` | `Map` | No | Enables the Model Context Protocol server (`POST /mcp` on the web listeners, plus the `cronstable mcp` stdio bridge) so AI agents can observe and, opt-in, control jobs/DAGs. Requires a `web` section. Off by default. See [`mcp`](#mcp) below. |
+| `mcp` | `Map` | No | Enables the Model Context Protocol server (`POST /mcp` on the web listeners, plus the `cronstable mcp` stdio bridge) so AI agents can observe and, opt-in, control jobs/DAGs. Requires a `web` section. Off by default. See [`mcp`](#mcp) below and [MCP](MCP). |
 | `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `state` | `Map` | No | Enables the opt-in durable state store: restart-durable run history, missed-run catch-up, restart-surviving retries, and once-per-boot `@reboot` runs. Without it cronstable is stateless (everything in memory, exactly as before). See [Durable State](Durable-State). |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
@@ -70,6 +70,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `allowedOrigins` | `Seq(Str)` | `[]` | Extra exact-match browser `Origin`s allowed to call the **mutating** endpoints (`POST /jobs/{name}/start`, `/jobs/{name}/cancel`, `/dags/{name}/trigger`, `/dags/{name}/backfill`, task decisions). Cross-site browser requests to those endpoints are refused `403` as a CSRF/DNS-rebinding defense; same-origin requests (the served dashboard) and clients that send no `Origin` (curl, monitoring) always pass, and `/mcp` keeps enforcing its own `mcp.allowedOrigins`. Setting `headers` with `Access-Control-Allow-Origin: <origin>` implicitly allow-lists that origin; `Access-Control-Allow-Origin: "*"` disables the check (logged loudly). |
 | `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, cronstable refuses to start. |
 | `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. Only ever applies to unix sockets, so it is irrelevant on Windows (where `unix://` listeners are unsupported). |
+| `ui` | `Bool` | `true` | Serve the browser dashboard at `/`. `ui: false` omits the dashboard page while every JSON endpoint keeps working, for an API-only deployment. See [Web Dashboard](Web-Dashboard). |
 | `metrics` | `Bool \| Map` with `enabled` / `public` (each `Bool`) and `durationBuckets` (`Seq(Float)`) | enabled | The Prometheus `GET /metrics` endpoint, served by default whenever the web API is on. `metrics: false` (bool shorthand) disables it; the map form sets `enabled` (default `true`), `public` (default `false`; exempts only `/metrics` from `authToken`), and `durationBuckets` (histogram bounds in seconds; must be finite, positive, and strictly increasing, else a `ConfigError`). See [Metrics with Prometheus](Metrics-with-Prometheus). |
 | `nodeHistory` | `Bool \| Map` with `enabled` (`Bool`), `interval` (`Float`) and `points` (`Int`) | enabled | Background node CPU/memory sampling for the dashboard's node history chart, served by `GET /node/history`. On by default whenever the web API is on; `nodeHistory: false` disables the sampling task. The map form sets `interval` (seconds between samples, default `5.0`, minimum `1.0`) and `points` (ring size, default `720` — the last hour at the default cadence; 10–50000). The ring is in-memory only and follows the web app's lifecycle. |
 
@@ -96,10 +97,10 @@ as the REST API, so there is one source of truth.
 | `allowedOrigins` | `Seq(Str)` | `[]` | Exact-match browser `Origin`s allowed to call `/mcp`. Empty serves non-browser clients only, so a present `Origin` not on the list is refused `403` (a DNS-rebinding defense). A non-empty list additionally answers CORS preflight with a scoped `Access-Control-Allow-Origin`. |
 | `allowUnauthenticated` | `Bool` | `false` | Serve `/mcp` on a routable (non-loopback, non-socket) listener even with no `web.authToken`. Fail-closed default: with no token the web app has no auth middleware at all, so an enabled `/mcp` on a routable address raises a `ConfigError` at load. Set true only when the endpoint is protected by other means (an mTLS-terminating proxy, a network policy). |
 | `resources` | `Bool` | `true` | Expose MCP **resources**: URI-addressable read-only context like `cronstable://status` and `cronstable://jobs/{name}` that mirrors the read tools for clients that consume resources. Their scope follows `toolsets` (a `cronstable://dags/{name}` resource is served only when the `dags` toolset is on). |
-| `prompts` | `Bool` | `true` | Expose MCP **prompts**: canned triage playbooks (`triage_job_failure`, `why_did_dag_run_fail`, `blast_radius`, `fleet_health_summary`, `backfill_plan`) that chain the read tools into repeatable workflows. |
+| `prompts` | `Bool` | `true` | Expose MCP **prompts**: canned triage playbooks (`triage_job_failure`, `why_did_dag_run_fail`, `blast_radius`, `fleet_health_summary`, `backfill_plan`) that chain the read tools into repeatable workflows. Like resources, their scope follows `toolsets`: `why_did_dag_run_fail` and `backfill_plan` are served only when the `dags` toolset is on, so the default `[observe]` exposes the other three. |
 | `instructions` | `EmptyNone() \| Str` | none | Optional free-text server `instructions` surfaced to the client at `initialize`. |
-| `maxRows` | `Int` | `200` | Ceiling on any list tool's `limit`; a larger request is capped (never an error) and an opaque `nextOffset` is offered for the rest. |
-| `maxBodyBytes` | `Int` | `1048576` | Cap on a single `/mcp` request body (tool arguments arrive from an LLM); an oversized POST is refused `413`. |
+| `maxRows` | `Int` | `200` | Ceiling on any list tool's `limit`; a larger request is capped (never an error) and an opaque `nextOffset` is offered for the rest. Must be `>= 1` (a `ConfigError` at load). |
+| `maxBodyBytes` | `Int` | `1048576` | Cap on a single `/mcp` request body (tool arguments arrive from an LLM); an oversized POST is refused `413`. Must be `>= 1` (a `ConfigError` at load). |
 
 ```yaml
 web:
@@ -120,6 +121,10 @@ mcp:
 Wire a client to it with, e.g., `claude mcp add --transport http cronstable
 https://host/mcp --header "Authorization: Bearer $TOKEN"`, or over stdio with
 `claude mcp add cronstable -- cronstable mcp --url http://127.0.0.1:8080`.
+
+This section is only the config schema. The full tool catalog, the prompts and
+resources, client setup recipes, and the stdio bridge's flags are documented in
+[MCP](MCP).
 
 ### `cluster`
 
@@ -159,11 +164,19 @@ required **only for this backend**:
 | `electLeader` | `Bool` | `false` | When true, only the quorum-gated elected leader runs *scheduled* jobs (manual API triggers and retries are unaffected). Off by default, so a gossip `cluster` section is observe-only until opted in. The lease backends imply `electLeader: true` (configuring one is opting into leadership). |
 | `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). With a lease backend (`kubernetes`/`etcd`/`filesystem`) a non-default `distribution` is a **hard `ConfigError` at load** (a single lease holder cannot be a per-job owner), not a silent fallback. See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
 
-Gossip load-time validation (in addition to the numeric ranges above): with
-`electLeader: true`, a **2-node** cluster (one peer) is rejected outright with a
-`ConfigError` (a quorum of 2 needs both up, strictly worse than one replica);
-an **even** cluster size **greater than 2** is allowed but logs a warning (an
-odd count is best for a clean majority).
+Gossip load-time validation (in addition to the numeric ranges above): every
+address -- `listen` and each `peers[].host` -- must be `host:port` with a
+numeric port in `1`-`65535`, and an IPv6 host must be written **bracketed**
+(`[2001:db8::1]:8900`); a bare IPv6 literal is a `ConfigError` at load
+(`looks like a bare IPv6 address; write it as [ipv6]:port`), because splitting
+it at the last colon would silently mis-read the host and, for a peer, drop it
+from quorum with no error. The same address checks apply to the
+[observability overlay](#observability-overlay)'s `listen`/`peers`, which are
+built through the same code path. With `electLeader: true`, a **2-node**
+cluster (one peer) is rejected outright with a `ConfigError` (a quorum of 2
+needs both up, strictly worse than one replica); an **even** cluster size
+**greater than 2** is allowed but logs a warning (an odd count is best for a
+clean majority).
 
 **Kubernetes backend** (`backend: kubernetes`), under `cluster.kubernetes`. A
 `coordination.k8s.io/v1` `Lease` is the fence. Defaults from `DEFAULT_K8S`:
@@ -199,6 +212,16 @@ traffic sent in cleartext, a `ConfigError`). Likewise a `username` or resolved
 `password` requires **every** endpoint to be `https://`, so the credentials and
 bearer token are never POSTed in cleartext; a `username` without a resolvable
 `password` is also rejected.
+
+One more etcd check is advisory rather than fatal: a small `ttl` also shrinks
+the per-request timeout each renew POST gets (roughly
+`(ttl - max(1, ttl/3) - 1s) / 5`), and when that budget falls below ~1 second
+-- any integer `ttl` from `3` to `8` -- load emits a one-time startup advisory.
+If a single round-trip to etcd is slower than the budget (e.g. a cross-AZ or
+cross-region endpoint), every renew round times out, the node treats a
+reachable etcd as unreachable, and `Leader` jobs fail closed. It is the
+operator's explicit `ttl` choice and a local, low-latency etcd is fine, so
+cronstable warns rather than rejects; raise `ttl` otherwise.
 
 **Filesystem backend** (`backend: filesystem`), under `cluster.filesystem`. The
 flock-guarded, fence-counted TTL lease of the durable state store's filesystem
@@ -385,9 +408,11 @@ Per-task keys:
 | `onReject` | `fail` / `skip` | `fail` | Approval gate: what a rejection does. |
 
 Plus the shared launch fields a job takes: `shell`, `environment`,
-`captureStdout` / `captureStderr`, `saveLimit`, `maxLineLength`, `streamPrefix`,
-`failsWhen`, `executionTimeout`, `killTimeout`, `user` / `group`, `env_file`,
-`secrets`, `stateAllowedScopes`.
+`captureStdout` / `captureStderr`, `monitorResources`, `saveLimit`,
+`maxLineLength`, `streamPrefix`, `failsWhen`, `executionTimeout`,
+`killTimeout`, `statsd`, `user` / `group`, `env_file`, `secrets`,
+`stateAllowedScopes`. Where a task's `monitorResources` numbers surface is
+covered under [Metrics](#metrics) below.
 
 The graph is validated at load: unknown/duplicate ids, a cycle, a self-edge, or
 an `expand.fromTask` that is not a direct non-mapped dependency are config
@@ -447,8 +472,8 @@ See [Schedules and Timezones](Schedules-and-Timezones).
 | `concurrencyPolicy` | `Enum(["Allow", "Forbid", "Replace"])` | `Allow` | Behavior when a scheduled run overlaps a still-running instance. `Allow`: run concurrently. `Forbid`: skip the new run. `Replace`: cancel the running instance and start the new one. |
 | `concurrencyScope` | `Enum(["node", "cluster"])` | `node` | How far `concurrencyPolicy` reaches. `node` (default): an overlap is another instance in this cronstable process, exactly as before. `cluster`: `Forbid`/`Replace` also exclude instances of the job on other nodes sharing the [`state`](#state) store, via a per-job TTL slot lease (`slots/<job name>`) in the state store -- it works with or without a `cluster` section. Requires a `state` section somewhere in the assembled config: without one, load fails with a `ConfigError` naming the offending job(s). `cluster` with `concurrencyPolicy: Allow` is likewise a `ConfigError` at load (Allow places no bound on concurrent instances, so widening its scope gates nothing). Enforcement is best-effort at-least-once, not exactly-once; `state.slotTtlSeconds` and `state.onStoreUnavailable` govern the edges. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation) **only when set to `cluster`** (existing configs keep their digests; replicas disagreeing on it show as drift). See [Concurrency and Timeouts](Concurrency-and-Timeouts#concurrency-across-a-cluster). |
 | `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
-| `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). |
-| `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals, so both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). |
+| `executionTimeout` | `Float` | none | Seconds after which a still-running run is terminated. Unset means no timeout. Must be `> 0` when set. Termination signals the job's whole process group/tree, so the timeout bounds the run's work -- descendants included -- not just its root process; the platform-specific escalation is under `killTimeout` below. See [Running on Windows](Running-on-Windows). |
+| `killTimeout` | `Float` | `30` | Seconds to wait after the graceful terminate before the forced kill. Must be `>= 0`. A job spawns in its own session/process group (`start_new_session` on POSIX), and cancellation takes the whole group down, not just the process cronstable spawned. On POSIX the graceful step is a `SIGTERM` to the **group** (trappable); once the direct child exits or `killTimeout` elapses, the group is **unconditionally** `SIGKILL`ed -- the leader exiting says nothing about descendants still holding the job's output pipes, and an already-empty group makes that a no-op. On Windows there is no graceful group signal: the graceful step remains an immediate `TerminateProcess` of the direct child (ungraceful, no notification), and the forced step walks the live process tree with `taskkill /F /T`; a descendant already orphaned when `taskkill` runs is missed, which is why the post-kill stream drain is separately bounded. See [Running on Windows](Running-on-Windows). |
 
 See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
@@ -619,7 +644,7 @@ is raised. Privilege switching is **not supported on Windows**: a job with
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `statsd` | `Map({"prefix": Str, "host": Str, "port": Int})` | none | When set, emit start/stop/success/duration metrics over UDP. All three keys are required. |
-| `monitorResources` | `Bool` or `Map` | `false` | Sample each run's CPU time and peak resident memory (RSS) by polling the job's process tree while it runs. Observability only: the numbers ride the run record into the dashboard, `GET /metrics` and statsd, but never change a run's success/failure verdict. Off by default; a per-instance sampling task is spawned only when it is on. Set it under `defaults:` to enable it fleet-wide. The map form tunes it: `enabled` (`Bool`, default `true`), `interval` (`Float` seconds between samples, default `1.0`), `history` (`Int` chart-series points kept per run, default `240`; `0` keeps summary numbers only). |
+| `monitorResources` | `Bool` or `Map` | `false` | Sample each run's CPU time and peak resident memory (RSS) by polling the job's process tree while it runs. Observability only: the numbers ride the run record into the dashboard, `GET /metrics` and statsd, but never change a run's success/failure verdict. Off by default; a per-instance sampling task is spawned only when it is on. Set it under `defaults:` to enable it fleet-wide. The map form tunes it: `enabled` (`Bool`, default `true`), `interval` (`Float` seconds between samples, default `1.0`), `history` (`Int` chart-series points kept per run, default `240`; `0` keeps summary numbers only). Full feature guide: [resource monitoring](Resource-Monitoring). |
 
 See [Metrics with statsd](Metrics-with-Statsd). Prometheus metrics are not
 configured per job: the `GET /metrics` endpoint is global, tuned under
@@ -634,7 +659,9 @@ appears in the dashboard run history and stats, in the durable run record's
 `resources` object (so it survives a restart), and as the metrics listed in
 [Metrics with Prometheus](Metrics-with-Prometheus). Report templates and the
 shell reporter also receive `cpu_seconds` / `max_rss_bytes`
-(`CRONSTABLE_CPU_SECONDS` / `CRONSTABLE_MAX_RSS_BYTES`).
+(`CRONSTABLE_CPU_SECONDS` / `CRONSTABLE_MAX_RSS_BYTES`). This section covers
+the config surface; the full feature guide is
+[resource monitoring](Resource-Monitoring).
 
 DAG tasks accept `monitorResources` too, but surface the result differently:
 a finished task instance's usage is recorded in the `resources` object of its

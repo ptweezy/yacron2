@@ -249,7 +249,11 @@ class MCPHandler:
             "jobs, DAGs, the cluster/fleet, metrics and durable state. "
             "Mutating tools (run/cancel a job, trigger/backfill/approve a "
             "DAG) require confirm=true and appear only when the operator "
-            "disabled readOnly. Start with cron_get_status or cron_list_jobs."
+            "disabled readOnly. Start with cron_get_status or "
+            "cron_list_jobs. When authoring a schedule, verify it with "
+            "cron_validate_schedule / cron_explain_schedule (the daemon's "
+            "own engine) before proposing it; cron_why_no_run explains why "
+            "a job's schedule did or did not fire at a given timestamp."
         )
         result["instructions"] = instructions
         return result
@@ -638,6 +642,116 @@ class MCPHandler:
                 False,
                 True,
             ),
+            (
+                "observe",
+                False,
+                "cron_schedule_pressure",
+                "Schedule pressure",
+                "The fleet's collision heatmap: every enabled schedule's "
+                "fires over the next `hours` (default 24, max 168), bucketed "
+                "by hour and minute in `tz` (default UTC). Answers 'how many "
+                "jobs fire at :00?' and 'which minutes are empty?'.",
+                obj({"hours": _INT, "tz": _STR}),
+                self._t_schedule_pressure,
+                False,
+                True,
+            ),
+            (
+                "observe",
+                False,
+                "cron_schedule_duplicates",
+                "Duplicate schedules",
+                "Groups of jobs whose schedules fire on the identical "
+                "instants (semantic equality: */5 == 0-59/5, same timezone). "
+                "Use to spot copy-pasted schedules worth spreading out.",
+                obj({}),
+                self._t_schedule_duplicates,
+                False,
+                True,
+            ),
+            (
+                "observe",
+                False,
+                "cron_suggest_slot",
+                "Suggest a slot",
+                "The least-loaded slot for a new job, from the fleet's real "
+                "fires over the next 24h: `period` 'hourly' picks a minute, "
+                "'daily' a minute and hour; returns the cron expression, two "
+                "runners-up, and the busiest slot for contrast.",
+                obj(
+                    {
+                        "period": _enum(["hourly", "daily"]),
+                        "tz": _STR,
+                    }
+                ),
+                self._t_suggest_slot,
+                False,
+                True,
+            ),
+            (
+                "observe",
+                False,
+                "cron_validate_schedule",
+                "Validate a schedule",
+                "Parse and lint a cron expression BEFORE it becomes a job: "
+                "valid true/false with the engine's exact error (including "
+                "Quartz dialect hints), the plain-English description, the "
+                "normalized form, advisory lint findings and the first "
+                "upcoming fire, all from the daemon's own scheduling engine. "
+                "`tz` (IANA zone the job will run in) enables the DST "
+                "checks; `seed` (the prospective job name) resolves "
+                "Jenkins-style H slots.",
+                obj(
+                    {"expression": _STR, "tz": _STR, "seed": _STR},
+                    ["expression"],
+                ),
+                self._t_validate_schedule,
+                False,
+                True,
+            ),
+            (
+                "observe",
+                False,
+                "cron_explain_schedule",
+                "Explain a schedule",
+                "Decode a cron expression into a plain-English description, "
+                "its next `count` fires (default 5, max 60) as ISO instants "
+                "in `tz` (default UTC; pass the job's zone), and advisory "
+                "lint findings, so a schedule can be authored, verified "
+                "against the daemon's own engine, and round-tripped to the "
+                "user for confirmation. `seed` (a job name) resolves "
+                "Jenkins-style H slots.",
+                obj(
+                    {
+                        "expression": _STR,
+                        "count": _INT,
+                        "tz": _STR,
+                        "seed": _STR,
+                    },
+                    ["expression"],
+                ),
+                self._t_explain_schedule,
+                False,
+                True,
+            ),
+            (
+                "observe",
+                False,
+                "cron_why_no_run",
+                "Why no run?",
+                "Explain field-by-field why a job's schedule did or did not "
+                "select a timestamp ('day-of-week Tuesday is not in Monday "
+                "and Friday'), with the nearest real fire on each side and "
+                "notes on this dialect's day-field AND rule and DST "
+                "effects. `at` is ISO 8601; a naive timestamp reads as wall "
+                "time in the job's own timezone. If the schedule DOES "
+                "match, the answer points at execution history "
+                "(cron_list_runs) instead.",
+                obj({"name": _STR, "at": _STR}, ["name", "at"]),
+                self._t_why_no_run,
+                False,
+                True,
+            ),
             # ---- dags ----
             (
                 "dags",
@@ -952,6 +1066,143 @@ class MCPHandler:
                 total, len(samples)
             ),
         )
+
+    async def _t_schedule_pressure(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        # no clamp here: croninfo.schedule_pressure clamps hours to
+        # [1, 168] authoritatively and echoes the clamped value back in
+        # the payload; only the default is applied at this layer.
+        hours = _opt_int(args.get("hours"))
+        hours = 24 if hours is None else hours
+        tz = args.get("tz")
+        if tz is not None and not isinstance(tz, str):
+            raise _ToolInputError("`tz` must be an IANA timezone string")
+        try:
+            # offloaded to the default executor (see the _async wrapper in
+            # cron.py): the up-to-168h occurrence walk is pure CPU and must
+            # not stall job dispatch on the scheduler's event loop.
+            payload = await self._cron.schedule_pressure_payload_async(
+                hours, tz or None
+            )
+        except ValueError as err:
+            return _tool_error(str(err))
+        busiest = payload["busiest_minute"]
+        return _result(
+            payload,
+            "{} fire(s) from {} job(s) in the next {}h; busiest minute :{:02d}"
+            " ({} job(s)), {} minute(s) empty".format(
+                payload["total_fires"],
+                payload["jobs"],
+                payload["hours"],
+                busiest["minute"],
+                busiest["jobs"],
+                len(payload["empty_minutes"]),
+            ),
+        )
+
+    async def _t_schedule_duplicates(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        # offloaded (see cron.py): the fleet walk must not block the loop.
+        payload = await self._cron.schedule_duplicates_payload_async()
+        groups = payload["groups"]
+        biggest = (
+            "; biggest: {} job(s) sharing '{}'".format(
+                groups[0]["count"], groups[0]["expression"]
+            )
+            if groups
+            else ""
+        )
+        return _result(
+            payload,
+            "{} duplicate group(s) across {} scheduled job(s){}".format(
+                len(groups), payload["jobs"], biggest
+            ),
+        )
+
+    async def _t_suggest_slot(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        period = args.get("period") or "hourly"
+        tz = args.get("tz")
+        if tz is not None and not isinstance(tz, str):
+            raise _ToolInputError("`tz` must be an IANA timezone string")
+        try:
+            # offloaded (see cron.py): the 24h fleet walk must not block
+            # the loop; the bad-period/timezone ValueError still surfaces
+            # at the await.
+            payload = await self._cron.schedule_suggest_payload_async(
+                period, tz or None
+            )
+        except ValueError as err:
+            return _tool_error(str(err))
+        return _result(
+            payload,
+            "least-loaded {} slot: '{}' ({} fire(s) already there "
+            "in 24h)".format(
+                payload["period"],
+                payload["expression"],
+                payload["fires_in_window"],
+            ),
+        )
+
+    @staticmethod
+    def _preview_args(
+        args: Dict[str, Any],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """The shared `tz`/`seed` arguments of the schedule sandboxes."""
+        tz = args.get("tz")
+        if tz is not None and not isinstance(tz, str):
+            raise _ToolInputError("`tz` must be an IANA timezone string")
+        seed = args.get("seed")
+        if seed is not None and not isinstance(seed, str):
+            raise _ToolInputError("`seed` must be a string (a job name)")
+        return (tz or None), (seed or None)
+
+    async def _t_validate_schedule(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        expr = _req_str(args, "expression")
+        tz, seed = self._preview_args(args)
+        try:
+            # count=1: the gate needs validity, lint and never_fires, not a
+            # fire list; the single fire keeps never_fires truthful and
+            # doubles as a confirmation of the first launch instant.
+            payload = self._cron.schedule_preview_payload(
+                expr, tz, count=1, seed=seed
+            )
+        except ValueError as err:
+            return _tool_error(str(err))
+        return _result(payload, _preview_summary(payload))
+
+    async def _t_explain_schedule(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        expr = _req_str(args, "expression")
+        tz, seed = self._preview_args(args)
+        count = _opt_int(args.get("count"))
+        count = 5 if count is None else max(1, min(count, 60))
+        try:
+            payload = self._cron.schedule_preview_payload(
+                expr, tz, count=count, seed=seed
+            )
+        except ValueError as err:
+            return _tool_error(str(err))
+        return _result(payload, _preview_summary(payload))
+
+    async def _t_why_no_run(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        name = _req_str(args, "name")
+        at = _req_str(args, "at")
+        try:
+            payload = self._cron.schedule_why_payload(name, at)
+        except ValueError as err:
+            return _tool_error(str(err))
+        if payload is None:
+            return _tool_error(
+                "job not found: {!r}. Use cron_list_jobs to enumerate.".format(
+                    name
+                )
+            )
+        return _result(payload, _why_summary(payload))
 
     async def _t_get_version(self, args: Dict[str, Any]) -> Dict[str, Any]:
         data = {
@@ -1558,6 +1809,74 @@ def _result(structured: Dict[str, Any], summary: str) -> Dict[str, Any]:
 def _tool_error(message: str) -> Dict[str, Any]:
     """A tool-execution failure (isError:true), readable by the model."""
     return {"content": [{"type": "text", "text": message}], "isError": True}
+
+
+def _preview_summary(payload: Dict[str, Any]) -> str:
+    """The one-line verdict of a validate/explain schedule payload."""
+    if not payload.get("valid"):
+        return "INVALID: {}".format(payload.get("error"))
+    if payload.get("reboot"):
+        return (
+            "valid: @reboot runs once when the daemon starts, never on a "
+            "timetable"
+        )
+    parts = ["valid: {}".format(payload["description"])]
+    if payload.get("never_fires"):
+        parts.append(
+            "WARNING: no future occurrence, this schedule never fires"
+        )
+    else:
+        warnings = sum(
+            1 for f in payload["lint"] if f.get("level") == "warning"
+        )
+        notes = len(payload["lint"]) - warnings
+        if warnings or notes:
+            parts.append(
+                "{} lint warning(s), {} note(s)".format(warnings, notes)
+            )
+        fires = payload.get("fires") or []
+        if fires:
+            parts.append("first fire {}".format(fires[0]))
+    return "; ".join(parts)
+
+
+def _why_summary(payload: Dict[str, Any]) -> str:
+    """The one-line verdict of a cron_why_no_run payload."""
+    name = payload["job"]
+    if payload.get("reboot"):
+        return (
+            "job {!r} is @reboot: it runs once when the daemon starts and "
+            "never fires on a timetable".format(name)
+        )
+    if payload["matches"]:
+        text = "YES: the schedule of job {!r} selects {}".format(
+            name, payload["at_in_zone"]
+        )
+        # a DST note rewrites the story ("fired at the shifted wall time"),
+        # so it belongs in the one-line verdict, not only in the notes.
+        for note in payload["notes"]:
+            if note["code"].startswith("dst-"):
+                text += "; BUT " + note["message"]
+        if not payload["enabled"]:
+            return text + ", but the job is disabled, so it did not launch"
+        return text + (
+            "; if no run is on record (cron_list_runs), look at execution, "
+            "not the schedule: daemon downtime, concurrencyPolicy, or "
+            "cluster leadership"
+        )
+    matched = [c["field"] for c in payload["checks"] if c["matched"]]
+    failed = [
+        "{} {} is not in {}".format(c["field"], c["label"], c["allowed"])
+        for c in payload["checks"]
+        if not c["matched"]
+    ]
+    text = "NO"
+    if matched:
+        text += ": {} matched".format(", ".join(matched))
+    text += "; " + "; ".join(failed)
+    if not payload["enabled"]:
+        text += " (the job is also disabled)"
+    return text
 
 
 def _req_str(args: Dict[str, Any], key: str) -> str:

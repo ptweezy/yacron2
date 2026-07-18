@@ -35,6 +35,11 @@ except ImportError:
         'pip install "crontab>=1,<2"'
     )
 
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+from cronstable.cronexpr import CronTab as NewCronTab  # noqa: E402
+
 OUT = os.path.join(os.path.dirname(__file__), "data", "cron_golden.json")
 
 # --------------------------------------------------------------------------
@@ -337,6 +342,23 @@ def main() -> None:
             ct.next(now=_aware(spec), default_utc=False)
             for spec in AWARE_NEXT_NOWS
         ]
+        # Aware vectors pin the IN-HOUSE engine's real-instant policy, not
+        # the legacy library's: at a DST edge the old package does naive
+        # civil arithmetic and can answer with a NEGATIVE delay (-3300 for
+        # */5 minutes on the second leg of a fall-back hour).  cronstable's
+        # next() deliberately diverges there (a gap-swallowed match counts
+        # once at its shifted label, a repeated wall time counts on its
+        # first leg only); everywhere else the two agree to the last bit,
+        # which the live differential test still proves.
+        try:
+            new_ct = NewCronTab(expr)
+        except ValueError:
+            pass
+        else:
+            entry["aware_next"] = [
+                new_ct.next(now=_aware(spec), default_utc=False)
+                for spec in AWARE_NEXT_NOWS
+            ]
         entry["test"] = [
             ct.test(datetime.datetime.fromisoformat(s)) for s in TEST_DTS
         ]
@@ -366,8 +388,11 @@ def main() -> None:
     out = {
         "_comment": (
             "Golden vectors recorded from the legacy `crontab` "
-            "(parse-crontab) package. Regenerate with "
-            "tests/gen_cron_golden.py; do not edit by hand."
+            "(parse-crontab) package, except aware_next, which pins the "
+            "in-house engine's real-instant DST policy (the legacy "
+            "library can answer a negative delay at a DST edge). "
+            "Regenerate with tests/gen_cron_golden.py; do not edit by "
+            "hand."
         ),
         "naive_next_nows": NAIVE_NEXT_NOWS,
         "aware_next_nows": AWARE_NEXT_NOWS,

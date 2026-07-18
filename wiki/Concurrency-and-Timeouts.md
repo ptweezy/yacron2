@@ -33,13 +33,16 @@ reach to instances on other nodes (see
 check always runs first, and the cluster gate is additive). Independently,
 each running instance carries a deadline derived from `executionTimeout`; on
 expiry it is cancelled, and `killTimeout` controls the
-SIGTERM-then-SIGKILL escalation used during any cancellation.
+SIGTERM-then-SIGKILL escalation used during any cancellation. Both signals go
+to the job's whole **process group** -- each job is spawned in its own session
+-- so a cancellation takes down the command's descendants too, not just the
+process cronstable spawned.
 
 The SIGTERM-then-SIGKILL escalation is the POSIX behavior. On Windows there
-are no POSIX signals, so both steps call `TerminateProcess` (an immediate,
-ungraceful stop); `killTimeout` still bounds the wait, but the
-terminate-then-kill escalation is effectively moot because the outcome is the
-same hard kill. See [Running on Windows](Running-on-Windows).
+are no POSIX signals: the graceful step falls back to `TerminateProcess` on
+the direct child (an immediate, ungraceful stop), and the forced step kills
+the live process tree with `taskkill /F /T`; `killTimeout` still bounds the
+wait between the two. See [Running on Windows](Running-on-Windows).
 
 ## Option summary
 
@@ -48,7 +51,7 @@ same hard kill. See [Running on Windows](Running-on-Windows).
 | `concurrencyPolicy` | enum: `Allow`, `Forbid`, `Replace` | `Allow` | Behavior when a launch is requested while another instance of the same job is still running. |
 | `concurrencyScope` | enum: `node`, `cluster` | `node` | How far `concurrencyPolicy` reaches: `node` considers only this process's running instances; `cluster` makes `Forbid`/`Replace` also exclude instances on other nodes sharing the [`state` store](Durable-State). See [Concurrency across a cluster](#concurrency-across-a-cluster). |
 | `executionTimeout` | float (seconds, `> 0` when set) | none (`null`) | Maximum wall-clock duration of a single run. On expiry the run is cancelled and assigned return code `-100`. |
-| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is cancelled, seconds to wait after SIGTERM before sending SIGKILL (POSIX); on Windows both calls map to `TerminateProcess`, so `killTimeout` only bounds the wait before the same hard kill. See [Running on Windows](Running-on-Windows). |
+| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is cancelled, seconds to wait after the process-group SIGTERM before the unconditional process-group SIGKILL (POSIX); on Windows, seconds between the direct-child `TerminateProcess` and the `taskkill /F /T` tree kill. See [Running on Windows](Running-on-Windows). |
 
 Types are from the strictyaml schema (`concurrencyPolicy` is
 `Enum(["Allow", "Forbid", "Replace"])`, `concurrencyScope` is
@@ -121,8 +124,9 @@ outgoing instance. This flag changes how the finished run is reaped:
   first) is irrelevant: the reaper short-circuits on `replaced` before
   inspecting it.
 
-Cancellation of the outgoing instance uses the same SIGTERM/`killTimeout`/SIGKILL
-escalation described under [Cancellation and killTimeout](#cancellation-and-killtimeout).
+Cancellation of the outgoing instance uses the same process-group
+SIGTERM/`killTimeout`/SIGKILL sequence described under
+[Cancellation and killTimeout](#cancellation-and-killtimeout).
 `maybe_launch_job` awaits each `cancel()` before starting the replacement, so
 the new instance is launched only after the old one has terminated.
 
@@ -333,7 +337,7 @@ On timeout (the remaining time elapses, or was non-positive), cronstable:
 1. Logs `Job <name> exceeded its executionTimeout of <N> seconds, cancelling
    it...`.
 2. Sets the run's return code to `-100`.
-3. Calls `cancel()` to terminate the process (see below).
+3. Calls `cancel()` to terminate the run and its process group (see below).
 
 A `-100` return code is therefore the marker of a timeout-induced termination.
 For a normal (non-replaced) run, `retcode = -100` is non-zero, so a job with
@@ -360,38 +364,71 @@ jobs:
 ## Cancellation and killTimeout
 
 Cancellation (`RunningJob.cancel`) is invoked both by an `executionTimeout`
-expiry and by `concurrencyPolicy: Replace`. The sequence is:
+expiry and by `concurrencyPolicy: Replace`. It terminates the run and
+everything the run spawned. On POSIX each job is started in a fresh session
+(`start_new_session`), so the job and every descendant share one process
+group -- the child's own pid -- which cancellation then signals as a unit
+(`os.killpg` in `cronstable/platform.py`). Windows has no equivalent at spawn
+time; descendants are reached through the live process tree instead
+(`taskkill`, below). The sequence is:
 
-1. If the process is still running (`returncode is None`), send SIGTERM via
-   `proc.terminate()`. A `ProcessLookupError` (process already gone) is
-   ignored.
-2. Wait up to `killTimeout` seconds for the process to exit, using
-   `asyncio.wait_for(proc.wait(), killTimeout)`.
-3. If it has not exited by then, log `Job <name> did not gracefully terminate
-   after <N> seconds, killing it...` and send SIGKILL via `proc.kill()`.
+1. Send SIGTERM to the whole process group. This reaches the descendants even
+   when the process cronstable spawned has already exited. If the group cannot
+   be signalled (it is already empty, or `killpg` failed), fall back to
+   SIGTERM on the direct child via `proc.terminate()`; a `ProcessLookupError`
+   (process already gone) is ignored.
+2. Wait up to `killTimeout` seconds for the direct child to exit, using
+   `asyncio.wait_for(proc.wait(), killTimeout)`. If it has not exited by then,
+   log `Job <name> did not gracefully terminate after <N> seconds, killing
+   it...`.
+3. Send SIGKILL to the whole process group -- **unconditionally**, whether or
+   not the direct child exited within `killTimeout`. The child exiting says
+   nothing about descendants sharing its group, and those are what hold the
+   job's stdout/stderr pipes open. A group that is already empty makes this a
+   no-op; where the group cannot be signalled, fall back to `proc.kill()` on
+   the direct child.
 
-`proc.terminate()` = SIGTERM and `proc.kill()` = SIGKILL only on POSIX (a real
-escalation; a child can trap SIGTERM to clean up). On Windows both
-`terminate()` and `kill()` call `TerminateProcess`, an immediate ungraceful
-stop in which the child is *not* notified to clean up, so the escalation is
-effectively moot: `killTimeout` still bounds the wait, but the result is the
-same hard kill. See [Running on Windows](Running-on-Windows).
+Signalling the group is what makes `executionTimeout` a bound on the run's
+*work* rather than just on its root process. A command like
+`sh -c 'helper & main'` leaves `helper` behind holding the write-ends of the
+job's stdout/stderr pipes; killing only the shell would leave the pipes open,
+so the run would never finish draining, its slot would never be released, and
+under `concurrencyPolicy: Forbid` the job would never run again. Killing the
+group takes the helper down with the shell.
+
+On Windows there is no process group to signal and no graceful kill at all,
+so the two steps differ: step 1 falls back to `proc.terminate()` --
+`TerminateProcess` on the direct child, an immediate ungraceful stop the
+child cannot trap -- and step 3 shells out to `taskkill /F /T`, which
+force-kills the live parent/child process tree (the `taskkill` run itself is
+bounded at 10 seconds; on failure the fallback is `proc.kill()` on the direct
+child). The escalation on Windows is therefore one of *scope* (direct child,
+then whole tree), not of gracefulness: the child is never notified to clean
+up. See [Running on Windows](Running-on-Windows).
 
 `killTimeout` defaults to `30` seconds and must be `>= 0`. A value of `0` is
-valid and means SIGKILL is sent almost immediately after SIGTERM (the
-`asyncio.wait_for` with a zero timeout gives the process essentially no grace
-period). The SIGTERM/SIGKILL escalation is POSIX-specific: on Windows both
-`terminate()` and `kill()` map to `TerminateProcess`, an immediate hard kill in
-which the child is not notified, so the escalation is moot: `killTimeout` still
-bounds the wait, but the outcome is the same hard kill.
+valid and means the group SIGKILL follows almost immediately after the group
+SIGTERM (the `asyncio.wait_for` with a zero timeout gives the process
+essentially no grace period).
 
 `killTimeout` gives a job time to flush buffers and clean up after being asked
 to stop; raise it for jobs that need longer to shut down, lower it for jobs
 that may ignore SIGTERM and must be force-killed quickly. This grace and the
 "ignore SIGTERM" guidance apply only on POSIX; on Windows `TerminateProcess`
 gives the child no chance to flush or clean up and a job cannot trap or ignore
-the stop, so `killTimeout` effectively only delays the (identical) hard kill.
-See [Running on Windows](Running-on-Windows).
+the stop, so `killTimeout` effectively only delays the tree kill. See
+[Running on Windows](Running-on-Windows).
+
+As defense in depth, a descendant that escaped the group entirely (it called
+`setsid` itself, or on Windows it was already orphaned when `taskkill` walked
+the tree) cannot strand the run either: a killed run's wait for its
+stdout/stderr streams to reach EOF is bounded (30 seconds, a fixed constant --
+deliberately independent of `killTimeout`, which is legitimately `0` for jobs
+that must be killed at once but whose already-captured output should not be
+discarded). When that bound expires the readers are cancelled, the output
+captured so far is kept, cronstable closes its end of the job's pipes, and the
+run leaves the running set -- at the cost only of output the escaped
+descendant would have produced afterwards.
 
 ```yaml
 jobs:
@@ -409,9 +446,10 @@ jobs:
 ```
 
 This example demonstrates POSIX-only behavior (a shell trapping SIGTERM). On
-Windows there is no signal to trap; the job would be hard-killed via
-`TerminateProcess` regardless, so the trap and the SIGTERM/SIGKILL timing it
-illustrates do not apply. See [Running on Windows](Running-on-Windows).
+Windows there is no signal to trap; the job would be stopped ungracefully
+regardless (`TerminateProcess`, then the `taskkill /F /T` tree kill), so the
+trap and the SIGTERM/SIGKILL timing it illustrates do not apply. See
+[Running on Windows](Running-on-Windows).
 
 ## Scope and interaction
 

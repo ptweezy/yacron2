@@ -535,8 +535,13 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
    so a string command runs as `["/bin/sh", "-c", command]`; on Windows the
    default is empty, so a string command with no shell goes through
    `create_subprocess_shell` to the native command processor `%ComSpec%`
-   (cmd.exe). A list command bypasses the shell on every platform. It assembles
-   `env` (only when the job has `environment` entries, layering them over
+   (cmd.exe). A list command bypasses the shell on every platform. The spawn
+   kwargs start from `platform.new_process_group_kwargs()`: on POSIX
+   `start_new_session=True` puts the job in a fresh session/process group
+   (the child's pid is the pgid), so `cancel()` can take the whole descendant
+   tree down as a unit; on Windows no creation flag is needed (descendants
+   are reached later via the `taskkill` tree walk, see `cancel()` below). It
+   assembles `env` (only when the job has `environment` entries, layering them over
    `os.environ` after `fixup_pyinstaller_env`), sets `preexec_fn=self._demote`
    when a uid/gid is configured, requests `stdout`/`stderr` PIPEs per
    `captureStdout`/`captureStderr`, sets the stream buffer `limit` to
@@ -574,17 +579,30 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
    `executionTimeout`, sets `retcode = -100`, and calls `cancel()`. Finally it
    reads the stream buffers.
 
-4. **`cancel()`** sends `SIGTERM` (`proc.terminate()`), waits up to
-   `killTimeout` for graceful exit, and `proc.kill()`s (`SIGKILL`) on timeout;
-   it then calls `_on_stop()`. The signal mapping is POSIX-specific: on POSIX
-   `terminate()` = `SIGTERM` (graceful/trappable) and `kill()` = `SIGKILL`
-   (forceful), a real escalation. On Windows there are no POSIX signals: both
-   `terminate()` and `kill()` call `TerminateProcess` (immediate, ungraceful, the
-   child is not notified to clean up), so the terminate -> kill escalation is
-   effectively moot, though `killTimeout` still bounds the wait. `_on_stop()` is
-   idempotent (guarded by `self._stopped`) because `cancel()` and `wait()` can
-   both reach it for one run (e.g. under `Replace`); it emits the statsd
-   `job_stopped` metric once.
+4. **`cancel()`** signals the job's whole process group, not just the spawned
+   process. It sends SIGTERM to the group via
+   `platform.kill_process_group(pid, force=False)` (falling back to
+   `proc.terminate()` on the direct child where the group cannot be
+   signalled), waits up to `killTimeout` for the direct child to exit, then
+   force-kills the group with `kill_process_group(pid, force=True)` --
+   unconditionally, even when the child exited in time, because descendants
+   sharing its group are what hold the job's stdout/stderr pipes open
+   (fallback: `proc.kill()` on the direct child). On POSIX both group signals
+   are `os.killpg` (SIGTERM, then SIGKILL). On Windows a non-forced call
+   always reports "not signalled" (there is no process group and no graceful
+   kill), so the graceful step is the direct-child `TerminateProcess`
+   fallback, and the forced step shells out to `taskkill /F /T`, which walks
+   the live process tree (the `taskkill` run is bounded at 10s). A run whose
+   spawn failed (`proc is None`) makes `cancel()` a logged no-op rather than
+   an error, since callers (the `Replace` branch, the cluster slot-renewer)
+   run outside the scheduler loop's try/except. On a killed run the stream
+   drain in `_read_job_streams` is bounded (30s, fixed) so a descendant that
+   escaped the group cannot strand the run in `running_jobs`; cronstable then
+   closes its end of the job's pipes. Finally `cancel()` calls `_on_stop()`,
+   which is idempotent (guarded by `self._stopped`) because `cancel()` and
+   `wait()` can both reach it for one run (e.g. under `Replace`); it emits
+   the statsd `job_stopped` metric once. Full user-facing semantics:
+   [Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout).
 
 5. **Failure classification.** `fail_reason` is a property evaluated against
    `failsWhen`: `always`, then `nonzeroReturn` (`retcode != 0`), then

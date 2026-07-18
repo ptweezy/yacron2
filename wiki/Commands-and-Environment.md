@@ -51,8 +51,19 @@ how the process is launched (`RunningJob.start` in `cronstable/job.py`):
   shell involved. The argv is taken verbatim from the list; no word splitting,
   globbing, quoting, or `$VAR` expansion is performed.
 
-In all cases the argv elements are encoded to bytes (`c.encode()`) before the
-subprocess is created.
+In all cases the argv is passed through `platform.encode_argv` before the
+subprocess is created: on POSIX each element is encoded to UTF-8 bytes (so the
+child's argv is independent of the locale); on Windows the strings are passed
+through unchanged (`CreateProcessW` works from `str` and rejects `bytes`).
+
+Whatever the command form, the subprocess is spawned with
+`platform.new_process_group_kwargs()` applied: on POSIX the job starts in a
+fresh session (`start_new_session`), placing it and every descendant in their
+own process group, so a cancellation (an `executionTimeout` expiry,
+`concurrencyPolicy: Replace`, or an API cancel) can take the whole tree down
+as a unit; on Windows no creation flag is used and cancellation walks the
+process tree instead. See
+[Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout).
 
 ```yaml
 jobs:

@@ -1014,6 +1014,32 @@
   .heat-cell.unknown { background: var(--unknown); }
   .heat-cell.act { cursor: pointer; }
 
+  /* schedule pressure: forward-looking fleet collision heatmap */
+  .press-summary { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; margin: 2px 0 8px; font-size: 11.5px; color: var(--fg-dim); }
+  .press-summary b { color: var(--fg); }
+  .press-grid { display: grid; grid-template-columns: 30px 1fr; gap: 2px 8px; min-width: 520px; }
+  .press-hlabel { font-size: 9px; color: var(--fg-faint); text-align: right; align-self: center; }
+  .press-cells { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 1px; height: 7px; }
+  .press-cell { border-radius: 1px; background: color-mix(in srgb, var(--fg-faint) 10%, transparent); }
+  .press-cell.p { background: var(--run); }
+  .press-cell.hot { background: var(--fail); }
+  .press-axis { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 1px; font-size: 9px; color: var(--fg-faint); margin-bottom: 3px; }
+  .press-axis span { overflow: visible; white-space: nowrap; }
+  .press-hist { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 1px; align-items: end; height: 30px; margin: 10px 0 2px; }
+  .press-hist i { display: block; min-height: 1px; background: var(--run); opacity: .85; border-radius: 1px 1px 0 0; }
+  .press-hist i.hot { background: var(--fail); }
+  .press-hist i.zero { background: color-mix(in srgb, var(--fg-faint) 18%, transparent); }
+  .press-sect { margin-top: 10px; }
+  .press-dup { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; padding: 5px 0; border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); font-size: 11.5px; }
+  .press-dup .chip { cursor: pointer; }
+  .press-suggest { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .press-suggest .out { font-size: 11.5px; color: var(--fg-dim); }
+  .press-suggest .out .chip { cursor: pointer; }
+  /* wallboard strip variant */
+  .wb-press { display: flex; gap: 14px; align-items: center; padding: 4px 14px 0; }
+  .wb-press .press-hist { flex: 1; height: 26px; margin: 0; }
+  .wb-press .lbl { font-size: 11px; color: var(--fg-faint); white-space: nowrap; }
+
   /* ---------- cluster peer swimlane ---------- */
   #swimPanel { border-top: 1px solid var(--border); padding: 10px 12px; }
   #swimPanel .swim-note { color: var(--fg-faint); font-style: italic; font-size: 11px; }
@@ -1417,6 +1443,7 @@
     <span class="grow"></span>
     <button class="ghostbtn" id="radarBtn" title="Next-fire radar">⌁ radar</button>
     <button class="ghostbtn" id="heatBtn" title="Activity heatmap">▦ heat</button>
+    <button class="ghostbtn" id="pressBtn" title="Schedule pressure: upcoming fire collisions">▥ pressure</button>
     <button class="ghostbtn" id="tailBtn" title="Merged multi-tail console">≋ tail</button>
     <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
@@ -1460,6 +1487,17 @@
       <span class="faint" id="heatMeta"></span>
     </div>
     <div class="heat-body" id="heatBody"></div>
+  </div>
+
+  <div class="card press" id="pressureCard" style="display:none">
+    <div class="card-label"><span>┌─ schedule pressure</span><span class="grow"></span>
+      <select class="mini" id="pressTz" title="display timezone">
+        <option value="utc">UTC</option>
+        <option value="browser">local</option>
+      </select>
+      <span class="faint" id="pressMeta"></span>
+    </div>
+    <div id="pressBody"></div>
   </div>
 
   <div class="card" id="nodeCard" style="display:none">
@@ -1837,6 +1875,9 @@
   <!-- escalation incident stamp: a static flow strip (escalationTick toggles
        it); aria-hidden because it re-renders every second -->
   <div class="wb-incident" id="wbIncident" style="display:none" aria-hidden="true"></div>
+  <!-- forward-looking schedule-pressure strip (shown when the pressure
+       panel pref is on and a /schedule/pressure payload has landed) -->
+  <div class="wb-press" id="wbPressure" style="display:none" aria-hidden="true"></div>
   <div class="wb-grid" id="wbGrid"></div>
   <div class="wb-foot" id="wbFoot"></div>
   <!-- zen all-clear screensaver: appears over an idle, healthy wallboard -->
@@ -2745,6 +2786,7 @@
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
+    press: false, pressTz: "utc",
     // node-resources history card + live resource-chart refresh cadence (ms)
     nodeCard: false, resMs: 2000,
     boot: true,   // BIOS-style boot self-test on load
@@ -2791,6 +2833,10 @@
     radar: { items: [], sig: null },   // next-fire radar: [{name, t, c}] sorted by instant (+ render signature)
     wallboard: false,          // TV kiosk mode active
     heat: { cache: {}, loading: false },   // activity heatmap: name -> {at, runs:[{t,o}]}
+    // schedule pressure: the daemon's /schedule/pressure + /duplicates
+    // payloads, cached with a TTL (the fleet forecast only moves by the
+    // minute, so per-poll refetching would be waste)
+    press: { data: null, dups: null, at: 0, loading: false, suggestHtml: "" },
     swim: { key: null, buf: [] },          // cluster peer swimlane ring buffer
     fleet: { data: null, failOnly: false },    // fleet view: last /fleet payload + failing-only filter
     // merged multi-tail console: tailed job names, per-job stream state,
@@ -2986,9 +3032,12 @@
     } catch (_) { return { type: "unknown", raw: expr }; }
   }
   function dayMatches(p, c) {
-    // standard cron OR-semantics between day-of-month and day-of-week
+    // Both restricted: BOTH must match. This dialect keeps parse-crontab's
+    // AND rule between day-of-month and day-of-week, mirroring the daemon's
+    // engine (cronexpr._day_matches), unlike standard cron's OR:
+    // '0 0 13 * 5' is Friday the 13th, not every Friday plus every 13th.
     const domR = p.dom.restricted, dowR = p.dow.restricted;
-    if (domR && dowR) return p.dom.has(c.D) || p.dow.has(c.dow);
+    if (domR && dowR) return p.dom.has(c.D) && p.dow.has(c.dow);
     if (domR) return p.dom.has(c.D);
     if (dowR) return p.dow.has(c.dow);
     return true;
@@ -3038,6 +3087,11 @@
     if (job.timezone) return job.timezone;       // IANA name (incl. "UTC")
     return job.utc ? "UTC" : "LOCAL";
   }
+  // The schedule text the CLIENT engine should parse: an H (hashed-slot)
+  // schedule ships the plain values it resolved to as schedule_resolved,
+  // since parseCron knows no H. Display keeps job.schedule (what the user
+  // wrote); computation uses this.
+  function schedOf(job) { return job.schedule_resolved || job.schedule; }
   // next N fire times as {c: components, t: instant ms}
   function nextRuns(parsed, n, frame, fromMs) {
     if (parsed.type !== "fields") return [];
@@ -3124,13 +3178,16 @@
       timePart = "At " + mp + " past " + hp;
     }
 
-    // day-of-month and day-of-week combine with OR when BOTH are restricted
-    // (standard cron) — reflect that in the prose with "or", not a comma.
+    // dom and dow must BOTH match when both are restricted: the client
+    // engine (dayMatches, mirroring the daemon's cronexpr._day_matches)
+    // keeps parse-crontab's AND rule ('0 0 13 * 5' is Friday the 13th),
+    // unlike standard cron's OR, so the prose must say so too; the
+    // wording mirrors the server describer (croninfo.describe_cron).
     const dayClauses = [];
     if (!everyDow) dayClauses.push("on " + listJoin(p.dow.values.map((d) => DOWN[d])));
     if (!everyDom) dayClauses.push("on the " + listJoin(p.dom.values.map((d) => ordinal(d))) + (everyDow ? " of the month" : ""));
     const clauses = [];
-    if (dayClauses.length === 2) clauses.push(dayClauses.join(" or "));
+    if (dayClauses.length === 2) clauses.push(dayClauses[1] + ", and only " + dayClauses[0]);
     else if (dayClauses.length === 1) clauses.push(dayClauses[0]);
     if (!everyMon) clauses.push("in " + listJoin(p.month.values.map((m) => MONTHS[m])));
     else if (everyDom && everyDow) clauses.push("every day");
@@ -3620,7 +3677,7 @@
     const items = [];
     for (const j of state.jobs) {
       if (!j.enabled) continue;
-      const parsed = parseCron(j.schedule);
+      const parsed = parseCron(schedOf(j));
       if (parsed.type !== "fields") continue;
       const runs = nextRuns(parsed, 1, frameOf(j), now);
       if (runs.length) items.push({ name: j.name, t: runs[0].t, c: runs[0].c });
@@ -3654,7 +3711,7 @@
       $("radarFeed").innerHTML = feed.length
         ? feed.map((x) => {
             const j = state.byName[x.name];
-            const title = fmtWall(x.c, j && parseCron(j.schedule).hasSeconds) + (j ? " · " + describeCron(j.schedule) : "");
+            const title = fmtWall(x.c, j && parseCron(schedOf(j)).hasSeconds) + (j ? " · " + describeCron(schedOf(j)) : "");
             return '<li data-job="' + escAttr(x.name) + '" title="' + escAttr(title) + '">' +
               '<span class="cd">' + fmtCountdown((x.t - now) / 1000) + "</span>" +
               '<span class="nm">' + esc(x.name) + "</span></li>";
@@ -3750,14 +3807,19 @@
     document.body.classList.toggle("tv", on);
     $("tvBtn").classList.toggle("on", on);
     setHashTv(on);
-    if (on) renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
+    if (on) {
+      renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
+      if (prefs.press) loadPressure(false);   // hydrate the pressure strip on entry
+    }
     else {
       // symmetric teardown: escalationTick stops running the moment the
       // wallboard is off, so anything it lit must be doused here or a
       // re-entry after recovery flashes a stale INCIDENT stamp + vignette
       // over a healthy grid until the next tick.
       $("wbGrid").innerHTML = "";
-      state.wbSig = state.wbFootSig = state.wbVerdictSig = null;
+      $("wbPressure").innerHTML = "";
+      $("wbPressure").style.display = "none";
+      state.wbSig = state.wbFootSig = state.wbVerdictSig = state.wbPressSig = null;
       $("wbVerdict").style.display = "none";
       $("wbIncident").style.display = "none";
       $("wbAlarm").style.opacity = "0";
@@ -3836,6 +3898,7 @@
       }).join("");
     }
     renderWbFoot();
+    renderWbPressure();
     // fresh paint = fresh verdict: a recovery poll clears the stale banner
     // and dimming NOW rather than up to a second later at the next tick --
     // and a rebuilt grid regains .escalate in the same frame, not a tick
@@ -4075,6 +4138,163 @@
   function setHeat(v) {
     prefs.heat = v; savePref("heat"); $("heatBtn").classList.toggle("on", v);
     if (v) { renderHeatmap(); loadHeatmap(true); } else $("heatCard").style.display = "none";
+  }
+
+  // ===================================================================
+  //  schedule pressure: forward-looking fleet collision heatmap
+  // ===================================================================
+  // The daemon enumerates every enabled schedule's fires over the next 24h
+  // with its own engine (/schedule/pressure), so this panel shows what WILL
+  // fire, timezone- and DST-exact, where the activity heatmap shows what
+  // DID run. Cached with a TTL: the forecast only moves by the minute.
+  const PRESS_TTL = 55 * 1000;
+  function pressTzParam() {
+    if (prefs.pressTz !== "browser") return null;   // null: server default (UTC)
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; }
+    catch (_) { return null; }
+  }
+  async function loadPressure(force) {
+    const st = state.press;
+    if (!prefs.press || st.loading) return;
+    if (!force && st.data && (performance.now() - st.at) < PRESS_TTL) { renderPressure(); return; }
+    st.loading = true;
+    try {
+      const tz = pressTzParam();
+      const q = tz ? "?tz=" + encodeURIComponent(tz) : "";
+      const [pr, dr] = await Promise.all([
+        apiFetch("/schedule/pressure" + q),
+        apiFetch("/schedule/duplicates"),
+      ]);
+      if (pr.ok) st.data = await pr.json();
+      if (dr.ok) st.dups = await dr.json();
+      st.at = performance.now();
+    } catch (e) { if (e.message === "unauthorized") return; }
+    finally { st.loading = false; }
+    renderPressure();
+    renderWbPressure();
+  }
+  function pressBars(byMinuteFires, byMinuteJobs, tall) {
+    const hmax = Math.max(1, ...byMinuteFires);
+    let bars = "";
+    for (let m = 0; m < 60; m++) {
+      const v = byMinuteFires[m] || 0;
+      const jn = byMinuteJobs ? (byMinuteJobs[m] || 0) : null;
+      const h = v ? Math.max(6, Math.round(100 * v / hmax)) : 2;
+      const tip = ":" + pad2(m) + " · " + v + " fire" + (v === 1 ? "" : "s") +
+        (jn == null ? "" : " · " + jn + " job" + (jn === 1 ? "" : "s"));
+      bars += '<i class="' + (v ? (v >= hmax * 0.7 ? "hot" : "") : "zero") +
+        '" style="height:' + h + '%" title="' + escAttr(tip) + '"></i>';
+    }
+    return '<div class="press-hist"' + (tall ? "" : ' style="height:26px"') + ">" + bars + "</div>";
+  }
+  function renderPressure() {
+    if (!prefs.press) { $("pressureCard").style.display = "none"; return; }
+    $("pressureCard").style.display = "";
+    const d = state.press.data;
+    const body = $("pressBody");
+    if (!d) {
+      body.innerHTML = '<div class="tlempty">Loading the fleet fire forecast…</div>';
+      return;
+    }
+    const grid = d.grid || [];
+    let max = 1;
+    for (const row of grid) for (const c of row) if (c > max) max = c;
+    const hot = Math.max(5, Math.ceil(max * 0.7));
+    const bm = d.busiest_minute || {};
+    const excl = d.excluded || {};
+    let html = '<div class="press-summary">' +
+      "<span><b>" + esc(d.total_fires) + "</b> fires in the next " + esc(d.hours) + "h from <b>" + esc(d.jobs) + "</b> schedules</span>" +
+      "<span>busiest minute <b>:" + pad2(bm.minute || 0) + "</b> (" + esc(bm.jobs || 0) + " jobs)</span>" +
+      "<span><b>" + esc((d.empty_minutes || []).length) + "</b> of 60 minutes empty</span>" +
+      ((excl.disabled || excl.reboot)
+        ? '<span class="faint">not counting ' +
+          [excl.disabled ? excl.disabled + " disabled" : "", excl.reboot ? excl.reboot + " @reboot" : ""].filter(Boolean).join(", ") + "</span>"
+        : "") +
+      "</div>";
+    // the 24h x 60min grid, hour rows in the selected display zone
+    html += '<div class="press-grid"><span></span><div class="press-axis">';
+    for (let m = 0; m < 60; m++) html += "<span>" + (m % 10 === 0 ? ":" + pad2(m) : "") + "</span>";
+    html += "</div>";
+    for (let h = 0; h < 24; h++) {
+      const row = grid[h] || [];
+      html += '<span class="press-hlabel">' + (h % 3 === 0 ? pad2(h) : "") + '</span><div class="press-cells">';
+      for (let m = 0; m < 60; m++) {
+        const c = row[m] || 0;
+        if (!c) { html += '<span class="press-cell"></span>'; continue; }
+        const op = (0.3 + 0.7 * (c / max)).toFixed(2);
+        html += '<span class="press-cell ' + (c >= hot ? "hot" : "p") + '" style="opacity:' + op +
+          '" title="' + escAttr(pad2(h) + ":" + pad2(m) + " · " + c + " fire" + (c === 1 ? "" : "s")) + '"></span>';
+      }
+      html += "</div>";
+    }
+    html += "</div>";
+    html += '<div class="card-label" style="padding-left:0;border:0">fires by minute of hour · whole window</div>';
+    html += pressBars(d.by_minute_fires || [], d.by_minute_jobs || [], true);
+    // duplicate schedules (semantic grouping, from the daemon's own engine)
+    const dups = state.press.dups;
+    if (dups && dups.groups && dups.groups.length) {
+      const groups = dups.groups;
+      html += '<div class="press-sect"><div class="card-label" style="padding-left:0;border:0">duplicate schedules · ' +
+        groups.length + " group" + (groups.length === 1 ? "" : "s") + "</div>";
+      for (const g of groups.slice(0, 6)) {
+        html += '<div class="press-dup"><span class="chip" title="' + escAttr(g.description || "") + '">' + esc(g.expression) + "</span>" +
+          '<span class="faint">× ' + esc(g.count) + (g.timezone && g.timezone !== "UTC" ? " · " + esc(g.timezone) : "") + "</span>" +
+          g.jobs.slice(0, 6).map((n) => '<span class="chip" data-job="' + escAttr(n) + '">' + esc(n) + "</span>").join("") +
+          (g.jobs.length > 6 ? '<span class="faint">+' + (g.jobs.length - 6) + " more</span>" : "") +
+          "</div>";
+      }
+      if (groups.length > 6) html += '<div class="faint">… ' + (groups.length - 6) + " more group(s)</div>";
+      html += "</div>";
+    } else if (dups) {
+      html += '<div class="press-sect faint">no duplicate schedules: every enabled job fires on its own set of instants</div>';
+    }
+    html += '<div class="press-suggest">' +
+      '<button class="ghostbtn mini" data-suggest="hourly">◴ suggest an hourly slot</button>' +
+      '<button class="ghostbtn mini" data-suggest="daily">◴ suggest a daily slot</button>' +
+      '<span class="out" id="pressSuggestOut">' + (state.press.suggestHtml || "") + "</span></div>";
+    body.innerHTML = html;
+    $("pressMeta").textContent = "next " + (d.hours || 24) + "h · " + (d.timezone || "UTC");
+  }
+  async function suggestSlot(period) {
+    const tz = pressTzParam();
+    const q = "?period=" + encodeURIComponent(period) + (tz ? "&tz=" + encodeURIComponent(tz) : "");
+    let s;
+    try {
+      const r = await apiFetch("/schedule/suggest" + q);
+      if (!r.ok) return;
+      s = await r.json();
+    } catch (_) { return; }
+    state.press.suggestHtml =
+      "least loaded " + esc(s.period) + ': <span class="chip" data-expr="' + escAttr(s.expression) + '" title="click to copy">' + esc(s.expression) + "</span> " +
+      '<span class="faint">(' + esc(s.fires_in_window) + " fires there now; or let each job spread itself: " +
+      '</span><span class="chip" data-expr="' + escAttr(s.hash_hint) + '" title="H hashes the job name to a stable slot · click to copy">' + esc(s.hash_hint) + '</span><span class="faint">)</span>';
+    const out = $("pressSuggestOut");
+    if (out) out.innerHTML = state.press.suggestHtml;
+  }
+  function setPressure(v) {
+    prefs.press = v; savePref("press"); $("pressBtn").classList.toggle("on", v);
+    if (v) { renderPressure(); loadPressure(true); }
+    else { $("pressureCard").style.display = "none"; renderWbPressure(); }
+  }
+  // compact wallboard strip: the 60-bin minute histogram + the headline
+  function renderWbPressure() {
+    const el = $("wbPressure");
+    if (!el) return;
+    const d = prefs.press ? state.press.data : null;
+    if (!state.wallboard || !d) {
+      el.style.display = "none"; el.innerHTML = ""; state.wbPressSig = null;
+      return;
+    }
+    const bmf = d.by_minute_fires || [];
+    const bm = d.busiest_minute || {};
+    const sig = bmf.join(",") + "|" + (bm.minute || 0);
+    if (sig !== state.wbPressSig) {
+      state.wbPressSig = sig;
+      el.innerHTML = '<span class="lbl">24h pressure</span>' +
+        pressBars(bmf, d.by_minute_jobs || [], false) +
+        '<span class="lbl">busiest :' + pad2(bm.minute || 0) + " · " + esc(bm.jobs || 0) + " jobs</span>";
+    }
+    el.style.display = "";
   }
 
   // ===================================================================
@@ -4970,15 +5190,17 @@
     if (!job) { box.innerHTML = ""; return; }
     const frame = frameOf(job);
     const frameLabel = frame === "LOCAL" ? "your local time (server local — approximate)" : frame;
-    const parsed = parseCron(job.schedule);
+    const parsed = parseCron(schedOf(job));
     const runs = parsed.type === "fields" ? nextRuns(parsed, 6, frame, Date.now()) : [];
     // a field schedule that yields no upcoming runs is an impossible date
     // (e.g. "31 of February") — say so instead of a confident-but-wrong prose.
     const impossible = parsed.type === "fields" && !runs.length;
-    const desc = impossible ? "This schedule can never occur (impossible date)." : describeCron(job.schedule);
+    const desc = impossible ? "This schedule can never occur (impossible date)." : describeCron(schedOf(job));
     let html =
       '<p class="sched-desc">' + esc(desc) + "</p>" +
-      '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + '</span> · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b></div>";
+      '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + "</span>" +
+      (job.schedule_resolved ? ' <span class="faint">(H resolves to</span> <span class="chip">' + esc(job.schedule_resolved) + '</span><span class="faint">)</span>' : "") +
+      ' · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b></div>";
 
     // foot-gun advisories: self-overlap, thundering-herd collisions, DST
     const warns = scheduleWarnings(job);
@@ -5538,6 +5760,7 @@
       { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
       { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
+      { ic: "▥", lbl: "Toggle schedule pressure", sub: "upcoming fire collisions + duplicates", run: () => setPressure(!prefs.press) },
       { ic: "⊞", lbl: "Toggle fleet view", sub: "every node's runs", run: () => setFleet(!prefs.fleet) },
       { ic: "≋", lbl: "Multi-tail console", run: () => openTail([]) },
       { ic: "≋", lbl: "Multi-tail: failing jobs", run: () => tailPreset("fail") },
@@ -6863,6 +7086,20 @@
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
     $("heatBtn").addEventListener("click", () => setHeat(!prefs.heat));
+    $("pressBtn").addEventListener("click", () => setPressure(!prefs.press));
+    $("pressTz").addEventListener("change", (e) => {
+      prefs.pressTz = e.target.value; savePref("pressTz");
+      state.press.suggestHtml = "";        // computed in the old zone
+      loadPressure(true);
+    });
+    $("pressBody").addEventListener("click", (e) => {
+      const sug = e.target.closest("[data-suggest]");
+      if (sug) { suggestSlot(sug.getAttribute("data-suggest")); return; }
+      const ex = e.target.closest("[data-expr]");
+      if (ex) { copyText(ex.getAttribute("data-expr"), "schedule"); return; }
+      const it = e.target.closest("[data-job]");
+      if (it) openDrawer(it.getAttribute("data-job"), "schedule");
+    });
     $("nodeMeter").addEventListener("click", () => setNodeCard(!prefs.nodeCard));
     $("tailBtn").addEventListener("click", () => { if (state.tail.open) closeTail(); else openTail([]); });
     $("tvBtn").addEventListener("click", () => setWallboard(!state.wallboard));
@@ -7829,6 +8066,34 @@
     return '<div class="sbx-uses"><span class="faint">recent:</span><div class="sbx-recent">' +
       list.map((x) => '<span class="chip" data-expr="' + escAttr(x) + '">' + esc(x) + "</span>").join("") + "</div></div>";
   }
+  // True only when the expression is valid APART from its H items: H is
+  // opaque to parseCron, so substitute each H item with the plain form it
+  // resolves into (H -> *, H/n -> */n, H(a-b) -> a-b, H(a-b)/n -> a-b/n)
+  // and require the rebuilt expression to parse. A backwards H(a-b) range
+  // or an H in the year column (the trailing field of the 6-/7-field
+  // forms) is invalid, the daemon's engine rejects both, so those fall
+  // through to the normal invalid-expression error instead of the
+  // reassuring H info message.
+  function sbxLooksHashed(expr) {
+    const fields = expr.split(/\s+/);
+    if (fields.length < 5 || fields.length > 7) return false;
+    const yearIdx = fields.length === 5 ? -1 : fields.length - 1;
+    let sawH = false;
+    const rebuilt = [];
+    for (let i = 0; i < fields.length; i++) {
+      const items = [];
+      for (const item of fields[i].split(",")) {
+        const m = item.match(/^[hH](?:\((\d+)-(\d+)\))?(?:\/(\d+))?$/);
+        if (!m) { items.push(item); continue; }
+        sawH = true;
+        if (i === yearIdx) return false;
+        if (m[1] != null && +m[1] > +m[2]) return false;
+        items.push((m[1] != null ? m[1] + "-" + m[2] : "*") + (m[3] != null ? "/" + m[3] : ""));
+      }
+      rebuilt.push(items.join(","));
+    }
+    return sawH && parseCron(rebuilt.join(" ")).type === "fields";
+  }
   function renderSandbox() {
     const expr = $("sbxInput").value.trim();
     const frame = $("sbxFrame").value || "UTC";
@@ -7839,7 +8104,10 @@
     if (parsed.type === "reboot") {
       html += '<p class="sbx-desc">Runs once, when cronstable starts (@reboot).</p>';
     } else if (parsed.type !== "fields") {
-      html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';
+      if (sbxLooksHashed(expr))
+        html += '<p class="sbx-desc">An <b>H</b> slot is a stable hash of the job name, so it resolves per job, not in this sandbox. Open a job\'s <b>schedule</b> tab to see the values its H resolved to.</p>';
+      else
+        html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';
     } else {
       const runs = nextRuns(parsed, 12, frame, Date.now());
       const impossible = !runs.length;
@@ -7900,7 +8168,7 @@
     for (const j of state.jobs) {
       if (j.name === job.name || !j.enabled) continue;
       if (scanned++ > 200) break;                 // hard cap on the fan-out
-      const p = parseCron(j.schedule);
+      const p = parseCron(schedOf(j));
       if (p.type !== "fields") continue;
       const r = nextRuns(p, 1, frameOf(j), Date.now());
       if (r.length && minuteOf(r[0].t) === target) others.push(j.name);
@@ -7930,7 +8198,7 @@
     return null;
   }
   function scheduleWarnings(job) {
-    const parsed = parseCron(job.schedule);
+    const parsed = parseCron(schedOf(job));
     if (parsed.type !== "fields") return [];
     const frame = frameOf(job);
     const out = [];
@@ -8262,11 +8530,14 @@
   // reflect persisted add-on-panel prefs onto their toggles + initial render
   $("radarBtn").classList.toggle("on", prefs.radar);
   $("heatBtn").classList.toggle("on", prefs.heat);
+  $("pressBtn").classList.toggle("on", prefs.press);
+  $("pressTz").value = prefs.pressTz;
   $("dagsBtn").classList.toggle("on", prefs.dags);
   $("stateBtn").classList.toggle("on", prefs.stateInsp);
   $("heatWindow").value = prefs.heatWindow;
   if (prefs.radar) renderRadar();
   if (prefs.heat) { renderHeatmap(); loadHeatmap(true); }
+  if (prefs.press) { renderPressure(); loadPressure(true); }
   if (prefs.nodeCard) setNodeCard(true);
   // opt-in run ledger: hydrate the in-memory mirror from IndexedDB before the
   // first poll so anomaly baselines + the History note are ready immediately.
@@ -8295,6 +8566,7 @@
   setInterval(tick, 1000);
   setInterval(alarmTick, 1000);                               // adaptive failure alarm (self-gates its cadence)
   setInterval(() => { if (prefs.heat) loadHeatmap(false); }, 60000);  // slow heatmap refresh
+  setInterval(() => { if (prefs.press) loadPressure(false); }, 60000); // pressure forecast refresh
   tick();
   if (prefs.boot && !reduceMotion() && bootDue()) {
     runBootSequence(startApp);          // POST screen types out, then starts the app

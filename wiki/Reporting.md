@@ -63,7 +63,7 @@ The following variables are available when rendering any report template:
 | `command` | str or list | The job's command. |
 | `shell` | str | The job's shell. |
 | `environment` | dict or None | The subprocess environment (`None` when the job defines no `environment`). |
-| `cpu_seconds` | float or None | Total CPU time (user + system) of the run's process tree, or `None` when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored. |
+| `cpu_seconds` | float or None | Total CPU time (user + system) of the run's process tree, or `None` when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `cpu_user_seconds` / `cpu_system_seconds` | float or None | The user- and system-mode components of `cpu_seconds`. |
 | `max_rss_bytes` | int or None | Peak resident-set size (bytes) observed during the run, or `None` when unmonitored. |
 
@@ -298,7 +298,7 @@ following variables describing the job outcome:
 | `CRONSTABLE_STDOUT` | Captured stdout (possibly truncated; see below). |
 | `CRONSTABLE_STDERR_TRUNCATED` | `"1"` if `CRONSTABLE_STDERR` was truncated, `"0"` otherwise. |
 | `CRONSTABLE_STDOUT_TRUNCATED` | `"1"` if `CRONSTABLE_STDOUT` was truncated, `"0"` otherwise. |
-| `CRONSTABLE_CPU_SECONDS` | Total CPU seconds of the run's process tree, or empty string when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored. |
+| `CRONSTABLE_CPU_SECONDS` | Total CPU seconds of the run's process tree, or empty string when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `CRONSTABLE_MAX_RSS_BYTES` | Peak resident-set size in bytes, or empty string when unmonitored. |
 
 **Truncation:** stdout and stderr can be large, and there are OS limits on
@@ -459,5 +459,6 @@ the logs (it is tied to a secret); for sentry, the DSN env-var name is logged.
 - [Failure Detection and Retries](Failure-Detection-and-Retries)
 - [Output Capturing](Output-Capturing)
 - [Metrics with statsd](Metrics-with-Statsd)
+- [Resource Monitoring](Resource-Monitoring)
 - [Includes, Defaults, and Multi-File Config](Includes-and-Defaults)
 - [Running on Windows](Running-on-Windows)

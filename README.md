@@ -41,6 +41,11 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
   (see [Classic crontab files](#classic-crontab-files))
+* Built-in **schedule linting**: dead schedules that can never fire again are
+  called out loudly (never silently dropped), and common footguns (AND day
+  semantics, uneven `*/n` steps, day-31-in-April, schedules that DST skips or
+  repeats) are flagged at config load, in the dashboards, and over the API
+  (see [Schedule linting](#schedule-linting))
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
 * Flexible configuration: you decide how to determine if a cron job fails or not
@@ -75,11 +80,13 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   read per-job run history on demand
 * Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
   AI agents (Claude, Cursor, VS Code Copilot). An agent can **observe**
-  cronstable, and **control** it when you opt in. It is read-only by default and
-  exposes tools, resources, and triage prompts covering jobs, DAGs, the
-  cluster/fleet, metrics, and durable state. It is served at `POST /mcp` on the
-  web listeners and through a `cronstable mcp` stdio bridge, and is hand-rolled
-  in pure Python with no new dependencies
+  cronstable, **author and debug schedules** with the daemon's own engine
+  (validate/explain an expression, explain field-by-field why a job did not
+  run at a timestamp), and **control** it when you opt in. It is read-only by
+  default and exposes tools, resources, and triage prompts covering jobs,
+  DAGs, the cluster/fleet, metrics, and durable state. It is served at
+  `POST /mcp` on the web listeners and through a `cronstable mcp` stdio
+  bridge, and is hand-rolled in pure Python with no new dependencies
 * Native **Prometheus metrics** at `/metrics` (plus per-job statsd push
   metrics), covering run outcomes, durations, retries, schedules, and cluster
   health (see [Metrics](#metrics))
@@ -253,6 +260,18 @@ brew install ptweezy/tap/cronstable
 This installs the self-contained release binary for your platform (signed and
 notarized on macOS; glibc `amd64`/`arm64` on Linux via Homebrew on Linux), so no
 Python is required. Upgrade later with `brew upgrade cronstable`.
+
+### Install using winget
+
+On Windows, install the [winget package](https://github.com/microsoft/winget-pkgs/tree/master/manifests/p/ptweezy/cronstable):
+
+```shell
+winget install ptweezy.cronstable
+```
+
+This installs the self-contained release binary (`amd64` or `arm64`, matching
+your system), so no Python is required. Upgrade later with
+`winget upgrade ptweezy.cronstable`.
 
 ### Install using binary
 
@@ -921,7 +940,7 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The `schedule` option can be a string in the classic crontab format (5, 6 or 7 fields; ranges, steps, lists and `jan`/`mon` names), parsed by cronstable's built-in cron engine; see [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) for the full dialect.
+The `schedule` option can be a string in the classic crontab format (5, 6 or 7 fields; ranges, steps, lists, `jan`/`mon` names, and Quartz's `?` standing alone in a day field), parsed by cronstable's built-in cron engine; see [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) for the full dialect. Expressions in other dialects (Quartz `#`/`W`, the seconds-first 6-field layout) fail with an error naming the dialect and how to convert.
 Additionally @reboot can be included , which will only run the job when cronstable is initially
 executed. Further `schedule` can be an object with properties.  The following configuration
 runs a command every 5 minutes, but only on the specific date 2017-07-19, and
@@ -938,6 +957,82 @@ jobs:
       year: 2017
       dayOfWeek: "*"
 ```
+
+#### Schedule linting
+
+Every schedule is linted at config load. The linter flags legal expressions
+that probably do not mean what they say: a schedule with **no future
+occurrence** (a fixed past year, `0 0 30 2 *`), day-of-month and day-of-week
+both restricted (a day must match BOTH here, unlike Vixie cron's either),
+`*/n` steps that do not divide their field (`*/7` minutes fires at :56 and
+then :00), day values no selected month is long enough to reach, Feb 29
+schedules that only fire in leap years, and wall times a DST transition in
+the job's timezone skips or repeats. Findings are logged per job at load
+time, served as `schedule_findings` (plus a `never_fires` flag) on the
+`/jobs` and `/status` endpoints, and shown in the dashboards' cron
+sandboxes. A dead schedule stays a loud warning rather than an error, so a
+parked job (`year: "2020"`) cannot fail an upgrade; prefer `enabled: false`
+to say what you mean. `GET /schedule/preview` runs the same
+parse/describe/preview/lint for any expression before it becomes a job.
+See [Schedule Linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting).
+
+#### Hashed schedules: H
+
+`H * * * *` runs a job every hour at a minute hashed from the job's name
+(Jenkins-style; `H`, `H(a-b)`, `H/n`, and `H(a-b)/n` work in any field but
+the year). Every job lands on its own **stable** slot, so a fleet of hourly
+jobs spreads across the hour instead of stampeding at `:00`, and because the
+slot is a pure function of the name rather than random jitter, it survives
+restarts, reloads and replicas, and "was this run late?" stays answerable.
+In day-of-month, rangeless `H` forms (bare `H` and `H/n`) hash over 1 to 28
+so short months are never skipped; renaming a job re-hashes its slots. The linter notes the concrete
+values each `H` resolved to, and `/jobs` serves them as `schedule_resolved`.
+See [Hashed Schedules](https://github.com/ptweezy/cronstable/wiki/Hashed-Schedules).
+
+#### Schedule pressure: the fleet's collision heatmap
+
+`GET /schedule/pressure` enumerates every enabled schedule's fires over the
+next 24 hours with the scheduler's own engine (timezone- and DST-exact) and
+buckets them into an hour-by-minute grid: "37 jobs fire at :00, minute 23
+is empty", as data. The web dashboard draws it as a heatmap card (with a
+compact strip on the wallboard), the TUI has the same panel as an overlay,
+and the `cron_schedule_pressure` MCP tool serves it to agents. See
+[Schedule Pressure](https://github.com/ptweezy/cronstable/wiki/Schedule-Pressure).
+
+#### Duplicate-schedule detection
+
+`GET /schedule/duplicates` groups jobs whose schedules fire on the
+identical instants, using the engine's semantic equality (`*/5` equals
+`0-59/5`, `@hourly` equals `0 * * * *`) and the resolved timezone, so
+"these 14 jobs all share `0 0 * * *`" surfaces before midnight proves it.
+Shown in the pressure card and TUI overlay. See
+[Duplicate Schedule Detection](https://github.com/ptweezy/cronstable/wiki/Duplicate-Schedule-Detection).
+
+#### Suggest a slot
+
+`GET /schedule/suggest?period=hourly|daily` recommends the least-loaded
+minute (or hour:minute) for a new job from the fleet's real fires,
+deterministically, with ties breaking away from the busiest slot; the
+response includes runners-up and the `H` spelling that would keep future
+jobs spreading themselves. Also available as one-click buttons in the
+pressure card and via the `cron_suggest_slot` MCP tool. See
+[Suggest a Slot](https://github.com/ptweezy/cronstable/wiki/Suggest-a-Slot).
+
+#### Why didn't it run?
+
+`GET /schedule/why?job=<name>&at=<timestamp>` decomposes the scheduler's
+own match test field by field for one job and one instant: "minute
+matched; day-of-week Tuesday is not in Monday and Friday", with each
+field's accepted values rendered as prose, the nearest real fire on each
+side of the timestamp, and notes when the answer is genuinely surprising
+(the day-field AND rule where Vixie cron would have fired, and DST wall
+times that were skipped or repeated). Aware timestamps convert into the
+job's timezone, naive ones read as wall time there, and `@reboot`,
+disabled, hashed-`H` and `dag:<name>` schedules all answer honestly.
+Agents get the same explainer as the `cron_why_no_run` MCP tool,
+alongside `cron_validate_schedule` and `cron_explain_schedule` for
+checking an expression before it becomes a job. See
+[Why Didn't It Run?](https://github.com/ptweezy/cronstable/wiki/Why-No-Run).
 
 #### Second-level schedules
 
@@ -2008,6 +2103,7 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
 * **Configure it**:
   [Configuration Reference](https://github.com/ptweezy/cronstable/wiki/Configuration-Reference) ·
   [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) ·
+  [Schedule Linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting) ·
   [Classic Crontabs](https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs) ·
   [Includes and Defaults](https://github.com/ptweezy/cronstable/wiki/Includes-and-Defaults) ·
   [Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment) ·
@@ -2020,15 +2116,20 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
   [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting)
 * **Watch it**:
   [Web Dashboard](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard) ·
+  [Terminal Dashboard](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard) ·
   [HTTP API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) ·
+  [MCP Server](https://github.com/ptweezy/cronstable/wiki/MCP) ·
   [Metrics with Prometheus](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Prometheus) ·
   [Metrics with Statsd](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Statsd) ·
+  [Resource Monitoring](https://github.com/ptweezy/cronstable/wiki/Resource-Monitoring) ·
   [CLI Reference](https://github.com/ptweezy/cronstable/wiki/CLI-Reference)
 * **Scale it**:
   [Durable State](https://github.com/ptweezy/cronstable/wiki/Durable-State) ·
   [Orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs) ·
   [Clustering and Leader Election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election) ·
-  [Architecture and Internals](https://github.com/ptweezy/cronstable/wiki/Architecture-and-Internals)
+  [Job-Set ID](https://github.com/ptweezy/cronstable/wiki/Job-Set-ID) ·
+  [Architecture and Internals](https://github.com/ptweezy/cronstable/wiki/Architecture-and-Internals) ·
+  [MCP Server Design](https://github.com/ptweezy/cronstable/wiki/MCP-Server-Design)
 
 ## Contributing and license
 

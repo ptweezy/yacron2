@@ -3,9 +3,11 @@
 This page documents the `cronstable` command and every argument it accepts, the
 `cronstable state` administration subcommands, the job-facing state commands a
 running job uses (`state get|set|delete|keys`, `cursor`, `lock`, `artifact`,
-`idempotent`, `secret`), the runtime model (foreground execution, signal
-handling, exit codes), and common invocations. Behavior is taken from
-`cronstable/__main__.py`, `cronstable/state_admin.py`, and `cronstable/jobcli.py`.
+`idempotent`, `secret`, `xcom`), the `mcp` and `tui` client subcommands, the
+runtime model (foreground execution, signal handling, exit codes), and common
+invocations. Behavior is taken from `cronstable/__main__.py`,
+`cronstable/state_admin.py`, `cronstable/jobcli.py`, `cronstable/mcpcli.py`, and
+`cronstable/tui.py`.
 
 ## Synopsis
 
@@ -14,15 +16,21 @@ cronstable [-c FILE-OR-DIR] [-l LOG_LEVEL] [-v] [--job-set-id] [--version]
 cronstable state ACTION [options] [-c FILE-OR-DIR]
 cronstable state get|set|delete|keys ...  [--scope NAME | --global]
 cronstable cursor|lock|artifact|idempotent|secret ...  [--scope NAME | --global]
+cronstable xcom push|pull|list ...
+cronstable mcp [--url URL] [--token TOKEN | --token-env VAR] [--check]
+cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [options]
 ```
 
 Without a subcommand, `cronstable` is the scheduler daemon described below. With
 the `state` subcommand it is an offline administration tool for the durable
 state store; see [The `state` subcommand](#the-state-subcommand). The
-`state get|set|delete|keys`, `cursor`, `lock`, `artifact`, `idempotent`, and
-`secret` commands are a different surface: a *running job* uses them to reach the
-daemon's store through its loopback endpoint; see
-[Job-facing state commands](#job-facing-state-commands).
+`state get|set|delete|keys`, `cursor`, `lock`, `artifact`, `idempotent`,
+`secret`, and `xcom` commands are a different surface: a *running job* uses
+them to reach the daemon's store through its loopback endpoint; see
+[Job-facing state commands](#job-facing-state-commands). The `mcp` and `tui`
+subcommands are clients of a running daemon's web listener: the MCP stdio
+bridge and the terminal dashboard; see [The `mcp` subcommand](#the-mcp-subcommand)
+and [The `tui` subcommand](#the-tui-subcommand).
 
 `cronstable` runs as a single foreground process. It does not daemonize, does not
 fork, and does not write a PID file. Diagnostics go to stdout/stderr via the
@@ -37,13 +45,16 @@ process supervisor (systemd, a container runtime, etc.); see
 | `-c`, `--config` | path (file or directory) | platform default[^cfgdefault] | Configuration file, or a directory containing configuration files. When a directory, every `*.yml`/`*.yaml` file, plus every classic crontab (`*.crontab`, `*.cron`, or a file named `crontab`), is loaded (entries whose name starts with `_` or `.` are skipped). See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) and [Classic Crontabs](Classic-Crontabs). |
 | `-l`, `--log-level` | string | `INFO` | Root log level. Passed to `logging.basicConfig(level=getattr(logging, LOG_LEVEL))`, so the value must name an attribute of the `logging` module (e.g. `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). |
 | `-v`, `--validate-config` | flag | off | Parse and validate the configuration, then exit. Exits `0` if valid, `1` on a configuration error. Does not start the scheduler or web server. |
-| `--job-set-id` | flag | off | Parse the configuration, print the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation) (an order-independent hash of every job's effective configuration) to stdout, and exit `0`. Identical across instances running the same set of jobs. Exits `1` on a configuration error. |
+| `--job-set-id` | flag | off | Parse the configuration, print the [job-set id](Job-Set-ID) (an order-independent hash of every job's effective configuration) to stdout, and exit `0`. Identical across instances running the same set of jobs. Exits `1` on a configuration error. |
 | `--version` | flag | off | Print the cronstable version to stdout and exit `0`. |
 | `-h`, `--help` | flag | — | Print usage (argparse builtin) and exit `0`. |
 
-The only other command-line surface is the `state` subcommand,
+The other command-line surfaces are the `state` subcommand,
 [documented below](#the-state-subcommand), which administers the durable state
-store. Job schedules, commands, environment, reporting, and the web API are
+store; the [job-facing state commands](#job-facing-state-commands) a running
+job uses; and the client subcommands [`mcp`](#the-mcp-subcommand) and
+[`tui`](#the-tui-subcommand), which talk to a running daemon's web listener.
+Job schedules, commands, environment, reporting, and the web API are
 configured entirely in YAML, not on the command line; see the
 [Configuration Reference](Configuration-Reference).
 
@@ -121,8 +132,10 @@ Constructs the scheduler from the resolved config exactly like
 order-independent hash of every job's effective configuration, identical
 across instances running the same set of jobs regardless of file order or
 how the jobs are split across files. This is the same value served by the
-[`GET /job-set-id`](HTTP-API) endpoint and compared between cluster peers; see
-[Clustering and Leader Election](Clustering-and-Leader-Election#the-job-set-id-foundation).
+[`GET /job-set-id`](HTTP-API) endpoint and compared between cluster peers
+([Clustering and Leader Election](Clustering-and-Leader-Election)); the full
+treatment -- what the hash covers, what it excludes, and why -- lives on the
+[job-set id](Job-Set-ID) page.
 
 Because the config is fully parsed first, a configuration error exits `1`, and
 the [default-path special case](#default-path-special-case) applies just as it
@@ -292,7 +305,7 @@ option, or a missing required one such as `backup` without `-o`).
 
 Alongside the offline `state` admin actions above, cronstable ships a family of
 **job-facing** state commands -- `state get|set|delete|keys`, `cursor`, `lock`,
-`artifact`, `idempotent`, and `secret` -- that a *running job's* command line
+`artifact`, `idempotent`, `secret`, and `xcom` -- that a *running job's* command line
 uses to reach the daemon's durable store. They are thin clients of the
 [loopback state endpoint](HTTP-API#job-facing-state-endpoints-loopback) the
 daemon injects into every job's environment: each reads the injected
@@ -324,7 +337,8 @@ another's state by accident. Two mutually exclusive flags override it:
 | `--scope NAME` | Act in the named scope. |
 | `--global` | Act in the shared `global` scope (deliberate cross-job coordination). |
 
-(`secret` takes neither flag: a run's secrets are always its own.)
+(`secret` takes neither flag: a run's secrets are always its own. `xcom` takes
+neither flag either: the daemon injects the DAG run's XCom scope.)
 
 The commands share one exit-code convention, made for shell branching:
 
@@ -383,6 +397,18 @@ releases the lock afterward -- even if the command fails or is signalled.
 `--ttl` overrides the lease TTL (default `state.jobApi.lockTtlSeconds`). The
 daemon also releases any lock a run still holds when the run ends, so a crash
 never leaks one.
+
+`--timeout` defaults to `0` seconds, so `--wait` alone makes a single pass
+over the permits and gives up immediately; give it a positive `--timeout` to
+actually block. `--permits` accepts `1` (the default -- a mutex) through
+`1024`; the daemon rejects a count outside that range (exit `1`), because
+every permit is a separate lease the acquire pass probes in turn.
+
+The `--` separator belongs to `lock run` alone: cronstable splits the trailing
+command off at the first `--` *before* argument parsing, so a bare `--` in any
+other invocation -- another subcommand, or even a flag-only call such as
+`cronstable --version --` -- is rejected with
+`` `--` is only valid before a `lock run` command `` and exits `2`.
 
 ### `artifact put|get|list` (named blob store)
 
@@ -483,10 +509,38 @@ cronstable artifact put report.pdf ./out/report.pdf --global
 cronstable artifact get report.pdf -o ./report.pdf --global
 ```
 
+## The `mcp` subcommand
+
+```
+cronstable mcp [--url URL] [--token TOKEN | --token-env VAR]
+               [--protocol-version REV] [--timeout SECONDS] [--check]
+```
+
+`cronstable mcp` runs the MCP stdio bridge: a thin standard-library client that
+connects a desktop MCP client (stdio transport) to a running daemon's `/mcp`
+endpoint (`--url`, default `http://127.0.0.1:8080`). Like the job-facing
+commands it needs no config file and never imports the daemon graph. The
+bridge, every flag (including `--protocol-version` and `--timeout`), and
+client setup are documented on the [MCP](MCP) page.
+
+## The `tui` subcommand
+
+```
+cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [--theme NAME]
+               [--tv] [--job NAME] [--boot | --no-boot] [--ascii]
+               [--poll SECONDS]
+```
+
+`cronstable tui` opens the terminal dashboard -- the
+[Web Dashboard](Web-Dashboard)'s keyboard-driven TUI sibling -- against a
+running daemon's web listener (`--url`, default `http://127.0.0.1:8080`). It
+requires an interactive terminal. Every option, key, and panel is documented
+on the [Terminal Dashboard](Terminal-Dashboard) page.
+
 ## Runtime model
 
 When started normally (no `--version`, no `--validate-config`, no
-`--job-set-id`, no `state` subcommand, with a usable config), cronstable:
+`--job-set-id`, no subcommand, with a usable config), cronstable:
 
 1. Configures logging from `-l`.
 2. Resolves and parses the configuration (`-c`), exiting `1` on error.
@@ -532,7 +586,7 @@ See [Running on Windows](Running-on-Windows).
 | --- | --- |
 | `0` | `--version` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
 | `1` | Configuration error (parse/schema/validation failure or unreadable config); the default `-c` path (platform-specific: `/etc/cronstable.d` on POSIX, `%APPDATA%\cronstable` on Windows) does not exist and no `-c` was given; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
-| `2` | Usage error (argparse builtin): unknown option or missing required option (e.g. `state backup` without `-o`); or `cronstable state` invoked with no action. |
+| `2` | Usage error (argparse builtin): unknown option or missing required option (e.g. `state backup` without `-o`); `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
 
 A traceback (non-zero, not the clean `1` path) results from an invalid
 `--log-level` value, since the level is resolved before error handling is in

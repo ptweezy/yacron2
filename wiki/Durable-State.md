@@ -195,7 +195,11 @@ with no native rename:
   unknown `schemaVersion`, truncated JSON from a crash mid-write) is moved to
   `quarantine/` on read and skipped, never guessed at and never fatal. A plain
   I/O error (an NFS blip) leaves the record in place and skips it for that
-  read only.
+  read only. The two readers that would act on "absent" as permanent opt out
+  of that skip with a **strict** read that propagates the error instead: the
+  DAG [mapped-expansion read](Orchestration-and-DAGs#fan-out-dynamic-mapping)
+  retries later, and the [GC blob sweep](#garbage-collection-and-manifests)
+  stands down for that pass.
 * **Derived watermarks, no mutable cursors.** The "last fired" cursor is
   computed as the maximum over the immutable records, so nothing depends on
   rewriting an existing file, and the answer is order-independent even when
@@ -449,15 +453,17 @@ from any node.
 Before anything is written, `redactArchivedSecrets` (default `true`) scrubs
 recognisable secrets from the output: `KEY=value` assignments whose key looks
 secret-bearing (`PASSWORD`, `SECRET`, `TOKEN`, `API_KEY`,
-`AWS_SECRET_ACCESS_KEY`, ...), `Authorization: Bearer`/`Basic` headers, and
-well-known token formats (cloud keys, GitHub personal access tokens, private
-key blocks). Job output routinely embeds credentials by accident -- a crashed
-script echoing its environment is the classic case -- and an archive multiplies
-the exposure, so redaction is on by default; set `redactArchivedSecrets: false`
-only when the output itself is the artifact and the store is trusted. The
-redaction is best-effort pattern matching, not a guarantee; the archive files
-are additionally created `0o600` (see
-[Operational notes](#operational-notes)).
+`AWS_SECRET_ACCESS_KEY`, ...), `Authorization: Bearer`/`Basic` headers,
+credentials embedded in URLs and connection strings
+(`scheme://user:password@host`, including the user-less
+`redis://:password@host` form), and well-known token formats (cloud keys,
+GitHub personal access tokens, JWTs, private key blocks). Job output
+routinely embeds credentials by accident -- a crashed script echoing its
+environment is the classic case -- and an archive multiplies the exposure, so
+redaction is on by default; set `redactArchivedSecrets: false` only when the
+output itself is the artifact and the store is trusted. The redaction is
+best-effort pattern matching, not a guarantee; the archive files are
+additionally created `0o600` (see [Operational notes](#operational-notes)).
 
 ## Restart-surviving retries
 
@@ -880,8 +886,12 @@ cronstable lock run db-maintenance --scope global --wait --timeout 60 \
 ```
 
 `--permits N` makes it a **semaphore** of `N` concurrent holders instead of a
-mutex (`N = 1`). `--wait --timeout S` blocks up to `S` seconds for a free
-permit; without `--wait`, a taken lock returns immediately (exit `3`). For
+mutex (`N = 1`); `N` must be between `1` and `1024` -- the acquire probes
+permits sequentially, so an absurd count is refused up front rather than
+turned into that many store operations per pass. `--wait --timeout S` blocks
+up to `S` seconds for a free permit (`--timeout` defaults to `0`, so `--wait`
+alone makes a single pass and gives up, exactly like omitting it); without
+`--wait`, a taken lock returns immediately (exit `3`). For
 manual control, `cronstable lock acquire NAME` prints a hold token and
 `cronstable lock release TOKEN` frees it. The acquire reply also carries the
 lease's monotonic **fence** token, for a job that needs true fencing on top of
@@ -991,6 +1001,12 @@ families (see [Metrics with Prometheus](Metrics-with-Prometheus)):
 A backend read error at scrape time omits the state families from that scrape
 (the job and daemon families still serve) rather than failing it with a 500.
 
+The [Web Dashboard](Web-Dashboard) adds a browser view over the same store:
+an opt-in **durable state inspector** with per-primitive tabs over the
+store's documents and records, fed by the
+[state inspector endpoints](HTTP-API#state-inspector-endpoints). Its page
+documents the UI.
+
 ## Operational notes
 
 * **File modes.** The store's directories are created `0o700` and its data
@@ -1025,5 +1041,5 @@ A backend read error at scrape time omits the state families from that scrape
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the owner gate catch-up and retries re-check.
 - [Output Capturing](Output-Capturing): what `archiveOutput` persists.
 - [HTTP Control API](HTTP-API): `GET /jobs/{name}/trends`, the run endpoints, and the job-facing `/v1/` loopback endpoints.
-- [Web Dashboard](Web-Dashboard): the rehydrated history views, and the separate browser-side run ledger.
+- [Web Dashboard](Web-Dashboard): the rehydrated history views, the separate browser-side run ledger, and the durable state inspector.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the `cronstable_state_*` families and the restart-durable job counters.

@@ -59,6 +59,11 @@ claude mcp add --transport http cronstable http://127.0.0.1:8080/mcp \
 - Run the **`triage_job_failure`** prompt against `flaky-export`.
 - "Run the on-demand-sync job now." → `cron_run_job` (with `confirm: true`).
 - "Summarize overall health." → the **`fleet_health_summary`** prompt.
+- "I want a job at 9am on weekdays. Write the schedule and double-check it."
+  → `cron_validate_schedule` / `cron_explain_schedule` verify the expression
+  with the daemon's own engine and round-trip the description.
+- "Why didn't heartbeat run at 09:00:30?" → `cron_why_no_run` explains field
+  by field which cron constraint failed at that instant.
 
 See the [MCP wiki page](https://github.com/ptweezy/cronstable/wiki/MCP) for the
 full tool / resource / prompt catalog and security notes.

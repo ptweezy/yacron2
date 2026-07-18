@@ -110,7 +110,9 @@ def looks_like_crontab(data: str) -> bool:
         if len(fields) < 6:
             return False
         try:
-            CronTab(" ".join(fields[:5]))
+            # hash_key="": this is a content sniff, not a real job, and an
+            # H field must still read as "valid cron fields" here.
+            CronTab(" ".join(fields[:5]), hash_key="")
         except ValueError:
             return False
         return True
@@ -189,17 +191,21 @@ def _job_from_line(
         raise CrontabError(
             "{}: schedule {!r} has no command".format(where, schedule)
         )
+    name = "{}:{}".format(label, lineno)
     if schedule != "@reboot":
         # Validate here so a bad field is reported with its file and line;
         # JobConfig parses the same string again later, but anonymously.
+        # The job name seeds the H hash form, exactly as JobConfig will;
+        # note these names embed the LINE number, so inserting lines above
+        # an H entry re-hashes its slot along with renaming it.
         try:
-            CronTab(schedule)
+            CronTab(schedule, hash_key=name)
         except ValueError as ex:
             raise CrontabError(
                 "{}: invalid schedule {!r}: {}".format(where, schedule, ex)
             ) from ex
     job: Dict[str, Any] = {
-        "name": "{}:{}".format(label, lineno),
+        "name": name,
         "schedule": schedule,
         "command": _unescape_percent(command, where),
     }

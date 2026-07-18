@@ -1233,3 +1233,34 @@ def test_dispatch_refuses_without_a_tty(monkeypatch):
         token_env = tui.ENV_TOKEN
 
     assert tui.dispatch(Args()) == 2
+
+
+async def test_schedule_pressure_overlay(tmp_path):
+    h = Harness()
+    h.daemon.jobs = [
+        _job("herd-a", schedule="0 * * * *", outcome="success"),
+        _job("herd-b", schedule="0 * * * *", outcome="success"),
+        _job("spread", schedule="H * * * *", outcome="success"),
+    ]
+    # the daemon resolves H before serving /jobs; emulate that field
+    h.daemon.jobs[2]["schedule_resolved"] = "58 * * * *"
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 3)
+        app._toggle("press")
+        await _wait_for(lambda: app.pressure is not None)
+        await h.settle()
+        screen = h.term.screen()
+        assert "schedule pressure" in screen
+        assert "duplicate schedules" in screen
+        assert "0 * * * *" in screen          # the herd's group
+        assert "suggest" in screen
+        assert "busiest :00" in screen
+        # the H job counted via its resolved schedule: 2 herd + 1 spread
+        assert "3 schedules" in screen
+        # esc closes the overlay again
+        h.keys.send("esc")
+        await h.settle()
+        assert not app.is_open("press")
+    finally:
+        await h.stop()

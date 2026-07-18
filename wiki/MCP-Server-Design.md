@@ -1,6 +1,33 @@
 # Design Document: A Model Context Protocol (MCP) Server for cronstable
 
-**Status:** Proposed · **Author:** Principal Engineering · **Date:** 2026-07-08 · **Target spec:** MCP `2025-11-25`
+**Status:** Implemented · **Author:** Principal Engineering · **Date:** 2026-07-08 · **Target spec:** MCP `2025-11-25`
+
+> **This design shipped.** It was implemented as `cronstable/mcp.py` and
+> `cronstable/mcpcli.py`; the user-facing documentation is the [MCP](MCP)
+> page, and the shipped configuration fields are in the
+> [`mcp` configuration reference](Configuration-Reference#mcp). The body of
+> this document is preserved as written on 2026-07-08 and is not updated to
+> match the implementation; where they differ, the implementation wins. The
+> divergences:
+>
+> - **`--validate` shipped as `--check`** (§9): the stdio bridge's self-check
+>   flag is `cronstable mcp --check`.
+> - **No per-run job resource template** (§5.3): the proposed
+>   `cronstable://jobs/{name}/runs/{run_id}` shipped as
+>   `cronstable://jobs/{name}/runs` (the whole retained history, no
+>   `run_id`). The DAG template kept `{run_key}`.
+> - **Three additional config keys** (§7): the shipped `mcp:` block also
+>   takes `allowUnauthenticated`, `resources`, and `prompts`.
+> - **Stricter fail-closed rule** (§6/§7): there is no
+>   bind-safe-listeners-and-warn mode for a mixed listen set. Startup raises
+>   a `ConfigError` whenever any routable listener lacks a token;
+>   `mcp.allowUnauthenticated: true` is the explicit override.
+> - **Offset paging, not opaque cursors** (§5.1): list tools take
+>   `offset`/`limit` and return a `nextOffset`; only the two log-tail tools
+>   take a `cursor`, an integer position for polling newly appended lines.
+> - **Resources and prompts are toolset-scoped** (§5.3/§5.4): the `dags`
+>   resource templates and the `why_did_dag_run_fail` / `backfill_plan`
+>   prompts require the `dags` toolset.
 
 ---
 
@@ -47,7 +74,7 @@ MCP is an open JSON-RPC 2.0 protocol that lets an AI application (host/client) c
 
 ## 3. Why MCP fits cronstable
 
-cronstable already exposes a rich read/act surface over aiohttp (documented in `wiki/HTTP-API.md`). MCP turns that surface into something an agent can drive with judgment. The value lands in three modes:
+cronstable already exposes a rich read/act surface over aiohttp (documented in [`wiki/HTTP-API.md`](HTTP-API)). MCP turns that surface into something an agent can drive with judgment. The value lands in three modes:
 
 **Observe**, an agent can list jobs and their health (`GET /jobs`, `/status`), read run history/trends/resources (`/jobs/{name}/runs`, `/trends`, `/resources`), tail logs (`/jobs/{name}/logs`), read the single-pane cluster/fleet views (`/cluster`, `/fleet`, `/node`), parse Prometheus metrics (`/metrics`), inspect DAG runs (`/dags/...`), and browse the durable state store metadata (`/state`, `/state/documents`, `/state/records`).
 
@@ -181,7 +208,7 @@ These tools operate exclusively on cronstable's **own closed, well-defined domai
 | `cron_tail_dag_task_logs` | Last N lines + cursor for a running task instance. | `GET /dags/.../tasks/{taskkey}/logs` | dags | `dag`, `run_key`, `taskkey`, `tail?`, `cursor?` |
 | `cron_inspect_state` | Metadata-only store inventory / namespace docs / stream records; **secret names only, values redacted**. | `GET /state`, `/state/documents`, `/state/records` | state | `ns?`, `stream?`, `cursor?`, `limit?` |
 
-**Result shaping (all read tools):** return `structuredContent` (JSON) **plus** a compact human-readable `text` summary mirror; declare `outputSchema` where the shape is stable. Prefer human-readable fields over uuids; return counts + top-N + opaque cursor for large lists (never a full dump). Each tool's `limit` is **clamped to `mcp.maxRows`**: a caller asking for more is capped, with a `text` note saying so (no error). Offer `response_format: concise|detailed` on the heavy ones; and on truncation, include a `text` note steering the agent to a narrower query. Give actionable errors ("job not found: use `cron_list_jobs` to enumerate"), this is standard agent-tool hygiene ([writing tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents), [code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)).
+**Result shaping (all read tools):** return `structuredContent` (JSON) **plus** a compact human-readable `text` summary mirror; declare `outputSchema` where the shape is stable. Prefer human-readable fields over uuids; return counts + top-N + opaque cursor for large lists (never a full dump). Each tool's `limit` is **clamped to `mcp.maxRows`**: a caller asking for more is capped, with a `text` note saying so (no error). Offer `response_format: concise|detailed` on the heavy ones; and on truncation, include a `text` note steering the agent to a narrower query. Give actionable errors ("job not found: use `cron_list_jobs` to enumerate"), this is standard agent-tool hygiene ([writing tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents), [code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)). *(Shipped divergence: list pagination is `offset`/`limit` with a `nextOffset` in results, not opaque cursors; only the log-tail tools take a `cursor`.)*
 
 ### 5.2 Mutating tools (`readOnlyHint: false`; require `readOnly: false`)
 
@@ -204,9 +231,11 @@ Application-controlled, cacheable read context for capable clients. **Mirror eve
 - Fixed: `cronstable://status`, `cronstable://cluster`, `cronstable://fleet`, `cronstable://version`
 - Templates: `cronstable://jobs/{name}`, `cronstable://jobs/{name}/runs/{run_id}`, `cronstable://dags/{name}`, `cronstable://dags/{name}/runs/{run_key}`, `cronstable://state/{ns}`
 
+*(Shipped divergence: the job-runs template is `cronstable://jobs/{name}/runs`, no `{run_id}`; and resources are toolset-scoped, so the `dags` templates require the `dags` toolset.)*
+
 ### 5.4 Prompts (the "Reason" layer)
 
-User-controlled slash-command playbooks that chain the read tools. Prompts are supported by Claude Desktop/Code/Cursor/VS Code, so they reach most operators.
+User-controlled slash-command playbooks that chain the read tools. Prompts are supported by Claude Desktop/Code/Cursor/VS Code, so they reach most operators. *(Shipped divergence: prompts are toolset-scoped; `why_did_dag_run_fail` and `backfill_plan` require the `dags` toolset.)*
 
 | Prompt | Arguments | What it orchestrates |
 | --- | --- | --- |
@@ -223,13 +252,13 @@ User-controlled slash-command playbooks that chain the read tools. Prompts are s
 **Reuse cronstable's existing model as-is for the self-hosted case.** The spec's stated minimum for a hardened local server is exactly what cronstable already ships: stdio, **or** HTTP restricted by (a) a bearer token and/or (b) a unix domain socket with restricted filesystem permissions ([security best practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices)). cronstable's `web.authToken` (bearer, resolved via `_resolve_web_token`, compared in constant time with `hmac.compare_digest`, **fail-closed** on an empty token), `web.socketMode` fs-gated unix sockets, and reverse-proxy-terminated mTLS **meet and exceed** that bar. **No OAuth is required to be spec-compliant**, because OAuth is OPTIONAL and stdio/IPC transports are exempt.
 
 **Concrete rules for the `/mcp` route:**
-- **Fail closed when unauthenticated on a routable listener (the load-bearing rule).** cronstable's app-wide auth middleware (`_make_auth_middleware`) is only installed when a token *resolves*; with no `web.authToken` there is **no middleware at all** and every route is open. Therefore, if `mcp.enabled` is true and no token is inherited, cronstable **refuses to expose `/mcp` on any listener that isn't loopback (`127.0.0.1`/`::1`) or a filesystem-gated unix socket**, startup raises a `ConfigError` when every listener is routable, or binds `/mcp` only on the safe listeners and hard-warns on a mixed listen set (§7). An unauthenticated `/mcp` on a routable address would expose full read, and, under `readOnly:false`, mutating, access.
+- **Fail closed when unauthenticated on a routable listener (the load-bearing rule).** cronstable's app-wide auth middleware (`_make_auth_middleware`) is only installed when a token *resolves*; with no `web.authToken` there is **no middleware at all** and every route is open. Therefore, if `mcp.enabled` is true and no token is inherited, cronstable **refuses to expose `/mcp` on any listener that isn't loopback (`127.0.0.1`/`::1`) or a filesystem-gated unix socket**, startup raises a `ConfigError` when every listener is routable, or binds `/mcp` only on the safe listeners and hard-warns on a mixed listen set (§7). An unauthenticated `/mcp` on a routable address would expose full read, and, under `readOnly:false`, mutating, access. *(Shipped divergence: the bind-safe-and-warn option was dropped; any tokenless routable listener raises a `ConfigError` unless `mcp.allowUnauthenticated: true`.)*
 - **Token on every request; `/mcp` is never public.** It inherits the app-wide auth middleware; do **not** add `/mcp` to `WEB_PUBLIC_PATHS` or the `metrics.public` exemption. Unauthenticated ⇒ `401`.
 - **`cron_query_metrics` re-imposes auth even though `/metrics` may be public.** The `metrics.public` opt-out exists for scrapers that can't send credentials; the MCP tool must **not** become an auth-bypass back-door to metrics. It reads the metrics *through the authenticated MCP surface*, not by exempting itself.
 - **Origin validation (new):** the REST API doesn't validate `Origin` today; the `/mcp` handler **must**, returning `403` on a present-but-invalid Origin, because MCP clients may be browser-based (DNS-rebinding defense). Configurable via `mcp.allowedOrigins` (empty ⇒ non-browser only).
 - **CORS for browser clients (new).** `allowedOrigins` is only a rebinding *check*; a browser-hosted client also needs CORS to talk to `/mcp`. When `allowedOrigins` is **non-empty**, `/mcp` answers `OPTIONS` preflight and returns a **scoped** `Access-Control-Allow-Origin` (echoing only an allow-listed Origin, **never `*`**, credentialed CORS may not use a wildcard), with `Access-Control-Allow-Headers: Authorization, Content-Type, MCP-Protocol-Version` and `Access-Control-Expose-Headers: MCP-Protocol-Version`. Empty `allowedOrigins` ⇒ **no CORS headers** (non-browser clients only). This closes the "Origin-validated but not browser-reachable" half-spec.
 - **Bounded request bodies (new).** Tool arguments arrive from an LLM; `/mcp` caps the request body at `mcp.maxBodyBytes` (default 1 MiB, aiohttp's `client_max_size`) and returns `413` beyond it, so a runaway or hostile client can't exhaust memory.
-- **Localhost binding:** cronstable already supports `http://127.0.0.1` + unix sockets; keep the default guidance to bind loopback/socket and terminate TLS/mTLS in a reverse proxy (matching `wiki/HTTP-API.md`).
+- **Localhost binding:** cronstable already supports `http://127.0.0.1` + unix sockets; keep the default guidance to bind loopback/socket and terminate TLS/mTLS in a reverse proxy (matching [`wiki/HTTP-API.md`](HTTP-API)).
 - **No token passthrough:** cronstable *is* the resource; it must never forward a caller's bearer token to a downstream. (A hard MUST NOT.)
 - **No session-as-auth:** we're stateless, so there are no sessions to hijack; if that ever changes, verify the token on every request, use CSPRNG session IDs, and bind them to identity.
 - **Confused-deputy: not applicable**: cronstable is a single **direct** resource server, not an OAuth proxy/aggregator. Explicitly **stay out of the proxy pattern** to avoid that entire attack class.
@@ -280,9 +309,11 @@ Opt("mcp"): Map({
 }),
 ```
 
+*(Shipped divergence: the final schema also takes `allowUnauthenticated`, `resources`, and `prompts`; see the [`mcp` configuration reference](Configuration-Reference#mcp).)*
+
 Defaults are filled by a `_build_mcp_config` helper (mirroring how `jobApi` defaults come from `DEFAULT_JOB_API`). **Validation / fail-closed:**
 - if `mcp.enabled` is true but `web.listen` is empty, raise a `ConfigError` (there is nowhere to serve `/mcp`);
-- **if `mcp.enabled` is true and no `web.authToken` resolves, refuse to expose `/mcp` on any non-loopback, non-unix-socket listener**: raise a `ConfigError` when every listener is routable, or bind `/mcp` only on the loopback/socket listeners and hard-warn when the listen set is mixed. (The auth middleware does not exist without a token, so a routable `/mcp` would be unauthenticated, §6.);
+- **if `mcp.enabled` is true and no `web.authToken` resolves, refuse to expose `/mcp` on any non-loopback, non-unix-socket listener**: raise a `ConfigError` when every listener is routable, or bind `/mcp` only on the loopback/socket listeners and hard-warn when the listen set is mixed. (The auth middleware does not exist without a token, so a routable `/mcp` would be unauthenticated, §6.) *(Shipped divergence: a `ConfigError` in both cases, with `mcp.allowUnauthenticated: true` as the escape hatch.)*;
 - if `act` appears in `toolsets` while `readOnly: true`, log a warning that mutating tools remain suppressed (read-only wins);
 - each tool's `limit` input is **clamped to `mcp.maxRows`**, a request above the cap is capped with a `text` note, not an error.
 
@@ -310,7 +341,7 @@ The server is built in four increments, each shippable on its own.
 **Read-only core (stdio + HTTP), secure by default.** Ship the protocol core and the `observe` toolset, read-only.
 - **New `cronstable/mcp.py`:** `MCPHandler` (JSON-RPC dispatch; `initialize`/`ping`/`tools/list`/`tools/call`; the §5.1 `observe` tools; **capabilities gated to `{tools:{listChanged:false}}`**; stateless `handle_http`/`handle_http_get`; error mapping; `_json.dumps_bytes`-based serialization). Include the security basics from day one: `Origin`→403, `Accept`→406, body-size→413, and the fail-closed token/listener check.
 - **`cronstable/cron.py`:** (re)construct `self._mcp` and register `web.post("/mcp", …)`/`web.get("/mcp", …)` in `start_stop_web_app` **on each reload**; extract reusable payload builders from `_web_get_status`/`_web_list_jobs`/`_web_job_runs`/`_web_get_cluster`/`_web_get_fleet`/`_web_get_node`/`_web_metrics` (separating request-parsing from payload construction, §4.3); add the Origin check.
-- **New `cronstable/mcpcli.py`:** the stdio frame-proxy (urllib, no aiohttp), with `initialize`-sniffed `MCP-Protocol-Version` header injection and a `--validate` self-check.
+- **New `cronstable/mcpcli.py`:** the stdio frame-proxy (urllib, no aiohttp), with `initialize`-sniffed `MCP-Protocol-Version` header injection and a `--validate` self-check *(shipped as `--check`)*.
 - **`cronstable/__main__.py`:** add the top-level `mcp` subparser in `_add_state_subcommands` (or a sibling `_add_mcp_subcommand`), routed like the other job-facing subcommands (lazy import, no `Cron`).
 - **`cronstable/config.py`:** `mcp:` schema + `_build_mcp_config` + the fail-closed checks (empty-listen, token/routable-listener, maxRows clamp).
 - **`tests/test_mcp.py`:** direct `MCPHandler.handle_message()` calls with the mock-`Req` style of `tests/test_ui_endpoints.py`.
@@ -319,7 +350,7 @@ The server is built in four increments, each shippable on its own.
 
 **Resources & prompts.** Add `resources/list`, `resources/templates/list`, `resources/read`, `prompts/list`, `prompts/get` and the `state` toolset (`cron_inspect_state` with redaction). **Extend `_capabilities()` to advertise `resources`/`prompts` only now that they're registered.** Optional: SSE upgrade on `POST /mcp` for progress on `cron_backfill_dag`.
 
-**Hardening, docs, distribution.** Finalize `MCP-Protocol-Version` edge cases and scoped **CORS** for browser-hosted clients; add the optional OAuth Resource-Server path behind a config flag (only if a public endpoint is wanted); publish to the [official MCP Registry](https://github.com/modelcontextprotocol/registry) via `mcp-publisher` with a `server.json` declaring both a `packages[]` (PyPI, `uvx cronstable mcp`) and a `remotes[]` (`streamable-http` URL) entry, plus an `mcp-name:` line in `README.md` for ownership proof; add copy-paste client configs and the Inspector CI smoke test (§10). New `wiki/MCP.md`; update `wiki/HTTP-API.md` and `wiki/Configuration-Reference.md`.
+**Hardening, docs, distribution.** Finalize `MCP-Protocol-Version` edge cases and scoped **CORS** for browser-hosted clients; add the optional OAuth Resource-Server path behind a config flag (only if a public endpoint is wanted); publish to the [official MCP Registry](https://github.com/modelcontextprotocol/registry) via `mcp-publisher` with a `server.json` declaring both a `packages[]` (PyPI, `uvx cronstable mcp`) and a `remotes[]` (`streamable-http` URL) entry, plus an `mcp-name:` line in `README.md` for ownership proof; add copy-paste client configs and the Inspector CI smoke test (§10). New [`wiki/MCP.md`](MCP); update [`wiki/HTTP-API.md`](HTTP-API) and [`wiki/Configuration-Reference.md`](Configuration-Reference).
 
 ---
 
@@ -342,7 +373,7 @@ The server is built in four increments, each shippable on its own.
 
 **Static checks:** `cronstable/mcp.py` and `cronstable/mcpcli.py` must pass `ruff` and `mypy` at **line-length 79, py310** (repo config). **`mcpcli.py` must not import `aiohttp`/`strictyaml`/the `Cron` graph**, enforce with a test that imports it and asserts those modules are absent from `sys.modules`, preserving the fast-start contract of the job-facing subcommands.
 
-**Client wiring (ship in `README.md`/`wiki/MCP.md`)** ([Claude Code MCP](https://code.claude.com/docs/en/mcp)):
+**Client wiring (ship in `README.md`/[`wiki/MCP.md`](MCP))** ([Claude Code MCP](https://code.claude.com/docs/en/mcp)):
 - Claude Code (HTTP): `claude mcp add --transport http cronstable https://cronstable.example/mcp --header "Authorization: Bearer $TOKEN"`
 - Claude Code (stdio): `claude mcp add --transport stdio cronstable -- cronstable mcp --url http://127.0.0.1:8080`
 - Claude Desktop: `claude_desktop_config.json` → `mcpServers.cronstable = {command:"cronstable", args:["mcp","--url","http://127.0.0.1:8080"]}` (absolute paths; any JSON error silently disables all servers).

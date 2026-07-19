@@ -996,9 +996,7 @@ def _is_quiescent(
     * no consulted non-terminal entry exists at all (the run could
       terminalise this pass).
     """
-    if expansions and any(
-        items is not None for items in expansions.values()
-    ):
+    if expansions and any(items is not None for items in expansions.values()):
         return False
     if tasks_awaiting_expansion(spec, body):
         return False
@@ -1427,9 +1425,7 @@ def reconcile_crashed(
     def transform(body):
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, 0
-        changed = _reconcile_entries(
-            spec, body, now, proc, host, is_pid_alive
-        )
+        changed = _reconcile_entries(spec, body, now, proc, host, is_pid_alive)
         if changed:
             body["updatedAt"] = now
             return body, changed

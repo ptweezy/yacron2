@@ -1619,7 +1619,7 @@ async def test_adopt_orphans_keys_pass_and_full_pass(tmp_path):
         await _teardown(cron)
 
 
-async def test_read_xcom_list_guards(tmp_path):
+async def test_read_xcom_list_guards(tmp_path, monkeypatch):
     cron = await _make_cron(tmp_path, _LINEAR)
     try:
         backend = cron.state_backend
@@ -1645,8 +1645,10 @@ async def test_read_xcom_list_guards(tmp_path):
         )
         assert await read("items") == [1, 2, 3]
         # a store that cannot be read leaves the fan-out unknown (None)
-        with _break_record_reads(backend):
-            assert await read("items") is None
+        _break_record_reads(
+            monkeypatch, backend, jobstate.ARTIFACT_STREAM_PREFIX + scope
+        )
+        assert await read("items") is None
     finally:
         await _teardown(cron)
 

@@ -13,8 +13,6 @@ import datetime
 import json
 import sys
 
-import pytest
-
 from cronstable import mcp as mcp_mod
 from cronstable.config import _build_mcp_config, parse_config_string
 from cronstable.cron import Cron, JobRunInfo
@@ -272,9 +270,7 @@ async def test_resources_and_prompts_can_be_disabled():
 
 async def test_page_and_limit_fall_back_on_junk():
     h = _handler()
-    result = await _call(
-        h, "cron_get_status", {"limit": "x", "offset": ["y"]}
-    )
+    result = await _call(h, "cron_get_status", {"limit": "x", "offset": ["y"]})
     meta = result["structuredContent"]["page"]
     assert meta["offset"] == 0
     assert meta["limit"] == 200  # maxRows default
@@ -460,9 +456,7 @@ async def test_run_job_success_and_confirm_gate(monkeypatch):
     result = await _call(h, "cron_run_job", {"name": "hello"})
     assert result["isError"] is True  # confirm missing
     assert launched == []
-    result = await _call(
-        h, "cron_run_job", {"name": "hello", "confirm": True}
-    )
+    result = await _call(h, "cron_run_job", {"name": "hello", "confirm": True})
     assert result["structuredContent"] == {"started": "hello"}
     assert launched == ["hello"]
 
@@ -516,15 +510,11 @@ async def test_resources_read_requires_uri():
 
 async def test_resources_read_job_template_and_ghost():
     h = _handler()
-    resp = await _req(
-        h, "resources/read", {"uri": "cronstable://jobs/hello"}
-    )
+    resp = await _req(h, "resources/read", {"uri": "cronstable://jobs/hello"})
     contents = resp["result"]["contents"][0]
     assert contents["mimeType"] == "application/json"
     assert json.loads(contents["text"])["name"] == "hello"
-    resp = await _req(
-        h, "resources/read", {"uri": "cronstable://jobs/ghost"}
-    )
+    resp = await _req(h, "resources/read", {"uri": "cronstable://jobs/ghost"})
     assert resp["error"]["code"] == mcp_mod.RESOURCE_NOT_FOUND
 
 
@@ -640,9 +630,7 @@ def test_preview_summary_shapes():
 
 
 def test_why_summary_shapes():
-    assert "@reboot" in mcp_mod._why_summary(
-        {"job": "j", "reboot": True}
-    )
+    assert "@reboot" in mcp_mod._why_summary({"job": "j", "reboot": True})
     yes = mcp_mod._why_summary(
         {
             "job": "j",
@@ -862,9 +850,7 @@ async def test_dag_tools_full_flow(tmp_path):
         assert "approved gate" in result["content"][0]["text"]
 
         # resources/read: dag detail template (found + ghost)
-        resp = await _req(
-            h, "resources/read", {"uri": "cronstable://dags/ap"}
-        )
+        resp = await _req(h, "resources/read", {"uri": "cronstable://dags/ap"})
         detail = json.loads(resp["result"]["contents"][0]["text"])
         assert detail["name"] == "ap"
         resp = await _req(
@@ -996,9 +982,7 @@ def test_mcp_config_round_trip_through_parse():
 
 async def test_tools_call_unknown_tool_is_invalid_params():
     h = _handler()
-    resp = await _req(
-        h, "tools/call", {"name": "ghost_tool", "arguments": {}}
-    )
+    resp = await _req(h, "tools/call", {"name": "ghost_tool", "arguments": {}})
     assert resp["error"]["code"] == mcp_mod.INVALID_PARAMS
     assert "unknown tool" in resp["error"]["message"]
 

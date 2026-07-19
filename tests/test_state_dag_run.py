@@ -62,6 +62,10 @@ async def _reap_running(cron):
     for rj in rjs:
         await rj.wait()
         await cron._handle_finished_job(rj)
+    # The reaper batches DAG-task completions and records them once per run
+    # after draining a batch of finished jobs; mirror that flush here (the
+    # completions are only buffered until it runs).
+    await cron._dag.flush_completions()
     return bool(rjs)
 
 
@@ -546,6 +550,93 @@ async def test_trigger_and_introspection(tmp_path):
         assert one["runKey"] == run_key
         assert await cron._dag.get_run("lin", "nope") is None
         assert await cron._dag.trigger_run("ghost") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_list_dags_caches_terminal_runs(tmp_path):
+    # list_dags' rollup must serve immutable terminal runs from cache: after a
+    # first pass populates it, a second pass reads no documents at all (no bulk
+    # list_documents, no per-run read_document), while the rollup stays correct.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        for _ in range(3):
+            rk = await cron._dag.trigger_run("lin")
+            body = await _drive(cron, "lin", rk)
+            assert body["state"] == dag.SUCCESS
+
+        backend = cron.state_backend
+        calls = {"list_documents": 0, "read_document": 0}
+        real_list = backend.list_documents
+        real_read = backend.read_document
+
+        async def counting_list(ns):
+            calls["list_documents"] += 1
+            return await real_list(ns)
+
+        async def counting_read(ns, key):
+            calls["read_document"] += 1
+            return await real_read(ns, key)
+
+        backend.list_documents = counting_list
+        backend.read_document = counting_read
+
+        first = await cron._dag.list_dags()
+        lin = next(d for d in first if d["name"] == "lin")
+        assert lin["totalRuns"] == 3
+        assert lin["runCounts"] == {"success": 3}
+        assert lin["latestRun"]["state"] == "success"
+        # cold cache: three terminal runs read individually (below the bulk
+        # threshold), no full list_documents sweep needed
+        assert calls == {"list_documents": 0, "read_document": 3}
+
+        calls["list_documents"] = 0
+        calls["read_document"] = 0
+        second = await cron._dag.list_dags()
+        lin2 = next(d for d in second if d["name"] == "lin")
+        # identical rollup, and served entirely from cache (keys listing only)
+        assert lin2["totalRuns"] == 3
+        assert lin2["runCounts"] == {"success": 3}
+        assert lin2["latestRun"] == lin["latestRun"]
+        assert calls == {"list_documents": 0, "read_document": 0}
+    finally:
+        await _teardown(cron)
+
+
+async def test_parallel_completions_recorded_in_one_batched_rmw(
+    tmp_path, monkeypatch
+):
+    # Three independent tasks finish together in one reaper batch; the flush
+    # must record all three in a SINGLE mark_tasks_finished transform (one
+    # document RMW + fsync), not one per task.
+    yaml = (
+        "dags:\n  - name: fan\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "      - id: b\n        command: 'x'\n"
+        "      - id: c\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        for t in ("a", "b", "c"):
+            _set_cmd(cron, "fan", t, [_PY, "-c", "pass"])
+        batch_sizes = []
+        real = dagrun.dag.mark_tasks_finished
+
+        def spy(marks, now):
+            batch_sizes.append(len(marks))
+            return real(marks, now)
+
+        monkeypatch.setattr(dagrun.dag, "mark_tasks_finished", spy)
+        run_key = await cron._dag.trigger_run("fan")
+        body = await _drive(cron, "fan", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert all(
+            body["tasks"][t]["state"] == dag.SUCCESS for t in ("a", "b", "c")
+        )
+        # exactly one batched completion RMW, carrying all three tasks
+        assert batch_sizes == [3]
     finally:
         await _teardown(cron)
 

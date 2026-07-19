@@ -241,6 +241,38 @@ async def test_depends_on_past_skips_non_run_outcomes(tmp_path):
     assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
 
 
+async def test_depends_on_past_widens_past_non_run_probe_page(tmp_path):
+    # More than a probe page of cancelled records sits at the head of the
+    # ledger, above the decisive failure. The gate probes a small page first;
+    # a probe-only read would see only cancels and wrongly ALLOW. It must widen
+    # to the full window, find the buried failure, and block.
+    cron = await _dep_cron(tmp_path)
+    await _put_ledger(cron, "failure", "2026-07-01T10:00:00+00:00")
+    for i in range(cron_mod.DEPENDS_GATE_PROBE + 3):
+        await _put_ledger(
+            cron, "cancelled", "2026-07-01T10:{:02d}:00+00:00".format(10 + i)
+        )
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is False
+
+
+async def test_depends_on_past_probe_page_suffices_without_widening(tmp_path):
+    # Common case: the newest ledger record is a real outcome, so the gate
+    # reads a single probe page and never widens to the full 50-record window.
+    cron = await _dep_cron(tmp_path)
+    await _put_ledger(cron, "success", "2026-07-01T10:00:00+00:00")
+    await _put_ledger(cron, "failure", "2026-07-01T10:05:00+00:00")
+    calls = []
+    real = cron.state_backend.list_records
+
+    async def counting(stream, **kw):
+        calls.append(kw.get("limit"))
+        return await real(stream, **kw)
+
+    cron.state_backend.list_records = counting  # type: ignore[method-assign]
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is False
+    assert calls == [cron_mod.DEPENDS_GATE_PROBE]  # one read, no widening
+
+
 # --- catch-up latch fixes ---------------------------------------------------
 
 

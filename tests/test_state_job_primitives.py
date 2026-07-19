@@ -634,6 +634,55 @@ async def test_artifact_list_newest_per_name(tmp_path):
     await backend.stop()
 
 
+async def test_artifact_put_prunes_superseded_same_name_records(tmp_path):
+    # Republishing one name must not grow the stream without bound: the name-
+    # keyed prune drops superseded records, keeping only the newest per name,
+    # while reads still return the latest value.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        for i in range(30):
+            await jobstate.artifact_put(
+                backend, "s", "rolling", str(i).encode()
+            )
+        _rec, data = await jobstate.artifact_get(backend, "s", "rolling")
+        assert data == b"29"  # newest value survives
+        raw = await backend.list_records(
+            jobstate.ARTIFACT_STREAM_PREFIX + "s"
+        )
+        # amortised prune bounds the stream near the distinct-name count (1),
+        # far below the 30 publishes (slack of at most the prune cadence).
+        assert len(raw) <= state._PRUNE_EVERY_APPENDS
+        listing = await jobstate.artifact_list(backend, "s")
+        assert [r["name"] for r in listing] == ["rolling"]
+    finally:
+        await backend.stop()
+
+
+async def test_artifact_prune_keeps_every_live_name(tmp_path):
+    # The safety property a blind newest-N prune would violate: with more
+    # distinct names than the prune cadence, every name's latest must survive.
+    # (A newest-N record prune would evict live names once their count exceeds
+    # N, then the orphan-blob sweep would delete still-referenced blobs.)
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        names = ["n{}".format(i) for i in range(20)]  # > _PRUNE_EVERY_APPENDS
+        for nm in names:
+            await jobstate.artifact_put(backend, "s", nm, b"v1")
+        for nm in names:  # republish each, triggering prunes along the way
+            await jobstate.artifact_put(
+                backend, "s", nm, (nm + "-v2").encode()
+            )
+        listing = await jobstate.artifact_list(backend, "s")
+        assert sorted(r["name"] for r in listing) == sorted(names)
+        for nm in names:
+            got = await jobstate.artifact_get(backend, "s", nm)
+            assert got is not None and got[1] == (nm + "-v2").encode()
+    finally:
+        await backend.stop()
+
+
 async def test_artifact_missing_returns_none(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()

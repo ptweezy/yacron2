@@ -72,6 +72,18 @@ def fixup_pyinstaller_env(env: Dict[str, str]) -> None:
 # failure reports); this only bounds the in-memory buffer the UI streams from.
 LIVE_LOG_LIMIT = 1000
 
+# Hard cap on the lines held in one subscriber's delivery queue. A live tail
+# that keeps up drains this to near-empty each loop; the cap only bites when a
+# subscriber stalls (a backgrounded tab, a full/slow TCP window) while its job
+# is a firehose. Without it the queue grows to the run's ENTIRE output per
+# stalled subscriber (the LIVE_LOG_LIMIT ring bounds the shared buffer, not the
+# per-subscriber queue), so one paused tab on a chatty job could pin hundreds
+# of MB. On overflow the OLDEST queued line is dropped so the viewer keeps
+# receiving the newest output; the live tail is best-effort, and a reconnect
+# re-snapshots the ring buffer. Generous headroom over the 1000-line ring so a
+# briefly-slow client loses nothing.
+LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT = 8192
+
 # How long a forcibly-terminated run waits for its stdout/stderr to reach EOF
 # before the readers are cancelled and whatever they captured is kept (see
 # RunningJob._read_job_streams). Only ever reached when a descendant escaped
@@ -113,16 +125,44 @@ class JobOutputStream:
         # Cron._archive_output) can record the truncation instead of
         # presenting the tail as the whole output.
         self.published = 0
+        # lines a stalled subscriber's bounded queue overflowed and dropped;
+        # observability only (the live tail is best-effort).
+        self.dropped = 0
+
+    @staticmethod
+    def _offer(queue: "asyncio.Queue", item: Any) -> bool:
+        """Enqueue for one subscriber, dropping its oldest line if full.
+
+        Returns True when an existing item had to be evicted to make room.
+        publish() runs synchronously on the event-loop thread, so no consumer
+        coroutine interleaves here and the get_nowait/put_nowait pair is race
+        free. Dropping the OLDEST keeps the newest output flowing to a viewer
+        that has fallen behind, and guarantees room for the end-of-stream
+        sentinel even when the queue is saturated.
+        """
+        try:
+            queue.put_nowait(item)
+            return False
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:  # pragma: no cover - full implies non-empty
+                pass
+            queue.put_nowait(item)
+            return True
 
     def publish(self, stream_name: str, line: str) -> None:
         item = (stream_name, line)
         self.published += 1
         self.lines.append(item)
         for queue in self._subscribers:
-            queue.put_nowait(item)
+            if self._offer(queue, item):
+                self.dropped += 1
 
     def subscribe(self) -> "asyncio.Queue":
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(
+            maxsize=LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT
+        )
         self._subscribers.append(queue)
         if self.closed:
             # the run already finished: deliver the end sentinel immediately so
@@ -142,9 +182,11 @@ class JobOutputStream:
         if self.closed:
             return
         self.closed = True
-        # None is the end-of-stream sentinel for subscriber read loops.
+        # None is the end-of-stream sentinel for subscriber read loops. Route
+        # it through _offer so a saturated queue still receives it (dropping an
+        # oldest line to make room) and the reader loop terminates.
         for queue in self._subscribers:
-            queue.put_nowait(None)
+            self._offer(queue, None)
 
 
 class StreamReader:

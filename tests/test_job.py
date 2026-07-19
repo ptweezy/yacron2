@@ -190,6 +190,44 @@ async def test_job_output_stream_ring_buffer_bounds():
 
 
 @pytest.mark.asyncio
+async def test_job_output_stream_subscriber_queue_drops_oldest_when_full(
+    monkeypatch,
+):
+    # A stalled subscriber (never draining its queue) must not grow without
+    # bound: the queue is capped and overflow drops the OLDEST line so the
+    # viewer keeps receiving the newest output.
+    monkeypatch.setattr(cronstable.job, "LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT", 3)
+    out = cronstable.job.JobOutputStream()
+    queue = out.subscribe()
+    for i in range(5):
+        out.publish("stdout", f"line {i}\n")
+    assert queue.qsize() == 3
+    assert out.dropped == 2
+    # oldest two (line 0, line 1) were evicted; newest three remain in order
+    assert queue.get_nowait() == ("stdout", "line 2\n")
+    assert queue.get_nowait() == ("stdout", "line 3\n")
+    assert queue.get_nowait() == ("stdout", "line 4\n")
+
+
+@pytest.mark.asyncio
+async def test_job_output_stream_sentinel_delivered_to_saturated_queue(
+    monkeypatch,
+):
+    # close()'s end sentinel must reach even a subscriber whose bounded queue is
+    # already full, or that reader loop would never terminate.
+    monkeypatch.setattr(cronstable.job, "LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT", 2)
+    out = cronstable.job.JobOutputStream()
+    queue = out.subscribe()
+    out.publish("stdout", "a\n")
+    out.publish("stdout", "b\n")
+    out.close()
+    drained = []
+    while not queue.empty():
+        drained.append(queue.get_nowait())
+    assert drained[-1] is None  # sentinel present despite the earlier overflow
+
+
+@pytest.mark.asyncio
 async def test_stream_reader_publishes_to_output():
     # the on_line hook wires StreamReader output into a JobOutputStream so the
     # web UI can tail lines live as the job produces them.

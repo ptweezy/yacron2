@@ -192,6 +192,8 @@ from typing import (
     List,
     Optional,
     Set,
+    TypeVar,
+    cast,
 )
 
 import aiohttp
@@ -1325,7 +1327,14 @@ def _split_host_port(addr: str) -> "tuple[str, int]":
     return host, int(port)
 
 
-def _memoized_derived(method: Callable[..., Any]) -> Callable[..., Any]:
+# the result type a memoized derived method computes (see _memoized_derived);
+# preserving it through the decorator keeps call sites fully typed.
+_DerivedT = TypeVar("_DerivedT")
+
+
+def _memoized_derived(
+    method: "Callable[[ClusterManager], _DerivedT]",
+) -> "Callable[[ClusterManager], _DerivedT]":
     """Memoize a zero-argument election-derived ClusterManager method.
 
     The decorated methods are pure derivations over the peer table (plus a
@@ -1359,7 +1368,7 @@ def _memoized_derived(method: Callable[..., Any]) -> Callable[..., Any]:
     name = method.__name__
 
     @functools.wraps(method)
-    def wrapper(self: "ClusterManager") -> Any:
+    def wrapper(self: "ClusterManager") -> "_DerivedT":
         key = self._derived_state_key()
         if key != self._derived_cache_key:
             # an input changed since the cached round: every memoized result
@@ -1367,7 +1376,10 @@ def _memoized_derived(method: Callable[..., Any]) -> Callable[..., Any]:
             self._derived_cache_key = key
             self._derived_cache.clear()
         try:
-            return self._derived_cache[name]
+            # the cache is heterogeneous (one dict for every derived method,
+            # keyed by method name), so entries are stored as Any; the cast
+            # restores the static type the method computed the value with.
+            return cast("_DerivedT", self._derived_cache[name])
         except KeyError:
             value = method(self)
             self._derived_cache[name] = value

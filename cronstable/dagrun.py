@@ -859,37 +859,63 @@ class DagScheduler:
 
     async def _do_advance(self, dagcfg: Any, ref: RunRef) -> None:
         spec = dagcfg.spec
-        # 1. reconcile first: fail any task a crash left running with a dead
-        # process (protects our own live tasks by proc token).  Its RMW
-        # already observed the document body, so reuse that observation to
-        # see which mapped tasks are ready to expand, and pre-read their
-        # upstream XCom lists (outside the claim RMW), instead of paying a
-        # separate second read of the same document on every advance.
-        body = await self._reconcile_run(dagcfg, ref)
+        now = _now()
+        proc = self._cron._proc_token
+        host = self._cron._state_host
+        # 1. reconcile AND claim in one RMW (dag.reconcile_and_plan): fail
+        # any task a crash left running with a dead process (protects our
+        # own live tasks by proc token), then, unless mapped tasks are
+        # awaiting expansion, continue straight into propagate/claim/
+        # terminalise on the same body.  In the common case this is the
+        # advance's ONLY document RMW (and on a quiescent run it keeps the
+        # document without a rewrite); the old shape paid a reconcile RMW
+        # plus a claim RMW on every owned run's wake and after every task
+        # completion.
+        transform = self._wrap(
+            dag.reconcile_and_plan(spec, now, proc, host, platform.pid_alive)
+        )
+        body, combined = await self._mutate(ref[0], ref[1], transform)
         if body is None:
+            # the run document does not exist (or no backend answered):
+            # nothing to advance, exactly like the old reconcile step
+            # observing no document.
             await self._release(ref)
             return
+        if combined.reconciled:
+            logger.info(
+                "dag run %s/%s: reconciled %d interrupted task(s)",
+                ref[0],
+                ref[1],
+                combined.reconciled,
+            )
         if dag.is_terminal_run(body):
             await self._on_terminal(ref)
             return
         run_id = str(body.get("runId"))
-        expansions = await self._read_expansions(dagcfg, run_id, body)
-        # 3. claim: atomically expand + propagate + claim ready tasks.
-        now = _now()
-        proc = self._cron._proc_token
-        host = self._cron._state_host
-        transform = self._wrap(
-            dag.plan_and_claim(spec, now, proc, host, expansions)
-        )
-        stored, result = await self._mutate(ref[0], ref[1], transform)
-        if result is None:
-            return
-        # 4. launch each claimed task (subprocess); record pid or fail. Each
-        # launch is independent -- one failing must not skip the rest of the
-        # batch (which would strand them claimed-but-unlaunched).
+        result = combined.advance
+        if combined.expansions_needed:
+            # 2. mapped tasks await their upstream lists: pre-read them from
+            # the reconciled body (outside any document lock, exactly as
+            # before), then run the classic claim RMW as the second step.
+            expansions = await self._read_expansions(dagcfg, run_id, body)
+            now = _now()
+            transform = self._wrap(
+                dag.plan_and_claim(spec, now, proc, host, expansions)
+            )
+            claimed, result = await self._mutate(ref[0], ref[1], transform)
+            if result is None:
+                return
+            if claimed is not None:
+                body = claimed
+        # 3. launch each claimed task (subprocess), collecting the launched
+        # pids to stamp in one batched RMW below; a launch that fails is
+        # failed explicitly (exit 127) per task.  Each launch is independent:
+        # one failing must not skip the rest of the batch (which would
+        # strand them claimed-but-unlaunched).
+        pid_stamps: List[Tuple[str, str, Optional[int], Optional[int]]] = []
         for intent in result.launches:
             try:
-                await self._launch_task(dagcfg, ref, run_id, intent)
+                stamp = await self._launch_task(dagcfg, ref, run_id, intent)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - fail just this task, keep going
@@ -911,16 +937,40 @@ class DagScheduler:
                     attempt=intent.attempt,
                     poke=intent.poke_number if intent.is_sensor else None,
                 )
+            else:
+                if stamp is not None:
+                    pid_stamps.append(stamp)
+        if pid_stamps:
+            # 4. ONE RMW stamps every launched pid.  Per-launch stamping
+            # cost a full document parse+rewrite+fsync per subprocess, so a
+            # mapped fan-out paid up to MAX_CLAIMS_PER_PASS full rewrites of
+            # a document holding up to MAX_MAPPED_ITEMS entries per pass.
+            # Best-effort like the old per-task write: each task already
+            # owns its slot (proc was set at claim, so reconciliation
+            # protects it even without a pid), and the reaper will record
+            # its completion; a failed batch write must not fail
+            # already-running tasks.
+            try:
+                await self._set_pids(ref, pid_stamps)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the pids are an optimisation
+                logger.warning(
+                    "dag run %s/%s: could not record pids for %d launched "
+                    "task(s)",
+                    ref[0],
+                    ref[1],
+                    len(pid_stamps),
+                )
         # 5. terminal? release the lease; else schedule the next wake.
-        final = stored if stored is not None else body
-        if dag.is_terminal_run(final):
+        if dag.is_terminal_run(body):
             await self._on_terminal(ref)
         elif result.deferred:
             # the claim quota capped this pass (dag.MAX_CLAIMS_PER_PASS):
             # more instances are claimable right now, so re-service promptly.
             self._wake[ref] = now
         else:
-            self._wake[ref] = self._compute_wake(spec, final, now)
+            self._wake[ref] = self._compute_wake(spec, body, now)
 
     async def _read_expansions(
         self, dagcfg: Any, run_id: str, body: Dict[str, Any]
@@ -1087,7 +1137,7 @@ class DagScheduler:
 
     async def _launch_task(
         self, dagcfg: Any, ref: RunRef, run_id: str, intent
-    ) -> None:
+    ) -> Optional[Tuple[str, str, Optional[int], Optional[int]]]:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
         token, env = self._prepare_task_run(
@@ -1128,25 +1178,18 @@ class DagScheduler:
                 attempt=dref.attempt,
                 poke=dref.poke,
             )
-            return
+            return None
         self._cron.running_jobs[template.name].append(running)
         self._cron._jobs_running.set()
         pid = running.proc.pid if running.proc is not None else None
-        # best-effort: the task already owns its slot (proc was set at claim,
-        # so reconciliation protects it even without a pid), and the reaper
-        # will record its completion; a failed pid write must not abort the
-        # launch batch or, worse, fail an already-running task.
-        try:
-            await self._set_pid(dagcfg, ref, taskkey, pid, dref.attempt)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - the pid is an optimisation
-            logger.warning(
-                "dag run %s/%s: could not record pid for task %s",
-                ref[0],
-                ref[1],
-                taskkey,
-            )
+        # the pid is NOT stamped here: the caller collects every launched
+        # (taskkey, proc, pid, attempt) and stamps the whole batch in one
+        # RMW after the launch loop (see _do_advance), instead of one full
+        # document rewrite per subprocess.  Deferring it is safe because the
+        # pid is only an optimisation: the task already owns its slot (proc
+        # was set at claim, so reconciliation protects it even without a
+        # pid), and the reaper will record its completion.
+        return (taskkey, dref.proc, pid, dref.attempt)
 
     def _prepare_task_run(
         self, dagcfg: Any, run_id: str, run_key: str, intent, template
@@ -1209,23 +1252,20 @@ class DagScheduler:
         env.update(dag_env)
         return ctx.token, env
 
-    async def _set_pid(
+    async def _set_pids(
         self,
-        dagcfg: Any,
         ref: RunRef,
-        taskkey: str,
-        pid: Optional[int],
-        attempt: Optional[int] = None,
+        stamps: List[Tuple[str, str, Optional[int], Optional[int]]],
     ) -> None:
-        transform = self._wrap(
-            dag.set_task_pid(
-                taskkey,
-                self._cron._proc_token,
-                pid,
-                _now(),
-                attempt=attempt,
-            )
-        )
+        """Record a whole launch loop's pids in one batched RMW.
+
+        ``stamps`` carries ``(taskkey, proc, pid, attempt)`` per launched
+        instance; :func:`dag.set_task_pids` applies each under the same
+        per-entry proc-token/attempt fence the old per-task
+        :func:`dag.set_task_pid` write used, so batching only removes RMWs,
+        never a fence.
+        """
+        transform = self._wrap(dag.set_task_pids(stamps, _now()))
         await self._mutate(ref[0], ref[1], transform)
 
     # =====================================================================

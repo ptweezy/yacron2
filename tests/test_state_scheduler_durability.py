@@ -1087,6 +1087,10 @@ async def test_trends_single_pass_matches_filter_per_window(
         ]
         for i, (seconds_ago, outcome) in enumerate(history):
             await put(seconds_ago, outcome, duration=float(i + 1))
+        # a poison record is skipped by the parse, not counted anywhere
+        await cron.state_backend.append_record(
+            "runs/j", {"finished_at": "not-a-date"}
+        )
 
         payload = await cron.job_trends_payload("j")
         assert payload is not None
@@ -1123,6 +1127,22 @@ async def test_trends_single_pass_matches_filter_per_window(
         assert totals == {"1h": 2, "24h": 4, "7d": 6, "30d": 8, "all": 9}
     finally:
         await _stop_state(cron)
+
+
+async def test_trends_cancellation_propagates(tmp_path):
+    # cancellation is not a store failure: it must re-raise, never degrade
+    # to the in-memory history
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+
+        async def _cancelled(*_a, **_k):
+            raise asyncio.CancelledError
+
+        cron.state_backend.list_records = _cancelled  # type: ignore[method-assign]
+        with pytest.raises(asyncio.CancelledError):
+            await cron.job_trends_payload("j")
+    finally:
+        cron.state_backend = None
 
 
 async def test_trends_degrades_to_memory_and_404s(tmp_path):

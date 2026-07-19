@@ -137,7 +137,7 @@ def bench(
     group,
     detail="",
     unit="s",
-    gate_pct=25.0,
+    gate_pct=15.0,
     gate_floor=0.010,
     compare="min",
     repeats=(5, 2, 1),
@@ -149,6 +149,13 @@ def bench(
     ``subprocess=True`` marks a benchmark that measures a child process (cold
     start, import, peak RSS): it belongs to the noisier subprocess tier, which
     ``--tier`` can select on its own so CI can run it with its own round count.
+
+    The default ``gate_pct`` (15%) suits the deterministic in-process compute
+    metrics, which are rock-steady across the five CI rounds; the noisier tiers
+    (subprocess process-spawn, real-disk state I/O, peak-RSS) set a looser
+    limit of their own so ordinary jitter never trips them.  A regression must
+    also clear the measured noise band regardless (see compare.py), so a tight
+    percentage does not mean a jumpy gate.
     """
 
     def deco(fn):
@@ -346,6 +353,7 @@ def bench_python_baseline():
     "startup.version",
     "startup",
     detail="cronstable --version",
+    gate_pct=25.0,
     repeats=(40, 5, 2),
     subprocess=True,
 )
@@ -357,6 +365,7 @@ def bench_startup_version():
     "startup.import_cronexpr",
     "startup",
     detail="import cronstable.cronexpr",
+    gate_pct=25.0,
     repeats=(12, 3, 1),
     subprocess=True,
 )
@@ -368,6 +377,7 @@ def bench_import_cronexpr():
     "startup.import_config",
     "startup",
     detail="import cronstable.config",
+    gate_pct=25.0,
     repeats=(12, 3, 1),
     subprocess=True,
 )
@@ -379,6 +389,7 @@ def bench_import_config():
     "startup.import_daemon",
     "startup",
     detail="import cronstable.cron (full daemon graph)",
+    gate_pct=25.0,
     repeats=(12, 3, 1),
     subprocess=True,
 )
@@ -390,6 +401,7 @@ def bench_import_daemon():
     "startup.validate_config_100",
     "startup",
     detail="cronstable --validate-config, 100 jobs",
+    gate_pct=25.0,
     repeats=(8, 2, 1),
     subprocess=True,
 )
@@ -402,6 +414,7 @@ def bench_validate_config():
     "startup.job_set_id_100",
     "startup",
     detail="cronstable --job-set-id, 100 jobs",
+    gate_pct=25.0,
     repeats=(8, 2, 1),
     subprocess=True,
 )
@@ -998,6 +1011,75 @@ def bench_kv_roundtrip():
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _artifact_scope_churned():
+    """A store where one scope has had many artifact puts over a few names,
+    built once (untimed).  Newest-per-name is all any reader wants, so a
+    release that prunes superseded records at put time leaves a small stream
+    here while an older one accumulates every version -- the difference this
+    benchmark surfaces on the read side."""
+
+    def build():
+        import asyncio
+
+        from cronstable import jobstate
+
+        path = os.path.join(_tmpdir(), "artifact-churn")
+        os.makedirs(path, exist_ok=True)
+        n = _n(2000)
+        names = 8
+
+        async def seed():
+            backend = _state_backend(path)
+            await backend.start()
+            for i in range(n):
+                await jobstate.artifact_put(
+                    backend, "bench", "report-%d" % (i % names), b"payload"
+                )
+            await backend.stop()
+
+        asyncio.run(seed())
+        return path
+
+    return fixture("artifact_churned", build)
+
+
+@bench(
+    "state.artifact_list_churn",
+    "state",
+    detail="artifact_list after 2k puts over 8 names",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.005,
+)
+def bench_artifact_list_churn():
+    import asyncio
+
+    try:
+        from cronstable import jobstate
+    except ImportError as exc:
+        raise Skip("cronstable.jobstate unavailable: %r" % exc) from None
+    if not hasattr(jobstate, "artifact_put") or not hasattr(
+        jobstate, "artifact_list"
+    ):
+        raise Skip("jobstate artifact API not present")
+    path = _artifact_scope_churned()
+
+    async def run():
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            t0 = time.perf_counter()
+            for _ in range(10):
+                await jobstate.artifact_list(backend, "bench")
+            dt = time.perf_counter() - t0
+        except TypeError as exc:
+            raise Skip("artifact_list signature changed: %r" % exc) from None
+        await backend.stop()
+        return dt
+
+    return asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # json / fingerprint / redact / ical
 # ---------------------------------------------------------------------------
@@ -1505,7 +1587,18 @@ def main(argv=None):
     meta = _cronstable_meta()
     started = time.perf_counter()
     results = []
+    prev_group = None
     for spec in selected:
+        # Release the finished group's fixtures before starting the next one.
+        # Fixtures are large (100k CronTabs, 100k-job configs) and keyed within
+        # a group; without this the cache held the UNION of every group's
+        # fixtures resident for the whole suite. Benchmarks are registered
+        # grouped, so a group change is a safe eviction boundary (a fixture a
+        # later group still needs is simply rebuilt, untimed).
+        if prev_group is not None and spec["group"] != prev_group:
+            _FIX.clear()
+            gc.collect()
+        prev_group = spec["group"]
         result = _run_one(spec)
         results.append(result)
         if result["skipped"]:

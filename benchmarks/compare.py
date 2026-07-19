@@ -139,15 +139,59 @@ def _rel_cov(entry):
 
     Uses the per-round estimator values that _merge preserved in
     ``round_values``; needs at least two rounds to estimate scatter, else
-    None.  Returned as a fraction of the mean.
+    None.  Returned as a fraction of the metric's center.
+
+    From three rounds up the scatter is a ROBUST estimate: the median absolute
+    deviation scaled to a standard-deviation equivalent (x1.4826).  A single
+    throttled/GC-stalled round then cannot inflate the band and so cannot mask
+    a real regression behind it -- the failure mode a plain stdev has on a
+    handful of noisy samples.  (A degenerate MAD of 0, e.g. a tied median on
+    few points, falls back to stdev so the band is never falsely zero.)  Two
+    rounds carry too little shape for a robust estimator, so they keep stdev.
     """
     rounds = entry.get("round_values") or []
     if len(rounds) < _MIN_ROUNDS_FOR_NOISE:
         return None
-    mean = statistics.fmean(rounds)
-    if mean <= 0:
+    center = statistics.median(rounds)
+    if center <= 0:
         return None
-    return statistics.stdev(rounds) / mean
+    if len(rounds) >= 3:
+        med = statistics.median(rounds)
+        mad = statistics.median([abs(x - med) for x in rounds])
+        scatter = 1.4826 * mad or statistics.stdev(rounds)
+    else:
+        scatter = statistics.stdev(rounds)
+    return scatter / center
+
+
+def _baseline_of(side_map):
+    """The interpreter-startup floor (``startup.python_baseline``) measured on
+    one side, or None if it was not run (older release, filtered run)."""
+    entry = side_map.get("startup.python_baseline")
+    if entry is None or entry.get("skipped"):
+        return None
+    return entry.get("value")
+
+
+def _adjusted_values(name, base, cur, base_floor, cur_floor):
+    """Startup metrics minus the co-measured interpreter-startup floor.
+
+    ``cronstable --version`` and the import timings are dominated by Python's
+    own process spawn + interpreter init, which cronstable cannot regress.
+    Subtracting each side's ``startup.python_baseline`` isolates cronstable's
+    OWN contribution, so a real +2ms of import cost is not diluted below the
+    gate by ~40ms of un-regressable interpreter overhead.  Returns the pair of
+    adjusted values, or the raw pair when the floor is unknown or would leave a
+    non-positive remainder (a subtraction artefact, not a real measurement).
+    """
+    if not name.startswith("startup.") or name == "startup.python_baseline":
+        return base["value"], cur["value"]
+    if base_floor is None or cur_floor is None:
+        return base["value"], cur["value"]
+    ab, ac = base["value"] - base_floor, cur["value"] - cur_floor
+    if ab <= 0 or ac <= 0:
+        return base["value"], cur["value"]
+    return ab, ac
 
 
 def _noise_band(base, cur):
@@ -167,6 +211,8 @@ def _compare(baseline, current):
     """Per-metric comparison rows plus gate violations."""
     rows = []
     violations = []
+    base_floor = _baseline_of(baseline)
+    cur_floor = _baseline_of(current)
     for name, cur in current.items():
         if cur.get("skipped"):
             continue
@@ -184,7 +230,13 @@ def _compare(baseline, current):
                 }
             )
             continue
-        delta = _delta_pct(base["value"], cur["value"])
+        # Gate on cronstable's own contribution: startup metrics have their
+        # interpreter-startup floor subtracted first. The displayed base/cur
+        # values stay the raw totals; only delta_pct (what gates) is adjusted.
+        adj_base, adj_cur = _adjusted_values(
+            name, base, cur, base_floor, cur_floor
+        )
+        delta = _delta_pct(adj_base, adj_cur)
         noise = _noise_band(base, cur)
         # Unknown noise (too few rounds) never suppresses: the guard is only
         # allowed to make the gate MORE conservative, never to hide a
@@ -198,7 +250,7 @@ def _compare(baseline, current):
             delta is not None
             and gate_pct is not None
             and delta > gate_pct
-            and (cur["value"] - base["value"]) > (cur.get("gate_floor") or 0.0)
+            and (adj_cur - adj_base) > (cur.get("gate_floor") or 0.0)
         )
         if over_gate and significant:
             gated = True

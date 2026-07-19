@@ -5431,3 +5431,132 @@ async def test_mtls_conditional_304_and_gzip(tmp_path):
     finally:
         await a.stop()
         await b.stop()
+
+
+# --------------------------------------------------------------------------
+# memoization of election-derived sets, and the /peer response cache
+# --------------------------------------------------------------------------
+
+
+def test_derived_sets_memoized_match_fresh_computation(no_tls):
+    # The election-derived sets are memoized against a mutation generation
+    # bumped by every PeerState field write (including the direct assignments
+    # tests make). The contract is zero behavioural change: at any point, the
+    # memoized value must be exactly what an uncached derivation would
+    # produce. Each method's pre-memoization body is reachable as
+    # fn.__wrapped__ (functools.wraps), which this test uses as the oracle
+    # before and after view mutations through record_success/record_failure.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    # node-b vouches a bridge target (node-x, witnessed once, enough at
+    # quorum 2) and an unconfirmable contender (node-e), so the bridge and
+    # contender derivations all return non-trivial values.
+    _seed_agree(
+        mgr,
+        "b:1",
+        "node-b",
+        mutual={"node-a", "node-c", "node-x"},
+        vouched={"node-e"},
+    )
+    _seed_agree(mgr, "c:1", "node-c", mutual={"node-a", "node-b"})
+    derived = [
+        mgr.cluster_size,
+        mgr._agreeing_peers,
+        mgr._agreeing_peer_names,
+        mgr._bridge_candidates,
+        mgr._eligible_candidates,
+        mgr._unconfirmed_contenders,
+        mgr._available_contenders,
+        mgr.conflict_names,
+        mgr.conflicting_sizes,
+        mgr.conflicting_policies,
+    ]
+
+    def assert_memo_matches_fresh():
+        for fn in derived:
+            fresh = fn.__wrapped__(mgr)
+            assert fn() == fresh  # first (computing) call
+            assert fn() == fresh  # second (cached) call: identical value
+
+    # sanity: the seeded scenario really exercises every derivation
+    assert mgr._agreeing_peer_names() == ["node-b", "node-c"]
+    assert mgr._bridge_candidates() == ["node-x"]
+    assert mgr._unconfirmed_contenders() == ["node-e"]
+    assert mgr._available_contenders() == ["node-x"]
+    assert_memo_matches_fresh()
+    # a record_failure mutation must invalidate: the memoized values change
+    # in step with a fresh derivation (node-b drops out of the live set)
+    mgr.view.record_failure("b:1", "down", untrusted=False)
+    assert mgr._agreeing_peer_names() == ["node-c"]
+    assert_memo_matches_fresh()
+    # a record_success mutation likewise: node-b returns declaring a
+    # divergent cluster size, which both excludes it from the mutual set and
+    # surfaces a size conflict
+    mgr.view.record_success(
+        "b:1",
+        "node-b",
+        "v1:mine",
+        SCHEME_VERSION,
+        "v1:mine",
+        NOW,
+        "node-a",
+        peer_instance="inst-b:1",
+        my_instance=mgr.instance_id,
+        peer_members=[("node-a", mgr.instance_id, True)],
+        peer_size=5,
+    )
+    assert mgr._agreeing_peer_names() == ["node-c"]
+    assert mgr.conflicting_sizes() == [5]
+    assert_memo_matches_fresh()
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_serves_cached_pair_until_view_mutates(no_tls):
+    # /peer serves the same (payload, etag) pair from its short-TTL cache
+    # (the payload cascade and the hash run once, not per request), but a
+    # view mutation invalidates the pair immediately: the generation in the
+    # cache key changes, so election-relevant staleness is zero.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    calls = {"n": 0}
+
+    def provider():
+        calls["n"] += 1
+        return {
+            "j": {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": None,
+                "last": None,
+            }
+        }
+
+    mgr.set_job_summaries_provider(provider)
+    resp1 = await mgr._handle_peer(_Req())
+    assert resp1.status == 200 and calls["n"] == 1
+    etag = resp1.headers["ETag"]
+    # a second request inside the TTL: identical payload and etag, and the
+    # payload cascade (observable via the provider) did NOT run again
+    resp2 = await mgr._handle_peer(_Req())
+    assert resp2.status == 200
+    assert resp2.headers["ETag"] == etag
+    assert resp2.text == resp1.text
+    assert calls["n"] == 1
+    # the conditional path is served from the same cached pair
+    req = _Req()
+    req.headers = {"If-None-Match": etag}
+    resp3 = await mgr._handle_peer(req)
+    assert resp3.status == 304 and calls["n"] == 1
+    # a view mutation (a poll round absorbing an observation) invalidates
+    # at once, well inside the TTL: the pair is rebuilt and the new body
+    # reflects the mutated view
+    _seed_agree(mgr, "b:1", "node-b")
+    resp4 = await mgr._handle_peer(req)
+    assert resp4.status == 200 and calls["n"] == 2
+    assert resp4.headers["ETag"] != etag
+    payload = json.loads(resp4.text)
+    assert payload["mutual_agreeing"] == ["node-b"]

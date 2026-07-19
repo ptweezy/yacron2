@@ -1133,6 +1133,15 @@ def test_dag_task_id_charset_rejected():
         )
     with pytest.raises(dag.DagValidationError, match="may not contain"):
         dag.validate_graph(DagSpec.build("d", [TaskSpec("a#0")]))
+    # a CR/LF (or other control char) in an id would forge daemon log lines
+    for bad in ("a\nb", "a\rb", "a\tb"):
+        with pytest.raises(
+            dag.DagValidationError, match="control characters"
+        ):
+            dag.validate_graph(DagSpec.build("d", [TaskSpec(bad)]))
+    # but only control chars are rejected: printable ids (space, ':', '.',
+    # '-') are still accepted, so the fix narrows nothing operators may use.
+    dag.validate_graph(DagSpec.build("d", [TaskSpec("a b.c-d:e")]))
 
 
 # --------------------------------------------------------------------------
@@ -1848,3 +1857,523 @@ def test_task_record_without_resources_field_still_parses():
     assert ResourceUsage.from_dict(body["tasks"]["a"].get("resources")) is None
     assert ResourceUsage.from_dict("garbage") is None
     assert ResourceUsage.from_dict({"cpu_user_seconds": "nan?"}) is None
+
+
+# --------------------------------------------------------------------------
+# Internal helper edge cases (pure functions driven against hand-built bodies)
+#
+# These exercise the low-level state-machine helpers -- _apply_expansions,
+# _propagate_placeholder, _advance_task, _is_quiescent and friends -- directly,
+# hitting the defensive/no-op branches the higher-level executor tests above
+# do not walk through.
+# --------------------------------------------------------------------------
+
+
+# validate_graph / _validate_expand edge cases
+
+
+def test_validate_empty_task_id():
+    spec = _spec(TaskSpec(""))
+    with pytest.raises(dag.DagValidationError, match="non-empty"):
+        dag.validate_graph(spec)
+
+
+def test_validate_depends_on_self():
+    spec = _spec(TaskSpec("a", depends_on=("a",)))
+    with pytest.raises(dag.DagValidationError, match="dependsOn itself"):
+        dag.validate_graph(spec)
+
+
+def test_validate_expand_from_task_not_a_task():
+    # from_task is neither in depends_on nor a known task: the expand-specific
+    # "is not a task" error fires (not the generic unknown-dependsOn one).
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec(
+            "b",
+            depends_on=("a",),
+            expand=ExpandSpec(from_task="ghost", key="items"),
+        ),
+    )
+    with pytest.raises(dag.DagValidationError, match="is not a task"):
+        dag.validate_graph(spec)
+
+
+# _mapped_group_state: the all-skipped reduction
+
+
+def test_mapped_group_all_skipped_reduces_to_skipped():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "w",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["mapped"]["w"] = {"items": ["a", "b"], "expandedAt": 1.0}
+    body["tasks"]["w#0"] = {"id": "w", "state": dag.SKIPPED}
+    body["tasks"]["w#1"] = {"id": "w", "state": dag.SKIPPED}
+    assert dag._mapped_group_state(body, "w") == dag.SKIPPED
+    # a success sibling alongside a skipped one still reduces to skipped (no
+    # failure present).
+    body["tasks"]["w#0"]["state"] = dag.SUCCESS
+    assert dag._mapped_group_state(body, "w") == dag.SKIPPED
+
+
+# tasks_awaiting_expansion: terminal run + already-resolved placeholder
+
+
+def test_awaiting_expansion_empty_on_terminal_run():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "w",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["state"] = dag.SUCCESS  # terminal run
+    assert dag.tasks_awaiting_expansion(spec, body) == []
+
+
+def test_awaiting_expansion_skips_resolved_placeholder():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "w",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    # the placeholder already resolved (upstream_failed) without expanding:
+    # it must not be re-offered for an XCom pre-read every pass.
+    body["tasks"]["w"]["state"] = dag.UPSTREAM_FAILED
+    assert dag.tasks_awaiting_expansion(spec, body) == []
+
+
+# plan_and_claim transform: no-op on None / terminal body
+
+
+def test_plan_and_claim_noop_on_none_and_terminal():
+    spec = _spec(TaskSpec("a"))
+    transform = dag.plan_and_claim(spec, 5.0, "p", "h", {})
+    new, result = transform(None)
+    assert dag.is_keep(new)
+    assert result.launches == []
+    body = _body(spec)
+    body["state"] = dag.FAILED
+    new, result = transform(body)
+    assert dag.is_keep(new)
+    assert result.launches == []
+
+
+# _apply_expansions: the three skip branches
+
+
+def test_apply_expansions_skip_branches():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    # (1) items is None -> unknown read, left for a later pass.
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    result = dag.AdvanceResult()
+    dag._apply_expansions(spec, body, {"work": None}, 1.0, result)
+    assert body["mapped"] == {}
+    assert result.changed is False
+
+    # (2) target has no expand (or is unknown): nothing to materialise.
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    result = dag.AdvanceResult()
+    dag._apply_expansions(
+        spec, body, {"gen": [1, 2], "ghost": [1]}, 1.0, result
+    )
+    assert body["mapped"] == {}
+    assert result.changed is False
+
+    # (3) upstream is not (yet) success under this fresh body: no fan-out.
+    body = _body(spec)  # gen still pending
+    result = dag.AdvanceResult()
+    dag._apply_expansions(spec, body, {"work": [1, 2]}, 1.0, result)
+    assert body["mapped"] == {}
+    assert "work#0" not in body["tasks"]
+    assert result.changed is False
+
+
+# _instances_of: an un-expanded mapped task has no concrete instances
+
+
+def test_instances_of_unexpanded_mapped_is_empty():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)  # no mapped entry yet
+    assert dag._instances_of(spec, body, spec.by_id["work"]) == []
+    # a plain task is always exactly one instance keyed by its id.
+    assert dag._instances_of(spec, body, spec.by_id["gen"]) == [
+        ("gen", None, None)
+    ]
+
+
+# _propagate_placeholder: source skipped, and a sibling-dep fail/skip verdict
+
+
+def test_propagate_placeholder_source_skipped():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SKIPPED
+    result = dag.AdvanceResult()
+    dag._propagate_placeholder(
+        spec, body, spec.by_id["work"], 1.0, result
+    )
+    assert _state(body, "work") == dag.SKIPPED
+    assert result.changed is True
+
+
+def test_propagate_placeholder_sibling_dep_fail_and_skip():
+    # the expand source succeeds, but a NON-expand dependency terminalises the
+    # placeholder through the ordinary deps verdict.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec("other"),
+        TaskSpec(
+            "work",
+            depends_on=("gen", "other"),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["tasks"]["other"]["state"] = dag.FAILED
+    result = dag.AdvanceResult()
+    dag._propagate_placeholder(spec, body, spec.by_id["work"], 1.0, result)
+    assert _state(body, "work") == dag.UPSTREAM_FAILED
+
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["tasks"]["other"]["state"] = dag.SKIPPED
+    result = dag.AdvanceResult()
+    dag._propagate_placeholder(spec, body, spec.by_id["work"], 1.0, result)
+    assert _state(body, "work") == dag.SKIPPED
+
+
+# _advance_task: unknown-state no-op + defensive verdict computation
+
+
+def test_advance_task_unknown_state_is_noop():
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    entry = body["tasks"]["a"]
+    entry["state"] = "not-a-real-state"
+    result = dag.AdvanceResult()
+    dag._advance_task(
+        spec, body, spec.by_id["a"], "a", None, None, entry, 5.0,
+        "p", "h", result,
+    )
+    assert entry["state"] == "not-a-real-state"
+    assert result.changed is False
+    assert result.launches == []
+
+
+def test_advance_task_direct_call_computes_verdict():
+    # a direct call passes verdict=None; the task-level verdict is computed
+    # defensively and a ready pending task is claimed.
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    entry = body["tasks"]["a"]
+    result = dag.AdvanceResult()
+    dag._advance_task(
+        spec, body, spec.by_id["a"], "a", None, None, entry, 5.0,
+        "p", "h", result,
+    )
+    assert entry["state"] == dag.RUNNING
+    assert [i.task_id for i in result.launches] == ["a"]
+
+
+# _advance_running: poke-in-flight / not-due / launch-quota-spent
+
+
+def test_advance_running_leaves_inflight_and_not_due_pokes():
+    task = TaskSpec("s", type=dag.SENSOR, poke_interval=10.0)
+    # a poke is in flight (proc set): leave it alone.
+    entry = {"state": dag.RUNNING, "proc": "p", "pid": None, "pokeCount": 1}
+    result = dag.AdvanceResult()
+    dag._advance_running(task, "s", None, None, entry, 100.0, "p", "h", result)
+    assert result.changed is False
+    assert result.launches == []
+    # idle but not yet due (nextPokeAt in the future): leave it alone.
+    entry = {
+        "state": dag.RUNNING,
+        "proc": None,
+        "pid": None,
+        "nextPokeAt": 200.0,
+        "pokeCount": 1,
+    }
+    result = dag.AdvanceResult()
+    dag._advance_running(task, "s", None, None, entry, 100.0, "p", "h", result)
+    assert result.changed is False
+    assert result.launches == []
+
+
+def test_advance_running_defers_when_quota_spent(monkeypatch):
+    monkeypatch.setattr(dag, "MAX_CLAIMS_PER_PASS", 0)
+    task = TaskSpec("s", type=dag.SENSOR, poke_interval=10.0, poke_timeout=1e9)
+    entry = {
+        "state": dag.RUNNING,
+        "proc": None,
+        "pid": None,
+        "nextPokeAt": None,
+        "firstPokeAt": 99.0,
+        "pokeCount": 1,
+        "attempt": 0,
+    }
+    result = dag.AdvanceResult()
+    dag._advance_running(task, "s", None, None, entry, 100.0, "p", "h", result)
+    assert result.launches == []
+    assert result.deferred is True
+    assert entry["proc"] is None  # not claimed this pass
+
+
+# _sensor_timed_out: no first poke recorded -> not timed out
+
+
+def test_sensor_timed_out_without_first_poke():
+    task = TaskSpec("s", type=dag.SENSOR, poke_timeout=25.0)
+    assert dag._sensor_timed_out(task, {}, 1000.0) is False
+    # once a first poke instant is present, the timeout window applies.
+    assert dag._sensor_timed_out(task, {"firstPokeAt": 100.0}, 130.0) is True
+    assert dag._sensor_timed_out(task, {"firstPokeAt": 100.0}, 110.0) is False
+
+
+# _maybe_terminalise: a post-creation mapped placeholder never blocks the run
+
+
+def test_maybe_terminalise_ignores_unmaterialised_mapped_task():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    # `work` was added by a reload after the run doc was created: it has no
+    # entry in this run, so it must not gate terminalisation.
+    del body["tasks"]["work"]
+    result = dag.AdvanceResult()
+    dag._maybe_terminalise(spec, body, 5.0, result)
+    assert body["state"] == dag.SUCCESS
+    assert result.changed is True
+
+
+# set_task_pid: no-op on missing run / non-running entry
+
+
+def test_set_task_pid_noop_on_none_and_non_running():
+    spec = _spec(TaskSpec("a"))
+    transform = dag.set_task_pid("a", "p", 1234, 1.0)
+    new, changed = transform(None)
+    assert dag.is_keep(new)
+    assert changed is False
+    # entry present but still pending (never claimed): nothing to stamp.
+    body = _body(spec)
+    new, changed = transform(body)
+    assert dag.is_keep(new)
+    assert changed is False
+    assert body["tasks"]["a"]["pid"] is None
+
+
+# mark_task_finished: no-op on None / duplicate / attempt fence
+
+
+def test_mark_task_finished_noop_none_and_duplicate():
+    spec = _spec(TaskSpec("a"))
+    task = spec.by_id["a"]
+    transform = dag.mark_task_finished(
+        "a", success=True, exit_code=0, fail_reason=None, now=1.0, task=task
+    )
+    new, changed = transform(None)
+    assert dag.is_keep(new)
+    assert changed is False
+    # already terminal (a duplicate completion): a no-op.
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.SUCCESS
+    new, changed = transform(body)
+    assert dag.is_keep(new)
+    assert changed is False
+
+
+def test_mark_task_finished_attempt_fence_with_matching_proc():
+    # proc matches the live claim but the attempt does not: a stale attempt's
+    # completion is dropped by the attempt fence (line reached only when the
+    # proc fence passes first).
+    spec = _spec(TaskSpec("a", max_attempts=3))
+    task = spec.by_id["a"]
+    body = _body(spec)
+    entry = body["tasks"]["a"]
+    entry["state"] = dag.RUNNING
+    entry["proc"] = "proc-A"
+    entry["attempt"] = 2
+    transform = dag.mark_task_finished(
+        "a",
+        success=True,
+        exit_code=0,
+        fail_reason=None,
+        now=1.0,
+        task=task,
+        expected_proc="proc-A",
+        expected_attempt=0,
+    )
+    new, changed = transform(body)
+    assert dag.is_keep(new)
+    assert changed is False
+    assert _state(body, "a") == dag.RUNNING  # the live attempt is untouched
+
+
+# mark_tasks_finished: batch apply, per-entry fences, and the empty result
+
+
+def test_mark_tasks_finished_batch_applies_and_fences():
+    spec = _spec(
+        TaskSpec("a"),
+        TaskSpec("s", type=dag.SENSOR, poke_interval=10.0),
+        TaskSpec("done"),
+        TaskSpec("pf"),
+        TaskSpec("af", max_attempts=3),
+        TaskSpec("pk", type=dag.SENSOR, poke_interval=10.0),
+    )
+    body = _body(spec)
+    for tid in ("a", "s", "pf", "af", "pk"):
+        body["tasks"][tid]["state"] = dag.RUNNING
+    body["tasks"]["a"]["proc"] = "p"
+    body["tasks"]["s"]["proc"] = "p"
+    body["tasks"]["pf"]["proc"] = "realproc"
+    body["tasks"]["af"]["proc"] = "p"
+    body["tasks"]["af"]["attempt"] = 0
+    body["tasks"]["pk"]["proc"] = "p"
+    body["tasks"]["pk"]["pokeCount"] = 0
+    body["tasks"]["done"]["state"] = dag.SUCCESS  # already terminal
+
+    marks = [
+        {
+            "taskkey": "a", "success": True, "exit_code": 0,
+            "fail_reason": None, "task": spec.by_id["a"],
+        },
+        {"taskkey": "s", "success": False, "task": spec.by_id["s"]},
+        {"taskkey": "done", "success": True, "task": spec.by_id["done"]},
+        {
+            "taskkey": "pf", "success": True, "task": spec.by_id["pf"],
+            "expected_proc": "other",
+        },
+        {
+            "taskkey": "af", "success": True, "task": spec.by_id["af"],
+            "expected_attempt": 5,
+        },
+        {
+            "taskkey": "pk", "success": True, "task": spec.by_id["pk"],
+            "expected_poke": 9,
+        },
+    ]
+    new, applied = dag.mark_tasks_finished(marks, 100.0)(body)
+    assert set(applied) == {"a", "s"}
+    assert _state(body, "a") == dag.SUCCESS
+    # a failed sensor poke reschedules (still running), not fails.
+    assert _state(body, "s") == dag.RUNNING
+    assert body["tasks"]["s"]["nextPokeAt"] == 110.0
+    # fenced / duplicate entries are all left untouched.
+    assert _state(body, "done") == dag.SUCCESS
+    assert _state(body, "pf") == dag.RUNNING
+    assert _state(body, "af") == dag.RUNNING
+    assert _state(body, "pk") == dag.RUNNING
+
+
+def test_mark_tasks_finished_none_body_and_all_dropped():
+    spec = _spec(TaskSpec("a"))
+    # None body -> keep, empty applied list.
+    new, applied = dag.mark_tasks_finished(
+        [{"taskkey": "a", "success": True, "task": spec.by_id["a"]}], 1.0
+    )(None)
+    assert dag.is_keep(new)
+    assert applied == []
+    # every mark drops (task already terminal) -> document kept untouched.
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.SUCCESS
+    new, applied = dag.mark_tasks_finished(
+        [{"taskkey": "a", "success": True, "task": spec.by_id["a"]}], 1.0
+    )(body)
+    assert dag.is_keep(new)
+    assert applied == []
+
+
+# apply_approval: no such run
+
+
+def test_apply_approval_no_such_run():
+    transform = dag.apply_approval(
+        "gate", approved=True, by="alice", now=1.0, on_reject=dag.FAILED
+    )
+    new, result = transform(None)
+    assert dag.is_keep(new)
+    assert result["ok"] is False
+    assert result["reason"] == "no such run"
+
+
+# reconcile_crashed: no-op on None / terminal run
+
+
+def test_reconcile_crashed_noop_on_none_and_terminal():
+    spec = _spec(TaskSpec("a"))
+    transform = dag.reconcile_crashed(spec, 1.0, "p", "h", lambda pid: False)
+    new, n = transform(None)
+    assert dag.is_keep(new)
+    assert n == 0
+    body = _body(spec)
+    body["state"] = dag.SUCCESS
+    new, n = transform(body)
+    assert dag.is_keep(new)
+    assert n == 0
+
+
+# _has_live_process: proc-less entry, own token, and a live child on this host
+
+
+def test_has_live_process_variants():
+    # no proc recorded -> owner is gone (never treated as live).
+    assert dag._has_live_process(
+        {"proc": None}, "p", "h", lambda pid: True
+    ) is False
+    # our own proc token -> trusted alive without a pid probe.
+    assert dag._has_live_process(
+        {"proc": "p"}, "p", "h", lambda pid: False
+    ) is True
+    # a foreign token but a live child on this host -> alive.
+    entry = {"proc": "other", "host": "h", "pid": 4321}
+    assert dag._has_live_process(entry, "p", "h", lambda pid: True) is True
+    # a foreign token whose pid is dead -> not alive.
+    assert dag._has_live_process(entry, "p", "h", lambda pid: False) is False

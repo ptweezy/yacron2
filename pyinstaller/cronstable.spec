@@ -40,6 +40,40 @@ except ImportError:
     pass
 
 
+# Modules that are never reachable at runtime but that the analysis (or a
+# dependency's optional `try: import ...` probe) could otherwise rake into the
+# bundle. cronstable is a headless daemon with an ANSI TUI (raw termios/tty on
+# POSIX, msvcrt on Windows) and an HTML/JSON web UI, so no GUI toolkit is ever
+# imported; the TUI reads raw keypresses itself and never uses readline; durable
+# state is JSON (orjson / stdlib json), never sqlite. Excluding a module that was
+# never going to be collected is a harmless no-op, so this list is insurance
+# against dead weight sneaking in. Verified against the tree and the runtime deps
+# (aiohttp / jinja2 / strictyaml / sentry-sdk / aiosmtplib / psutil / tzdata);
+# the per-arch `--version` smoke test is the build-time backstop.
+excludes = [
+    # GUI toolkits: never imported by a headless daemon.
+    "tkinter",
+    "_tkinter",
+    "turtle",
+    "turtledemo",
+    "idlelib",
+    # curses: the TUI drives the terminal through termios/tty directly.
+    "curses",
+    "_curses",
+    "_curses_panel",
+    # the TUI reads raw keypresses; nothing uses readline's line editor.
+    "readline",
+    # no sqlite anywhere in cronstable or its runtime deps.
+    "sqlite3",
+    "_sqlite3",
+    # dev/tooling stdlib that never runs inside the frozen daemon.
+    "test",
+    "lib2to3",
+    "ensurepip",
+    "pydoc_data",
+]
+
+
 # optimize=2 compiles every bundled module at -OO: it strips assert statements
 # AND docstrings from the frozen bytecode. cronstable's modules are deliberately
 # docstring-dense (the rationale lives next to the code), and those strings
@@ -59,7 +93,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

@@ -15,6 +15,7 @@ tests/test_config_backends.py.
 
 import asyncio
 import contextlib
+import datetime
 import logging
 
 import pytest
@@ -760,5 +761,533 @@ async def test_confirm_after_denied_acquire_does_not_assert_leadership(
         assert a._lease is not None  # adopted
         assert a._lease_deadline_mono is None  # leadership not asserted
         assert a.is_leader() is False
+    finally:
+        await _stop(a)
+
+
+# --- _renew_once state machine and pure-helper edge cases -------------------
+
+
+def test_utcnow_is_tz_aware_utc():
+    now = fsb_mod._utcnow()
+    assert isinstance(now, datetime.datetime)
+    # deadlines/display must be an aware UTC stamp, never naive local time.
+    assert now.tzinfo is datetime.timezone.utc
+
+
+def test_is_quorate_false_before_any_round(tmp_path):
+    # a fresh backend has never contacted the store: the freshness deadline
+    # is unset, so it is not quorate and names no leader (Leader jobs fail
+    # closed, PreferLeader runs -- the documented cold-start posture).
+    a = _backend(tmp_path)
+    assert a._quorum_deadline_mono is None
+    assert a.is_quorate() is False
+    assert a.leader_name() is None
+
+
+def test_apply_round_without_expiry_clears_display_deadline(tmp_path):
+    # a positive round that carries no wall-clock expiry (expires_at None)
+    # clears the dashboard deadline and, being a non-leader outcome, drops
+    # the held lease and the monotonic fence; the holder falls back to the
+    # unknown-holder sentinel, never None.
+    a = _backend(tmp_path)
+    a._lease_deadline = datetime.datetime.now(datetime.timezone.utc)
+    a._apply_round(None, False, None, None)
+    assert a._lease_deadline is None
+    assert a._lease_deadline_mono is None
+    assert a._holder == fsb_mod._UNKNOWN_HOLDER
+    assert a._quorum_deadline_mono is not None  # freshness always extends
+
+
+async def test_first_round_elects_and_follower_defers(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    b = await _started(_backend(tmp_path, "node-b"))
+    try:
+        await a._renew_once()  # campaign -> acquire
+        assert a.is_leader() is True
+        assert a.leader_name() == "node-a"
+        assert a._lease is not None
+        clock.advance(1.0)
+        await b._renew_once()  # observe a live foreign holder -> defer
+        assert b.is_leader() is False
+        assert b.is_quorate() is True
+        assert b.leader_name() == "node-a"
+    finally:
+        await _stop(a, b)
+
+
+async def test_holding_renew_keeps_fence_no_regain(tmp_path, monkeypatch):
+    # a same-holder renew of a valid lease is the not-gaining path: the
+    # fence is preserved and leadership never re-syncs the ran-set.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+        await a._renew_once()
+        first_fence = a._lease.fence
+        clock.advance(a.renew_period)
+        await a._renew_once()
+        assert a.is_leader() is True
+        assert a._lease.fence == first_fence  # renew, not a takeover bump
+    finally:
+        await _stop(a)
+
+
+async def test_renew_refused_sets_lease_lost_then_follows(
+    tmp_path, monkeypatch
+):
+    # B takes over A's long-expired lease; A's next renew is positively
+    # refused (renew_lease -> None), so A marks the lease lost and drops it,
+    # then the same round's read observes B and A lands a clean follower.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    b = await _started(_backend(tmp_path, "node-b"))
+    try:
+        await a._renew_once()
+        clock.advance(a.ttl + 5.0)
+        await b._renew_once()  # takeover
+        assert b.is_leader() is True
+        await a._renew_once()  # renew refused -> lease_lost, then observe B
+        assert a._lease is None
+        assert a.is_leader() is False
+        assert a.leader_name() == "node-b"
+    finally:
+        await _stop(a, b)
+
+
+async def test_adopts_own_lease_then_next_renew_regains(
+    tmp_path, monkeypatch
+):
+    # an acquire abandoned by its timeout landed on disk under our token.
+    # Round one's unlocked read recognises the token and ADOPTS the lease
+    # object without asserting leadership (is_leader stays False); round two
+    # then renews that adopted lease under the lock and GAINS leadership --
+    # the renew-gaining branch that forces a ran-set re-read before applying.
+    _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+        landed = await a._store.acquire_lease(
+            a.election_name, a._holder_token, a.ttl
+        )
+        assert landed is not None
+        assert a._lease is None
+
+        await a._renew_once()  # observe own token -> adopt, not leader yet
+        assert a._lease is not None
+        assert a.is_leader() is False
+
+        await a._renew_once()  # locked renew of the adopted lease -> gain
+        assert a.is_leader() is True
+        assert a._reboot_ran_synced is True
+        assert a.leader_name() == "node-a"
+    finally:
+        await _stop(a)
+
+
+async def test_denied_acquire_confirm_adopts_own_token(tmp_path, monkeypatch):
+    # a denied acquire whose confirming (unlocked) read shows OUR token --
+    # an earlier abandoned acquire landed -- adopts the lease but must not
+    # grant leadership from the read; the next locked renew does.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+        landed = await a._store.acquire_lease(
+            a.election_name, a._holder_token, a.ttl
+        )
+        assert landed is not None
+
+        async def _deny(*_args, **_kw):
+            return None  # every acquire denied this round
+
+        monkeypatch.setattr(a._store, "acquire_lease", _deny)
+
+        reads = {"n": 0}
+        real_read = a._store.read_lease
+
+        async def _read(name):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return None  # observe: looks absent -> campaign
+            return await real_read(name)  # confirm: our token
+
+        monkeypatch.setattr(a._store, "read_lease", _read)
+        clock.advance(1.0)
+        await a._renew_once()
+        assert a._lease is not None  # adopted via the confirm read
+        assert a._lease_deadline_mono is None  # leadership not asserted
+        assert a.is_leader() is False
+    finally:
+        await _stop(a)
+
+
+async def test_renew_timeout_leaves_state_to_its_deadlines(
+    tmp_path, monkeypatch
+):
+    # a locked renew that TIMES OUT is UNKNOWN, not refused: the round must
+    # change nothing and return (never fall through to the unlocked read and
+    # re-extend the fence off a read), keeping _lease for the next retry.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+        await a._renew_once()
+        assert a.is_leader() is True
+        held = a._lease
+        deadline = a._lease_deadline_mono
+
+        async def _timeout(*_args, **_kw):
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(a._store, "renew_lease", _timeout)
+        clock.advance(a.renew_period)
+        await a._renew_once()
+        assert a._lease is held  # kept for the next locked-renew retry
+        assert a._lease_deadline_mono == deadline  # fence untouched by a read
+        assert a.is_leader() is True  # survived the transient timeout
+    finally:
+        await _stop(a)
+
+
+async def test_observe_read_timeout_changes_nothing(tmp_path, monkeypatch):
+    # a non-holder whose observe read times out learns nothing: the round
+    # returns without extending any deadline, so the node stays unquorate.
+    _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+
+        async def _timeout(*_args, **_kw):
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(a._store, "read_lease", _timeout)
+        await a._renew_once()
+        assert a.is_leader() is False
+        assert a.is_quorate() is False
+    finally:
+        await _stop(a)
+
+
+async def test_acquire_timeout_changes_nothing(tmp_path, monkeypatch):
+    # the store is empty (observe reads absent), the campaign acquire times
+    # out (UNKNOWN, not denied): change nothing and return -- an own-holder
+    # adoption next round self-heals if the write actually landed.
+    _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+
+        async def _timeout(*_args, **_kw):
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(a._store, "acquire_lease", _timeout)
+        await a._renew_once()  # observe absent -> campaign -> acquire times out
+        assert a.is_leader() is False
+        assert a.is_quorate() is False
+        assert a._lease is None
+    finally:
+        await _stop(a)
+
+
+async def test_denied_acquire_with_absent_confirm_stays_follower(
+    tmp_path, monkeypatch
+):
+    # a denied acquire whose confirming read also answers nothing (the store
+    # failed closed, not a lost race): no positive observation, so no
+    # deadline extends and the node is left unquorate.
+    _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+
+        async def _none(*_args, **_kw):
+            return None
+
+        monkeypatch.setattr(a._store, "read_lease", _none)  # observe + confirm
+        monkeypatch.setattr(a._store, "acquire_lease", _none)  # denied
+        await a._renew_once()
+        assert a.is_leader() is False
+        assert a.is_quorate() is False
+    finally:
+        await _stop(a)
+
+
+async def test_denied_acquire_confirm_foreign_holder_follows(
+    tmp_path, monkeypatch
+):
+    # the lost-race path: observe read saw the slot absent, our acquire was
+    # denied, and the confirming read shows a FOREIGN holder (a rival won).
+    # We adopt no lease (not our token) but the read is store contact, so we
+    # land a quorate follower deferring to the rival.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    b = await _started(_backend(tmp_path, "node-b"))
+    try:
+        await b._renew_once()  # B genuinely holds the lease on disk
+        assert b.is_leader() is True
+
+        async def _deny(*_args, **_kw):
+            return None  # A's acquire is denied this round
+
+        monkeypatch.setattr(a._store, "acquire_lease", _deny)
+        reads = {"n": 0}
+        real_read = a._store.read_lease
+
+        async def _read(name):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return None  # observe: looks absent -> campaign
+            return await real_read(name)  # confirm: B's foreign lease
+
+        monkeypatch.setattr(a._store, "read_lease", _read)
+        clock.advance(1.0)
+        await a._renew_once()
+        assert a._lease is None  # a foreign token is never adopted
+        assert a.is_leader() is False
+        assert a.is_quorate() is True  # the confirm read counts as contact
+        assert a.leader_name() == "node-b"
+    finally:
+        await _stop(a, b)
+
+
+async def test_confirm_read_timeout_changes_nothing(tmp_path, monkeypatch):
+    # a denied acquire whose confirming read TIMES OUT is UNKNOWN: the round
+    # returns without extending quorum.
+    _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+
+        async def _deny(*_args, **_kw):
+            return None
+
+        monkeypatch.setattr(a._store, "acquire_lease", _deny)
+        reads = {"n": 0}
+
+        async def _read(name):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return None  # observe: absent -> campaign
+            raise asyncio.TimeoutError  # confirm times out
+
+        monkeypatch.setattr(a._store, "read_lease", _read)
+        await a._renew_once()
+        assert a.is_leader() is False
+        assert a.is_quorate() is False
+    finally:
+        await _stop(a)
+
+
+# --- start's first-round-failure path --------------------------------------
+
+
+async def test_start_survives_first_round_failure_unquorate(
+    tmp_path, monkeypatch, caplog
+):
+    # start() runs one bounded best-effort round so state is real before the
+    # first spawn pass; an OSError there must be swallowed (logged) and the
+    # node just starts unquorate rather than aborting start.
+    backend = _backend(tmp_path)
+
+    async def _boom():
+        raise OSError("mount not answering yet")
+
+    monkeypatch.setattr(backend, "_renew_once", _boom)
+    caplog.set_level(logging.WARNING, logger="cronstable.backends.filesystem")
+    await backend.start()
+    try:
+        assert backend._task is not None  # the renew loop was still launched
+        assert backend.is_quorate() is False
+        assert any(
+            "first round did not complete" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        await backend.stop()
+
+
+# --- the renew loop: error handling and inter-round sleep ------------------
+
+
+async def test_renew_loop_warns_and_survives_store_error(
+    tmp_path, monkeypatch, caplog
+):
+    # a round that raises OSError is a transient failure: the loop warns and
+    # keeps going (the fixed quorum deadline lapses, the next round retries).
+    _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+
+        rounds = {"n": 0}
+
+        async def _boom():
+            rounds["n"] += 1
+            raise OSError("mount gone")
+
+        monkeypatch.setattr(a, "_renew_once", _boom)
+        monkeypatch.setattr(
+            type(a), "renew_period", property(lambda self: 0.001)
+        )
+        caplog.set_level(
+            logging.WARNING, logger="cronstable.backends.filesystem"
+        )
+        task = asyncio.create_task(a._renew_loop())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not task.done()  # survived the raising round
+        assert any(
+            "election round failed" in r.getMessage() for r in caplog.records
+        )
+        # The behaviour this test is named for: the loop RAN AGAIN after the
+        # raising round rather than merely staying alive. Neither
+        # `task.done()` nor `task.cancelled() or task.exception() is None`
+        # could show that; both are true by construction after an awaited
+        # cancel, whatever the loop did.
+        for _ in range(2000):
+            if rounds["n"] >= 2:
+                break
+            await asyncio.sleep(0.001)
+        assert rounds["n"] >= 2, "the loop did not run again after the raise"
+        a._stop.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    finally:
+        await _stop(a)
+
+
+async def test_renew_loop_logs_unexpected_error_and_survives(
+    tmp_path, monkeypatch, caplog
+):
+    # a NON-store error (not OSError/TimeoutError) must be caught by the
+    # keep-the-loop-alive guard: it is logged at exception level and the
+    # loop keeps running rather than dying.
+    _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+
+        rounds = {"n": 0}
+
+        async def _boom():
+            rounds["n"] += 1
+            raise ValueError("unexpected")
+
+        monkeypatch.setattr(a, "_renew_once", _boom)
+        monkeypatch.setattr(
+            type(a), "renew_period", property(lambda self: 0.001)
+        )
+        caplog.set_level(
+            logging.ERROR, logger="cronstable.backends.filesystem"
+        )
+        task = asyncio.create_task(a._renew_loop())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert any(
+            "unexpected error in the filesystem election loop"
+            in r.getMessage()
+            for r in caplog.records
+        )
+        # The behaviour this test is named for: the loop RAN AGAIN after the
+        # raising round rather than merely staying alive. Neither
+        # `task.done()` nor `task.cancelled() or task.exception() is None`
+        # could show that; both are true by construction after an awaited
+        # cancel, whatever the loop did.
+        for _ in range(2000):
+            if rounds["n"] >= 2:
+                break
+            await asyncio.sleep(0.001)
+        assert rounds["n"] >= 2, "the loop did not run again after the raise"
+        a._stop.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    finally:
+        await _stop(a)
+
+
+async def test_renew_loop_sleeps_between_rounds_until_stopped(
+    tmp_path, monkeypatch
+):
+    # between rounds the loop parks on the stop event for renew_period; when
+    # that wait times out (no stop yet) it just loops again for the next
+    # round.  Drive a tiny renew_period so the timeout path is exercised
+    # without a real wait, and stop on the second round.
+    _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    monkeypatch.setattr(
+        type(a), "renew_period", property(lambda self: 0.001)
+    )
+    try:
+        rounds = {"n": 0}
+
+        async def _round():
+            rounds["n"] += 1
+            if rounds["n"] >= 2:
+                a._stop.set()  # exit after the inter-round sleep timed out
+
+        monkeypatch.setattr(a, "_renew_once", _round)
+        task = asyncio.create_task(a._renew_loop())
+        # wait_for both bounds the hang and re-raises any error the loop died
+        # of, so a `task.done()` assertion after it would add nothing.
+        await asyncio.wait_for(task, timeout=2.0)
+        assert rounds["n"] >= 2  # ran a second round after the sleep timeout
+    finally:
+        await _stop(a)
+
+
+async def test_renew_loop_reraises_cancellation(tmp_path, monkeypatch):
+    # a cancel that lands inside the round's wait_for must propagate out of
+    # the loop (the CancelledError re-raise), not be swallowed as a store
+    # error -- otherwise stop() could never tear the loop down.
+    _Clock(monkeypatch)
+    a = _backend(tmp_path, "node-a")
+    try:
+
+        async def _hang():
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(a, "_renew_once", _hang)
+        task = asyncio.create_task(a._renew_loop())
+        for _ in range(3):
+            await asyncio.sleep(0)  # let the loop park inside the round
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+    finally:
+        await _stop(a)
+
+
+# --- reboot-ran refresh bookkeeping ----------------------------------------
+
+
+async def test_synced_leader_refresh_failure_logs_debug(
+    tmp_path, monkeypatch, caplog
+):
+    # once a leader is synced, a periodic ran-set re-read that later FAILS is
+    # merely a stale-cache annoyance, not a deferral (the set is already
+    # trusted): it logs DEBUG "could not refresh", never the leader-worded
+    # "deferring" WARNING, and leadership is unaffected.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a", extra="    ttl: 90\n"))
+    try:
+        await a._renew_once()  # acquire -> forced re-read completes -> synced
+        assert a.is_leader() is True
+        assert a._reboot_ran_synced is True
+
+        _failing_list_records(monkeypatch, a)
+        caplog.set_level(
+            logging.DEBUG, logger="cronstable.backends.filesystem"
+        )
+        clock.advance(fsb_mod._REBOOT_RAN_REFRESH + 1.0)  # throttle now due
+        await a._renew_once()  # renew succeeds; the throttled refresh fails
+        assert a.is_leader() is True  # election work untouched by the failure
+
+        refresh_debugs = [
+            r
+            for r in caplog.records
+            if "could not refresh the @reboot-ran set" in r.getMessage()
+        ]
+        assert refresh_debugs
+        assert all(r.levelno == logging.DEBUG for r in refresh_debugs)
+        assert not any(
+            "deferring pending @reboot one-shots" in r.getMessage()
+            for r in caplog.records
+        )
     finally:
         await _stop(a)

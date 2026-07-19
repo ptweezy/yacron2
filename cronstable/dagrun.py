@@ -93,6 +93,13 @@ ADVANCE_RETRY_DELAY = 5.0
 COMPLETION_RETRY_DELAY = 5.0
 COMPLETION_RETRY_MAX_DELAY = 60.0
 
+#: In list_dags' cached rollup, when this many run docs of one dag still need a
+#: body read (cold cache, or a burst of new/non-terminal runs), fetch them in
+#: one list_documents sweep instead of that many individual read_document round
+#: trips. The steady state (a handful of running runs, the rest terminal and
+#: cached) stays below this and reads only the few that changed.
+DAG_ROLLUP_BULK_THRESHOLD = 8
+
 RunRef = Tuple[str, str]  # (dag_name, run_key)
 
 
@@ -158,6 +165,19 @@ class DagScheduler:
         # bodies by every full adopt pass and every GC pass, and a key is
         # evicted when this node (re-)creates a run under it.
         self._terminal_run_keys: Dict[str, Set[str]] = {}
+        # dag name -> {run key -> cached per-run summary} backing list_dags'
+        # rollup. A terminal run's summary is immutable, so it is cached and
+        # never re-read; non-terminal (running/pending) runs are re-read each
+        # call. Pruned against each key listing (GC'd runs drop out) and the
+        # entry is evicted when a run is (re-)created under the key (see
+        # _create_doc). Note this is only PART of _terminal_run_keys'
+        # invalidation: that one is additionally rebuilt from store bodies by
+        # every full adopt and GC pass, whereas nothing rebuilds this cache on
+        # a timer. A terminal entry therefore survives until something evicts
+        # it by key, which is why forget() has to clear it explicitly on a
+        # backend swap: run keys are deterministic, so the new store's runs
+        # would otherwise read the old store's cached terminal state.
+        self._dag_summary_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
@@ -175,6 +195,12 @@ class DagScheduler:
         self._pending_completions: Dict[
             Tuple[RunRef, str], Dict[str, Any]
         ] = {}
+        # run ref -> task completions the reaper has handed over but not yet
+        # recorded. on_task_finished buffers here; flush_completions (called
+        # once the reaper has drained a whole batch of finished jobs) records
+        # each run's buffered completions in ONE document RMW instead of one
+        # per task -- the win for a mapped fan-out finishing together.
+        self._completion_buffer: Dict[RunRef, List[Dict[str, Any]]] = {}
         self._service_task: Optional[asyncio.Task] = None
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
@@ -575,6 +601,11 @@ class DagScheduler:
             known = self._terminal_run_keys.get(dagcfg.name)
             if known is not None:
                 known.discard(run_key)
+            # same reason for list_dags' rollup cache: a re-created key must
+            # not keep serving the GC'd predecessor's terminal summary.
+            summaries = self._dag_summary_cache.get(dagcfg.name)
+            if summaries is not None:
+                summaries.pop(run_key, None)
         return bool(created)
 
     # =====================================================================
@@ -1275,26 +1306,159 @@ class DagScheduler:
     async def on_task_finished(self, running: RunningJob) -> None:
         dref = running.dag_ref
         assert dref is not None  # only called for a DAG-task RunningJob
-        dagcfg = self._dags().get(dref.dag_name)
-        if dagcfg is None:
+        if dref.dag_name not in self._dags():
             return  # dag removed mid-run; the doc is orphaned, GC handles it
         success = running.fail_reason is None
         # sampled usage (monitorResources) rides the completion into the
         # dag_run document, serialised here so dag.py stays data-only.
         usage = running.resource_usage
-        await self._finish_task(
-            dagcfg,
-            (dref.dag_name, dref.run_key),
-            dref.taskkey,
-            dref.task_id,
-            success=success,
-            exit_code=running.retcode,
-            fail_reason=running.fail_reason,
-            proc=dref.proc,
-            attempt=dref.attempt,
-            poke=dref.poke,
-            resources=usage.to_dict() if usage is not None else None,
+        ref = (dref.dag_name, dref.run_key)
+        # Buffer, don't record: the reaper hands over each finished task one at
+        # a time, and flush_completions (invoked once it has drained the whole
+        # batch) folds a run's completions into a single RMW. Recording here
+        # would be one full-document write+fsync per task again.
+        self._completion_buffer.setdefault(ref, []).append(
+            {
+                "taskkey": dref.taskkey,
+                "taskId": dref.task_id,
+                "success": success,
+                "exitCode": running.retcode,
+                "failReason": running.fail_reason,
+                "proc": dref.proc,
+                "attempt": dref.attempt,
+                "poke": dref.poke,
+                "resources": usage.to_dict() if usage is not None else None,
+            }
         )
+
+    async def flush_completions(self) -> None:
+        """Record every buffered task completion, one batched RMW per run.
+
+        Called by the reaper after it has handled a whole batch of finished
+        jobs (see ``Cron._run``'s reaper loop).  A mapped fan-out whose N
+        instances finish together is recorded in one full-document
+        read-modify-write + fsync per run instead of N, and the run gets a
+        single graph advance rather than one per task.  Robust by
+        construction: a run whose flush raises has its whole batch re-queued
+        for retry, never dropped, and one run's failure never affects another.
+        """
+        if not self._completion_buffer:
+            return
+        buffered = self._completion_buffer
+        self._completion_buffer = {}
+        for ref, entries in buffered.items():
+            try:
+                await self._flush_run_completions(ref, entries)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - never lose a completion
+                # An unrecorded completion leaves its entry RUNNING forever
+                # (trusted by reconciliation while this daemon lives); queue
+                # the whole batch for retry rather than dropping it. A
+                # removed-task entry self-drops on the retry (see
+                # _finish_task), so queueing unconditionally is safe.
+                logger.exception(
+                    "dag run %s/%s: flushing task completions failed; "
+                    "re-queued for retry",
+                    ref[0],
+                    ref[1],
+                )
+                for entry in entries:
+                    self._queue_completion(
+                        ref,
+                        entry["taskkey"],
+                        entry["taskId"],
+                        success=entry["success"],
+                        exit_code=entry["exitCode"],
+                        fail_reason=entry["failReason"],
+                        proc=entry["proc"],
+                        attempt=entry["attempt"],
+                        poke=entry["poke"],
+                        resources=entry.get("resources"),
+                    )
+
+    async def _flush_run_completions(
+        self, ref: RunRef, entries: List[Dict[str, Any]]
+    ) -> None:
+        dagcfg = self._dags().get(ref[0])
+        if dagcfg is None:
+            # dag removed on reload: drop these completions (and any queued
+            # retry of them), exactly as _finish_task drops a removed task's.
+            for entry in entries:
+                self._pending_completions.pop((ref, entry["taskkey"]), None)
+            return
+        marks: List[Dict[str, Any]] = []
+        live: List[Dict[str, Any]] = []
+        for entry in entries:
+            task = dagcfg.spec.by_id.get(entry["taskId"])
+            if task is None:
+                # the task was removed from the DAG (a config reload) while its
+                # instance was running: drop the stale completion (and a queued
+                # retry of it, which would otherwise re-run forever).
+                self._pending_completions.pop((ref, entry["taskkey"]), None)
+                continue
+            jitter = (
+                _jitter(task.poke_jitter) if task.type == dag.SENSOR else 0.0
+            )
+            marks.append(
+                {
+                    "taskkey": entry["taskkey"],
+                    "success": entry["success"],
+                    "exit_code": entry["exitCode"],
+                    "fail_reason": entry["failReason"],
+                    "task": task,
+                    "jitter": jitter,
+                    "expected_proc": entry["proc"],
+                    "expected_attempt": entry["attempt"],
+                    "expected_poke": entry["poke"],
+                    "resources": entry.get("resources"),
+                }
+            )
+            live.append(entry)
+        if not marks:
+            return  # every entry was a removed task: nothing to record/advance
+        transform = self._wrap(dag.mark_tasks_finished(marks, _now()))
+        try:
+            _, applied = await self._mutate(ref[0], ref[1], transform)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one failed RMW must not wedge the run
+            # Unlike a pid write, a lost completion is NOT best-effort:
+            # unrecorded, the entry stays RUNNING under our proc token, which
+            # reconciliation trusts forever while this daemon lives (and the
+            # lease keeps peers out). So EVERY entry in the batch is queued for
+            # retry, not just one.
+            for entry in live:
+                self._queue_completion(
+                    ref,
+                    entry["taskkey"],
+                    entry["taskId"],
+                    success=entry["success"],
+                    exit_code=entry["exitCode"],
+                    fail_reason=entry["failReason"],
+                    proc=entry["proc"],
+                    attempt=entry["attempt"],
+                    poke=entry["poke"],
+                    resources=entry.get("resources"),
+                )
+        else:
+            applied_set = set(applied or [])
+            for entry in live:
+                # settled (applied, or fenced out as a duplicate/superseded/
+                # stale-poke completion): a queued copy must not retry forever.
+                self._pending_completions.pop((ref, entry["taskkey"]), None)
+                if entry["taskkey"] not in applied_set:
+                    logger.debug(
+                        "dag run %s/%s: task %s completion dropped as "
+                        "stale/duplicate by the fence",
+                        ref[0],
+                        ref[1],
+                        entry["taskkey"],
+                    )
+        # one fresh advance for the whole batch, off the reaper's critical path
+        # (a concurrent periodic advance may hold the per-run lock).
+        self._wake[ref] = 0.0
+        self._cron._track_state_write(self.advance_one(ref))
 
     async def _finish_task(
         self,
@@ -1649,36 +1813,120 @@ class DagScheduler:
                 ],
             }
             if backend is not None:
-                try:
-                    docs = await asyncio.wait_for(
-                        backend.list_documents(self._ns(name)),
-                        timeout=STATE_OP_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - degrade, never fail /dags
-                    docs = []
-                if docs:
-                    docs.sort(
-                        key=lambda b: float(b.get("createdAt") or 0),
-                        reverse=True,
-                    )
-                    latest = docs[0]
-                    entry["latestRun"] = {
-                        "runKey": latest.get("runKey"),
-                        "state": latest.get("state"),
-                        "kind": latest.get("kind"),
-                        "createdAt": latest.get("createdAt"),
-                        "updatedAt": latest.get("updatedAt"),
-                    }
-                    counts: Dict[str, int] = {}
-                    for body in docs:
-                        st = str(body.get("state", "running"))
-                        counts[st] = counts.get(st, 0) + 1
-                    entry["runCounts"] = counts
-                    entry["totalRuns"] = len(docs)
+                rollup = await self._dag_run_rollup(backend, name)
+                if rollup:
+                    entry.update(rollup)
             out.append(entry)
         return out
+
+    @staticmethod
+    def _summarize_run(body: Dict[str, Any]) -> Dict[str, Any]:
+        """The handful of fields list_dags' rollup needs from a run document,
+        plus whether the run is terminal (so its summary can be cached)."""
+        return {
+            "runKey": body.get("runKey"),
+            "state": str(body.get("state", "running")),
+            "kind": body.get("kind"),
+            "createdAt": body.get("createdAt"),
+            "updatedAt": body.get("updatedAt"),
+            "terminal": dag.is_terminal_run(body),
+        }
+
+    @staticmethod
+    def _rollup_from_summaries(
+        summaries: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """latestRun (newest by createdAt), runCounts histogram, totalRuns."""
+        if not summaries:
+            return {}
+        latest = max(summaries, key=lambda s: float(s.get("createdAt") or 0))
+        counts: Dict[str, int] = {}
+        for s in summaries:
+            counts[s["state"]] = counts.get(s["state"], 0) + 1
+        return {
+            "latestRun": {
+                "runKey": latest.get("runKey"),
+                "state": latest.get("state"),
+                "kind": latest.get("kind"),
+                "createdAt": latest.get("createdAt"),
+                "updatedAt": latest.get("updatedAt"),
+            },
+            "runCounts": counts,
+            "totalRuns": len(summaries),
+        }
+
+    async def _bulk_rollup(
+        self, backend: StateBackend, ns: str, name: str
+    ) -> Optional[Dict[str, Any]]:
+        """One list_documents sweep: rebuild the cache from every body and roll
+        it up. Used for the cold cache / large-delta case and when the backend
+        cannot list keys only. Returns None (omit the rollup) on a hiccup,
+        matching the old degrade behaviour."""
+        try:
+            docs = await asyncio.wait_for(
+                backend.list_documents(ns), timeout=STATE_OP_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - degrade, never fail /dags
+            return None
+        cache = self._dag_summary_cache.setdefault(name, {})
+        cache.clear()
+        summaries = []
+        for body in docs:
+            s = self._summarize_run(body)
+            summaries.append(s)
+            if isinstance(s["runKey"], str):
+                cache[s["runKey"]] = s
+        return self._rollup_from_summaries(summaries)
+
+    async def _dag_run_rollup(
+        self, backend: StateBackend, name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Per-dag run rollup for list_dags, caching immutable terminal runs.
+
+        Lists keys only, drops cache entries for GC'd runs, and re-reads just
+        the new or still-running documents (terminal ones are served from
+        cache) -- so a ~3s /dags poll stops re-parsing every retained run of
+        every dag. Falls back to a single full parse when the backend cannot
+        list keys only or when many bodies need reading at once (cold cache).
+        Best-effort: returns None to omit the rollup rather than failing /dags.
+        """
+        ns = self._ns(name)
+        try:
+            keys = await asyncio.wait_for(
+                backend.list_document_keys(ns), timeout=STATE_OP_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - degrade, never fail /dags
+            return None
+        if keys is None:
+            # backend has no keys-only listing: one full parse, no caching win
+            return await self._bulk_rollup(backend, ns, name)
+        cache = self._dag_summary_cache.setdefault(name, {})
+        keyset = set(keys)
+        for gone in [k for k in cache if k not in keyset]:
+            del cache[gone]
+        to_read = [
+            k for k in keys if not (k in cache and cache[k]["terminal"])
+        ]
+        if len(to_read) > DAG_ROLLUP_BULK_THRESHOLD:
+            return await self._bulk_rollup(backend, ns, name)
+        for key in to_read:
+            try:
+                body = await asyncio.wait_for(
+                    backend.read_document(ns, key), timeout=STATE_OP_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - degrade, never fail /dags
+                return None
+            if body is None:
+                cache.pop(key, None)  # deleted since the listing
+                continue
+            cache[key] = self._summarize_run(body)
+        return self._rollup_from_summaries(list(cache.values()))
 
     async def get_run(
         self, dag_name: str, run_key: str
@@ -1951,8 +2199,23 @@ class DagScheduler:
         # queued completions targeted the old store; the new store's runs are
         # reconciled from scratch (a still-RUNNING entry is recovered there).
         self._pending_completions.clear()
+        self._completion_buffer.clear()
+        # Run keys are deterministic (dag name + logical date), so the new
+        # store's runs collide with whatever the old store left cached here.
+        # _dag_summary_cache is the load-bearing one: _dag_run_rollup skips
+        # re-reading any key whose cached summary is terminal, and unlike
+        # _terminal_run_keys nothing rebuilds it on a timer -- so without this
+        # clear, /dags serves the OLD store's finished state for the NEW
+        # store's live run until an unrelated eviction happens to knock the
+        # key out. _terminal_run_keys would self-heal at the next full adopt
+        # pass, but until then it suppresses adoption of the new store's runs,
+        # so drop it here and bring that pass forward to now.
+        self._dag_summary_cache.clear()
+        self._terminal_run_keys.clear()
+        self._advance_again.clear()
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
+        self._next_full_adopt = 0.0
         self._next_gc = 0.0
 
 

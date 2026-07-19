@@ -195,6 +195,16 @@ def validate_graph(spec: DagSpec) -> None:
             raise DagValidationError(
                 "task id {!r} may not contain '#' or '/'".format(task.id)
             )
+        # The id reaches %s log sinks and durable keys verbatim, so a control
+        # character (CR/LF) could forge or split daemon log lines. Reject the
+        # C0 range and DEL here (the docstring already promises a safe
+        # charset) without narrowing the printable set configs may rely on.
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in task.id):
+            raise DagValidationError(
+                "task id {!r} may not contain control characters".format(
+                    task.id
+                )
+            )
         if task.id in seen:
             raise DagValidationError("duplicate task id {!r}".format(task.id))
         seen[task.id] = task
@@ -1310,6 +1320,89 @@ def mark_task_finished(
             )
         body["updatedAt"] = now
         return body, True
+
+    return transform
+
+
+def mark_tasks_finished(marks: List[Dict[str, Any]], now: float):
+    """Terminalise (or park-for-retry) a whole batch of finished instances in
+    ONE RMW.  The batched form of :func:`mark_task_finished`.
+
+    ``marks`` is a list of per-instance dicts, each carrying the same fields
+    the single transform takes: ``taskkey``, ``success``, ``exit_code``,
+    ``fail_reason``, ``task`` (the :class:`TaskSpec`), ``jitter``, and the
+    ``expected_proc`` / ``expected_attempt`` / ``expected_poke`` fences, plus
+    an optional serialised ``resources`` dict.
+
+    Batching is safe for exactly the reason :func:`set_task_pids` is: every
+    mark is fenced and applied against ONLY its own task's entry, so applying
+    the batch is equivalent to applying the single-entry transforms in
+    sequence.  A stale/duplicate/superseded completion (its instance
+    re-claimed under a fresh proc token, a newer attempt or a later poke now
+    live) is dropped on its own while the rest of the batch still lands.  A
+    reaper flush of a mapped fan-out that used to pay one full-document parse +
+    rewrite + fsync PER completion now pays one per run per flush.
+
+    Returns the list of taskkeys actually applied (empty -> document left
+    untouched, exactly like a lone fenced-out completion), so the caller can
+    settle each applied entry's retry-queue copy and log the dropped ones.
+    """
+
+    def transform(body):
+        if body is None:
+            return _DOC_KEEP, []
+        tasks = body.get("tasks", {})
+        applied: List[str] = []
+        for mark in marks:
+            taskkey = mark["taskkey"]
+            entry = tasks.get(taskkey)
+            if entry is None or entry.get("state") != RUNNING:
+                # already reconciled/terminal: a duplicate completion is a
+                # no-op (the mark_task_finished state fence).
+                continue
+            expected_proc = mark.get("expected_proc")
+            if (
+                expected_proc is not None
+                and entry.get("proc") != expected_proc
+            ):
+                continue  # superseded attempt (the proc-token fence)
+            expected_attempt = mark.get("expected_attempt")
+            if (
+                expected_attempt is not None
+                and int(entry.get("attempt", 0)) != expected_attempt
+            ):
+                continue  # a newer attempt is live (the attempt fence)
+            expected_poke = mark.get("expected_poke")
+            if (
+                expected_poke is not None
+                and int(entry.get("pokeCount", 0)) != expected_poke
+            ):
+                continue  # a later poke is live (the poke fence)
+            task = mark["task"]
+            if task.type == SENSOR:
+                _finish_sensor(
+                    entry,
+                    mark["success"],
+                    now,
+                    task,
+                    mark.get("jitter", 0.0),
+                    mark.get("resources"),
+                )
+            else:
+                _finish_plain(
+                    entry,
+                    mark["success"],
+                    mark.get("exit_code"),
+                    mark.get("fail_reason"),
+                    now,
+                    task,
+                    mark.get("resources"),
+                )
+            applied.append(taskkey)
+        if not applied:
+            return _DOC_KEEP, []
+        body["updatedAt"] = now
+        return body, applied
 
     return transform
 

@@ -182,12 +182,18 @@ def _field_values(
             if v is None:
                 raise ValueError("bad field: %s" % part)
             start, end = v, (hi if "/" in part else v)
-        values: List[int]
+        # Iterate range lazily (never list(range(...))): a huge endpoint like
+        # "1-2000000000" would otherwise allocate billions of ints before the
+        # per-value check below rejects it, an OOM that also defeats the
+        # degrade-to-prose guarantee. range is lazy and the loop raises on the
+        # first out-of-range value, so an over-range spec costs O(1) while
+        # every accepted schedule still yields identical values.
+        values: Iterable[int]
         if start <= end:
-            values = list(range(start, end + 1, step))
+            values = range(start, end + 1, step)
         else:  # wrap-around range, e.g. fri-mon
-            values = list(range(start, hi + 1, step)) + list(
-                range(lo, end + 1, step)
+            values = itertools.chain(
+                range(start, hi + 1, step), range(lo, end + 1, step)
             )
         for v in values:
             v = 0 if (hi == 6 and v == 7) else v

@@ -1,12 +1,15 @@
 import asyncio
 import datetime
 import json
+import logging
 import socket
 
 import aiohttp
 import pytest
 
 from cronstable.cluster import (
+    MAX_ADVERTISED_REBOOT_JOBS,
+    MIN_COMPRESS_BYTES,
     NODE_STATS_HEADER,
     STATUS_AGREED,
     STATUS_CONFLICT,
@@ -17,6 +20,7 @@ from cronstable.cluster import (
     STATUS_UNTRUSTED,
     ClusterManager,
     ClusterView,
+    _aged_job_summaries,
     _hrw_owner,
     _parse_members,
     _parse_str_list,
@@ -25,6 +29,7 @@ from cronstable.cluster import (
     elect_available_leader,
     elect_job_owner,
     elect_leader,
+    gossip_tls_loadable,
     quorum_size,
 )
 from cronstable.config import DEFAULT_CLUSTER, ConfigError, parse_config_string
@@ -5560,3 +5565,358 @@ async def test_handle_peer_serves_cached_pair_until_view_mutates(no_tls):
     assert resp4.headers["ETag"] != etag
     payload = json.loads(resp4.text)
     assert payload["mutual_agreeing"] == ["node-b"]
+
+
+# --------------------------------------------------------------------------
+# pure parse helpers (call directly with tricky inputs)
+# --------------------------------------------------------------------------
+
+
+def test_parse_members_drops_non_dict_entries():
+    # a CA-vouched-but-hostile members[] with junk entries degrades to only the
+    # well-formed tuples, rather than raising (non-dict entry -> continue).
+    good = {"node_name": "n", "instance_id": "i", "agreed": True}
+    out = _parse_members(["not-a-dict", 5, None, good])
+    assert out == [("n", "i", True)]
+    # not a list at all -> empty
+    assert _parse_members("nope") == []
+
+
+def test_parse_members_max_len_drops_overlong_name_or_instance():
+    # an entry whose name OR instance exceeds max_len is dropped whole.
+    over_name = {"node_name": "x" * 10, "instance_id": "i", "agreed": True}
+    over_inst = {"node_name": "n", "instance_id": "y" * 10, "agreed": True}
+    ok = {"node_name": "nn", "instance_id": "ii", "agreed": False}
+    out = _parse_members([over_name, over_inst, ok], max_len=5)
+    assert out == [("nn", "ii", False)]
+
+
+def test_parse_members_max_items_caps_length():
+    entries = [
+        {"node_name": "n{}".format(i), "instance_id": "i", "agreed": True}
+        for i in range(6)
+    ]
+    out = _parse_members(entries, max_items=2)
+    assert len(out) == 2
+    assert out == [("n0", "i", True), ("n1", "i", True)]
+
+
+def test_parse_members_drops_control_character_values():
+    ctrl = {"node_name": "bad\nname", "instance_id": "i", "agreed": True}
+    assert _parse_members([ctrl]) == []
+
+
+def test_parse_str_list_drops_overlong_and_caps_items():
+    # over-long strings are dropped (max_len branch)...
+    assert _parse_str_list(["ok", "toolong"], max_len=4) == {"ok"}
+    # ...and max_items bounds the resulting set (break branch).
+    out = _parse_str_list(["a", "b", "c", "d"], max_items=2)
+    # the kept items are the FIRST max_items, not an arbitrary subset (a
+    # `out <= {"a","b","c","d"}` check here held by construction, since the
+    # result is built from the input, and so asserted nothing).
+    assert out == {"a", "b"}
+    # non-strings and non-lists degrade to empty rather than raising
+    assert _parse_str_list([1, 2, "keep"]) == {"keep"}
+    assert _parse_str_list("nope") == set()
+
+
+def test_aged_job_summaries_returns_unchanged_when_not_elapsed():
+    jobs = {"a": {"scheduled_in": 30}}
+    # elapsed == 0 -> the stored snapshot is returned as-is (same object)
+    assert _aged_job_summaries(jobs, NOW, NOW) is jobs
+    # now < taken_at (negative elapsed) also short-circuits to the original
+    earlier = NOW - datetime.timedelta(seconds=5)
+    assert _aged_job_summaries(jobs, NOW, earlier) is jobs
+    # None inputs pass straight through
+    assert _aged_job_summaries(None, NOW, NOW) is None
+    assert _aged_job_summaries(jobs, None, NOW) is jobs
+
+
+def test_aged_job_summaries_ages_countdown_when_elapsed():
+    jobs = {"a": {"scheduled_in": 30}, "b": {"scheduled_in": 2}}
+    later = NOW + datetime.timedelta(seconds=10)
+    aged = _aged_job_summaries(jobs, NOW, later)
+    assert aged is not jobs  # copied, never mutated
+    assert aged["a"]["scheduled_in"] == 20
+    assert aged["b"]["scheduled_in"] == 0  # clamped at 0
+    assert jobs["a"]["scheduled_in"] == 30  # original untouched
+
+
+def test_gossip_tls_loadable_no_certs_needed():
+    # a non-gossip backend never has cluster TLS to pre-validate -> True
+    assert gossip_tls_loadable({"backend": "etcd"}) is True
+    # a gossip config with no tls block (nothing on disk) -> True
+    assert gossip_tls_loadable({"backend": "gossip"}) is True
+    # default backend is gossip; an empty/absent tls still short-circuits True
+    assert gossip_tls_loadable({}) is True
+
+
+# --------------------------------------------------------------------------
+# TLS-backed ClusterManager tests using a fake aiohttp session/request
+# --------------------------------------------------------------------------
+
+
+class _CovFakeContent:
+    def __init__(self, body):
+        self._body = body
+
+    async def iter_chunked(self, _n):
+        # single-shot body; enough to exercise _read_capped's happy path.
+        yield self._body
+
+
+class _CovFakeResp:
+    def __init__(self, status, body=b"", headers=None):
+        self.status = status
+        self.headers = headers or {}
+        self.content = _CovFakeContent(body)
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise aiohttp.ClientError("status {}".format(self.status))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+class _CovFakeSession:
+    def __init__(self, resp):
+        self._resp = resp
+
+    def get(self, _url, **_kwargs):
+        return self._resp
+
+
+class _FakeReq:
+    def __init__(self, body, headers=None):
+        self.content = _CovFakeContent(body)
+        self.headers = headers or {}
+
+
+def _observe_body(**overrides):
+    base = {
+        "node_name": "peer-b",
+        "job_set_id": "v1:same",
+        "scheme_version": SCHEME_VERSION,
+        "instance_id": "inst-b",
+    }
+    base.update(overrides)
+    return json.dumps(base).encode("utf-8")
+
+
+async def test_observe_peer_rejects_overlong_field(tmp_path):
+    # a CA-vouched peer returning an over-long scalar identity field is a
+    # payload-bloat / log-injection vector -> the observation is failed, not
+    # stored (branch: len(value) > MAX_PEER_FIELD_LEN).
+    tls = _write_tls(tmp_path)
+    host = "peer-x:9000"
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [host], "node-a"),
+        lambda: "v1:same",
+    )
+    body = _observe_body(node_name="x" * 300)
+    resp = _CovFakeResp(200, body, {"ETag": '"e"'})
+    await mgr._observe_peer(_CovFakeSession(resp), host, "v1:same")
+    peer = mgr.view.peers[host]
+    assert peer.status == STATUS_UNREACHABLE
+    assert "over 256 chars" in peer.last_error
+
+
+async def test_observe_peer_rejects_bad_cluster_size(tmp_path):
+    tls = _write_tls(tmp_path)
+    host = "peer-x:9000"
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [host], "node-a"),
+        lambda: "v1:same",
+    )
+    body = _observe_body(cluster_size=0)  # not a positive integer
+    resp = _CovFakeResp(200, body, {"ETag": '"e"'})
+    await mgr._observe_peer(_CovFakeSession(resp), host, "v1:same")
+    peer = mgr.view.peers[host]
+    assert peer.status == STATUS_UNREACHABLE
+    assert "cluster_size is not a positive" in peer.last_error
+
+
+async def test_observe_peer_rejects_non_bool_elect_leader(tmp_path):
+    tls = _write_tls(tmp_path)
+    host = "peer-x:9000"
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [host], "node-a"),
+        lambda: "v1:same",
+    )
+    body = _observe_body(cluster_size=2, elect_leader="yes")
+    resp = _CovFakeResp(200, body, {"ETag": '"e"'})
+    await mgr._observe_peer(_CovFakeSession(resp), host, "v1:same")
+    peer = mgr.view.peers[host]
+    assert peer.status == STATUS_UNREACHABLE
+    assert "elect_leader is not a boolean" in peer.last_error
+
+
+async def test_handle_peer_compresses_without_gzip(tmp_path, monkeypatch):
+    # a /peer body over MIN_COMPRESS_BYTES from a client that did NOT advertise
+    # gzip still gets compressed via aiohttp's default negotiation (the else
+    # branch of the gzip pick). Exercised by calling the handler directly.
+    tls = _write_tls(tmp_path)
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [], "node-a"),
+        lambda: "v1:same",
+    )
+    # a fat summaries block guarantees the body clears the compress floor.
+    mgr.set_job_summaries_provider(
+        lambda: {
+            "job-{:03d}".format(i): {
+                "scheduled_in": i,
+                "last_status": "ok",
+                "note": "padding-value-" + ("z" * 20),
+            }
+            for i in range(60)
+        }
+    )
+    # Record which coding each branch asks for. enable_compression() acts at
+    # write time and never touches resp.body, so a body-size assertion here
+    # only re-checks the padding fixture above: it stayed green with the
+    # enable_compression() calls deleted outright.
+    codings = []
+    real_enable = aiohttp.web.Response.enable_compression
+
+    def spy_enable(self, force=None, **kw):
+        codings.append(force)
+        return real_enable(self, force, **kw)
+
+    monkeypatch.setattr(
+        aiohttp.web.Response, "enable_compression", spy_enable
+    )
+
+    # no gzip in Accept-Encoding -> the else-branch enable_compression()
+    req = _FakeReq(b"", {"Accept-Encoding": "identity"})
+    resp = await mgr._handle_peer(req)
+    assert resp.status == 200
+    assert isinstance(resp.body, bytes) and len(resp.body) >= MIN_COMPRESS_BYTES
+    assert codings == [None]  # bare call: aiohttp negotiates
+    # and the gzip-advertised path picks gzip EXPLICITLY (the sibling branch)
+    req_gzip = _FakeReq(b"", {"Accept-Encoding": "gzip, deflate"})
+    resp2 = await mgr._handle_peer(req_gzip)
+    assert resp2.status == 200
+    assert codings == [None, aiohttp.web.ContentCoding.gzip]
+
+
+async def test_handle_reboot_ran_truncates_persistent_set(tmp_path):
+    # the persistent ran-set is bounded: a push that would grow it past
+    # MAX_ADVERTISED_REBOOT_JOBS is truncated to a stable sorted prefix.
+    tls = _write_tls(tmp_path)
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [], "node-a"),
+        lambda: "v1:x",
+    )
+    # pre-seed with names that sort AFTER the pushed ones so the truncation
+    # deterministically drops them.
+    mgr._ran_reboot_jobs = {"pre-{:03d}".format(i) for i in range(300)}
+    pushed = ["job-{:04d}".format(i) for i in range(MAX_ADVERTISED_REBOOT_JOBS)]
+    body = json.dumps({"job_set_id": "v1:x", "names": pushed}).encode("utf-8")
+    resp = await mgr._handle_reboot_ran(_FakeReq(body))
+    assert resp.status == 204
+    assert len(mgr._ran_reboot_jobs) == MAX_ADVERTISED_REBOOT_JOBS
+    # the sorted prefix kept every pushed "job-*" and dropped the "pre-*" tail
+    assert "job-0000" in mgr._ran_reboot_jobs
+    assert "pre-000" not in mgr._ran_reboot_jobs
+
+
+async def test_poll_all_logs_unexpected_peer_error(tmp_path, caplog):
+    # an *unexpected* exception from one peer coroutine (a bug, not a network
+    # failure) is logged and does not abort the round.
+    tls = _write_tls(tmp_path)
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), ["p:1"], "node-a"),
+        lambda: "v1:x",
+    )
+    mgr._session = object()  # non-None so _poll_all does real work
+
+    async def boom(_session, _host, _my_id):
+        raise ValueError("simulated bug")
+
+    mgr._poll_peer = boom
+    with caplog.at_level(logging.ERROR, logger="cronstable.cluster"):
+        await mgr._poll_all()
+    assert mgr._poll_rounds == 1
+    assert any(
+        "unexpected error polling" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_poll_all_reraises_cancellation(tmp_path):
+    # a CancelledError surfacing from a peer coroutine must propagate out of the
+    # round, not be swallowed as a logged error.
+    tls = _write_tls(tmp_path)
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), ["p:1"], "node-a"),
+        lambda: "v1:x",
+    )
+    mgr._session = object()
+
+    async def cancelled(_session, _host, _my_id):
+        raise asyncio.CancelledError()
+
+    mgr._poll_peer = cancelled
+    with pytest.raises(asyncio.CancelledError):
+        await mgr._poll_all()
+
+
+async def test_poll_loop_sleeps_between_rounds(tmp_path):
+    # the loop polls, then waits interval; when the wait times out (no stop yet)
+    # it loops again -- so a short interval yields repeated poll rounds.
+    tls = _write_tls(tmp_path)
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [], "node-a"),
+        lambda: "v1:x",
+    )
+    mgr.config["interval"] = 0.01
+    calls = []
+
+    async def counting():
+        calls.append(1)
+
+    mgr._poll_all = counting
+    task = asyncio.create_task(mgr._poll_loop())
+    try:
+        # long enough for several interval timeouts to fire
+        for _ in range(50):
+            if len(calls) >= 3:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        mgr._stop.set()
+        await task
+    assert len(calls) >= 3  # looped through the wait-timeout branch repeatedly
+
+
+async def test_start_cleans_up_on_initial_poll_cancellation(tmp_path):
+    # if the up-front poll round is cancelled after the session/runner are up,
+    # start() must tear them back down (no leaked session/runner) and re-raise.
+    tls = _write_tls(tmp_path)
+    mgr = ClusterManager(
+        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [], "node-a"),
+        lambda: "v1:x",
+    )
+
+    async def cancel():
+        raise asyncio.CancelledError()
+
+    mgr._poll_all = cancel
+    with pytest.raises(asyncio.CancelledError):
+        await mgr.start()
+    assert mgr._session is None
+    assert mgr._runner is None
+    assert mgr._poll_task is None
+
+
+async def test_gossip_tls_loadable_dry_runs_context_build(tmp_path):
+    # a gossip config WITH tls is a side-effect-free dry-run of the context
+    # build: valid material loads, a half-written PEM does not.
+    tls = _write_tls(tmp_path)
+    assert gossip_tls_loadable({"backend": "gossip", "tls": tls}) is True
+    with open(tls["cert"], "w") as fh:
+        fh.write("-----BEGIN CERTIFICATE-----\nnot-valid-base64\n")
+    assert gossip_tls_loadable({"backend": "gossip", "tls": tls}) is False

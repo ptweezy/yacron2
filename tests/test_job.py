@@ -16,6 +16,7 @@ import cronstable.platform
 import cronstable.statsd
 from cronstable.platform import DEFAULT_SHELL, IS_WINDOWS
 from tests._commands import (
+    PYTHON,
     cmd_print,
     cmd_print_sleep_print,
     cmd_sleep,
@@ -187,6 +188,44 @@ async def test_job_output_stream_ring_buffer_bounds():
         ("stdout", "line 3\n"),
         ("stdout", "line 4\n"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_job_output_stream_subscriber_queue_drops_oldest_when_full(
+    monkeypatch,
+):
+    # A stalled subscriber (never draining its queue) must not grow without
+    # bound: the queue is capped and overflow drops the OLDEST line so the
+    # viewer keeps receiving the newest output.
+    monkeypatch.setattr(cronstable.job, "LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT", 3)
+    out = cronstable.job.JobOutputStream()
+    queue = out.subscribe()
+    for i in range(5):
+        out.publish("stdout", f"line {i}\n")
+    assert queue.qsize() == 3
+    assert out.dropped == 2
+    # oldest two (line 0, line 1) were evicted; newest three remain in order
+    assert queue.get_nowait() == ("stdout", "line 2\n")
+    assert queue.get_nowait() == ("stdout", "line 3\n")
+    assert queue.get_nowait() == ("stdout", "line 4\n")
+
+
+@pytest.mark.asyncio
+async def test_job_output_stream_sentinel_delivered_to_saturated_queue(
+    monkeypatch,
+):
+    # close()'s end sentinel must reach even a subscriber whose bounded queue is
+    # already full, or that reader loop would never terminate.
+    monkeypatch.setattr(cronstable.job, "LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT", 2)
+    out = cronstable.job.JobOutputStream()
+    queue = out.subscribe()
+    out.publish("stdout", "a\n")
+    out.publish("stdout", "b\n")
+    out.close()
+    drained = []
+    while not queue.empty():
+        drained.append(queue.get_nowait())
+    assert drained[-1] is None  # sentinel present despite the earlier overflow
 
 
 @pytest.mark.asyncio
@@ -1315,6 +1354,67 @@ jobs:
 
 
 @pytest.mark.asyncio
+async def test_start_failure_log_does_not_leak_the_child_environment(
+    monkeypatch, caplog
+):
+    # The spawn kwargs carry a full os.environ copy plus the CRONSTABLE_*
+    # loopback credentials, and the spawn-failure handler formats kwargs into
+    # an ERROR record. Logging it verbatim published every environment secret
+    # the daemon holds to journald/syslog and anything shipping from them.
+    conf = cronstable.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command:
+      - /bin/true
+    schedule: "* * * * *"
+    environment:
+      - key: JOB_VAR
+        value: job-value
+""",
+        "",
+    )
+    monkeypatch.setenv("SPAWN_LEAK_CANARY", "canary-from-os-environ")
+
+    async def boom(*args, **kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job.extra_env = {"CRONSTABLE_STATE_TOKEN": "tok-canary-deadbeef"}
+
+    with caplog.at_level(logging.DEBUG, logger="cronstable"):
+        await job.start()
+    assert job.start_failed
+
+    blob = caplog.text
+    assert "canary-from-os-environ" not in blob
+    assert "tok-canary-deadbeef" not in blob
+    assert "job-value" not in blob
+    # the diagnostic itself survives: the failure, the job, and the fact that
+    # a custom environment was in play
+    assert "Error launching subprocess of job test" in blob
+    assert "vars, values omitted" in blob
+
+
+def test_loggable_spawn_kwargs_passes_through_without_env():
+    # no env in kwargs (the common case: a job with no `environment:` and no
+    # control-channel injection) is returned untouched, same object.
+    kwargs = {"limit": 4096}
+    assert cronstable.job.loggable_spawn_kwargs(kwargs) is kwargs
+
+
+def test_loggable_spawn_kwargs_leaves_other_keys_alone():
+    kwargs = {"env": {"A": "secret-a", "B": "secret-b"}, "limit": 4096}
+    out = cronstable.job.loggable_spawn_kwargs(kwargs)
+    assert out["limit"] == 4096
+    assert out["env"] == "<2 vars, values omitted>"
+    # the caller's dict is not mutated: it is still the real env handed to the
+    # subprocess
+    assert kwargs["env"] == {"A": "secret-a", "B": "secret-b"}
+
+
+@pytest.mark.asyncio
 async def test_statsd_failure_does_not_crash(monkeypatch):
     # statsd is best-effort: a send error (e.g. an unresolvable host) must be
     # swallowed and not propagate out of start()/wait() to crash the scheduler.
@@ -1801,3 +1901,757 @@ async def test_report_shell_combined_over_limit_is_not_truncated(monkeypatch):
     assert env["CRONSTABLE_STDERR_TRUNCATED"] == "0"
     assert len(env["CRONSTABLE_STDOUT"]) == each
     assert len(env["CRONSTABLE_STDERR"]) == each
+
+
+# ===========================================================================
+# Reporter / stream / cancel path behaviors: reporter secret-source and
+# error/timeout branches, StreamReader passthrough-emit fallbacks,
+# JobOutputStream teardown edges, RunningJob.cancel of a live process, the
+# live-resource accessors, fail_reason, and _report_common exception handling.
+# ===========================================================================
+
+_SIMPLE_JOB_TEST = """
+jobs:
+  - name: test
+    command: echo hi
+    schedule: "* * * * *"
+"""
+
+_MAIL_JOB = """
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        mail:
+          from: from@example.com
+          to: to@example.com
+          smtpHost: smtp.example.com
+          smtpPort: 1025
+          username: theuser
+"""
+
+_SHELL_JOB = """
+jobs:
+  - name: test
+    command: echo the-command
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        shell:
+          command: "true"
+"""
+
+
+def _fresh_job():
+    conf = cronstable.config.parse_config_string(_SIMPLE_JOB_TEST, "")
+    return cronstable.job.RunningJob(conf.jobs[0], None)
+
+
+def _mail_report_config():
+    conf = cronstable.config.parse_config_string(_MAIL_JOB, "")
+    return conf.jobs[0], conf.jobs[0].onFailure["report"]
+
+
+def _mail_job_mock(job_config, success=False, stdout="out", stderr="err"):
+    return Mock(
+        config=job_config,
+        stdout=stdout,
+        stderr=stderr,
+        template_vars={
+            "name": job_config.name,
+            "success": success,
+            "fail_reason": None if success else "reasons",
+            "stdout": stdout,
+            "stderr": stderr,
+        },
+    )
+
+
+async def _run_mail_capturing(report, job, success=False):
+    """Drive MailReporter with the SMTP conversation stubbed out."""
+    login_calls = []
+    messages = []
+
+    async def connect(self):
+        pass
+
+    async def starttls(self):
+        pass
+
+    async def login(self, username, password):
+        login_calls.append((username, password))
+
+    async def send_message(self, message):
+        messages.append(message)
+
+    def close(self):
+        pass
+
+    with (
+        patch("aiosmtplib.SMTP.connect", connect),
+        patch("aiosmtplib.SMTP.starttls", starttls),
+        patch("aiosmtplib.SMTP.login", login),
+        patch("aiosmtplib.SMTP.send_message", send_message),
+        patch("aiosmtplib.SMTP.close", close),
+    ):
+        await cronstable.job.MailReporter().report(success, job, report)
+    return login_calls, messages
+
+
+# ---------------------------------------------------------------------------
+# StreamReader passthrough-emit fallbacks
+# ---------------------------------------------------------------------------
+
+
+def test_stream_reader_emit_falls_back_to_ascii_on_unicode_error():
+    # _emit writes bytes to the console; when the console's buffer refuses the
+    # bytes (UnicodeEncodeError), it must fall back to an ascii-replaced text
+    # write rather than let the reader task die.
+    class FakeBuffer:
+        def write(self, data):
+            raise UnicodeEncodeError("utf-8", "x", 0, 1, "nope")
+
+    class FakeStream:
+        def __init__(self):
+            self.buffer = FakeBuffer()
+            self.text_written = []
+            self.flushed = 0
+
+        def write(self, text):
+            self.text_written.append(text)
+
+        def flush(self):
+            self.flushed += 1
+
+    fs = FakeStream()
+    cronstable.job.StreamReader._emit(fs, "hello\n")
+
+    assert fs.text_written == ["hello\n"]  # ascii-replaced text path taken
+    assert fs.flushed == 1
+
+
+async def test_flush_emit_buffer_survives_broken_daemon_stream(caplog):
+    # If the daemon's own stdout is a dead pipe, the batched passthrough flush
+    # must swallow the OSError and log a single warning -- the job's capture is
+    # unaffected, so the reader keeps going.
+    fake = asyncio.StreamReader()
+    fake.feed_eof()
+    reader = cronstable.job.StreamReader("j", "stdout", fake, "", 10)
+
+    def boom(out, text):
+        raise OSError("dead pipe")
+
+    reader._emit = boom  # instance attr: plain function, not bound
+    reader._emit_buffer = ["line\n"]
+
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        reader._flush_emit_buffer()
+
+    assert reader._emit_buffer == []  # buffer was drained despite the failure
+    assert any(
+        "could not mirror" in rec.getMessage() for rec in caplog.records
+    )
+    await reader.join()  # let the (already EOF) read task settle
+
+
+# ---------------------------------------------------------------------------
+# JobOutputStream teardown edges
+# ---------------------------------------------------------------------------
+
+
+def test_output_stream_unsubscribe_unknown_queue_is_noop():
+    out = cronstable.job.JobOutputStream()
+    queue = out.subscribe()
+    out.unsubscribe(queue)
+    # unsubscribing a queue that is no longer registered must not raise
+    out.unsubscribe(queue)
+    # a queue that was never registered at all is equally a no-op
+    out.unsubscribe(asyncio.Queue())
+    # the subscriber really is gone: a publish reaches no one
+    out.publish("stdout", "x\n")
+    assert queue.empty()
+
+
+def test_output_stream_close_is_idempotent():
+    out = cronstable.job.JobOutputStream()
+    queue = out.subscribe()
+    out.close()
+    out.close()  # second close short-circuits, no second sentinel enqueued
+    assert queue.get_nowait() is None
+    assert queue.empty()
+
+
+# ---------------------------------------------------------------------------
+# SentryReporter
+# ---------------------------------------------------------------------------
+
+
+async def test_sentry_report_env_var_unset_is_skipped(monkeypatch, caplog):
+    monkeypatch.delenv("TEST_SENTRY_UNSET", raising=False)
+    conf = cronstable.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        sentry:
+          dsn:
+            fromEnvVar: TEST_SENTRY_UNSET
+""",
+        "",
+    )
+    report = conf.jobs[0].onFailure["report"]
+    job = Mock(config=conf.jobs[0])
+
+    # sentry_sdk must never be initialized down this path -- the early return
+    # fires before the (expensive) import.
+    def boom(*args, **kwargs):
+        raise AssertionError("sentry_sdk.init must not be called")
+
+    monkeypatch.setattr("sentry_sdk.init", boom)
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cronstable.job.SentryReporter().report(True, job, report)
+
+    assert any("dsn env var" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_sentry_report_applies_environment_and_max_string_length(
+    monkeypatch,
+):
+    import sentry_sdk.utils
+
+    conf = cronstable.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        sentry:
+          dsn:
+            value: http://xxx:yyy@sentry/9
+          environment: staging
+          maxStringLength: 4096
+""",
+        "",
+    )
+    job_config = conf.jobs[0]
+    report = job_config.onFailure["report"]
+    job = Mock(
+        config=job_config,
+        stdout="out",
+        stderr="err",
+        retcode=0,
+        template_vars={
+            "name": job_config.name,
+            "success": False,
+            "fail_reason": "reasons",
+            "stdout": "out",
+            "stderr": "err",
+            "environment": {},
+        },
+    )
+
+    transports = []
+
+    class FakeSentryTransport:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.messages_sent = []
+            options = args[0] if args else kwargs.get("options", {})
+            dsn = options.get("dsn")
+            self.parsed_dsn = Dsn(dsn) if dsn else None
+
+        def capture_envelope(self, envelope):
+            event = envelope.get_event()
+            if event is not None:
+                self.messages_sent.append(event)
+
+        def capture_event(self, event_opt):
+            self.messages_sent.append(event_opt)
+
+        def record_lost_event(self, *args, **kwargs):
+            pass
+
+        def is_healthy(self):
+            return True
+
+        def kill(self):
+            pass
+
+        def flush(self, *args, **kwargs):
+            pass
+
+    def make_transport(*args, **kwargs):
+        transport = FakeSentryTransport(*args, **kwargs)
+        transports.append(transport)
+        return transport
+
+    monkeypatch.setattr("sentry_sdk.client.make_transport", make_transport)
+
+    await cronstable.job.SentryReporter().report(False, job, report)
+
+    # maxStringLength was pushed into the sentry-sdk global
+    assert sentry_sdk.utils.MAX_STRING_LENGTH == 4096
+    # environment reached sentry_sdk.init -> the client options
+    assert transports
+    assert transports[-1].args[0].get("environment") == "staging"
+    messages = [m for t in transports for m in t.messages_sent]
+    assert len(messages) == 1
+    msg = messages[0]
+    assert msg["level"] == "error"  # default level
+    assert msg["extra"]["job"] == "test"
+    assert msg["extra"]["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# MailReporter secret sources + skip/timeout branches
+# ---------------------------------------------------------------------------
+
+
+async def test_mail_report_password_from_file(tmp_path):
+    pw = tmp_path / "smtp-pass"
+    pw.write_text("filesecret\n")
+    job_config, report = _mail_report_config()
+    report["mail"]["password"] = {
+        "value": None,
+        "fromFile": str(pw),
+        "fromEnvVar": None,
+    }
+    job = _mail_job_mock(job_config)
+
+    login_calls, messages = await _run_mail_capturing(report, job)
+
+    # the password read from the file (trailing newline stripped) is used
+    assert login_calls == [("theuser", "filesecret")]
+    assert len(messages) == 1
+
+
+async def test_mail_report_html_body():
+    job_config, report = _mail_report_config()
+    report["mail"]["password"] = {
+        "value": "pw",
+        "fromFile": None,
+        "fromEnvVar": None,
+    }
+    report["mail"]["html"] = True
+    report["mail"]["body"] = "<b>hi</b>"
+    job = _mail_job_mock(job_config)
+
+    _login_calls, messages = await _run_mail_capturing(report, job)
+
+    assert len(messages) == 1
+    # html=True routes through set_content(..., subtype="html")
+    assert messages[0].get_content_type() == "text/html"
+
+
+async def test_mail_report_password_env_unset_is_skipped(monkeypatch, caplog):
+    monkeypatch.delenv("TEST_SMTP_PW", raising=False)
+    job_config, report = _mail_report_config()
+    report["mail"]["password"] = {
+        "value": None,
+        "fromFile": None,
+        "fromEnvVar": "TEST_SMTP_PW",
+    }
+    job = _mail_job_mock(job_config)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("SMTP must not be constructed")
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        with patch("aiosmtplib.SMTP", boom):
+            await cronstable.job.MailReporter().report(False, job, report)
+
+    assert any(
+        "password env var is not set" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+async def test_mail_report_skips_empty_body_on_success():
+    job_config, report = _mail_report_config()
+    # a body that renders to nothing on success: the reporter must skip sending
+    report["mail"]["body"] = "{% if not success %}only-on-failure{% endif %}"
+    job = _mail_job_mock(job_config, success=True)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("SMTP must not be constructed for an empty body")
+
+    with patch("aiosmtplib.SMTP", boom):
+        await cronstable.job.MailReporter().report(True, job, report)
+
+
+async def test_mail_report_times_out(monkeypatch, caplog):
+    monkeypatch.setattr(cronstable.job, "MAIL_REPORT_TIMEOUT", 0.1)
+    job_config, report = _mail_report_config()
+    job = _mail_job_mock(job_config)
+
+    async def slow_connect(self):
+        await asyncio.sleep(5)
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        with patch("aiosmtplib.SMTP.connect", slow_connect):
+            # must return (not raise) once the overall bound trips
+            await asyncio.wait_for(
+                cronstable.job.MailReporter().report(False, job, report), 10
+            )
+
+    assert any(
+        "did not complete within" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# ShellReporter: exec-with-shell, plain-shell, spawn error, timeout
+# ---------------------------------------------------------------------------
+
+
+def _shell_job_mock(job_config):
+    return Mock(
+        config=job_config,
+        stdout="out",
+        stderr="err",
+        retcode=1,
+        fail_reason="boom",
+        failed=True,
+        resource_usage=None,
+    )
+
+
+async def test_shell_report_exec_with_explicit_shell(tmp_path):
+    # an explicit `shell` on a string command routes through the exec branch as
+    # [shell, "-c", command]; using the test interpreter as the shell keeps
+    # this deterministic on every platform.
+    marker = tmp_path / "ran"
+    conf = cronstable.config.parse_config_string(_SHELL_JOB, "")
+    report = conf.jobs[0].onFailure["report"]
+    report["shell"]["shell"] = PYTHON
+    report["shell"]["command"] = (
+        "import pathlib; pathlib.Path({}).write_text('ok')".format(
+            repr(str(marker))
+        )
+    )
+    job = _shell_job_mock(conf.jobs[0])
+
+    await cronstable.job.ShellReporter().report(
+        False, job, conf.jobs[0].onFailure["report"]
+    )
+
+    assert marker.read_text() == "ok"  # the exec branch really ran the command
+
+
+async def test_shell_report_plain_shell_nonzero_is_logged(caplog):
+    # with no explicit shell, a string command runs through the plain-shell
+    # branch (create_subprocess_shell); a nonzero exit is logged, not raised.
+    # `exit 3` is valid in both POSIX sh and Windows cmd.
+    conf = cronstable.config.parse_config_string(_SHELL_JOB, "")
+    report = conf.jobs[0].onFailure["report"]
+    report["shell"]["shell"] = ""
+    report["shell"]["command"] = "exit 3"
+    job = _shell_job_mock(conf.jobs[0])
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cronstable.job.ShellReporter().report(
+            False, job, conf.jobs[0].onFailure["report"]
+        )
+
+    assert any(
+        "return code 3" in rec.getMessage() for rec in caplog.records
+    )
+
+
+async def test_shell_report_spawn_error_is_logged(caplog):
+    # a missing reporter binary raises FileNotFoundError (an OSError) at spawn;
+    # the reporter logs it and returns rather than crashing the reaper.
+    conf = cronstable.config.parse_config_string(_SHELL_JOB, "")
+    report = conf.jobs[0].onFailure["report"]
+    report["shell"]["command"] = ["cronstable-no-such-reporter-binary-xyz"]
+    job = _shell_job_mock(conf.jobs[0])
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cronstable.job.ShellReporter().report(
+            False, job, conf.jobs[0].onFailure["report"]
+        )
+
+    assert any(
+        "Error executing shell reporter" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+async def test_shell_report_timeout_kills_hanging_reporter(caplog):
+    # a reporter command that never exits is killed once its timeout trips, and
+    # report() returns instead of wedging the reaper.
+    conf = cronstable.config.parse_config_string(_SHELL_JOB, "")
+    report = conf.jobs[0].onFailure["report"]
+    report["shell"]["shell"] = PYTHON
+    report["shell"]["command"] = "import time; time.sleep(120)"
+    report["shell"]["timeout"] = 0.5
+    job = _shell_job_mock(conf.jobs[0])
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await asyncio.wait_for(
+            cronstable.job.ShellReporter().report(
+                False, job, conf.jobs[0].onFailure["report"]
+            ),
+            30,
+        )
+
+    assert any(
+        "did not finish within" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+async def test_shell_report_timeout_direct_kill_fallback(
+    monkeypatch, caplog
+):
+    # when the reporter times out and its process group cannot be signalled
+    # (kill_process_group returns False), the reporter falls back to killing
+    # the direct child.
+    async def never_signalled(pid, *, force):
+        return False
+
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", never_signalled
+    )
+    # Spy on the fallback itself. Asserting on the "did not finish within" log
+    # line cannot test this: job.py emits it BEFORE the kill_process_group
+    # call the patch above replaces, so such an assertion holds even with the
+    # whole fallback branch deleted. It is also exactly what the sibling test
+    # above asserts with no patch at all, which is what gave this one away.
+    killed = []
+    real_kill = asyncio.subprocess.Process.kill
+
+    def spy_kill(self):
+        killed.append(self.pid)
+        return real_kill(self)
+
+    monkeypatch.setattr(asyncio.subprocess.Process, "kill", spy_kill)
+
+    conf = cronstable.config.parse_config_string(_SHELL_JOB, "")
+    report = conf.jobs[0].onFailure["report"]
+    report["shell"]["shell"] = PYTHON
+    report["shell"]["command"] = "import time; time.sleep(120)"
+    report["shell"]["timeout"] = 0.5
+    job = _shell_job_mock(conf.jobs[0])
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await asyncio.wait_for(
+            cronstable.job.ShellReporter().report(
+                False, job, conf.jobs[0].onFailure["report"]
+            ),
+            30,
+        )
+
+    assert killed, "direct-kill fallback did not run"
+    assert any(
+        "did not finish within" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# RunningJob.cancel of a live process
+# ---------------------------------------------------------------------------
+
+
+async def test_cancel_terminates_a_running_job():
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_sleep(30))
+        + '\n    schedule: "* * * * *"\n',
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    await job.start()
+    assert job.proc is not None
+    assert job.proc.returncode is None  # still running
+
+    await asyncio.wait_for(job.cancel(), 20)
+
+    # the child was signalled and reaped, so it is no longer running
+    assert job.proc.returncode is not None
+    assert job._terminated is True
+    # draining afterwards completes the run without error
+    await asyncio.wait_for(job.wait(), 20)
+
+
+async def test_cancel_falls_back_to_direct_kill(monkeypatch):
+    # where the process group cannot be signalled at all, cancel() must fall
+    # back to the direct child: a graceful terminate (guarded against a
+    # ProcessLookupError on an already-dead pid), then, after killTimeout, a
+    # hard kill. Drive it with a stubbed process so the timeout/fallback
+    # branches fire deterministically on every platform.
+    async def never_signalled(pid, *, force):
+        return False
+
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", never_signalled
+    )
+    job = _fresh_job()
+    job.config.killTimeout = 0.3
+
+    terminate_calls = []
+    kill_calls = []
+
+    proc = Mock()
+    proc.pid = 4321
+    proc.returncode = None
+
+    def terminate():
+        terminate_calls.append(True)
+        raise ProcessLookupError()  # already reaped: must be swallowed
+
+    def kill():
+        kill_calls.append(True)
+
+    async def wait():
+        await asyncio.sleep(30)  # never returns before killTimeout
+
+    proc.terminate = terminate
+    proc.kill = kill
+    proc.wait = wait
+    job.proc = proc
+
+    await asyncio.wait_for(job.cancel(), 10)
+
+    assert terminate_calls == [True]  # graceful terminate attempted
+    assert kill_calls == [True]  # then hard-killed after the timeout
+    assert job._terminated is True
+
+
+# ---------------------------------------------------------------------------
+# live_resources / live_resource_series
+# ---------------------------------------------------------------------------
+
+
+def test_live_resources_none_without_monitor():
+    job = _fresh_job()
+    assert job._resource_monitor is None
+    assert job.live_resources() is None
+    assert job.live_resource_series() is None
+
+
+def test_live_resources_delegate_to_monitor():
+    job = _fresh_job()
+    monitor = Mock()
+    monitor.snapshot.return_value = {"cpu_seconds": 1.5}
+    monitor.series.return_value = [[0.0, 1.0], [1.0, 2.0]]
+    job._resource_monitor = monitor
+
+    assert job.live_resources() == {"cpu_seconds": 1.5}
+    assert job.live_resource_series() == [[0.0, 1.0], [1.0, 2.0]]
+
+
+# ---------------------------------------------------------------------------
+# fail_reason branches
+# ---------------------------------------------------------------------------
+
+
+def _set_fails_when(job, always=False, nonzero=False, stdout=False,
+                    stderr=False):
+    job.config.failsWhen = {
+        "always": always,
+        "nonzeroReturn": nonzero,
+        "producesStdout": stdout,
+        "producesStderr": stderr,
+    }
+
+
+def test_fail_reason_always():
+    job = _fresh_job()
+    _set_fails_when(job, always=True)
+    assert job.fail_reason == "failsWhen=always"
+    assert job.failed is True
+
+
+def test_fail_reason_nonzero_return():
+    job = _fresh_job()
+    _set_fails_when(job, nonzero=True)
+    job.retcode = 5
+    assert job.fail_reason == (
+        "failsWhen=nonzeroReturn and retcode=5"
+    )
+
+
+def test_fail_reason_produces_stdout():
+    job = _fresh_job()
+    _set_fails_when(job, stdout=True)
+    job.retcode = 0
+    job.stdout = "some output\n"
+    assert job.fail_reason == (
+        "failsWhen=producesStdout and stdout is not empty"
+    )
+
+
+def test_fail_reason_produces_stdout_via_discarded_count():
+    # even when stdout was all discarded (over saveLimit), the discard count
+    # still counts as "produced output".
+    job = _fresh_job()
+    _set_fails_when(job, stdout=True)
+    job.retcode = 0
+    job.stdout = None
+    job.stdout_discarded = 3
+    assert job.fail_reason == (
+        "failsWhen=producesStdout and stdout is not empty"
+    )
+
+
+def test_fail_reason_produces_stderr():
+    job = _fresh_job()
+    _set_fails_when(job, stderr=True)
+    job.retcode = 0
+    job.stderr = "an error\n"
+    assert job.fail_reason == (
+        "failsWhen=producesStderr and stderr is not empty"
+    )
+
+
+def test_fail_reason_none_when_no_condition_met():
+    job = _fresh_job()
+    _set_fails_when(job)  # all conditions off
+    job.retcode = 0
+    assert job.fail_reason is None
+    assert job.failed is False
+
+
+# ---------------------------------------------------------------------------
+# _report_common exception handling
+# ---------------------------------------------------------------------------
+
+
+async def test_report_common_logs_reporter_exceptions(caplog):
+    job = _fresh_job()
+
+    class BoomReporter:
+        async def report(self, success, job, config):
+            raise RuntimeError("kaboom")
+
+    class OkReporter:
+        def __init__(self):
+            self.calls = 0
+
+        async def report(self, success, job, config):
+            self.calls += 1
+
+    ok = OkReporter()
+    # shadow the class-level REPORTERS with our fakes for this instance
+    job.REPORTERS = [BoomReporter(), ok]
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await job._report_common({}, False)
+
+    # the raising reporter is logged, and gather still runs the other reporter
+    assert ok.calls == 1
+    assert any(
+        "Problem reporting job" in rec.getMessage() for rec in caplog.records
+    )

@@ -13,9 +13,11 @@ Outputs:
   --merged-out PATH  the merged current-side results as one JSON document
 
 Gating: a metric fails when it slows down by more than its declared gate
-percentage AND by more than its absolute floor (so microsecond jitter on a
-sub-millisecond metric never gates).  Failures exit 1 unless --warn-only
-(ordinary commits) or --accept (an acknowledged, intentional regression).
+percentage AND by more than its absolute floor AND by more than a couple of
+its measured noise bands (the round-to-round scatter of the two sides, so
+measurement noise on a jittery metric never gates).  Failures exit 1 unless
+--warn-only (ordinary commits) or --accept (an acknowledged, intentional
+regression).
 
 Usage:
     python benchmarks/compare.py \
@@ -25,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import math
 import statistics
 import sys
 
@@ -56,6 +59,17 @@ _DARK = {
 }
 
 _MAX_CHART_ROWS = 16
+
+# Significance guard for the gate.  A metric's round-to-round scatter is
+# estimated as the coefficient of variation of its per-round estimator values;
+# the two sides' CoVs combine in quadrature into a noise band.  A regression
+# gates only when it ALSO exceeds _SIG_SIGMA noise bands -- so measurement
+# noise can never trip the gate, and the gate percentage can be tightened
+# without drowning in false positives.  When a side has fewer than two rounds
+# the noise cannot be estimated, and the guard falls back to not suppressing
+# (the gate behaves exactly as it did before this guard existed).
+_SIG_SIGMA = 2.0
+_MIN_ROUNDS_FOR_NOISE = 2
 
 
 def _fmt(value, unit):
@@ -89,6 +103,13 @@ def _merge(docs):
             slot = merged.setdefault(name, {"entry": None, "round_values": []})
             if entry.get("skipped"):
                 slot.setdefault("skip_reason", entry.get("reason"))
+                # Keep the skipped row's declared config. bench.py stamps
+                # gate_pct/gate_floor/info on a skipped result too, and that
+                # is the only thing downstream can use to tell coverage the
+                # gate LOST from an info-only metric that never gates;
+                # discarding it here made every skipped metric look ungateable
+                # by design.
+                slot.setdefault("skipped_entry", entry)
                 continue
             if slot["entry"] is None:
                 slot["entry"] = dict(entry)
@@ -96,10 +117,15 @@ def _merge(docs):
     out = {}
     for name, slot in merged.items():
         if slot["entry"] is None:
+            declared = slot.get("skipped_entry") or {}
             out[name] = {
                 "name": name,
                 "skipped": True,
                 "reason": slot.get("skip_reason", "skipped"),
+                "gate_pct": declared.get("gate_pct"),
+                "gate_floor": declared.get("gate_floor"),
+                "info": declared.get("info"),
+                "unit": declared.get("unit"),
             }
             continue
         entry = slot["entry"]
@@ -120,10 +146,181 @@ def _delta_pct(base, cur):
     return (cur - base) / base * 100.0
 
 
+def _rel_cov(entry):
+    """A side's round-to-round scatter as a coefficient of variation.
+
+    Uses the per-round estimator values that _merge preserved in
+    ``round_values``; needs at least two rounds to estimate scatter, else
+    None.  Returned as a fraction of the metric's center.
+
+    From three rounds up the scatter is a ROBUST estimate: the median absolute
+    deviation scaled to a standard-deviation equivalent (x1.4826).  A single
+    throttled/GC-stalled round then cannot inflate the band and so cannot mask
+    a real regression behind it -- the failure mode a plain stdev has on a
+    handful of noisy samples.  (A degenerate MAD of 0, e.g. a tied median on
+    few points, falls back to stdev so the band is never falsely zero.)  Two
+    rounds carry too little shape for a robust estimator, so they keep stdev.
+    """
+    rounds = entry.get("round_values") or []
+    if len(rounds) < _MIN_ROUNDS_FOR_NOISE:
+        return None
+    center = statistics.median(rounds)
+    if center <= 0:
+        return None
+    if len(rounds) >= 3:
+        med = statistics.median(rounds)
+        mad = statistics.median([abs(x - med) for x in rounds])
+        scatter = 1.4826 * mad or statistics.stdev(rounds)
+    else:
+        scatter = statistics.stdev(rounds)
+    return scatter / center
+
+
+def _baseline_of(side_map):
+    """The interpreter-startup floor (``startup.python_baseline``) measured on
+    one side, or None if it was not run (older release, filtered run)."""
+    entry = side_map.get("startup.python_baseline")
+    if entry is None or entry.get("skipped"):
+        return None
+    return entry.get("value")
+
+
+def _adjusted_values(name, base, cur, base_floor, cur_floor):
+    """Startup metrics minus the co-measured interpreter-startup floor.
+
+    ``cronstable --version`` and the import timings are dominated by Python's
+    own process spawn + interpreter init, which cronstable cannot regress.
+    Subtracting each side's ``startup.python_baseline`` isolates cronstable's
+    OWN contribution, so a regression in import cost is measured against the
+    ~9ms cronstable actually owns rather than being diluted by ~30ms of
+    un-regressable interpreter overhead.  Returns the pair of adjusted values,
+    or the raw pair when the floor is unknown or would leave a non-positive
+    remainder (a subtraction artefact, not a real measurement).
+
+    The gate's sensitivity after this is ``gate_pct`` of the OWN share (25%
+    for the startup benches), floored by :func:`_adjusted_floor`.  It is not a
+    fixed millisecond figure: this docstring previously promised to catch
+    "+2ms", which no startup metric has ever delivered, since +2ms is under
+    25% of every measured own share.
+    """
+    if not name.startswith("startup.") or name == "startup.python_baseline":
+        return base["value"], cur["value"]
+    if base_floor is None or cur_floor is None:
+        return base["value"], cur["value"]
+    ab, ac = base["value"] - base_floor, cur["value"] - cur_floor
+    if ab <= 0 or ac <= 0:
+        return base["value"], cur["value"]
+    return ab, ac
+
+
+# Absolute floor for a startup metric once its interpreter-startup share has
+# been subtracted.  The raw 10ms default (bench.py) is calibrated against the
+# ~40ms totals; applied to an own share of a few ms it swamps gate_pct
+# entirely.  2ms sits below gate_pct for every own share big enough to gate on
+# a percentage, so gate_pct is what actually binds, while still declining to
+# fail a release over a sub-2ms move on a tiny metric, where the own share's
+# relative noise is worst.
+ADJUSTED_GATE_FLOOR = 0.002
+
+
+def _adjusted_floor(cur, adj_cur):
+    """``gate_floor`` brought onto the scale :func:`_adjusted_values` left.
+
+    ``gate_floor`` is an absolute "too small to bother failing a release over"
+    threshold, calibrated against a metric's RAW value.  When the startup
+    adjustment strips the interpreter floor, the quantity being gated shrinks
+    (often to a small fraction of the raw total) while the constant does not,
+    so the unscaled floor silently re-imposed the very dilution the
+    subtraction exists to remove: ``startup.import_cronexpr`` owns ~9.5ms of
+    its ~41ms total against a 10ms default floor, so even a +100% regression
+    in cronstable's own import cost could not clear it and the metric was
+    effectively ungated.
+
+    Deliberately a flat cap rather than the same ratio the values were reduced
+    by: a proportional floor still scales with the interpreter overhead, which
+    left the effective threshold drifting to roughly +47% instead of the
+    declared ``gate_pct``.  Capping makes ``gate_pct`` the binding constraint
+    wherever a percentage is meaningful, so the sensitivity this module
+    documents is the sensitivity it delivers.
+
+    Returns ``gate_floor`` unchanged whenever no adjustment happened: every
+    non-startup metric, plus any startup metric whose interpreter floor was
+    unavailable (an older baseline, or a run filtered to the in-process tier,
+    so ``startup.python_baseline`` is missing on one side) or whose
+    subtraction left a non-positive remainder.  Those keep the raw floor and
+    stay hard to gate, for the same reason they keep raw values: there is no
+    measured own share to judge them on.
+    """
+    floor = cur.get("gate_floor") or 0.0
+    raw = cur.get("value")
+    if not floor or not raw or adj_cur >= raw:
+        return floor
+    return min(floor, ADJUSTED_GATE_FLOOR)
+
+
+def _noise_band(base, cur):
+    """Combined round-to-round noise band as a fraction, or None if unknown.
+
+    The two sides' coefficients of variation add in quadrature; None whenever
+    either side has too few rounds to estimate its own scatter.
+    """
+    noise_base = _rel_cov(base)
+    noise_cur = _rel_cov(cur)
+    if noise_base is None or noise_cur is None:
+        return None
+    return math.hypot(noise_base, noise_cur)
+
+
+def _declared_gate_pct(baseline, current, name):
+    """``gate_pct`` for ``name`` from whichever side declares one.
+
+    A skipped entry still carries the benchmark's declared gate, so this
+    distinguishes a metric that WOULD gate from an ``info=True`` metric that
+    never gates by design (``gate_pct`` is None for those, see bench.py).
+    """
+    for side in (current, baseline):
+        entry = side.get(name)
+        if entry is not None and entry.get("gate_pct") is not None:
+            return entry["gate_pct"]
+    return None
+
+
+def _gate_coverage(baseline, current):
+    """How much of the declared gate this run actually compared.
+
+    A gate can only fire on a metric measured on BOTH sides, and a metric can
+    fall out three ways: skipped on both sides, skipped (or absent) now after
+    the baseline measured it, or measured only now.  None of the three
+    produces a row that can gate, and the first produces no row at all, so a
+    report that does not count them presents a pass over a shrunken set as a
+    pass over the whole one.  Only metrics that declare a ``gate_pct`` are
+    counted; an ``info``-only metric skipping is not lost coverage.
+    """
+    coverage = {"compared": 0, "both": [], "dropped": [], "new": []}
+    for name in sorted(set(baseline) | set(current)):
+        if _declared_gate_pct(baseline, current, name) is None:
+            continue
+        cur, base = current.get(name), baseline.get(name)
+        cur_ok = cur is not None and not cur.get("skipped")
+        base_ok = base is not None and not base.get("skipped")
+        if cur_ok and base_ok:
+            coverage["compared"] += 1
+        elif not cur_ok and not base_ok:
+            coverage["both"].append(name)
+        elif not cur_ok:
+            coverage["dropped"].append(name)
+        else:
+            coverage["new"].append(name)
+    return coverage
+
+
 def _compare(baseline, current):
-    """Per-metric comparison rows plus gate violations."""
+    """Per-metric comparison rows, gate violations, and gate coverage."""
     rows = []
     violations = []
+    coverage = _gate_coverage(baseline, current)
+    base_floor = _baseline_of(baseline)
+    cur_floor = _baseline_of(current)
     for name, cur in current.items():
         if cur.get("skipped"):
             continue
@@ -135,28 +332,49 @@ def _compare(baseline, current):
                     "entry": cur,
                     "base_value": None,
                     "delta_pct": None,
+                    "noise_pct": None,
+                    "significant": None,
                     "gated": False,
                 }
             )
             continue
-        delta = _delta_pct(base["value"], cur["value"])
+        # Gate on cronstable's own contribution: startup metrics have their
+        # interpreter-startup floor subtracted first. The displayed base/cur
+        # values stay the raw totals; only delta_pct (what gates) is adjusted.
+        adj_base, adj_cur = _adjusted_values(
+            name, base, cur, base_floor, cur_floor
+        )
+        delta = _delta_pct(adj_base, adj_cur)
+        noise = _noise_band(base, cur)
+        # Unknown noise (too few rounds) never suppresses: the guard is only
+        # allowed to make the gate MORE conservative, never to hide a
+        # regression when it lacks the data to prove it is noise.
+        significant = noise is None or (
+            delta is not None and abs(delta) / 100.0 > _SIG_SIGMA * noise
+        )
         gated = False
         gate_pct = cur.get("gate_pct")
-        if (
+        # The floor is brought onto the same scale as the values: comparing
+        # an adjusted delta against the raw-scale constant is what made the
+        # small-own-share startup metrics ungateable.
+        over_gate = (
             delta is not None
             and gate_pct is not None
             and delta > gate_pct
-            and (cur["value"] - base["value"]) > (cur.get("gate_floor") or 0.0)
-        ):
+            and (adj_cur - adj_base) > _adjusted_floor(cur, adj_cur)
+        )
+        if over_gate and significant:
             gated = True
             violations.append(
-                "%s regressed %+.1f%% (%s to %s, gate %.0f%%)"
+                "%s regressed %+.1f%% (%s to %s, gate %.0f%%, noise band "
+                "+-%s)"
                 % (
                     name,
                     delta,
                     _fmt(base["value"], cur["unit"]),
                     _fmt(cur["value"], cur["unit"]),
                     gate_pct,
+                    "%.1f%%" % (noise * 100) if noise is not None else "n/a",
                 )
             )
         rows.append(
@@ -165,10 +383,15 @@ def _compare(baseline, current):
                 "entry": cur,
                 "base_value": base["value"],
                 "delta_pct": delta,
+                "noise_pct": noise * 100 if noise is not None else None,
+                "significant": significant,
+                # a change that cleared the raw gate but not the noise band:
+                # reported, but explicitly not gated.
+                "suppressed": over_gate and not significant,
                 "gated": gated,
             }
         )
-    return rows, violations
+    return rows, violations, coverage
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +467,11 @@ def build_svg(rows, base_label, cur_label):
         ".num{font-variant-numeric:tabular-nums}"
         ".grid{stroke:%(grid)s;stroke-width:1}"
         ".zero{stroke:%(baseline)s;stroke-width:1}"
-        ".fast{fill:%(faster)s}.slow{fill:%(slower)s}" % _LIGHT
+        ".fast{fill:%(faster)s}.slow{fill:%(slower)s}"
+        # a label drawn INSIDE a clamped bar: near-black reads on both the
+        # blue and the red fill, in either theme (>=4.5:1), where white would
+        # fail on the red; so it needs no per-theme override.
+        ".inlabel{fill:#000000}" % _LIGHT
     )
     dark_css = (
         "@media(prefers-color-scheme:dark){"
@@ -312,23 +539,37 @@ def build_svg(rows, base_label, cur_label):
         label = "%+.1f%%" % delta
         if row["gated"]:
             label += " (gate)"
+        rightward = delta > 0
         if length >= 0.75:
-            cls = "slow" if delta > 0 else "fast"
+            cls = "slow" if rightward else "fast"
             parts.append(
                 '<path class="%s" d="%s"/>'
-                % (cls, _bar_path(center, y_bar, length, bar_h, delta > 0))
+                % (cls, _bar_path(center, y_bar, length, bar_h, rightward))
             )
-        if delta > 0:
-            parts.append(
-                '<text class="t2 num" x="%.1f" y="%.1f" font-size="10">'
-                "%s</text>" % (center + length + 6, y_mid + 4, label)
-            )
+        # Place the percentage just past the bar's data-end -- UNLESS a large
+        # (clamped) bar would push it off the plot: past the right edge, or
+        # left into the metric-name gutter (the bug where a -94% label landed
+        # on top of the name). Then draw it INSIDE the bar's end instead, so
+        # the number stays readable rather than colliding or clipping.
+        pad = 6.0
+        # rough font-size-10 advance; err high so a borderline label goes
+        # inside (always legible) rather than half-off the edge.
+        label_w = len(label) * 6.0 + 3.0
+        end = center + length if rightward else center - length
+        if rightward:
+            if end + pad + label_w <= width - 10.0:
+                lx, anchor, lcls = end + pad, "start", "t2 num"
+            else:
+                lx, anchor, lcls = end - pad, "end", "inlabel num"
         else:
-            parts.append(
-                '<text class="t2 num" x="%.1f" y="%.1f" font-size="10" '
-                'text-anchor="end">%s</text>'
-                % (center - length - 6, y_mid + 4, label)
-            )
+            if end - pad - label_w >= gutter + 4.0:
+                lx, anchor, lcls = end - pad, "end", "t2 num"
+            else:
+                lx, anchor, lcls = end + pad, "start", "inlabel num"
+        parts.append(
+            '<text class="%s" x="%.1f" y="%.1f" font-size="10" '
+            'text-anchor="%s">%s</text>' % (lcls, lx, y_mid + 4, anchor, label)
+        )
 
     if omitted > 0:
         parts.append(
@@ -356,6 +597,7 @@ def build_md(
     baseline,
     img_url=None,
     accept=False,
+    coverage=None,
 ):
     lines = ["### Performance vs %s" % (base_label or "(no baseline)")]
     lines.append("")
@@ -383,9 +625,26 @@ def build_md(
             lines.append("**Gate: FAILED**")
             lines.extend("- %s" % v for v in violations)
         else:
-            lines.append(
-                "**Gate: passed.** No metric exceeded its regression limit."
+            # Qualified by how many metrics the gate could actually compare.
+            # An unqualified pass over a set that silently lost its webui
+            # metrics reads as coverage the run did not have.
+            cov = coverage or {}
+            missed = (
+                len(cov.get("both", ()))
+                + len(cov.get("dropped", ()))
+                + len(cov.get("new", ()))
             )
+            if missed:
+                lines.append(
+                    "**Gate: passed** over %d of %d gated metrics. No "
+                    "compared metric exceeded its regression limit."
+                    % (cov.get("compared", 0), cov.get("compared", 0) + missed)
+                )
+            else:
+                lines.append(
+                    "**Gate: passed.** No metric exceeded its regression "
+                    "limit."
+                )
         lines.append("")
         lines.append(
             "Both versions ran interleaved on one runner; time metrics "
@@ -393,6 +652,25 @@ def build_md(
             "Negative change is faster or smaller."
         )
         lines.append("")
+        lines.append(
+            "A regression gates only when it exceeds its declared limit AND "
+            "%.0f noise bands -- the +- column, the two sides' round-to-round "
+            "scatter combined in quadrature -- so measurement noise alone "
+            "cannot fail the gate." % _SIG_SIGMA
+        )
+        lines.append("")
+        suppressed = [r for r in rows if r.get("suppressed")]
+        if suppressed:
+            lines.append(
+                "Over the raw limit but within the noise band (reported, not "
+                "gated): %s."
+                % ", ".join(
+                    "%s (%+.1f%%, noise +-%.1f%%)"
+                    % (r["name"], r["delta_pct"], r["noise_pct"] or 0.0)
+                    for r in sorted(suppressed, key=lambda r: -r["delta_pct"])
+                )
+            )
+            lines.append("")
 
         comparable = [r for r in rows if r["delta_pct"] is not None]
         comparable.sort(key=lambda r: -abs(r["delta_pct"]))
@@ -403,20 +681,29 @@ def build_md(
         )
         lines.append("")
         lines.append(
-            "| Benchmark | %s | %s | Change |" % (base_label, cur_label)
+            "| Benchmark | %s | %s | Change | Noise +- |"
+            % (base_label, cur_label)
         )
-        lines.append("|---|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|")
         for row in comparable:
             entry = row["entry"]
-            mark = " **(gate)**" if row["gated"] else ""
+            if row["gated"]:
+                mark = " **(gate)**"
+            elif row.get("suppressed"):
+                mark = " (within noise)"
+            else:
+                mark = ""
+            noise = row.get("noise_pct")
+            noise_cell = "%.1f%%" % noise if noise is not None else "n/a"
             lines.append(
-                "| %s | %s | %s | %+.1f%%%s |"
+                "| %s | %s | %s | %+.1f%%%s | %s |"
                 % (
                     row["name"],
                     _fmt(row["base_value"], entry["unit"]),
                     _fmt(entry["value"], entry["unit"]),
                     row["delta_pct"],
                     mark,
+                    noise_cell,
                 )
             )
         lines.append("")
@@ -440,6 +727,17 @@ def build_md(
             lines.append(
                 "Measured in %s but not in this run: %s."
                 % (base_label, ", ".join(dropped))
+            )
+        both_sides = (coverage or {}).get("both", ())
+        if both_sides:
+            # Skipped on both sides, so absent from every list above (the
+            # dropped list only covers metrics the baseline measured). These
+            # are ungated by construction: say so rather than let a clean
+            # gate line imply they passed.
+            lines.append("")
+            lines.append(
+                "Not measured on either side (ungated): %s."
+                % ", ".join(sorted(both_sides))
             )
     else:
         lines.append("| Benchmark | %s |" % cur_label)
@@ -493,7 +791,7 @@ def main(argv=None):
             "cronstable_version", "baseline"
         )
 
-    rows, violations = _compare(baseline, current)
+    rows, violations, coverage = _compare(baseline, current)
 
     if args.merged_out:
         merged_doc = dict(current_docs[0])
@@ -520,6 +818,7 @@ def main(argv=None):
                     baseline,
                     img_url=args.img_url,
                     accept=args.accept,
+                    coverage=coverage,
                 )
             )
 
@@ -528,6 +827,16 @@ def main(argv=None):
         "compared %d metrics (%s vs %s): %d gate violation(s)"
         % (comparable, cur_label, base_label or "no baseline", len(violations))
     )
+    # Visible in the job log too, not only the rendered report: a metric that
+    # declared a gate but was not compared produces no violation, so silence
+    # here reads as coverage. "new" is expected for a benchmark added this
+    # release and is already reported as such, so it is not warned about.
+    lost = sorted(coverage["both"]) + sorted(coverage["dropped"])
+    if lost:
+        print(
+            "::warning::perf gate: %d declared-gate metric(s) not compared, "
+            "so ungated this run: %s" % (len(lost), ", ".join(lost))
+        )
     for violation in violations:
         if args.accept or args.warn_only:
             print("::warning::perf gate: %s" % violation)

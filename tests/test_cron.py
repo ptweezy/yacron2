@@ -428,6 +428,163 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     assert [r.outcome for r in cron.run_history["test"]] == ["failure"]
 
 
+@pytest.mark.asyncio
+async def test_reaper_finishes_whole_batch_when_one_job_raises(
+    monkeypatch, caplog
+):
+    # Regression: one job failing to finish must not take the rest of the
+    # reaper's batch with it, nor strand the DAG-task completions that batch
+    # has already buffered.
+    #
+    # Reachable in production: _handle_finished_job awaits
+    # _job_api.finish_run, which touches the state backend (locks.release_all)
+    # and can raise JobStateError("state backend is unavailable", 503). That
+    # call used to be unguarded, with flush_completions after it inside the
+    # same try, so a single raise (a) abandoned the jobs the batch had not
+    # reached yet and (b) skipped the flush, leaving the completions buffered
+    # by the jobs already handled RUNNING in their dag_run until some
+    # unrelated later job reached the next flush; nothing else drains
+    # _completion_buffer (_retry_completions only sees _pending_completions).
+    # Batching is what turned a per-job failure into a cross-job one.
+    import logging
+    from types import SimpleNamespace
+
+    from cronstable.jobstate import JobStateError
+
+    cron = cronstable.cron.Cron(None)
+    # shutdown already signalled, so the reaper returns as soon as the running
+    # set drains: one batch is all this test needs.
+    cron._stop_event.set()
+
+    class FakeRunningJob:
+        # only what the reaper touches: a wait() for an already-exited
+        # process and a name for the log line. A class rather than a
+        # SimpleNamespace because the reaper keys its wait-task map (and its
+        # done set) by job, and SimpleNamespace is unhashable.
+        def __init__(self, name):
+            self.config = SimpleNamespace(name=name)
+
+        async def wait(self):
+            return None
+
+    for name in ("t1", "t2", "t3"):
+        cron.running_jobs[name] = [FakeRunningJob(name)]
+
+    ref = ("dag", "run-key")
+    handled = []
+
+    async def fake_handle_finished_job(job):
+        # mirrors the real handler's order: the instance leaves running_jobs
+        # first, then finish_run (which is what 503s), then the completion is
+        # buffered for the batch flush.
+        cron.running_jobs.pop(job.config.name, None)
+        handled.append(job.config.name)
+        if len(handled) == 2:
+            # the second job of the batch to be handled fails. done_jobs is a
+            # set, so which job that is is not fixed; failing on the second
+            # one guarantees both a completion already buffered (to strand)
+            # and a job not yet reached (to abandon), whatever the order.
+            raise JobStateError("state backend is unavailable", status=503)
+        cron._dag._completion_buffer.setdefault(ref, []).append(
+            {"taskkey": job.config.name}
+        )
+
+    recorded = []
+
+    async def fake_flush_run_completions(run_ref, entries):
+        recorded.extend((run_ref, entry["taskkey"]) for entry in entries)
+
+    monkeypatch.setattr(cron, "_handle_finished_job", fake_handle_finished_job)
+    monkeypatch.setattr(
+        cron._dag, "_flush_run_completions", fake_flush_run_completions
+    )
+
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        try:
+            # the fixed reaper awaits no timer: it drains the batch, flushes
+            # and returns. Only a regression is still running here, parked in
+            # the whole-loop handler's 1-second back-off.
+            await asyncio.wait_for(reaper, timeout=0.5)
+        except asyncio.TimeoutError:
+            reaper.cancel()
+            await asyncio.gather(reaper, return_exceptions=True)
+
+    # (a) the raise did not abandon the rest of the batch
+    assert sorted(handled) == ["t1", "t2", "t3"]
+    # (b) ...nor skip the flush: every completion buffered around it was
+    # recorded (the raiser never got as far as buffering its own), leaving
+    # the buffer drained rather than stranded.
+    assert sorted(key for _, key in recorded) == sorted(
+        name for name in handled if name != handled[1]
+    )
+    assert all(run_ref == ref for run_ref, _ in recorded)
+    assert cron._dag._completion_buffer == {}
+    # and it stayed a per-job event: the whole-loop handler (whose back-off
+    # stalls the reaper for a second) never saw it.
+    messages = [r.message for r in caplog.records]
+    assert any("bug (6)" in m for m in messages)
+    assert not any("bug (3)" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_reaper_flushes_completions_even_when_the_batch_unwinds(
+    monkeypatch,
+):
+    # The companion to the test above, pinning the OTHER half of the fix.
+    # That one is satisfied by the per-job try/except alone: it swallows the
+    # JobStateError before anything can escape the batch loop, so it would
+    # still pass with the try/finally removed. This one uses CancelledError,
+    # which the per-job guard deliberately re-raises, so the flush is reached
+    # only because it sits in a finally. Without it, the completions the
+    # batch had already buffered are lost on the way out.
+    from types import SimpleNamespace
+
+    cron = cronstable.cron.Cron(None)
+    cron._stop_event.set()
+
+    class FakeRunningJob:
+        def __init__(self, name):
+            self.config = SimpleNamespace(name=name)
+
+        async def wait(self):
+            return None
+
+    for name in ("t1", "t2"):
+        cron.running_jobs[name] = [FakeRunningJob(name)]
+
+    ref = ("dag", "run-key")
+    handled = []
+
+    async def fake_handle_finished_job(job):
+        cron.running_jobs.pop(job.config.name, None)
+        handled.append(job.config.name)
+        if len(handled) == 2:
+            # escapes the per-job guard by design
+            raise asyncio.CancelledError()
+        cron._dag._completion_buffer.setdefault(ref, []).append(
+            {"taskkey": job.config.name}
+        )
+
+    recorded = []
+
+    async def fake_flush_run_completions(run_ref, entries):
+        recorded.extend((run_ref, entry["taskkey"]) for entry in entries)
+
+    monkeypatch.setattr(cron, "_handle_finished_job", fake_handle_finished_job)
+    monkeypatch.setattr(
+        cron._dag, "_flush_run_completions", fake_flush_run_completions
+    )
+
+    reaper = asyncio.create_task(cron._wait_for_running_jobs())
+    # the cancellation propagates out of the reaper, which is correct: what
+    # matters is that the buffered completion was flushed on the way.
+    await asyncio.gather(reaper, return_exceptions=True)
+
+    assert recorded == [(ref, handled[0])]
+    assert cron._dag._completion_buffer == {}
+
+
 def test_simple_config_file(tracing_running_job):
     config_arg = str(Path(__file__).parent / "testconfig.yaml")
     cronstable.cron.Cron(config_arg)

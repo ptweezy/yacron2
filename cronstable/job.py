@@ -67,10 +67,51 @@ def fixup_pyinstaller_env(env: Dict[str, str]) -> None:
             env[env_var] = env.get(f"{env_var}_ORIG", "")
 
 
+def loggable_spawn_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``kwargs`` with the child environment reduced to a summary.
+
+    The spawn kwargs carry ``env``: a full copy of the daemon's own
+    :data:`os.environ` (whatever the operator exported to cronstable, such as
+    cloud keys, database URLs, or a systemd ``EnvironmentFile``) plus the
+    job's configured variables plus the ``CRONSTABLE_*`` control-channel vars,
+    whose token is a live bearer credential for the loopback state API.
+    Formatting that dict into a log record publishes all of it to
+    journald/syslog and any shipper behind them, at whatever level the record
+    was emitted.
+
+    :func:`cronstable.redact.redact_secrets` deliberately does not help here:
+    it is scoped to archived job output and is pattern-based, so it would miss
+    any variable whose name it doesn't recognise.  Names alone are also not
+    safe to log (a variable can be named after the secret it holds), so the
+    value is replaced wholesale by a count, which is what the surviving
+    diagnostics (a bad ``argv[0]``, a bad encoding, a resource-exhaustion
+    errno) actually need: whether a custom environment was in play, not what
+    was in it.  ``preexec_fn`` and the stream/limit entries are left alone;
+    none of them carries user data.
+    """
+    if "env" not in kwargs:
+        return kwargs
+    redacted = dict(kwargs)
+    redacted["env"] = "<{} vars, values omitted>".format(len(kwargs["env"]))
+    return redacted
+
+
 # How many of the most recent output lines a JobOutputStream retains for the
 # live web log tail. Independent of saveLimit (which bounds the text kept for
 # failure reports); this only bounds the in-memory buffer the UI streams from.
 LIVE_LOG_LIMIT = 1000
+
+# Hard cap on the lines held in one subscriber's delivery queue. A live tail
+# that keeps up drains this to near-empty each loop; the cap only bites when a
+# subscriber stalls (a backgrounded tab, a full/slow TCP window) while its job
+# is a firehose. Without it the queue grows to the run's ENTIRE output per
+# stalled subscriber (the LIVE_LOG_LIMIT ring bounds the shared buffer, not the
+# per-subscriber queue), so one paused tab on a chatty job could pin hundreds
+# of MB. On overflow the OLDEST queued line is dropped so the viewer keeps
+# receiving the newest output; the live tail is best-effort, and a reconnect
+# re-snapshots the ring buffer. Generous headroom over the 1000-line ring so a
+# briefly-slow client loses nothing.
+LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT = 8192
 
 # How long a forcibly-terminated run waits for its stdout/stderr to reach EOF
 # before the readers are cancelled and whatever they captured is kept (see
@@ -113,16 +154,46 @@ class JobOutputStream:
         # Cron._archive_output) can record the truncation instead of
         # presenting the tail as the whole output.
         self.published = 0
+        # lines a stalled subscriber's bounded queue overflowed and dropped;
+        # observability only (the live tail is best-effort).
+        self.dropped = 0
+
+    @staticmethod
+    def _offer(queue: "asyncio.Queue", item: Any) -> bool:
+        """Enqueue for one subscriber, dropping its oldest line if full.
+
+        Returns True when an existing item had to be evicted to make room.
+        publish() runs synchronously on the event-loop thread, so no consumer
+        coroutine interleaves here and the get_nowait/put_nowait pair is race
+        free. Dropping the OLDEST keeps the newest output flowing to a viewer
+        that has fallen behind, and guarantees room for the end-of-stream
+        sentinel even when the queue is saturated.
+        """
+        try:
+            queue.put_nowait(item)
+            return False
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except (
+                asyncio.QueueEmpty
+            ):  # pragma: no cover - full implies non-empty
+                pass
+            queue.put_nowait(item)
+            return True
 
     def publish(self, stream_name: str, line: str) -> None:
         item = (stream_name, line)
         self.published += 1
         self.lines.append(item)
         for queue in self._subscribers:
-            queue.put_nowait(item)
+            if self._offer(queue, item):
+                self.dropped += 1
 
     def subscribe(self) -> "asyncio.Queue":
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(
+            maxsize=LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT
+        )
         self._subscribers.append(queue)
         if self.closed:
             # the run already finished: deliver the end sentinel immediately so
@@ -142,9 +213,11 @@ class JobOutputStream:
         if self.closed:
             return
         self.closed = True
-        # None is the end-of-stream sentinel for subscriber read loops.
+        # None is the end-of-stream sentinel for subscriber read loops. Route
+        # it through _offer so a saturated queue still receives it (dropping an
+        # oldest line to make room) and the reader loop terminates.
         for queue in self._subscribers:
-            queue.put_nowait(None)
+            self._offer(queue, None)
 
 
 class StreamReader:
@@ -908,7 +981,11 @@ class RunningJob:
             # POSIX wants UTF-8 bytes argv (locale-independent); Windows wants
             # str (CreateProcessW rejects bytes). See platform.encode_argv.
             args = platform.encode_argv(cmd)
-            logger.debug("subprocess: args=%r, kwargs=%r", args, kwargs)
+            logger.debug(
+                "subprocess: args=%r, kwargs=%r",
+                args,
+                loggable_spawn_kwargs(kwargs),
+            )
             self.proc = await create(*args, **kwargs)
         except (
             subprocess.SubprocessError,
@@ -929,7 +1006,7 @@ class RunningJob:
                 "(system encoding: %s)",
                 self.config.name,
                 cmd,
-                kwargs,
+                loggable_spawn_kwargs(kwargs),
                 sys.getdefaultencoding(),
             )
             self.start_failed = True

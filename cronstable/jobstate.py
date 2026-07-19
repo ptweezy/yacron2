@@ -324,9 +324,13 @@ async def artifact_put(
     The payload is written to the content-addressed blob store (identical
     payloads dedupe to one blob) and an immutable record ``{name, sha256,
     size, at, meta}`` is appended to the scope's ``artifacts/`` stream, so a
-    later run or a peer node reads the newest version back by name.  Versions
-    accumulate (a new put never overwrites an old blob); the scope's whole
-    artifact stream is reclaimed together when the job is garbage collected.
+    later run or a peer node reads the newest version back by name.  Only the
+    newest record per name is ever read back, so the append carries
+    ``prune_latest_by="name"``: superseded older records of the same name are
+    amortised away (and their now-orphan blobs reclaimed by the next sweep),
+    bounding the stream to the number of distinct names rather than the number
+    of publishes.  The scope's whole artifact stream is still reclaimed
+    together when the job is garbage collected.
     """
     if max_bytes and max_bytes > 0 and len(data) > max_bytes:
         raise JobStateError(
@@ -344,7 +348,9 @@ async def artifact_put(
     }
     if meta:
         record["meta"] = meta
-    await backend.append_record(ARTIFACT_STREAM_PREFIX + scope, record)
+    await backend.append_record(
+        ARTIFACT_STREAM_PREFIX + scope, record, prune_latest_by="name"
+    )
     return record
 
 

@@ -62,6 +62,10 @@ async def _reap_running(cron):
     for rj in rjs:
         await rj.wait()
         await cron._handle_finished_job(rj)
+    # The reaper batches DAG-task completions and records them once per run
+    # after draining a batch of finished jobs; mirror that flush here (the
+    # completions are only buffered until it runs).
+    await cron._dag.flush_completions()
     return bool(rjs)
 
 
@@ -546,6 +550,93 @@ async def test_trigger_and_introspection(tmp_path):
         assert one["runKey"] == run_key
         assert await cron._dag.get_run("lin", "nope") is None
         assert await cron._dag.trigger_run("ghost") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_list_dags_caches_terminal_runs(tmp_path):
+    # list_dags' rollup must serve immutable terminal runs from cache: after a
+    # first pass populates it, a second pass reads no documents at all (no bulk
+    # list_documents, no per-run read_document), while the rollup stays correct.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        for _ in range(3):
+            rk = await cron._dag.trigger_run("lin")
+            body = await _drive(cron, "lin", rk)
+            assert body["state"] == dag.SUCCESS
+
+        backend = cron.state_backend
+        calls = {"list_documents": 0, "read_document": 0}
+        real_list = backend.list_documents
+        real_read = backend.read_document
+
+        async def counting_list(ns):
+            calls["list_documents"] += 1
+            return await real_list(ns)
+
+        async def counting_read(ns, key):
+            calls["read_document"] += 1
+            return await real_read(ns, key)
+
+        backend.list_documents = counting_list
+        backend.read_document = counting_read
+
+        first = await cron._dag.list_dags()
+        lin = next(d for d in first if d["name"] == "lin")
+        assert lin["totalRuns"] == 3
+        assert lin["runCounts"] == {"success": 3}
+        assert lin["latestRun"]["state"] == "success"
+        # cold cache: three terminal runs read individually (below the bulk
+        # threshold), no full list_documents sweep needed
+        assert calls == {"list_documents": 0, "read_document": 3}
+
+        calls["list_documents"] = 0
+        calls["read_document"] = 0
+        second = await cron._dag.list_dags()
+        lin2 = next(d for d in second if d["name"] == "lin")
+        # identical rollup, and served entirely from cache (keys listing only)
+        assert lin2["totalRuns"] == 3
+        assert lin2["runCounts"] == {"success": 3}
+        assert lin2["latestRun"] == lin["latestRun"]
+        assert calls == {"list_documents": 0, "read_document": 0}
+    finally:
+        await _teardown(cron)
+
+
+async def test_parallel_completions_recorded_in_one_batched_rmw(
+    tmp_path, monkeypatch
+):
+    # Three independent tasks finish together in one reaper batch; the flush
+    # must record all three in a SINGLE mark_tasks_finished transform (one
+    # document RMW + fsync), not one per task.
+    yaml = (
+        "dags:\n  - name: fan\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "      - id: b\n        command: 'x'\n"
+        "      - id: c\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        for t in ("a", "b", "c"):
+            _set_cmd(cron, "fan", t, [_PY, "-c", "pass"])
+        batch_sizes = []
+        real = dagrun.dag.mark_tasks_finished
+
+        def spy(marks, now):
+            batch_sizes.append(len(marks))
+            return real(marks, now)
+
+        monkeypatch.setattr(dagrun.dag, "mark_tasks_finished", spy)
+        run_key = await cron._dag.trigger_run("fan")
+        body = await _drive(cron, "fan", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert all(
+            body["tasks"][t]["state"] == dag.SUCCESS for t in ("a", "b", "c")
+        )
+        # exactly one batched completion RMW, carrying all three tasks
+        assert batch_sizes == [3]
     finally:
         await _teardown(cron)
 
@@ -1995,5 +2086,1110 @@ async def test_compute_wake_prefers_due_retry(tmp_path):
             }
         }
         assert cron._dag._compute_wake(spec, body, now) == 1010.0
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# XCom read-side helpers and list_dags run rollups: driven directly against a
+# real backend (no task subprocesses, no scheduler loop). Run documents are
+# minted with _create_doc and XCom records seeded through jobstate.artifact_*,
+# then xcom_for_run / _read_xcom_list / the _bulk_rollup + _dag_run_rollup pair
+# are called and their merged/aggregated results asserted.
+# ===========================================================================
+
+_XC_YAML = (
+    "dags:\n  - name: xc\n    tasks:\n"
+    "      - id: a\n        command: 'x'\n"
+    "      - id: b\n        command: 'x'\n"
+)
+
+
+async def _mint_run(cron, run_key):
+    """Create a bare (running) run document and return its runId."""
+    dagcfg = cron.cron_dags["xc"]
+    created = await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+    assert created
+    body = await cron._dag.get_run("xc", run_key)
+    return body["runId"]
+
+
+# --------------------------------------------------------------------------
+# xcom_for_run: assemble the dashboard's flat XCom list from the artifact store
+# --------------------------------------------------------------------------
+
+
+async def test_xcom_for_run_inlines_and_flags_values(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        run_id = await _mint_run(cron, "r1")
+        scope = dag.xcom_scope("xc", str(run_id))
+        await jobstate.artifact_put(cron.state_backend, scope, "a/small", b"hi")
+        await jobstate.artifact_put(
+            cron.state_backend, scope, "b/big", b"0123456789"
+        )
+        await jobstate.artifact_put(
+            cron.state_backend, scope, "c/bin", b"\xff\xfe"
+        )
+
+        # max_value_bytes 4: "hi" inlines, the 10-byte value is oversize, and
+        # the 2-byte non-UTF-8 value is fetched but flagged binary.
+        res = await cron._dag.xcom_for_run(
+            "xc", "r1", max_value_bytes=4
+        )
+        assert res["dag"] == "xc"
+        assert res["runKey"] == "r1"
+        assert res["runId"] == run_id
+        assert res["truncated"] is False
+
+        by = {(e["taskkey"], e["key"]): e for e in res["entries"]}
+        assert by[("a", "small")]["value"] == "hi"
+        assert by[("a", "small")]["size"] == 2
+        assert by[("b", "big")].get("oversize") is True
+        assert "value" not in by[("b", "big")]
+        assert by[("c", "bin")].get("binary") is True
+        assert "value" not in by[("c", "bin")]
+        # every entry carries the record's digest through
+        assert all(e["sha256"] for e in res["entries"])
+    finally:
+        await _teardown(cron)
+
+
+async def test_xcom_for_run_truncates_beyond_max_entries(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        run_id = await _mint_run(cron, "r1")
+        scope = dag.xcom_scope("xc", str(run_id))
+        for i in range(3):
+            await jobstate.artifact_put(
+                cron.state_backend, scope, "t/k{}".format(i), b"v"
+            )
+        res = await cron._dag.xcom_for_run("xc", "r1", max_entries=1)
+        assert res["truncated"] is True
+        assert len(res["entries"]) == 1
+    finally:
+        await _teardown(cron)
+
+
+async def test_xcom_for_run_unknown_dag_or_run_returns_none(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        # unknown dag: not in the configured set
+        assert await cron._dag.xcom_for_run("ghost", "r1") is None
+        # known dag, unknown run key: no document
+        assert await cron._dag.xcom_for_run("xc", "nope") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_xcom_for_run_without_run_id_returns_empty(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        ns = dag.DAG_RUN_NS_PREFIX + "xc"
+
+        def _strip(body):
+            body["runId"] = ""
+            return body, None
+
+        await cron.state_backend.mutate_document(ns, "r1", _strip)
+        # a run with no runId cannot address an XCom scope: empty, not an error
+        res = await cron._dag.xcom_for_run("xc", "r1")
+        assert res["runId"] == ""
+        assert res["entries"] == []
+        assert res["truncated"] is False
+    finally:
+        await _teardown(cron)
+
+
+async def test_xcom_for_run_backend_hiccup_degrades(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        run_id = await _mint_run(cron, "r1")
+        scope = dag.xcom_scope("xc", str(run_id))
+        await jobstate.artifact_put(cron.state_backend, scope, "a/k", b"hi")
+
+        async def _boom(*a, **k):
+            raise OSError("store hiccup")
+
+        monkeypatch.setattr(jobstate, "artifact_list", _boom)
+        # a store blip listing the stream degrades to an empty result rather
+        # than 500-ing the XCom tab.
+        res = await cron._dag.xcom_for_run("xc", "r1")
+        assert res["runId"] == run_id
+        assert res["entries"] == []
+        assert res["truncated"] is False
+    finally:
+        await _teardown(cron)
+
+
+async def test_xcom_for_run_swept_blob_has_no_value(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        run_id = await _mint_run(cron, "r1")
+        scope = dag.xcom_scope("xc", str(run_id))
+        await jobstate.artifact_put(cron.state_backend, scope, "a/k", b"hi")
+
+        async def _unreadable(digest):
+            raise OSError("blob read failed")  # swept / unreadable payload
+
+        monkeypatch.setattr(cron.state_backend, "get_blob", _unreadable)
+        # a small-enough record whose blob is unreadable reads back as no value
+        # at all (neither inlined nor flagged binary), skipped like any other
+        # unreadable value rather than failing the tab.
+        res = await cron._dag.xcom_for_run("xc", "r1")
+        entry = res["entries"][0]
+        assert entry["taskkey"] == "a" and entry["key"] == "k"
+        assert "value" not in entry
+        assert "binary" not in entry
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# _read_xcom_list: the list a mapped task fans out over, with strict absence
+# --------------------------------------------------------------------------
+
+
+async def test_read_xcom_list_parses_published_list(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        scope = dag.xcom_scope("xc", "run-x")
+        await jobstate.artifact_put(
+            cron.state_backend, scope, dag.xcom_name("gen", "items"),
+            b'["a", "b", "c"]',
+        )
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got == ["a", "b", "c"]
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_absent_key_is_empty(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        # upstream succeeded but never published this key -> no items to map
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "missing")
+        assert got == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_invalid_json_is_empty(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        scope = dag.xcom_scope("xc", "run-x")
+        await jobstate.artifact_put(
+            cron.state_backend, scope, dag.xcom_name("gen", "items"),
+            b"this is not json",
+        )
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_non_list_json_is_empty(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        scope = dag.xcom_scope("xc", "run-x")
+        await jobstate.artifact_put(
+            cron.state_backend, scope, dag.xcom_name("gen", "items"),
+            b'{"a": 1}',
+        )
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_timeout_is_none(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        async def _slow(*a, **k):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(jobstate, "artifact_get", _slow)
+        # a transient store timeout must NOT read as "published nothing": it
+        # stays unknown (None) so the mapped task retries on a later pass.
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_missing_blob_is_empty(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        async def _gone(*a, **k):
+            raise jobstate.JobStateError("blob missing", status=410)
+
+        monkeypatch.setattr(jobstate, "artifact_get", _gone)
+        # the record survives but its payload blob is gone (410): definitively
+        # unrecoverable -> empty fan-out, not an infinite retry.
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_store_error_is_none(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        async def _err(*a, **k):
+            raise RuntimeError("unreadable record")
+
+        monkeypatch.setattr(jobstate, "artifact_get", _err)
+        # an I/O error / a record only a newer node understands leaves the
+        # fan-out unknown (None), never empty.
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_non_portable_value_is_empty(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        scope = dag.xcom_scope("xc", "run-x")
+        await jobstate.artifact_put(
+            cron.state_backend, scope, dag.xcom_name("gen", "items"),
+            b'["a", "b"]',
+        )
+
+        # Force the portability check to reject the parsed list, standing in
+        # for an out-of-64-bit-window int / non-finite float that the stdlib
+        # accepts but orjson cannot round-trip. (Such values cannot be
+        # produced as literal bytes on an orjson host, so the branch is driven
+        # by making the collaborating check raise.)
+        def _reject(_value):
+            raise dagrun._json.UnsupportedValue("not fleet-portable")
+
+        monkeypatch.setattr(dagrun._json, "ensure_portable", _reject)
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got == []  # mapped to empty rather than wedging every advance
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# list_dags run rollups: _bulk_rollup (full sweep) + _dag_run_rollup (cached)
+# --------------------------------------------------------------------------
+
+
+async def test_bulk_rollup_builds_cache_and_rollup(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        await _mint_run(cron, "r2")
+        ns = cron._dag._ns("xc")
+        roll = await cron._dag._bulk_rollup(cron.state_backend, ns, "xc")
+        assert roll["totalRuns"] == 2
+        assert roll["runCounts"] == {"running": 2}
+        assert roll["latestRun"]["runKey"] in {"r1", "r2"}
+        # the sweep also (re)builds the per-dag summary cache keyed by run key
+        cache = cron._dag._dag_summary_cache["xc"]
+        assert set(cache) == {"r1", "r2"}
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_reads_and_caches(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        await _mint_run(cron, "r2")
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        assert roll["totalRuns"] == 2
+        assert roll["runCounts"] == {"running": 2}
+        assert set(cron._dag._dag_summary_cache["xc"]) == {"r1", "r2"}
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_serves_terminal_from_cache(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        # cold pass reads and caches the one run
+        await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        # mark it terminal in the cache so the next pass may skip the re-read
+        cron._dag._dag_summary_cache["xc"]["r1"]["terminal"] = True
+
+        reads = {"n": 0}
+        real = cron.state_backend.read_document
+
+        async def counting(ns, key):
+            reads["n"] += 1
+            return await real(ns, key)
+
+        monkeypatch.setattr(cron.state_backend, "read_document", counting)
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        assert roll["totalRuns"] == 1
+        assert reads["n"] == 0  # terminal run served entirely from cache
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_keys_none_falls_back_to_bulk(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+
+        async def _no_keys(ns):
+            return None
+
+        monkeypatch.setattr(
+            cron.state_backend, "list_document_keys", _no_keys
+        )
+        # a backend that cannot list keys only degrades to a full parse
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        assert roll["totalRuns"] == 1
+        assert roll["runCounts"] == {"running": 1}
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_threshold_falls_back_to_bulk(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        await _mint_run(cron, "r2")
+        # a large read delta (more than the threshold) takes the single bulk
+        # sweep rather than N per-run reads
+        monkeypatch.setattr(dagrun, "DAG_ROLLUP_BULK_THRESHOLD", 0)
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        assert roll["totalRuns"] == 2
+        assert set(cron._dag._dag_summary_cache["xc"]) == {"r1", "r2"}
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_degrades_on_keys_error(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+
+        async def _boom(ns):
+            raise OSError("keys listing failed")
+
+        monkeypatch.setattr(cron.state_backend, "list_document_keys", _boom)
+        # a hiccup omits the rollup (None) rather than failing /dags
+        assert await cron._dag._dag_run_rollup(cron.state_backend, "xc") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_bulk_rollup_degrades_on_error(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+
+        async def _boom(ns):
+            raise OSError("list failed")
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _boom)
+        ns = cron._dag._ns("xc")
+        assert await cron._dag._bulk_rollup(cron.state_backend, ns, "xc") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_prunes_gone_cache_keys(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        # a stale cache entry for a run that no longer exists must be dropped
+        cron._dag._dag_summary_cache["xc"] = {
+            "stale": {
+                "runKey": "stale",
+                "state": "success",
+                "kind": "manual",
+                "createdAt": 1.0,
+                "updatedAt": 1.0,
+                "terminal": True,
+            }
+        }
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        assert "stale" not in cron._dag._dag_summary_cache["xc"]
+        assert roll["totalRuns"] == 1
+        assert roll["latestRun"]["runKey"] == "r1"
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_degrades_on_read_error(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+
+        async def _boom(ns, key):
+            raise OSError("read failed")
+
+        monkeypatch.setattr(cron.state_backend, "read_document", _boom)
+        # a per-run read that errors omits the rollup (None), not a 500
+        assert await cron._dag._dag_run_rollup(cron.state_backend, "xc") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_missing_body_is_skipped(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+
+        async def _gone(ns, key):
+            return None  # deleted between the listing and the read
+
+        monkeypatch.setattr(cron.state_backend, "read_document", _gone)
+        # a key that vanished after the listing is dropped, not fatal: with
+        # nothing readable the rollup is empty
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        assert roll == {}
+        assert "r1" not in cron._dag._dag_summary_cache["xc"]
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# forget() on a backend swap: every per-store cache is dropped, so /dags stops
+# serving the OLD store's finished run for the NEW store's live one.
+# --------------------------------------------------------------------------
+
+
+async def test_forget_clears_every_per_store_cache(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        assert cron._dag._dag_summary_cache["xc"]
+
+        d = cron._dag
+        ref = ("xc", "r1")
+        # every attribute scoped to the CURRENT store, dirtied by hand so
+        # forget() has something to drop in each one. This is the cheap guard
+        # for the next attribute added to the class and forgotten here; the
+        # user-visible consequence of missing one is the test below.
+        d._owned[ref] = Lease(
+            name="l", holder="h", fence=1, expires_at=dagrun._now() + 3600.0
+        )
+        renewer = asyncio.ensure_future(asyncio.sleep(3600))
+        d._renewers[ref] = renewer
+        d._locks[ref] = asyncio.Lock()
+        d._wake[ref] = 1.0
+        d._next_logical["xc"] = _utcnow()
+        d._seeded["xc"] = "sig"
+        d._seed_failed["xc"] = "sig"
+        d._pending_completions[(ref, "a")] = {}
+        d._completion_buffer[ref] = [{"taskId": "a"}]
+        d._terminal_run_keys["xc"] = {"r1"}
+        d._advance_again.add(ref)
+        # ALL four cadence fields are pushed into the future, not just the
+        # full-adopt one: they default to 0.0, so asserting they are 0.0 after
+        # forget() without dirtying them first passes whether or not forget()
+        # touches them.
+        d._next_full_adopt = dagrun._now() + 3600.0
+        d._next_adopt = dagrun._now() + 3600.0
+        d._next_sched_check = dagrun._now() + 3600.0
+        d._next_gc = dagrun._now() + 3600.0
+
+        d.forget()
+
+        assert not d._owned
+        assert not d._renewers
+        assert not d._locks
+        assert not d._wake
+        assert not d._next_logical
+        assert not d._seeded
+        assert not d._seed_failed
+        assert not d._pending_completions
+        assert not d._completion_buffer
+        assert not d._terminal_run_keys
+        assert not d._dag_summary_cache
+        assert not d._advance_again
+        # every cadence is brought forward to now: the next adopt pass has to
+        # be a FULL one (that is what rebuilds _terminal_run_keys from the new
+        # store's bodies).
+        assert d._next_full_adopt == 0.0
+        assert d._next_adopt == 0.0
+        assert d._next_sched_check == 0.0
+        assert d._next_gc == 0.0
+        # renewing a lease against a store that is gone is pointless
+        with pytest.raises(asyncio.CancelledError):
+            await renewer
+    finally:
+        await _teardown(cron)
+
+
+async def test_forget_drops_stale_terminal_summary_across_backend_swap(
+    tmp_path,
+):
+    store_a = tmp_path / "store-a"
+    store_b = tmp_path / "store-b"
+    store_a.mkdir()
+    store_b.mkdir()
+    cron = await _make_cron(store_a, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+
+        # store A: one run driven to SUCCESS, then rolled up so its summary is
+        # cached. A terminal summary is immutable, so nothing ever re-reads it.
+        run_key = await cron._dag.trigger_run("lin")
+        assert (await _drive(cron, "lin", run_key))["state"] == dag.SUCCESS
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "lin")
+        assert roll["runCounts"] == {dag.SUCCESS: 1}
+        assert cron._dag._dag_summary_cache["lin"][run_key]["terminal"]
+        assert run_key in cron._dag._terminal_run_keys["lin"]
+
+        # store B: a PEER node creates a live run under the SAME key (run keys
+        # are deterministic: dag name + logical date), so it collides with what
+        # store A left in this node's caches. It has to be a peer, since this
+        # node's own _create_doc evicts the key from both caches on the way in.
+        peer = await _make_cron(store_b, _LINEAR)
+        try:
+            assert await peer._dag._create_doc(
+                peer.cron_dags["lin"], run_key, None, "manual"
+            )
+        finally:
+            await _teardown(peer)
+
+        # dirty the remaining per-store bookkeeping so the swap has something
+        # to clear in each of them.
+        ref = ("lin", run_key)
+        cron._dag._completion_buffer[ref] = [{"taskId": "a"}]
+        cron._dag._advance_again.add(ref)
+        cron._dag._pending_completions[(ref, "a")] = {}
+        cron._dag._next_full_adopt = dagrun._now() + 3600.0
+
+        # the swap: a different path is a different store config, which is what
+        # drives Cron.start_stop_state through _dag.forget().
+        swap = "state:\n  path: {}\n".format(store_b) + _LINEAR
+        await cron.start_stop_state(_state_cfg(swap))
+        assert cron.state_backend is not None
+
+        # the user-visible symptom, asserted first because it is the whole
+        # point: /dags must report the new store's RUNNING run, not the old
+        # store's finished one. With the summary cache left standing this key
+        # is skipped as "terminal, immutable" and never re-read, so the stale
+        # success is served indefinitely (nothing rebuilds that cache on a
+        # timer, unlike _terminal_run_keys, which the full adopt pass heals).
+        live = await cron._dag.get_run("lin", run_key)
+        assert live["state"] == dag.RUNNING  # the peer's run, in store B
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "lin")
+        assert roll["runCounts"] == {dag.RUNNING: 1}
+        assert roll["latestRun"]["state"] == dag.RUNNING
+
+        # and nothing else the old store populated survived. (Ownership and
+        # the wake/lock maps are NOT asserted empty here: the swap ends in
+        # _rehydrate_from_state, which legitimately re-adopts the new store's
+        # live run. test_forget_clears_every_per_store_cache pins those.)
+        d = cron._dag
+        assert run_key not in d._terminal_run_keys.get("lin", set())
+        assert not d._completion_buffer
+        assert not d._pending_completions
+        assert not d._advance_again
+
+        await _drive(cron, "lin", run_key)  # reap the re-adopted launch
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# DagScheduler lifecycle plumbing: scheduled firing, orphan adoption,
+# advance-lease usability, task-run preparation, completion flushing, boot
+# reconciliation, and removed-dag GC. The individual lifecycle methods are
+# called directly so their store-error / reload / takeover branches run
+# deterministically -- no wall-clock races, no real network.
+# ===========================================================================
+
+
+# --------------------------------------------------------------------------
+# _fire_scheduled: fires due seeded dags, skips unseeded / unscheduled ones,
+# and isolates a per-dag firing failure.
+# --------------------------------------------------------------------------
+
+
+async def test_fire_scheduled_fires_due_skips_unseeded_and_isolates_errors(
+    tmp_path, monkeypatch
+):
+    yaml = (
+        "dags:\n"
+        "  - name: s1\n    schedule: '* * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "  - name: s2\n    schedule: '* * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "  - name: plain\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "s1", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "s2", "a", [_PY, "-c", "pass"])
+        due = _utcnow() - datetime.timedelta(seconds=90)
+
+        # s1 is seeded and due -> a scheduled run is created.
+        cron._dag._seeded["s1"] = cron._dag._sched_sig(cron.cron_dags["s1"])
+        cron._dag._next_logical["s1"] = due
+        # s2 is due but NOT seeded -> skipped (waits for the seed cadence).
+        cron._dag._next_logical["s2"] = due
+        # `plain` has no schedule -> skipped (schedule_job is None).
+
+        await cron._dag._fire_scheduled(dagrun._now())
+
+        s1_runs = await cron._dag.list_runs("s1")
+        assert len(s1_runs) >= 1
+        assert all(r["kind"] == "scheduled" for r in s1_runs)
+        assert await cron._dag.list_runs("s2") == []  # unseeded: never fired
+        assert await cron._dag.list_runs("plain") == []  # unscheduled
+
+        # One dag's firing raising must NOT abort the whole pass: seed s2 and
+        # make s1's _fire_forward blow up; s2 still fires.
+        cron._dag._seeded["s2"] = cron._dag._sched_sig(cron.cron_dags["s2"])
+        cron._dag._next_logical["s2"] = due
+        real_fire = cron._dag._fire_forward
+
+        async def flaky(dagcfg, now_dt):
+            if dagcfg.name == "s1":
+                raise RuntimeError("firing s1 blew up")
+            return await real_fire(dagcfg, now_dt)
+
+        monkeypatch.setattr(cron._dag, "_fire_forward", flaky)
+        await cron._dag._fire_scheduled(dagrun._now())  # must not raise
+        monkeypatch.undo()
+        assert len(await cron._dag.list_runs("s2")) >= 1  # healthy dag fired
+
+        # Reap every launched task so the run docs settle and nothing leaks.
+        for name in ("s1", "s2"):
+            for r in await cron._dag.list_runs(name):
+                await _drive(cron, name, r["runKey"])
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# _adopt_one_dag: the incremental (keys-only) pass owns an orphaned active run
+# and caches a terminal one; the full pass rebuilds the terminal cache.
+# --------------------------------------------------------------------------
+
+
+async def test_adopt_one_dag_keys_only_then_full(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        dagcfg = cron.cron_dags["lin"]
+        backend = cron.state_backend
+
+        # one terminal run, plus an active run created directly (unowned, no
+        # subprocess launched).
+        term_key = await cron._dag.trigger_run("lin")
+        assert (await _drive(cron, "lin", term_key))["state"] == dag.SUCCESS
+        assert await cron._dag._create_doc(dagcfg, "full-active", None, "manual")
+        full_ref = ("lin", "full-active")
+
+        # a fresh scan starts with no ownership and no terminal cache.
+        cron._dag.forget()
+        cron._dag._terminal_run_keys.pop("lin", None)
+
+        # FULL pass: parses every body, claims the active run, and rebuilds the
+        # terminal cache from truth.
+        await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=True)
+        assert full_ref in cron._dag._owned  # active run claimed
+        assert cron._dag._terminal_run_keys["lin"] == {term_key}
+
+        # drive the claimed run to completion, then a second active run drives
+        # the incremental (keys-only) pass.
+        await _drive(cron, "lin", "full-active")
+        assert await cron._dag._create_doc(dagcfg, "keys-active", None, "manual")
+        keys_ref = ("lin", "keys-active")
+        cron._dag.forget()
+        cron._dag._terminal_run_keys.pop("lin", None)
+
+        # keys-only pass: reads only the not-known-terminal bodies, owns the
+        # active run, and records the terminal runs in the cache.
+        await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=False)
+        assert keys_ref in cron._dag._owned
+        assert cron._dag._terminal_run_keys["lin"] == {term_key, "full-active"}
+        assert "keys-active" not in cron._dag._terminal_run_keys["lin"]
+        await _drive(cron, "lin", "keys-active")  # reap the adopted launch
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# _lease_usable: live -> usable; expired + store down -> fail closed (kept);
+# expired but still ours -> fail closed (kept); expired + peer took over ->
+# ownership dropped.
+# --------------------------------------------------------------------------
+
+
+async def test_lease_usable_live_stale_and_taken_over(tmp_path, monkeypatch):
+    yaml = (
+        "dags:\n  - name: lu\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        dagcfg = cron.cron_dags["lu"]
+        run_key = "manual-lu"
+        assert await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+        ref = ("lu", run_key)
+        lease_name = cron._dag._lease_name(ref)
+        lease = await cron.state_backend.acquire_lease(
+            lease_name, cron._slot_holder(), 30.0
+        )
+        cron._dag._owned[ref] = lease
+
+        # 1. a live (unexpired) lease gates the run.
+        assert await cron._dag._lease_usable(ref, lease) is True
+
+        # 2. expired + store unreachable: unverifiable -> fail closed, but
+        # ownership is retained (the renew loop can still recover it).
+        lease.expires_at = dagrun._now() - 5.0
+        backend = cron.state_backend
+        cron.state_backend = None
+        assert await cron._dag._lease_usable(ref, lease) is False
+        cron.state_backend = backend
+        assert ref in cron._dag._owned
+
+        # 3. expired but the store still shows OUR holder+fence (untaken):
+        # fail closed, ownership retained.
+        assert await cron._dag._lease_usable(ref, lease) is False
+        assert ref in cron._dag._owned
+
+        # 3b. expired and the store cannot answer (read_lease raises):
+        # unverifiable -> fail closed, ownership retained.
+        async def _boom_read(name):
+            raise RuntimeError("store unreachable")
+
+        monkeypatch.setattr(cron.state_backend, "read_lease", _boom_read)
+        assert await cron._dag._lease_usable(ref, lease) is False
+        assert ref in cron._dag._owned
+        monkeypatch.undo()
+
+        # 4. expired AND a peer took the lease over (fence bumped): positively
+        # superseded -> drop ownership here.
+        await cron.state_backend.release_lease(lease)
+        peer = await cron.state_backend.acquire_lease(
+            lease_name, "peer-node", 30.0
+        )
+        assert peer.fence == lease.fence + 1
+        assert await cron._dag._lease_usable(ref, lease) is False
+        assert ref not in cron._dag._owned  # dropped: at-least-once handoff
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# _prepare_task_run: the no-jobApi early return, and the secret-resolution loop
+# (a good secret is staged; a broken one is skipped, not fatal).
+# --------------------------------------------------------------------------
+
+
+async def test_prepare_task_run_env_and_secrets(tmp_path):
+    missing = tmp_path / "nope.secret"  # never created -> fromFile raises
+    yaml = (
+        "dags:\n  - name: sec\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n        secrets:\n"
+        "          - name: GOOD\n            value: sval\n"
+        "          - name: BAD\n            fromFile: {}\n".format(missing)
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        dagcfg = cron.cron_dags["sec"]
+        template = dagcfg.task_templates["a"]
+        intent = dag.LaunchIntent(
+            task_id="a",
+            taskkey="a",
+            map_index=None,
+            map_item=None,
+            attempt=0,
+            is_sensor=False,
+            poke_number=0,
+        )
+        run_id = "0123456789abcdef"
+
+        # With the loopback API down there is no run to register: the DAG env
+        # is still returned, token is None.
+        api = cron._job_api
+        cron._job_api = None
+        token, env = cron._dag._prepare_task_run(
+            dagcfg, run_id, "manual-1", intent, template
+        )
+        assert token is None
+        assert env[dag.ENV_DAG_NAME] == "sec"
+        assert env[dag.ENV_DAG_TASK] == "a"
+        assert env[dag.ENV_DAG_RUN_ID] == run_id
+        cron._job_api = api
+
+        # With the API up, the secret loop stages GOOD and skips the broken
+        # BAD (its fromFile cannot be read) rather than failing the launch.
+        token, env = cron._dag._prepare_task_run(
+            dagcfg, run_id, "manual-1", intent, template
+        )
+        assert token is not None
+        ctx = cron._job_api._runs[token]
+        assert ctx.secrets == {"GOOD": "sval"}  # BAD dropped, not fatal
+        assert env[dag.ENV_DAG_NAME] == "sec"
+        await cron._job_api.finish_run(token)  # unregister; no leak
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# flush_completions: a run whose flush raises has its WHOLE batch re-queued for
+# retry (never dropped), and one run's failure never loses another's.
+# --------------------------------------------------------------------------
+
+
+async def test_flush_completions_requeues_batch_on_failure(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        ref = ("lin", "manual-fc")
+        cron._dag._completion_buffer[ref] = [
+            {
+                "taskkey": "a",
+                "taskId": "a",
+                "success": True,
+                "exitCode": 0,
+                "failReason": None,
+                "proc": "tok",
+                "attempt": 0,
+                "poke": None,
+                "resources": None,
+            }
+        ]
+
+        async def _boom(r, entries):
+            raise RuntimeError("store stall on flush")
+
+        monkeypatch.setattr(cron._dag, "_flush_run_completions", _boom)
+        await cron._dag.flush_completions()  # swallows + re-queues
+
+        assert (ref, "a") in cron._dag._pending_completions  # queued, not lost
+        assert cron._dag._completion_buffer == {}  # buffer was consumed
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# _flush_run_completions: a completion for a task the reload removed is dropped
+# (and its queued retry purged); a completion for a whole removed dag drops the
+# whole batch.
+# --------------------------------------------------------------------------
+
+
+async def test_flush_run_completions_drops_removed_task_and_dag(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        dagcfg = cron.cron_dags["lin"]
+        run_key = "manual-drop"
+        assert await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+        ref = ("lin", run_key)
+
+        def _entry(taskkey, task_id):
+            return {
+                "taskkey": taskkey,
+                "taskId": task_id,
+                "success": True,
+                "exitCode": 0,
+                "failReason": None,
+                "proc": "tok",
+                "attempt": 0,
+                "poke": None,
+                "resources": None,
+            }
+
+        # a completion for a task the DAG no longer defines: dropped, along with
+        # any queued retry of it (which would otherwise re-run forever). Nothing
+        # to record -> no advance, no crash.
+        cron._dag._queue_completion(
+            ref, "ghost", "ghost",
+            success=True, exit_code=0, fail_reason=None,
+            proc="tok", attempt=0, poke=None,
+        )
+        assert (ref, "ghost") in cron._dag._pending_completions
+        await cron._dag._flush_run_completions(ref, [_entry("ghost", "ghost")])
+        assert (ref, "ghost") not in cron._dag._pending_completions
+
+        # a completion for a dag the reload removed entirely: the whole batch's
+        # queued retries are purged and nothing is recorded.
+        cron._dag._queue_completion(
+            ref, "a", "a",
+            success=True, exit_code=0, fail_reason=None,
+            proc="tok", attempt=0, poke=None,
+        )
+        assert (ref, "a") in cron._dag._pending_completions
+        del cron.cron_dags["lin"]
+        await cron._dag._flush_run_completions(ref, [_entry("a", "a")])
+        assert (ref, "a") not in cron._dag._pending_completions
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# _flush_run_completions: a failed RMW re-queues every live entry for retry; a
+# fenced-out (stale/duplicate) completion is settled, not retried forever.
+# --------------------------------------------------------------------------
+
+
+async def test_flush_run_completions_requeues_on_stall_and_settles_stale(
+    tmp_path,
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        dagcfg = cron.cron_dags["lin"]
+        run_key = "manual-live"
+        assert await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+        ref = ("lin", run_key)
+        entry = {
+            "taskkey": "a",
+            "taskId": "a",
+            "success": True,
+            "exitCode": 0,
+            "failReason": None,
+            "proc": "tok",
+            "attempt": 0,
+            "poke": None,
+            "resources": None,
+        }
+
+        # the recording RMW stalls: the live entry is queued for retry, never
+        # dropped (unrecorded, it would stay RUNNING under our proc forever).
+        real_mutate = cron._dag._mutate
+
+        async def _stalled(name, key, transform):
+            raise asyncio.TimeoutError()
+
+        cron._dag._mutate = _stalled
+        await cron._dag._flush_run_completions(ref, [entry])
+        cron._dag._mutate = real_mutate
+        assert (ref, "a") in cron._dag._pending_completions
+        await _drain_pending(cron)  # let the trailing advance settle
+
+        # the RMW now succeeds, but task `a` was never claimed (still PENDING,
+        # proc None): the completion's proc="tok" fails the fence, so nothing is
+        # applied and the settled queue entry is popped (not retried forever).
+        cron._dag._pending_completions[(ref, "a")] = {
+            "ref": ref, "taskkey": "a", "taskId": "a", "success": True,
+            "exitCode": 0, "failReason": None, "proc": "tok", "attempt": 0,
+            "poke": None, "resources": None, "delay": 1.0, "nextTryAt": 0.0,
+        }
+        await cron._dag._flush_run_completions(ref, [entry])
+        assert (ref, "a") not in cron._dag._pending_completions  # settled
+        body = await cron._dag.get_run("lin", run_key)
+        assert body["tasks"]["a"]["state"] == dag.PENDING  # fence held: no-op
+        await _drain_pending(cron)
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# reconcile_on_boot: adopts this node's active runs, skips terminal ones, and
+# swallows a per-dag listing timeout.
+# --------------------------------------------------------------------------
+
+
+async def test_reconcile_on_boot_adopts_active_and_tolerates_timeout(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        dagcfg = cron.cron_dags["lin"]
+
+        term_key = await cron._dag.trigger_run("lin")
+        assert (await _drive(cron, "lin", term_key))["state"] == dag.SUCCESS
+        assert await cron._dag._create_doc(dagcfg, "manual-active", None, "manual")
+        active_ref = ("lin", "manual-active")
+        cron._dag.forget()  # a fresh restart owns nothing
+
+        await cron._dag.reconcile_on_boot()
+        assert active_ref in cron._dag._owned  # active run adopted here
+        assert ("lin", term_key) not in cron._dag._owned  # terminal skipped
+        await _drive(cron, "lin", "manual-active")  # reap the adopted launch
+
+        # a listing timeout for a dag is logged and skipped, never raised.
+        async def _timeout(namespace):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _timeout)
+        cron._dag.forget()
+        await cron._dag.reconcile_on_boot()  # must not raise
+        monkeypatch.undo()
+    finally:
+        await _teardown(cron)
+
+
+# --------------------------------------------------------------------------
+# gc_removed_dags: a terminal run of a dag gone from every config is deleted
+# once older than the grace; a recent one, and an actively-owned one, are kept.
+# --------------------------------------------------------------------------
+
+
+async def test_gc_removed_dags_deletes_old_terminal_keeps_recent_and_owned(
+    tmp_path, monkeypatch
+):
+    yaml = (
+        "dags:\n  - name: gc\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "gc", "a", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("gc")
+        assert (await _drive(cron, "gc", run_key))["state"] == dag.SUCCESS
+        dagcfg = cron.cron_dags["gc"]
+        backend = cron.state_backend
+        ns = dag.DAG_RUN_NS_PREFIX + "gc"
+
+        # a still-active run of the removed dag is never collected (only a
+        # terminal run is), so a re-added dag resumes it where it stopped.
+        assert await cron._dag._create_doc(dagcfg, "gc-active", None, "manual")
+        active_keys = {run_key, "gc-active"}
+
+        del cron.cron_dags["gc"]  # gone from every live config
+
+        # a large grace keeps the still-recent terminal run (and the active).
+        await cron._dag.gc_removed_dags(backend, {"gc"}, grace=100000.0)
+        docs = await backend.list_documents(ns)
+        assert {b["runKey"] for b in docs} == active_keys
+
+        # an owned terminal run is never collected, even when old enough.
+        cron._dag._owned[("gc", run_key)] = object()  # sentinel lease
+        await cron._dag.gc_removed_dags(backend, {"gc"}, grace=0.0)
+        docs = await backend.list_documents(ns)
+        assert {b["runKey"] for b in docs} == active_keys
+        del cron._dag._owned[("gc", run_key)]
+
+        # a per-dag failure is isolated, not raised, so the pass survives it.
+        real_list = backend.list_documents
+
+        async def _boom(namespace):
+            raise RuntimeError("listing blew up")
+
+        monkeypatch.setattr(backend, "list_documents", _boom)
+        await cron._dag.gc_removed_dags(backend, {"gc"}, grace=0.0)  # no raise
+        monkeypatch.setattr(backend, "list_documents", real_list)
+
+        # unowned + past the grace: the terminal run is deleted; the still
+        # active run survives.
+        await cron._dag.gc_removed_dags(backend, {"gc"}, grace=0.0)
+        assert {b["runKey"] for b in await backend.list_documents(ns)} == {
+            "gc-active"
+        }
     finally:
         await _teardown(cron)

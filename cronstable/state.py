@@ -545,6 +545,7 @@ class StateBackend(abc.ABC):
         data: Dict[str, Any],
         *,
         prune_keep: Optional[int] = None,
+        prune_latest_by: Optional[str] = None,
     ) -> str:
         """Append one immutable record to ``stream``; return its record id.
 
@@ -557,6 +558,17 @@ class StateBackend(abc.ABC):
         derived cursors are monotonic maxima).  A caller that needs the
         bound enforced exactly NOW still calls :meth:`prune_records`
         directly.
+
+        ``prune_latest_by`` is the NAME-KEYED counterpart for a stream whose
+        records supersede one another by a field (the artifact store, keyed
+        by ``"name"``): it keeps only the newest record per distinct value of
+        that field and drops the superseded older ones, so the stream bounds
+        to the number of distinct values rather than the append count.  Unlike
+        ``prune_keep`` (newest-N regardless of field, which would evict a live
+        value once the distinct-value count exceeds N) it never removes the
+        current version of any value.  Amortised on the same cadence as
+        ``prune_keep``; the two may be combined but the artifact store uses
+        only this one.
         """
 
     @abc.abstractmethod
@@ -953,6 +965,15 @@ class FilesystemStateBackend(StateBackend):
         directory never grows to a single flat directory of millions of
         entries (which some filesystems handle poorly).
         """
+        # A legitimate digest is content-addressed sha256 hex (lowercase, 64
+        # chars; see put_blob's hashlib.sha256(...).hexdigest()). Reject
+        # anything else before it reaches the filesystem so a crafted digest
+        # (e.g. a "sha256" field from a malicious restore archive) cannot
+        # escape the blob directory via ".." or a path separator.
+        if len(digest) != 64 or any(
+            c not in "0123456789abcdef" for c in digest
+        ):
+            raise ValueError("invalid blob digest: {!r}".format(digest))
         return os.path.join(self.base, BLOBS_DIR, digest[:2], digest + ".blob")
 
     def _next_seq(self) -> int:
@@ -1337,9 +1358,15 @@ class FilesystemStateBackend(StateBackend):
         data: Dict[str, Any],
         *,
         prune_keep: Optional[int] = None,
+        prune_latest_by: Optional[str] = None,
     ) -> str:
         return await self._call(
-            "append", self._append_sync, stream, data, prune_keep
+            "append",
+            self._append_sync,
+            stream,
+            data,
+            prune_keep,
+            prune_latest_by,
         )
 
     def _append_sync(
@@ -1347,6 +1374,7 @@ class FilesystemStateBackend(StateBackend):
         stream: str,
         data: Dict[str, Any],
         prune_keep: Optional[int] = None,
+        prune_latest_by: Optional[str] = None,
     ) -> str:
         stream_dir = self._stream_dir(stream)
         self._makedirs_durable(stream_dir)
@@ -1367,19 +1395,24 @@ class FilesystemStateBackend(StateBackend):
             {"schemaVersion": SCHEME_VERSION, "data": data}, sort_keys=True
         )
         self._atomic_write(os.path.join(stream_dir, rec_id + ".json"), payload)
-        if prune_keep is not None and prune_keep > 0:
+        want_keep = prune_keep is not None and prune_keep > 0
+        if want_keep or prune_latest_by:
             # The folded prune: same worker call as the append (one dispatch,
             # not two), and only every K-th append per stream actually pays
             # the re-list-and-delete, which on a bounded stream usually
-            # deletes nothing.  Between prunes the stream exceeds ``keep`` by
+            # deletes nothing.  Between prunes the stream exceeds its bound by
             # at most K-1 records.  Best-effort by construction: the append
             # HAS landed by this point, so a prune failure must never make
             # the whole call read as failed (several callers make
             # load-bearing decisions, e.g. the @reboot launch gate, from
-            # whether the append landed).
+            # whether the append landed).  One gate check drives both prune
+            # kinds so the countdown is consumed once.
             if self._append_prune_due(stream):
                 try:
-                    self._prune_sync(stream, prune_keep)
+                    if prune_keep is not None and prune_keep > 0:
+                        self._prune_sync(stream, prune_keep)
+                    if prune_latest_by:
+                        self._prune_latest_by_sync(stream, prune_latest_by)
                 except OSError as ex:
                     logger.warning(
                         "state: could not prune stream %r after an append "
@@ -1767,6 +1800,53 @@ class FilesystemStateBackend(StateBackend):
             # derive_max memo must not survive it, see
             # _derive_max_invalidate.
             self._derive_max_invalidate(os.path.basename(stream_dir))
+        return deleted
+
+    def _prune_latest_by_sync(self, stream: str, field: str) -> int:
+        """Keep only the newest record per distinct value of ``field``.
+
+        The name-keyed prune for the artifact store: records supersede one
+        another by ``name``, and only the newest per name is ever read back
+        (see ``artifact_get_record`` / ``artifact_list`` /
+        ``referenced_blob_digests``), so an older record for a name that has a
+        newer one is pure dead weight -- it only pins its now-orphan blob.
+        Deleting those bounds the stream to the number of distinct names, and
+        their blobs are reclaimed by the next orphan-blob sweep.
+
+        Never deletes the newest record of any name, so no live value is lost
+        (the failure mode a blind newest-N prune has here).  A record that
+        cannot be read *right now* (a raced deletion, an NFS blip, or a newer
+        node's schema) is LEFT IN PLACE and does not count as having seen its
+        value: it could be the live newest of a name, so superseding anything
+        on its account -- or deleting it -- could drop a live version.
+        Best-effort like :meth:`_prune_sync`.
+        """
+        stream_dir = self._stream_dir(stream)
+        try:
+            names = sorted(
+                n for n in os.listdir(stream_dir) if n.endswith(".json")
+            )
+        except FileNotFoundError:
+            return 0
+        names.reverse()  # newest first: the first record kept per value wins
+        seen: set = set()
+        deleted = 0
+        for name in names:
+            data = self._read_record(stream_dir, name)
+            if data is None:
+                continue  # unreadable/raced: never supersede on its account
+            value = data.get(field)
+            if not isinstance(value, str):
+                continue  # unclassifiable: keep it, cannot judge supersession
+            if value in seen:
+                try:
+                    os.unlink(os.path.join(stream_dir, name))
+                    deleted += 1
+                except OSError:
+                    # already gone (raced with another prune/node): ignore.
+                    pass
+            else:
+                seen.add(value)
         return deleted
 
     # --- lease -----------------------------------------------------------

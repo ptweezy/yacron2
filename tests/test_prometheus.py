@@ -59,6 +59,9 @@ def sample_value(text, name, **labels):
 
 def test_escape_label_value():
     assert escape_label_value('a"b\\c\nd') == 'a\\"b\\\\c\\nd'
+    # a carriage return is escaped too: a raw CR is not valid inside a quoted
+    # label value in the OpenMetrics exposition grammar.
+    assert escape_label_value("a\rb") == "a\\rb"
 
 
 def test_format_value():
@@ -1346,3 +1349,207 @@ async def test_prune_spares_still_running_removed_job(tmp_path):
     cron.update_config()
     text = cron.metrics.render(cron)
     assert 'job_name="doomed"' not in text
+
+
+# ---------------------------------------------------------------------------
+# seed_counters: non-numeric bucket bounds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_bucket", ["not-a-float", None])
+def test_seed_counters_non_numeric_buckets_skip_histogram(bad_bucket):
+    # A hand-edited / corrupt snapshot whose "buckets" cannot be coerced to
+    # floats (ValueError for a string, TypeError for None) must not be fatal:
+    # buckets_match falls back to False, so the histogram is NOT seeded, but
+    # the outcome counters still seed (they are bucket-independent).
+    snapshot = {
+        "buckets": [bad_bucket],
+        "jobs": {
+            "j": {
+                "runs": {"success": 2},
+                "duration_sum": 4.0,
+                "duration_count": 2,
+                "bucket_counts": [1] * len(DEFAULT_DURATION_BUCKETS),
+            }
+        },
+    }
+    metrics = PrometheusMetrics()
+    seeded = metrics.seed_counters(snapshot, keep=["j"])
+    assert seeded == 1
+    text = _registry_text(metrics)
+    # outcome counter seeded despite the unusable buckets
+    assert (
+        sample_value(
+            text, "cronstable_job_runs_total", job_name="j", status="success"
+        )
+        == 2
+    )
+    # histogram left at zero: the corrupt buckets blocked _seed_histogram
+    assert (
+        sample_value(
+            text, "cronstable_job_duration_seconds_count", job_name="j"
+        )
+        == 0
+    )
+
+
+def test_seed_counters_matching_buckets_seeds_histogram_baseline():
+    # Control for the test above: with valid, matching buckets the very same
+    # payload DOES seed the histogram, proving the zero above is caused by the
+    # bad bounds and not by some other omission.
+    snapshot = {
+        "buckets": list(DEFAULT_DURATION_BUCKETS),
+        "jobs": {
+            "j": {
+                "runs": {"success": 2},
+                "duration_sum": 4.0,
+                "duration_count": 2,
+                "bucket_counts": [1] * len(DEFAULT_DURATION_BUCKETS),
+            }
+        },
+    }
+    metrics = PrometheusMetrics()
+    metrics.seed_counters(snapshot, keep=["j"])
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_duration_seconds_count", job_name="j"
+        )
+        == 2
+    )
+
+
+# ---------------------------------------------------------------------------
+# _state_families: lock-acquisition and throttle families
+# ---------------------------------------------------------------------------
+
+
+class FakeStateBackend:
+    """Minimal stand-in exposing the surface _state_families reads."""
+
+    def __init__(self, stats):
+        self._stats = stats
+
+    def view_dict(self):
+        return {"backend": "sqlite", "topology": "single"}
+
+    def stats(self):
+        return self._stats
+
+
+@pytest.mark.asyncio
+async def test_state_families_emit_lock_and_throttle_counters():
+    stats = {
+        "ops": {"put": {"count": 5, "errors": 1, "seconds": 0.25}},
+        "lock": {"acquisitions": 4, "wait_seconds": 1.5},
+        "throttle": {"count": 3, "wait_seconds": 0.75},
+    }
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.state_backend = FakeStateBackend(stats)
+    text = cron.metrics.render(cron)
+
+    # lock family (acquisitions > 0 gate is open)
+    assert (
+        sample_value(text, "cronstable_state_lock_acquisitions_total") == 4
+    )
+    assert (
+        sample_value(text, "cronstable_state_lock_wait_seconds_total") == 1.5
+    )
+    # throttle family (count > 0 gate is open)
+    assert sample_value(text, "cronstable_state_throttled_ops_total") == 3
+    assert (
+        sample_value(text, "cronstable_state_throttle_wait_seconds_total")
+        == 0.75
+    )
+    # the info + op families rendered too
+    assert 'cronstable_state_info{backend="sqlite"' in text
+    assert (
+        sample_value(text, "cronstable_state_ops_total", op="put") == 5
+    )
+
+
+@pytest.mark.asyncio
+async def test_state_families_omit_lock_and_throttle_when_idle():
+    # zero acquisitions / zero throttled ops keep those families off the
+    # scrape (no frozen zeros), the negative side of the gates above.
+    stats = {
+        "lock": {"acquisitions": 0, "wait_seconds": 0.0},
+        "throttle": {"count": 0, "wait_seconds": 0.0},
+    }
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.state_backend = FakeStateBackend(stats)
+    text = cron.metrics.render(cron)
+    assert "cronstable_state_lock_acquisitions_total" not in text
+    assert "cronstable_state_throttled_ops_total" not in text
+
+
+# ---------------------------------------------------------------------------
+# _job_families: last-run CPU / RSS gauges
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_job_families_emit_last_run_cpu_and_rss():
+    from cronstable.resources import ResourceUsage
+
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cron._record_run(
+        "alpha",
+        JobRunInfo(
+            outcome="success",
+            exit_code=0,
+            started_at=now - datetime.timedelta(seconds=3),
+            finished_at=now,
+            fail_reason=None,
+            output=_closed_output(),
+            resource_usage=ResourceUsage(1.25, 0.75, 9000, 4),
+        ),
+    )
+    text = cron.metrics.render(cron)
+    # cpu_total_seconds = user + system = 2.0
+    assert (
+        sample_value(
+            text, "cronstable_job_last_run_cpu_seconds", job_name="alpha"
+        )
+        == 2.0
+    )
+    assert (
+        sample_value(
+            text, "cronstable_job_last_run_max_rss_bytes", job_name="alpha"
+        )
+        == 9000
+    )
+
+
+@pytest.mark.asyncio
+async def test_job_families_omit_last_run_cpu_when_unmonitored():
+    # the negative side: a run without resource_usage exports neither gauge.
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cron._record_run(
+        "alpha",
+        JobRunInfo(
+            outcome="success",
+            exit_code=0,
+            started_at=now - datetime.timedelta(seconds=3),
+            finished_at=now,
+            fail_reason=None,
+            output=_closed_output(),
+        ),
+    )
+    text = cron.metrics.render(cron)
+    assert (
+        sample_value(
+            text, "cronstable_job_last_run_cpu_seconds", job_name="alpha"
+        )
+        is None
+    )
+    assert (
+        sample_value(
+            text, "cronstable_job_last_run_max_rss_bytes", job_name="alpha"
+        )
+        is None
+    )

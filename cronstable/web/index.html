@@ -2858,7 +2858,7 @@
     selected: null,            // selected job name (keyboard cursor)
     drawerJob: null, tab: "logs",
     stream: null,              // AbortController for the log SSE
-    log: { lines: [], curMatch: -1, total: 0 },
+    log: { lines: [], curMatch: -1, total: 0, matchCount: 0, matchSig: null },
     prevFail: {},              // name -> finished_at of last seen failure (notifications)
     seenFirst: false,
     connected: true,
@@ -2880,7 +2880,7 @@
     // minute, so per-poll refetching would be waste)
     press: { data: null, dups: null, at: 0, loading: false, suggestHtml: "" },
     swim: { key: null, buf: [] },          // cluster peer swimlane ring buffer
-    fleet: { data: null, failOnly: false },    // fleet view: last /fleet payload + failing-only filter
+    fleet: { data: null, failOnly: false, lastSig: null },    // fleet view: last /fleet payload + failing-only filter (+ dirty-check signature)
     // merged multi-tail console: tailed job names, per-job stream state,
     // per-job identity colors, and the merged line buffer
     tail: { open: false, jobs: [], streams: {}, colors: {}, lines: [], total: 0 },
@@ -3752,7 +3752,19 @@
 
   // per-second tick for relative cells (no full rerender)
   function tick() {
+    // Hidden tab (backgrounded window, or a wallboard on a screen that's been
+    // switched away): skip the four document-wide querySelectorAll sweeps
+    // entirely. Every cell here is purely visual and recomputed from live data
+    // or Date.now(), so nothing drifts; the visibilitychange handler fires one
+    // immediate tick() on return so countdowns jump straight to the right
+    // value. A foreground wallboard (the common case) has hidden === false and
+    // is unaffected.
+    if (document.hidden) return;
     document.querySelectorAll("[data-ago]").forEach((e) => { e.textContent = fmtAgo(e.getAttribute("data-ago")); });
+    // fleet matrix ages (compact "5m" form): kept live here so renderFleet can
+    // skip its full nodes x jobs rebuild when the payload is otherwise unchanged
+    // without freezing the "N ago" readouts.
+    document.querySelectorAll("[data-ago-short]").forEach((e) => { e.textContent = agoShort(e.getAttribute("data-ago-short")); });
     // DAG/state relative cells: epoch-second "ago", and live countdowns to an
     // ISO instant (retry ladder) or an epoch instant (sensor poke / lease).
     document.querySelectorAll("[data-ago-epoch]").forEach((e) => { e.textContent = agoEpoch(parseFloat(e.getAttribute("data-ago-epoch"))); });
@@ -3877,6 +3889,7 @@
   }
   function setSound(v) {
     prefs.sound = v; savePref("sound"); syncSettings();
+    restartPolling();   // an input to the hidden-tab poll gate (see setNotify)
     if (v) { audio(); playCue("ok"); }             // enable is a gesture: unlock + confirm
     else if (audioCtx) { try { audioCtx.suspend(); } catch (_) {} }
   }
@@ -4863,7 +4876,9 @@
     const box = $("fleetPanel");
     $("fleetBtn").classList.toggle("on", prefs.fleet);
     const data = prefs.fleet ? state.fleet.data : null;
-    if (!data) { box.style.display = "none"; return; }
+    // Reset the dirty-check signature whenever the panel is hidden so re-opening
+    // (or a fresh payload) always renders rather than matching a stale sig.
+    if (!data) { box.style.display = "none"; state.fleet.lastSig = null; return; }
     box.style.display = "";
     const nodes = data.nodes || [];
     const spread = !!data.elect_leader && data.distribution === "spread";
@@ -4879,6 +4894,17 @@
     });
     const failCount = rows.filter(failing).length;
     if (state.fleet.failOnly) rows = rows.filter(failing);
+    // Dirty-check: skip the full nodes x jobs innerHTML rebuild when nothing
+    // that renders has changed since the last frame. Relative ages are NOT in
+    // the built HTML anymore (they live in data-ago-short spans that tick()
+    // refreshes), so an unchanged /fleet payload yields identical markup and
+    // the rebuild is pure waste. The signature also folds in the failing-only
+    // filter and the spread-owner assignment (derived from local /jobs, not the
+    // /fleet payload) so an owner change still forces a redraw.
+    const ownerSig = spread ? rows.map((j) => { const l = state.byName[j]; return l ? (l.clusterOwner || "") : ""; }).join(",") : "";
+    const sig = JSON.stringify(data) + "|" + state.fleet.failOnly + "|" + ownerSig;
+    if (sig === state.fleet.lastSig) return;
+    state.fleet.lastSig = sig;
     let runningCells = 0;
     for (const n of nodes) if (n.jobs) for (const j of Object.keys(n.jobs)) if (n.jobs[j].running) runningCells++;
     const truncatedNodes = nodes.filter((n) => n.truncated).map((n) => n.node_name || n.host || "?");
@@ -4895,9 +4921,13 @@
     const anyLoad = nodes.some((n) => n.node_stats);
     const th = nodes.map((n) => {
       const st = n.self ? "self" : (n.status || "unknown");
-      const age = n.self ? "live" : (n.as_of ? agoShort(n.as_of) + " ago" : "never reached");
+      // as_of age is a live data-ago-short span (tick() keeps it current); the
+      // static cases ("live"/"never reached") stay plain text.
+      const ageHtml = n.self ? "live" : (n.as_of
+        ? '<span data-ago-short="' + escAttr(n.as_of) + '">' + esc(agoShort(n.as_of)) + "</span> ago"
+        : "never reached");
       return '<th><span class="nname2' + (n.self ? " selfcol" : "") + '">' + esc(n.node_name || n.host || "?") + "</span>" +
-        '<span class="nsub"><span class="cdot ' + esc(st) + '"></span>' + esc(n.self ? "this node" : st) + " · " + esc(age) +
+        '<span class="nsub"><span class="cdot ' + esc(st) + '"></span>' + esc(n.self ? "this node" : st) + " · " + ageHtml +
         (n.truncated ? " · partial" : "") + "</span>" +
         // per-node live CPU/memory when the cluster shares node stats
         // (cluster.observability); the whole row is omitted when no node does.
@@ -4923,7 +4953,7 @@
           const g = s.last.outcome === "failure" ? GLYPH.fail : s.last.outcome === "cancelled" ? GLYPH.cancelled : s.last.outcome === "unknown" ? GLYPH.unknown : GLYPH.ok;
           cls = "cell " + k;
           body = g + " " + esc(s.last.outcome === "success" ? "ok" : s.last.outcome) +
-            '<span class="age">' + esc(agoShort(s.last.finished_at)) + "</span>";
+            '<span class="age" data-ago-short="' + escAttr(s.last.finished_at || "") + '">' + esc(agoShort(s.last.finished_at)) + "</span>";
           tip = s.last.outcome + (s.last.exit_code != null ? " (exit " + s.last.exit_code + ")" : "") +
             " · finished " + fmtAgo(s.last.finished_at) +
             (s.last.duration != null ? " · took " + fmtDuration(s.last.duration) : "");
@@ -5618,7 +5648,7 @@
   //  live logs  (SSE) + ANSI + search + timestamps
   // ===================================================================
   function termEl() { return $("term"); }
-  function clearTerm() { state.log.lines = []; state.log.curMatch = -1; state.log.total = 0; termEl().innerHTML = ""; updateLogCount(); }
+  function clearTerm() { state.log.lines = []; state.log.curMatch = -1; state.log.total = 0; state.log.matchSig = null; termEl().innerHTML = ""; updateLogCount(); }
   function stopStream() { if (state.stream) { state.stream.abort(); state.stream = null; } }
 
   function logQuery() {
@@ -5755,24 +5785,51 @@
     if (emptyNode) t.innerHTML = "";
     const item = { stream, text, kind, ts: Date.now(), n: ++state.log.total };
     state.log.lines.push(item);
+    let trimmed = null;
     // O(1) trim: drop the oldest line + its node rather than rebuilding the view
     if (state.log.lines.length > MAX_LOG_LINES) {
-      state.log.lines.shift();
+      trimmed = state.log.lines.shift();
       const first = t.firstElementChild;
       if (first) first.remove();
     }
     const q = logQuery();
     t.appendChild(buildLineNode(item, q));
     if (prefs.follow && (atBottom || kind === "sys")) t.scrollTop = t.scrollHeight;
+    // Incremental match-count upkeep: while the cached count is valid for the
+    // current query (renderTerm/query-change resets matchSig, forcing a full
+    // recount there), fold in only the one appended line and any one trimmed
+    // line -- O(1) -- instead of rescanning the whole buffer per streamed line.
+    // A chatty job with a search active would otherwise be O(lines * buffer).
+    if (state.log.matchSig !== null && state.log.matchSig === logQuerySig(q)) {
+      if (!item.kind && lineMatches(item.text, q)) state.log.matchCount++;
+      if (trimmed && !trimmed.kind && lineMatches(trimmed.text, q)) state.log.matchCount--;
+    }
     updateLogCount();
+  }
+  // Stable identity for a parsed log query, so updateLogCount recomputes only
+  // when the search actually changed. Regex mode is always the "gi" flags, so
+  // the pattern source alone distinguishes queries.
+  function logQuerySig(q) {
+    if (!q || q.bad) return null;
+    if (q.re) return "r:" + q.re.source;
+    if (q.text) return "t:" + q.text;
+    return null;
   }
   function updateLogCount() {
     const q = logQuery();
     const c = $("logCount");
-    if (!q || (!q.text && !q.re)) { c.textContent = ""; return; }
-    if (q.bad) { c.textContent = "bad regex"; return; }
-    let n = 0;
-    for (const it of state.log.lines) if (!it.kind && lineMatches(it.text, q)) n++;
+    if (!q || (!q.text && !q.re)) { c.textContent = ""; state.log.matchSig = null; return; }
+    if (q.bad) { c.textContent = "bad regex"; state.log.matchSig = null; return; }
+    const sig = logQuerySig(q);
+    // Full rescan only when the query changed since the last count; the per-
+    // line append path keeps matchCount current for an unchanged query.
+    if (state.log.matchSig !== sig) {
+      let n = 0;
+      for (const it of state.log.lines) if (!it.kind && lineMatches(it.text, q)) n++;
+      state.log.matchCount = n;
+      state.log.matchSig = sig;
+    }
+    const n = state.log.matchCount;
     c.textContent = n + (n === 1 ? " match" : " matches");
   }
   function jumpMatch(dir) {
@@ -6310,14 +6367,19 @@
   }
   function setPoll(v) { prefs.pollMs = v; savePref("pollMs"); restartPolling(); syncSettings(); }
   function setNotify(v) {
+    // restartPolling on every path: notify is an input to the hidden-tab poll
+    // gate, and the permission prompt resolves asynchronously, so a tab that
+    // is already hidden when the user answers would otherwise sit with no
+    // poll armed until the next visibilitychange. It clears before arming,
+    // so calling it when nothing changed is free.
     if (v && "Notification" in window && Notification.permission !== "granted") {
       Notification.requestPermission().then((perm) => {
-        prefs.notify = perm === "granted"; savePref("notify"); syncSettings();
+        prefs.notify = perm === "granted"; savePref("notify"); syncSettings(); restartPolling();
         toast(prefs.notify ? "ok" : "err", prefs.notify ? "notifications on" : "permission denied");
       });
       return;
     }
-    prefs.notify = v && ("Notification" in window); savePref("notify"); syncSettings();
+    prefs.notify = v && ("Notification" in window); savePref("notify"); syncSettings(); restartPolling();
   }
   function syncSettings() {
     $("setTheme").value = prefs.theme;
@@ -7379,10 +7441,47 @@
   //  polling control
   // ===================================================================
   let pollTimer = null;
+  // Cadence while the tab is hidden and an alerting pref is armed. Slow
+  // enough to keep the hidden-tab saving most of its value, frequent enough
+  // that a failure alert is not meaningfully stale.
+  const HIDDEN_POLL_MS = 30000;
   function restartPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (prefs.pollMs > 0) pollTimer = setInterval(loadJobs, prefs.pollMs);
+    if (!(prefs.pollMs > 0)) return;
+    // Don't poll at the FOREGROUND rate while the tab is hidden: an idle
+    // backgrounded viewer would otherwise keep the daemon serving its full
+    // /jobs + /cluster + /dags fan-out every pollMs forever. The
+    // visibilitychange handler calls this again (and forces one immediate
+    // refresh) when the tab comes back.
+    //
+    // Stopping outright is wrong when something is consuming the poll,
+    // though. Three opt-in features refresh ONLY off loadJobs and all three
+    // exist precisely for the tab nobody is watching: desktop notifications
+    // (maybeNotify), the standing alarm (state.anyFailing, which alarmTick
+    // reads on its own ungated 1s interval), and the run ledger
+    // (ledgerRecord, which accumulates history per poll). Gating purely on
+    // visibility silenced new-failure notifications while hidden, left
+    // alarmTick pulsing on a stale anyFailing (a resolved failure kept
+    // sounding, a fresh one stayed quiet), and punched a hole in the ledger
+    // for as long as the tab was backgrounded. Polling slowly keeps all
+    // three honest and still drops hidden-tab load by 6x at the default 5s
+    // cadence. With none of them on, nothing reads a hidden-tab poll, so it
+    // is skipped entirely.
+    if (
+      document.hidden
+      && !(prefs.notify || prefs.sound || state.ledger.on)
+    ) return;
+    pollTimer = setInterval(
+      loadJobs,
+      document.hidden ? Math.max(prefs.pollMs, HIDDEN_POLL_MS) : prefs.pollMs,
+    );
   }
+  // Pause/resume polling and the per-second tick with page visibility; on
+  // return, resync once immediately rather than waiting up to a full interval.
+  document.addEventListener("visibilitychange", () => {
+    restartPolling();
+    if (!document.hidden) { loadJobs(); tick(); }
+  });
 
   // ===================================================================
   //  wiring
@@ -8156,6 +8255,7 @@
   }
   function setLedger(v) {
     prefs.ledger = v; savePref("ledger"); state.ledger.on = v; syncSettings();
+    restartPolling();   // an input to the hidden-tab poll gate (see setNotify)
     if (v) { state.ledger.ready = false; ledgerLoad().then(() => { refreshLedgerStat(); renderRows(); }); }
     else { state.ledger.stats = {}; refreshLedgerStat(); renderRows(); }
   }
@@ -8958,6 +9058,63 @@
     runBootSequence(startApp);          // POST screen types out, then starts the app
   } else {
     startApp();
+  }
+
+  // Performance-benchmark hook: EXPOSED ONLY under ?perf=1, so it is entirely
+  // inert in normal use (no global is defined, nothing runs). benchmarks/
+  // bench.py drives these to time the render hot paths (the jobs table, the
+  // fleet matrix, the log-search count) against synthetic data in a headless
+  // browser. Each render wrapper clears its dirty-check signature first so the
+  // timed call does the full rebuild rather than the early-return.
+  if (location.search.indexOf("perf=1") >= 0) {
+    const _pjob = (i) => ({
+      name: "job" + i, enabled: true, running: i % 7 === 0,
+      schedule: "*/5 * * * *", command: "echo " + i,
+      captureStdout: true, utc: true, timezone: null, pids: i % 7 === 0 ? [1] : [],
+      scheduled_in: 30 + (i % 100),
+      last_run: {
+        outcome: i % 5 === 0 ? "failure" : "success",
+        exit_code: i % 5 === 0 ? 1 : 0,
+        started_at: new Date(Date.now() - 61000 - i * 1000).toISOString(),
+        finished_at: new Date(Date.now() - 60000 - i * 1000).toISOString(),
+        duration: 1.2, fail_reason: null, resources: null,
+      },
+      history: [],
+    });
+    window.__perf = {
+      seedJobs(n) {
+        const jobs = Array.from({ length: n }, (_, i) => _pjob(i));
+        state.jobs = jobs; state.byName = {};
+        jobs.forEach((j) => { state.byName[j.name] = j; });
+      },
+      renderRows() { state.lastRowSig = null; renderRows(); },
+      seedFleet(nodes, per) {
+        const ns = Array.from({ length: nodes }, (_, k) => ({
+          node_name: "node" + k, self: k === 0, status: "live",
+          as_of: new Date(Date.now() - 5000).toISOString(),
+          jobs: Object.fromEntries(Array.from({ length: per }, (_, i) => ["job" + i, {
+            running: i % 9 === 0, enabled: true,
+            last: { outcome: i % 6 === 0 ? "failure" : "success",
+              finished_at: new Date(Date.now() - 60000).toISOString(),
+              exit_code: 0, duration: 1 },
+          }])),
+        }));
+        state.fleet.data = { enabled: true, nodes: ns, distribution: "spread",
+          elect_leader: true, interval: 5 };
+        prefs.fleet = true;
+      },
+      renderFleet() { state.fleet.lastSig = null; renderFleet(); },
+      seedLog(n, q) {
+        state.log.lines = Array.from({ length: n }, (_, i) => ({
+          stream: "stdout", kind: null, ts: Date.now(), n: i,
+          text: i % 3 ? "\x1b[32mINFO\x1b[0m worker " + i + " ok" : "plain line " + i,
+        }));
+        $("logSearch").value = q; $("optRegex").checked = false;
+        state.log.matchSig = null;
+      },
+      updateLogCount() { state.log.matchSig = null; updateLogCount(); },
+      tick() { tick(); },
+    };
   }
 })();
 </script>

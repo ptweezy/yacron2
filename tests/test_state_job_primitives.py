@@ -634,6 +634,55 @@ async def test_artifact_list_newest_per_name(tmp_path):
     await backend.stop()
 
 
+async def test_artifact_put_prunes_superseded_same_name_records(tmp_path):
+    # Republishing one name must not grow the stream without bound: the name-
+    # keyed prune drops superseded records, keeping only the newest per name,
+    # while reads still return the latest value.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        for i in range(30):
+            await jobstate.artifact_put(
+                backend, "s", "rolling", str(i).encode()
+            )
+        _rec, data = await jobstate.artifact_get(backend, "s", "rolling")
+        assert data == b"29"  # newest value survives
+        raw = await backend.list_records(
+            jobstate.ARTIFACT_STREAM_PREFIX + "s"
+        )
+        # amortised prune bounds the stream near the distinct-name count (1),
+        # far below the 30 publishes (slack of at most the prune cadence).
+        assert len(raw) <= state._PRUNE_EVERY_APPENDS
+        listing = await jobstate.artifact_list(backend, "s")
+        assert [r["name"] for r in listing] == ["rolling"]
+    finally:
+        await backend.stop()
+
+
+async def test_artifact_prune_keeps_every_live_name(tmp_path):
+    # The safety property a blind newest-N prune would violate: with more
+    # distinct names than the prune cadence, every name's latest must survive.
+    # (A newest-N record prune would evict live names once their count exceeds
+    # N, then the orphan-blob sweep would delete still-referenced blobs.)
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        names = ["n{}".format(i) for i in range(20)]  # > _PRUNE_EVERY_APPENDS
+        for nm in names:
+            await jobstate.artifact_put(backend, "s", nm, b"v1")
+        for nm in names:  # republish each, triggering prunes along the way
+            await jobstate.artifact_put(
+                backend, "s", nm, (nm + "-v2").encode()
+            )
+        listing = await jobstate.artifact_list(backend, "s")
+        assert sorted(r["name"] for r in listing) == sorted(names)
+        for nm in names:
+            got = await jobstate.artifact_get(backend, "s", nm)
+            assert got is not None and got[1] == (nm + "-v2").encode()
+    finally:
+        await backend.stop()
+
+
 async def test_artifact_missing_returns_none(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()
@@ -709,3 +758,67 @@ async def test_referenced_blob_digests(tmp_path):
     refs = await jobstate.referenced_blob_digests(backend, ["s1", "s2"])
     assert refs == {d1, d2}
     await backend.stop()
+
+
+# --------------------------------------------------------------------------
+# Logic layer: scope guard and artifact edge branches
+# --------------------------------------------------------------------------
+
+
+async def test_require_scope_rejects_blank(tmp_path):
+    # a blank (or whitespace-only) scope strips to empty and is refused before
+    # any store work -- _require_scope's guard branch.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        with pytest.raises(JobStateError, match="non-empty scope"):
+            await jobstate.kv_get(backend, "   ", "k")
+    finally:
+        await backend.stop()
+
+
+async def test_artifact_put_stores_optional_meta(tmp_path):
+    # the optional meta mapping rides along on the record and reads back.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        rec = await jobstate.artifact_put(
+            backend, "s", "r.csv", b"a,b\n", meta={"kind": "csv"}
+        )
+        assert rec["meta"] == {"kind": "csv"}
+        got = await jobstate.artifact_get(backend, "s", "r.csv")
+        assert got is not None
+        record, data = got
+        assert record["meta"] == {"kind": "csv"}
+        assert data == b"a,b\n"
+    finally:
+        await backend.stop()
+
+
+async def test_artifact_get_record_absent_returns_none(tmp_path):
+    # a name never published reads back as None on both the record and the
+    # (record, payload) accessor -- the exhausted-stream branch.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        assert await jobstate.artifact_get_record(backend, "s", "nope") is None
+        assert await jobstate.artifact_get(backend, "s", "nope") is None
+    finally:
+        await backend.stop()
+
+
+async def test_artifact_get_raises_410_when_blob_swept(tmp_path):
+    # the record survives but its content-addressed blob was garbage-collected:
+    # artifact_get must fail closed with a 410, not return empty bytes.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        await jobstate.artifact_put(backend, "s", "x", b"payload")
+        # sweep with an empty referenced set: nothing is referenced, so the
+        # blob is reclaimed while its record remains in the stream.
+        assert await backend.sweep_orphan_blobs(set(), 0.0) == 1
+        with pytest.raises(JobStateError) as ei:
+            await jobstate.artifact_get(backend, "s", "x")
+        assert ei.value.status == 410
+    finally:
+        await backend.stop()

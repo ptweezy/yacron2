@@ -153,7 +153,7 @@ async def test_call_runs_sync_half_on_daemon_thread(tmp_path):
     seen = {}
     real_append = backend._append_sync
 
-    def spy(stream, data, prune_keep=None):
+    def spy(stream, data, prune_keep=None, prune_latest_by=None):
         thread = threading.current_thread()
         seen["daemon"] = thread.daemon
         seen["name"] = thread.name
@@ -176,7 +176,7 @@ async def test_call_propagates_sync_half_exception(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()
 
-    def boom(stream, data, prune_keep=None):
+    def boom(stream, data, prune_keep=None, prune_latest_by=None):
         raise _StoreBoom("sync half exploded")
 
     backend._append_sync = boom  # type: ignore[method-assign]
@@ -196,7 +196,7 @@ async def test_call_survives_abandoned_await(tmp_path):
     entered = threading.Event()
     release = threading.Event()
 
-    def blocked(stream, data, prune_keep=None):
+    def blocked(stream, data, prune_keep=None, prune_latest_by=None):
         entered.set()
         release.wait(timeout=30)  # released below; bound is a safety net
         return "late-result"

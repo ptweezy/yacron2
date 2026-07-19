@@ -9,6 +9,7 @@ through main_loop with the test_main.py argv/exit pattern.
 """
 
 import asyncio
+import builtins
 import datetime
 import io
 import json
@@ -23,8 +24,9 @@ import pytest
 import cronstable.__main__
 import cronstable.state as state_mod
 from cronstable import state_admin
+from cronstable.config import ConfigError
 from cronstable.platform import IS_WINDOWS
-from cronstable.state import _TokenBucket
+from cronstable.state import _TokenBucket, RECORDS_DIR
 from tests.test_state import _backend
 
 _UTC = datetime.timezone.utc
@@ -1098,3 +1100,368 @@ def test_restore_over_unreadable_lease(tmp_path, monkeypatch, capsys):
     # the restore keeps the store's copy rather than risk a fence regression
     assert code == 0
     assert "kept 1 current lease file(s)" in capsys.readouterr().out
+
+
+# ===========================================================================
+# state-admin internals: the non-filesystem backend guard, a backup skipping
+# an unreadable file, restore's fence-max merge and atomic-replace failure,
+# a migrate copy failure, the gc dag-run keep-set walk and its blob-sweep
+# skip, and the check inventory listing.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# _load_state_backend: the non-filesystem backend guard
+# ---------------------------------------------------------------------------
+
+
+def test_load_backend_rejects_non_filesystem(tmp_path, monkeypatch):
+    # the CLI only administers the filesystem backend: a factory returning
+    # anything else must be refused with a clear ConfigError.
+    config = _write_config(tmp_path, tmp_path / "store")
+    monkeypatch.setattr(
+        state_admin, "make_state_backend", lambda cfg, get_id: object()
+    )
+    with pytest.raises(ConfigError, match="filesystem backend only"):
+        state_admin._load_state_backend(config)
+
+
+# ---------------------------------------------------------------------------
+# cmd_backup: an unreadable carried file is skipped, not fatal
+# ---------------------------------------------------------------------------
+
+
+def test_backup_skips_unreadable_files(tmp_path, monkeypatch, capsys):
+    # a file that cannot be read (a prune, a Windows sharing violation) is
+    # skipped by design for a backup taken against a live daemon: the archive
+    # is still written, just without that member.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    archive = str(tmp_path / "backup.tar.gz")
+
+    blocked = os.path.abspath(str(store))
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        try:
+            path = os.fspath(file)
+        except TypeError:
+            return real_open(file, *args, **kwargs)
+        if isinstance(path, bytes):
+            path = os.fsdecode(path)
+        if os.path.abspath(path).startswith(blocked):
+            raise OSError("simulated read failure")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    code = _cli(
+        monkeypatch, ["state", "backup", "-c", config, "-o", archive]
+    )
+    assert code == 0
+    # every carried file's read raised, so all were skipped: 0 members.
+    assert "backed up 0 file(s)" in capsys.readouterr().out
+    assert os.path.exists(archive)
+
+
+# ---------------------------------------------------------------------------
+# cmd_restore: fence-max merge + atomic-replace failure
+# ---------------------------------------------------------------------------
+
+
+def test_restore_keeps_current_lease_when_archived_fence_older(
+    tmp_path, monkeypatch, capsys
+):
+    # restoring an archive's older lease over a store's current one would
+    # regress the fence counter (a lease file is its fence's only home): the
+    # restore must keep the newer current lease and say so, while still
+    # merging the non-lease payload.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        backend = _backend(store)
+        await backend.start()
+        await backend.append_record("runs/j", {"outcome": "success"})
+        return await backend.acquire_lease("slot", "n1", ttl=30.0)
+
+    lease = _run(seed())
+    assert lease is not None and lease.fence == 1
+
+    archive = str(tmp_path / "backup.tar.gz")
+    assert (
+        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        == 0
+    )
+
+    # bump the store's fence past the archived one: taking over a released
+    # lease increments it.
+    async def bump():
+        backend = _backend(store)
+        await backend.start()
+        current = await backend.read_lease("slot")
+        await backend.release_lease(current)
+        return await backend.acquire_lease("slot", "n2", ttl=30.0)
+
+    bumped = _run(bump())
+    assert bumped is not None and bumped.fence == 2
+
+    capsys.readouterr()
+    assert (
+        _cli(
+            monkeypatch,
+            ["state", "restore", "-c", config, "--force", archive],
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "kept 1 current lease file(s)" in out
+
+    async def after():
+        backend = _backend(store)
+        await backend.start()
+        return await backend.read_lease("slot")
+
+    after_lease = _run(after())
+    assert after_lease is not None
+    assert after_lease.fence == 2  # NOT regressed to the archived fence 1
+    assert after_lease.holder == "n2"
+
+
+def test_restore_reports_failure_when_target_is_a_directory(
+    tmp_path, monkeypatch, capsys
+):
+    # a restore lands every member via a temp sibling + atomic replace; if
+    # the final path is blocked (a directory sits where the record must go)
+    # the replace fails cleanly with a per-member message and a non-zero exit.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    archive = str(tmp_path / "backup.tar.gz")
+    assert (
+        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        == 0
+    )
+
+    # find a record member the archive carries and pre-create its restore
+    # target as a DIRECTORY so the atomic replace onto it fails.
+    with tarfile.open(archive) as tar:
+        member = next(
+            m
+            for m in tar.getmembers()
+            if m.isfile() and m.name.startswith(RECORDS_DIR + "/")
+        )
+    dest = tmp_path / "restored"
+    config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
+    dest_base = dest / "default"
+    blocker = dest_base / member.name.replace("/", os.sep)
+    os.makedirs(blocker)  # a directory where the restored file should land
+
+    code = _cli(
+        monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "failed to restore" in out
+    assert member.name in out
+    assert os.path.isdir(blocker)  # still a directory; nothing clobbered it
+
+
+def test_restore_keeps_lease_whose_current_fence_is_unreadable(
+    tmp_path, monkeypatch, capsys
+):
+    # when the store's current lease file cannot be read (its fence is
+    # unprovable), the restore cannot show the archived fence is not older,
+    # so it fails safe and keeps the current file rather than risk a regress.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        backend = _backend(store)
+        await backend.start()
+        await backend.append_record("runs/j", {"outcome": "success"})
+        lease = await backend.acquire_lease("leader", "n1", ttl=3600.0)
+        assert lease is not None
+
+    _run(seed())
+    archive = str(tmp_path / "backup.tar.gz")
+    assert (
+        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        == 0
+    )
+
+    with tarfile.open(archive) as tar:
+        lease_member = next(
+            m.name
+            for m in tar.getmembers()
+            if m.isfile() and m.name.endswith(".lease")
+        )
+    dest = tmp_path / "dest"
+    config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
+    # a directory where the current lease file would be: open() of it raises,
+    # so the store's fence is unreadable (populated store, unprovable merge).
+    target = dest / "default" / lease_member.replace("/", os.sep)
+    os.makedirs(target)
+
+    code = _cli(
+        monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
+    )
+    assert code == 0
+    assert "kept 1 current lease file(s)" in capsys.readouterr().out
+    assert os.path.isdir(target)  # kept: never overwritten by the archive
+
+
+# ---------------------------------------------------------------------------
+# cmd_migrate: copy failure is reported cleanly
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_reports_copy_failure_when_target_is_a_directory(
+    tmp_path, monkeypatch, capsys
+):
+    # each migrated file lands via a temp sibling + atomic rename; a blocked
+    # destination path (a directory where a record must go) surfaces as a
+    # per-file "failed to copy" and a non-zero exit, not a traceback.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    src_base = os.path.join(str(store), "default")
+    _full, arcname = next(state_admin._walk_carried(src_base))
+
+    dest = tmp_path / "dest"
+    dest_base = dest / "default"
+    blocker = dest_base / arcname.replace("/", os.sep)
+    os.makedirs(blocker)  # a directory where a copied file must land
+
+    code = _cli(
+        monkeypatch,
+        ["state", "migrate", "-c", config, "--dest", str(dest), "--force"],
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "failed to copy" in out
+    assert os.path.isdir(blocker)
+
+
+# ---------------------------------------------------------------------------
+# _gc_async: the dag-run keep-set walk protects a run's XCom artifacts
+# ---------------------------------------------------------------------------
+
+
+def test_gc_keeps_artifacts_referenced_by_live_dag_run(
+    tmp_path, monkeypatch, capsys
+):
+    # a live dag run's document names its XCom artifact scope; the gc pass
+    # must add that scope to the keep set (enumerating dagrun/<dag> docs) so
+    # the run's aged artifact stream survives, while an unreferenced aged
+    # artifact stream of the same age is reclaimed.
+    from cronstable import jobstate
+    from cronstable.dag import xcom_scope
+
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    xcom = xcom_scope("etl", "run1")
+
+    async def seed():
+        backend = _backend(store)
+        await backend.start()
+        # a run document under dagrun/etl naming its XCom scope by runId.
+        await backend.mutate_document(
+            "dagrun/etl", "run1", lambda cur: ({"runId": "run1"}, None)
+        )
+        old = state_mod._now() - 8 * 86400.0  # dead past the 7-day grace
+        monkeypatch.setattr(state_mod, "_now", lambda: old)
+        try:
+            kept = await jobstate.artifact_put(
+                backend, xcom, "x", b"xcom-payload"
+            )
+            orphan = await jobstate.artifact_put(
+                backend, "orphan-scope", "o", b"orphan-payload"
+            )
+        finally:
+            monkeypatch.undo()
+        for rec in (kept, orphan):
+            os.utime(backend._blob_path(rec["sha256"]), (old, old))
+        return kept, orphan
+
+    kept, orphan = _run(seed())
+    _seed_gc_manifests(store)
+
+    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "gc removed" in out
+    # the dag-run reference kept the XCom scope's stream alive ...
+    assert len(_read_store(store, "artifacts/" + xcom)) == 1
+    # ... while the unreferenced stream of the same age was reclaimed.
+    assert _read_store(store, "artifacts/orphan-scope") == []
+
+
+def test_gc_skips_blob_sweep_when_artifact_record_unreadable(
+    tmp_path, monkeypatch, capsys
+):
+    # the orphan-blob sweep is biased to KEEP: if any artifact record cannot
+    # be read (here a record stamped with a newer, unknown schema), the
+    # reference set is unknown, so the sweep is skipped and says why rather
+    # than treating a still-live blob as an orphan.
+    from cronstable import jobstate
+
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        backend = _backend(store)
+        await backend.start()
+        await jobstate.artifact_put(backend, "global", "a", b"payload")
+        # a well-formed record written by a newer scheme: a strict read (the
+        # sweep's reference walk) propagates instead of skipping it.
+        stream_dir = backend._stream_dir("artifacts/global")
+        with open(
+            os.path.join(
+                stream_dir, "00000000000000000009-x-000000000009.json"
+            ),
+            "wb",
+        ) as fobj:
+            fobj.write(
+                json.dumps(
+                    {
+                        "schemaVersion": "v9",
+                        "data": {"name": "a", "sha256": "deadbeef"},
+                    }
+                ).encode()
+            )
+
+    _run(seed())
+    _seed_gc_manifests(store)
+
+    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "orphan-blob sweep skipped" in out
+    assert "could not be read" in out
+
+
+# ---------------------------------------------------------------------------
+# cmd_check: the inventory listing
+# ---------------------------------------------------------------------------
+
+
+def test_check_inventory_lists_streams_and_quarantine(
+    tmp_path, monkeypatch, capsys
+):
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    base = os.path.join(str(store), "default")
+    # a stray non-directory in the records root is skipped, not counted ...
+    with open(os.path.join(base, RECORDS_DIR, "stray.txt"), "w") as fobj:
+        fobj.write("not a stream dir")
+    # ... and a quarantined file is tallied in the inventory.
+    quarantine = os.path.join(base, "quarantine")
+    os.makedirs(quarantine, exist_ok=True)
+    with open(os.path.join(quarantine, "poison.rec"), "wb") as fobj:
+        fobj.write(b"poison")
+
+    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "is writable" in out
+    assert "runs: 2 record(s)" in out
+    assert "quarantined: 1 record(s)" in out

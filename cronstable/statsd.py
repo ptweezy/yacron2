@@ -40,7 +40,11 @@ class StatsdJobMetricWriter:
     def __init__(self, host, port, prefix, job):
         self.host = host
         self.port = port
-        self.prefix = prefix
+        # Strip statsd wire-format metacharacters (CR, LF, ':', '|') from the
+        # prefix so a configured prefix cannot forge or inject additional
+        # samples into the datagram. None of these are legal in a statsd
+        # metric name, so a prefix that works today is left unchanged.
+        self.prefix = prefix.translate({ord(c): None for c in "\r\n:|"})
         self.start_time = None
         self.job = job
 

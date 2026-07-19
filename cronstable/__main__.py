@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Any
 
 import cronstable.version
 from cronstable import platform
@@ -110,19 +111,166 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     jobcli.add_state_job_actions(actions)
     jobcli.add_job_commands(sub)
 
-    # `cronstable mcp`: the MCP stdio bridge. Like the job-facing commands it
-    # is a thin stdlib client of the running daemon (imported lazily so it
-    # never pulls the daemon graph into the CLI import cost).
-    from cronstable import mcpcli
+    # `cronstable mcp` and `cronstable tui` register as bare stubs below, NOT
+    # by importing cronstable.mcpcli / cronstable.tui. Importing tui alone runs
+    # its ~7000-line module body and pulls unicodedata's C table plus dozens of
+    # other modules (~50ms), and every job-spawned thin client (`state get`,
+    # `lock`, `xcom pull`) builds this parser first, so the eager import
+    # taxed a hot path for two commands almost never the one invoked. The real
+    # modules are imported only inside their dispatch branches (see main_loop).
+    # A parity test (tests/test_cli_stubs.py) keeps the stub flags in lockstep
+    # with the real add_mcp_command / add_tui_command definitions.
+    _add_mcp_stub(sub)
+    _add_tui_stub(sub)
 
-    mcpcli.add_mcp_command(sub)
 
-    # `cronstable tui`: the terminal dashboard. Registering it is cheap
-    # (cronstable.tui defers its aiohttp import until the app actually
-    # starts), keeping every other CLI invocation as light as before.
-    from cronstable import tui
+# Mirrors of cronstable.mcpcli / cronstable.tui module constants used only to
+# register their subparsers. Kept here so building the CLI never imports those
+# modules; the parity test asserts these match the originals.
+_MCP_DEFAULT_URL = "http://127.0.0.1:8080"
+_MCP_ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
+_MCP_DEFAULT_PROTOCOL_VERSION = "2025-11-25"
+_MCP_DEFAULT_TIMEOUT = 30.0
+_TUI_DEFAULT_URL = "http://127.0.0.1:8080"
+_TUI_ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
+_TUI_THEME_HUES = ["carolina", "amber", "green", "modern", "standard"]
 
-    tui.add_tui_command(sub)
+
+def _add_mcp_stub(sub: Any) -> None:
+    """Register `cronstable mcp` without importing cronstable.mcpcli.
+
+    Must stay flag-for-flag identical to mcpcli.add_mcp_command; the parity
+    test enforces it.
+    """
+    parser = sub.add_parser(
+        "mcp",
+        help="run the MCP stdio bridge to a running daemon's /mcp endpoint "
+        "(for desktop MCP clients)",
+    )
+    parser.add_argument(
+        "--url",
+        default=_MCP_DEFAULT_URL,
+        metavar="URL",
+        help="daemon web base URL serving /mcp (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        metavar="TOKEN",
+        help="web.authToken bearer value (prefer --token-env to keep it out "
+        "of the process table)",
+    )
+    parser.add_argument(
+        "--token-env",
+        default=None,
+        metavar="VAR",
+        help="env var holding the bearer token (default: {} if set)".format(
+            _MCP_ENV_TOKEN
+        ),
+    )
+    parser.add_argument(
+        "--protocol-version",
+        default=None,
+        metavar="REV",
+        help="pin the MCP-Protocol-Version sent before initialize "
+        "(default: {})".format(_MCP_DEFAULT_PROTOCOL_VERSION),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=_MCP_DEFAULT_TIMEOUT,
+        metavar="SECONDS",
+        help="per-request deadline (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--check",
+        dest="mcp_check",
+        default=False,
+        action="store_true",
+        help="handshake the endpoint (initialize + tools/list) and exit, "
+        "instead of proxying stdin",
+    )
+
+
+def _add_tui_stub(sub: Any) -> None:
+    """Register `cronstable tui` without importing cronstable.tui.
+
+    Must stay flag-for-flag identical to tui.add_tui_command; the parity test
+    enforces it.
+    """
+    parser = sub.add_parser(
+        "tui",
+        help=(
+            "open the terminal dashboard (the web dashboard's TUI "
+            "sibling) against a running daemon's web listener"
+        ),
+        description=(
+            "A keyboard-driven terminal rendition of the cronstable web "
+            "dashboard, speaking the same HTTP control API. The web "
+            "page's shortcuts apply: j/k move, Enter opens a job, r "
+            "runs it, x cancels, / filters, Ctrl-K opens the command "
+            "palette, ? lists every key."
+        ),
+    )
+    parser.add_argument(
+        "--url",
+        default=_TUI_DEFAULT_URL,
+        help="daemon web listener (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="bearer token for web.authToken-protected daemons",
+    )
+    parser.add_argument(
+        "--token-env",
+        default=_TUI_ENV_TOKEN,
+        metavar="VAR",
+        help=(
+            "environment variable to read the token from when --token "
+            "is not given (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--theme",
+        default=None,
+        choices=list(_TUI_THEME_HUES)
+        + [h + "-light" for h in _TUI_THEME_HUES],
+        help="start on a specific theme (persisted for next time)",
+    )
+    parser.add_argument(
+        "--tv",
+        action="store_true",
+        help="start straight on the wallboard (the page's #tv)",
+    )
+    parser.add_argument(
+        "--job",
+        default=None,
+        metavar="NAME",
+        help="open a job's drawer at startup (the page's #job/NAME)",
+    )
+    parser.add_argument(
+        "--boot",
+        action="store_true",
+        help="force the boot self-test even if one ran recently",
+    )
+    parser.add_argument(
+        "--no-boot",
+        action="store_true",
+        help="skip the boot self-test",
+    )
+    parser.add_argument(
+        "--ascii",
+        action="store_true",
+        help="plain-ASCII status glyphs (limited fonts/terminals)",
+    )
+    parser.add_argument(
+        "--poll",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="refresh interval; 0 pauses (default: remembered, else 3)",
+    )
 
 
 def main_loop(loop):

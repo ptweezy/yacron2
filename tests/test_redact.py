@@ -1,6 +1,11 @@
 """Secret scrubbing for archived job output (cronstable.redact)."""
 
-from cronstable.redact import REDACTED, redact_lines, redact_secrets
+from cronstable.redact import (
+    REDACTED,
+    _starts_mid_pem,
+    redact_lines,
+    redact_secrets,
+)
 
 
 def test_key_value_secrets_redacted():
@@ -242,3 +247,21 @@ def test_redact_lines_complete_pem_block_unaffected_by_seed():
     assert all(line == REDACTED for line in out[1:4])
     assert out[4] == "done"
     assert "MIIEvQIBAD" not in "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# _starts_mid_pem: dashed lines that carry no PEM marker in mid-block detect.
+# ---------------------------------------------------------------------------
+
+
+def test_starts_mid_pem_skips_dashed_line_without_marker():
+    # a line containing '-----' but matching neither BEGIN nor END is skipped;
+    # a following orphaned END (no preceding BEGIN) still reports mid-block.
+    lines = ["----- decorative banner -----", "-----END RSA PRIVATE KEY-----"]
+    assert _starts_mid_pem(lines) is True
+
+
+def test_starts_mid_pem_dashes_but_never_a_marker_is_not_mid_block():
+    # dashes present but no real PEM marker anywhere: falls through to False.
+    lines = ["----- decorative banner -----", "an ordinary log line"]
+    assert _starts_mid_pem(lines) is False

@@ -1,6 +1,22 @@
+# This repository is LF-only.
+#
+# `* text=auto eol=lf` tells git to detect text files, store them with LF in
+# the index, and check them out with LF on every platform (including Windows,
+# even under core.autocrlf=true). CRLF can therefore neither be committed nor
+# checked out for any text file: `git add` normalizes it away. The tox-static
+# CI job additionally fails the build if a CRLF blob ever reaches the index.
+* text=auto eol=lf
+
+# Declared binaries are stored verbatim and never inspected or EOL-normalized
+# by the rule above.
+*.png binary
+*.gif binary
+*.webp binary
+
 # The example shell scripts (example/*/gen-certs.sh, node-entrypoint.sh) are
 # bind-mounted from the working tree and executed by `sh` inside Linux
-# containers, so they must check out with LF line endings everywhere. Without
-# this, a default Windows clone (core.autocrlf=true) converts them to CRLF and
-# every cluster demo dies at its first line ("set: illegal option -").
+# containers, so they must check out with LF everywhere. The `text` attribute
+# (not `text=auto`) guarantees they are always treated as text and never
+# misdetected as binary. Without LF, a Windows checkout breaks them at their
+# first line ("set: illegal option -").
 *.sh text eol=lf

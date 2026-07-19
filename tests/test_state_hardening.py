@@ -571,6 +571,20 @@ async def test_put_blob_dedupe_rearms_the_sweep_age_guard(tmp_path):
     assert await backend.get_blob(digest) == b"republished-content"
 
 
+def test_blob_path_rejects_a_non_sha256_digest(tmp_path):
+    # A digest is a content-addressed lowercase sha256 hex string.  A crafted
+    # value (e.g. a "sha256" field from a malicious restore archive) must be
+    # rejected before it builds a path, so it can never traverse out of the
+    # blob directory via ".." or a path separator.
+    backend = _backend(tmp_path)
+    for bad in ("../../etc/passwd", "0" * 63, "0" * 65, "g" * 64, "AB" * 32):
+        with pytest.raises(ValueError, match="invalid blob digest"):
+            backend._blob_path(bad)
+    # a well-formed digest still yields a normal sharded path.
+    good = "a" * 64
+    assert backend._blob_path(good).endswith(good + ".blob")
+
+
 # --- 12: GC reclaims ONLY ephemeral leases, only once dead past grace -------
 
 

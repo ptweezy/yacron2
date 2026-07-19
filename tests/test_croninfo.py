@@ -669,3 +669,138 @@ def test_duplicate_schedules_distinguish_extension_forms():
     groups = duplicate_schedules(entries)
     grouped = {g["jobs"][0]: g["jobs"] for g in groups}
     assert grouped == {"a": ["a", "b"], "d": ["d", "e"]}
+
+
+# ---------------------------------------------------------------------------
+# tolerant parser rejections, special-form splitter errors, and extra
+# describe_cron / linter step + DST edges
+# ---------------------------------------------------------------------------
+import pytest  # noqa: E402
+from cronstable.croninfo import (  # noqa: E402
+    _DOW_NAMES,
+    _field_values,
+    _finish_split,
+    _split_special_dow,
+)
+
+
+# --- _field_values: the tolerant parser's rejection and wrap-around branches
+
+
+def test_field_values_rejects_bad_step():
+    # a non-dividing '/' step whose text is not a positive integer
+    with pytest.raises(ValueError, match="bad step"):
+        _field_values("*/0", 0, 59)
+    with pytest.raises(ValueError, match="bad step"):
+        _field_values("*/x", 0, 59)
+
+
+def test_field_values_rejects_unresolvable_range():
+    # a range whose endpoints are neither digits nor known names
+    with pytest.raises(ValueError, match="bad field"):
+        _field_values("x-y", 0, 59)
+
+
+def test_field_values_wraps_a_descending_range():
+    # fri-mon crosses the week boundary: Fri, Sat, Sun, Mon
+    assert _field_values("fri-mon", 0, 6, _DOW_NAMES) == [0, 1, 5, 6]
+
+
+def test_field_values_rejects_a_huge_range_without_materializing():
+    # "1-2000000000" must degrade (raise, caught upstream as Custom prose)
+    # rather than build list(range(...)) of billions of ints.  The lazy
+    # iteration raises on the first out-of-range value, so this returns at
+    # once instead of exhausting memory -- if it ever materialized the list
+    # the test would hang/OOM rather than fail.
+    with pytest.raises(ValueError, match="out of range"):
+        _field_values("1-2000000000", 0, 59)
+
+
+def test_field_values_stepped_range_over_ceiling_stays_accepted():
+    # a stepped range whose declared end exceeds the field ceiling but whose
+    # only in-step value is within range stays accepted: lazy iteration must
+    # preserve the exact accept/reject decision the list(range(...)) form had.
+    assert _field_values("1-100/1000", 0, 59) == [1]
+
+
+# --- the special-form splitters degrade malformed input to Custom prose
+
+
+def test_finish_split_rejects_special_forms_beside_a_star():
+    # "*,L": the star already covers every day, so the L phrase would
+    # overstate the restriction
+    with pytest.raises(ValueError, match="beside a star"):
+        _finish_split("*,l", ["*"], ["the last day of the month"])
+    # and end to end through describe_cron
+    assert describe_cron("0 0 *,l * *").startswith("Custom schedule")
+
+
+def test_split_special_dow_rejects_bad_last_weekday():
+    with pytest.raises(ValueError, match="bad L day-of-week"):
+        _split_special_dow("lx")
+    assert describe_cron("0 0 * * lx").startswith("Custom schedule")
+
+
+def test_split_special_dow_rejects_out_of_range_last_weekday():
+    with pytest.raises(ValueError, match="out of range"):
+        _split_special_dow("l8")
+    assert describe_cron("0 0 * * l8").startswith("Custom schedule")
+
+
+def test_split_special_dow_rejects_bad_hash_weekday():
+    with pytest.raises(ValueError, match="bad '#' weekday"):
+        _split_special_dow("9#2")
+    assert describe_cron("0 0 * * 9#2").startswith("Custom schedule")
+
+
+# --- describe_cron prose branches
+
+
+def test_describe_cron_hash_resolution_failure_degrades_to_custom():
+    # the H hint fires, but the engine rejects the step, so the tolerant
+    # describer catches it rather than raising
+    assert describe_cron("H/0 * * * *", hash_key="report") == (
+        "Custom schedule: H/0 * * * *"
+    )
+
+
+def test_describe_time_fixed_minute_every_n_hours():
+    # minute is a literal and the hour is an evenly dividing star-step
+    assert describe_cron("5 */6 * * *") == "At :05 every 6 hours, every day"
+
+
+def test_describe_seconds_unrestricted_seconds_append_clause():
+    # a 7-field schedule with a restricted minute but an unrestricted
+    # seconds column: the seconds sub-select, they do not set the cadence
+    assert describe_cron("* 30 4 * * * *") == (
+        "At 04:30, every day, every second"
+    )
+
+
+# --- linter step and DST edges
+
+
+def test_lint_step_of_one_is_not_uneven():
+    # '*/1' is every value, so there is no wrap gap to warn about
+    assert "uneven-step" not in _codes("*/1 * * * *")
+
+
+def test_lint_dst_accepts_a_naive_reference_instant():
+    # now is naive here, so _lint_dst falls back to now.date() for its
+    # scan origin and still lands the spring-forward gap note
+    naive = datetime.datetime(2026, 7, 18, 12, 0)
+    finding = next(
+        f
+        for f in lint_schedule("30 2 * * *", timezone=_NY, now=naive)
+        if f.code == "dst-skipped-time"
+    )
+    assert finding.level == "note"
+    assert "2027-03-14" in finding.message
+
+
+def test_lint_dst_stops_after_two_findings():
+    # a schedule whose restricted hours straddle both yearly transitions
+    # produces two DST notes and the scan breaks at the cap
+    codes = _codes("30 1,2 * * *", tz=_NY)
+    assert codes.count("dst-repeated-time") == 1
+    assert codes.count("dst-skipped-time") == 1

@@ -28,6 +28,8 @@ import pytest
 
 from cronstable.cronexpr import CronTab
 
+UTC = datetime.timezone.utc
+
 # next() deltas are compared to a nanosecond: the legacy library computed
 # its float seconds along a different arithmetic path, so a microsecond
 # `now` can disagree in the last bits (1.999999 vs 1.9999989999999999).
@@ -679,3 +681,158 @@ def test_hash_errors():
     # a '#' in a failed H item still carries the Quartz hint
     with pytest.raises(ValueError, match="Quartz"):
         CronTab("H#3 * * * *", hash_key="x")
+
+
+# ---------------------------------------------------------------------------
+# the backward walk and iteration internals: prev() / _prev_civil /
+# _last_time / occurrences, plus two parse-error edges
+# ---------------------------------------------------------------------------
+
+
+# _prev_civil: year and month rollback branches
+
+
+def test_prev_rolls_back_through_year_column():
+    # base year 2026 is not in the year set {2020}; the walk drops to the
+    # previous listed year, then finds Jan 1 2020 as the fire.
+    ct = CronTab("0 0 1 1 * 2020")
+    ago = ct.prev(now=datetime.datetime(2026, 1, 1), default_utc=True)
+    assert ago == (
+        datetime.datetime(2026, 1, 1) - datetime.datetime(2020, 1, 1)
+    ).total_seconds()
+
+
+def test_prev_month_rollback_crosses_year_boundary():
+    # months set is {6}; from March the current-year scan finds no month
+    # at or before June-that-is-<=-March, so it steps to the prior year.
+    ct = CronTab("0 0 1 6 *")
+    got = ct._prev_civil(datetime.datetime(2026, 3, 1))
+    assert got == datetime.datetime(2025, 6, 1)
+
+
+def test_prev_month_end_clamps_the_rollback_sentinel():
+    # rolling back into February with the day sentinel at 31 must clamp to
+    # the real month end (28) before scanning days.
+    ct = CronTab("0 0 * 2 *")  # every day of February
+    got = ct._prev_civil(datetime.datetime(2026, 3, 15))
+    assert got == datetime.datetime(2026, 2, 28)
+
+
+def test_prev_scans_back_across_months_for_a_dom():
+    # day 15 is absent from the days below March 9, so the walk decrements
+    # the month and finds Feb 15.
+    ct = CronTab("0 0 15 * *")
+    got = ct._prev_civil(datetime.datetime(2026, 3, 10))
+    assert got == datetime.datetime(2026, 2, 15)
+
+
+def test_prev_single_month_wraps_month_below_one():
+    # only January fires; from Jan 10 the same-month scan fails, month
+    # decrements below 1 and wraps to December of the prior year.
+    ct = CronTab("0 0 15 1 *")
+    got = ct._prev_civil(datetime.datetime(2026, 1, 10))
+    assert got == datetime.datetime(2025, 1, 15)
+
+
+# _prev_in
+
+
+def test_prev_in_returns_none_below_the_floor():
+    ct = CronTab("* * * * *")
+    assert CronTab._prev_in((6,), 3) is None
+    assert CronTab._prev_in((2, 6, 9), 7) == 6
+    # nothing strictly before the 1970 floor: the walk exhausts its years
+    # and returns None.
+    assert ct._prev_civil(datetime.datetime(1970, 1, 1, 0, 0, 0)) is None
+
+
+# _last_time: earlier-minute selection within a matching hour
+
+
+def test_prev_picks_earlier_minute_in_the_same_hour():
+    # at 09:45 the most recent same-day fire of 0/30 past 9 is 09:30, which
+    # forces _last_time down the minute < target branch.
+    ct = CronTab("0,30 9 * * *")
+    got = ct._prev_civil(datetime.datetime(2026, 7, 18, 9, 45))
+    assert got == datetime.datetime(2026, 7, 18, 9, 30)
+
+
+def test_last_time_earlier_hour_and_second_branches():
+    ct = CronTab("0,30 8,12 * * * *")
+    # target hour 10 has no matching hour; the latest hour below it (8) is
+    # returned at its own last minute/second.
+    assert ct._last_time(datetime.time(10, 5, 0)) == datetime.time(8, 30, 0)
+
+
+# prev(): now omitted, and the aware DST-gap anchor walk
+
+
+def test_prev_naive_none_when_year_column_has_nothing_earlier():
+    # base year 2025 is not in {2030} and no listed year precedes it, so the
+    # naive walk returns None straight from the year column.
+    ct = CronTab("0 0 1 1 * 2030")
+    assert ct.prev(now=datetime.datetime(2026, 1, 1), default_utc=True) is None
+
+
+def test_prev_aware_none_when_nothing_earlier():
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("0 0 1 1 * 2030")
+    now = datetime.datetime(2026, 1, 1, tzinfo=ny)
+    assert ct.prev(now=now) is None
+
+
+def test_prev_now_omitted_uses_wall_clock():
+    ct = CronTab("* * * * *")
+    ago_utc = ct.prev(default_utc=True)
+    ago_local = ct.prev(default_utc=False)
+    assert ago_utc is not None and 0 < ago_utc <= 60
+    assert ago_local is not None and 0 < ago_local <= 60
+
+
+def test_prev_aware_walks_past_a_spring_forward_gap_anchor():
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("30 2 * * *")
+    # On 2026-03-08 the 02:30 label is skipped; the fire lands at 03:30 EDT
+    # (07:30Z).  From 04:00 EDT (08:00Z) the most recent real fire is that
+    # shifted-label instant, 30 minutes earlier.  The backward anchor first
+    # lands in the gap and must be re-walked to an anchor the zone keeps.
+    now = datetime.datetime(2026, 3, 8, 4, 0, tzinfo=ny)
+    ago = ct.prev(now=now)
+    assert ago == 30 * 60
+
+
+def test_prev_aware_true_elapsed_matches_forward_iteration():
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("*/30 * * * *")
+    now = datetime.datetime(2026, 7, 18, 15, 47, tzinfo=ny)
+    ago = ct.prev(now=now)
+    # 15:30 EDT is 17 minutes back; result is the true elapsed seconds.
+    assert ago == 17 * 60
+
+
+# occurrences(): start omitted
+
+
+def test_occurrences_start_omitted_utc_and_local():
+    ct = CronTab("* * * * *")
+    before_utc = datetime.datetime.now(UTC).replace(tzinfo=None)
+    first_utc = next(iter(ct.occurrences(default_utc=True)))
+    assert isinstance(first_utc, datetime.datetime) and first_utc.tzinfo is None
+    assert 0 <= (first_utc - before_utc).total_seconds() <= 120
+
+    before_local = datetime.datetime.now()
+    first_local = next(iter(ct.occurrences(default_utc=False)))
+    assert 0 <= (first_local - before_local).total_seconds() <= 120
+
+
+# parse-error edges
+
+
+def test_non_integer_step_is_rejected():
+    with pytest.raises(ValueError, match="step"):
+        CronTab("*/x * * * *")
+
+
+def test_hash_step_must_be_positive():
+    with pytest.raises(ValueError, match="positive"):
+        CronTab("H/0 * * * *", hash_key="x")

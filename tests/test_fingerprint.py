@@ -5,6 +5,9 @@ import pytest
 from cronstable.config import parse_config_string
 from cronstable.fingerprint import (
     SCHEME_VERSION,
+    _redact_action,
+    _redact_report,
+    _SECRET_PLACEHOLDER,
     canonical_job,
     job_digest,
     job_set_id,
@@ -815,3 +818,66 @@ jobs:
 """
     # redaction hides the value, not the fact that a webhook is configured
     assert _id(with_hook) != _id(without)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for the report/action redactors directly, including the arcs
+# where the secret-bearing blocks are absent.
+# ---------------------------------------------------------------------------
+
+
+def test_redact_report_passes_through_when_no_secret_bearing_blocks():
+    # no sentry / mail / webhook: every isinstance gate is skipped and the
+    # non-secret content survives unchanged (a fresh copy, input untouched).
+    report = {"shell": {"command": "true"}}
+    out = _redact_report(report)
+    assert out == {"shell": {"command": "true"}}
+    assert out is not report
+
+
+def test_redact_report_redacts_every_secret_leaf():
+    report = {
+        "sentry": {"dsn": {"value": "https://k@example.com/1"}},
+        "mail": {"password": {"value": "hunter2"}},
+        "webhook": {
+            "url": {"value": "https://hooks.example.com/AAA"},
+            "headers": {"Authorization": "token-abc"},
+        },
+    }
+    out = _redact_report(report)
+    assert out["sentry"]["dsn"]["value"] == _SECRET_PLACEHOLDER
+    assert out["mail"]["password"]["value"] == _SECRET_PLACEHOLDER
+    assert out["webhook"]["url"]["value"] == _SECRET_PLACEHOLDER
+    assert out["webhook"]["headers"]["Authorization"] == _SECRET_PLACEHOLDER
+    # copy-on-write: the caller's dict still holds the real secrets
+    assert report["mail"]["password"]["value"] == "hunter2"
+    assert report["webhook"]["headers"]["Authorization"] == "token-abc"
+
+
+def test_redact_report_webhook_url_only_without_headers():
+    # webhook present with a url but no headers dict: exercises the
+    # headers-absent arc while still redacting the url value.
+    out = _redact_report({"webhook": {"url": {"value": "https://x/AAA"}}})
+    assert out["webhook"]["url"]["value"] == _SECRET_PLACEHOLDER
+    assert "headers" not in out["webhook"]
+
+
+def test_redact_report_webhook_with_no_url_and_no_headers_untouched():
+    # webhook is a dict but carries neither a url value nor headers, so no new
+    # webhook copy is made and the block passes through unchanged.
+    out = _redact_report({"webhook": {"body": "static template"}})
+    assert out["webhook"] == {"body": "static template"}
+
+
+def test_redact_action_without_report_preserves_other_keys():
+    # no report key: the redactor copies the action and returns it as-is.
+    out = _redact_action({"retry": {"maximumRetries": 3}})
+    assert out == {"retry": {"maximumRetries": 3}}
+
+
+def test_redact_action_with_report_redacts_nested_secret():
+    action = {"report": {"sentry": {"dsn": {"value": "https://k@e/1"}}}}
+    out = _redact_action(action)
+    assert out["report"]["sentry"]["dsn"]["value"] == _SECRET_PLACEHOLDER
+    # original untouched
+    assert action["report"]["sentry"]["dsn"]["value"] == "https://k@e/1"

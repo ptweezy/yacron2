@@ -129,7 +129,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v8.3.2
         with:
-          version: "0.11.26"
+          version: "0.11.29"
       - name: Decide release
         id: d
         env:
@@ -246,6 +246,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.0
+      # This repository is LF-only (see .gitattributes). Fail fast if any
+      # tracked blob ever reaches the index with CRLF or mixed line endings,
+      # e.g. one that slipped past `text=auto` normalization by being marked
+      # binary or committed by a client that ignored .gitattributes.
+      - name: Guard against CRLF line endings
+        run: |
+          crlf="$(git ls-files --eol | grep -E 'i/(crlf|mixed)' || true)"
+          if [ -n "$crlf" ]; then
+            echo "::error::Tracked files with CRLF/mixed line endings (this repo is LF-only):"
+            echo "$crlf"
+            exit 1
+          fi
       - uses: actions/setup-python@v6.3.0
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install tox tox-uv
@@ -309,7 +321,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v8.3.2
         with:
-          version: "0.11.26"
+          version: "0.11.29"
       - name: Build distributions
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -350,7 +362,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v8.3.2
         with:
-          version: "0.11.26"
+          version: "0.11.29"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -599,7 +611,7 @@ jobs:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
       - uses: astral-sh/setup-uv@v8.3.2
         with:
-          version: "0.11.26"
+          version: "0.11.29"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -721,7 +733,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v8.3.2
         with:
-          version: "0.11.26"
+          version: "0.11.29"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -812,7 +824,9 @@ jobs:
   # this commit and the latest published release tag, interleaved on one
   # runner so machine noise cancels out of the comparison, and
   # benchmarks/compare.py then diffs the two sides and enforces each metric's
-  # declared regression limit. It runs on every event, in the same fan-out as
+  # declared regression limit (a regression must also clear the metric's
+  # measured round-to-round noise band to gate, so jitter cannot fail a
+  # release). It runs on every event, in the same fan-out as
   # the builds. Enforcement is release-only: the `release` job needs this one,
   # so a gated regression blocks publishing, while on an ordinary commit the
   # identical comparison merely warns (a branch experiment is never blocked by
@@ -834,7 +848,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v8.3.2
         with:
-          version: "0.11.26"
+          version: "0.11.29"
       - name: Install current and baseline environments
         id: envs
         env:
@@ -844,6 +858,20 @@ jobs:
           uv venv --python 3.14 .venv-new
           SETUPTOOLS_SCM_PRETEND_VERSION="$NEW_VERSION" \
             uv pip install --python .venv-new/bin/python .
+          # Web-UI benchmarks (webui.*) time renders in a headless Chromium via
+          # Playwright. Install it on BOTH sides (the baseline venv is created
+          # below): a metric that skips on the baseline is reported with no
+          # comparison and gated: False, so installing only on the current side
+          # left every webui.* gate permanently inert, a 5s render regression
+          # included. Releases before the ?perf=1 hook shipped still skip on the
+          # baseline for that reason, but the gate now self-heals as soon as a
+          # hooked release becomes the baseline instead of staying dead.
+          # Best-effort: on failure the webui.* metrics skip (recorded, never
+          # failed), compare.py flags them as ungated, and the rest of the gate
+          # is unaffected.
+          uv pip install --python .venv-new/bin/python playwright || true
+          .venv-new/bin/python -m playwright install --with-deps chromium \
+            || echo "::warning::playwright/chromium unavailable; webui.* skip"
           git fetch --tags --force
           prev=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
           if [ -n "$prev" ]; then
@@ -857,26 +885,43 @@ jobs:
             uv venv --python 3.14 .venv-old
             SETUPTOOLS_SCM_PRETEND_VERSION="$prev" \
               uv pip install --python .venv-old/bin/python /tmp/perf-baseline
+            # Same Playwright install on the baseline side, so webui.* can
+            # actually be compared. The browser download above is cached
+            # per-runner, so this only adds the Python package.
+            uv pip install --python .venv-old/bin/python playwright || true
           else
             echo "::notice::No release tag yet; recording a baseline without a comparison."
           fi
           echo "prev=$prev" >> "$GITHUB_OUTPUT"
-      - name: Run benchmarks (interleaved rounds)
+      - name: Run benchmarks (interleaved rounds, per tier)
         env:
           PYTHONHASHSEED: "0"
           PREV: ${{ steps.envs.outputs.prev }}
         run: |
           set -euo pipefail
           mkdir -p perf
-          # Old then new, twice: interleaving puts both sides through the same
-          # runner weather; compare.py folds the rounds with each metric's own
-          # estimator (best-of for time, median for memory).
-          for round in 1 2; do
-            if [ -n "$PREV" ]; then
-              .venv-old/bin/python benchmarks/bench.py --json "perf/old.$round.json"
-            fi
-            .venv-new/bin/python benchmarks/bench.py --json "perf/new.$round.json"
-          done
+          # Two tiers with their own round counts. The fast in-process metrics
+          # get more rounds: it is cheap, and more rounds tighten the per-metric
+          # noise band that compare.py now gates against, so a real regression
+          # is easier to tell from jitter. The noisier subprocess metrics (cold
+          # start, import, peak RSS) get fewer, since each round spawns
+          # processes. Old then new within each round interleaves both sides
+          # through the same runner weather; compare.py folds every
+          # perf/{old,new}.*.json with each metric's own estimator (best-of for
+          # time, median for memory).
+          run_tier() {
+            tier="$1"; rounds="$2"
+            for round in $(seq 1 "$rounds"); do
+              if [ -n "$PREV" ]; then
+                .venv-old/bin/python benchmarks/bench.py --tier "$tier" \
+                  --json "perf/old.$tier$round.json"
+              fi
+              .venv-new/bin/python benchmarks/bench.py --tier "$tier" \
+                --json "perf/new.$tier$round.json"
+            done
+          }
+          run_tier inprocess 5
+          run_tier subprocess 2
       - name: Compare and gate
         env:
           RELEASE: ${{ needs.version.outputs.release }}
@@ -964,7 +1009,7 @@ jobs:
           path: dist
 
       - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@v1.14.0
+        uses: pypa/gh-action-pypi-publish@v1.14.1
         with:
           # Idempotent re-runs: the publish precedes the tag/Release below, so if
           # a later step fails (e.g. the tag push) the version is already on PyPI.
@@ -1258,7 +1303,9 @@ jobs:
   #
   # Cross-repo pushes need a token the default GITHUB_TOKEN can't provide: set a
   # repo secret HOMEBREW_TAP_TOKEN to a PAT (fine-grained, Contents: read/write
-  # on ptweezy/homebrew-tap is enough). If it is unset the job warns and skips.
+  # on ptweezy/homebrew-tap is enough). If it is unset the job fails loudly
+  # rather than leaving the tap stale (the step below says why); this header
+  # described the older warn-and-skip behaviour long after it changed.
   homebrew:
     needs: [version, release]
     if: needs.version.outputs.release == 'true'
@@ -1318,13 +1365,35 @@ jobs:
   #
   # Cross-repo PRs need a token the default GITHUB_TOKEN can't provide: set a repo
   # secret WINGET_TOKEN to a PAT (classic, public_repo scope is enough) that can
-  # fork microsoft/winget-pkgs and open a PR under that account. If it is unset
-  # the job fails loudly rather than silently leaving the manifest stale (see the
-  # homebrew job above for why silent-skip is the wrong default here).
+  # fork microsoft/winget-pkgs and open a PR under that account. Normally an
+  # unset token must fail loudly rather than silently leave the manifest stale
+  # (see the homebrew job above for why silent-skip is the wrong default here);
+  # it currently exits 0 instead, as part of the temporary allowance below.
+  #
+  # TEMPORARY: this job is warning-only until the initial ptweezy.cronstable
+  # submission PR is merged into microsoft/winget-pkgs. `wingetcreate update`
+  # fetches the EXISTING manifest to bump it, so it fails until the package
+  # exists there.
+  #
+  # Once that first PR merges, ALL THREE suppressions have to come off, or the
+  # job goes on passing over a genuinely broken manifest update. A silent-skip
+  # default is how the homebrew tap froze across several releases while every
+  # run stayed green (see that job's own note above), which is the failure mode
+  # a partial restore here would recreate:
+  #   1. `continue-on-error: true` on the job (below). This one dominates: while
+  #      it is set, neither of the others can fail the release. They do still
+  #      flip the job's own recorded conclusion in the run view, which is the
+  #      only signal a partial restore leaves.
+  #   2. the missing-token branch's `exit 0` (restore it to `exit 1`).
+  #   3. the `if ! ./wingetcreate.exe update ...; then ... exit 0; fi` wrapper
+  #      around the update itself: delete the wrapper and let the command's own
+  #      exit status fail the step under `set -e`. This is the one with no
+  #      other trace, and it survives removing 1 and 2.
   winget:
     needs: [version, release]
     if: needs.version.outputs.release == 'true'
     runs-on: windows-latest
+    continue-on-error: true
     defaults:
       run:
         shell: bash
@@ -1336,18 +1405,21 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${WINGET_TOKEN:-}" ]; then
-            echo "::error::WINGET_TOKEN is not set; cannot update the winget manifest. Add it as a repo secret (a GitHub PAT with public_repo scope) and re-run this release." >&2
-            exit 1
+            echo "::warning::WINGET_TOKEN is not set; skipping winget manifest update. Add it as a repo secret (a GitHub PAT with public_repo scope) to enable it." >&2
+            exit 0
           fi
           curl -fsSL -o wingetcreate.exe \
             https://github.com/microsoft/winget-create/releases/latest/download/wingetcreate.exe
-          ./wingetcreate.exe update ptweezy.cronstable \
+          if ! ./wingetcreate.exe update ptweezy.cronstable \
             --version "$VERSION" \
             --urls \
               "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-amd64.exe" \
               "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-arm64.exe" \
             --submit --no-open --token "$WINGET_TOKEN" \
-            --prtitle "New version: ptweezy.cronstable version ${VERSION}"
+            --prtitle "New version: ptweezy.cronstable version ${VERSION}"; then
+            echo "::warning::wingetcreate update failed (expected until the initial ptweezy.cronstable PR is merged into microsoft/winget-pkgs). Treating as non-fatal for now." >&2
+            exit 0
+          fi
 
   # ---------------------------------------------------------------------------
   # Docs. Runs on an ordinary commit and is NOT gated on the build+test matrix:

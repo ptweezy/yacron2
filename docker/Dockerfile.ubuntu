@@ -64,6 +64,13 @@ RUN set -eux; \
     fi; \
     rm -rf /var/lib/apt/lists/*
 
+# Drop pip from the venv before it ships. The runtime image installs nothing
+# (no package manager, read-only root filesystem), so pip and its vendored
+# bundle are pure dead weight in the copied /opt/venv. Nothing at runtime
+# imports pip, so removing it is safe; setuptools stays for any dependency that
+# still reaches for pkg_resources.
+RUN /opt/venv/bin/pip uninstall -y pip || true
+
 # ---- runtime stage ------------------------------------------------------
 FROM ubuntu:${UBUNTU_VERSION}
 

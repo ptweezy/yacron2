@@ -13,10 +13,12 @@ real :class:`~cronstable.state.FilesystemStateBackend` in a temp dir like
 import asyncio
 import datetime
 import json
+import types
 
 import pytest
 from aiohttp import web
 
+from cronstable.config import ConfigError
 from cronstable.cron import (
     Cron,
     JobRunInfo,
@@ -934,3 +936,594 @@ async def test_auth_middleware_accepts_query_token_on_ics_only():
     # keeping tokens out of URLs everywhere else
     with pytest.raises(web.HTTPUnauthorized):
         await _run_auth(mw, _AuthReq("/jobs", query={"token": "sekrit"}))
+
+
+# ===========================================================================
+# Direct-call payload builders behind the web endpoints: schedule explainers,
+# fleet analysis, next-fire / never-fires helpers, the metadata-only state
+# inspector, and a handful of small web helpers.  Driven with a tiny in-memory
+# config and lightweight fakes -- no live cluster, lease, or network.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# schedule_why_payload: the resolved-source + previous/next-fire tail
+# ---------------------------------------------------------------------------
+
+_WHY_PAYLOAD_YAML = """
+jobs:
+  - name: weekday
+    command: echo hi
+    schedule: "0 9 * * mon,fri"
+    utc: true
+  - name: hashed
+    command: echo hi
+    schedule: "H 9 * * *"
+    utc: true
+"""
+
+
+def test_schedule_why_payload_reports_neighbouring_fires():
+    cron = _cron(_WHY_PAYLOAD_YAML)
+    # a Wednesday 09:00 UTC: no match, but real fires exist on both sides
+    payload = cron.schedule_why_payload("weekday", "2026-07-15T09:00:00")
+    assert payload is not None
+    assert payload["expression"] == "0 9 * * mon,fri"
+    assert payload["reboot"] is False
+    assert payload["matches"] is False
+    # previous fire = Mon 2026-07-13, next fire = Fri 2026-07-17 (both 09:00Z)
+    assert payload["previous_fire"] == "2026-07-13T09:00:00+00:00"
+    assert payload["next_fire"] == "2026-07-17T09:00:00+00:00"
+    # a real (non-@reboot) schedule always carries the field-by-field checks
+    assert payload["checks"]
+
+
+def test_schedule_why_payload_surfaces_resolved_hash_source():
+    cron = _cron(_WHY_PAYLOAD_YAML)
+    payload = cron.schedule_why_payload("hashed", "2026-07-15T09:00:00")
+    assert payload is not None
+    # an H schedule resolves to a concrete minute; the payload exposes it
+    assert payload["expression"] == "H 9 * * *"
+    assert payload["resolved"] != "H 9 * * *"
+    assert payload["resolved"].endswith(" 9 * * *")
+    assert payload["resolved"].split()[0].isdigit()
+
+
+def test_schedule_why_payload_unknown_job_is_none():
+    cron = _cron(_WHY_PAYLOAD_YAML)
+    assert cron.schedule_why_payload("ghost", "2026-07-15T09:00:00") is None
+
+
+# ---------------------------------------------------------------------------
+# fleet-analysis payloads built with their own entries snapshot
+# ---------------------------------------------------------------------------
+
+_FLEET_PAYLOAD_YAML = """
+jobs:
+  - name: herd-a
+    command: "true"
+    schedule: "0 * * * *"
+  - name: herd-b
+    command: "true"
+    schedule: "0 * * * *"
+  - name: parked
+    command: "true"
+    schedule: "0 0 * * *"
+    enabled: false
+  - name: boot
+    command: "true"
+    schedule: "@reboot"
+"""
+
+
+def test_schedule_pressure_payload_builds_own_entries():
+    cron = _cron(_FLEET_PAYLOAD_YAML)
+    payload = cron.schedule_pressure_payload(hours=24)
+    assert payload["excluded"] == {"disabled": 1, "reboot": 1}
+    assert len(payload["grid"]) == 24
+    assert len(payload["grid"][0]) == 60
+    # both herd jobs land on minute 0
+    assert payload["by_minute_jobs"][0] == 2
+
+
+def test_schedule_duplicates_payload_groups_the_herd():
+    cron = _cron(_FLEET_PAYLOAD_YAML)
+    payload = cron.schedule_duplicates_payload()
+    assert payload["jobs"] == 2  # only the two enabled cron jobs
+    assert len(payload["groups"]) == 1
+    assert payload["groups"][0]["jobs"] == ["herd-a", "herd-b"]
+
+
+def test_schedule_suggest_payload_avoids_the_herd():
+    cron = _cron(_FLEET_PAYLOAD_YAML)
+    payload = cron.schedule_suggest_payload(period="hourly")
+    assert payload["period"] == "hourly"
+    assert payload["minute"] != 0  # never lands on the busy slot
+
+
+def test_schedule_suggest_payload_rejects_bad_period():
+    cron = _cron(_FLEET_PAYLOAD_YAML)
+    with pytest.raises(ValueError):
+        cron.schedule_suggest_payload(period="weekly")
+
+
+# ---------------------------------------------------------------------------
+# _scheduled_in / _schedule_never_fires: index vs dead-latch, once seeded
+# ---------------------------------------------------------------------------
+
+_DEAD_YAML = """
+jobs:
+  - name: live
+    command: echo hi
+    schedule: "*/5 * * * *"
+  - name: parked
+    command: echo hi
+    schedule: "0 0 1 1 * 2020"
+  - name: off
+    command: echo hi
+    schedule: "*/5 * * * *"
+    enabled: false
+"""
+
+
+def test_scheduled_in_reads_index_and_dead_latch():
+    cron = _cron(_DEAD_YAML)
+    now = datetime.datetime.now(_UTC)
+    cron._ensure_seeded(now)
+    # a live schedule is read from the fire index, not re-walked: */5 puts the
+    # next fire within 300s. (A bare `>= 0.0` here asserted nothing: the value
+    # is naturally positive just after seeding, so it never reached the
+    # max(0.0, ...) clamp it looked like it was testing.)
+    live = cron._scheduled_in("live", cron.cron_jobs["live"], False)
+    assert live is not None and 0.0 <= live <= 300.0
+    # a fire time already in the past clamps to zero rather than going
+    # negative: this is the clamp branch.
+    cron._next_fire["live"] = now - datetime.timedelta(seconds=90)
+    assert cron._scheduled_in("live", cron.cron_jobs["live"], False) == 0.0
+    cron._ensure_seeded(now)
+    # a dead schedule sits in the dead-latch: no next run
+    assert cron._scheduled_in("parked", cron.cron_jobs["parked"], False) is None
+    # disabled / running jobs short-circuit to None
+    assert cron._scheduled_in("off", cron.cron_jobs["off"], False) is None
+    assert cron._scheduled_in("live", cron.cron_jobs["live"], True) is None
+
+
+def test_schedule_never_fires_index_vs_latch():
+    cron = _cron(_DEAD_YAML)
+    # before seeding: enabled crontab job falls through to the engine search
+    assert cron._schedule_never_fires("live", cron.cron_jobs["live"]) is False
+    now = datetime.datetime.now(_UTC)
+    cron._ensure_seeded(now)
+    # after seeding the two probes decide it: index -> fires, latch -> never
+    assert cron._schedule_never_fires("live", cron.cron_jobs["live"]) is False
+    assert cron._schedule_never_fires("parked", cron.cron_jobs["parked"]) is True
+    # a disabled job is never "never fires" (it simply does not schedule)
+    assert cron._schedule_never_fires("off", cron.cron_jobs["off"]) is False
+
+
+# ---------------------------------------------------------------------------
+# _job_to_dict: the spread-distribution cluster-owner block
+# ---------------------------------------------------------------------------
+
+_CLUSTER_YAML = """
+jobs:
+  - name: leader
+    command: echo hi
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+  - name: prefer
+    command: echo hi
+    schedule: "*/5 * * * *"
+    clusterPolicy: PreferLeader
+"""
+
+
+def test_job_to_dict_spread_owner_block():
+    cron = _cron(_CLUSTER_YAML)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = types.SimpleNamespace(
+        distribution="spread",
+        job_owner=lambda n: "node-A",
+        available_job_owner=lambda n: "node-B",
+    )
+    leader = cron._job_to_dict("leader", cron.cron_jobs["leader"])
+    assert leader["clusterPolicy"] == "Leader"
+    assert leader["clusterOwner"] == "node-A"  # Leader -> job_owner
+    prefer = cron._job_to_dict("prefer", cron.cron_jobs["prefer"])
+    assert prefer["clusterPolicy"] == "PreferLeader"
+    assert prefer["clusterOwner"] == "node-B"  # PreferLeader -> available_
+
+
+# ---------------------------------------------------------------------------
+# state inspector payloads, driven by small fake backends
+# ---------------------------------------------------------------------------
+
+
+class _FakeBackend:
+    """A minimal state backend: only the inspector methods are exercised."""
+
+    def __init__(self, *, inventory=None, documents=None, records=None):
+        self._inventory = inventory
+        self._documents = documents
+        self._records = records
+
+    def view_dict(self):
+        return {"backend": "fake"}
+
+    def stats(self):
+        return {"ok": True}
+
+    async def inventory(self):
+        if isinstance(self._inventory, Exception):
+            raise self._inventory
+        return dict(self._inventory)
+
+    async def list_documents(self, ns):
+        if isinstance(self._documents, Exception):
+            raise self._documents
+        return list(self._documents)
+
+    async def list_records(self, stream, limit, newest_first):
+        if isinstance(self._records, Exception):
+            raise self._records
+        return list(self._records)
+
+
+async def test_state_payload_degrades_when_inventory_fails():
+    cron = _cron(_DEAD_YAML)
+    cron.state_backend = _FakeBackend(inventory=RuntimeError("boom"))
+    payload = await cron.state_payload()
+    # the health-only fallback: enumerable False, empty maps, still enabled
+    assert payload["enabled"] is True
+    assert payload["enumerable"] is False
+    assert payload["records"] == {} and payload["documents"] == {}
+    assert payload["view"] == {"backend": "fake"}
+    # this node's own memory state is always grafted on
+    assert payload["node"]["host"] == cron._state_host
+
+
+async def test_state_payload_grafts_node_retries_and_slots():
+    from cronstable.job import JobRetryState
+
+    cron = _cron(_DEAD_YAML)
+    cron.state_backend = _FakeBackend(
+        inventory={
+            "view": {"backend": "fake"},
+            "stats": {},
+            "enumerable": True,
+            "records": {},
+            "documents": {},
+            "leases": [],
+        }
+    )
+    st = JobRetryState(8.0, 2.0, 60.0)
+    st.count = 3
+    st.next_retry_at = datetime.datetime.now(_UTC)
+    st.scheduled_delay = 12.0
+    cron.retry_state["live"] = st
+    cron._slot_leases["live"] = Lease("slots/live", "host#tok", 1, 9e18)
+    cron._slot_refs["live"] = 2
+    payload = await cron.state_payload()
+    retries = {r["job"]: r for r in payload["node"]["retries"]}
+    assert retries["live"]["attempt"] == 3
+    assert retries["live"]["delaySeconds"] == 12.0
+    slots = {s["slot"]: s for s in payload["node"]["slots"]}
+    assert slots["live"]["holder"] == "host#tok"
+    assert slots["live"]["refs"] == 2
+
+
+async def test_state_documents_payload_redacts_kv_values():
+    cron = _cron(_DEAD_YAML)
+    cron.state_backend = _FakeBackend(
+        documents=[
+            {"key": "a", "value": {"pw": "hunter2"}},
+            # a non-JSON-serializable value: valueSize degrades to None
+            {"key": "b", "value": {1, 2, 3}},
+        ]
+    )
+    payload = await cron.state_documents_payload("kv/scope")
+    doc = payload["documents"][0]
+    assert "value" not in doc  # the secret is stripped
+    assert doc["valueType"] == "dict"
+    assert doc["valueSize"] > 0
+    assert payload["namespace"] == "kv/scope"
+    unserializable = payload["documents"][1]
+    assert "value" not in unserializable
+    assert unserializable["valueType"] == "set"
+    assert unserializable["valueSize"] is None
+
+
+async def test_state_documents_payload_passes_cursor_docs_verbatim():
+    cron = _cron(_DEAD_YAML)
+    cron.state_backend = _FakeBackend(
+        documents=[{"key": "c", "value": "2026-07-01"}]
+    )
+    # a non-kv namespace is NOT redacted: the watermark rides through
+    payload = await cron.state_documents_payload("cursor/scope")
+    assert payload["documents"][0]["value"] == "2026-07-01"
+
+
+async def test_state_documents_payload_rejects_and_degrades():
+    cron = _cron(_DEAD_YAML)
+    good = _FakeBackend(documents=RuntimeError("read failed"))
+    cron.state_backend = good
+    # a backend read error degrades to an empty list, not a raise
+    payload = await cron.state_documents_payload("kv/scope")
+    assert payload["documents"] == []
+    # a bad namespace is a 400 ApiActionError
+    from cronstable.cron import ApiActionError
+
+    with pytest.raises(ApiActionError):
+        await cron.state_documents_payload("runs/etl")
+    # no store configured is a 404 ApiActionError
+    cron.state_backend = None
+    with pytest.raises(ApiActionError):
+        await cron.state_documents_payload("kv/scope")
+
+
+async def test_state_records_payload_guards_and_degrades():
+    from cronstable.cron import ApiActionError
+
+    cron = _cron(_DEAD_YAML)
+    cron.state_backend = _FakeBackend(records=[{"seq": 1}, {"seq": 2}])
+    payload = await cron.state_records_payload("runs/live", limit=10)
+    assert payload["stream"] == "runs/live"
+    assert payload["records"] == [{"seq": 1}, {"seq": 2}]
+    # a log stream is forbidden (raw job output)
+    with pytest.raises(ApiActionError):
+        await cron.state_records_payload("logs/live")
+    # an empty stream name is a 400
+    with pytest.raises(ApiActionError):
+        await cron.state_records_payload("")
+    # a backend error degrades to []
+    cron.state_backend = _FakeBackend(records=RuntimeError("boom"))
+    degraded = await cron.state_records_payload("runs/live")
+    assert degraded["records"] == []
+    # no store is a 404
+    cron.state_backend = None
+    with pytest.raises(ApiActionError):
+        await cron.state_records_payload("runs/live")
+
+
+# ---------------------------------------------------------------------------
+# job_resources_payload / job_runs_payload / job_trends_payload edges
+# ---------------------------------------------------------------------------
+
+_RES_YAML = """
+jobs:
+  - name: heavy
+    command: echo hi
+    schedule: "*/5 * * * *"
+    monitorResources:
+      interval: 0.5
+      history: 50
+"""
+
+
+def test_job_resources_payload_collects_live_series():
+    cron = _cron(_RES_YAML)
+
+    class _Running:
+        proc = types.SimpleNamespace(pid=4321)
+        started_at = datetime.datetime.now(_UTC)
+
+        def live_resource_series(self):
+            return [[1.0, 5.0, 1024]]
+
+        def live_resources(self):
+            return {"cpu_percent": 10.0}
+
+    cron.running_jobs["heavy"] = [_Running()]
+    payload = cron.job_resources_payload("heavy", max_runs=20)
+    assert payload["monitored"] is True
+    assert payload["interval"] == 0.5
+    assert len(payload["live"]) == 1
+    live = payload["live"][0]
+    assert live["pid"] == 4321
+    assert live["series"] == [[1.0, 5.0, 1024]]
+    assert live["current"] == {"cpu_percent": 10.0}
+
+
+def test_job_resources_payload_skips_unsampled_instances():
+    cron = _cron(_RES_YAML)
+
+    class _Quiet:
+        proc = None
+        started_at = None
+
+        def live_resource_series(self):
+            return None
+
+        def live_resources(self):
+            return None
+
+    cron.running_jobs["heavy"] = [_Quiet()]
+    payload = cron.job_resources_payload("heavy", max_runs=20)
+    assert payload["live"] == []  # the unsampled instance is filtered out
+
+
+def test_job_resources_payload_unknown_job_is_none():
+    cron = _cron(_RES_YAML)
+    assert cron.job_resources_payload("ghost", max_runs=5) is None
+
+
+def test_job_runs_payload_unknown_job_is_none():
+    cron = _cron(_RES_YAML)
+    assert cron.job_runs_payload("ghost") is None
+    payload = cron.job_runs_payload("heavy")
+    assert payload["name"] == "heavy"
+    assert payload["runs"] == []
+    assert payload["stats"]["total"] == 0
+
+
+async def test_job_trends_payload_unknown_job_is_none():
+    cron = _cron(_RES_YAML)
+    assert await cron.job_trends_payload("ghost") is None
+
+
+# ---------------------------------------------------------------------------
+# small web helpers: _web_int_query, _web_json_body
+# ---------------------------------------------------------------------------
+
+
+def test_web_int_query_defaults_and_clamps():
+    q = Cron._web_int_query
+    assert q(Req(), "n", default=7, lo=1, hi=100) == 7  # missing -> default
+    assert q(Req({"n": "20"}), "n", default=7, lo=1, hi=100) == 20
+    assert q(Req({"n": "500"}), "n", default=7, lo=1, hi=100) == 100  # hi clamp
+    assert q(Req({"n": "-3"}), "n", default=7, lo=1, hi=100) == 1  # lo clamp
+    assert q(Req({"n": "bad"}), "n", default=7, lo=1, hi=100) == 7  # unparsable
+
+
+class _BodyReq:
+    def __init__(self, *, can_read, body=None, raises=None):
+        self.can_read_body = can_read
+        self._body = body
+        self._raises = raises
+
+    async def json(self):
+        if self._raises is not None:
+            raise self._raises
+        return self._body
+
+
+async def test_web_json_body_variants():
+    body = Cron._web_json_body
+    # no body to read -> empty dict
+    assert await body(_BodyReq(can_read=False)) == {}
+    # a JSON object round-trips
+    assert await body(
+        _BodyReq(can_read=True, body={"decision": "approve"})
+    ) == {"decision": "approve"}
+    # malformed JSON -> 400
+    with pytest.raises(web.HTTPBadRequest):
+        await body(_BodyReq(can_read=True, raises=ValueError("bad json")))
+    # a non-object JSON body -> 400
+    with pytest.raises(web.HTTPBadRequest):
+        await body(_BodyReq(can_read=True, body=[1, 2, 3]))
+
+
+# ---------------------------------------------------------------------------
+# header builders merge operator-supplied web.headers
+# ---------------------------------------------------------------------------
+
+
+def test_security_and_sse_headers_merge_custom():
+    cron = _cron(_RES_YAML)
+    cron.web_config = {"headers": {"X-Custom": "yes"}}
+    sec = cron._security_headers()
+    assert sec["X-Custom"] == "yes"
+    assert any(k.lower() == "content-security-policy" for k in sec)
+    sse = cron._sse_headers()
+    assert sse["Content-Type"] == "text/event-stream"
+    assert sse["X-Custom"] == "yes"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_web_token: the fromFile read-error path
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_web_token_missing_file_fails_closed(tmp_path):
+    missing = tmp_path / "nope" / "token"  # parent dir does not exist either
+    with pytest.raises(ConfigError):
+        Cron._resolve_web_token(
+            {
+                "authToken": {
+                    "value": None,
+                    "fromFile": str(missing),
+                    "fromEnvVar": None,
+                }
+            }
+        )
+
+
+def test_resolve_web_token_reads_file(tmp_path):
+    tok = tmp_path / "token"
+    tok.write_text("s3cret\n")
+    assert (
+        Cron._resolve_web_token(
+            {
+                "authToken": {
+                    "value": None,
+                    "fromFile": str(tok),
+                    "fromEnvVar": None,
+                }
+            }
+        )
+        == "s3cret"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _apply_socket_mode: non-unix early-out + chmod failure warning
+# ---------------------------------------------------------------------------
+
+
+def test_apply_socket_mode_ignores_non_unix(monkeypatch, caplog):
+    # a TCP listen url is a no-op (returns without touching the filesystem).
+    # Asserted by making any chmod fatal: the scheme guard is what has to keep
+    # us out of it. Merely CALLING _apply_socket_mode proves nothing, since
+    # the chmod that a missing guard would reach is itself wrapped in a
+    # try/except that swallows the resulting OSError.
+    import logging
+    import os as _os
+
+    def boom(*a, **kw):
+        raise AssertionError("chmod attempted for a non-unix listen url")
+
+    monkeypatch.setattr(_os, "chmod", boom)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        Cron._apply_socket_mode("http://127.0.0.1:8080", "600")
+    assert caplog.records == []
+
+
+def test_apply_socket_mode_warns_on_chmod_failure(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        # a unix path that does not exist: os.chmod raises OSError, caught
+        Cron._apply_socket_mode("unix:///no/such/socket.sock", "600")
+    assert any("socketMode" in r.getMessage() for r in caplog.records)
+
+
+def test_apply_socket_mode_warns_on_bad_mode(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        # a non-octal mode raises ValueError from int(mode, 8), also caught
+        Cron._apply_socket_mode("unix:///tmp/whatever.sock", "not-octal")
+    assert any("socketMode" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _artifact_scope_names: global + per-job + per-dag-task scopes
+# ---------------------------------------------------------------------------
+
+_SCOPE_YAML = """
+state:
+  path: {path}
+jobs:
+  - name: writer
+    command: echo hi
+    schedule: "*/5 * * * *"
+    stateAllowedScopes:
+      - shared-a
+dags:
+  - name: pipe
+    schedule: "0 4 * * *"
+    tasks:
+      - id: t
+        command: 'true'
+        stateAllowedScopes:
+          - shared-b
+"""
+
+
+def test_artifact_scope_names_unions_all_sources(tmp_path):
+    from cronstable.jobstate import GLOBAL_SCOPE
+
+    cron = _cron(_SCOPE_YAML.format(path=str(tmp_path).replace("\\", "/")))
+    scopes = cron._artifact_scope_names()
+    assert GLOBAL_SCOPE in scopes  # the shared scope is always present
+    assert "shared-a" in scopes  # from the job
+    assert "shared-b" in scopes  # from the dag task template

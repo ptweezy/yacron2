@@ -6,6 +6,7 @@ network, no crypto), which is what carries its coverage in CI.
 
 import pytest
 
+from cronstable.backends.kubernetes import KubernetesBackend
 from cronstable.config import parse_config_string
 from cronstable.leadership import (
     REBOOT_RAN_KEY,
@@ -484,3 +485,32 @@ def test_quorate_follower_still_defers_when_not_self_demoted():
         quorate=True, is_leader=False, holder="node-b", demoted=False
     )
     assert follower.is_available_leader() is False
+
+
+# --- lease-backend inherits the LeadershipBackend ABC defaults -------------
+
+
+def _k8s_backend(extra=""):
+    yaml = (
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  nodeName: node-a\n"
+        "  connectTimeout: 4\n"
+        "  kubernetes:\n"
+        "    leaseName: yl\n"
+        "    leaseNamespace: ns\n"
+        "    leaseDurationSeconds: 15\n"
+        "    renewDeadlineSeconds: 10\n"
+        "    retryPeriodSeconds: 2\n" + extra
+    )
+    cfg = parse_config_string(yaml, "").cluster_config
+    return KubernetesBackend(cfg, lambda: "v1:job")
+
+
+def test_lease_backend_conflicting_policies_and_tls_loadable():
+    # a lease backend inherits the LeadershipBackend defaults: no coordination-
+    # policy divergence gate (gossip-only) and no per-node mTLS material to
+    # pre-validate before a rotation teardown.
+    b = _k8s_backend()
+    assert b.conflicting_policies() == []
+    assert b.tls_files_loadable() is True

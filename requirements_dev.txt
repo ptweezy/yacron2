@@ -3,6 +3,17 @@
 # OpenSSL), so don't install it there; those tests importorskip it and self-skip
 # when it's absent. Every other platform keeps full coverage.
 cryptography; platform_machine != "ARM64" or sys_platform != "win32"
+# orjson is the optional `speedups` extra, but the tests that cover the
+# accelerated durable-state/gossip JSON paths are worthless if no CI cell ever
+# installs it: they were importorskip-guarded and therefore skipped in all 12
+# matrix cells, so the orjson arm of cronstable._json shipped unexercised.
+# Installed here so `tox -e py` really runs it. Excluded where a wheel is not
+# reliably available (win-arm64; a just-released Python that orjson has not
+# built for yet) since it needs a Rust toolchain to build from source; those
+# cells still self-skip via importorskip, and
+# test_orjson_is_installed_where_a_wheel_exists fails if this line ever stops
+# covering the cells that DO have wheels.
+orjson>=3.9; python_version < "3.15" and (platform_machine != "ARM64" or sys_platform != "win32")
 # security linter; bandit[toml] reads its config from pyproject.toml.
 bandit[toml]
 mypy

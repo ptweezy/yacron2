@@ -106,6 +106,13 @@ MAX_CATCHUP_OCCURRENCES = 100
 # In-memory only (like the rest of the run record), and bounded so a frequently
 # scheduled job cannot grow memory without limit.
 RUN_HISTORY_LIMIT = 50
+# First page size the onlyIfLastSucceeded gate reads from the durable run
+# ledger (see _depends_on_past_ok). The gate needs only the newest success/
+# failure record, so it probes this many newest records and widens to the
+# full RUN_HISTORY_LIMIT window only when the whole probe page is non-run
+# outcomes (cancelled/skipped) -- reading a few records instead of 50 on the
+# common path, while preserving the same skip window.
+DEPENDS_GATE_PROBE = 8
 # How many compact run summaries to embed per job in the /jobs payload — enough
 # for the dashboard's inline sparkline without shipping the full detailed
 # history on every poll. The full history is available from /jobs/{name}/runs.
@@ -7201,17 +7208,55 @@ class Cron:
                     for job, task in list(wait_tasks.items()):
                         if task in done_tasks:
                             done_jobs.add(job)
-                    for job in done_jobs:
-                        task = wait_tasks.pop(job)
-                        try:
-                            task.result()
-                        except Exception:  # pragma: no cover
-                            logger.exception(
-                                "Unexpected error while waiting on job %s; "
-                                "please report this as a bug (2)",
-                                job.config.name,
-                            )
-                        await self._handle_finished_job(job)
+                    try:
+                        for job in done_jobs:
+                            task = wait_tasks.pop(job)
+                            try:
+                                task.result()
+                            except Exception:  # pragma: no cover
+                                logger.exception(
+                                    "Unexpected error while waiting on job "
+                                    "%s; please report this as a bug (2)",
+                                    job.config.name,
+                                )
+                            try:
+                                await self._handle_finished_job(job)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                # Per-job, so one job's failure to finish
+                                # (e.g. the state backend 503ing out of
+                                # _job_api.finish_run) does not skip the
+                                # remaining jobs in this batch. No
+                                # `pragma: no cover` unlike its siblings
+                                # below: this arm has a test
+                                # (test_reaper_finishes_whole_batch_when_
+                                # one_job_raises), so let the coverage gate
+                                # notice if it stops being reached.
+                                logger.exception(
+                                    "Unexpected error finishing job %s; "
+                                    "please report this as a bug (6)",
+                                    job.config.name,
+                                )
+                    finally:
+                        # Record all DAG-task completions buffered while
+                        # handling this batch in one RMW per run (a mapped
+                        # fan-out finishing together no longer pays a full
+                        # document write+fsync per task). No-op when no DAG
+                        # tasks finished.
+                        #
+                        # In a finally: the buffer holds completions from jobs
+                        # ALREADY handled in this batch, so letting an
+                        # exception from a later job skip the flush would
+                        # strand their dag_run entries as RUNNING until some
+                        # unrelated job completes and reaches the next flush
+                        # (indefinitely, if none does: nothing else drains
+                        # this buffer; _retry_completions only sees
+                        # _pending_completions, which flush_completions
+                        # populates from its own except arm). Batching is what
+                        # made this cross-job: pre-batching each completion
+                        # wrote itself.
+                        await self._dag.flush_completions()
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # pragma: no cover
@@ -7702,6 +7747,43 @@ class Cron:
         )
         return result if isinstance(result, str) else None
 
+    async def _list_gate_records(
+        self, backend: Any, name: str
+    ) -> List[Dict[str, Any]]:
+        """Newest durable run records for the onlyIfLastSucceeded gate.
+
+        Read incrementally: the gate consumes only the single newest
+        success/failure record, but non-run outcomes (cancelled/skipped) at the
+        head must be skipped over.  Probe :data:`DEPENDS_GATE_PROBE` newest
+        records first and widen to the full :data:`RUN_HISTORY_LIMIT` window
+        ONLY when that page is entirely non-run outcomes -- so the common case
+        (the newest record is a real outcome) materialises a few records
+        instead of all 50, without shrinking the skip window a real answer
+        may need.
+
+        Raises through to the caller's fail-closed/degrade handling on a store
+        error or timeout, exactly as the single read it replaces.
+        """
+        stream = self._run_stream(name)
+        probe = min(DEPENDS_GATE_PROBE, RUN_HISTORY_LIMIT)
+        recs: List[Dict[str, Any]] = await asyncio.wait_for(
+            backend.list_records(stream, limit=probe, newest_first=True),
+            timeout=STATE_OP_TIMEOUT,
+        )
+        # a real outcome in the probe page, or a page shorter than the probe
+        # (the stream is exhausted), means widening would reveal nothing newer.
+        if len(recs) < probe or any(
+            r.get("outcome") in ("success", "failure") for r in recs
+        ):
+            return recs
+        widened: List[Dict[str, Any]] = await asyncio.wait_for(
+            backend.list_records(
+                stream, limit=RUN_HISTORY_LIMIT, newest_first=True
+            ),
+            timeout=STATE_OP_TIMEOUT,
+        )
+        return widened
+
     async def _depends_on_past_ok(self, job: JobConfig) -> bool:
         """Whether ``job``'s depends-on-past gate permits a scheduled fire.
 
@@ -7770,14 +7852,7 @@ class Cron:
             return False
         if backend is not None:
             try:
-                recs = await asyncio.wait_for(
-                    backend.list_records(
-                        self._run_stream(job.name),
-                        limit=RUN_HISTORY_LIMIT,
-                        newest_first=True,
-                    ),
-                    timeout=STATE_OP_TIMEOUT,
-                )
+                recs = await self._list_gate_records(backend, job.name)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:  # noqa: BLE001 - policy decides below

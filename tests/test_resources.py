@@ -2,9 +2,12 @@
 
 import asyncio
 import contextlib
+import logging
 import sys
+from collections import deque
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 import cronstable.resources as resources
@@ -741,3 +744,397 @@ def test_resolve_node_history_config():
         {"nodeHistory": {"interval": 2, "points": 100}}
     )
     assert cfg == {"interval": 2.0, "points": 100}
+
+
+# ---- portable resource-accounting internals --------------------------------
+#
+# The following group drives the hermetic internals directly: the series
+# recorder's odd-tail compaction, the ledger series parser's numeric-coercion
+# guard, the shared ppid index and sampling ticker, the process-tree folding
+# from a snapshot index, and the NodeResourceSampler snapshot/overlay/history
+# branches. Everything is hermetic: fake psutil.Process stand-ins and fake
+# cgroup trees under tmp_path, no real network, no wall-clock races.
+
+
+# ---- _SeriesRecorder._compact odd tail -------------------------------------
+
+
+def test_series_recorder_compact_keeps_odd_tail():
+    # an odd-sized point buffer at compaction time (reachable when the cap is
+    # odd) merges the leading pair and carries the newest tail point through
+    # unmerged, rather than dropping it.
+    rec = _SeriesRecorder(3)
+    rec.add(0.0, 0.0, 10)
+    rec.add(1.0, 10.0, 20)
+    rec.add(2.0, 20.0, 30)  # third point trips _compact() with 3 points
+    # pair (0,1) -> [1.0, mean(0,10)=5.0, max(10,20)=20]; tail [2,20,30] kept.
+    assert rec.points() == [[1.0, 5.0, 20], [2.0, 20.0, 30]]
+
+
+# ---- _parse_series numeric-coercion guard ----------------------------------
+
+
+def test_parse_series_drops_unconvertible_points():
+    # a point whose rss is not int-coercible, or whose time is not
+    # float-coercible, is dropped point-wise (the try/except continue), while
+    # a well-formed neighbour survives.
+    assert resources._parse_series([[1.0, 2.0, "notanint"]]) is None
+    assert resources._parse_series([["notafloat", 1.0, 2]]) is None
+    parsed = resources._parse_series([[1.0, 2.0, "x"], [3.0, 4.0, 5]])
+    assert parsed == [[3.0, 4.0, 5]]
+
+
+# ---- _ppid_index -----------------------------------------------------------
+
+
+def test_ppid_index_none_without_psutil(monkeypatch):
+    monkeypatch.setattr(resources, "psutil", None)
+    assert resources._ppid_index() is None
+
+
+def test_ppid_index_builds_from_ppid_map(monkeypatch):
+    # one snapshot of pid->ppid folds into ppid->[child pids].
+    monkeypatch.setattr(resources.psutil, "_ppid_map",
+                        lambda: {2: 1, 3: 1, 1: 0})
+    index = resources._ppid_index()
+    assert index is not None
+    assert set(index[1]) == {2, 3}
+    assert index[0] == [1]
+
+
+def test_ppid_index_none_when_map_raises(monkeypatch):
+    def boom():
+        raise RuntimeError("snapshot failed")
+
+    monkeypatch.setattr(resources.psutil, "_ppid_map", boom)
+    assert resources._ppid_index() is None
+
+
+# ---- _SharedSampleTicker ---------------------------------------------------
+
+
+def test_ticker_unregister_wakes_remaining(monkeypatch):
+    # unregistering one of several monitors keeps the task and just nudges the
+    # wake event so the ticker recomputes its next-due instant.
+    ticker = resources._SharedSampleTicker()
+    m1, m2 = object(), object()
+    ticker._due = {m1: 0.0, m2: 0.0}
+    ticker._wake.clear()
+    ticker.unregister(m1)
+    assert m1 not in ticker._due
+    assert m2 in ticker._due
+    assert ticker._wake.is_set()
+
+
+class _TickMon:
+    """Minimal monitor stand-in for driving _SharedSampleTicker._run."""
+
+    def __init__(self, interval, on_sample):
+        self._interval = interval
+        self._on_sample = on_sample
+
+    def _sample(self, index):
+        self._on_sample(self, index)
+
+
+async def test_ticker_run_returns_when_last_monitor_leaves():
+    # a monitor that unregisters itself during its own sample drains _due; the
+    # run loop then returns cleanly instead of spinning on an empty schedule.
+    ticker = resources._SharedSampleTicker()
+    seen = []
+
+    def on_sample(mon, index):
+        seen.append(index)
+        ticker._due.pop(mon, None)
+
+    mon = _TickMon(0.01, on_sample)
+    ticker._due = {mon: 0.0}
+    await asyncio.wait_for(ticker._run(), timeout=5)
+    assert len(seen) == 1  # sampled exactly once, then the loop returned
+    assert ticker._due == {}
+
+
+async def test_ticker_run_swallows_sampler_bug(caplog):
+    # a bug in a monitor's _sample must not crash the ticker: it is logged and
+    # the run loop exits rather than propagating.
+    ticker = resources._SharedSampleTicker()
+
+    def on_sample(mon, index):
+        raise ValueError("sampler bug")
+
+    mon = _TickMon(0.01, on_sample)
+    ticker._due = {mon: 0.0}
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await asyncio.wait_for(ticker._run(), timeout=5)
+    assert any("sampling ticker stopped" in r.message
+               for r in caplog.records)
+
+
+# ---- ResourceMonitor._tree_from_index / _sample_locked ---------------------
+
+
+class _FakeProc:
+    """psutil.Process stand-in for driving the sampler directly."""
+
+    def __init__(self, pid, create_time, user=0.0, system=0.0, rss=1024):
+        self.pid = pid
+        self._create_time = create_time
+        self.user = user
+        self.system = system
+        self.rss = rss
+        self.children_list = []
+        self.children_error = None
+        self.cpu_times_error = None
+        self.memory_info_error = None
+        self.create_time_error = None
+
+    def oneshot(self):
+        return contextlib.nullcontext()
+
+    def cpu_times(self):
+        if self.cpu_times_error is not None:
+            raise self.cpu_times_error
+        return SimpleNamespace(user=self.user, system=self.system)
+
+    def memory_info(self):
+        if self.memory_info_error is not None:
+            raise self.memory_info_error
+        return SimpleNamespace(rss=self.rss)
+
+    def create_time(self):
+        if self.create_time_error is not None:
+            raise self.create_time_error
+        return self._create_time
+
+    def children(self, recursive=False):
+        if self.children_error is not None:
+            raise self.children_error
+        return list(self.children_list)
+
+
+def _patch_process_table(monkeypatch, procs):
+    """Point resources.psutil.Process at a fixed pid->_FakeProc table."""
+
+    def fake_process(pid):
+        if pid not in procs:
+            raise psutil.NoSuchProcess(pid)
+        return procs[pid]
+
+    monkeypatch.setattr(resources.psutil, "Process", fake_process)
+
+
+def test_tree_from_index_folds_tree_and_skips_impostors(monkeypatch):
+    # the tree is derived from the shared ppid snapshot: real descendants are
+    # included, a pid created BEFORE the root (recycled) is rejected, and a
+    # pid that vanished since the snapshot is skipped.
+    root = _FakeProc(pid=100, create_time=1000.0, user=0.1, system=0.05,
+                     rss=1000)
+    child = _FakeProc(pid=200, create_time=1001.0, user=2.0, system=1.0,
+                      rss=2000)
+    grandchild = _FakeProc(pid=300, create_time=1002.0, user=3.0,
+                           system=0.5, rss=4000)
+    stale = _FakeProc(pid=400, create_time=999.0)  # older than root
+    procs = {200: child, 300: grandchild, 400: stale}  # 500 is absent
+    _patch_process_table(monkeypatch, procs)
+
+    monitor = ResourceMonitor(100, job_name="tree", interval=1.0, history=0)
+    monitor._proc = root
+    # 200 is listed a second time under itself: the already-seen guard must
+    # skip the duplicate rather than looping.
+    index = {100: [200, 400, 500], 200: [300, 200]}
+    monitor._sample_locked(index)
+
+    assert monitor._samples == 1
+    assert monitor._cpu_user == pytest.approx(0.1 + 2.0 + 3.0)
+    assert monitor._cpu_system == pytest.approx(0.05 + 1.0 + 0.5)
+    assert monitor._max_rss == 1000 + 2000 + 4000  # stale/absent excluded
+
+
+def test_tree_from_index_root_gone_returns_root_only():
+    # if the root's create_time read fails, the tree collapses to the root
+    # alone (read below on its own).
+    monitor = ResourceMonitor(100, job_name="lone", interval=1.0, history=0)
+    root = _FakeProc(pid=100, create_time=1000.0)
+    root.create_time_error = psutil.NoSuchProcess(100)
+    tree = monitor._tree_from_index(root, {100: [200]})
+    assert tree == [root]
+
+
+def test_sample_locked_skips_unreadable_members(monkeypatch):
+    # a member that raises a transient error (AccessDenied) and one that
+    # raises an unexpected error during its read are both skipped; the root
+    # still contributes its reading.
+    root = _FakeProc(pid=100, create_time=1000.0, user=0.5, rss=1000)
+    denied = _FakeProc(pid=200, create_time=1001.0, user=9.0, rss=9000)
+    denied.cpu_times_error = psutil.AccessDenied(200)
+    broken = _FakeProc(pid=300, create_time=1002.0, user=7.0, rss=7000)
+    broken.memory_info_error = RuntimeError("weird")
+    _patch_process_table(monkeypatch, {200: denied, 300: broken})
+
+    monitor = ResourceMonitor(100, job_name="skip", interval=1.0, history=0)
+    monitor._proc = root
+    monitor._sample_locked({100: [200, 300]})
+
+    assert monitor._samples == 1
+    assert monitor._cpu_user == pytest.approx(0.5)  # only the root counted
+    assert monitor._max_rss == 1000
+
+
+def test_sample_locked_children_walk_root_transient():
+    # without a shared index the tree is walked via children(); a transient
+    # failure there falls back to reading the root alone.
+    monitor = ResourceMonitor(100, job_name="walk", interval=1.0, history=0)
+    root = _FakeProc(pid=100, create_time=1000.0, user=1.5, rss=2048)
+    root.children_error = psutil.NoSuchProcess(100)
+    monitor._proc = root
+    monitor._sample_locked()
+    assert monitor._samples == 1
+    assert monitor._cpu_user == pytest.approx(1.5)
+    assert monitor._max_rss == 2048
+
+
+def test_sample_locked_children_walk_hard_error_is_inert():
+    # a non-transient error from children() aborts the sample entirely (no
+    # reading banked) rather than raising out of the sampler.
+    monitor = ResourceMonitor(100, job_name="hard", interval=1.0, history=0)
+    root = _FakeProc(pid=100, create_time=1000.0, user=1.5)
+    root.children_error = RuntimeError("table read blew up")
+    monitor._proc = root
+    monitor._sample_locked()
+    assert monitor._samples == 0
+
+
+# ---- NodeResourceSampler init / snapshot / overlay / history ---------------
+
+
+def _make_cgroup(tmp_path, *, cpu_usec=None):
+    """A minimal available cgroup v2 reader over a fake tree under tmp_path."""
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text("cpu memory\n")
+    d = root / "box"
+    d.mkdir()
+    if cpu_usec is not None:
+        (d / "cpu.stat").write_text(f"usage_usec {cpu_usec}\n")
+    proc = tmp_path / "proc_self_cgroup"
+    proc.write_text("0::/box\n")
+    return resources._CgroupV2Reader(str(root), str(proc)), d
+
+
+def test_node_sampler_init_handles_psutil_process_failure(monkeypatch):
+    # if the daemon's own psutil.Process cannot be built, the sampler still
+    # constructs, just without its own-footprint proc handle.
+    def boom(*a, **k):
+        raise RuntimeError("no self process")
+
+    monkeypatch.setattr(resources.psutil, "Process", boom)
+    sampler = NodeResourceSampler()
+    assert sampler._proc is None
+
+
+def test_node_sampler_init_primes_cgroup_cpu_baseline(tmp_path, monkeypatch):
+    # inside a limited slice the constructor primes the CPU delta baseline
+    # from the current cgroup usage so the first snapshot has a window.
+    reader, _d = _make_cgroup(tmp_path, cpu_usec=5_000_000)  # 5.0 CPU-seconds
+    assert reader.available
+    monkeypatch.setattr(resources, "_CgroupV2Reader", lambda *a, **k: reader)
+    sampler = NodeResourceSampler()
+    assert sampler._cgroup_prev_cpu is not None
+    assert sampler._cgroup_prev_cpu[0] == pytest.approx(5.0)
+
+
+def test_node_sampler_snapshot_includes_own_footprint():
+    # a live snapshot on this host carries the daemon's own rss/cpu on top of
+    # the system-wide numbers.
+    sampler = NodeResourceSampler()
+    snap = sampler.snapshot()
+    assert snap is not None
+    assert "proc_rss_bytes" in snap
+    assert "proc_cpu_percent" in snap
+    assert snap["proc_rss_bytes"] > 0
+
+
+def test_node_sampler_snapshot_overlays_available_cgroup(tmp_path):
+    # when a cgroup slice is available the snapshot swaps host-wide memory for
+    # the slice's limit/usage (same keys), exercising the overlay call path.
+    reader, d = _make_cgroup(tmp_path)
+    mib = 1024 * 1024
+    (d / "memory.max").write_text(f"{512 * mib}\n")
+    (d / "memory.current").write_text(f"{128 * mib}\n")
+    sampler = NodeResourceSampler()
+    sampler._cgroup = reader
+    snap = sampler.snapshot()
+    assert snap is not None
+    assert snap["mem_total_bytes"] == 512 * mib
+    assert snap["mem_used_bytes"] == 128 * mib
+    assert snap["mem_percent"] == pytest.approx(25.0)
+
+
+def test_node_sampler_snapshot_none_when_system_read_fails(monkeypatch,
+                                                           caplog):
+    def boom():
+        raise RuntimeError("proc read denied")
+
+    monkeypatch.setattr(resources.psutil, "virtual_memory", boom)
+    sampler = NodeResourceSampler()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        assert sampler.snapshot() is None
+    assert any("node resource sampling failed" in r.message
+               for r in caplog.records)
+
+
+def test_node_sampler_snapshot_survives_own_footprint_failure():
+    # the own-footprint read is best-effort: if it is denied the system-wide
+    # snapshot is still returned, just without the proc_* keys.
+    sampler = NodeResourceSampler()
+
+    class _BadSelf:
+        def memory_info(self):
+            raise RuntimeError("denied")
+
+        def cpu_percent(self, interval=None):
+            raise RuntimeError("denied")
+
+    sampler._proc = _BadSelf()
+    snap = sampler.snapshot()
+    assert snap is not None
+    assert "mem_total_bytes" in snap
+    assert "proc_rss_bytes" not in snap
+
+
+def test_node_sampler_overlay_cgroup_swallows_errors():
+    # a cgroup read that raises leaves the already-populated host-wide values
+    # untouched rather than propagating.
+    sampler = NodeResourceSampler()
+
+    class _BadCgroup:
+        available = True
+
+        def memory_limit(self):
+            raise RuntimeError("cgroup read blew up")
+
+    sampler._cgroup = _BadCgroup()
+    data = {
+        "cpu_percent": 3.0,
+        "cpu_count": 4,
+        "mem_percent": 2.0,
+        "mem_used_bytes": 1,
+        "mem_total_bytes": 999,
+    }
+    sampler._overlay_cgroup(data)
+    assert data["mem_total_bytes"] == 999  # unchanged by the failed overlay
+
+
+async def test_node_sampler_history_run_swallows_snapshot_error(monkeypatch,
+                                                                caplog):
+    sampler = NodeResourceSampler()
+    sampler._history = deque(maxlen=5)
+
+    def boom():
+        raise ValueError("snapshot blew up")
+
+    monkeypatch.setattr(sampler, "snapshot", boom)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await asyncio.wait_for(sampler._history_run(), timeout=5)
+    assert any("node history sampler stopped" in r.message
+               for r in caplog.records)

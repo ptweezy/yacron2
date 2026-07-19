@@ -18,12 +18,20 @@ Usage:
     python benchmarks/bench.py --quick              # roughly 10x smaller
     python benchmarks/bench.py --smoke              # minimal, for unit tests
     python benchmarks/bench.py --only cronexpr      # substring filter
+    python benchmarks/bench.py --tier inprocess     # skip the subprocess tier
     python benchmarks/bench.py --list               # list benchmarks
 
 Every timed benchmark returns the wall-clock seconds of a fixed workload
 (lower is better); memory benchmarks return MB.  Per-benchmark repeats give
 the distribution; compare.py uses each metric's declared estimator ("min" for
 time, "median" for memory) so one noisy repeat cannot fake a regression.
+
+To keep that estimator honest the harness works to lower the measurement
+noise floor: it runs untimed warm-up passes before the measured repeats, and
+(best-effort) pins itself to one CPU and raises its priority to cut scheduling
+jitter.  Benchmarks split into two tiers -- the fast in-process metrics and
+the noisier subprocess metrics (cold start, import, peak RSS) -- selectable
+with --tier so CI can give each its own round count.
 """
 
 import argparse
@@ -47,6 +55,13 @@ SCHEMA = 1
 _MODES = {"full": (1.0, 0), "quick": (0.1, 1), "smoke": (0.01, 2)}
 _MODE = "full"
 
+# Untimed warm-up passes per mode, discarded before the measured repeats: they
+# page in code and data and let the CPU reach a steady clock so first-call
+# effects never enter the distribution.  Smoke runs none, keeping the unit test
+# fast.  Overridable with --warmup.
+_WARMUPS = {"full": 1, "quick": 1, "smoke": 0}
+_WARMUP_OVERRIDE = None
+
 
 def _scale() -> float:
     return _MODES[_MODE][0]
@@ -58,6 +73,12 @@ def _n(base: int, floor: int = 1) -> int:
 
 def _reps(spec) -> int:
     return spec[_MODES[_MODE][1]]
+
+
+def _warmups() -> int:
+    if _WARMUP_OVERRIDE is not None:
+        return _WARMUP_OVERRIDE
+    return _WARMUPS[_MODE]
 
 
 class Skip(Exception):
@@ -116,13 +137,26 @@ def bench(
     group,
     detail="",
     unit="s",
-    gate_pct=25.0,
+    gate_pct=15.0,
     gate_floor=0.010,
     compare="min",
     repeats=(5, 2, 1),
     info=False,
+    subprocess=False,
 ):
-    """Register a benchmark.  The function returns one measured value."""
+    """Register a benchmark.  The function returns one measured value.
+
+    ``subprocess=True`` marks a benchmark that measures a child process (cold
+    start, import, peak RSS): it belongs to the noisier subprocess tier, which
+    ``--tier`` can select on its own so CI can run it with its own round count.
+
+    The default ``gate_pct`` (15%) suits the deterministic in-process compute
+    metrics, which are rock-steady across the five CI rounds; the noisier tiers
+    (subprocess process-spawn, real-disk state I/O, peak-RSS) set a looser
+    limit of their own so ordinary jitter never trips them.  A regression must
+    also clear the measured noise band regardless (see compare.py), so a tight
+    percentage does not mean a jumpy gate.
+    """
 
     def deco(fn):
         _BENCHMARKS.append(
@@ -136,6 +170,7 @@ def bench(
                 "compare": compare,
                 "repeats": repeats,
                 "info": info,
+                "subprocess": subprocess,
                 "fn": fn,
             }
         )
@@ -308,6 +343,7 @@ def _timed_child(args):
     detail="python -c pass",
     repeats=(40, 5, 1),
     info=True,
+    subprocess=True,
 )
 def bench_python_baseline():
     return _timed_child(["-c", "pass"])
@@ -317,7 +353,9 @@ def bench_python_baseline():
     "startup.version",
     "startup",
     detail="cronstable --version",
+    gate_pct=25.0,
     repeats=(40, 5, 2),
+    subprocess=True,
 )
 def bench_startup_version():
     return _timed_child(["-m", "cronstable", "--version"])
@@ -327,7 +365,9 @@ def bench_startup_version():
     "startup.import_cronexpr",
     "startup",
     detail="import cronstable.cronexpr",
+    gate_pct=25.0,
     repeats=(12, 3, 1),
+    subprocess=True,
 )
 def bench_import_cronexpr():
     return _timed_child(["-c", "import cronstable.cronexpr"])
@@ -337,7 +377,9 @@ def bench_import_cronexpr():
     "startup.import_config",
     "startup",
     detail="import cronstable.config",
+    gate_pct=25.0,
     repeats=(12, 3, 1),
+    subprocess=True,
 )
 def bench_import_config():
     return _timed_child(["-c", "import cronstable.config"])
@@ -347,7 +389,9 @@ def bench_import_config():
     "startup.import_daemon",
     "startup",
     detail="import cronstable.cron (full daemon graph)",
+    gate_pct=25.0,
     repeats=(12, 3, 1),
+    subprocess=True,
 )
 def bench_import_daemon():
     return _timed_child(["-c", "import cronstable.cron"])
@@ -357,7 +401,9 @@ def bench_import_daemon():
     "startup.validate_config_100",
     "startup",
     detail="cronstable --validate-config, 100 jobs",
+    gate_pct=25.0,
     repeats=(8, 2, 1),
+    subprocess=True,
 )
 def bench_validate_config():
     path = _config_path(_n(100))
@@ -368,7 +414,9 @@ def bench_validate_config():
     "startup.job_set_id_100",
     "startup",
     detail="cronstable --job-set-id, 100 jobs",
+    gate_pct=25.0,
     repeats=(8, 2, 1),
+    subprocess=True,
 )
 def bench_job_set_id_cli():
     path = _config_path(_n(100))
@@ -464,10 +512,15 @@ def bench_occurrences():
     return time.perf_counter() - t0
 
 
+# Rescaled (id bumped from the legacy cronexpr.test_match, which was ~7ms and
+# noise-dominated): ten passes over the 20k fixture put the timed region near
+# 70ms so scheduler/GC jitter is a small fraction.  The id carries the new
+# scale so the name keeps meaning one workload across releases; see
+# benchmarks/README.md.
 @bench(
-    "cronexpr.test_match",
+    "cronexpr.test_match_200k",
     "cronexpr",
-    detail="test() one instant against 20k tabs",
+    detail="test() one instant against 20k tabs, 10 passes (200k matches)",
 )
 def bench_test_match():
     tabs = fixture(
@@ -477,8 +530,9 @@ def bench_test_match():
         ),
     )
     t0 = time.perf_counter()
-    for tab in tabs:
-        tab.test(_NAIVE)
+    for _ in range(10):
+        for tab in tabs:
+            tab.test(_NAIVE)
     return time.perf_counter() - t0
 
 
@@ -636,10 +690,13 @@ def bench_next_fires():
     return time.perf_counter() - t0
 
 
+# Rescaled (id bumped from the legacy schedule.duplicates_5k, ~9ms and noisy):
+# its own 20k-entry fixture puts the timed region near 40ms.  Id carries the
+# new scale; see benchmarks/README.md.
 @bench(
-    "schedule.duplicates_5k",
+    "schedule.duplicates_20k",
     "schedule",
-    detail="duplicate_schedules over 5k entries",
+    detail="duplicate_schedules over 20k entries",
     repeats=(3, 2, 1),
 )
 def bench_duplicates():
@@ -647,7 +704,7 @@ def bench_duplicates():
         from cronstable.croninfo import duplicate_schedules
     except ImportError as exc:
         raise Skip("duplicate_schedules unavailable: %r" % exc) from None
-    entries = fixture("entries_5k", lambda: _schedule_entries(_n(5000)))
+    entries = fixture("entries_dup_20k", lambda: _schedule_entries(_n(20000)))
     t0 = time.perf_counter()
     duplicate_schedules(entries)
     return time.perf_counter() - t0
@@ -732,17 +789,20 @@ def bench_dag_layered():
     return time.perf_counter() - t0
 
 
+# Rescaled (id bumped from the legacy dag.plan_claim_2k, ~5ms): a 10k-task run
+# puts the timed transform near 25ms.  Id carries the new scale; see
+# benchmarks/README.md.
 @bench(
-    "dag.plan_claim_2k",
+    "dag.plan_claim_10k",
     "dag",
-    detail="plan_and_claim over a fresh 2k-task run",
+    detail="plan_and_claim over a fresh 10k-task run",
     repeats=(3, 2, 1),
 )
 def bench_dag_plan():
     dag = _dag_module()
     if not hasattr(dag, "new_run_body") or not hasattr(dag, "plan_and_claim"):
         raise Skip("dag planning API not present")
-    n = _n(2000)
+    n = _n(10000)
     tasks = [dag.TaskSpec(id="t%d" % i) for i in range(n)]
     spec = dag.DagSpec.build("wide", tasks)
     try:
@@ -763,6 +823,227 @@ def bench_dag_plan():
     t0 = time.perf_counter()
     transform(body)
     return time.perf_counter() - t0
+
+
+@bench(
+    "dag.finish_fanin_1k",
+    "dag",
+    detail="record 1k mapped-task completions to a run doc (durable)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.005,
+)
+def bench_dag_finish_fanin():
+    """A mapped fan-out's N instances finishing together.
+
+    Fixed workload -- record N task completions durably to one run document --
+    run the way this release records them: a single batched read-modify-write
+    (``mark_tasks_finished``) where that exists, else N separate ones
+    (``mark_task_finished``).  A release that batches pays one full-document
+    serialize + fsync instead of N, so the comparison surfaces exactly that.
+    """
+    import asyncio
+
+    dag = _dag_module()
+    if not hasattr(dag, "new_run_body") or not hasattr(
+        dag, "mark_task_finished"
+    ):
+        raise Skip("dag completion API not present")
+    n = _n(1000)
+    tasks = [dag.TaskSpec(id="t%d" % i) for i in range(n)]
+    spec = dag.DagSpec.build("d", tasks)
+    now = 1700000000.0
+    ns = dag.DAG_RUN_NS_PREFIX + "d"
+    run_key = "r"
+    batched = getattr(dag, "mark_tasks_finished", None)
+
+    def _running_body():
+        body = dag.new_run_body(
+            dag="d",
+            run_key=run_key,
+            run_id="rid",
+            logical_date=None,
+            kind="scheduled",
+            now=now,
+            spec=spec,
+        )
+        for task in tasks:
+            entry = body["tasks"][task.id]
+            entry["state"] = "running"
+            entry["proc"] = "p"
+            entry["attempt"] = 0
+        return body
+
+    async def run():
+        path = tempfile.mkdtemp(prefix="dagfin-", dir=_tmpdir())
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            body = _running_body()
+            await backend.mutate_document(
+                ns, run_key, lambda cur, b=body: (b, None)
+            )
+            if batched is not None:
+                marks = [
+                    {
+                        "taskkey": t.id,
+                        "success": True,
+                        "exit_code": 0,
+                        "fail_reason": None,
+                        "task": t,
+                        "jitter": 0.0,
+                        "expected_proc": "p",
+                        "expected_attempt": 0,
+                        "expected_poke": None,
+                        "resources": None,
+                    }
+                    for t in tasks
+                ]
+                t0 = time.perf_counter()
+                await backend.mutate_document(ns, run_key, batched(marks, now))
+                dt = time.perf_counter() - t0
+            else:
+                t0 = time.perf_counter()
+                for t in tasks:
+                    transform = dag.mark_task_finished(
+                        t.id,
+                        success=True,
+                        exit_code=0,
+                        fail_reason=None,
+                        now=now,
+                        task=t,
+                        expected_proc="p",
+                        expected_attempt=0,
+                    )
+                    await backend.mutate_document(ns, run_key, transform)
+                dt = time.perf_counter() - t0
+        finally:
+            await backend.stop()
+            shutil.rmtree(path, ignore_errors=True)
+        return dt
+
+    try:
+        return asyncio.run(run())
+    except TypeError as exc:
+        raise Skip("dag completion signature changed: %r" % exc) from None
+
+
+def _cron_cls():
+    try:
+        from cronstable.cron import Cron
+    except ImportError as exc:
+        raise Skip("cronstable.cron unavailable: %r" % exc) from None
+    return Cron
+
+
+async def _teardown_cron(cron):
+    """Best-effort release of a bench Cron's resources (no job API was started
+    here, so just the dag scheduler and the state backend)."""
+    import contextlib
+
+    dagsched = getattr(cron, "_dag", None)
+    if dagsched is not None and hasattr(dagsched, "shutdown"):
+        with contextlib.suppress(Exception):
+            await dagsched.shutdown()
+    backend = getattr(cron, "state_backend", None)
+    if backend is not None:
+        with contextlib.suppress(Exception):
+            await backend.stop()
+
+
+_BENCH_DAG_YAML = (
+    "dags:\n  - name: benchdag\n    tasks:\n"
+    "      - id: a\n        command: 'x'\n"
+)
+
+
+def _seeded_dag_runs():
+    """A dag namespace pre-seeded with terminal run documents, built once."""
+
+    def build():
+        import asyncio
+
+        from cronstable import dag
+
+        path = os.path.join(_tmpdir(), "dag-runs")
+        os.makedirs(path, exist_ok=True)
+        runs = _n(50)
+        ns = dag.DAG_RUN_NS_PREFIX + "benchdag"
+
+        async def seed():
+            backend = _state_backend(path)
+            await backend.start()
+            for i in range(runs):
+                body = {
+                    "dag": "benchdag",
+                    "runKey": "r%05d" % i,
+                    "runId": "id%d" % i,
+                    "state": "success",
+                    "kind": "scheduled",
+                    "createdAt": 1700000000.0 + i,
+                    "updatedAt": 1700000000.0 + i,
+                    "tasks": {},
+                    "mapped": {},
+                }
+                await backend.mutate_document(
+                    ns, "r%05d" % i, lambda cur, b=body: (b, None)
+                )
+            await backend.stop()
+
+        asyncio.run(seed())
+        return path
+
+    return fixture("seeded_dag_runs", build)
+
+
+@bench(
+    "dag.list_dags_warm",
+    "dag",
+    detail="list_dags steady poll over a dag with 50 terminal runs",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_dag_list_dags_warm():
+    """The /dags dashboard poll's rollup for one dag with many terminal runs.
+
+    A release that caches immutable terminal runs re-reads nothing on the
+    steady poll; one that re-reads every run document each call pays the full
+    scan every time -- the difference this steady-state measurement surfaces.
+    """
+    import asyncio
+
+    Cron = _cron_cls()
+    path = _seeded_dag_runs()
+    cfg = "state:\n  path: %s\n%s" % (
+        path.replace("\\", "/"),
+        _BENCH_DAG_YAML,
+    )
+
+    async def run():
+        try:
+            cron = Cron(None, config_yaml=cfg)
+        except TypeError as exc:
+            raise Skip("Cron signature changed: %r" % exc) from None
+        backend = _state_backend(path)
+        await backend.start()
+        cron.state_backend = backend
+        cron._state_configured = True
+        dagsched = getattr(cron, "_dag", None)
+        if dagsched is None or not hasattr(dagsched, "list_dags"):
+            await _teardown_cron(cron)
+            raise Skip("cron._dag.list_dags not present")
+        try:
+            await dagsched.list_dags()  # warm any terminal-run cache
+            t0 = time.perf_counter()
+            for _ in range(5):
+                await dagsched.list_dags()
+            dt = time.perf_counter() - t0
+        finally:
+            await _teardown_cron(cron)
+        return dt
+
+    return asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
@@ -951,6 +1232,170 @@ def bench_kv_roundtrip():
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _artifact_scope_churned():
+    """A store where one scope has had many artifact puts over a few names,
+    built once (untimed).  Newest-per-name is all any reader wants, so a
+    release that prunes superseded records at put time leaves a small stream
+    here while an older one accumulates every version -- the difference this
+    benchmark surfaces on the read side."""
+
+    def build():
+        import asyncio
+
+        from cronstable import jobstate
+
+        path = os.path.join(_tmpdir(), "artifact-churn")
+        os.makedirs(path, exist_ok=True)
+        n = _n(2000)
+        names = 8
+
+        async def seed():
+            backend = _state_backend(path)
+            await backend.start()
+            for i in range(n):
+                await jobstate.artifact_put(
+                    backend, "bench", "report-%d" % (i % names), b"payload"
+                )
+            await backend.stop()
+
+        asyncio.run(seed())
+        return path
+
+    return fixture("artifact_churned", build)
+
+
+@bench(
+    "state.artifact_list_churn",
+    "state",
+    detail="artifact_list after 2k puts over 8 names",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.005,
+)
+def bench_artifact_list_churn():
+    import asyncio
+
+    try:
+        from cronstable import jobstate
+    except ImportError as exc:
+        raise Skip("cronstable.jobstate unavailable: %r" % exc) from None
+    if not hasattr(jobstate, "artifact_put") or not hasattr(
+        jobstate, "artifact_list"
+    ):
+        raise Skip("jobstate artifact API not present")
+    path = _artifact_scope_churned()
+
+    async def run():
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            t0 = time.perf_counter()
+            for _ in range(10):
+                await jobstate.artifact_list(backend, "bench")
+            dt = time.perf_counter() - t0
+        except TypeError as exc:
+            raise Skip("artifact_list signature changed: %r" % exc) from None
+        await backend.stop()
+        return dt
+
+    return asyncio.run(run())
+
+
+_BENCH_GATE_YAML = (
+    "jobs:\n  - name: gated\n    command: 'x'\n"
+    "    schedule: '* * * * *'\n    onlyIfLastSucceeded: true\n"
+)
+
+
+def _seeded_run_ledger():
+    """A job's durable run ledger pre-seeded with success records, built once.
+    The newest is a real outcome, so a release that probes a small newest page
+    reads a few records where one reading the full window reads them all."""
+
+    def build():
+        import asyncio
+
+        Cron = _cron_cls()
+        path = os.path.join(_tmpdir(), "run-ledger")
+        os.makedirs(path, exist_ok=True)
+        n = max(_n(60), 2)
+        stream = Cron._run_stream("gated")
+
+        async def seed():
+            backend = _state_backend(path)
+            await backend.start()
+            for i in range(n):
+                await backend.append_record(
+                    stream,
+                    {
+                        "outcome": "success",
+                        "exit_code": 0,
+                        "started_at": None,
+                        "finished_at": "2026-07-01T10:%02d:%02d+00:00"
+                        % (i // 60, i % 60),
+                        "duration": None,
+                        "fail_reason": None,
+                    },
+                )
+            await backend.stop()
+
+        asyncio.run(seed())
+        return path
+
+    return fixture("seeded_run_ledger", build)
+
+
+@bench(
+    "state.depends_on_past_gate",
+    "state",
+    detail="onlyIfLastSucceeded gate read against a 60-record ledger",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_depends_on_past_gate():
+    """The onlyIfLastSucceeded fire gate's durable read.
+
+    The gate needs only the newest real outcome; a release that probes a small
+    newest page reads a few records, one that always materialises the full
+    RUN_HISTORY_LIMIT window reads them all -- what this measures, per fire.
+    """
+    import asyncio
+
+    Cron = _cron_cls()
+    path = _seeded_run_ledger()
+    cfg = "state:\n  path: %s\n%s" % (
+        path.replace("\\", "/"),
+        _BENCH_GATE_YAML,
+    )
+
+    async def run():
+        try:
+            cron = Cron(None, config_yaml=cfg)
+        except TypeError as exc:
+            raise Skip("Cron signature changed: %r" % exc) from None
+        if not hasattr(cron, "_depends_on_past_ok"):
+            raise Skip("_depends_on_past_ok not present")
+        job = cron.cron_jobs.get("gated")
+        if job is None:
+            raise Skip("gated job not configured")
+        backend = _state_backend(path)
+        await backend.start()
+        cron.state_backend = backend
+        cron._state_configured = True
+        try:
+            await cron._depends_on_past_ok(job)  # warm imports/paths
+            t0 = time.perf_counter()
+            for _ in range(20):
+                await cron._depends_on_past_ok(job)
+            dt = time.perf_counter() - t0
+        finally:
+            await _teardown_cron(cron)
+        return dt
+
+    return asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # json / fingerprint / redact / ical
 # ---------------------------------------------------------------------------
@@ -1117,6 +1562,218 @@ def bench_ical():
 
 
 # ---------------------------------------------------------------------------
+# tui: the terminal dashboard's per-frame string work.  The log drawer
+# re-measures, re-cuts and re-inks its whole buffer each frame, and the log
+# search re-scans it, so these functions -- text_width / cut_to_width /
+# rewrite_sgr / strip_ansi -- are the terminal UI's hottest per-frame cost
+# (and where the printable-ASCII fast paths live).  Measured in-process; no
+# terminal, no app loop.
+# ---------------------------------------------------------------------------
+
+
+def _tui_module():
+    try:
+        from cronstable import tui
+    except ImportError as exc:
+        raise Skip("cronstable.tui unavailable: %r" % exc) from None
+    return tui
+
+
+def _tui_log_lines(n):
+    """A realistic log buffer: coloured (SGR) lines, plain ASCII, a wide-glyph
+    line, and one carrying control characters -- the mix a real job emits."""
+    plain = "2026-07-18 12:00:%02d INFO worker %d processed batch in 12ms"
+    colored = (
+        "\x1b[32m2026-07-18 12:00:%02d\x1b[0m \x1b[1mworker %d\x1b[0m "
+        "\x1b[36mOK\x1b[0m done"
+    )
+    wide = "进度 %d%% ▕████████▏ 完了 \x1b[33mwarn\x1b[0m"
+    hostile = "line %d \x07\x08 spinner \r\x1b[2K progress"
+    out = []
+    for i in range(n):
+        r = i % 4
+        if r == 0:
+            out.append(colored % (i % 60, i))
+        elif r == 1:
+            out.append(plain % (i % 60, i))
+        elif r == 2:
+            out.append(wide % (i % 100))
+        else:
+            out.append(hostile % i)
+    return out
+
+
+@bench(
+    "tui.log_restyle_5k",
+    "tui",
+    detail="text_width + cut_to_width + rewrite_sgr over a 5k-line drawer",
+    repeats=(5, 2, 1),
+)
+def bench_tui_log_restyle():
+    tui = _tui_module()
+    for attr in ("text_width", "cut_to_width", "rewrite_sgr", "Theme"):
+        if not hasattr(tui, attr):
+            raise Skip("cronstable.tui lacks %s" % attr)
+    try:
+        theme = tui.Theme("carolina", False)
+    except Exception as exc:  # pragma: no cover - signature drift
+        raise Skip("tui.Theme construction failed: %r" % exc) from None
+    lines = fixture("tui_log_lines_5k", lambda: _tui_log_lines(_n(5000)))
+    width = 110
+    t0 = time.perf_counter()
+    for line in lines:
+        tui.text_width(line)
+        row = tui.cut_to_width(line, width)
+        tui.rewrite_sgr(row, theme)
+    return time.perf_counter() - t0
+
+
+@bench(
+    "tui.log_search_20k",
+    "tui",
+    detail="strip_ansi + substring match over a 20k-line drawer",
+    repeats=(5, 2, 1),
+)
+def bench_tui_log_search():
+    tui = _tui_module()
+    if not hasattr(tui, "strip_ansi"):
+        raise Skip("cronstable.tui lacks strip_ansi")
+    lines = fixture("tui_log_lines_20k", lambda: _tui_log_lines(_n(20000)))
+    needle = "worker"
+    t0 = time.perf_counter()
+    for line in lines:
+        tui.strip_ansi(line).lower().find(needle)
+    return time.perf_counter() - t0
+
+
+# ---------------------------------------------------------------------------
+# webui: the browser dashboard's render hot paths, timed inside a headless
+# Chromium via the page's ?perf=1 __perf hook.  The whole group skips unless
+# Playwright + its Chromium build are installed AND the page carries the hook
+# (an older release predates it), and never runs in --smoke (the unit test must
+# not launch a browser).  These are the client-side twins of the tui.* metrics.
+# ---------------------------------------------------------------------------
+
+
+def _web_page():
+    """Launch headless Chromium once and load the hooked dashboard page.
+
+    Cached for the whole webui group (torn down at interpreter exit); a missing
+    dependency, a failed launch, or a hookless page each raise Skip so the
+    metrics record as skipped, never failed.
+    """
+
+    def build():
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise Skip("playwright not installed: %r" % exc) from None
+        try:
+            import cronstable.web
+
+            page_path = os.path.join(
+                os.path.dirname(cronstable.web.__file__), "index.html"
+            )
+        except ImportError as exc:
+            raise Skip("cronstable.web unavailable: %r" % exc) from None
+        if not os.path.exists(page_path):
+            raise Skip("web/index.html not found next to cronstable.web")
+        try:
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch()
+        except Exception as exc:
+            raise Skip("chromium launch failed: %r" % exc) from None
+        atexit.register(lambda: (browser.close(), pw.stop()))
+        page = browser.new_page()
+        page.goto("file://" + page_path.replace("\\", "/") + "?perf=1")
+        page.wait_for_timeout(300)
+        if not page.evaluate("() => !!(window.__perf)"):
+            raise Skip("page lacks the ?perf=1 __perf hook (older release)")
+        return page
+
+    return fixture("web_page", build)
+
+
+def _web_time(page, setup_js, op_js, batch=10, batches=12):
+    """Min per-op wall time (seconds) of ``op_js`` after ``setup_js``.
+
+    Timed with the page's own ``performance.now()`` so only the render work is
+    measured, never the Python<->browser round trip.  Each batch times
+    ``batch`` ops together and divides -- Chromium clamps ``performance.now()``
+    to ~100us, so a single fast render reads as zero; a batch clears the clamp.
+    The MIN batch-mean over ``batches`` is the least-noisy statistic, matching
+    the suite's ``compare='min'``.
+    """
+    ms = page.evaluate(
+        "() => { %s; for (let w=0; w<2; w++) { %s; }"
+        " let best = Infinity;"
+        " for (let b=0; b<%d; b++) {"
+        "   const a = performance.now();"
+        "   for (let i=0; i<%d; i++) { %s; }"
+        "   best = Math.min(best, (performance.now() - a) / %d); }"
+        " return best; }" % (setup_js, op_js, batches, batch, op_js, batch)
+    )
+    return ms / 1000.0
+
+
+@bench(
+    "webui.render_rows_500",
+    "webui",
+    detail="renderRows full rebuild over 500 jobs (headless Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_render_rows():
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    return _web_time(
+        page,
+        "__perf.seedJobs(%d)" % _n(500),
+        "__perf.renderRows()",
+    )
+
+
+@bench(
+    "webui.render_fleet_15x400",
+    "webui",
+    detail="renderFleet full rebuild, 15 nodes x 400 jobs (headless Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_render_fleet():
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    return _web_time(
+        page,
+        "__perf.seedJobs(%d); __perf.seedFleet(15, %d)" % (_n(400), _n(400)),
+        "__perf.renderFleet()",
+    )
+
+
+@bench(
+    "webui.log_count_5k",
+    "webui",
+    detail="updateLogCount over a 5k-line buffer with a search (Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_log_count():
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    return _web_time(
+        page,
+        "__perf.seedLog(%d, 'worker')" % _n(5000),
+        "__perf.updateLogCount()",
+    )
+
+
+# ---------------------------------------------------------------------------
 # memory: deterministic traced allocations plus real child-process RSS.
 # ---------------------------------------------------------------------------
 
@@ -1215,6 +1872,7 @@ def _child_peak_rss_mb(args):
     gate_floor=3.0,
     compare="median",
     repeats=(5, 2, 1),
+    subprocess=True,
 )
 def bench_rss_version():
     return _child_peak_rss_mb(["-m", "cronstable", "--version"])
@@ -1229,6 +1887,7 @@ def bench_rss_version():
     gate_floor=3.0,
     compare="median",
     repeats=(5, 2, 1),
+    subprocess=True,
 )
 def bench_rss_daemon():
     return _child_peak_rss_mb(["-c", "import cronstable.cron"])
@@ -1265,7 +1924,21 @@ def _run_one(spec):
     reps = _reps(spec["repeats"])
     values = []
     error = None
-    for _ in range(reps):
+    # Untimed warm-up passes, discarded: page in code/data and let the CPU
+    # settle so first-call effects never land in the measured distribution.  A
+    # warm-up that raises the same Skip/error the measured pass would raise
+    # short-circuits to the skip path without running the timed loop.
+    for _ in range(_warmups()):
+        gc.collect()
+        try:
+            spec["fn"]()
+        except Skip as exc:
+            error = str(exc)
+            break
+        except Exception as exc:
+            error = "error: %r" % exc
+            break
+    for _ in range(reps if error is None else 0):
         gc.collect()
         gc_was_enabled = gc.isenabled()
         gc.disable()
@@ -1323,8 +1996,49 @@ def _fmt(value, unit):
     return "%.3f s" % value
 
 
+def _stabilize():
+    """Best-effort: pin to one CPU and raise priority to cut scheduling jitter.
+
+    Every step is optional and independently guarded: a platform (or a runner
+    without the privilege) that refuses one simply runs without it.  Pinning
+    the parent also pins the children it spawns, so the startup-tier subprocess
+    timings inherit the same steady core.  Returns the labels applied, for the
+    result document's provenance.
+    """
+    applied = []
+    try:
+        import psutil
+
+        proc = psutil.Process()
+        ncpu = os.cpu_count() or 1
+        try:
+            if ncpu >= 2 and hasattr(proc, "cpu_affinity"):
+                core = ncpu - 1
+                proc.cpu_affinity([core])
+                applied.append("affinity=cpu%d" % core)
+        except Exception:
+            pass
+        try:
+            if sys.platform == "win32":
+                proc.nice(psutil.HIGH_PRIORITY_CLASS)
+                applied.append("priority=high")
+            else:
+                os.nice(-5)  # needs CAP_SYS_NICE; ignored where unavailable
+                applied.append("nice=-5")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    if applied:
+        print(
+            "note: perf environment pinned: %s" % ", ".join(applied),
+            file=sys.stderr,
+        )
+    return applied
+
+
 def main(argv=None):
-    global _MODE
+    global _MODE, _WARMUP_OVERRIDE
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", help="write results to this JSON file")
     parser.add_argument(
@@ -1340,10 +2054,32 @@ def main(argv=None):
         help="run benchmarks whose name or group contains this substring",
     )
     parser.add_argument(
+        "--tier",
+        choices=["all", "inprocess", "subprocess"],
+        default="all",
+        help="run only the in-process tier or only the subprocess "
+        "(startup / peak-RSS) tier; the two have different noise profiles "
+        "and CI runs them with different round counts",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        metavar="N",
+        help="override the per-mode untimed warm-up passes (default: "
+        "1 full/quick, 0 smoke)",
+    )
+    parser.add_argument(
+        "--no-stabilize",
+        action="store_true",
+        help="do not pin CPU affinity or raise process priority",
+    )
+    parser.add_argument(
         "--list", action="store_true", help="list benchmarks and exit"
     )
     args = parser.parse_args(argv)
     _MODE = "smoke" if args.smoke else "quick" if args.quick else "full"
+    _WARMUP_OVERRIDE = args.warmup
     _ensure_importable()
 
     if args.list:
@@ -1354,20 +2090,43 @@ def main(argv=None):
             )
         return 0
 
+    def _in_tier(spec):
+        if args.tier == "all":
+            return True
+        return bool(spec.get("subprocess")) == (args.tier == "subprocess")
+
     selected = [
         spec
         for spec in _BENCHMARKS
-        if not args.only
-        or any(s in spec["name"] or s in spec["group"] for s in args.only)
+        if _in_tier(spec)
+        and (
+            not args.only
+            or any(s in spec["name"] or s in spec["group"] for s in args.only)
+        )
     ]
     if not selected:
-        print("no benchmark matches %r" % (args.only,), file=sys.stderr)
+        print(
+            "no benchmark matches %r (tier=%s)" % (args.only, args.tier),
+            file=sys.stderr,
+        )
         return 2
 
+    stabilized = [] if args.no_stabilize else _stabilize()
     meta = _cronstable_meta()
     started = time.perf_counter()
     results = []
+    prev_group = None
     for spec in selected:
+        # Release the finished group's fixtures before starting the next one.
+        # Fixtures are large (100k CronTabs, 100k-job configs) and keyed within
+        # a group; without this the cache held the UNION of every group's
+        # fixtures resident for the whole suite. Benchmarks are registered
+        # grouped, so a group change is a safe eviction boundary (a fixture a
+        # later group still needs is simply rebuilt, untimed).
+        if prev_group is not None and spec["group"] != prev_group:
+            _FIX.clear()
+            gc.collect()
+        prev_group = spec["group"]
         result = _run_one(spec)
         results.append(result)
         if result["skipped"]:
@@ -1381,6 +2140,9 @@ def main(argv=None):
     doc = {
         "schema": SCHEMA,
         "mode": _MODE,
+        "tier": args.tier,
+        "warmups": _warmups(),
+        "stabilized": stabilized,
         "cronstable_version": meta["version"],
         "orjson": meta["orjson"],
         "python": _platform.python_version(),

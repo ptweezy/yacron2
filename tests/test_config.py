@@ -7,6 +7,7 @@ from cronstable import config
 from cronstable.config import (
     DEFAULT_CONFIG,
     ConfigError,
+    DagConfig,
     JobConfig,
     mergedicts,
     parse_config_string,
@@ -1412,3 +1413,45 @@ def test_parse_config_dir_records_oserror(tmp_path, monkeypatch):
     # the collected per-file errors surface as one aggregate ConfigError
     with pytest.raises(ConfigError, match="disk on fire"):
         config.parse_config(str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# dag + state/etcd builder error branches
+# ---------------------------------------------------------------------------
+
+
+def test_dag_task_wraps_job_template_config_error():
+    # a launch field that JobConfig rejects (executionTimeout must be > 0)
+    # surfaces wrapped with the dag/task context, not as a bare Job error.
+    with pytest.raises(ConfigError, match=r"dag 'd': task 't1':"):
+        DagConfig(
+            {
+                "name": "d",
+                "tasks": [
+                    {"id": "t1", "command": "true", "executionTimeout": 0}
+                ],
+            }
+        )
+
+
+def test_dag_requires_at_least_one_task():
+    with pytest.raises(ConfigError, match="needs at least one task"):
+        DagConfig({"name": "d", "tasks": []})
+
+
+def test_state_jobapi_listen_invalid_port_rejected():
+    # a listen authority whose port is out of range makes urlparse.port raise
+    # ValueError; the state builder turns that into a clean ConfigError instead
+    # of letting it escape and permanently disable the loopback endpoint.
+    with pytest.raises(ConfigError, match="invalid port"):
+        parse_config_string(
+            "state:\n  path: /x\n  jobApi:\n    listen: 127.0.0.1:70000\n", ""
+        )
+
+
+def test_etcd_endpoints_must_be_non_empty():
+    # an etcd cluster with an empty endpoints list has nothing to talk to.
+    with pytest.raises(ConfigError, match="at least one URL"):
+        config._build_etcd_cluster_config(
+            {"backend": "etcd", "nodeName": "node-a", "etcd": {"endpoints": []}}
+        )

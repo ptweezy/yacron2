@@ -5,6 +5,197 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.25 (2026-07-19)
+
+A bounding and hardening release.  The previous two passes made the hot
+paths cheap; this one puts ceilings on the paths that had none, so a
+fleet's worst minute is bounded rather than merely fast on a good one.
+The batching work lands where a fan-out finishes all at once, the
+ceilings land where a queue or a stream could previously grow with the
+workload, and the benchmark harness learns to tell a real regression
+from runner noise.  All figures below are from an A/B benchmark of this
+release against 1.2.24 on the same machine, interleaved rounds, with the
+scenario sizes noted per figure.
+
+### DAG completions land in one write per flush
+
+- **A mapped fan-in used to pay a full run-document rewrite per finished
+  task**: each completion took its own locked read-modify-write and fsync
+  of the whole document and its own graph advance, so a thousand
+  instances finishing together cost a thousand of each.  Completions are
+  now buffered while the reaper drains a batch and applied through one
+  batched transform per run, followed by a single advance for the whole
+  batch.  Every mark keeps its own proc-token, attempt and poke fences
+  and applies against only its own task entry, so a superseded or
+  duplicate completion is still dropped on its own while the rest of the
+  batch lands.  Finishing a 1,000-instance fan-in dropped from 13.3s to
+  12.7ms.
+- **A completion is now durable at the next reaper flush rather than
+  the instant the task is reaped.**  A crash inside that window leaves
+  the task's entry reading `RUNNING`; boot reconciliation recovers it by
+  pid liveness exactly as it recovers a task the daemon died while
+  running, so no outcome is lost, but the recovery path is
+  reconciliation rather than the record itself.
+- **`/dags` stops re-parsing finished runs.**  The rollup listed and
+  fully parsed every retained run document of every dag on every call,
+  which a three-second dashboard poll repeated forever.  Run terminality
+  is monotonic, so each terminal run's summary is now cached and the
+  rollup reads only keys plus the documents that are new or still
+  running, falling back to a single bulk sweep past
+  `DAG_ROLLUP_BULK_THRESHOLD` (8) unread documents or on a backend with
+  no keys-only listing.  A warm rollup dropped from 11.1ms to 1.7ms.
+
+### Queues and streams gain ceilings
+
+- **A live-log subscriber can no longer pin a run's whole output.**  The
+  1,000-line ring buffer bounded what the dashboard showed but not what
+  a subscriber's delivery queue held, so one stalled SSE viewer (a
+  backgrounded tab, a full TCP window) accumulated every line the job
+  ever wrote.  Subscriber queues are now bounded at
+  `LIVE_LOG_SUBSCRIBER_QUEUE_LIMIT` (8,192 lines, ample headroom over
+  the ring) and overflow drops the oldest queued line, so a viewer that
+  falls behind keeps receiving current output instead of a growing
+  backlog.  A viewer more than 8,192 lines behind now misses lines in
+  its live tail; captured output, archived runs and failure reports are
+  unaffected, and a reconnect re-snapshots the ring.  The number of
+  lines dropped this way is counted per stream.
+- **Artifact and XCom streams bound to their distinct names.**  A put
+  appended a record and superseded versions accumulated until the job
+  was garbage collected, so a job republishing one name every minute
+  grew its stream without limit.  Appends now carry a name-keyed prune
+  that keeps the newest record per name and drops the superseded ones,
+  amortised on the same one-in-eight cadence as the existing bounded
+  prune, with the orphaned blobs reclaimed by the next sweep.  Only the
+  newest record per name was ever readable, so nothing that was
+  reachable becomes unreachable, but the older records are now deleted
+  rather than retained, and the first put per stream after upgrade
+  prunes the history already accumulated.  Listing a 1,000-put stream
+  of ten names dropped from 820ms to 9.2ms.
+- **An over-range cron field costs O(1) instead of an allocation.**
+  Enumerating a field materialised its whole range before checking any
+  value, so `1-2000000000` allocated billions of integers before the
+  first bound check could reject it, which also defeated the promise
+  that an unparseable schedule degrades to prose rather than failing.
+  Enumeration is lazy and raises on the first out-of-range value; every
+  schedule that parsed before yields identical values.
+
+### A dependency gate reads a probe page
+
+- **`onlyIfLastSucceeded` materialised the full 50-record history
+  window on every scheduled fire** to find an outcome that is almost
+  always in the newest few records.  It now probes the newest
+  `DEPENDS_GATE_PROBE` (8) records and widens to the full window only
+  when the probe came back full and held nothing but cancellations and
+  skips, so the skip window is preserved exactly.  Evaluating the gate
+  dropped from 64.8ms to 33.3ms.
+
+### The CLI stops importing what it will not run
+
+- **Every job-spawned thin client paid for the terminal dashboard.**
+  Registering `cronstable mcp` and `cronstable tui` imported their
+  modules, and importing the TUI runs a 7,000-line module body and
+  pulls in `unicodedata`'s C table.  Every `cronstable state get`,
+  `lock` and `xcom pull` a job runs builds that parser first, so two
+  commands almost never invoked taxed the ones invoked constantly.
+  Both subcommands now register as stubs and import their real modules
+  only when dispatched, with a parity test holding the stub flags
+  in lockstep with the real definitions.  `cronstable --version` fell
+  from 128ms to 113ms, and against the interpreter's own floor
+  cronstable's share of it fell from 108ms to 93ms.
+
+### The dashboard paints only what changed
+
+- **The fleet matrix rebuilt its nodes-by-jobs grid on every poll.**
+  Relative ages moved out of the built markup into spans the
+  once-a-second tick refreshes, which lets the render skip the whole
+  `innerHTML` rebuild and reflow when the payload, the failures-only
+  filter and the owner set are all unchanged.
+- **Log search match counts update incrementally** as lines arrive
+  instead of rescanning the buffer, with a full rescan only when the
+  query itself changes.
+- **A hidden tab stops polling.**  A backgrounded viewer kept the
+  daemon serving its full jobs, cluster and dags fan-out every interval
+  forever; polling now pauses while the tab is hidden and resyncs once
+  immediately on return rather than waiting out an interval.
+
+### Untrusted text stops reaching wire formats verbatim
+
+- **DAG task ids reject control characters.**  An id reaches log sinks
+  and durable keys verbatim, so an embedded CR or LF could forge or
+  split daemon log lines.  The C0 range and DEL are now refused at
+  config load; the printable set is unchanged.
+- **A statsd prefix cannot inject samples.**  CR, LF, `:` and `|` are
+  stripped from the configured prefix, none of which is legal in a
+  statsd metric name, so a working prefix is unchanged.
+- **Prometheus label values escape CR** as well as LF, backslash and
+  quote.  LF remains the only line delimiter, but a raw CR inside a
+  quoted value is not valid in the exposition grammar and can confuse
+  strict scrapers.
+- **Blob digests are validated before they become paths.**  A digest is
+  content-addressed lowercase sha256 hex by construction; anything else
+  is now refused rather than joined into a filesystem path, so a
+  crafted `sha256` field in a restored archive cannot escape the blob
+  directory.
+
+### The benchmark gate learns what noise looks like
+
+- **A regression must now clear the measurement's own scatter to gate.**
+  Each side's round-to-round coefficient of variation is estimated (from
+  three rounds up, by a median absolute deviation, so one throttled
+  round cannot inflate the band and hide a real regression behind it),
+  the two sides are combined in quadrature, and a change over its
+  declared limit gates only if it also exceeds two of those bands.
+  Unknown scatter never suppresses, so the guard can only make the gate
+  more conservative.  Suppressed changes are reported rather than
+  silently dropped, and every metric's band is shown alongside its
+  delta.
+- **Benchmarks split into two tiers with their own round counts.**  The
+  cheap deterministic in-process metrics run five rounds per side, which
+  tightens the noise estimate they are judged against; the nine
+  subprocess metrics (cold start, imports, peak RSS) run two, since each
+  round spawns processes.
+- **Startup metrics are gated on cronstable's own share.**  Each side's
+  measured interpreter floor is subtracted before the delta is computed,
+  so a change is judged against the part cronstable controls rather than
+  diluted by process spawn and interpreter init.  Displayed values stay
+  the raw totals.
+- **Nine benchmarks were added and three rescaled**, covering the DAG
+  fan-in and claim paths, the artifact stream, the dependency gate, the
+  TUI's log restyle and search, and the schedule duplicate scan.  Three
+  more time the web dashboard's row, fleet and log-count renders in a
+  headless browser through a `?perf=1` hook that is inert without it;
+  these are recorded rather than gated.
+- **Regression labels no longer fall outside the chart.**  A large
+  improvement clamped to the axis put its percentage label on top of the
+  metric-name gutter; a label that will not fit outside its bar is now
+  drawn inside the bar's end, in a near-black that clears contrast
+  against both fills in light and dark themes.
+
+### Build, test and release plumbing
+
+- **The repository is LF-only and CI enforces it.**  `.gitattributes`
+  now stores and checks out every text file with LF on all platforms
+  including Windows under `core.autocrlf=true`, images are declared
+  binary, and a static-analysis step fails the build if a CRLF or
+  mixed-ending blob ever reaches the index.
+- **The coverage floor rises from 85% to 90%**, against a measured
+  91.9% on the lowest matrix cell, and the suite grows by roughly 336
+  tests (about 7,300 lines) covering the filesystem state backend's
+  garbage collection, migration, blob and lease internals, the DAG
+  state machine and scheduler, the web payload builders and state
+  inspector, cluster gossip and leadership renewal, resource sampling,
+  the CLI entry point and cron parsing edge cases.
+- **Images and binaries shed dead weight.**  The eight container builds
+  uninstall pip from the virtualenv after the last step that needs it,
+  removing 11.4MB per image, and the frozen binary excludes sixteen
+  stdlib modules it never loads (GUI toolkits, curses, readline,
+  sqlite3 and the developer stdlib), removing a further 172KB.
+- **`winget` manifest updates are temporarily warning-only**, since
+  `wingetcreate update` bumps an existing manifest and cannot succeed
+  until the initial submission merges into `microsoft/winget-pkgs`.
+- Build tooling moves to uv 0.11.29 and
+  `pypa/gh-action-pypi-publish` 1.14.1.
+
 ## 1.2.24 (2026-07-18)
 
 A second performance pass, aimed at the work a fleet repeats continuously:

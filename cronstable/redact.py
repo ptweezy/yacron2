@@ -176,6 +176,8 @@ def _pem_state_after(line: str, in_pem: bool) -> bool:
     marker *presence* mis-ordered exactly those lines and leaked the second
     key's whole base64 body.
     """
+    if "-----" not in line:  # cheap gate, parallel to redact_secrets
+        return in_pem
     pos = 0
     while True:
         marker = _PEM_END if in_pem else _PEM_BEGIN

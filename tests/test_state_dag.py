@@ -1133,6 +1133,15 @@ def test_dag_task_id_charset_rejected():
         )
     with pytest.raises(dag.DagValidationError, match="may not contain"):
         dag.validate_graph(DagSpec.build("d", [TaskSpec("a#0")]))
+    # a CR/LF (or other control char) in an id would forge daemon log lines
+    for bad in ("a\nb", "a\rb", "a\tb"):
+        with pytest.raises(
+            dag.DagValidationError, match="control characters"
+        ):
+            dag.validate_graph(DagSpec.build("d", [TaskSpec(bad)]))
+    # but only control chars are rejected: printable ids (space, ':', '.',
+    # '-') are still accepted, so the fix narrows nothing operators may use.
+    dag.validate_graph(DagSpec.build("d", [TaskSpec("a b.c-d:e")]))
 
 
 # --------------------------------------------------------------------------

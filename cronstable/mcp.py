@@ -109,6 +109,10 @@ def _dumps(obj: Any) -> bytes:
         return _stdlib_json.dumps(obj, default=str).encode("utf-8")
 
 
+# Prometheus exposition line: metric name, optional {labels}, then a value.
+_METRIC_LINE_RE = re.compile(r"^([A-Za-z_:][\w:]*)(\{[^}]*\})?\s+(\S+)")
+
+
 def _parse_prometheus(
     text: str, match: Optional[str], limit: int
 ) -> Tuple[List[Dict[str, Any]], int]:
@@ -118,7 +122,6 @@ def _parse_prometheus(
     HELP/TYPE comment lines are skipped and values are kept as strings so a
     ``NaN`` / ``+Inf`` gauge round-trips untouched.
     """
-    line_re = re.compile(r"^([A-Za-z_:][\w:]*)(\{[^}]*\})?\s+(\S+)")
     needle = match.lower() if match else None
     samples: List[Dict[str, Any]] = []
     total = 0
@@ -126,7 +129,7 @@ def _parse_prometheus(
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        m = line_re.match(line)
+        m = _METRIC_LINE_RE.match(line)
         if m is None:
             continue
         name = m.group(1)

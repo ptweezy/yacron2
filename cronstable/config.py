@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -3163,7 +3164,7 @@ def _validate_dags(config: CronstableConfig) -> None:
     if not config.dags:
         return
     names = [d.name for d in config.dags]
-    dups = sorted({n for n in names if names.count(n) > 1})
+    dups = sorted(n for n, c in Counter(names).items() if c > 1)
     if dups:
         raise ConfigError("duplicate dag name(s): {}".format(", ".join(dups)))
     # Each task's launch template is named '<dag>.<taskId>' and shares the

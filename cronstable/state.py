@@ -965,6 +965,15 @@ class FilesystemStateBackend(StateBackend):
         directory never grows to a single flat directory of millions of
         entries (which some filesystems handle poorly).
         """
+        # A legitimate digest is content-addressed sha256 hex (lowercase, 64
+        # chars; see put_blob's hashlib.sha256(...).hexdigest()). Reject
+        # anything else before it reaches the filesystem so a crafted digest
+        # (e.g. a "sha256" field from a malicious restore archive) cannot
+        # escape the blob directory via ".." or a path separator.
+        if len(digest) != 64 or any(
+            c not in "0123456789abcdef" for c in digest
+        ):
+            raise ValueError("invalid blob digest: {!r}".format(digest))
         return os.path.join(self.base, BLOBS_DIR, digest[:2], digest + ".blob")
 
     def _next_seq(self) -> int:

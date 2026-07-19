@@ -183,6 +183,8 @@ def render_calendar(
                 _runtime_phrase(entry.avg_duration)
             )
         uid_ns = hashlib.sha256(entry.name.encode("utf-8")).hexdigest()[:12]
+        summary = _escape(entry.name)
+        desc = _escape(description)
         count = 0
         truncated = False
         for fire in entry.tab.occurrences(start.astimezone(zone)):
@@ -201,8 +203,8 @@ def render_calendar(
                     "DTSTAMP:" + dtstamp,
                     "DTSTART:" + stamp,
                     "DURATION:" + duration,
-                    "SUMMARY:" + _escape(entry.name),
-                    "DESCRIPTION:" + _escape(description),
+                    "SUMMARY:" + summary,
+                    "DESCRIPTION:" + desc,
                     "STATUS:CONFIRMED",
                     "TRANSP:TRANSPARENT",
                     "END:VEVENT",
@@ -213,9 +215,7 @@ def render_calendar(
             # raw ';' inside a TEXT value is illegal per RFC 5545, and the
             # job name (the value) must stay unambiguous
             lines.append(
-                "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(
-                    per_job_cap, _escape(entry.name)
-                )
+                "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(per_job_cap, summary)
             )
     lines.append("END:VCALENDAR")
     return _CRLF.join(_fold(line) for line in lines) + _CRLF

@@ -195,6 +195,16 @@ def validate_graph(spec: DagSpec) -> None:
             raise DagValidationError(
                 "task id {!r} may not contain '#' or '/'".format(task.id)
             )
+        # The id reaches %s log sinks and durable keys verbatim, so a control
+        # character (CR/LF) could forge or split daemon log lines. Reject the
+        # C0 range and DEL here (the docstring already promises a safe
+        # charset) without narrowing the printable set configs may rely on.
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in task.id):
+            raise DagValidationError(
+                "task id {!r} may not contain control characters".format(
+                    task.id
+                )
+            )
         if task.id in seen:
             raise DagValidationError("duplicate task id {!r}".format(task.id))
         seen[task.id] = task

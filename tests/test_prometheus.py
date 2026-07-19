@@ -59,6 +59,9 @@ def sample_value(text, name, **labels):
 
 def test_escape_label_value():
     assert escape_label_value('a"b\\c\nd') == 'a\\"b\\\\c\\nd'
+    # a carriage return is escaped too: a raw CR is not valid inside a quoted
+    # label value in the OpenMetrics exposition grammar.
+    assert escape_label_value("a\rb") == "a\\rb"
 
 
 def test_format_value():

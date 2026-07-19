@@ -92,8 +92,16 @@ PEER_STATUSES = (
 
 
 def escape_label_value(value: str) -> str:
-    """Escape a label value per the exposition formats (\\, ", newline)."""
-    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+    """Escape a label value per the exposition formats (\\, ", CR, LF)."""
+    # Escape CR as well as LF. A raw carriage return inside a quoted label
+    # value is not valid in the OpenMetrics exposition grammar and can
+    # confuse strict scrapers, though LF is the only line delimiter.
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace('"', '\\"')
+    )
 
 
 def escape_help(text: str, openmetrics: bool = False) -> str:

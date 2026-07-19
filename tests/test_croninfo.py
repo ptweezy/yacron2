@@ -706,6 +706,23 @@ def test_field_values_wraps_a_descending_range():
     assert _field_values("fri-mon", 0, 6, _DOW_NAMES) == [0, 1, 5, 6]
 
 
+def test_field_values_rejects_a_huge_range_without_materializing():
+    # "1-2000000000" must degrade (raise, caught upstream as Custom prose)
+    # rather than build list(range(...)) of billions of ints.  The lazy
+    # iteration raises on the first out-of-range value, so this returns at
+    # once instead of exhausting memory -- if it ever materialized the list
+    # the test would hang/OOM rather than fail.
+    with pytest.raises(ValueError, match="out of range"):
+        _field_values("1-2000000000", 0, 59)
+
+
+def test_field_values_stepped_range_over_ceiling_stays_accepted():
+    # a stepped range whose declared end exceeds the field ceiling but whose
+    # only in-step value is within range stays accepted: lazy iteration must
+    # preserve the exact accept/reject decision the list(range(...)) form had.
+    assert _field_values("1-100/1000", 0, 59) == [1]
+
+
 # --- the special-form splitters degrade malformed input to Custom prose
 
 

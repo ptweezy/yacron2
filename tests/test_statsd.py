@@ -89,3 +89,17 @@ async def test_job_stopped_is_a_noop_before_started(monkeypatch):
     writer = StatsdJobMetricWriter("host", 8125, "app.job", _FakeJob())
     await writer.job_stopped()  # start_time is None
     assert recorder.calls == []
+
+
+async def test_prefix_metacharacters_are_stripped(monkeypatch):
+    # a configured prefix carrying statsd wire metacharacters (newline, ':',
+    # '|') must not be able to forge or inject extra samples into the datagram
+    recorder = _SendRecorder()
+    monkeypatch.setattr("cronstable.statsd.send_to_statsd", recorder)
+    writer = StatsdJobMetricWriter(
+        "host", 8125, "evil\nother.metric:0|g", _FakeJob()
+    )
+    assert writer.prefix == "evilother.metric0g"  # metachars removed
+    await writer.job_started()
+    # only the sanitised prefix reaches the wire; no injected extra line
+    assert recorder.calls[-1][2] == "evilother.metric0g.start:1|g\n"

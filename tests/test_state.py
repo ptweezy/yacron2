@@ -903,14 +903,22 @@ async def test_record_run_noop_without_backend():
 
 
 async def test_prune_on_append_bounds_ledger(tmp_path):
+    from cronstable.state import _PRUNE_EVERY_APPENDS
+
     cron = Cron(None, config_yaml=_ONE_JOB)
     cfg = _state_cfg(
         "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 3\n"
     )
     await cron.start_stop_state(cfg)
-    for i in range(6):
+    # the prune folded into the append is amortised: it actually runs on the
+    # first append of a stream and then every K-th, so the stream may briefly
+    # exceed the bound by up to K-1 records but never more.
+    for i in range(_PRUNE_EVERY_APPENDS + 1):
         cron._record_run("j", _info(i))
         await _drain_state_writes(cron)  # sequential -> deterministic bound
+        recs = await cron.state_backend.list_records(cron._run_stream("j"))
+        assert len(recs) <= 3 + _PRUNE_EVERY_APPENDS - 1
+    # the last append crossed the amortisation cadence: the bound is enforced
     recs = await cron.state_backend.list_records(cron._run_stream("j"))
     assert len(recs) == 3
 
@@ -1426,12 +1434,16 @@ async def test_no_archive_without_flag(tmp_path):
 
 
 async def test_archive_output_pruned_to_max(tmp_path):
+    from cronstable.state import _PRUNE_EVERY_APPENDS
+
     cron = Cron(None, config_yaml=_archive_yaml(archive=True))
     cfg = _state_cfg(
         "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 2\n"
     )
     await cron.start_stop_state(cfg)
-    for i in range(4):
+    # one past the amortisation cadence, so the folded prune has run again
+    # on the archive stream (see test_prune_on_append_bounds_ledger).
+    for i in range(_PRUNE_EVERY_APPENDS + 1):
         cron._record_run("j", _info_with_output([("stdout", "run %d" % i)]))
         await _drain_state_writes(cron)
     logs = await cron.state_backend.list_records(cron._log_stream("j"))

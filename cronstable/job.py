@@ -80,6 +80,15 @@ LIVE_LOG_LIMIT = 1000
 # once) by jobs that would then lose output they had already produced.
 KILLED_STREAM_DRAIN_TIMEOUT = 30.0
 
+# Overall bound on one mail report's SMTP conversation (connect, STARTTLS,
+# login, send). aiosmtplib's own default is 60 seconds PER OPERATION, so a
+# black-holed or tar-pitting SMTP server could hold a report for several
+# minutes with no explicit bound; the report runs inside the job's completion
+# sequence, so that would also hold up the same job's retry arming. Generous
+# for any healthy server; on expiry the report is logged as failed and the
+# socket released.
+MAIL_REPORT_TIMEOUT = 60.0
+
 
 class JobOutputStream:
     """In-memory, broadcastable view of a job run's captured output.
@@ -157,6 +166,10 @@ class StreamReader:
         # called with (stream_name, line) for each line read, so a live viewer
         # (the web UI) can tail output as the job produces it.
         self.on_line = on_line
+        # lines awaiting one batched passthrough write to the daemon's own
+        # stdout/stderr; flushed once per drained read (see _queue_emit).
+        self._emit_buffer: List[str] = []
+        self._emit_scheduled = False
         self._reader = asyncio.create_task(self._read(stream))
         self.discarded_lines = 0
 
@@ -171,12 +184,48 @@ class StreamReader:
             out_stream.write(safe)
         out_stream.flush()
 
+    def _flush_emit_buffer(self) -> None:
+        self._emit_scheduled = False
+        if not self._emit_buffer:
+            return
+        text = "".join(self._emit_buffer)
+        self._emit_buffer.clear()
+        out = sys.stdout if self.stream_name == "stdout" else sys.stderr
+        try:
+            self._emit(out, text)
+        except (OSError, ValueError):
+            # The daemon's own stdout/stderr is broken or closed (a dead
+            # pipe consumer). The passthrough copy is best-effort; the
+            # capture buffers and live-tail publish above are unaffected,
+            # so log once per batch and keep reading the job's output.
+            logger.warning(
+                "job %s: could not mirror %s to the daemon's own stream",
+                self.job_name,
+                self.stream_name,
+                exc_info=True,
+            )
+
+    def _queue_emit(self, out_line: str) -> None:
+        # One write+flush per DRAINED READ, not per line: readline() completes
+        # without suspending while earlier reads left complete lines buffered,
+        # so a flush scheduled with call_soon runs only once the read loop
+        # actually blocks for new data, by which point every line of the
+        # burst is in the buffer and goes out as a single write. Per line the
+        # old inline emit cost two blocking syscalls ON THE EVENT LOOP THREAD,
+        # and with the daemon's stdout pipe full it stalled the entire loop
+        # once per line.
+        self._emit_buffer.append(out_line)
+        if not self._emit_scheduled:
+            self._emit_scheduled = True
+            asyncio.get_running_loop().call_soon(self._flush_emit_buffer)
+
     async def _read(self, stream):
         prefix = self.stream_prefix.format(
             job_name=self.job_name, stream_name=self.stream_name
         )
         limit_top = self.save_limit // 2
         limit_bottom = self.save_limit - limit_top
+        passthrough = self.stream_name in ("stdout", "stderr")
         while True:
             try:
                 # errors="replace" so a job emitting non-UTF-8 bytes does not
@@ -190,14 +239,14 @@ class StreamReader:
                 )
                 continue
             if not line:
+                # EOF: push out whatever the last drain accumulated (the
+                # already-scheduled callback then finds an empty buffer).
+                self._flush_emit_buffer()
                 return
             if self.on_line is not None:
                 self.on_line(self.stream_name, line)
-            out_line = prefix + line
-            if self.stream_name == "stdout":
-                self._emit(sys.stdout, out_line)
-            elif self.stream_name == "stderr":
-                self._emit(sys.stderr, out_line)
+            if passthrough:
+                self._queue_emit(prefix + line)
             if self.save_limit > 0:
                 if len(self.save_top) < limit_top:
                     self.save_top.append(line)
@@ -401,9 +450,35 @@ class MailReporter(Reporter):
             use_tls=mail["tls"],
             validate_certs=mail["validate_certs"],
         )
+        # One overall bound on the whole conversation: aiosmtplib only bounds
+        # each individual operation (60s default), so without this a
+        # black-holed server could hold the report (and the job's completion
+        # sequence behind it) for several minutes.
+        try:
+            await asyncio.wait_for(
+                self._converse(smtp, mail, username, password, message),
+                MAIL_REPORT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "mail: report for job %s did not complete within %.0f "
+                "seconds; giving up on it",
+                job.config.name,
+                MAIL_REPORT_TIMEOUT,
+            )
+
+    @staticmethod
+    async def _converse(
+        smtp: Any,
+        mail: Dict[str, Any],
+        username: Optional[str],
+        password: Optional[str],
+        message: EmailMessage,
+    ) -> None:
         await smtp.connect()
         # close() (sync, idempotent) guarantees the socket is released even if
-        # starttls/login/send raises, so a failing SMTP server can't leak a
+        # starttls/login/send raises (including the CancelledError a
+        # wait_for timeout injects), so a failing SMTP server can't leak a
         # connection per report.
         try:
             if mail["starttls"]:

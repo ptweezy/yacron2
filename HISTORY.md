@@ -5,6 +5,139 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.23 (2026-07-18)
+
+A performance release: the hot paths flagged by a full efficiency review now
+do their work once instead of per poll, per map instance, or per stored
+record.  All figures below are from an A/B benchmark of this release against
+the previous one on the same machine.
+
+### Status payloads read the scheduler's own index
+
+- **`/jobs`, `/status`, and the gossiped fleet summaries** no longer re-run
+  a cron-engine search per job per request: they read the next-fire index
+  the run loop already maintains (the same source the Prometheus next-run
+  gauge reads), keeping the engine search only for the startup window before
+  the index is seeded.  Builds 4-7x faster on a 300-job fleet, and the
+  saving repeats on every dashboard poll and every cluster gossip exchange.
+- **A running job with a dead schedule** used to earn its `never_fires`
+  flag by searching the remaining calendar horizon on every poll (about a
+  millisecond each time for `0 0 31 2 *`); the answer now comes from the
+  dead-schedules latch in constant time.  A schedule that dies while the
+  daemon runs (a fixed year slipping into the past) now joins that latch
+  with the same warning a seed-time-dead schedule gets, instead of leaving
+  the fire index silently.
+
+### DAG runs advance with less store traffic
+
+- **One document read fewer per advance**: the crash-reconcile step already
+  observes the run document inside its locked read-modify-write, so the
+  advance reuses that body instead of re-reading the same document before
+  the claim.
+- **Completion bursts coalesce**: when many task completions land at once
+  (a mapped fan-in), the spawned advances collapse into at most the pass
+  already running plus one follow-up that observes the whole burst, instead
+  of one full pass per completion.  A burst of 20 completions measured 20
+  advance passes and 60 durable document operations before, 2 passes and 4
+  operations now.
+- **The claim transform is cheaper on large fan-outs**: the dependency
+  verdict is resolved once per task instead of once per map instance, and
+  the transform's working copy of the run document is cloned through the
+  orjson fast path when the `speedups` extra is installed.  A claim pass
+  over a 1000-instance fan-out dropped from 3.2ms to 1.5ms, all of it time
+  spent holding the document lock.
+
+### Artifact lookups stop reading whole streams
+
+- **Reading an artifact by name** probes the newest 64 records first and
+  only then falls back to the full scan, so the common lookup (a recently
+  published name) no longer reads the scope's entire publish history: 65ms
+  to 5ms against a 1500-record stream, for every `cronstable artifact get`
+  and every mapped-task expansion.  Looking up a name that was never
+  published costs one probe page on top of the old full scan.
+- **The dashboard's XCom tab** fetches each value directly by the blob
+  digest its own listing already holds, instead of re-listing the run's
+  whole artifact stream per entry: at 200 entries that is one stream read
+  instead of 201, and the tab renders 2.5x faster.
+
+### Job completion leaves the reaper's hot loop
+
+- **Reporters no longer run inline on the reaper**: each finished run's
+  report and retry-arm sequence is spawned as its own tracked task, chained
+  per job so overlapping instances of one job are still handled in finish
+  order, and drained in full on graceful shutdown.  One slow SMTP server or
+  webhook used to delay every other job's completion, slot release, and
+  retry arming daemon-wide: with a reporter that takes half a second, the
+  next job's completion waited 524ms before and 0.1ms now.  Mail reports
+  also gained an overall 60-second bound (aiosmtplib's default only bounds
+  each individual protocol step).
+- **The reaper is fully event-driven while jobs run**: the job-launch
+  signal joins its wait set, replacing the 1-second poll that re-counted
+  the running set.  A daemon babysitting one long-running job used to wake
+  86,400 times a day for that; now it wakes only when a job starts or
+  finishes.
+- **Job output passthrough batches per pipe drain**: mirroring a job's
+  stdout/stderr to the daemon's own used to cost a blocking write and flush
+  on the event loop for every line; lines are now coalesced and written
+  once per drained read.  A 20,000-line job drains in 55ms instead of
+  132ms, and a stalled daemon-stdout pipe no longer freezes the event loop
+  once per line (a broken pipe is logged and skipped; capture and the live
+  web tail are unaffected).
+
+### Durable writes carry their own housekeeping
+
+- **The bounded-stream prune rides inside the append**: every run, retry,
+  in-flight, manifest, counter, and archive append used to be paired with a
+  separate re-list-and-sort prune call that usually deleted nothing.  The
+  bound now travels with the append (one store dispatch instead of two) and
+  the actual re-list runs on one append in eight per stream, so a stream
+  may briefly hold up to seven records beyond its bound before the next
+  due prune trims it.  Recording one bounded run record: 6.0ms to 4.9ms,
+  half the worker dispatches.
+- **Serialization sheds its pre-flight walk where it can**: with the
+  `speedups` extra installed, the fleet-portability check now walks
+  payloads only for the one hazard orjson cannot catch itself (a NaN or
+  infinite float); oversized integers and non-string keys are refused by
+  the serializer and reported as the same error as before.  A run record
+  with a full resource series serializes in 69us instead of 93us, and the
+  lease record written on every ~10s renew, built entirely from the
+  daemon's own values, skips the walk outright: 0.18us instead of 0.89us.
+
+### Cluster and DAG background chatter thins out
+
+- **The etcd backend re-reads the `@reboot-ran` key every 60 seconds**
+  instead of on every ~5-second renew round once it is synced and has no
+  marks to persist, matching the filesystem backend's cadence: roughly
+  17,000 fewer etcd reads per node per day.  A leadership gain or a known
+  lease loss still forces an immediate unthrottled read-back, so the
+  failover double-fire guard is unchanged.
+- **The DAG adopt scan stops re-reading finished runs**: run terminality is
+  monotonic, so each node remembers which run documents it has seen finish
+  and the 30-second orphan scan reads only the runs it does not know yet,
+  discovering the rest from a single key listing (a new backend capability
+  that lists document keys without opening any body).  With `retainRuns:
+  50` that is one directory listing instead of 50 document reads and
+  parses per dag per cycle: 5.8ms to 2.6ms per scan on local disk, with
+  the gap growing on networked stores where each read is a round trip.  A
+  periodic full pass and the hourly GC rebuild the cache from actual
+  bodies.
+
+### Frames and samples get cheaper
+
+- **The terminal dashboard's string machinery gained ASCII fast paths**:
+  width measurement and row cutting now short-circuit for escape-free
+  ASCII (nearly every character of every frame), the ANSI matcher runs
+  only at escape characters instead of at every position, and theme
+  colours are compiled to SGR fragments once per theme instead of
+  re-parsing hex per span.  Assembling a 60-row frame's strings dropped
+  from 6.2ms to under 0.1ms.
+- **Concurrently monitored jobs share one process-table snapshot**: per-run
+  resource monitors used to each walk the entire process table every
+  sampling tick; a shared ticker now takes one snapshot per tick and each
+  due monitor derives its own process tree from it, keeping per-monitor
+  intervals and the per-member CPU/memory reads unchanged.  Eight
+  monitored jobs sample in 2.8ms per tick instead of 27.3ms.
+
 ## 1.2.22 (2026-07-18)
 
 The schedule dialect learns to speak business days, and the scheduler's own

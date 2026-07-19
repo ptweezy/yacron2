@@ -153,11 +153,11 @@ async def test_call_runs_sync_half_on_daemon_thread(tmp_path):
     seen = {}
     real_append = backend._append_sync
 
-    def spy(stream, data):
+    def spy(stream, data, prune_keep=None):
         thread = threading.current_thread()
         seen["daemon"] = thread.daemon
         seen["name"] = thread.name
-        return real_append(stream, data)
+        return real_append(stream, data, prune_keep)
 
     backend._append_sync = spy  # type: ignore[method-assign]
     rec_id = await backend.append_record("s", {"i": 1})
@@ -176,7 +176,7 @@ async def test_call_propagates_sync_half_exception(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()
 
-    def boom(stream, data):
+    def boom(stream, data, prune_keep=None):
         raise _StoreBoom("sync half exploded")
 
     backend._append_sync = boom  # type: ignore[method-assign]
@@ -196,7 +196,7 @@ async def test_call_survives_abandoned_await(tmp_path):
     entered = threading.Event()
     release = threading.Event()
 
-    def blocked(stream, data):
+    def blocked(stream, data, prune_keep=None):
         entered.set()
         release.wait(timeout=30)  # released below; bound is a safety net
         return "late-result"
@@ -310,7 +310,7 @@ async def test_shutdown_completes_despite_hung_state_write(
 
     hang = asyncio.get_running_loop().create_future()
 
-    async def hung_append(stream, data):
+    async def hung_append(stream, data, *, prune_keep=None):
         await hang  # never resolves
 
     monkeypatch.setattr(cron.state_backend, "append_record", hung_append)

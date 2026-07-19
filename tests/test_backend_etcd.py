@@ -1063,7 +1063,7 @@ async def test_renew_gain_syncs_before_leadership_applies(monkeypatch):
     async def campaign(lease_id):
         return "node-a", True
 
-    async def sync():
+    async def sync(*, leaderish=None):
         sync_calls.append(("leader-at-sync", b._is_leader))
         # simulate the read-back failing: synced stays False
 
@@ -1094,7 +1094,7 @@ async def test_renew_steady_state_syncs_after_apply(monkeypatch):
     async def campaign(lease_id):
         return "node-a", True
 
-    async def sync():
+    async def sync(*, leaderish=None):
         sync_calls.append(("leader-at-sync", b._is_leader))
 
     monkeypatch.setattr(b, "_keepalive", keepalive)
@@ -1129,7 +1129,7 @@ async def test_known_lease_loss_closes_reboot_gate(monkeypatch):
     async def campaign(lease_id):
         return "node-a", True  # immediately re-won
 
-    async def sync():
+    async def sync(*, leaderish=None):
         pass  # read-back does NOT complete this round
 
     monkeypatch.setattr(b, "_keepalive", keepalive)

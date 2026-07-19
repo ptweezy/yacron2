@@ -696,6 +696,10 @@ async def _run_to_completion(cron, name):
     running_job = cron.running_jobs[name][-1]
     await running_job.wait()
     await cron._handle_finished_job(running_job)
+    # the report+retry-arm sequence (which emits the failure counters) runs
+    # as a spawned per-job task; wait for it like the reaper's old inline
+    # await did.
+    await cron._drain_completions()
     return running_job
 
 

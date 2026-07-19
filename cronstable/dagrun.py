@@ -34,7 +34,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cronstable import _json, dag, platform
 from cronstable.cronexpr import CronTab
@@ -59,6 +59,17 @@ DAG_LEASE_TTL = 30.0
 SCHEDULE_CHECK_INTERVAL = 20.0
 ADOPT_SCAN_INTERVAL = 30.0
 GC_INTERVAL = 3600.0
+
+# How often the adopt scan does a FULL body listing instead of the cheap
+# keys-only pass.  Terminality is monotonic, so the per-dag terminal-key cache
+# lets the ordinary scan skip re-reading runs already known finished (with
+# retainRuns: 50 the old scan re-read and re-parsed all ~50 documents per dag
+# every 30s mostly to rediscover that).  The periodic full pass, plus the
+# hourly GC's full listing, rebuilds the cache from actual bodies, bounding
+# how long the one known stale-cache corner (a terminal run GC-deleted and
+# re-created under the SAME key by an operator backfill within a single scan
+# interval, then orphaned) can delay that run's adoption.
+ADOPT_FULL_REFRESH = 600.0
 
 # How often the owner re-advances a run that is blocked on an approval gate, so
 # a decision recorded on a peer node (which cannot advance a run it does not
@@ -135,9 +146,19 @@ class DagScheduler:
         self._owned: Dict[RunRef, Lease] = {}
         self._renewers: Dict[RunRef, asyncio.Task] = {}
         self._locks: Dict[RunRef, asyncio.Lock] = {}
+        # refs whose in-flight advance must run once more before its lock
+        # is released: the burst-coalescing latch (see advance_one).
+        self._advance_again: Set[RunRef] = set()
         # soonest wall-clock instant an owned run wants another advance (a due
         # sensor poke or task retry); drives the loop's sleep cap.
         self._wake: Dict[RunRef, float] = {}
+        # dag name -> run keys this node has SEEN terminal.  Terminality is
+        # monotonic, so the adopt scan skips re-reading these (see
+        # _adopt_one_dag); pruned against each key listing, rebuilt from
+        # bodies by every full adopt pass and every GC pass, and a key is
+        # evicted when this node (re-)creates a run under it.
+        self._terminal_run_keys: Dict[str, Set[str]] = {}
+        self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
         self._next_logical: Dict[str, datetime.datetime] = {}
@@ -197,7 +218,9 @@ class DagScheduler:
 
     # --- backend op helpers (all bounded) --------------------------------
 
-    async def _mutate(self, dag_name: str, key: str, transform):
+    async def _mutate(
+        self, dag_name: str, key: str, transform
+    ) -> "Tuple[Optional[Dict[str, Any]], Any]":
         backend = self._backend()
         if backend is None:
             return None, None
@@ -545,6 +568,13 @@ class DagScheduler:
             return body, True
 
         _stored, created = await self._mutate(dagcfg.name, run_key, _create)
+        if created:
+            # a fresh run now lives under this key: it must not inherit a
+            # stale "known terminal" marking from a GC'd predecessor (an
+            # operator backfill legitimately re-creates a logical date's key).
+            known = self._terminal_run_keys.get(dagcfg.name)
+            if known is not None:
+                known.discard(run_key)
         return bool(created)
 
     # =====================================================================
@@ -620,6 +650,7 @@ class DagScheduler:
     def _drop_owned(self, ref: RunRef) -> None:
         self._owned.pop(ref, None)
         self._wake.pop(ref, None)
+        self._advance_again.discard(ref)
         renewer = self._renewers.pop(ref, None)
         if renewer is not None and not renewer.done():
             renewer.cancel()
@@ -643,17 +674,56 @@ class DagScheduler:
         backend = self._backend()
         if backend is None:
             return
+        now = _now()
+        full = now >= self._next_full_adopt
+        if full:
+            self._next_full_adopt = now + ADOPT_FULL_REFRESH
         for name, dagcfg in list(self._dags().items()):
             try:
-                await self._adopt_one_dag(backend, name, dagcfg)
+                await self._adopt_one_dag(backend, name, dagcfg, full=full)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - isolate per-dag failures
                 logger.exception("dag %s: orphan adoption failed", name)
 
     async def _adopt_one_dag(
-        self, backend: StateBackend, name: str, dagcfg: Any
+        self, backend: StateBackend, name: str, dagcfg: Any, *, full: bool
     ) -> None:
+        if not full:
+            try:
+                keys = await asyncio.wait_for(
+                    backend.list_document_keys(self._ns(name)),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return
+            if keys is not None:
+                # Keys-only pass: one directory listing, plus a body read for
+                # only the runs not already owned here or known terminal;
+                # the steady state re-reads nothing.  A key that vanished
+                # from the listing (GC'd, here or on a peer) is dropped from
+                # the cache by the intersection below.
+                known = self._terminal_run_keys.setdefault(name, set())
+                known.intersection_update(keys)
+                for key in keys:
+                    if key in known or (name, key) in self._owned:
+                        continue
+                    try:
+                        body = await asyncio.wait_for(
+                            backend.read_document(self._ns(name), key),
+                            timeout=STATE_OP_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        return
+                    if body is None:
+                        continue  # deleted (or unreadable) since the listing
+                    if dag.is_terminal_run(body):
+                        known.add(key)
+                        continue
+                    if not isinstance(body.get("runKey"), str):
+                        continue
+                    await self._try_own(dagcfg, (name, key))
+                return
         try:
             docs = await asyncio.wait_for(
                 backend.list_documents(self._ns(name)),
@@ -661,16 +731,23 @@ class DagScheduler:
             )
         except asyncio.TimeoutError:
             return
+        terminal: Set[str] = set()
         for body in docs:
-            if dag.is_terminal_run(body):
-                continue
             run_key = body.get("runKey")
+            if dag.is_terminal_run(body):
+                if isinstance(run_key, str):
+                    terminal.add(run_key)
+                continue
             if not isinstance(run_key, str):
                 continue
             ref = (name, run_key)
             if ref in self._owned:
                 continue
             await self._try_own(dagcfg, ref)
+        # a full pass parsed every body: rebuild the cache from truth (also
+        # the self-heal for the stale-terminal corner ADOPT_FULL_REFRESH
+        # documents).
+        self._terminal_run_keys[name] = terminal
 
     # =====================================================================
     # Advancing an owned run
@@ -682,40 +759,63 @@ class DagScheduler:
                 await self.advance_one(ref)
 
     async def advance_one(self, ref: RunRef) -> None:
+        """Advance ``ref`` once, coalescing concurrent requests.
+
+        Completions arrive in bursts (a mapped fan-in can finish many
+        instances near-simultaneously) and each spawns an advance.
+        Queueing them all behind the per-ref lock would still run one
+        full reconcile+claim pass per completion against the same
+        document, most finding nothing left to claim.  Instead, a call
+        that finds an advance already in flight latches a rerun flag and
+        returns; the in-flight holder loops one more time when the flag
+        was set while it worked.  A burst of any size therefore costs at
+        most the pass already running plus one fresh pass that observes
+        everything the burst recorded.
+        """
         lock = self._locks.setdefault(ref, asyncio.Lock())
+        if lock.locked():
+            # No await between this check and the holder's own re-check
+            # under the lock, so the flag cannot be missed.
+            self._advance_again.add(ref)
+            return
         async with lock:
-            lease = self._owned.get(ref)
-            if lease is None:
-                # not ours to advance (e.g. a decision/completion recorded
-                # here for a run a peer owns): drop the wake hint too, or
-                # next_wake_delay() would return 0.0 forever and busy-spin
-                # the main loop.  The durable record itself is safe -- the
-                # owner picks it up via its own poll/advance wakes.
-                self._wake.pop(ref, None)
-                return
-            dagcfg = self._dags().get(ref[0])
-            if dagcfg is None:
-                await self._release(ref)  # dag removed on reload
-                return
-            if not await self._lease_usable(ref, lease):
-                if ref in self._owned:
-                    # unverifiable (store unreachable) or expired-but-untaken:
-                    # skip this advance and re-check shortly; the renew loop
-                    # re-establishes a live TTL or learns of the takeover.
-                    self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
-                return
-            try:
-                await self._do_advance(dagcfg, ref)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - never kill the loop
-                logger.exception(
-                    "dag run %s/%s: advance failed", ref[0], ref[1]
-                )
-                if ref in self._owned:
-                    # a due wake left in place would retry instantly every
-                    # loop pass against a fast-failing store; back off a bit.
-                    self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
+            while True:
+                self._advance_again.discard(ref)
+                await self._advance_locked(ref)
+                if ref not in self._advance_again:
+                    return
+
+    async def _advance_locked(self, ref: RunRef) -> None:
+        lease = self._owned.get(ref)
+        if lease is None:
+            # not ours to advance (e.g. a decision/completion recorded
+            # here for a run a peer owns): drop the wake hint too, or
+            # next_wake_delay() would return 0.0 forever and busy-spin
+            # the main loop.  The durable record itself is safe -- the
+            # owner picks it up via its own poll/advance wakes.
+            self._wake.pop(ref, None)
+            return
+        dagcfg = self._dags().get(ref[0])
+        if dagcfg is None:
+            await self._release(ref)  # dag removed on reload
+            return
+        if not await self._lease_usable(ref, lease):
+            if ref in self._owned:
+                # unverifiable (store unreachable) or expired-but-untaken:
+                # skip this advance and re-check shortly; the renew loop
+                # re-establishes a live TTL or learns of the takeover.
+                self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
+            return
+        try:
+            await self._do_advance(dagcfg, ref)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - never kill the loop
+            logger.exception("dag run %s/%s: advance failed", ref[0], ref[1])
+            if ref in self._owned:
+                # a due wake left in place would retry instantly every
+                # loop pass against a fast-failing store; back off a bit.
+                self._wake[ref] = _now() + ADVANCE_RETRY_DELAY
 
     async def _lease_usable(self, ref: RunRef, lease: Lease) -> bool:
         """Whether our advance lease still plausibly gates ``ref``.
@@ -760,11 +860,12 @@ class DagScheduler:
     async def _do_advance(self, dagcfg: Any, ref: RunRef) -> None:
         spec = dagcfg.spec
         # 1. reconcile first: fail any task a crash left running with a dead
-        # process (protects our own live tasks by proc token).
-        await self._reconcile_run(dagcfg, ref)
-        # 2. read the doc to see which mapped tasks are ready to expand, and
-        # pre-read their upstream XCom lists (outside the RMW).
-        body = await self._read(ref[0], ref[1])
+        # process (protects our own live tasks by proc token).  Its RMW
+        # already observed the document body, so reuse that observation to
+        # see which mapped tasks are ready to expand, and pre-read their
+        # upstream XCom lists (outside the claim RMW), instead of paying a
+        # separate second read of the same document on every advance.
+        body = await self._reconcile_run(dagcfg, ref)
         if body is None:
             await self._release(ref)
             return
@@ -975,6 +1076,9 @@ class DagScheduler:
 
     async def _on_terminal(self, ref: RunRef) -> None:
         logger.info("dag run %s/%s reached a terminal state", ref[0], ref[1])
+        # terminality is monotonic: remember it so the adopt scan never
+        # re-reads this run's document just to rediscover it finished.
+        self._terminal_run_keys.setdefault(ref[0], set()).add(ref[1])
         await self._release(ref)
 
     # =====================================================================
@@ -1343,7 +1447,17 @@ class DagScheduler:
                     continue
                 await self._try_own(dagcfg, (name, run_key))
 
-    async def _reconcile_run(self, dagcfg: Any, ref: RunRef) -> None:
+    async def _reconcile_run(
+        self, dagcfg: Any, ref: RunRef
+    ) -> Optional[Dict[str, Any]]:
+        """Fail tasks a crash left running; return the observed document.
+
+        The RMW already read the run document under its lock (and
+        ``mutate_document`` hands the current body back even on a kept
+        document), so the caller reuses the returned body instead of
+        paying a second full read of the same document right after.
+        ``None`` when the document does not exist (or no backend).
+        """
         transform = self._wrap(
             dag.reconcile_crashed(
                 dagcfg.spec,
@@ -1353,7 +1467,7 @@ class DagScheduler:
                 platform.pid_alive,
             )
         )
-        _stored, changed = await self._mutate(ref[0], ref[1], transform)
+        stored, changed = await self._mutate(ref[0], ref[1], transform)
         if changed:
             logger.info(
                 "dag run %s/%s: reconciled %d interrupted task(s)",
@@ -1361,6 +1475,7 @@ class DagScheduler:
                 ref[1],
                 changed,
             )
+        return stored
 
     # =====================================================================
     # Control-API surface: approvals, introspection, manual trigger, backfill
@@ -1590,17 +1705,25 @@ class DagScheduler:
                 "at": rec.get("at"),
             }
             if isinstance(size, int) and 0 <= size <= max_value_bytes:
-                try:
-                    got = await asyncio.wait_for(
-                        jobstate.artifact_get(backend, scope, full),
-                        timeout=STATE_OP_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - value unreadable; skip it
-                    got = None
-                if got is not None:
-                    _rec, data = got
+                # fetch the payload by the digest this record already
+                # carries: an artifact_get here would re-list and re-parse
+                # the run's whole artifact stream per entry (quadratic in
+                # the stream), only to resolve the very record in hand.
+                # A swept blob reads back as None and is skipped, exactly
+                # like any other unreadable value.
+                digest = rec.get("sha256")
+                data = None
+                if digest:
+                    try:
+                        data = await asyncio.wait_for(
+                            backend.get_blob(str(digest)),
+                            timeout=STATE_OP_TIMEOUT,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - unreadable; skip it
+                        data = None
+                if data is not None:
                     try:
                         entry["value"] = data.decode("utf-8")
                     except UnicodeDecodeError:
@@ -1647,6 +1770,11 @@ class DagScheduler:
             timeout=STATE_OP_TIMEOUT,
         )
         terminal = [b for b in docs if dag.is_terminal_run(b)]
+        # this pass parsed every body anyway: rebuild the adopt scan's
+        # terminal-key cache from truth (its periodic self-heal).
+        self._terminal_run_keys[name] = {
+            b["runKey"] for b in terminal if isinstance(b.get("runKey"), str)
+        }
         terminal.sort(key=lambda b: float(b.get("createdAt") or 0))
         excess = len(terminal) - dagcfg.retain_runs
         if excess <= 0:
@@ -1677,6 +1805,12 @@ class DagScheduler:
             backend.delete_document(self._ns(name), run_key),
             timeout=STATE_OP_TIMEOUT,
         )
+        known = self._terminal_run_keys.get(name)
+        if known is not None:
+            # the key may legitimately come back (an operator backfill of the
+            # same logical date re-creates it): a deleted key must not linger
+            # as "known terminal".
+            known.discard(run_key)
         if run_id:
             from cronstable.jobstate import ARTIFACT_STREAM_PREFIX
 

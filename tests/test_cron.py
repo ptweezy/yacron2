@@ -417,6 +417,8 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     )
     cron.running_jobs["test"].append(job)
     await cron._handle_finished_job(job)
+    # the report+retry-arm sequence runs as a spawned per-job task now
+    await cron._drain_completions()
 
     assert calls == [("failure", job)]
     # the finished run is recorded for the web UI

@@ -52,6 +52,11 @@ ARTIFACT_STREAM_PREFIX = "artifacts/"
 # agree on the default.
 GLOBAL_SCOPE = "global"
 
+# The newest-first probe page of :func:`artifact_get_record`'s two-step
+# scan.  Sized so the common lookup -- a recently published name --
+# resolves in one page without reading the scope's whole publish history.
+_GET_RECORD_PAGE = 64
+
 
 class JobStateError(Exception):
     """A caller-provoked failure, carrying the status the API should return.
@@ -359,20 +364,35 @@ async def artifact_get_record(
     fan-out that silently skips the whole task's work -- so the caller can
     tell "nothing published" from "could not read" and retry the latter.
 
-    Strictness necessarily spans the scope's whole stream, not just the
-    records carrying ``name``: until a record has been read there is no
-    telling which name it holds, and the unreadable one could be the newest
-    publish of exactly this one.  (A record with *bad content* is skipped even
-    under ``strict``: it is unrecoverable, and failing closed on it forever
-    would wedge the caller permanently.)
+    Strictness spans every record from the newest down to the returned
+    match, not just the records carrying ``name``: until a record has been
+    read there is no telling which name it holds, and the unreadable one
+    could be the newest publish of exactly this one.  Records OLDER than
+    the newest readable match need no such guarantee -- they could only
+    hold superseded versions, which cannot change the answer.  (A record
+    with *bad content* is skipped even under ``strict``: it is
+    unrecoverable, and failing closed on it forever would wedge the caller
+    permanently.)
     """
     scope = _require_scope(scope)
-    records = await backend.list_records(
-        ARTIFACT_STREAM_PREFIX + scope, newest_first=True, strict=strict
-    )
-    for record in records:
-        if record.get("name") == name:
-            return record
+    stream = ARTIFACT_STREAM_PREFIX + scope
+    # Two-step scan: the wanted name is usually among the newest few
+    # records (a stream accumulates one immutable record per publish
+    # until GC, newest last), so probe one small newest-first page before
+    # falling back to the single full read this replaces.  The common
+    # lookup then costs O(page) instead of O(all versions ever
+    # published), while a miss or a deeply-buried name costs at most one
+    # extra page over the old full scan.  A page shorter than its limit
+    # already proves the stream exhausted.
+    for limit in (_GET_RECORD_PAGE, None):
+        records = await backend.list_records(
+            stream, limit=limit, newest_first=True, strict=strict
+        )
+        for record in records:
+            if record.get("name") == name:
+                return record
+        if limit is None or len(records) < limit:
+            return None
     return None
 
 

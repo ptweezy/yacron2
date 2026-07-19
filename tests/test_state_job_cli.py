@@ -10,9 +10,12 @@ asserted deterministically without a live server (the real wire is covered in
 test_state_job_api.py).
 """
 
+import argparse
 import asyncio
+import io
 import json
 import sys
+import urllib.error
 import urllib.request
 
 import pytest
@@ -495,3 +498,403 @@ def test_response_timeout_clean_error(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "cannot reach the cronstable state endpoint" in err
     assert "Traceback" not in err
+
+# ===========================================================================
+# The _http seam itself (fake opener), plus the branches the
+# happy-path sections skip: artifact/xcom IO, lock run failures.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# the _http seam itself
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status, body, headers=None):
+        self.status = status
+        self.headers = headers or {"X-One": "1"}
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeOpener:
+    def __init__(self, outcome):
+        self._outcome = outcome
+        self.request = None
+
+    def open(self, req, timeout=None):
+        self.request = req
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
+
+
+def _post(monkeypatch, outcome, **kwargs):
+    monkeypatch.setenv("CRONSTABLE_STATE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CRONSTABLE_STATE_TOKEN", "tok")
+    opener = _FakeOpener(outcome)
+    monkeypatch.setattr(jobcli, "_OPENER", opener)
+    result = jobcli._http("POST", "/v1/kv/set", **kwargs)
+    return result, opener
+
+
+def test_http_json_body_and_headers(monkeypatch):
+    (status, headers, body), opener = _post(
+        monkeypatch,
+        _FakeResponse(200, b'{"ok": 1}'),
+        json_body={"key": "k"},
+    )
+    assert (status, body) == (200, b'{"ok": 1}')
+    assert headers == {"X-One": "1"}
+    req = opener.request
+    assert req.get_header("Content-type") == "application/json"
+    assert json.loads(req.data) == {"key": "k"}
+    assert req.get_header("Authorization") == "Bearer tok"
+
+
+def test_http_raw_data_is_octet_stream(monkeypatch):
+    _result, opener = _post(
+        monkeypatch, _FakeResponse(200, b"{}"), data=b"\x00\x01"
+    )
+    req = opener.request
+    assert req.get_header("Content-type") == "application/octet-stream"
+    assert req.data == b"\x00\x01"
+
+
+def test_http_error_response_keeps_status(monkeypatch):
+    err = urllib.error.HTTPError(
+        "http://x", 409, "conflict", None, io.BytesIO(b'{"error": "busy"}')
+    )
+    (status, headers, body), _ = _post(monkeypatch, err)
+    assert status == 409
+    assert headers == {}
+    assert body == b'{"error": "busy"}'
+
+
+def test_http_unreachable_raises_cli_error(monkeypatch):
+    err = urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+    with pytest.raises(jobcli._CliError, match="cannot reach"):
+        _post(monkeypatch, err)
+
+
+def test_parse_body_wraps_non_object_json():
+    assert jobcli._parse_body(b"[1, 2]") == {"value": [1, 2]}
+    assert jobcli._parse_body(b"") == {}
+    assert jobcli._parse_body(b"401: Unauthorized") == {}
+
+
+# ---------------------------------------------------------------------------
+# cursor / secret branches
+# ---------------------------------------------------------------------------
+
+
+def test_cursor_get_prints_value(monkeypatch, capsys):
+    http = _FakeHTTP({"/v1/cursor/get": (200, {"value": 42})})
+    assert _cli(monkeypatch, ["cursor", "get", "c"], http) == 0
+    assert capsys.readouterr().out.strip() == "42"
+
+
+def test_secret_list_prints_names(monkeypatch, capsys):
+    http = _FakeHTTP({"/v1/secret/list": (200, {"names": ["db", "api"]})})
+    assert _cli(monkeypatch, ["secret", "list"], http) == 0
+    assert capsys.readouterr().out.splitlines() == ["db", "api"]
+
+
+# ---------------------------------------------------------------------------
+# artifact: stdin/put, 404, stdout and file output
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_put_reads_stdin(monkeypatch):
+    http = _FakeHTTP({"/v1/artifact/put": (200, {"ok": True})})
+
+    class _Stdin:
+        buffer = io.BytesIO(b"payload-bytes")
+
+    monkeypatch.setattr(jobcli.sys, "stdin", _Stdin())
+    assert _cli(monkeypatch, ["artifact", "put", "report"], http) == 0
+    assert http.calls[0]["data"] == b"payload-bytes"
+
+
+def test_artifact_put_reads_file(monkeypatch, tmp_path):
+    http = _FakeHTTP({"/v1/artifact/put": (200, {"ok": True})})
+    src = tmp_path / "blob.bin"
+    src.write_bytes(b"\x01\x02")
+    code = _cli(
+        monkeypatch, ["artifact", "put", "report", str(src)], http
+    )
+    assert code == 0
+    assert http.calls[0]["data"] == b"\x01\x02"
+
+
+def test_artifact_put_unreadable_file(monkeypatch, tmp_path):
+    http = _FakeHTTP()
+    code = _cli(
+        monkeypatch,
+        ["artifact", "put", "report", str(tmp_path / "ghost")],
+        http,
+    )
+    assert code == 1
+
+
+def test_artifact_get_not_found(monkeypatch, capsys):
+    http = _FakeHTTP({"/v1/artifact/get": (404, b"")})
+    code = _cli(monkeypatch, ["artifact", "get", "report"], http)
+    assert code == 4
+    assert "artifact not found" in capsys.readouterr().err
+
+
+def test_artifact_get_writes_stdout(monkeypatch, capsysbinary):
+    http = _FakeHTTP({"/v1/artifact/get": (200, b"blob-bytes")})
+    assert _cli(monkeypatch, ["artifact", "get", "report"], http) == 0
+    assert b"blob-bytes" in capsysbinary.readouterr().out
+
+
+def test_artifact_get_writes_file(monkeypatch, tmp_path):
+    http = _FakeHTTP({"/v1/artifact/get": (200, b"blob-bytes")})
+    out = tmp_path / "out.bin"
+    code = _cli(
+        monkeypatch, ["artifact", "get", "report", "-o", str(out)], http
+    )
+    assert code == 0
+    assert out.read_bytes() == b"blob-bytes"
+
+
+def test_artifact_get_unwritable_output(monkeypatch, tmp_path):
+    http = _FakeHTTP({"/v1/artifact/get": (200, b"blob")})
+    # the output path is a directory: open(..., "wb") fails with OSError
+    code = _cli(
+        monkeypatch,
+        ["artifact", "get", "report", "-o", str(tmp_path)],
+        http,
+    )
+    assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# xcom: list, pull errors, missing task identity
+# ---------------------------------------------------------------------------
+
+
+def _xcom_env(monkeypatch, taskkey="a"):
+    monkeypatch.setenv(jobcli.ENV_DAG_XCOM_SCOPE, "dag:etl/2026")
+    if taskkey is not None:
+        monkeypatch.setenv(jobcli.ENV_DAG_TASKKEY, taskkey)
+
+
+def test_xcom_push_requires_taskkey(monkeypatch):
+    _xcom_env(monkeypatch, taskkey=None)
+    monkeypatch.delenv(jobcli.ENV_DAG_TASKKEY, raising=False)
+    code = _cli(monkeypatch, ["xcom", "push", "--key", "k"], _FakeHTTP())
+    assert code == 1
+
+
+def test_xcom_pull_server_error_is_cli_error(monkeypatch):
+    _xcom_env(monkeypatch)
+    http = _FakeHTTP({"/v1/artifact/get": (500, {"error": "boom"})})
+    code = _cli(
+        monkeypatch,
+        ["xcom", "pull", "--task", "b", "--key", "k"],
+        http,
+    )
+    assert code == 1
+
+
+def test_xcom_list_prints_names(monkeypatch, capsys):
+    _xcom_env(monkeypatch)
+    http = _FakeHTTP(
+        {
+            "/v1/artifact/list": (
+                200,
+                {"artifacts": [{"name": "a/k"}, {"name": "b/j"}]},
+            )
+        }
+    )
+    assert _cli(monkeypatch, ["xcom", "list"], http) == 0
+    assert capsys.readouterr().out.splitlines() == ["a/k", "b/j"]
+
+
+def test_xcom_outside_dag_task(monkeypatch):
+    monkeypatch.delenv(jobcli.ENV_DAG_XCOM_SCOPE, raising=False)
+    assert _cli(monkeypatch, ["xcom", "list"], _FakeHTTP()) == 1
+
+
+def test_xcom_push_from_stdin(monkeypatch):
+    _xcom_env(monkeypatch)
+    http = _FakeHTTP({"/v1/artifact/put": (200, {"ok": True})})
+
+    class _Stdin:
+        buffer = io.BytesIO(b"result-bytes")
+
+    monkeypatch.setattr(jobcli.sys, "stdin", _Stdin())
+    assert _cli(monkeypatch, ["xcom", "push", "--key", "k"], http) == 0
+    call = http.calls[0]
+    assert call["data"] == b"result-bytes"
+    assert call["query"]["name"] == "a/k"
+
+
+def test_xcom_push_from_file(monkeypatch, tmp_path):
+    _xcom_env(monkeypatch)
+    http = _FakeHTTP({"/v1/artifact/put": (200, {"ok": True})})
+    src = tmp_path / "out.json"
+    src.write_bytes(b'{"rows": 3}')
+    code = _cli(
+        monkeypatch, ["xcom", "push", "--key", "k", str(src)], http
+    )
+    assert code == 0
+    assert http.calls[0]["data"] == b'{"rows": 3}'
+
+
+def test_xcom_push_unreadable_file(monkeypatch, tmp_path):
+    _xcom_env(monkeypatch)
+    code = _cli(
+        monkeypatch,
+        ["xcom", "push", "--key", "k", str(tmp_path / "ghost")],
+        _FakeHTTP(),
+    )
+    assert code == 1
+
+
+def test_xcom_pull_not_found(monkeypatch, capsys):
+    _xcom_env(monkeypatch)
+    http = _FakeHTTP({"/v1/artifact/get": (404, b"")})
+    code = _cli(
+        monkeypatch,
+        ["xcom", "pull", "--task", "b", "--key", "k"],
+        http,
+    )
+    assert code == 4
+    assert "no xcom" in capsys.readouterr().err
+
+
+def test_xcom_pull_to_stdout_and_map_index(monkeypatch, capsysbinary):
+    _xcom_env(monkeypatch)
+    http = _FakeHTTP({"/v1/artifact/get": (200, b"payload")})
+    code = _cli(
+        monkeypatch,
+        ["xcom", "pull", "--task", "b", "--key", "k", "--map-index", "2"],
+        http,
+    )
+    assert code == 0
+    assert b"payload" in capsysbinary.readouterr().out
+    assert http.calls[0]["query"]["name"] == "b#2/k"
+
+
+def test_xcom_pull_to_file(monkeypatch, tmp_path):
+    _xcom_env(monkeypatch)
+    http = _FakeHTTP({"/v1/artifact/get": (200, b"payload")})
+    out = tmp_path / "in.bin"
+    code = _cli(
+        monkeypatch,
+        ["xcom", "pull", "--task", "b", "--key", "k", "-o", str(out)],
+        http,
+    )
+    assert code == 0
+    assert out.read_bytes() == b"payload"
+
+
+def test_xcom_pull_unwritable_output(monkeypatch, tmp_path):
+    _xcom_env(monkeypatch)
+    http = _FakeHTTP({"/v1/artifact/get": (200, b"payload")})
+    code = _cli(
+        monkeypatch,
+        ["xcom", "pull", "--task", "b", "--key", "k", "-o", str(tmp_path)],
+        http,
+    )
+    assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# lock run failure modes
+# ---------------------------------------------------------------------------
+
+_LOCK_OK = {
+    "/v1/lock/acquire": (200, {"acquired": True, "token": "T"}),
+    "/v1/lock/release": (200, {"released": True}),
+}
+
+
+def test_lock_run_requires_a_command(monkeypatch):
+    code = _cli(monkeypatch, ["lock", "run", "l"], _FakeHTTP(_LOCK_OK))
+    assert code == 1
+
+
+def test_lock_run_unrunnable_command_releases(monkeypatch):
+    http = _FakeHTTP(_LOCK_OK)
+    code = _cli(
+        monkeypatch,
+        ["lock", "run", "l", "--", "definitely-not-a-command-xyz"],
+        http,
+    )
+    assert code == 1
+    # the hold was released in the finally despite the failed spawn
+    assert [c["path"] for c in http.calls] == [
+        "/v1/lock/acquire",
+        "/v1/lock/release",
+    ]
+
+
+def test_lock_release_verb(monkeypatch):
+    http = _FakeHTTP(_LOCK_OK)
+    assert _cli(monkeypatch, ["lock", "release", "T"], http) == 0
+    assert http.calls[0]["path"] == "/v1/lock/release"
+    assert http.calls[0]["json"] == {"token": "T"}
+
+
+def test_lock_run_swallows_release_failure(monkeypatch):
+    import sys as real_sys
+
+    http = _FakeHTTP(
+        {
+            "/v1/lock/acquire": (200, {"acquired": True, "token": "T"}),
+            "/v1/lock/release": (500, {"error": "gone"}),
+        }
+    )
+    code = _cli(
+        monkeypatch,
+        ["lock", "run", "l", "--", real_sys.executable, "-c", "pass"],
+        http,
+    )
+    # the wrapped command's exit code wins; the failed release is swallowed
+    assert code == 0
+    # the hold was released in the finally despite the failed spawn
+    assert [c["path"] for c in http.calls] == [
+        "/v1/lock/acquire",
+        "/v1/lock/release",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# defensive unknown-action raises (unreachable through argparse)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "func,ns",
+    [
+        (jobcli._cmd_state, {"state_command": "bogus"}),
+        (jobcli._cmd_cursor, {"cursor_command": "bogus"}),
+        (jobcli._cmd_secret, {"secret_command": "bogus"}),
+        (jobcli._cmd_artifact, {"artifact_command": "bogus"}),
+        (jobcli._cmd_lock, {"lock_command": "bogus"}),
+    ],
+)
+def test_unknown_actions_raise(monkeypatch, func, ns):
+    monkeypatch.setenv("CRONSTABLE_STATE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CRONSTABLE_STATE_TOKEN", "tok")
+    with pytest.raises(jobcli._CliError, match="unknown"):
+        func(argparse.Namespace(**ns))
+
+
+def test_unknown_xcom_action_raises(monkeypatch):
+    monkeypatch.setenv(jobcli.ENV_DAG_XCOM_SCOPE, "dag:x/1")
+    with pytest.raises(jobcli._CliError, match="unknown xcom action"):
+        jobcli._cmd_xcom(argparse.Namespace(xcom_command="bogus"))

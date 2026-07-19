@@ -73,6 +73,14 @@ _ETCD_POSTS_PER_CYCLE = 5
 # concurrent writers UNION their marks instead of last-writer-wins clobbering.
 _REBOOT_RAN_CAS_ATTEMPTS = 3
 
+# Steady-state cadence of the @reboot-ran key re-read (mirrors the filesystem
+# backend's _REBOOT_RAN_REFRESH): the set changes rarely, so re-reading it on
+# EVERY renew round (~every 5s) cost ~17k etcd range POSTs per node per day
+# for nothing. While ``_reboot_ran_synced`` is False on a leaderish node, or
+# local marks await persistence, the sync still runs every round; the
+# throttle only spaces out the already-synced steady state.
+_REBOOT_RAN_REFRESH = 60.0
+
 # Reported as the holder when we lost a campaign (so a real holder exists) but
 # its identity could not be parsed from the txn response -- only reachable via
 # a non-conformant gateway that drops the failure-branch range value. Reporting
@@ -354,6 +362,12 @@ class EtcdBackend(LeaseBackend):
         # rate-limits the holder's "deferring @reboot one-shots" warning in
         # _sync_reboot_ran to once per outage (reset by a completed sync).
         self._reboot_ran_warned = False
+        # monotonic instant before which a fully-synced, nothing-to-persist
+        # node skips the @reboot-ran read entirely (see _REBOOT_RAN_REFRESH);
+        # advanced only by a COMPLETED read-back, or by a follower's failed
+        # one (a follower defers no one-shots, and a takeover forces its own
+        # unthrottled re-read via _reboot_ran_synced).
+        self._reboot_refresh_next = 0.0
         self._holder: Optional[str] = None
         self._lease_id: Optional[str] = None
         # wall-clock expiry, for the dashboard/lease_detail display ONLY
@@ -1002,14 +1016,16 @@ class EtcdBackend(LeaseBackend):
             # lease_mono were sampled above, so the sync's own latency can
             # extend neither the quorum freshness window nor the fence.
             self._reboot_ran_synced = False
-            await self._sync_reboot_ran()
+            await self._sync_reboot_ran(leaderish=True)
         self._apply_round(holder, won, now, mono, lease_mono)
         if not gaining:
-            await self._sync_reboot_ran()
+            await self._sync_reboot_ran(leaderish=self._is_leader)
 
     # --- @reboot-ran persistence (H2: no peer set, so persist to the store) --
 
-    async def _sync_reboot_ran(self) -> None:  # pragma: no cover - network
+    async def _sync_reboot_ran(
+        self, *, leaderish: Optional[bool] = None
+    ) -> None:  # pragma: no cover - network
         """Best-effort: read the @reboot-ran key, fold it in, re-persist marks.
 
         Wrapped so an auxiliary read/write failure never fails the leadership
@@ -1018,13 +1034,41 @@ class EtcdBackend(LeaseBackend):
         stored value (a non-UTF-8 / bad-base64 body from a misbehaving gateway)
         cannot escape -- this path is reached from start()'s initial round,
         which catches only the network tuple.
+
+        ``leaderish``: whether this node holds (or is right now winning)
+        the election key.  Passed in by the renew round (which just observed
+        the campaign) rather than read from ``_is_leader``, because the
+        takeover path syncs BEFORE leadership is applied; every node holds
+        its own campaign *lease*, so ``_lease_id`` could not stand in for
+        this the way the filesystem backend's held election lease does.
+        ``None`` (a direct call outside the round) falls back to the raw
+        win flag.
         """
+        if leaderish is None:
+            leaderish = self._is_leader
         try:
             # drop our own marks first if the job set changed, so a redefined
             # @reboot one-shot is not re-suppressed by a stale local mark being
             # re-published under the new job-set id (see
             # LeaseBackend._reconcile_local_reboot_ran).
             self._reconcile_local_reboot_ran()
+            # Throttle the steady state (mirrors the filesystem backend's
+            # _maintain_reboot_ran): once the cache reflects the store and
+            # every local mark is known persisted, the re-read runs only
+            # every _REBOOT_RAN_REFRESH seconds instead of every renew
+            # round.  Never throttled: a leaderish node that has not read
+            # the key back since gaining (or losing) its lease (it is
+            # DEFERRING its one-shots on that read), and a node with a
+            # mark the store may not carry yet (an eager persist that
+            # failed retries here).
+            self._reconcile_observed_reboot_ran()
+            unpersisted = self._reboot_ran_local - self._reboot_ran
+            if (
+                not (leaderish and not self._reboot_ran_synced)
+                and not unpersisted
+                and _monotonic() < self._reboot_refresh_next
+            ):
+                return
             await self._cas_write_reboot_ran()
         except (
             aiohttp.ClientError,
@@ -1059,6 +1103,16 @@ class EtcdBackend(LeaseBackend):
                         ex,
                     )
             else:
+                if not self._reboot_ran_synced:
+                    # an unsynced FOLLOWER's failed read: it defers no
+                    # one-shots on this (reboot_ran's raise gate is leader-
+                    # gated) and a takeover forces its own re-read, so space
+                    # the retry out to the refresh period instead of
+                    # hammering a sick etcd every round (mirrors the
+                    # filesystem backend's _maintain_reboot_ran).
+                    self._reboot_refresh_next = (
+                        _monotonic() + _REBOOT_RAN_REFRESH
+                    )
                 logger.debug("cluster: etcd reboot-ran sync failed: %s", ex)
 
     async def _cas_write_reboot_ran(self) -> None:  # pragma: no cover
@@ -1107,6 +1161,10 @@ class EtcdBackend(LeaseBackend):
             # still counts (every retry re-read and re-folded the key).
             self._reboot_ran_synced = True
             self._reboot_ran_warned = False
+            # ...and the steady-state read throttle advances (only a
+            # completed read may advance it on a leaderish node, so a
+            # failed one keeps retrying every round; see _sync_reboot_ran).
+            self._reboot_refresh_next = _monotonic() + _REBOOT_RAN_REFRESH
             combined = self._reboot_ran | self._reboot_ran_local
             if not (combined - self._reboot_ran):
                 # the store already holds every mark we would write (after

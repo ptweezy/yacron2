@@ -140,6 +140,14 @@ BLOBS_DIR = "blobs"
 BULK_CALL_SLOTS = 16
 LEASE_CALL_SLOTS = 8
 
+# How many ``prune_keep``-carrying appends a stream absorbs between actual
+# prune passes (see FilesystemStateBackend.append_record): the first such
+# append per stream since boot prunes immediately, then one in every K.  A
+# stream can therefore briefly hold up to K-1 records beyond its bound,
+# invisible to readers (listings are limit-bounded/newest-first, derived
+# cursors are monotonic maxima) and reclaimed by the next due prune.
+_PRUNE_EVERY_APPENDS = 8
+
 # Sentinels a :meth:`StateBackend.mutate_document` transform returns *in place
 # of* a new document body: leave the document exactly as it was (KEEP), or
 # delete it (DELETE).  Anything else the transform returns is the new document
@@ -531,8 +539,25 @@ class StateBackend(abc.ABC):
     # --- durable immutable records ---------------------------------------
 
     @abc.abstractmethod
-    async def append_record(self, stream: str, data: Dict[str, Any]) -> str:
-        """Append one immutable record to ``stream``; return its record id."""
+    async def append_record(
+        self,
+        stream: str,
+        data: Dict[str, Any],
+        *,
+        prune_keep: Optional[int] = None,
+    ) -> str:
+        """Append one immutable record to ``stream``; return its record id.
+
+        ``prune_keep`` folds the caller's usual follow-up
+        ``prune_records(stream, keep=prune_keep)`` into the same backend
+        call: one worker dispatch instead of two, and the backend may
+        AMORTISE the actual re-list-and-delete over several appends (the
+        stream can briefly exceed the bound by a small constant, which no
+        reader observes: listings are limit-bounded/newest-first and
+        derived cursors are monotonic maxima).  A caller that needs the
+        bound enforced exactly NOW still calls :meth:`prune_records`
+        directly.
+        """
 
     @abc.abstractmethod
     async def list_records(
@@ -644,6 +669,20 @@ class StateBackend(abc.ABC):
     @abc.abstractmethod
     async def list_documents(self, namespace: str) -> List[Dict[str, Any]]:
         """Every readable document body in ``namespace``, order-independent."""
+
+    async def list_document_keys(self, namespace: str) -> Optional[List[str]]:
+        """The keys of ``namespace``'s documents WITHOUT reading any body.
+
+        ``None`` means the backend cannot enumerate keys cheaply and
+        faithfully right now (no such capability, an unreadable directory, or
+        a stored key whose on-disk name cannot round-trip back to the logical
+        key); the caller must then fall back to :meth:`list_documents`.  An
+        empty namespace is ``[]``, not ``None``.  Exists for scans that
+        mostly re-visit documents they already know the state of: the DAG
+        adopt/GC scans re-list every retained run every cycle, and with this
+        they re-read only the runs not yet known terminal.
+        """
+        return None
 
     async def list_document_namespaces(
         self, prefix: str
@@ -847,6 +886,13 @@ class FilesystemStateBackend(StateBackend):
         self._inflight_lease = 0
         self._inflight_peak_bulk = 0
         self._inflight_peak_lease = 0
+        # Per-stream countdown gating the prune an append can carry (see
+        # append_record's ``prune_keep``): the first such append per stream
+        # since boot prunes immediately (trimming any pre-existing
+        # overgrowth), then only every _PRUNE_EVERY_APPENDS-th does. Written
+        # from worker threads, hence the lock.
+        self._prune_countdown: Dict[str, int] = {}
+        self._prune_gate_lock = threading.Lock()
 
     # --- paths -----------------------------------------------------------
 
@@ -1268,10 +1314,23 @@ class FilesystemStateBackend(StateBackend):
         for level in created:
             fsync_directory(os.path.dirname(level))
 
-    async def append_record(self, stream: str, data: Dict[str, Any]) -> str:
-        return await self._call("append", self._append_sync, stream, data)
+    async def append_record(
+        self,
+        stream: str,
+        data: Dict[str, Any],
+        *,
+        prune_keep: Optional[int] = None,
+    ) -> str:
+        return await self._call(
+            "append", self._append_sync, stream, data, prune_keep
+        )
 
-    def _append_sync(self, stream: str, data: Dict[str, Any]) -> str:
+    def _append_sync(
+        self,
+        stream: str,
+        data: Dict[str, Any],
+        prune_keep: Optional[int] = None,
+    ) -> str:
         stream_dir = self._stream_dir(stream)
         self._makedirs_durable(stream_dir)
         token = os.path.basename(stream_dir)
@@ -1291,7 +1350,36 @@ class FilesystemStateBackend(StateBackend):
             {"schemaVersion": SCHEME_VERSION, "data": data}, sort_keys=True
         )
         self._atomic_write(os.path.join(stream_dir, rec_id + ".json"), payload)
+        if prune_keep is not None and prune_keep > 0:
+            # The folded prune: same worker call as the append (one dispatch,
+            # not two), and only every K-th append per stream actually pays
+            # the re-list-and-delete, which on a bounded stream usually
+            # deletes nothing.  Between prunes the stream exceeds ``keep`` by
+            # at most K-1 records.  Best-effort by construction: the append
+            # HAS landed by this point, so a prune failure must never make
+            # the whole call read as failed (several callers make
+            # load-bearing decisions, e.g. the @reboot launch gate, from
+            # whether the append landed).
+            if self._append_prune_due(stream):
+                try:
+                    self._prune_sync(stream, prune_keep)
+                except OSError as ex:
+                    logger.warning(
+                        "state: could not prune stream %r after an append "
+                        "(kept records linger until the next prune): %s",
+                        stream,
+                        ex,
+                    )
         return rec_id
+
+    def _append_prune_due(self, stream: str) -> bool:
+        with self._prune_gate_lock:
+            left = self._prune_countdown.get(stream, 0)
+            if left <= 0:
+                self._prune_countdown[stream] = _PRUNE_EVERY_APPENDS - 1
+                return True
+            self._prune_countdown[stream] = left - 1
+            return False
 
     def _quarantine(self, path: str, name: str, reason: str) -> None:
         dest = os.path.join(
@@ -1691,7 +1779,13 @@ class FilesystemStateBackend(StateBackend):
             return None
 
     def _write_lease_file(self, lease_path: str, lease: Lease) -> None:
-        payload = _json.dumps_bytes(lease.to_dict(), sort_keys=True)
+        # trusted: a Lease is built entirely from this process's own strings,
+        # ints and clock reads (see Lease.to_dict), never job or store data,
+        # and this write runs on EVERY renew of every lease (~10s cadence),
+        # so it skips the recursive portability pre-walk.
+        payload = _json.dumps_bytes(
+            lease.to_dict(), sort_keys=True, trusted=True
+        )
         self._atomic_write(lease_path, payload)
 
     async def acquire_lease(
@@ -1963,6 +2057,43 @@ class FilesystemStateBackend(StateBackend):
         return await self._call(
             "doc-list", self._list_documents_sync, namespace
         )
+
+    async def list_document_keys(self, namespace: str) -> Optional[List[str]]:
+        return await self._call(
+            "doc-list", self._list_document_keys_sync, namespace
+        )
+
+    def _list_document_keys_sync(self, namespace: str) -> Optional[List[str]]:
+        from urllib.parse import unquote
+
+        ns_dir = self._doc_dir(namespace)
+        try:
+            names = os.listdir(ns_dir)
+        except FileNotFoundError:
+            return []  # no document ever written: exhaustively empty
+        except OSError:
+            return None  # unreadable right now: caller takes the full path
+        keys: List[str] = []
+        for name in names:
+            if not name.endswith(".doc"):
+                continue
+            token = name[: -len(".doc")]
+            if _FS_TRUNCATION_MARKER in token:
+                # a length-truncated token replaced the key's tail with a
+                # digest: the logical key cannot round-trip (documents have
+                # no name sidecar), so the WHOLE listing reports unable;
+                # returning the others would make this one invisible to a
+                # keys-driven scan.
+                return None
+            try:
+                keys.append(unquote(token, errors="strict"))
+            except UnicodeDecodeError:
+                # not a token our encoder produced (foreign/corrupt name):
+                # fall back rather than hand back a garbled key that cannot
+                # address the document.
+                return None
+        keys.sort()
+        return keys
 
     async def list_document_namespaces(
         self, prefix: str

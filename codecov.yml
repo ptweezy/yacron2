@@ -1,7 +1,7 @@
 # Coverage is already hard-gated in CI by tox's --cov-fail-under (see tox.ini).
 # Codecov here exists only to publish the merged number for the README badge and
 # PR context, so its own status checks are informational: they annotate PRs but
-# never block them, leaving the tox gate as the single source of pass/fail.
+# never block them. Tox gate is the single source of pass/fail.
 coverage:
   status:
     project:

@@ -10,16 +10,19 @@ through main_loop with the test_main.py argv/exit pattern.
 
 import asyncio
 import datetime
+import io
 import json
 import os
 import stat
 import sys
+import tarfile
 import time
 
 import pytest
 
 import cronstable.__main__
 import cronstable.state as state_mod
+from cronstable import state_admin
 from cronstable.platform import IS_WINDOWS
 from cronstable.state import _TokenBucket
 from tests.test_state import _backend
@@ -822,3 +825,276 @@ def test_cli_root_config_position_also_works(tmp_path, monkeypatch, capsys):
     _seed_store(store)
     assert _cli(monkeypatch, ["-c", config, "state", "check"]) == 0
     assert "is writable" in capsys.readouterr().out
+
+# ===========================================================================
+# Failure surfaces: absent stores, blocked destinations, archive
+# hygiene, unparseable leases, and the gc/keep-set config guards.
+# ===========================================================================
+
+# a dag section so the keep-set walk sees task templates (and their scopes)
+_DAG_BLOCK = (
+    "dags:\n"
+    "  - name: etl\n"
+    "    tasks:\n"
+    "      - id: a\n"
+    "        command: 'true'\n"
+)
+
+
+def _config_text(tmp_path, store, extra="", name="cfg.yaml"):
+    config = tmp_path / name
+    config.write_text("state:\n  path: {}\n".format(store) + extra)
+    return str(config)
+
+
+# ---------------------------------------------------------------------------
+# absent / blocked stores
+# ---------------------------------------------------------------------------
+
+
+def test_backup_without_store_reports_nothing_to_do(
+    tmp_path, monkeypatch, capsys
+):
+    config = _write_config(tmp_path, tmp_path / "never-created")
+    archive = str(tmp_path / "b.tar.gz")
+    code = _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+    assert code == 1
+    assert "nothing to back up" in capsys.readouterr().out
+
+
+def test_backup_into_unwritable_output_is_clean_error(
+    tmp_path, monkeypatch, capsys
+):
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    archive = str(tmp_path / "no-such-dir" / "b.tar.gz")
+    code = _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+    assert code == 1
+    assert "cronstable state error" in capsys.readouterr().out
+
+
+def test_migrate_without_store_reports_nothing_to_do(
+    tmp_path, monkeypatch, capsys
+):
+    config = _write_config(tmp_path, tmp_path / "never-created")
+    code = _cli(
+        monkeypatch,
+        ["state", "migrate", "-c", config, "--dest", str(tmp_path / "d")],
+    )
+    assert code == 1
+    assert "nothing to migrate" in capsys.readouterr().out
+
+
+def test_migrate_refuses_populated_dest_without_force(
+    tmp_path, monkeypatch, capsys
+):
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    dest = tmp_path / "dest"
+    _seed_store(dest)
+    code = _cli(
+        monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
+    )
+    assert code == 1
+    assert "--force" in capsys.readouterr().out
+
+
+def test_migrate_with_dest_deployment_id(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    dest = tmp_path / "dest"
+    code = _cli(
+        monkeypatch,
+        [
+            "state",
+            "migrate",
+            "-c",
+            config,
+            "--dest",
+            str(dest),
+            "--dest-deployment-id",
+            "prod-2",
+        ],
+    )
+    assert code == 0
+
+
+def test_migrate_blocked_destination_path(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    # the deployment subtree cannot be created: a file sits in its place
+    (dest / "default").write_text("not a directory")
+    code = _cli(
+        monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "failed to copy" in out or "cronstable state error" in out
+
+
+def test_restore_blocked_destination_path(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    archive = str(tmp_path / "b.tar.gz")
+    assert (
+        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        == 0
+    )
+    dest = tmp_path / "dest"
+    (dest / "default").mkdir(parents=True)
+    (dest / "default" / "records").write_text("not a directory")
+    config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
+    code = _cli(
+        monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "failed to restore" in out or "cronstable state error" in out
+
+
+# ---------------------------------------------------------------------------
+# gc guards + dag keep-sets
+# ---------------------------------------------------------------------------
+
+
+def test_gc_requires_grace_window(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "store"
+    # gcGraceSeconds: 0 disables gc entirely; a manual gc must refuse
+    config = _config_text(tmp_path, store, "  gcGraceSeconds: 0\n")
+    _seed_store(store)
+    code = _cli(monkeypatch, ["state", "gc", "-c", config])
+    assert code == 1
+    assert "gcGraceSeconds" in capsys.readouterr().out
+
+
+def test_gc_dry_run_with_dag_config(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "store"
+    config = _config_text(
+        tmp_path, store, "  gcGraceSeconds: 86400\n" + _DAG_BLOCK
+    )
+    _seed_store(store)
+    code = _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config])
+    assert code == 0
+
+
+# ---------------------------------------------------------------------------
+# check: degraded stores
+# ---------------------------------------------------------------------------
+
+
+def test_check_empty_store_layout(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "store"
+    store.mkdir()  # exists but has no records/quarantine subtrees yet
+    config = _write_config(tmp_path, store)
+    code = _cli(monkeypatch, ["state", "check", "-c", config])
+    assert code == 0
+    assert "is writable" in capsys.readouterr().out
+
+
+def test_check_skips_stray_files_in_records(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    (store / "default" / "records" / "stray.txt").write_text(
+        "not a stream dir"
+    )
+    code = _cli(monkeypatch, ["state", "check", "-c", config])
+    assert code == 0
+    assert "runs: 2 record(s)" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# archive hygiene helpers (direct)
+# ---------------------------------------------------------------------------
+
+
+def _tar_with(members):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, kind in members:
+            info = tarfile.TarInfo(name)
+            if kind == "dir":
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            else:
+                payload = b"{}"
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+    buf.seek(0)
+    return tarfile.open(fileobj=buf, mode="r")
+
+
+def test_safe_members_filters_escapes(tmp_path):
+    tar = _tar_with(
+        [
+            ("records/runs/ok.json", "file"),
+            ("records", "dir"),  # a directory member is never yielded
+            ("../escape.json", "file"),  # traversal out of dest
+        ]
+    )
+    names = [m.name for m in state_admin._safe_members(tar, str(tmp_path))]
+    assert names == ["records/runs/ok.json"]
+
+
+@pytest.mark.skipif(
+    not IS_WINDOWS, reason="mixed-drive commonpath only raises on Windows"
+)
+def test_safe_members_skips_foreign_drive_members(tmp_path):
+    tar = _tar_with([("Z:\\evil.json", "file")])
+    assert list(state_admin._safe_members(tar, str(tmp_path))) == []
+
+
+def test_lease_fence_parsing():
+    assert state_admin._lease_fence(b'{"fence": 7}') == 7
+    assert state_admin._lease_fence(b"not json") is None
+    assert state_admin._lease_fence(b'{"no": "fence"}') is None
+
+
+# ---------------------------------------------------------------------------
+# restore: unreadable current lease still restores (fence unprovable)
+# ---------------------------------------------------------------------------
+
+
+def test_restore_over_unreadable_lease(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+
+    async def seed():
+        backend = _backend(store)
+        await backend.start()
+        await backend.append_record("runs/j", {"outcome": "success"})
+        lease = await backend.acquire_lease("leader", "n1", ttl=3600.0)
+        assert lease is not None
+
+    _run(seed())
+    archive = str(tmp_path / "b.tar.gz")
+    assert (
+        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        == 0
+    )
+    # find the lease member the backup carried and block its restore target
+    with tarfile.open(archive) as tar:
+        lease_members = [
+            m.name
+            for m in tar.getmembers()
+            if m.isfile() and m.name.startswith("leases/")
+        ]
+    assert lease_members
+    dest = tmp_path / "dest"
+    config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
+    target = dest / "default" / lease_members[0]
+    target.mkdir(parents=True)  # a directory where the lease file would go
+    code = _cli(
+        monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
+    )
+    # the current lease exists but its fence cannot be read: unprovable, so
+    # the restore keeps the store's copy rather than risk a fence regression
+    assert code == 0
+    assert "kept 1 current lease file(s)" in capsys.readouterr().out

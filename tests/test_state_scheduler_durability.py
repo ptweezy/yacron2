@@ -616,10 +616,10 @@ async def test_retry_consume_settles_before_launch(tmp_path):
         backend = cron.state_backend
         real_append = backend.append_record
 
-        async def spy_append(stream, data):
+        async def spy_append(stream, data, *, prune_keep=None):
             if stream.startswith("retries/"):
                 events.append("append:" + data.get("kind", "?"))
-            return await real_append(stream, data)
+            return await real_append(stream, data, prune_keep=prune_keep)
 
         backend.append_record = spy_append  # type: ignore[method-assign]
 
@@ -843,10 +843,10 @@ async def test_reboot_marker_recorded_before_launch(tmp_path, monkeypatch):
         backend = cron.state_backend
         real_append = backend.append_record
 
-        async def spy_append(stream, data):
+        async def spy_append(stream, data, *, prune_keep=None):
             if stream.startswith("reboot/"):
                 events.append("record")
-            return await real_append(stream, data)
+            return await real_append(stream, data, prune_keep=prune_keep)
 
         backend.append_record = spy_append  # type: ignore[method-assign]
 

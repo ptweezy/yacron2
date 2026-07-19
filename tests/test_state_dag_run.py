@@ -27,6 +27,7 @@ import pytest
 
 from cronstable import dag, dagrun, jobstate
 from cronstable.cron import Cron
+from cronstable.state import Lease
 from tests.test_state_job_primitives import _break_record_reads
 
 _PY = sys.executable
@@ -1420,5 +1421,249 @@ async def test_monitored_task_resources_land_in_run_record(tmp_path):
         # and the tolerant parser round-trips what was stored
         stored = body["tasks"]["a"]["resources"]
         assert ResourceUsage.from_dict(stored) == usage
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Scheduler internals: catch-up replay, lease upkeep, orphan adoption,
+# XCom fan-out reads, and the degraded-store guards.
+# ===========================================================================
+
+_HOURLY = (
+    "dags:\n  - name: cu\n    schedule: '0 * * * *'\n"
+    "    onMissed: run-all\n    tasks:\n"
+    "      - id: a\n        command: 'x'\n"
+    "  - name: cu1\n    schedule: '0 * * * *'\n"
+    "    onMissed: run-once\n    tasks:\n"
+    "      - id: a\n        command: 'x'\n"
+)
+
+
+def test_jitter_bounds():
+    assert dagrun._jitter(0) == 0.0
+    assert dagrun._jitter(-1) == 0.0
+    assert 0.0 <= dagrun._jitter(5.0) <= 5.0
+
+
+async def test_scheduler_tolerates_missing_backend():
+    # a Cron without a state section still builds the DAG scheduler; every
+    # store-touching entry point must degrade, not crash
+    cron = Cron(None, config_yaml=_LINEAR)
+    assert await cron._dag._read("lin", "k") is None
+    await cron._dag._adopt_orphans()
+    assert await cron._dag._read_xcom_list("rid", "lin", "a", "k") is None
+
+
+async def test_catch_up_replays_missed_slots(tmp_path):
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        for name, expected_kinds in (
+            ("cu", 3),  # run-all: 01:00, 02:00 and 03:00 all replayed
+            ("cu1", 1),  # run-once: only the newest missed slot
+        ):
+            dagcfg = cron.cron_dags[name]
+            await cron._dag._create_run(dagcfg, base, "scheduled")
+            await cron._dag._catch_up(dagcfg, now_dt)
+            runs = await cron._dag.list_runs(name, limit=10)
+            kinds = [r["kind"] for r in runs]
+            assert kinds.count("catchup") == expected_kinds, name
+    finally:
+        await _teardown(cron)
+
+
+async def test_catch_up_honours_starting_deadline(tmp_path):
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        sched = dagcfg.schedule_job
+        sched.startingDeadlineSeconds = 3600.0
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        # only 03:00 is younger than the 1h deadline window
+        assert [r["kind"] for r in runs].count("catchup") == 1
+    finally:
+        await _teardown(cron)
+
+
+async def test_catch_up_without_prior_run_is_noop(tmp_path):
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        await cron._dag._catch_up(
+            dagcfg, datetime.datetime(2026, 1, 1, tzinfo=_UTC)
+        )
+        assert await cron._dag.list_runs("cu", limit=10) == []
+    finally:
+        await _teardown(cron)
+
+
+def _instant_sleep(monkeypatch):
+    real_sleep = asyncio.sleep
+
+    async def fast(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fast)
+
+
+async def test_renew_loop_retries_then_drops_on_takeover(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        ref = ("lin", "rk1")
+        first = Lease("dag-run/lin/rk1", "h#1", 1, 9e18)
+        fresh = Lease("dag-run/lin/rk1", "h#1", 2, 9e18)
+        cron._dag._owned[ref] = first
+        outcomes = [TimeoutError(), RuntimeError("blip"), fresh, None]
+
+        async def scripted(lease, ttl):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(cron.state_backend, "renew_lease", scripted)
+        _instant_sleep(monkeypatch)
+        await asyncio.wait_for(cron._dag._renew_loop(ref), 5)
+        # the fresh lease was adopted on the way, then the takeover dropped it
+        assert ref not in cron._dag._owned
+        assert outcomes == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_release_swallows_backend_errors(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        ref = ("lin", "rk1")
+        cron._dag._owned[ref] = Lease("dag-run/lin/rk1", "h#1", 1, 9e18)
+
+        async def broken(lease):
+            raise RuntimeError("store on fire")
+
+        monkeypatch.setattr(cron.state_backend, "release_lease", broken)
+        await cron._dag._release(ref)
+        assert ref not in cron._dag._owned
+    finally:
+        await _teardown(cron)
+
+
+async def test_try_own_shortcuts_and_failures(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        dagcfg = cron.cron_dags["lin"]
+        ref = ("lin", "rk1")
+        # already owned: no store round-trip
+        cron._dag._owned[ref] = Lease("dag-run/lin/rk1", "h#1", 1, 9e18)
+        assert await cron._dag._try_own(dagcfg, ref) is True
+        del cron._dag._owned[ref]
+
+        async def denied(name, holder, ttl):
+            return None  # a peer holds it
+
+        monkeypatch.setattr(cron.state_backend, "acquire_lease", denied)
+        assert await cron._dag._try_own(dagcfg, ref) is False
+
+        async def hanging(name, holder, ttl):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(cron.state_backend, "acquire_lease", hanging)
+        monkeypatch.setattr(dagrun, "STATE_OP_TIMEOUT", 0.05)
+        assert await cron._dag._try_own(dagcfg, ref) is False
+    finally:
+        await _teardown(cron)
+
+
+async def test_advance_releases_run_of_removed_dag(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        ref = ("ghost", "rk1")
+        cron._dag._owned[ref] = Lease("dag-run/ghost/rk1", "h#1", 1, 9e18)
+        await cron._dag.advance_one(ref)
+        assert ref not in cron._dag._owned
+    finally:
+        await _teardown(cron)
+
+
+async def test_adopt_orphans_keys_pass_and_full_pass(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        done_key = await cron._dag.trigger_run("lin")
+        await _drive(cron, "lin", done_key)  # terminal
+        open_key = await cron._dag.trigger_run("lin")
+        # simulate this daemon losing every hold (a restarted peer's view)
+        for ref in list(cron._dag._owned):
+            cron._dag._drop_owned(ref)
+        backend = cron.state_backend
+        dagcfg = cron.cron_dags["lin"]
+        await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=False)
+        assert ("lin", open_key) in cron._dag._owned
+        assert done_key in cron._dag._terminal_run_keys["lin"]
+        # a second keys-only pass skips both via the caches
+        await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=False)
+        # and the periodic full pass re-verifies from the bodies
+        for ref in list(cron._dag._owned):
+            cron._dag._drop_owned(ref)
+        await cron._dag._adopt_one_dag(backend, "lin", dagcfg, full=True)
+        assert ("lin", open_key) in cron._dag._owned
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_guards(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        backend = cron.state_backend
+        scope = dag.xcom_scope("lin", "rid1")
+
+        async def read(key):
+            return await cron._dag._read_xcom_list("rid1", "lin", "a", key)
+
+        # never published: no items to map
+        assert await read("absent") == []
+        # junk payloads definitively map to an empty fan-out
+        await jobstate.artifact_put(
+            backend, scope, dag.xcom_name("a", "junk"), b"not json"
+        )
+        assert await read("junk") == []
+        await jobstate.artifact_put(
+            backend, scope, dag.xcom_name("a", "object"), b'{"a": 1}'
+        )
+        assert await read("object") == []
+        # a real list expands to itself
+        await jobstate.artifact_put(
+            backend, scope, dag.xcom_name("a", "items"), b"[1, 2, 3]"
+        )
+        assert await read("items") == [1, 2, 3]
+        # a store that cannot be read leaves the fan-out unknown (None)
+        _break_record_reads(
+            monkeypatch, backend, jobstate.ARTIFACT_STREAM_PREFIX + scope
+        )
+        assert await read("items") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_compute_wake_prefers_due_retry(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        spec = cron.cron_dags["lin"].spec
+        now = 1000.0
+        body = {
+            "tasks": {
+                "a": {"state": dag.UP_FOR_RETRY, "nextRetryAt": 1010.0},
+                "b": {"state": dag.PENDING},
+            }
+        }
+        assert cron._dag._compute_wake(spec, body, now) == 1010.0
     finally:
         await _teardown(cron)

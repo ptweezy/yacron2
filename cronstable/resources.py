@@ -33,6 +33,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, Iterator, List, Optional, Tuple
@@ -304,17 +305,142 @@ class ResourceUsage:
         )
 
 
+def _ppid_index() -> Optional[Dict[int, List[int]]]:
+    """``ppid -> child pids`` for the whole table, from ONE snapshot.
+
+    ``psutil``'s ``children(recursive=True)`` scans the ENTIRE process table
+    on every call (via ``psutil._ppid_map``: one Toolhelp snapshot on
+    Windows, one /proc pass elsewhere), so K concurrently monitored runs
+    each doing their own call cost K independent full-table scans per tick.
+    The shared ticker takes the same snapshot once per due tick and every
+    due monitor derives its own tree from it (see
+    ``ResourceMonitor._tree_from_index``).  Deliberately ``_ppid_map`` and
+    not ``process_iter(attrs=...)``: the latter instantiates and queries a
+    Process for every pid on the system (~150x slower on Windows), where
+    this and ``children()`` touch only the raw pid table.  ``None`` when
+    psutil (or its private-but-long-stable ``_ppid_map``) is unavailable,
+    or the snapshot failed; callers then fall back to the per-monitor
+    ``children()`` walk.
+    """
+    if psutil is None:
+        return None
+    ppid_map = getattr(psutil, "_ppid_map", None)
+    if ppid_map is None:  # pragma: no cover - shipped by every psutil 3.x+
+        return None
+    index: Dict[int, List[int]] = {}
+    try:
+        for pid, ppid in ppid_map().items():
+            index.setdefault(ppid, []).append(pid)
+    except Exception:  # noqa: BLE001 - sampling must never raise
+        return None
+    return index
+
+
+class _SharedSampleTicker:
+    """One process-table walk per due tick, shared by every live monitor.
+
+    Monitors register instead of each running their own sampling task: the
+    ticker wakes at the earliest next-due instant, indexes the process table
+    ONCE (on a worker thread, like the old per-monitor samples), and samples
+    every monitor due at that instant against the single index.  Monitors
+    keep their individual intervals; only the full-table walk is shared,
+    and the per-member cpu/memory reads remain per monitor.  One ticker per
+    event loop (tests run a fresh loop per test); its task is cancelled as
+    soon as the last monitor unregisters.
+    """
+
+    def __init__(self) -> None:
+        # monitor -> loop-clock instant its next sample is due (0.0 = now:
+        # a fresh registration is sampled immediately, so even a very short
+        # run has a chance of one reading).
+        self._due: Dict["ResourceMonitor", float] = {}
+        self._task: Optional[asyncio.Task] = None
+        self._wake = asyncio.Event()
+
+    def register(self, monitor: "ResourceMonitor") -> None:
+        self._due[monitor] = 0.0
+        self._wake.set()
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    def unregister(self, monitor: "ResourceMonitor") -> None:
+        self._due.pop(monitor, None)
+        if not self._due and self._task is not None:
+            # cancel promptly rather than letting the task notice on its own,
+            # so an event loop being torn down right after the last stop()
+            # (the per-test loops) never finds a still-pending ticker task.
+            # An in-flight to_thread batch finishes on its worker thread; the
+            # per-monitor sample lock keeps that safe against stop()'s final
+            # reading, exactly as with the old cancelled per-monitor tasks.
+            self._task.cancel()
+            self._task = None
+        else:
+            self._wake.set()
+
+    async def _run(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            while self._due:
+                now = loop.time()
+                due = [m for m, at in self._due.items() if at <= now]
+                if due:
+                    await asyncio.to_thread(self._sample_batch, due)
+                    now = loop.time()
+                    for monitor in due:
+                        if monitor in self._due:
+                            self._due[monitor] = now + monitor._interval
+                if not self._due:
+                    return
+                delay = min(self._due.values()) - loop.time()
+                if delay > 0:
+                    self._wake.clear()
+                    try:
+                        await asyncio.wait_for(self._wake.wait(), delay)
+                    except asyncio.TimeoutError:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a sampler bug must not crash it
+            logger.warning(
+                "resource sampling ticker stopped on an unexpected error",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _sample_batch(monitors: List["ResourceMonitor"]) -> None:
+        # Worker thread. One table snapshot; each monitor folds its own tree.
+        index = _ppid_index()
+        for monitor in monitors:
+            monitor._sample(index)
+
+
+#: one ticker per event loop; weak keys so a torn-down loop drops its entry.
+_TICKERS: "weakref.WeakKeyDictionary[Any, _SharedSampleTicker]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _loop_ticker() -> _SharedSampleTicker:
+    loop = asyncio.get_running_loop()
+    ticker = _TICKERS.get(loop)
+    if ticker is None:
+        ticker = _SharedSampleTicker()
+        _TICKERS[loop] = ticker
+    return ticker
+
+
 class ResourceMonitor:
     """Samples a job subprocess tree for peak RSS and total CPU time.
 
-    Constructed with the launched child's pid; :meth:`start` begins a
-    background sampling task and :meth:`stop` ends it and returns the
-    accumulated :class:`ResourceUsage` (or ``None`` when nothing could be
-    sampled -- psutil absent, the pid already gone, or the run too short to
-    catch a single reading).
+    Constructed with the launched child's pid; :meth:`start` registers it
+    with the loop's shared sampling ticker and :meth:`stop` unregisters it
+    and returns the accumulated :class:`ResourceUsage` (or ``None`` when
+    nothing could be sampled: psutil absent, the pid already gone, or the
+    run too short to catch a single reading).
 
     One instance monitors one run.  It is created and driven entirely on the
-    scheduler's event loop, so it needs no locking.
+    scheduler's event loop; the sample lock below only serialises the worker
+    threads the samples themselves run on.
     """
 
     def __init__(
@@ -331,7 +457,10 @@ class ResourceMonitor:
         # bounded chart series of the run's samples (see _SeriesRecorder);
         # history <= 0 keeps the summary numbers only.
         self._recorder = _SeriesRecorder(history) if history > 0 else None
-        self._task: Optional[asyncio.Task] = None
+        # the loop-shared sampling ticker this monitor registered with (see
+        # _SharedSampleTicker); None until start() attaches, and again after
+        # stop() unregisters.
+        self._ticker: Optional[_SharedSampleTicker] = None
         self._proc: Any = None  # psutil.Process, once attached
         # Accumulated totals.  CPU time is tracked per tree member: _members
         # maps a (pid, create_time) key -- so a reused pid reads as a new
@@ -412,52 +541,79 @@ class ResourceMonitor:
             # the read.  Leave the monitor inert.
             self._proc = None
             return
-        # Take an immediate first reading so even a short run has a chance of a
-        # sample, then poll on the interval.
-        self._task = asyncio.create_task(self._run())
+        # Register with the loop's shared ticker: it takes an immediate first
+        # reading (so even a short run has a chance of a sample), then
+        # samples on this monitor's interval, with ONE process-table walk
+        # per tick serving every registered monitor instead of one full walk
+        # per monitor per tick.
+        self._ticker = _loop_ticker()
+        self._ticker.register(self)
 
-    async def _run(self) -> None:
-        try:
-            while True:
-                # Threaded because the sample walks the entire process table
-                # (a full /proc scan on Linux), which must not block the
-                # event loop.
-                await asyncio.to_thread(self._sample)
-                await asyncio.sleep(self._interval)
-        except asyncio.CancelledError:
-            # normal shutdown path (stop() cancels us); re-raise so the task
-            # is marked cancelled rather than swallowing it.
-            raise
-        except Exception:  # noqa: BLE001 - a sampler bug must not crash the loop
-            logger.warning(
-                "Job %s: resource sampler stopped on an unexpected error",
-                self._job_name,
-                exc_info=True,
-            )
-
-    def _sample(self) -> None:
+    def _sample(self, index: Optional[Dict[int, List[int]]] = None) -> None:
         """Read the process tree once, folding it into the running totals.
 
-        Runs in a worker thread (see :meth:`_run`), guarded by the sample
-        lock.  Everything written here is a plain int/float/dict read on the
-        event loop under the GIL; :meth:`snapshot` may observe a mid-sample
-        mix, which is harmless for a live readout.
+        Runs in a worker thread (the shared ticker's batch, or stop()'s
+        final reading), guarded by the sample lock.  ``index`` is the
+        ticker's shared ppid->child-pids snapshot; without one (the final
+        reading, the direct-call tests) the tree is walked via
+        ``children()`` as before.  Everything written here is a plain
+        int/float/dict read on the event loop under the GIL;
+        :meth:`snapshot` may observe a mid-sample mix, which is harmless
+        for a live readout.
         """
         with self._sample_lock:
-            self._sample_locked()
+            self._sample_locked(index)
 
-    def _sample_locked(self) -> None:
+    def _tree_from_index(
+        self, proc: Any, index: Dict[int, List[int]]
+    ) -> List[Any]:
+        """This run's process tree, derived from the shared table snapshot.
+
+        Mirrors ``psutil.Process.children(recursive=True)``: Process
+        objects are built only for this run's own tree members, and its
+        pid-reuse guard is kept (a candidate created BEFORE the root cannot
+        be its descendant, its pid chain was recycled).
+        """
+        try:
+            root_created = proc.create_time()
+        except Exception:  # noqa: BLE001 - root gone: read it alone below
+            return [proc]
+        tree = [proc]
+        seen = {proc.pid}
+        pending = [proc.pid]
+        while pending:
+            pid = pending.pop()
+            for child_pid in index.get(pid, ()):
+                if child_pid in seen:
+                    continue  # defensive: a cyclic/duplicated index entry
+                seen.add(child_pid)
+                try:
+                    child = psutil.Process(child_pid)
+                    if child.create_time() < root_created:
+                        continue
+                except Exception:  # noqa: BLE001 - vanished since snapshot
+                    continue
+                tree.append(child)
+                pending.append(child_pid)
+        return tree
+
+    def _sample_locked(
+        self, index: Optional[Dict[int, List[int]]] = None
+    ) -> None:
         proc = self._proc
         if proc is None:
             return
-        try:
-            tree: List[Any] = [proc] + proc.children(recursive=True)
-        except _TRANSIENT_ERRORS:
-            # the root is gone; still try to read it alone below (it may be a
-            # zombie whose cpu_times is readable on some platforms).
-            tree = [proc]
-        except Exception:  # noqa: BLE001 - never let sampling raise
-            return
+        if index is not None:
+            tree = self._tree_from_index(proc, index)
+        else:
+            try:
+                tree = [proc] + proc.children(recursive=True)
+            except _TRANSIENT_ERRORS:
+                # the root is gone; still try to read it alone below (it may
+                # be a zombie whose cpu_times is readable on some platforms).
+                tree = [proc]
+            except Exception:  # noqa: BLE001 - never let sampling raise
+                return
         live: Dict[tuple, tuple] = {}
         tree_pids = set()
         rss = 0
@@ -531,13 +687,9 @@ class ResourceMonitor:
         Idempotent: a second call (or a call after a monitor that never
         attached) returns the same result without error.
         """
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        if self._ticker is not None:
+            self._ticker.unregister(self)
+            self._ticker = None
         # One last opportunistic read: on a cancel/replace path the child may
         # still be alive here, and this catches its final CPU/RSS (any
         # still-live members are summed into the totals by _sample itself).

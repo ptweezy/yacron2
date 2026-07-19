@@ -730,16 +730,23 @@ class Theme:
         palette = dict(_P.get(name, _P["carolina"]))
         palette.update(_CVD[self.cvd])
         self.colors = palette
+        # SGR fragments precomputed once per theme: fg()/bg() run for every
+        # styled span of every painted frame, and re-parsing "#rrggbb" hex
+        # there dominated their cost.
+        self._fg = {key: _sgr_fg(spec) for key, spec in palette.items()}
+        self._bg = {key: _sgr_bg(spec) for key, spec in palette.items()}
 
     @property
     def name(self) -> str:
         return self.hue + ("-light" if self.light else "")
 
     def fg(self, key: str) -> str:
-        return _sgr_fg(self.colors.get(key, self.colors["fg"]))
+        got = self._fg.get(key)
+        return got if got is not None else self._fg["fg"]
 
     def bg(self, key: str) -> str:
-        return _sgr_bg(self.colors.get(key, self.colors["bg"]))
+        got = self._bg.get(key)
+        return got if got is not None else self._bg["bg"]
 
 
 def _hex_rgb(spec: str) -> Tuple[int, int, int]:
@@ -777,6 +784,10 @@ _ANSI_RE = re.compile(
 
 
 def strip_ansi(text: str) -> str:
+    # every _ANSI_RE alternative starts at an ESC, so escape-free text (the
+    # overwhelmingly common case for table cells) needs no regex pass at all.
+    if "\x1b" not in text:
+        return text
     return _ANSI_RE.sub("", text)
 
 
@@ -799,6 +810,11 @@ def scrub_non_sgr(text: str) -> str:
 
 def char_width(ch: str) -> int:
     """Display cells for one character (0 for combining, 2 for wide)."""
+    if " " <= ch <= "~":
+        # printable ASCII: always one cell, no unicodedata lookups. This is
+        # nearly every character of every frame, and the two category calls
+        # below were the painter's single hottest per-character cost.
+        return 1
     if ch == "\t":
         return 1  # tabs are pre-expanded by callers; safety net
     cat = unicodedata.category(ch)
@@ -810,6 +826,11 @@ def char_width(ch: str) -> int:
 
 
 def text_width(text: str) -> int:
+    if "\x1b" not in text and text.isascii():
+        # ASCII with no escapes: every character is one cell (C0 controls
+        # included; char_width reports 1 for them too), so the width IS
+        # the length.
+        return len(text)
     return sum(char_width(ch) for ch in strip_ansi(text))
 
 
@@ -1812,17 +1833,26 @@ def cut_to_width(row: str, width: int) -> str:
     """
     if width <= 0:
         return RESET
+    if "\x1b" not in row and row.isascii():
+        # escape-free ASCII: every character is one visible cell, so the cut
+        # is a plain slice with no per-character regex attempts or width sums.
+        cut = row[:width]
+        return cut + " " * (width - len(cut)) + RESET
     out: List[str] = []
     used = 0
     idx = 0
-    while idx < len(row) and used < width:
-        match = _ANSI_RE.match(row, idx)
-        if match:
-            if _SGR_TOKEN_RE.fullmatch(match.group(0)):
-                out.append(match.group(0))
-            idx = max(match.end(), idx + 1)
-            continue
+    row_len = len(row)
+    while idx < row_len and used < width:
         ch = row[idx]
+        # every escape sequence starts with ESC, so only attempt the (fairly
+        # expensive) regex match there instead of at every character.
+        if ch == "\x1b":
+            match = _ANSI_RE.match(row, idx)
+            if match:
+                if _SGR_TOKEN_RE.fullmatch(match.group(0)):
+                    out.append(match.group(0))
+                idx = max(match.end(), idx + 1)
+                continue
         w = char_width(ch)
         if used + w > width:
             break

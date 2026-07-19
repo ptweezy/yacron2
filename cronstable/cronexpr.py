@@ -167,13 +167,19 @@ _YEAR_HORIZON = 2099
 #: the backward mirror of ``_YEAR_HORIZON``.
 _YEAR_FLOOR = 1970
 
-#: a day-field item in the nearest-weekday shape (``15W``, ``LW``): valid
-#: in day-of-month, hint fodder anywhere else
-_QUARTZ_W = re.compile(r"(?:l|\d+)w\Z")
 
-#: a day-of-week item in Quartz's TRAILING-L shape (``5L``), which this
-#: dialect spells ``L5``
-_TRAILING_L = re.compile(r"\d+l\Z")
+def _is_quartz_w(item: str) -> bool:
+    """A day-field item in the nearest-weekday shape (``15W``, ``LW``): valid
+    in day-of-month, hint fodder anywhere else."""
+    body = item[:-1]
+    return item.endswith("w") and (body == "l" or body.isdecimal())
+
+
+def _is_trailing_l(item: str) -> bool:
+    """A day-of-week item in Quartz's trailing-L shape (``5L``), which this
+    dialect spells ``L5``."""
+    return item.endswith("l") and item[:-1].isdecimal()
+
 
 #: (day-of-month, day-of-week) column indexes per field count, for the
 #: wrong-field hints in :func:`_quartz_hint`
@@ -219,12 +225,12 @@ def _quartz_hint(fields: Tuple[str, ...]) -> Optional[str]:
                     "'#' (Quartz-style nth weekday, 5#3 = third Friday) "
                     "is only valid in the day-of-week field"
                 )
-            if _QUARTZ_W.match(item) and index != dom_index:
+            if _is_quartz_w(item) and index != dom_index:
                 return (
                     "'W' (Quartz-style nearest weekday, 15W / LW) is "
                     "only valid in the day-of-month field"
                 )
-            if index == dow_index and _TRAILING_L.match(item):
+            if index == dow_index and _is_trailing_l(item):
                 return (
                     "a trailing 'L' on a weekday is Quartz's last-weekday "
                     "form; this dialect spells it L<n> (L5 = last Friday)"

@@ -182,6 +182,9 @@ async def _newest(cron, stream):
 
 
 async def _stop_state(cron):
+    # finish any spawned report+retry-arm sequences before teardown (the
+    # reaper used to run them inline within _handle_finished_job).
+    await cron._drain_completions()
     for name in list(cron.retry_state):
         await cron.cancel_job_retries(name, settle=None)
     cron._cancel_coordination_tasks()

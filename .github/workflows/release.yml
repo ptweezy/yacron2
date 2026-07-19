@@ -7,7 +7,12 @@ name: CI
 # and musl/Alpine flavors, plus armv6 in musl only), macOS (arm64 + amd64 on
 # macOS 15, shipped; plus macOS 26/Tahoe as non-gating CI coverage) and Windows
 # (amd64 + arm64), and every Docker image (8 distros, full arch set, build-only)
-# -- and gates on ALL of it. No SOFTWARE is published on an ordinary commit; the
+# -- and gates on ALL of it. The `perf` job runs in the same fan-out: it
+# benchmarks this commit against the latest release tag (paired on one runner,
+# see benchmarks/) and, on a release, a regression beyond a metric's limit
+# fails the gate, while the resulting chart + summary are attached to the
+# GitHub Release and appended to its notes.
+# No SOFTWARE is published on an ordinary commit; the
 # one thing that is, is documentation -- a push to `develop` publishes wiki/ to
 # the GitHub wiki (the `wiki` job, ungated, since a doc is not an artifact).
 #
@@ -803,6 +808,124 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.distro }}
           cache-to: type=gha,mode=max,scope=${{ matrix.distro }}
 
+  # Paired performance benchmark. The suite in benchmarks/ runs against BOTH
+  # this commit and the latest published release tag, interleaved on one
+  # runner so machine noise cancels out of the comparison, and
+  # benchmarks/compare.py then diffs the two sides and enforces each metric's
+  # declared regression limit. It runs on every event, in the same fan-out as
+  # the builds. Enforcement is release-only: the `release` job needs this one,
+  # so a gated regression blocks publishing, while on an ordinary commit the
+  # identical comparison merely warns (a branch experiment is never blocked by
+  # a perf cost its author already knows about). An intentional regression
+  # ships by starting a pushed commit's SUBJECT with [perf:accept] (scanned
+  # exactly like the [release] marker: subjects only, never bodies). The
+  # artifact this job uploads (chart + summary + raw results) is what the
+  # `release` job attaches to the GitHub Release and appends to its notes.
+  perf:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0  # full history + tags: the baseline is the latest release tag
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.26"
+      - name: Install current and baseline environments
+        id: envs
+        env:
+          NEW_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          uv venv --python 3.14 .venv-new
+          SETUPTOOLS_SCM_PRETEND_VERSION="$NEW_VERSION" \
+            uv pip install --python .venv-new/bin/python .
+          git fetch --tags --force
+          prev=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          if [ -n "$prev" ]; then
+            # The baseline side: the last release's source in a worktree,
+            # installed into its own venv at its own pinned version. Both
+            # sides are DRIVEN by the current checkout's benchmarks/bench.py
+            # (the harness imports cronstable from whichever venv runs it), so
+            # a new benchmark measures both sides and an old release simply
+            # skips any API it does not have.
+            git worktree add /tmp/perf-baseline "$prev"
+            uv venv --python 3.14 .venv-old
+            SETUPTOOLS_SCM_PRETEND_VERSION="$prev" \
+              uv pip install --python .venv-old/bin/python /tmp/perf-baseline
+          else
+            echo "::notice::No release tag yet; recording a baseline without a comparison."
+          fi
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+      - name: Run benchmarks (interleaved rounds)
+        env:
+          PYTHONHASHSEED: "0"
+          PREV: ${{ steps.envs.outputs.prev }}
+        run: |
+          set -euo pipefail
+          mkdir -p perf
+          # Old then new, twice: interleaving puts both sides through the same
+          # runner weather; compare.py folds the rounds with each metric's own
+          # estimator (best-of for time, median for memory).
+          for round in 1 2; do
+            if [ -n "$PREV" ]; then
+              .venv-old/bin/python benchmarks/bench.py --json "perf/old.$round.json"
+            fi
+            .venv-new/bin/python benchmarks/bench.py --json "perf/new.$round.json"
+          done
+      - name: Compare and gate
+        env:
+          RELEASE: ${{ needs.version.outputs.release }}
+          NEW_VERSION: ${{ needs.version.outputs.new }}
+          PREV: ${{ steps.envs.outputs.prev }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          flags=""
+          if [ "$RELEASE" != "true" ]; then
+            flags="--warn-only"   # ordinary commit: same comparison, warnings only
+          fi
+          # [perf:accept] at the START of a pushed commit SUBJECT acknowledges
+          # the regression: it is still reported, but does not gate. Same
+          # range and same subject-only rule as the [release] marker scan.
+          zero="0000000000000000000000000000000000000000"
+          if [ -z "${BEFORE:-}" ] || [ "$BEFORE" = "$zero" ] \
+               || ! git rev-parse -q --verify "${BEFORE}^{commit}" >/dev/null; then
+            subjects="$(git log -1 --pretty=%s "$AFTER")"
+          else
+            subjects="$(git log --pretty=%s "${BEFORE}..${AFTER}")"
+          fi
+          if printf '%s\n' "$subjects" | grep -qiE '^\[perf:accept\]'; then
+            flags="$flags --accept"
+            echo "::notice::[perf:accept] marker found; regressions are reported but do not gate."
+          fi
+          if [ -z "$PREV" ]; then
+            .venv-new/bin/python benchmarks/compare.py \
+              --current perf/new.*.json --current-label "$NEW_VERSION" \
+              --md perf/perf-summary.md --merged-out perf/perf-results.json
+          else
+            .venv-new/bin/python benchmarks/compare.py $flags \
+              --baseline perf/old.*.json --current perf/new.*.json \
+              --baseline-label "$PREV" --current-label "$NEW_VERSION" \
+              --md perf/perf-summary.md --svg perf/perf-chart.svg \
+              --merged-out perf/perf-results.json \
+              --img-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${NEW_VERSION}/perf-chart.svg"
+          fi
+      # Upload even when the gate failed, so the report that explains the red
+      # X is always available on the run.
+      - uses: actions/upload-artifact@v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: perf-report
+          path: perf/
+          if-no-files-found: error
+          retention-days: 30
+
   # ---------------------------------------------------------------------------
   # Publish. Runs ONLY on a release, and ONLY after every gate job above has
   # succeeded. Skip-propagation makes docker-push/homebrew skip automatically
@@ -821,6 +944,7 @@ jobs:
       - binaries-macos
       - binaries-windows
       - docker
+      - perf
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -911,6 +1035,14 @@ jobs:
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
 
+      # The perf gate's output for THIS run: the mini chart, the markdown
+      # summary the notes embed, and the merged raw results for the record.
+      - name: Download performance report
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: perf-report
+          path: perf
+
       - name: Build release notes from HISTORY.md
         env:
           NEW: ${{ needs.version.outputs.new }}
@@ -932,6 +1064,15 @@ jobs:
           else
             echo "::warning::No HISTORY.md section for $NEW; release notes will be auto-generated only."
           fi
+          # Append the perf comparison (chart image + gate verdict + full
+          # table) below the curated notes. perf-summary.md already embeds
+          # the perf-chart.svg asset URL for this exact tag; the asset itself
+          # is attached by the Release step below, so the image resolves as
+          # soon as the Release exists.
+          {
+            echo ""
+            cat perf/perf-summary.md
+          } >> release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.2
@@ -946,8 +1087,13 @@ jobs:
           # Every shipped binary + the single SHA256SUMS, attached in one shot
           # (no later attach step, so nothing ever fights immutable-release
           # protection).
+          # perf-* is the benchmark report (chart + summary + raw results);
+          # the chart may be absent on the very first release (no baseline to
+          # diff against), which the glob tolerates and an explicit filename
+          # would not.
           files: |
             SHA256SUMS
+            perf/perf-*
             dist/*.whl
             dist/*.tar.gz
             binaries/cronstable-linux-amd64

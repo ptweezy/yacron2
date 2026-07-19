@@ -565,7 +565,9 @@ def _manifests_cover_scopes(recent: List[Dict[str, Any]]) -> bool:
     )
 
 
-def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
+def _job_run_info_from_dict(
+    rec: Dict[str, Any], *, output: Optional[JobOutputStream] = None
+) -> Optional["JobRunInfo"]:
     """Rebuild a :class:`JobRunInfo` from a durable ledger record.
 
     The inverse of :meth:`JobRunInfo.to_dict`, used to warm the in-memory
@@ -575,6 +577,11 @@ def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
     returns an empty (cleanly-terminating) stream for it.  A record missing or
     with an unparseable ``finished_at`` is skipped (returns ``None``) rather
     than crashing the rehydration.
+
+    ``output`` lets a bulk caller that never reads the stream (the trends
+    aggregation) supply one shared closed placeholder instead of paying an
+    allocation per record; leave it ``None`` for infos that enter
+    ``run_history``, where log replay expects each run's own stream.
     """
     # _parse_iso_utc pins naive timestamps to UTC: a rehydrated JobRunInfo
     # mixing naive and aware datetimes would raise TypeError from the
@@ -589,8 +596,9 @@ def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
     if finished is None:
         return None
     started = _parse_iso_utc(rec.get("started_at"))
-    empty = JobOutputStream()
-    empty.closed = True
+    if output is None:
+        output = JobOutputStream()
+        output.closed = True
     outcome = rec.get("outcome")
     exit_code = rec.get("exit_code")
     fail_reason = rec.get("fail_reason")
@@ -603,7 +611,7 @@ def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
         started_at=started,
         finished_at=finished,
         fail_reason=fail_reason if isinstance(fail_reason, str) else None,
-        output=empty,
+        output=output,
         # ResourceUsage.from_dict tolerates absent/foreign "resources" fields
         # (returns None), so a pre-monitoring or hand-edited record rehydrates
         # cleanly with no resource stats.
@@ -3109,12 +3117,18 @@ class Cron:
     async def job_trends_payload(self, name: str) -> Optional[Dict[str, Any]]:
         """SLA trend aggregates over the durable run ledger, or ``None``.
 
-        Behind ``GET /jobs/{name}/trends`` and MCP ``cron_get_job_trends``.
+        Behind ``GET /jobs/{name}/trends`` and MCP ``cron_get_job_trends``
+        (both routes share this method, so the executor offload below lives
+        in exactly one place).  Only the backend read is awaited on the
+        loop; the record parse and window aggregation (up to
+        :data:`TREND_SCAN_LIMIT` records, pure CPU) run on the default
+        executor over immutable snapshots, like the schedule
+        pressure/suggest/calendar builders, so a dashboard poll cannot
+        stall job dispatch.
         """
         if name not in self.cron_jobs:
             return None
-        infos: List[JobRunInfo] = []
-        source = "memory"
+        recs: Optional[List[Dict[str, Any]]] = None
         backend = self.state_backend
         if backend is not None:
             try:
@@ -3138,24 +3152,65 @@ class Cron:
                     name,
                     ex,
                 )
-            else:
-                source = "durable"
-                recs.reverse()  # oldest first, matching _run_stats
-                for rec in recs:
-                    restored = _job_run_info_from_dict(rec)
-                    if restored is not None:
-                        infos.append(restored)
-        if source == "memory":
-            infos = list(self.run_history.get(name) or [])
+        # The in-memory fallback reads live state, so its snapshot is taken
+        # on the loop; the ledger snapshot above is already ours alone.  The
+        # builder then touches nothing but its arguments.
+        fallback = (
+            list(self.run_history.get(name) or []) if recs is None else None
+        )
+        return await asyncio.get_running_loop().run_in_executor(
+            None, partial(self._job_trends_build, name, recs, fallback)
+        )
+
+    def _job_trends_build(
+        self,
+        name: str,
+        recs: Optional[List[Dict[str, Any]]],
+        fallback: Optional[List[JobRunInfo]],
+    ) -> Dict[str, Any]:
+        """Parse and aggregate for :meth:`job_trends_payload` (executor side).
+
+        Pure CPU over snapshots captured on the loop: ``recs`` is the
+        newest-first ledger listing when the backend read succeeded,
+        otherwise ``fallback`` is the in-memory history copy.
+        """
+        if recs is not None:
+            source = "durable"
+            infos: List[JobRunInfo] = []
+            recs.reverse()  # oldest first, matching _run_stats
+            # one shared, already-closed output stream for every rehydrated
+            # record: the trends aggregation never reads output, so the
+            # per-record buffer allocation would be pure waste at
+            # TREND_SCAN_LIMIT scale.
+            empty = JobOutputStream()
+            empty.closed = True
+            for rec in recs:
+                restored = _job_run_info_from_dict(rec, output=empty)
+                if restored is not None:
+                    infos.append(restored)
+        else:
+            source = "memory"
+            infos = fallback or []
         now = get_now(datetime.timezone.utc)
-        windows = {}
-        for label, seconds in TREND_WINDOWS:
-            recent = [
-                info
-                for info in infos
-                if (now - info.finished_at).total_seconds() <= seconds
-            ]
-            windows[label] = _run_stats(recent)
+        # One pass instead of one filter pass per window: each info's age is
+        # computed once and the info appended to every window it fits, which
+        # reproduces the per-window filters exactly (same members, same
+        # relative order).  Bucketing rather than a bisect slice because the
+        # listing's append order is not provably finished_at order: run
+        # records persist fire-and-forget, a shared mount interleaves other
+        # nodes' appends, and a crash-reconciled record carries a past
+        # interruption instant but lands in the stream at boot.
+        window_runs: Dict[str, List[JobRunInfo]] = {
+            label: [] for label, _ in TREND_WINDOWS
+        }
+        for info in infos:
+            age = (now - info.finished_at).total_seconds()
+            for label, seconds in TREND_WINDOWS:
+                if age <= seconds:
+                    window_runs[label].append(info)
+        windows = {
+            label: _run_stats(runs) for label, runs in window_runs.items()
+        }
         windows["all"] = _run_stats(infos)
         return {
             "name": name,

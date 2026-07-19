@@ -172,16 +172,29 @@ fold can only de-duplicate a double-run, never cause a zero-run.
 
 import asyncio
 import datetime
+import functools
 import hashlib
 import json
 import logging
 import math
 import os
 import ssl
+import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    TypeVar,
+    cast,
+)
 
 import aiohttp
 from aiohttp import web
@@ -305,6 +318,24 @@ NODE_STATS_STALE_ROUNDS = 3
 # outweighs the few bytes saved.
 MAX_PEER_ETAG_LEN = 128  # a stored / echoed ETag header value
 MIN_COMPRESS_BYTES = 1024  # smallest /peer body worth gzip-compressing
+
+# How long _handle_peer may re-serve an already-built (payload, ETag) pair
+# before rebuilding it (seconds, on the monotonic clock). The pair used to be
+# rebuilt per incoming request, BEFORE the If-None-Match check, so with P
+# peers the full payload cascade (the election derivations plus up to
+# MAX_ADVERTISED_JOB_SUMMARIES per-job entries, then a whole-document
+# json.dumps + sha256) ran P times per poll interval forever, even in the
+# steady state where every answer was a 304. Re-serving a <=1s-stale pair is
+# safe because pollers already tolerate arbitrary sampling times: each polls
+# on its own interval with its own phase, so a response built up to 1s before
+# the request arrived is indistinguishable from the poller having polled up
+# to 1s earlier, and the receipt-time ageing on the consumer side
+# (_aged_job_summaries) keeps derived countdowns exact regardless of when the
+# body was built. The TTL only bounds inputs the cache key cannot observe
+# (chiefly the live summaries-provider snapshot); election-relevant state is
+# keyed exactly, so a view change invalidates the pair immediately (zero
+# staleness there). See _handle_peer.
+PEER_RESPONSE_CACHE_TTL = 1.0
 
 # Gossiped node stats ride a /peer response HEADER, not the body: the live
 # CPU/memory values would roll the body's ETag every round and defeat the 304
@@ -871,6 +902,35 @@ class PeerState:
     # an hours-old reading as current forever -- see fresh_node_stats.
     node_stats_at: Optional[datetime.datetime] = None
 
+    # Process-wide count of PeerState field writes (a ClassVar, so the
+    # dataclass machinery ignores it). This is the generation the manager's
+    # memoized election-derived results are keyed on: those results are pure
+    # functions of the peer table (plus a few construction-time scalars), and
+    # the peer table only ever changes through attribute assignment on a
+    # PeerState. See __setattr__ below and
+    # ClusterManager._derived_state_key.
+    _mutation_generation: ClassVar[int] = 0
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Bump the generation on EVERY field write. Hooking assignment
+        # itself, rather than the record_success / record_failure entry
+        # points, makes the invalidation structurally exhaustive: any writer
+        # (the view's own updaters, dataclass construction when a fresh view
+        # is built, or a test seeding a peer field directly) rolls the
+        # generation, so a memoized result can never outlive the
+        # observations it was derived from. The counter is process-wide
+        # rather than per view on purpose: a bump from an unrelated view can
+        # only force a spurious recompute (never staleness), and the write
+        # path is cold (a handful of writes per poll round) next to the
+        # per-gate-check read path the memoization exists to serve. The one
+        # granularity caveat: this sees assignments, not in-place mutation
+        # of an already-assigned collection; that is sound today because
+        # every writer replaces peer collections wholesale (record_success
+        # assigns fresh ones, record_failure assigns None) and none appends
+        # into them.
+        object.__setattr__(self, name, value)
+        PeerState._mutation_generation += 1
+
     def fresh_node_stats(
         self, now: datetime.datetime, max_age: float
     ) -> Optional[Dict[str, Any]]:
@@ -1267,6 +1327,67 @@ def _split_host_port(addr: str) -> "tuple[str, int]":
     return host, int(port)
 
 
+# the result type a memoized derived method computes (see _memoized_derived);
+# preserving it through the decorator keeps call sites fully typed.
+_DerivedT = TypeVar("_DerivedT")
+
+
+def _memoized_derived(
+    method: "Callable[[ClusterManager], _DerivedT]",
+) -> "Callable[[ClusterManager], _DerivedT]":
+    """Memoize a zero-argument election-derived ClusterManager method.
+
+    The decorated methods are pure derivations over the peer table (plus a
+    few construction-time identity scalars): they change ONLY when a poll
+    round records an observation, yet each leader/owner gate check re-runs
+    the whole cascade from scratch. A single job_owner() call re-derives
+    _agreeing_peers (itself an O(N^2) scan over the peer table) about six
+    times and rescans for cluster_size about eight, and those gates run per
+    due job per launch, per job in the claim scan, per @reboot wakeup, per
+    catch-up evaluation, per incoming /peer request, and per dashboard poll.
+
+    So each result is cached on the manager, keyed (all results together, in
+    one dict) by :meth:`ClusterManager._derived_state_key`: the process-wide
+    PeerState mutation generation, which every peer-field write bumps (see
+    :meth:`PeerState.__setattr__`), plus the identity scalars the
+    derivations read. Any input change rolls the key, which drops the whole
+    cache at once; between changes every caller gets the one computed value
+    back, byte-for-byte the value a fresh derivation would produce (the
+    methods are deterministic reads with no side effects, so this is purely
+    a recomputation saving with zero behavioural change).
+
+    The cached object itself is shared between callers, so callers must
+    treat a returned list as frozen. Every current call site does: results
+    are only iterated, sorted, splatted into fresh lists, or wrapped in
+    set()/min()/max() (audited per site), and the elect_* helpers likewise
+    build their own candidate lists. Nested memoized calls (for example
+    _eligible_candidates calling _agreeing_peers) are safe: the derivations
+    perform no writes, and the manager runs on a single event loop, so the
+    key cannot move mid-computation.
+    """
+    name = method.__name__
+
+    @functools.wraps(method)
+    def wrapper(self: "ClusterManager") -> "_DerivedT":
+        key = self._derived_state_key()
+        if key != self._derived_cache_key:
+            # an input changed since the cached round: every memoized result
+            # derives from the same inputs, so drop them all together.
+            self._derived_cache_key = key
+            self._derived_cache.clear()
+        try:
+            # the cache is heterogeneous (one dict for every derived method,
+            # keyed by method name), so entries are stored as Any; the cast
+            # restores the static type the method computed the value with.
+            return cast("_DerivedT", self._derived_cache[name])
+        except KeyError:
+            value = method(self)
+            self._derived_cache[name] = value
+            return value
+
+    return wrapper
+
+
 class ClusterManager(LeadershipBackend):
     """Owns the mTLS ``/peer`` listener and the periodic peer-poll loop.
 
@@ -1356,6 +1477,47 @@ class ClusterManager(LeadershipBackend):
             Callable[[], Optional[Dict[str, Any]]]
         ] = None
         self._share_node_stats = False
+        # Memoized election-derived results (one dict for all of them,
+        # function name -> value), valid only for _derived_cache_key; see
+        # _memoized_derived / _derived_state_key.
+        self._derived_cache: Dict[str, Any] = {}
+        self._derived_cache_key: Optional["tuple"] = None
+        # The last (state key, monotonic build time, payload, etag) built by
+        # _handle_peer, re-served to pollers while the key still matches and
+        # the PEER_RESPONSE_CACHE_TTL clock bound holds; see _handle_peer.
+        self._peer_response_cache: Optional[
+            "tuple[Any, float, Dict[str, Any], str]"
+        ] = None
+
+    def _derived_state_key(self) -> "tuple":
+        """The key every memoized election-derived result is valid under.
+
+        The memoized derivations (see :func:`_memoized_derived`) read
+        exactly two kinds of input:
+
+        * **The peer table.** Covered by the process-wide PeerState mutation
+          generation: every field write, wherever it comes from
+          (record_success, record_failure, or a direct assignment in a
+          test), bumps it via :meth:`PeerState.__setattr__`, so no mutation
+          path can be missed by construction. Even replacing ``self.view``
+          with a freshly built one is covered, since constructing its
+          PeerState entries bumps the generation too.
+        * **A handful of scalars**: the configured peer count, the
+          electLeader flag, distribution, node_name, and instance_id. All
+          are assigned only in ``__init__`` today (a reload builds a whole
+          new manager, and with it an empty cache), but they ride along in
+          the key anyway as cheap insurance: if any is ever reassigned in
+          place, the key rolls and the cache is dropped rather than serving
+          results derived from a stale identity.
+        """
+        return (
+            PeerState._mutation_generation,
+            len(self.config["peers"]),
+            bool(self.config.get("electLeader")),
+            self.distribution,
+            self.node_name,
+            self.instance_id,
+        )
 
     def set_job_summaries_provider(
         self, provider: Callable[[], Dict[str, Any]]
@@ -1499,7 +1661,41 @@ class ClusterManager(LeadershipBackend):
         return payload
 
     @staticmethod
-    def _peer_etag(payload: Dict[str, Any], now_epoch: float) -> str:
+    def _stable_job_summaries(
+        job_summaries: Dict[str, Any], now_epoch: float
+    ) -> Dict[str, Any]:
+        """The hash-stable (change-relevant) form of a job_summaries block.
+
+        The ``scheduled_in`` normalisation documented on :meth:`_peer_etag`,
+        factored out so :meth:`_handle_peer` can build the normalised block
+        once per cached (payload, etag) pair and hand it to the etag
+        computation, instead of :meth:`_peer_etag` re-deriving it from the
+        payload (a second pass over up to MAX_ADVERTISED_JOB_SUMMARIES
+        entries) on every build.
+        """
+        return {
+            name: {
+                key: (
+                    value
+                    if key != "scheduled_in"
+                    else (
+                        round(now_epoch + value)
+                        if isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        else None
+                    )
+                )
+                for key, value in entry.items()
+            }
+            for name, entry in job_summaries.items()
+        }
+
+    @staticmethod
+    def _peer_etag(
+        payload: Dict[str, Any],
+        now_epoch: float,
+        stable_summaries: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """A strong ETag for ``payload``: a hash of change-relevant content.
 
         Deterministic across rounds while nothing real changed, so a poller
@@ -1519,24 +1715,20 @@ class ClusterManager(LeadershipBackend):
         sub-second rounding means back-to-back computations straddling a
         second boundary can very occasionally disagree -- the cost is one
         spurious full body, never a wrong 304.
+
+        ``stable_summaries`` lets a caller that already normalised the block
+        (via :meth:`_stable_job_summaries`, as :meth:`_handle_peer` does)
+        pass it in so it is not rebuilt here; when omitted the block is
+        derived from the payload exactly as before.
         """
         stable = dict(payload)
-        stable["job_summaries"] = {
-            name: {
-                key: (
-                    value
-                    if key != "scheduled_in"
-                    else (
-                        round(now_epoch + value)
-                        if isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        else None
-                    )
-                )
-                for key, value in entry.items()
-            }
-            for name, entry in payload["job_summaries"].items()
-        }
+        stable["job_summaries"] = (
+            stable_summaries
+            if stable_summaries is not None
+            else ClusterManager._stable_job_summaries(
+                payload["job_summaries"], now_epoch
+            )
+        )
         digest = hashlib.sha256(
             json.dumps(stable, sort_keys=True, separators=(",", ":")).encode(
                 "utf-8"
@@ -1545,11 +1737,69 @@ class ClusterManager(LeadershipBackend):
         return '"{}"'.format(digest)
 
     async def _handle_peer(self, request: web.Request) -> web.Response:
-        payload = self._peer_payload()
-        etag = self._peer_etag(
-            payload,
-            datetime.datetime.now(datetime.timezone.utc).timestamp(),
+        # Build-once caching for the (payload, etag) pair. These used to be
+        # rebuilt per incoming request BEFORE the If-None-Match comparison,
+        # so the steady-state 304 saved bandwidth but no CPU: the payload
+        # runs the full election cascade plus the per-job summary block, and
+        # the etag json.dumps + sha256 the whole document. Reuse is bounded
+        # two ways:
+        #
+        # * a state key: _derived_state_key() covers every election-relevant
+        #   input (any peer-field write bumps the generation), and the extra
+        #   components below cover the remaining payload inputs the
+        #   derivations do not read. A change to any of them invalidates the
+        #   pair immediately, so election-state staleness is exactly zero.
+        # * PEER_RESPONSE_CACHE_TTL bounds the inputs the key cannot observe
+        #   (chiefly the summaries provider's live snapshot); see the
+        #   constant for why a <=1s-stale pair is indistinguishable from the
+        #   poller having polled 1s earlier.
+        #
+        # The cached payload dict is shared across requests and must never
+        # be mutated per request; nothing below writes into it
+        # (json_response only serialises it), and the per-request live data
+        # (the node-stats reading) rides a response header, never the body.
+        now_mono = time.monotonic()
+        state_key = (
+            self._derived_state_key(),
+            # the live job-set id: a config reload changes it immediately
+            # and the advertised ran-set gating depends on it, so it must
+            # never be served stale.
+            self.get_job_set_id(),
+            # the recorded @reboot-run state feeding advertised_ran_jobs():
+            # its scoping id plus the set's cardinality. Cardinality catches
+            # every add and clear; the one same-length rewrite (a truncation
+            # at MAX_ADVERTISED_REBOOT_JOBS swapping names) is bounded by
+            # the TTL like the provider snapshot. Peer-learned ran-sets are
+            # already covered by the generation in _derived_state_key().
+            self._ran_jobs_job_set_id,
+            len(self._ran_reboot_jobs),
+            # the summaries provider itself (compared by identity):
+            # installing or swapping one must invalidate at once.
+            self._job_summaries_provider,
         )
+        cached = self._peer_response_cache
+        if (
+            cached is not None
+            and cached[0] == state_key
+            and now_mono - cached[1] <= PEER_RESPONSE_CACHE_TTL
+        ):
+            payload, etag = cached[2], cached[3]
+        else:
+            payload = self._peer_payload()
+            now_epoch = datetime.datetime.now(
+                datetime.timezone.utc
+            ).timestamp()
+            # normalise the summaries block once and hand it to the etag
+            # computation, instead of _peer_etag re-deriving it from the
+            # payload (see _stable_job_summaries).
+            etag = self._peer_etag(
+                payload,
+                now_epoch,
+                self._stable_job_summaries(
+                    payload["job_summaries"], now_epoch
+                ),
+            )
+            self._peer_response_cache = (state_key, now_mono, payload, etag)
         headers = {"ETag": etag}
         # The node-stats sidecar: a live reading (when sharing) travels as a
         # compact-JSON response header rather than in the body, so it never
@@ -2390,6 +2640,7 @@ class ClusterManager(LeadershipBackend):
 
     # --- leader election --------------------------------------------------
 
+    @_memoized_derived
     def cluster_size(self) -> int:
         """Total number of cluster members.
 
@@ -2455,6 +2706,7 @@ class ClusterManager(LeadershipBackend):
     def quorum(self) -> int:
         return quorum_size(self.cluster_size())
 
+    @_memoized_derived
     def _agreeing_peers(self) -> List[PeerState]:
         """Peers we *mutually* agree with on our job-set id *and* cluster size.
 
@@ -2545,6 +2797,7 @@ class ClusterManager(LeadershipBackend):
             agreeing.append(peer)
         return agreeing
 
+    @_memoized_derived
     def _agreeing_peer_names(self) -> List[str]:
         """Names of the peers we mutually agree with.
 
@@ -2554,6 +2807,7 @@ class ClusterManager(LeadershipBackend):
             peer.node_name for peer in self._agreeing_peers() if peer.node_name
         ]
 
+    @_memoized_derived
     def _bridge_candidates(self) -> List[str]:
         """Nodes we reach only *transitively* that we can confirm are quorate.
 
@@ -2620,6 +2874,7 @@ class ClusterManager(LeadershipBackend):
             name for name, seen in witnesses.items() if len(seen) + 1 >= quorum
         )
 
+    @_memoized_derived
     def _eligible_candidates(self) -> List[str]:
         """The names this node may actually *elect* as leader / job owner.
 
@@ -2662,6 +2917,7 @@ class ClusterManager(LeadershipBackend):
         ]
         return eligible + self._bridge_candidates()
 
+    @_memoized_derived
     def _unconfirmed_contenders(self) -> List[str]:
         """Quorate co-owners a peer *vouches* for that we cannot confirm
         ourselves -- folded into the ``spread`` ``Leader`` owner gate so it
@@ -2735,6 +2991,7 @@ class ClusterManager(LeadershipBackend):
 
     # --- duplicate-nodeName detection ------------------------------------
 
+    @_memoized_derived
     def conflict_names(self) -> List[str]:
         """nodeNames currently claimed by more than one distinct instance.
 
@@ -2838,6 +3095,7 @@ class ClusterManager(LeadershipBackend):
 
     # --- cluster-size (membership) divergence ----------------------------
 
+    @_memoized_derived
     def conflicting_sizes(self) -> List[int]:
         """Cluster sizes declared by agreeing peers that differ from ours.
 
@@ -2895,6 +3153,7 @@ class ClusterManager(LeadershipBackend):
             }
         )
 
+    @_memoized_derived
     def conflicting_policies(self) -> List[str]:
         """Coordination-policy divergences declared by agreeing peers.
 
@@ -3192,6 +3451,7 @@ class ClusterManager(LeadershipBackend):
         """
         return self.job_owner(job_name) == self.node_name
 
+    @_memoized_derived
     def _available_contenders(self) -> List[str]:
         """Reachable co-owners a peer vouches a two-way edge to that we cannot
         reach directly -- folded into the never-skip ``available`` owner set so

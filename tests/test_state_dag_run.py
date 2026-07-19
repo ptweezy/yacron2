@@ -1425,6 +1425,336 @@ async def test_monitored_task_resources_land_in_run_record(tmp_path):
         await _teardown(cron)
 
 
+# --------------------------------------------------------------------------
+# Advance-pass RMW economy: batched pid stamping, single-RMW quiescence
+# --------------------------------------------------------------------------
+
+
+def _wait_for_flag_script(flag):
+    """A bounded wait-for-file command body (so a failed test cannot leak
+    an immortal subprocess)."""
+    return (
+        "import os,sys,time\n"
+        "for _ in range(600):\n"
+        "    if os.path.exists(r'{}'): sys.exit(0)\n"
+        "    time.sleep(0.05)\n"
+        "sys.exit(1)"
+    ).format(flag)
+
+
+async def test_launch_batch_stamps_pids_in_one_rmw(tmp_path):
+    # regression (performance): the launch loop used to run one full
+    # document RMW PER launched task just to record its pid; the whole
+    # batch must now land through a single set_task_pids RMW, with every
+    # pid actually recorded.
+    yaml = (
+        "dags:\n  - name: par\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "      - id: b\n        command: 'x'\n"
+        "      - id: c\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        flag = tmp_path / "go"
+        script = _wait_for_flag_script(flag)
+        for tid in ("a", "b", "c"):
+            _set_cmd(cron, "par", tid, [_PY, "-c", script])
+        stamped = []
+        orig = cron._dag._set_pids
+
+        async def spy(ref, stamps):
+            stamped.append(list(stamps))
+            await orig(ref, stamps)
+
+        cron._dag._set_pids = spy
+        run_key = await cron._dag.trigger_run("par")
+        await _drain_pending(cron)
+        # one batched write covered all three launches
+        assert len(stamped) == 1
+        assert {s[0] for s in stamped[0]} == {"a", "b", "c"}
+        body = await cron._dag.get_run("par", run_key)
+        for tid in ("a", "b", "c"):
+            entry = body["tasks"][tid]
+            assert entry["state"] == dag.RUNNING
+            assert entry["proc"] == cron._proc_token
+            assert isinstance(entry["pid"], int)
+        cron._dag._set_pids = orig
+        flag.write_text("go")
+        body = await _drive(cron, "par", run_key)
+        assert body["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_quiescent_advance_is_single_kept_rmw(tmp_path):
+    # regression (performance): an advance of a quiescent run (its one task
+    # in flight under our own proc token) used to pay a reconcile RMW plus
+    # a claim RMW; the combined transform must make it ONE RMW that keeps
+    # the document (no rewrite, updatedAt untouched).
+    yaml = (
+        "dags:\n  - name: q1\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        flag = tmp_path / "go"
+        _set_cmd(cron, "q1", "a", [_PY, "-c", _wait_for_flag_script(flag)])
+        run_key = await cron._dag.trigger_run("q1")
+        await _drain_pending(cron)
+        ref = ("q1", run_key)
+        before = await cron._dag.get_run("q1", run_key)
+        assert before["tasks"]["a"]["state"] == dag.RUNNING
+        calls = []
+        orig = cron._dag._mutate
+
+        async def counting(dag_name, key, transform):
+            calls.append((dag_name, key))
+            return await orig(dag_name, key, transform)
+
+        cron._dag._mutate = counting
+        await cron._dag.advance_one(ref)
+        cron._dag._mutate = orig
+        assert calls == [ref]  # the whole advance was one document RMW
+        after = await cron._dag.get_run("q1", run_key)
+        assert after["updatedAt"] == before["updatedAt"]  # kept, not rewritten
+        assert after["tasks"]["a"]["state"] == dag.RUNNING
+        assert cron._dag._wake[ref] > dagrun._now()  # wake floor scheduled
+        flag.write_text("go")
+        body = await _drive(cron, "q1", run_key)
+        assert body["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_expansion_advance_falls_back_to_two_rmws(tmp_path):
+    # the combined transform cannot read XCom, so an advance that finds a
+    # mapped task awaiting expansion must flag it and run the classic
+    # pre-read + plan_and_claim RMW as a second step, then expand exactly
+    # as before.
+    yaml = (
+        "dags:\n  - name: fb\n    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: work\n        command: 'x'\n        dependsOn:\n"
+        "          - gen\n        expand:\n"
+        "          fromTask: gen\n          key: items\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        items_file = tmp_path / "items.json"
+        items_file.write_text('["only"]')
+        _set_cmd(
+            cron,
+            "fb",
+            "gen",
+            [
+                _PY,
+                "-m",
+                "cronstable",
+                "xcom",
+                "push",
+                "--key",
+                "items",
+                str(items_file),
+            ],
+        )
+        _set_cmd(cron, "fb", "work", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("fb")
+        ref = ("fb", run_key)
+        # let gen finish and its completion land, WITHOUT the follow-up
+        # advance observing it yet
+        await _reap_running(cron)
+        # cancel the completion's spawned auto-advance (it has not started:
+        # _reap_running never yields after creating it) so the counted
+        # advance below is the only one and burst coalescing cannot skew
+        # the RMW tally
+        pend = [
+            t for t in list(cron._pending_state_writes) if not t.done()
+        ]
+        for t in pend:
+            t.cancel()
+        await asyncio.gather(*pend, return_exceptions=True)
+        body = await cron._dag.get_run("fb", run_key)
+        assert body["tasks"]["gen"]["state"] == dag.SUCCESS
+        calls = []
+        orig = cron._dag._mutate
+
+        async def counting(dag_name, key, transform):
+            calls.append((dag_name, key))
+            return await orig(dag_name, key, transform)
+
+        cron._dag._mutate = counting
+        await cron._dag.advance_one(ref)
+        cron._dag._mutate = orig
+        body = await cron._dag.get_run("fb", run_key)
+        assert body["mapped"]["work"]["items"] == ["only"]
+        assert body["tasks"]["work#0"]["state"] == dag.RUNNING
+        # combined RMW (flagged expansions) + claim RMW + batched pid RMW
+        assert [c for c in calls if c == ref] == [ref, ref, ref]
+        body = await _drive(cron, "fb", run_key)
+        assert body["state"] == dag.SUCCESS, _states(body)
+    finally:
+        await _teardown(cron)
+
+
+async def test_combined_advance_reconciles_crashed_task_inline(tmp_path):
+    # a crashed foreign claim must be recovered AND re-claimed by the one
+    # combined RMW (the old flow needed the reconcile RMW plus the claim
+    # RMW to do the same).
+    yaml = (
+        "dags:\n  - name: rc\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n        retries: 1\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        flag = tmp_path / "go"
+        _set_cmd(cron, "rc", "a", [_PY, "-c", _wait_for_flag_script(flag)])
+        run_key = await cron._dag.trigger_run("rc")
+        ref = ("rc", run_key)
+        await _drain_pending(cron)
+
+        # a prior daemon's claim: foreign proc token, dead pid, our host
+        def _crash(body):
+            entry = body["tasks"]["a"]
+            entry["proc"] = "dead-daemon#deadbeef"
+            entry["pid"] = 2147480000
+            entry["host"] = cron._state_host
+            return body, None
+
+        ns = dag.DAG_RUN_NS_PREFIX + "rc"
+        await cron.state_backend.mutate_document(ns, run_key, _crash)
+        await cron._dag.advance_one(ref)
+        body = await cron._dag.get_run("rc", run_key)
+        entry = body["tasks"]["a"]
+        assert entry["state"] == dag.RUNNING
+        assert entry["proc"] == cron._proc_token  # re-claimed here
+        assert entry["attempt"] == 1  # the crashed attempt was consumed
+        flag.write_text("go")
+        body = await _drive(cron, "rc", run_key)
+        assert body["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_failed_batch_pid_write_does_not_fail_tasks(tmp_path):
+    # the batched pid stamp stays best-effort, like the old per-task write:
+    # a store hiccup on it must neither abort the advance nor fail the
+    # already-running tasks (the claim-time proc token protects them).
+    yaml = (
+        "dags:\n  - name: bp\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        flag = tmp_path / "go"
+        _set_cmd(cron, "bp", "a", [_PY, "-c", _wait_for_flag_script(flag)])
+
+        async def broken(ref, stamps):
+            raise RuntimeError("store on fire")
+
+        orig = cron._dag._set_pids
+        cron._dag._set_pids = broken
+        run_key = await cron._dag.trigger_run("bp")
+        await _drain_pending(cron)
+        body = await cron._dag.get_run("bp", run_key)
+        entry = body["tasks"]["a"]
+        assert entry["state"] == dag.RUNNING  # launched despite the failure
+        assert entry["proc"] == cron._proc_token  # still owned/protected
+        assert entry["pid"] is None  # only the optimisation was lost
+        cron._dag._set_pids = orig
+        flag.write_text("go")
+        body = await _drive(cron, "bp", run_key)
+        assert body["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_one_launch_failure_does_not_skip_the_batch(tmp_path):
+    # one task's launch blowing up must fail exactly that task (exit 127)
+    # while the rest of the claimed batch still launches, and its pid still
+    # lands through the batched stamp.
+    yaml = (
+        "dags:\n  - name: lf\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+        "      - id: b\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "lf", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lf", "b", [_PY, "-c", "pass"])
+        orig = cron._dag._launch_task
+
+        async def flaky(dagcfg, ref, run_id, intent):
+            if intent.task_id == "a":
+                raise RuntimeError("boom")
+            return await orig(dagcfg, ref, run_id, intent)
+
+        cron._dag._launch_task = flaky
+        run_key = await cron._dag.trigger_run("lf")
+        await _drain_pending(cron)
+        body = await cron._dag.get_run("lf", run_key)
+        assert body["tasks"]["a"]["state"] == dag.FAILED
+        assert body["tasks"]["a"]["exitCode"] == 127
+        assert body["tasks"]["a"]["failReason"] == "launch error"
+        # b was still launched (and its pid recorded) despite a's failure
+        assert body["tasks"]["b"]["state"] in (dag.RUNNING, dag.SUCCESS)
+        cron._dag._launch_task = orig
+        body = await _drive(cron, "lf", run_key)
+        assert body["state"] == dag.FAILED
+        assert body["tasks"]["b"]["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_subprocess_start_failure_fails_task_cleanly(
+    tmp_path, monkeypatch
+):
+    # a launch whose start() blows up is failed explicitly with exit 127 by
+    # the launch path itself, contributes NO pid stamp to the batch, and the
+    # run still terminalises.
+    from cronstable.job import RunningJob
+
+    yaml = (
+        "dags:\n  - name: sf\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "sf", "a", [_PY, "-c", "pass"])
+
+        async def boom(self):
+            raise RuntimeError("start blew up")
+
+        monkeypatch.setattr(RunningJob, "start", boom)
+        run_key = await cron._dag.trigger_run("sf")
+        monkeypatch.undo()
+        await _drain_pending(cron)
+        body = await _drive(cron, "sf", run_key)
+        assert body["state"] == dag.FAILED
+        entry = body["tasks"]["a"]
+        assert entry["state"] == dag.FAILED
+        assert entry["exitCode"] == 127
+        assert entry["failReason"] == "launch failed"
+        assert entry["pid"] is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_advance_of_missing_document_releases_ownership(tmp_path):
+    # the combined RMW observing NO document (a GC'd or never-created run)
+    # must release the ref, exactly like the old reconcile step did.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        ref = ("lin", "manual-ghost")
+        cron._dag._owned[ref] = Lease(
+            "dagadvance/lin/manual-ghost", "h#1", 1, 9e18
+        )
+        cron._dag._locks.setdefault(ref, asyncio.Lock())
+        await cron._dag.advance_one(ref)
+        assert ref not in cron._dag._owned
+    finally:
+        await _teardown(cron)
+
+
 # ===========================================================================
 # Scheduler internals: catch-up replay, lease upkeep, orphan adoption,
 # XCom fan-out reads, and the degraded-store guards.

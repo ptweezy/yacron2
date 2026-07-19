@@ -12,6 +12,7 @@ argument everywhere).  Backend + cron wiring lives in test_state_dag_run.py.
 """
 
 import asyncio
+import copy
 import json
 import sys
 
@@ -1459,6 +1460,375 @@ def test_unmonitored_task_keeps_resources_none():
     )
     assert _state(body, "s") == dag.SUCCESS
     assert body["tasks"]["s"]["resources"] == usage
+
+
+# --------------------------------------------------------------------------
+# Batched pid stamping (set_task_pids)
+# --------------------------------------------------------------------------
+
+
+def test_set_task_pids_batch_equals_sequential():
+    # applying the batch must be indistinguishable from applying the
+    # per-entry set_task_pid transforms one by one at the same instant.
+    spec = _spec(TaskSpec("a"), TaskSpec("b"), TaskSpec("c"))
+    base = _body(spec)
+    base, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), base)
+    stamps = [("a", "p", 11, 0), ("b", "p", 12, 0), ("c", "p", 13, None)]
+    seq = copy.deepcopy(base)
+    for taskkey, proc, pid, attempt in stamps:
+        seq, applied = _apply(
+            dag.set_task_pid(taskkey, proc, pid, 5.0, attempt=attempt), seq
+        )
+        assert applied is True
+    bat, applied = _apply(dag.set_task_pids(stamps, 5.0), copy.deepcopy(base))
+    assert applied == 3
+    assert bat == seq
+
+
+def test_set_task_pids_fences_each_entry_independently():
+    # one stale entry in a batch (a foreign re-claim, or a superseded
+    # attempt) must be dropped on its own while the rest still applies:
+    # batching removes RMWs, never a fence.
+    spec = _spec(TaskSpec("a", max_attempts=3), TaskSpec("b"), TaskSpec("c"))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    body["tasks"]["b"]["proc"] = "other-proc"  # re-claimed elsewhere
+    body["tasks"]["a"]["attempt"] = 1  # a newer attempt is the live one
+    stamps = [
+        ("a", "p", 11, 0),  # stale attempt: fenced out
+        ("b", "p", 12, 0),  # foreign proc: fenced out
+        ("c", "p", 13, 0),  # live: applies
+        ("ghost", "p", 14, 0),  # no such entry: dropped
+    ]
+    body, applied = _apply(dag.set_task_pids(stamps, 5.0), body)
+    assert applied == 1
+    assert body["tasks"]["a"]["pid"] is None
+    assert body["tasks"]["b"]["pid"] is None
+    assert body["tasks"]["b"]["proc"] == "other-proc"  # unclobbered
+    assert body["tasks"]["c"]["pid"] == 13
+
+
+def test_set_task_pids_all_fenced_keeps_document():
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    updated = body["updatedAt"]
+    new, applied = dag.set_task_pids([("a", "other", 9, 0)], 5.0)(body)
+    assert dag.is_keep(new) and applied == 0
+    assert body["updatedAt"] == updated  # not even the timestamp moved
+    new, applied = dag.set_task_pids([("a", "p", 9, 0)], 5.0)(None)
+    assert dag.is_keep(new) and applied == 0
+
+
+# --------------------------------------------------------------------------
+# Combined reconcile+claim transform (reconcile_and_plan)
+# --------------------------------------------------------------------------
+
+
+def test_reconcile_and_plan_single_pass_reconciles_and_reclaims():
+    # the common case: no expansions pending, so ONE transform application
+    # both recovers the crashed claim and re-claims it for launch.
+    spec = _spec(TaskSpec("a", max_attempts=2))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "old-proc", "h", {}), body)
+    body, _ = _apply(dag.set_task_pid("a", "old-proc", 999, 1.0), body)
+    tf = dag.reconcile_and_plan(
+        spec, 10.0, "new-proc", "h", lambda pid: False
+    )
+    body, res = _apply(tf, body)
+    assert res.reconciled == 1
+    assert res.expansions_needed is False
+    assert [i.taskkey for i in res.advance.launches] == ["a"]
+    assert res.advance.launches[0].attempt == 1
+    assert _state(body, "a") == dag.RUNNING
+    assert body["tasks"]["a"]["proc"] == "new-proc"
+    assert body["tasks"]["a"]["attempt"] == 1
+    assert body["updatedAt"] == 10.0
+
+
+def test_reconcile_and_plan_keeps_missing_or_terminal_body():
+    spec = _spec(TaskSpec("a"))
+    tf = dag.reconcile_and_plan(spec, 1.0, "p", "h", lambda pid: False)
+    new, res = tf(None)
+    assert dag.is_keep(new)
+    assert res.reconciled == 0 and res.advance.launches == []
+    body = _body(spec)
+    body["state"] = dag.SUCCESS
+    new, res = tf(body)
+    assert dag.is_keep(new)
+
+
+def test_reconcile_and_plan_flags_pending_expansion():
+    # a mapped task awaiting its upstream list: the transform applies ONLY
+    # the reconcile half and flags expansions_needed, so the driver runs the
+    # classic pre-read + plan_and_claim RMW as the second step.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("x", max_attempts=2),
+    )
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "old-proc", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "gen", success=True, exit_code=0, fail_reason=None,
+            now=2.0, task=spec.by_id["gen"],
+        ),
+        body,
+    )
+    # gen succeeded (work now awaits expansion); x crashed under a dead
+    # owner and must still be reconciled by the first half.
+    tf = dag.reconcile_and_plan(
+        spec, 10.0, "new-proc", "h", lambda pid: False
+    )
+    body, res = _apply(tf, body)
+    assert res.expansions_needed is True
+    assert res.advance is None  # the claim half did NOT run
+    assert res.reconciled == 1
+    assert _state(body, "x") == dag.UP_FOR_RETRY  # reconciled, not claimed
+    assert "work" not in body["mapped"]
+    assert _state(body, "work") == dag.PENDING
+    # the driver's second step then expands and claims in one RMW as before
+    body, res2 = _apply(
+        dag.plan_and_claim(spec, 11.0, "new-proc", "h", {"work": ["i"]}),
+        body,
+    )
+    assert body["mapped"]["work"]["items"] == ["i"]
+    keys = {i.taskkey for i in res2.launches}
+    assert keys == {"work#0", "x"}
+
+
+def test_reconcile_and_plan_expansion_pending_nothing_to_reconcile_keeps():
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "gen", success=True, exit_code=0, fail_reason=None,
+            now=2.0, task=spec.by_id["gen"],
+        ),
+        body,
+    )
+    tf = dag.reconcile_and_plan(spec, 3.0, "p", "h", lambda pid: False)
+    new, res = tf(body)
+    assert dag.is_keep(new)  # nothing recovered: no write for the flag
+    assert res.expansions_needed is True
+    assert res.advance is None
+    assert res.reconciled == 0
+
+
+def test_reconcile_and_plan_defeated_by_foreign_claim():
+    # a foreign running claim always defeats the quiescence short-circuit:
+    # its owner may be dead, and only the full pass (reconcile) can tell.
+    spec = _spec(TaskSpec("a", max_attempts=1), TaskSpec("b", max_attempts=1))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "old-proc", "h", {}), body)
+    tf = dag.reconcile_and_plan(
+        spec, 5.0, "new-proc", "h", lambda pid: False
+    )
+    body, res = _apply(tf, body)
+    assert res.reconciled == 2
+    assert res.advance.run_terminal is True  # no attempts left: run over
+    assert body["state"] == dag.FAILED
+
+
+# --------------------------------------------------------------------------
+# Quiescence short-circuit (the read-only pre-scan)
+# --------------------------------------------------------------------------
+
+
+def test_quiescent_all_running_returns_keep_and_never_mutates():
+    # an all-in-flight document (every instance claimed under OUR proc
+    # token, nothing due) is the canonical quiescent shape: both claim
+    # transforms must keep it, and the pre-scan must be strictly read-only.
+    spec = _spec(TaskSpec("a"), TaskSpec("b"))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.set_task_pids([("a", "p", 1, 0), ("b", "p", 2, 0)], 1.0), body
+    )
+    snapshot = copy.deepcopy(body)
+    new, res = dag.plan_and_claim(spec, 2.0, "p", "h", {})(body)
+    assert dag.is_keep(new)
+    assert res.launches == [] and res.changed is False
+    tf = dag.reconcile_and_plan(spec, 2.0, "p", "h", lambda pid: False)
+    new, cres = tf(body)
+    assert dag.is_keep(new)
+    assert cres.reconciled == 0 and cres.advance.launches == []
+    assert body == snapshot  # the pre-scan touched nothing
+
+
+def test_quiescence_defeated_by_due_retry():
+    spec = _spec(
+        TaskSpec("a", max_attempts=2, retry_delay=50.0), TaskSpec("b")
+    )
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "a", success=False, exit_code=1, fail_reason="x",
+            now=1.0, task=spec.by_id["a"],
+        ),
+        body,
+    )
+    # inside the backoff (due at 51): quiescent, kept without a copy
+    new, res = dag.plan_and_claim(spec, 20.0, "p", "h", {})(body)
+    assert dag.is_keep(new) and res.launches == []
+    # at the SAME now the transform receives, the due retry defeats it
+    body, res = _apply(dag.plan_and_claim(spec, 51.0, "p", "h", {}), body)
+    assert [i.taskkey for i in res.launches] == ["a"]
+
+
+def test_quiescence_defeated_by_due_poke():
+    spec = _spec(
+        TaskSpec("s", type=dag.SENSOR, poke_interval=10.0, poke_timeout=1e9),
+    )
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 100.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "s", success=False, exit_code=1, fail_reason=None,
+            now=100.0, task=spec.by_id["s"],
+        ),
+        body,
+    )
+    # idle until 110: quiescent
+    new, res = dag.plan_and_claim(spec, 105.0, "p", "h", {})(body)
+    assert dag.is_keep(new) and res.launches == []
+    # due at the transform's own now: re-pokes
+    body, res = _apply(dag.plan_and_claim(spec, 110.0, "p", "h", {}), body)
+    assert len(res.launches) == 1
+    # and with the poke now in flight (proc re-stamped) it is quiescent
+    # again
+    new, res = dag.plan_and_claim(spec, 120.0, "p", "h", {})(body)
+    assert dag.is_keep(new)
+
+
+def test_quiescence_never_blocks_terminalisation():
+    # every task terminal but the run not yet marked: the pre-scan finds no
+    # blocking entry and must fall through to the full pass, which
+    # terminalises.
+    spec = _spec(TaskSpec("a"))
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.SUCCESS
+    body, res = _apply(dag.plan_and_claim(spec, 5.0, "p", "h", {}), body)
+    assert res.run_terminal is True
+    assert body["state"] == dag.SUCCESS
+
+
+def test_quiescent_approval_gate_keeps_document():
+    spec = _spec(TaskSpec("gate", type=dag.APPROVAL))
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    assert body["tasks"]["gate"]["awaitingApproval"] is True
+    new, _res = dag.plan_and_claim(spec, 2.0, "p", "h", {})(body)
+    assert dag.is_keep(new)
+    # a parked gate blocks for a DIFFERENT proc token too (reconcile skips
+    # gates, so the combined transform is just as inert)
+    tf = dag.reconcile_and_plan(spec, 2.0, "q", "h", lambda pid: False)
+    new, _res = tf(body)
+    assert dag.is_keep(new)
+
+
+def test_quiescent_mapped_fanout_in_flight():
+    # the large-document case the short-circuit exists for: a fan-out whose
+    # instances are all claimed under our token idles as a plain read.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    body, _ = _apply(
+        dag.mark_task_finished(
+            "gen", success=True, exit_code=0, fail_reason=None,
+            now=2.0, task=spec.by_id["gen"],
+        ),
+        body,
+    )
+    body, _ = _apply(
+        dag.plan_and_claim(spec, 3.0, "p", "h", {"work": ["a", "b"]}), body
+    )
+    assert _state(body, "work#0") == dag.RUNNING
+    new, _res = dag.plan_and_claim(spec, 4.0, "p", "h", {})(body)
+    assert dag.is_keep(new)
+    tf = dag.reconcile_and_plan(spec, 4.0, "p", "h", lambda pid: False)
+    new, _res = tf(body)
+    assert dag.is_keep(new)
+    # an instance that cannot be matched to a consulted slot (its recorded
+    # mapIndex is out of the item range) is doubt: no short-circuit
+    body["tasks"]["work#1"]["mapIndex"] = 5
+    assert dag._is_quiescent(spec, body, 4.0, "p", None) is False
+
+
+def test_quiescence_is_conservative_on_odd_entries():
+    # every "in doubt" branch must resolve to NOT quiescent: the only cost
+    # is running the full pass, never skipping real work.
+    spec = _spec(TaskSpec("a"))
+    # 1. a non-terminal entry of a task the spec no longer has must not
+    # hold the short-circuit open: terminalisation ignores it, so keeping
+    # the document on its account would wedge the run forever.
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.SUCCESS
+    body["tasks"]["ghost"] = {"id": "ghost", "state": dag.RUNNING, "proc": "p"}
+    assert dag._is_quiescent(spec, body, 5.0, "p", None) is False
+    body, res = _apply(dag.plan_and_claim(spec, 5.0, "p", "h", {}), body)
+    assert res.run_terminal is True  # the full pass finished the run
+    # 2. an entry whose key does not match its recorded task id cannot be
+    # proven consulted: doubt
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.SUCCESS
+    body["tasks"]["weird"] = {"id": "a", "state": dag.RUNNING, "proc": "p"}
+    assert dag._is_quiescent(spec, body, 5.0, "p", None) is False
+    # 3. an unreadable retry instant: doubt
+    spec2 = _spec(TaskSpec("a", max_attempts=2))
+    body = _body(spec2)
+    body["tasks"]["a"]["state"] = dag.UP_FOR_RETRY
+    body["tasks"]["a"]["nextRetryAt"] = "soon"
+    assert dag._is_quiescent(spec2, body, 5.0, "p", None) is False
+    # 4. an unreadable (or missing) poke instant on an idle sensor: doubt
+    spec3 = _spec(TaskSpec("s", type=dag.SENSOR))
+    body = _body(spec3)
+    body["tasks"]["s"]["state"] = dag.RUNNING
+    body["tasks"]["s"]["nextPokeAt"] = "later"
+    assert dag._is_quiescent(spec3, body, 5.0, "p", None) is False
+    body["tasks"]["s"]["nextPokeAt"] = None
+    assert dag._is_quiescent(spec3, body, 5.0, "p", None) is False
+    # 5. a proc-less RUNNING plain task (a shape a claim never writes):
+    # doubt
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.RUNNING
+    assert dag._is_quiescent(spec, body, 5.0, "p", None) is False
+    # 6. an expanded placeholder whose task the spec stopped mapping: doubt
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.EXPANDED
+    assert dag._is_quiescent(spec, body, 5.0, "p", None) is False
+    # 7. a usable pre-read expansion defeats an otherwise quiescent body;
+    # an unreadable one (None) does not
+    body = _body(spec)
+    body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
+    assert dag._is_quiescent(spec, body, 2.0, "p", {"x": ["i"]}) is False
+    assert dag._is_quiescent(spec, body, 2.0, "p", {"x": None}) is True
+    # 8. no tasks at all: nothing blocks terminalisation, so no
+    # short-circuit
+    body = _body(spec)
+    body["tasks"] = {}
+    assert dag._is_quiescent(spec, body, 5.0, "p", None) is False
 
 
 def test_task_record_without_resources_field_still_parses():

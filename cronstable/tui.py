@@ -2193,6 +2193,15 @@ class App:
         self.wb_exit_hint_at = 0.0
 
         # ---- plumbing ----
+        # memo for the per-line ANSI transforms: line -> (rewritten,
+        # plain).  rewrite_sgr inks with the current theme, so the memo
+        # is valid for one theme only; _retheme() clears it.
+        self._ansi_cache: Dict[str, Tuple[str, str]] = {}
+        # last inputs of _log_search_recompute, so a repaint with an
+        # unchanged needle and buffer skips the full rescan
+        self._log_search_state: Optional[
+            Tuple[str, Optional["LogTail"], int, Any]
+        ] = None
         self.toasts: List[Tuple[str, str, float]] = []
         self.dirty = True
         self._dirty_event = asyncio.Event()
@@ -2206,6 +2215,27 @@ class App:
     def mark(self) -> None:
         self.dirty = True
         self._dirty_event.set()
+
+    #: Cache bound: ~2x the worst-case buffered line count across every
+    #: live tail (the drawer tail, the DAG task tail, and up to TAIL_MAX
+    #: console tails), so all buffers fit yet the memo stays finite.
+    ANSI_CACHE_MAX = 2 * LogTail.MAX_LINES * (TAIL_MAX + 2)
+
+    def _ansi_line(self, line: str) -> Tuple[str, str]:
+        """``(rewrite_sgr(line), strip_ansi(line))``, memoised.
+
+        Buffered log lines are immutable and repaint every frame, so
+        each distinct line pays for its two regex passes once instead
+        of once per paint.  Entries carry theme-inked SGR, hence the
+        wholesale clear in :meth:`_retheme`.
+        """
+        cached = self._ansi_cache.get(line)
+        if cached is None:
+            if len(self._ansi_cache) >= self.ANSI_CACHE_MAX:
+                self._ansi_cache.clear()
+            cached = (rewrite_sgr(line, self.theme), strip_ansi(line))
+            self._ansi_cache[line] = cached
+        return cached
 
     def toast(self, kind: str, message: str) -> None:
         # toasts embed job names and server error strings; flatten and
@@ -2915,6 +2945,8 @@ class AppActions(App):
             bool(self.prefs["light"]),
             str(self.prefs["cvd"]),
         )
+        # memoised log lines carry the old theme's SGR ink
+        self._ansi_cache.clear()
         self.term.invalidate()
         self.mark()
 
@@ -3981,6 +4013,20 @@ class AppKeys(AppPalette):
         jump would pin n/N to the same match forever."""
         needle = self.inputs["logsearch"].strip().lower()
         tail = self.log_tail
+        # the drawer calls this on every paint while a needle is typed;
+        # rescan the buffer only when an input changed.  The state keys
+        # on the tail object itself (not id(): addresses get reused) and
+        # on the newest entry as well as the count, because appends at
+        # the MAX_LINES cap trim the head and leave the count constant.
+        state = (
+            needle,
+            tail,
+            len(tail.lines) if tail is not None else -1,
+            tail.lines[-1] if tail is not None and tail.lines else None,
+        )
+        if not reset and state == self._log_search_state:
+            return
+        self._log_search_state = state
         prev: Optional[int] = None
         if not reset and self.log_matches:
             prev = self.log_matches[
@@ -5991,14 +6037,13 @@ class AppDrawers(AppOverlays):
         if tail is None:
             rows.append(paint.style("  no stream", "dim"))
             return rows
-        display: List[str] = []
         needle = search.strip().lower()
-        for stream, line, when in tail.lines:
+        content_width = width - 4 - (9 if self.timestamps else 0)
+
+        def render(stream: str, line: str, when: float) -> List[str]:
             if stream == "meta":  # inline end-of-run separator
-                display.append(paint.style("  ── %s ──" % line, "dim"))
-                continue
-            text = rewrite_sgr(line, self.theme)
-            plain = strip_ansi(line)
+                return [paint.style("  ── %s ──" % line, "dim")]
+            text, plain = self._ansi_line(line)
             prefix = ""
             if self.timestamps:
                 stamp = datetime.datetime.fromtimestamp(when)
@@ -6006,29 +6051,52 @@ class AppDrawers(AppOverlays):
             marker = paint.style(
                 "▏", "fail" if stream == "stderr" else "border"
             )
-            content_width = width - 4 - (9 if self.timestamps else 0)
             if needle and needle in plain.lower():
                 text = paint.style(plain, "bright", bg="sel")
             if self.wrap and text_width(plain) > content_width:
+                chunks: List[str] = []
                 start = 0
                 while start < len(plain):
                     chunk = plain[start : start + content_width]
-                    display.append(
+                    chunks.append(
                         " " + marker + prefix + paint.style(chunk, "fg")
                     )
                     start += content_width
-                continue
-            display.append(" " + marker + prefix + text)
+                return chunks
+            return [" " + marker + prefix + text]
+
+        suffix: List[str] = []
         if tail.error:
-            display.append(paint.style("  ⚠ %s" % tail.error, "fail"))
+            suffix.append(paint.style("  ⚠ %s" % tail.error, "fail"))
         elif tail.ended == "no-output":
-            display.append(
+            suffix.append(
                 paint.style("  ── end of run output (no-output) ──", "dim")
             )
-        max_scroll = max(0, len(display) - available)
-        self.log_scroll = min(self.log_scroll, max_scroll)
-        end = len(display) - self.log_scroll
-        rows.extend(display[max(0, end - available) : end])
+        if self.wrap:
+            # wrapped lines can span several rows, so sizing the scroll
+            # window still needs the full walk (each line's transforms
+            # are memoised, so the walk is regex-free after warm-up)
+            display: List[str] = []
+            for stream, line, when in tail.lines:
+                display.extend(render(stream, line, when))
+            display.extend(suffix)
+            max_scroll = max(0, len(display) - available)
+            self.log_scroll = min(self.log_scroll, max_scroll)
+            end = len(display) - self.log_scroll
+            rows.extend(display[max(0, end - available) : end])
+        else:
+            # unwrapped, every buffered entry paints exactly one row:
+            # clamp the scroll from counts alone and build only the
+            # visible slice instead of transforming the whole buffer
+            total = len(tail.lines) + len(suffix)
+            max_scroll = max(0, total - available)
+            self.log_scroll = min(self.log_scroll, max_scroll)
+            end = total - self.log_scroll
+            for idx in range(max(0, end - available), end):
+                if idx < len(tail.lines):
+                    rows.extend(render(*tail.lines[idx]))
+                else:
+                    rows.append(suffix[idx - len(tail.lines)])
         if not tail.lines and tail.ended is None and not tail.error:
             rows.append(paint.style("  waiting for output…", "dim"))
         return rows
@@ -6523,24 +6591,30 @@ class AppDrawers(AppOverlays):
                 )
             ]
         rows = [paint.style(" task: %s" % tail.label, "dim")]
-        display: List[str] = []
-        for stream, line, _when in tail.lines:
+        suffix: List[str] = []
+        if tail.error:
+            suffix.append(paint.style("  ⚠ %s" % tail.error, "fail"))
+        elif tail.ended == "no-output":
+            suffix.append(paint.style("  ── no output ──", "dim"))
+        available = body_lines - 1
+        # no wrapping here, so one buffered entry is one row: clamp the
+        # scroll from counts and transform only the visible slice
+        total = len(tail.lines) + len(suffix)
+        max_scroll = max(0, total - available)
+        self.panel_scroll = min(self.panel_scroll, max_scroll)
+        end = total - self.panel_scroll
+        for idx in range(max(0, end - available), end):
+            if idx >= len(tail.lines):
+                rows.append(suffix[idx - len(tail.lines)])
+                continue
+            stream, line, _when = tail.lines[idx]
             if stream == "meta":
-                display.append(paint.style("  ── end of log ──", "dim"))
+                rows.append(paint.style("  ── end of log ──", "dim"))
                 continue
             marker = paint.style(
                 "▏", "fail" if stream == "stderr" else "border"
             )
-            display.append(" " + marker + rewrite_sgr(line, self.theme))
-        if tail.error:
-            display.append(paint.style("  ⚠ %s" % tail.error, "fail"))
-        elif tail.ended == "no-output":
-            display.append(paint.style("  ── no output ──", "dim"))
-        available = body_lines - 1
-        max_scroll = max(0, len(display) - available)
-        self.panel_scroll = min(self.panel_scroll, max_scroll)
-        end = len(display) - self.panel_scroll
-        rows.extend(display[max(0, end - available) : end])
+            rows.append(" " + marker + self._ansi_line(line)[0])
         return rows
 
     # ---- multi-tail console -----------------------------------------
@@ -6566,16 +6640,25 @@ class AppDrawers(AppOverlays):
                 paint.style(" add: ", "dim")
                 + paint.style(self.inputs["tailadd"] + "▌", "bright")
             )
+        available = max(3, lines - 10)
+        total = sum(len(tail.lines) for tail in self.tails)
+        max_scroll = max(0, total - available)
+        self.panel_scroll = min(self.panel_scroll, max_scroll)
+        # the painted window is the last (available + panel_scroll) rows
+        # of the merged stream, and each tail's buffer is already time
+        # ordered, so merging only that many entries per tail yields the
+        # exact same window: an entry in the last K of the union is
+        # necessarily within the last K of its own tail.  Sorting stays
+        # stable across the trim (tuples are built in the same order),
+        # so ties on the timestamp render identically too.
+        window = available + self.panel_scroll
         merged: List[Tuple[float, int, str, str, str]] = []
         for idx, tail in enumerate(self.tails):
-            for stream, line, when in tail.lines:
+            for stream, line, when in tail.lines[-window:]:
                 if stream == "meta":
                     line = "── %s ──" % line
                 merged.append((when, idx, tail.label, stream, line))
         merged.sort(key=lambda item: item[0])
-        available = max(3, lines - 10)
-        max_scroll = max(0, len(merged) - available)
-        self.panel_scroll = min(self.panel_scroll, max_scroll)
         end = len(merged) - self.panel_scroll
         for when, idx, label, stream, line in merged[
             max(0, end - available) : end
@@ -6593,9 +6676,7 @@ class AppDrawers(AppOverlays):
             if stream == "meta":
                 body.append(" " + prefix + stamp + paint.style(line, "dim"))
             else:
-                body.append(
-                    " " + prefix + stamp + rewrite_sgr(line, self.theme)
-                )
+                body.append(" " + prefix + stamp + self._ansi_line(line)[0])
         if self.tails and not merged:
             body.append(paint.style("  waiting for output…", "dim"))
         return panel_frame(

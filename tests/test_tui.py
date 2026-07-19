@@ -1314,3 +1314,208 @@ async def test_week_calendar_overlay(tmp_path):
         assert not app.is_open("week")
     finally:
         await h.stop()
+
+
+# ===================================================================
+#  paint-path performance plumbing: the ANSI memo + scan gating
+# ===================================================================
+def _bare_app(tmp_path) -> TuiApp:
+    """An app instance with no daemon and no run loop, for driving the
+    pure render helpers directly."""
+    prefs = dict(tui.PREF_DEFAULTS)
+    return TuiApp(
+        Api("http://127.0.0.1:1", None),
+        HeadlessTerm(110, 32),
+        ScriptedKeys(),
+        prefs,
+        boot=False,
+        prefs_file=str(tmp_path / "prefs.json"),
+    )
+
+
+def _stub_tail(app: TuiApp, lines) -> "tui.LogTail":
+    tail = tui.LogTail(app.api, "/jobs/x/logs", "x", app.mark)
+    tail.lines = list(lines)
+    return tail
+
+
+async def test_ansi_memo_repaint_is_identical_and_regex_free(
+    tmp_path, monkeypatch
+):
+    """A repaint of an unchanged buffer must render the same rows from
+    the memo without re-running rewrite_sgr on any line."""
+    app = _bare_app(tmp_path)
+    paint = tui.Painter(app.theme)
+    lines = [("stdout", "plain %03d" % i, 100.0 + i) for i in range(30)]
+    lines.append(("stderr", "\x1b[31mred alert\x1b[0m", 200.0))
+    app.log_tail = _stub_tail(app, lines)
+    calls: List[str] = []
+    real = tui.rewrite_sgr
+    monkeypatch.setattr(
+        tui,
+        "rewrite_sgr",
+        lambda line, theme: calls.append(line) or real(line, theme),
+    )
+    first = app._drawer_logs(paint, 100, 20)
+    warm = len(calls)
+    assert warm > 0
+    assert "red alert" in strip_ansi("\n".join(first))
+    second = app._drawer_logs(paint, 100, 20)
+    assert second == first
+    assert len(calls) == warm  # every visible line was a cache hit
+    # the memo hands back the same entry object on a hit
+    assert app._ansi_line("plain 005") is app._ansi_line("plain 005")
+    # a theme change invalidates the memo: entries carry theme ink
+    app.prefs["light"] = not app.prefs["light"]
+    app._retheme()
+    assert app._ansi_cache == {}
+    app._drawer_logs(tui.Painter(app.theme), 100, 20)
+    assert len(calls) > warm
+
+
+async def test_ansi_memo_is_bounded(tmp_path):
+    app = _bare_app(tmp_path)
+    app.ANSI_CACHE_MAX = 8
+    for i in range(50):
+        app._ansi_line("line %d" % i)
+        assert len(app._ansi_cache) <= 8
+    # still serves correct transforms after a clear-and-refill
+    assert app._ansi_line("\x1b[31mx\x1b[0m")[1] == "x"
+
+
+async def test_drawer_log_slice_matches_the_full_walk(tmp_path):
+    """The unwrapped drawer clamps its scroll window from counts and
+    transforms only the visible slice.  With every line narrower than
+    the pane, the wrap path (which still walks and renders the whole
+    buffer) must paint the identical rows at every scroll position."""
+    app = _bare_app(tmp_path)
+    paint = tui.Painter(app.theme)
+    lines = [
+        ("stderr" if i % 7 == 0 else "stdout", "row %03d" % i, 50.0 + i)
+        for i in range(40)
+    ]
+    lines.insert(20, ("meta", "end of run output", 70.5))
+    tail = _stub_tail(app, lines)
+    tail.error = "stream lost"
+    app.log_tail = tail
+    app.inputs["logsearch"] = "row 03"
+    for scroll in (0, 3, 17, 999):
+        app.wrap = False
+        app.log_scroll = scroll
+        sliced = app._drawer_logs(paint, 90, 12)
+        app.wrap = True
+        app.log_scroll = scroll
+        walked = app._drawer_logs(paint, 90, 12)
+        assert sliced == walked
+
+
+async def test_log_search_recompute_skips_unchanged_inputs(tmp_path):
+    app = _bare_app(tmp_path)
+    app.log_tail = _stub_tail(
+        app,
+        [
+            ("stdout", "alpha error", 1.0),
+            ("stdout", "quiet", 2.0),
+            ("stdout", "beta error", 3.0),
+        ],
+    )
+    app.inputs["logsearch"] = "error"
+    app._log_search_recompute(reset=True)
+    assert app.log_matches == [0, 2]
+    # unchanged needle + buffer: the per-paint call must not rescan
+    app.log_matches = [999]
+    app._log_search_recompute()
+    assert app.log_matches == [999]
+    # reset (the needle-edit path) always forces the rescan
+    app._log_search_recompute(reset=True)
+    assert app.log_matches == [0, 2]
+    # an append at a constant line count (the MAX_LINES trim case)
+    # still re-arms the scan
+    tail = app.log_tail
+    tail.lines.append(("stdout", "gamma error", 4.0))
+    del tail.lines[0]
+    app._log_search_recompute()
+    assert app.log_matches == [1, 2]
+    # n/N navigation state survives further appends: the cursor stays
+    # on the same match while the list grows
+    app.log_match_idx = 1  # on "gamma error" (buffer index 2)
+    tail.lines.append(("stderr", "delta error", 5.0))
+    app._log_search_recompute()
+    assert app.log_matches == [1, 2, 3]
+    assert app.log_match_idx == 1
+
+
+async def test_render_tail_window_matches_the_full_merge(tmp_path):
+    """The console merges only the last (visible + scroll) entries of
+    each tail; the painted window must equal a naive sort of all lines
+    from all tails, including timestamp ties across tails."""
+    app = _bare_app(tmp_path)
+    specs = (
+        ("aa", 0.0, 3.0, 40),
+        ("bb", 1.0, 3.0, 25),
+        ("cc", 0.0, 3.0, 40),  # ties with aa on every stamp
+        ("dd", 2.0, 100.0, 2),  # short tail, one ancient entry
+    )
+    for name, base, step, count in specs:
+        tail = tui.LogTail(app.api, "/jobs/%s/logs" % name, name, app.mark)
+        tail.lines = [
+            ("stdout", "%s line %03d" % (name, i), base + i * step)
+            for i in range(count)
+        ]
+        app.tails.append(tail)
+    paint = tui.Painter(app.theme)
+
+    def naive(scroll: int, lines: int) -> List[str]:
+        merged = []
+        for idx, tail in enumerate(app.tails):
+            for _stream, line, when in tail.lines:
+                merged.append((when, idx, line))
+        merged.sort(key=lambda item: item[0])
+        available = max(3, lines - 10)
+        scroll = min(scroll, max(0, len(merged) - available))
+        end = len(merged) - scroll
+        return [line for _, _, line in merged[max(0, end - available) : end]]
+
+    for scroll in (0, 5, 37, 10_000):
+        app.panel_scroll = scroll
+        body = [strip_ansi(row) for row in app.render_tail(paint, 110, 24)]
+        expect = naive(scroll, 24)
+        joined = "\n".join(body)
+        # every expected line appears, in order, and nothing else does
+        pos = -1
+        for line in expect:
+            pos = joined.index(line, pos + 1)
+        assert sum(" line " in row for row in body) == len(expect)
+
+
+async def test_dag_logs_tab_transforms_only_the_visible_slice(tmp_path):
+    app = _bare_app(tmp_path)
+    lines = [("stdout", "row %02d" % i, float(i)) for i in range(20)]
+    lines.append(("meta", "done", 20.0))
+    tail = tui.LogTail(app.api, "/dag/t/logs", "task", app.mark)
+    tail.lines = lines
+    app.dag_task_tail = tail
+    paint = tui.Painter(app.theme)
+    app.panel_scroll = 0
+    rows = [strip_ansi(r) for r in app._dag_logs_tab(paint, 80, 6)]
+    assert rows == [
+        " task: task",
+        " ▏row 16",
+        " ▏row 17",
+        " ▏row 18",
+        " ▏row 19",
+        "  ── end of log ──",
+    ]
+    app.panel_scroll = 3
+    rows = [strip_ansi(r) for r in app._dag_logs_tab(paint, 80, 6)]
+    assert rows[1:] == [" ▏row %d" % n for n in (13, 14, 15, 16, 17)]
+    # the error suffix rides at the very end of the scrollback
+    tail.error = "boom"
+    app.panel_scroll = 0
+    rows = [strip_ansi(r) for r in app._dag_logs_tab(paint, 80, 6)]
+    assert rows[-1] == "  ⚠ boom"
+    assert rows[-2] == "  ── end of log ──"
+    # over-scroll clamps to the oldest rows
+    app.panel_scroll = 999
+    rows = [strip_ansi(r) for r in app._dag_logs_tab(paint, 80, 6)]
+    assert rows[1:] == [" ▏row %02d" % n for n in range(5)]

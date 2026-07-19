@@ -293,6 +293,216 @@ async def test_derive_max_still_skips_poison_record(tmp_path):
     assert await backend.derive_max("s", "ts") == 5
 
 
+def _spy_reads(backend):
+    """Wrap ``_read_record`` to record which record files a derive parses."""
+    read = []
+    real = FilesystemStateBackend._read_record
+
+    def spying(stream_dir, name, **kwargs):
+        read.append(name)
+        return real(backend, stream_dir, name, **kwargs)
+
+    backend._read_record = spying
+    return read
+
+
+async def test_derive_max_incremental_fold_reads_only_new_records(tmp_path):
+    # the watermark memo: a repeat derive over an unchanged stream is one
+    # listdir and ZERO record parses, and after appends it parses only the
+    # records that landed since the previous call (the performance fix: the
+    # catch-up path derives per job per service pass over a ledger of up to
+    # ~1000 multi-KB records, which used to be fully re-parsed every time).
+    backend = _backend(tmp_path)
+    await backend.start()
+    for ts in (1, 2, 3):
+        await backend.append_record("s", {"ts": ts})
+    assert await backend.derive_max("s", "ts") == 3  # full scan primes memo
+    read = _spy_reads(backend)
+    assert await backend.derive_max("s", "ts") == 3
+    assert read == []  # unchanged stream: nothing re-parsed
+    del backend._read_record
+    await backend.append_record("s", {"ts": 9})
+    await backend.append_record("s", {"ts": 4})
+    read = _spy_reads(backend)
+    assert await backend.derive_max("s", "ts") == 9
+    assert len(read) == 2  # only the two new records, never the old three
+
+
+async def test_derive_max_survives_prune_of_the_max_record(tmp_path):
+    # derived cursors are MONOTONIC maxima (see StateBackend.append_record):
+    # a bounded prune deletes only old records, and deleting a record whose
+    # value is already folded into the memo must never lower the cursor.
+    backend = _backend(tmp_path)
+    await backend.start()
+    for ts in (9, 1, 2, 3):
+        await backend.append_record("s", {"ts": ts})
+    assert await backend.derive_max("s", "ts") == 9
+    assert await backend.prune_records("s", keep=2) == 2  # 9 and 1 deleted
+    assert await backend.derive_max("s", "ts") == 9
+
+
+async def test_derive_max_watermark_record_pruned_after_newer_appends(
+    tmp_path,
+):
+    # a later prune may delete the memo's watermark record itself once newer
+    # records exist (prune keeps the newest ``keep``): that must read as a
+    # prune (fold only the newer names), not as a stream wipe.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("s", {"ts": 5})
+    assert await backend.derive_max("s", "ts") == 5  # watermark = the 5
+    await backend.append_record("s", {"ts": 1})
+    await backend.append_record("s", {"ts": 2})
+    await backend.prune_records("s", keep=2)  # deletes the watermark record
+    assert await backend.derive_max("s", "ts") == 5
+
+
+async def test_derive_max_wiped_stream_resets_to_none(tmp_path):
+    # prune keep<=0 deletes the WHOLE stream: the cursor must read as empty
+    # again (and then track only the recreated records), never echo the
+    # pre-wipe max out of the memo.
+    backend = _backend(tmp_path)
+    await backend.start()
+    for ts in (5, 8):
+        await backend.append_record("s", {"ts": ts})
+    assert await backend.derive_max("s", "ts") == 8
+    await backend.prune_records("s", keep=0)
+    assert await backend.derive_max("s", "ts") is None
+    await backend.append_record("s", {"ts": 3})
+    assert await backend.derive_max("s", "ts") == 3
+
+
+async def test_derive_max_wipe_then_append_before_next_derive(tmp_path):
+    # a keep<=0 wipe followed by appends BEFORE the next derive looks exactly
+    # like a prune from the listing alone (the new filenames sort above the
+    # old watermark): only the explicit memo invalidation on the wipe path
+    # keeps the deleted records' values out of the recreated stream's cursor.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("s", {"ts": 8})
+    assert await backend.derive_max("s", "ts") == 8
+    await backend.prune_records("s", keep=0)
+    await backend.append_record("s", {"ts": 3})
+    assert await backend.derive_max("s", "ts") == 3
+
+
+async def test_derive_max_invalidated_by_gc_stream_removal(
+    tmp_path, monkeypatch
+):
+    # collect_garbage removes whole streams without going through
+    # prune_records: it must invalidate the memo the same way, or a stream
+    # recreated after gc (again: new filenames above the old watermark)
+    # would inherit the collected records' max.
+    backend = _backend(tmp_path)
+    await backend.start()
+    old = state._now() - 7200.0
+    monkeypatch.setattr(state, "_now", lambda: old)
+    await backend.append_record("runs/gone", {"ts": 8})
+    monkeypatch.undo()
+    assert await backend.derive_max("runs/gone", "ts") == 8
+    result = await backend.collect_garbage(keep={"runs/": set()}, grace=3600.0)
+    assert "runs%2Fgone" in result["removed"]
+    await backend.append_record("runs/gone", {"ts": 3})
+    assert await backend.derive_max("runs/gone", "ts") == 3
+
+
+async def test_derive_max_externally_wiped_stream_yields_none(tmp_path):
+    # an out-of-band wipe (an operator's rm) never crosses the backend's own
+    # delete paths, so it is detected structurally: the watermark filename is
+    # gone AND nothing newer exists, a shape a bounded prune can never
+    # produce.  The memo is discarded and the empty stream reads None.
+    backend = _backend(tmp_path)
+    await backend.start()
+    for ts in (5, 8):
+        await backend.append_record("s", {"ts": ts})
+    assert await backend.derive_max("s", "ts") == 8
+    stream_dir = backend._stream_dir("s")
+    for name in os.listdir(stream_dir):
+        os.unlink(os.path.join(stream_dir, name))
+    assert await backend.derive_max("s", "ts") is None
+
+
+async def test_derive_max_newest_record_deleted_out_of_band_rescans(tmp_path):
+    # deleting just the NEWEST record out of band drops the watermark with
+    # survivors below it: the memo is discarded and a full rescan recomputes
+    # the max from what actually remains.
+    backend = _backend(tmp_path)
+    await backend.start()
+    for ts in (2, 9):
+        await backend.append_record("s", {"ts": ts})
+    assert await backend.derive_max("s", "ts") == 9
+    stream_dir = backend._stream_dir("s")
+    names = sorted(n for n in os.listdir(stream_dir) if n.endswith(".json"))
+    os.unlink(os.path.join(stream_dir, names[-1]))
+    assert await backend.derive_max("s", "ts") == 2
+
+
+async def test_derive_max_strict_error_on_new_record_after_memo(tmp_path):
+    # the incremental path parses only new records but with the SAME strict
+    # semantics: an environmental error on a new record fails the whole
+    # derive AND leaves the memo unadvanced, so the next derive retries the
+    # same record instead of skipping past it (a skipped record would let
+    # the cursor settle below the true max, the exact bug strict=True is
+    # there to prevent).
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("s", {"ts": 1})
+    assert await backend.derive_max("s", "ts") == 1
+    await backend.append_record("s", {"ts": 9})
+    stream_dir = backend._stream_dir("s")
+    names = sorted(n for n in os.listdir(stream_dir) if n.endswith(".json"))
+    # make the NEW record raise OSError on open: swap the file for a
+    # directory of the same name (open() on a dir raises OSError everywhere).
+    victim = os.path.join(stream_dir, names[-1])
+    os.remove(victim)
+    os.mkdir(victim)
+    with pytest.raises(OSError):
+        await backend.derive_max("s", "ts")
+    with pytest.raises(OSError):  # memo did not advance past the bad record
+        await backend.derive_max("s", "ts")
+
+
+async def test_derive_max_new_poison_record_skipped_incrementally(tmp_path):
+    # a content-bad NEW record keeps the first-scan behaviour on the
+    # incremental path too: quarantined and skipped, never wedging or
+    # regressing the cursor.  (The name sorts above any real record id.)
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("s", {"ts": 5})
+    assert await backend.derive_max("s", "ts") == 5
+    stream_dir = backend._stream_dir("s")
+    with open(os.path.join(stream_dir, "99999-bad.json"), "w") as fobj:
+        fobj.write("{not json")
+    assert await backend.derive_max("s", "ts") == 5
+    assert "99999-bad.json" not in os.listdir(stream_dir)  # quarantined
+
+
+async def test_derive_max_wipe_racing_a_scan_is_not_cached(tmp_path):
+    # a keep<=0 wipe that lands while a derive is mid-scan on another worker
+    # thread must fence that scan's memo write-back (the wipe-generation
+    # gate), or the finished scan would resurrect a fold of records that no
+    # longer exist and the recreated stream would inherit it.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("s", {"ts": 8})
+    real = FilesystemStateBackend._read_record
+
+    def wiping_read(stream_dir, name, **kwargs):
+        data = real(backend, stream_dir, name, **kwargs)
+        # the concurrent wipe, landing after the record was read but before
+        # the scan finishes and writes the memo.
+        backend._prune_sync("s", 0)
+        return data
+
+    backend._read_record = wiping_read
+    assert await backend.derive_max("s", "ts") == 8  # this scan's own answer
+    del backend._read_record
+    await backend.append_record("s", {"ts": 3})
+    # without the fence the raced scan would have cached best=8 and the new
+    # record (a newer filename) would merely fold onto it.
+    assert await backend.derive_max("s", "ts") == 3
+
+
 # --- worker lanes: lease isolation + wedge observability -----------------
 
 

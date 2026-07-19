@@ -400,6 +400,25 @@ class AdvanceResult:
     deferred: bool = False
 
 
+@dataclass
+class ReconcileAdvanceResult:
+    """What :func:`reconcile_and_plan` decided (its RMW result).
+
+    Carries the reconcile half's count next to the claim half's ordinary
+    :class:`AdvanceResult`, so the driver's launch, deferred and wake logic
+    consumes the exact shape :func:`plan_and_claim` already returns.
+    """
+
+    # how many crash-interrupted tasks the reconcile half recovered.
+    reconciled: int = 0
+    # mapped tasks are awaiting expansion: only the reconcile half was
+    # applied (``advance`` is None then), and the driver must pre-read the
+    # upstream XCom lists and run :func:`plan_and_claim` as a second RMW.
+    expansions_needed: bool = False
+    # the claim half's result when it ran inside this same RMW.
+    advance: Optional[AdvanceResult] = None
+
+
 # --------------------------------------------------------------------------
 # Dependency resolution over the run body
 # --------------------------------------------------------------------------
@@ -533,6 +552,10 @@ def plan_and_claim(
 
     ``expansions[task_id] is None`` means "the upstream list could not be read
     right now" -- the task is left for a later pass, never expanded to a guess.
+
+    A read-only quiescence pre-scan (:func:`_is_quiescent`) runs before the
+    deep copy: when it can prove nothing below would change the body, the
+    transform keeps the document without copying it at all.
     """
 
     def transform(
@@ -540,6 +563,13 @@ def plan_and_claim(
     ) -> Tuple[Any, AdvanceResult]:
         result = AdvanceResult()
         if body is None or is_terminal_run(body):
+            return _DOC_KEEP, result
+        if _is_quiescent(spec, body, now, proc, expansions):
+            # the pre-scan proved nothing below can change this body: skip
+            # the deep copy (and the rewrite) entirely.  On a large fan-out
+            # idling in flight this turns the periodic advance from a full
+            # in-lock copy of up to MAX_MAPPED_ITEMS task entries into a
+            # plain read.
             return _DOC_KEEP, result
         # deep copy, so the transform stays pure and retryable.  This runs
         # inside the document flock on every advance; the orjson-backed
@@ -911,6 +941,184 @@ def _maybe_terminalise(spec, body, now, result) -> None:
 
 
 # --------------------------------------------------------------------------
+# Quiescence pre-scan (a read-only fast path for the claim transforms)
+# --------------------------------------------------------------------------
+
+# Per-entry verdicts of the pre-scan.  ACT: this pass could change the entry,
+# or the scan cannot prove it will not (any doubt lands here; the only cost
+# is running the full pass, which is exactly the pre-scan-less behaviour).
+# BLOCKED: the entry is provably inert this pass AND its non-terminal state
+# is consulted by _maybe_terminalise, so the run provably cannot terminalise
+# either.  INERT: the entry is inert but does not hold the run open (a
+# terminal instance, or an expanded group placeholder whose materialised
+# instances carry the real state).
+_Q_ACT = "act"
+_Q_BLOCKED = "blocked"
+_Q_INERT = "inert"
+
+
+def _is_quiescent(
+    spec: DagSpec,
+    body: Dict[str, Any],
+    now: float,
+    proc: str,
+    expansions: Optional[Dict[str, Optional[List[Any]]]],
+) -> bool:
+    """Whether an advance pass over ``body`` provably cannot change it.
+
+    Called by :func:`plan_and_claim` and :func:`reconcile_and_plan` BEFORE
+    the deep copy, so a quiescent run (typically: every instance in flight
+    under this node's own proc token, nothing due) costs a read-only scan
+    instead of a full copy and rewrite of a document that can hold up to
+    ``MAX_MAPPED_ITEMS`` task entries.
+
+    The predicate is deliberately one-sided: ``True`` must be airtight (a
+    wrong ``True`` would silently skip real work and could wedge a run),
+    while a wrong ``False`` merely runs the full pass and rediscovers there
+    was nothing to do.  It is derived from what the transform halves can do,
+    and returns ``False`` (not quiescent) whenever any of the following
+    holds:
+
+    * a pre-read expansion list is usable, or any mapped task is awaiting
+      expansion (the driver must also learn ``expansions_needed``, which
+      only the full combined pass reports);
+    * any entry is pending (claimable now, or resolvable by propagation);
+    * any retry's backoff is due at ``now`` (the same ``now`` the transform
+      itself uses), or its due instant is unreadable;
+    * any idle sensor's next poke is due at ``now``, unscheduled, or
+      unreadable;
+    * any running entry is claimed under a FOREIGN proc token (the
+      reconcile half may recover it; an entry holding OUR token is left
+      alone by reconcile and claim alike);
+    * any entry is in a state this scan does not recognise, belongs to a
+      task no longer in the spec, or cannot be positively matched to a slot
+      :func:`_maybe_terminalise` consults;
+    * no consulted non-terminal entry exists at all (the run could
+      terminalise this pass).
+    """
+    if expansions and any(items is not None for items in expansions.values()):
+        return False
+    if tasks_awaiting_expansion(spec, body):
+        return False
+    blocked = False
+    for taskkey, entry in body.get("tasks", {}).items():
+        verdict = _entry_quiescence(spec, body, taskkey, entry, now, proc)
+        if verdict == _Q_ACT:
+            return False
+        if verdict == _Q_BLOCKED:
+            blocked = True
+    # With no BLOCKED entry every consulted task is terminal (or there are
+    # no tasks at all), so _maybe_terminalise could finish the run: not
+    # quiescent, let the full pass decide.
+    return blocked
+
+
+def _entry_quiescence(
+    spec: DagSpec,
+    body: Dict[str, Any],
+    taskkey: str,
+    entry: Dict[str, Any],
+    now: float,
+    proc: str,
+) -> str:
+    """Classify one task entry for :func:`_is_quiescent` (see the verdicts).
+
+    Mirrors the state dispatch of :func:`_advance_task`,
+    :func:`_advance_running` and the reconcile loop, erring to ``_Q_ACT``
+    for anything it cannot positively place.
+    """
+    state = entry.get("state")
+    if state in TERMINAL_STATES:
+        return _Q_INERT
+    task_id = entry.get("id")
+    task = spec.by_id.get(task_id) if isinstance(task_id, str) else None
+    if task is None:
+        # a non-terminal entry of a task the spec no longer has: the claim
+        # and terminalise passes ignore it entirely, so it must not hold
+        # the short-circuit open (the run can terminalise around it, and a
+        # quiescent verdict resting on it would keep the document forever).
+        return _Q_ACT
+    if state == EXPANDED:
+        if task.expand is None:
+            # the spec stopped mapping this task while its placeholder is
+            # still marked expanded: the full pass owns that corner.
+            return _Q_ACT
+        return _Q_INERT
+    if state == UP_FOR_RETRY:
+        try:
+            due_at = float(entry.get("nextRetryAt") or 0.0)
+        except (TypeError, ValueError):
+            return _Q_ACT
+        if due_at <= now:
+            return _Q_ACT  # the backoff has elapsed: claimable this pass
+        return _q_blocked(body, task, taskkey, entry)
+    if state == RUNNING:
+        if entry.get("awaitingApproval"):
+            # a parked approval gate: reconcile skips it, claims skip it,
+            # and its non-terminal state pins the run open.
+            return _q_blocked(body, task, taskkey, entry)
+        entry_proc = entry.get("proc")
+        if entry_proc is not None:
+            if entry_proc != proc:
+                # a foreign claim: the reconcile half may recover it (its
+                # owner may be dead), so the full pass must look at it.
+                return _Q_ACT
+            # our own live claim: reconcile trusts the proc token, and the
+            # claim/poke logic always skips an in-flight instance.
+            return _q_blocked(body, task, taskkey, entry)
+        if task.type != SENSOR or entry.get("pid") is not None:
+            # a proc-less RUNNING entry is only ever a sensor idling
+            # between pokes (see reconcile_crashed); anything else here is
+            # a shape this scan does not recognise.
+            return _Q_ACT
+        next_poke = entry.get("nextPokeAt")
+        if next_poke is None:
+            return _Q_ACT  # the poke is due immediately
+        try:
+            if float(next_poke) <= now:
+                return _Q_ACT  # the poke is due at this pass's now
+        except (TypeError, ValueError):
+            return _Q_ACT
+        return _q_blocked(body, task, taskkey, entry)
+    # PENDING (claimable or propagatable), or a state this build does not
+    # recognise.
+    return _Q_ACT
+
+
+def _q_blocked(
+    body: Dict[str, Any],
+    task: TaskSpec,
+    taskkey: str,
+    entry: Dict[str, Any],
+) -> str:
+    """``_Q_BLOCKED`` when :func:`_maybe_terminalise` provably consults this
+    inert entry, else ``_Q_ACT``.
+
+    Being consulted is what makes an inert non-terminal entry hold the run
+    open: terminalisation walks the SPEC (a plain task's own key, a mapped
+    task's ``id#i`` instances for its recorded item list), so an entry it
+    never visits, however inert, cannot stop the run from finishing, and a
+    quiescent verdict resting on such an entry could wedge the run.
+    Anything that cannot be positively matched to a consulted slot falls
+    back to the full pass.
+    """
+    if task.expand is None:
+        return _Q_BLOCKED if taskkey == task.id else _Q_ACT
+    mapped = body.get("mapped", {}).get(task.id)
+    items = mapped.get("items") if isinstance(mapped, dict) else None
+    map_index = entry.get("mapIndex")
+    if (
+        isinstance(items, list)
+        and isinstance(map_index, int)
+        and not isinstance(map_index, bool)
+        and 0 <= map_index < len(items)
+        and taskkey == task_display_key(task.id, map_index)
+    ):
+        return _Q_BLOCKED
+    return _Q_ACT
+
+
+# --------------------------------------------------------------------------
 # Completion / pid / approval / reconcile transforms
 # --------------------------------------------------------------------------
 
@@ -954,6 +1162,65 @@ def set_task_pid(
         entry["updatedAt"] = now
         body["updatedAt"] = now
         return body, True
+
+    return transform
+
+
+def set_task_pids(
+    entries: List[Tuple[str, str, Optional[int], Optional[int]]],
+    now: float,
+):
+    """Transform recording a whole launch batch's OS pids in ONE RMW.
+
+    The batched form of :func:`set_task_pid`: ``entries`` is a list of
+    ``(taskkey, proc, pid, attempt)`` tuples, one per just-launched task
+    instance, and the whole list is applied by a single read-modify-write.
+    An advance pass launches up to ``MAX_CLAIMS_PER_PASS`` instances, and a
+    mapped fan-out's document can hold up to ``MAX_MAPPED_ITEMS`` task
+    entries, so stamping each pid through its own full-document RMW cost one
+    full parse plus rewrite plus fsync PER LAUNCH; one batch write makes it
+    one per pass.
+
+    Batching is safe because it changes nothing about the fences: each entry
+    is checked independently against the current body with EXACTLY the
+    per-entry state, proc-token and attempt fences of :func:`set_task_pid`
+    (see its docstring for why a superseded owner's late pid write must be
+    dropped).  Every fence reads only its own task's entry and every apply
+    writes only its own task's ``pid``/``updatedAt``, so no entry's outcome
+    can depend on another's: applying the batch is equivalent to applying
+    the single-entry transforms sequentially, and a stale entry (its
+    instance re-claimed under a fresh proc token, or a newer attempt now
+    live) is dropped on its own while the rest of the batch still lands.
+    The result is the number of entries applied; zero keeps the document
+    untouched, exactly like a lone fenced-out pid write.
+    """
+
+    def transform(body):
+        if body is None:
+            return _DOC_KEEP, 0
+        applied = 0
+        tasks = body.get("tasks", {})
+        for taskkey, proc, pid, attempt in entries:
+            entry = tasks.get(taskkey)
+            if entry is None or entry.get("state") != RUNNING:
+                continue  # finished/reconciled already: drop like a dupe
+            if entry.get("proc") != proc:
+                # re-claimed by another owner after this launch: not our
+                # instance to stamp a pid on (the set_task_pid fence).
+                continue
+            if attempt is not None and int(entry.get("attempt", 0)) != (
+                attempt
+            ):
+                # a newer attempt is the live one; this is a stale launch's
+                # pid (the set_task_pid fence).
+                continue
+            entry["pid"] = pid
+            entry["updatedAt"] = now
+            applied += 1
+        if not applied:
+            return _DOC_KEEP, 0
+        body["updatedAt"] = now
+        return body, applied
 
     return transform
 
@@ -1159,23 +1426,112 @@ def reconcile_crashed(
     def transform(body):
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, 0
-        changed = 0
-        for entry in body.get("tasks", {}).values():
-            if entry.get("state") != RUNNING:
-                continue
-            if entry.get("awaitingApproval"):
-                continue  # gate: nothing to reconcile
-            if entry.get("proc") is None:
-                continue  # a sensor idling between pokes: not a crash victim
-            if _has_live_process(entry, proc, host, is_pid_alive):
-                continue
-            task = spec.by_id.get(entry.get("id"))
-            _reconcile_one(entry, task, now)
-            changed += 1
+        changed = _reconcile_entries(spec, body, now, proc, host, is_pid_alive)
         if changed:
             body["updatedAt"] = now
             return body, changed
         return _DOC_KEEP, 0
+
+    return transform
+
+
+def _reconcile_entries(
+    spec: DagSpec,
+    body: Dict[str, Any],
+    now: float,
+    proc: str,
+    host: str,
+    is_pid_alive,
+) -> int:
+    """The reconcile loop over ``body``'s task entries, mutating in place.
+
+    Shared by :func:`reconcile_crashed` and :func:`reconcile_and_plan` so
+    the two apply the identical recovery rules and fences; returns how many
+    entries were recovered (zero means nothing was touched).
+    """
+    changed = 0
+    for entry in body.get("tasks", {}).values():
+        if entry.get("state") != RUNNING:
+            continue
+        if entry.get("awaitingApproval"):
+            continue  # gate: nothing to reconcile
+        if entry.get("proc") is None:
+            continue  # a sensor idling between pokes: not a crash victim
+        if _has_live_process(entry, proc, host, is_pid_alive):
+            continue
+        task = spec.by_id.get(entry.get("id"))
+        _reconcile_one(entry, task, now)
+        changed += 1
+    return changed
+
+
+def reconcile_and_plan(
+    spec: DagSpec, now: float, proc: str, host: str, is_pid_alive
+):
+    """Build the combined reconcile+claim transform for one advance pass.
+
+    The driver used to pay two full read-modify-writes per advance, one for
+    :func:`reconcile_crashed` and one for :func:`plan_and_claim`, even on a
+    completely quiescent run (and an owned run re-advances at least once a
+    minute, plus after every task completion).  This transform composes the
+    two into a single RMW for the common case.  The composition is safe
+    because both halves are pure functions of the same ``(body, now)``:
+    applying reconcile then claim inside one lock is observably identical to
+    running the old two RMWs back-to-back with no interleaved writer, which
+    is a schedule the two-RMW flow already had to be correct under (the
+    per-run lease and lock make interleaving rare, never impossible, and
+    every proc-token/attempt fence is evaluated here against the very body
+    it mutates).
+
+    The one thing the claim half cannot do inside a transform is read XCom:
+    the expansion lists live outside the document, and a transform must stay
+    pure and free of I/O.  So after reconciling, the transform checks the
+    RECONCILED body for mapped tasks awaiting expansion.  When there are
+    none (the overwhelmingly common case) it continues straight into the
+    propagate/claim/terminalise logic with an empty expansion set, and the
+    whole advance is one RMW.  When some are awaiting, it applies only the
+    reconcile half, flags ``expansions_needed`` on the result, and the
+    driver pre-reads the lists from the returned body and runs the existing
+    :func:`plan_and_claim` RMW as a second step, exactly the old shape.
+
+    The same read-only quiescence pre-scan as :func:`plan_and_claim` runs
+    first; its foreign-proc-token rule covers the reconcile half (an entry
+    holding OUR token is trusted alive and never reconciled, so a quiescent
+    body is one the reconcile loop would not touch either).
+    """
+
+    def transform(
+        body: Optional[Dict[str, Any]],
+    ) -> Tuple[Any, ReconcileAdvanceResult]:
+        advance = AdvanceResult()
+        result = ReconcileAdvanceResult(advance=advance)
+        if body is None or is_terminal_run(body):
+            return _DOC_KEEP, result
+        if _is_quiescent(spec, body, now, proc, None):
+            return _DOC_KEEP, result
+        # deep copy for the same reason plan_and_claim does: the transform
+        # must stay pure and retryable.
+        working = _json.deepcopy_json(body)
+        result.reconciled = _reconcile_entries(
+            spec, working, now, proc, host, is_pid_alive
+        )
+        if tasks_awaiting_expansion(spec, working):
+            # expansion needs out-of-band XCom reads the driver must do
+            # between the halves: persist only the reconcile half and hand
+            # the decision back (advance=None says the claim half did NOT
+            # run, so the driver never mistakes this for an empty claim).
+            result.expansions_needed = True
+            result.advance = None
+            if result.reconciled:
+                working["updatedAt"] = now
+                return working, result
+            return _DOC_KEEP, result
+        _propagate_and_claim(spec, working, now, proc, host, advance)
+        _maybe_terminalise(spec, working, now, advance)
+        if not advance.changed and not result.reconciled:
+            return _DOC_KEEP, result
+        working["updatedAt"] = now
+        return working, result
 
     return transform
 

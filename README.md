@@ -2129,6 +2129,20 @@ jobs:
     schedule: "* * * * *"
 ```
 
+## Performance
+
+cronstable is built to run on small and old machines, and CI holds it to
+that: every commit runs an exhaustive benchmark suite (startup time, schedule
+computation for 100,000 jobs, config parsing, DAG planning, durable-state
+I/O, memory footprint, about 37 metrics in all) paired against the latest
+release on the same runner. A release that regresses a metric past its
+declared limit does not ship, and every release page carries a chart and a
+full table of the change against the previous release.
+
+Run the suite yourself with `python benchmarks/bench.py --quick`; see
+[Performance Benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks)
+for how the comparison and the gate work.
+
 ## Documentation map
 
 The [wiki](https://github.com/ptweezy/cronstable/wiki):
@@ -2152,6 +2166,7 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
   [Failure Detection and Retries](https://github.com/ptweezy/cronstable/wiki/Failure-Detection-and-Retries) ·
   [Reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) ·
   [Concurrency and Timeouts](https://github.com/ptweezy/cronstable/wiki/Concurrency-and-Timeouts) ·
+  [Performance Benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks) ·
   [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting)
 * **Watch it**:
   [Web Dashboard](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard) ·

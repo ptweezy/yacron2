@@ -5,6 +5,100 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.24 (2026-07-18)
+
+A second performance pass, aimed at the work a fleet repeats continuously:
+terminal painting, cluster gossip and election gates, durable-cursor reads,
+DAG document traffic, and the trends endpoint.  All figures below are from
+an A/B benchmark of this release against 1.2.23 on the same machine, with
+the scenario sizes noted per figure; medians of repeated runs, variance
+within a few percent.
+
+### The terminal dashboard paints what it shows
+
+- **The job drawer's log pane** used to re-run its ANSI rewrite over every
+  buffered line on every paint (a full 5,000-line tail is 10,000 regex
+  passes per frame, repeated once a second while idle and up to 30 times a
+  second under output floods), then slice out the ~40 visible rows.  It now
+  computes the visible window first and transforms only those rows, through
+  a bounded per-line cache that a theme change empties: a steady-state
+  paint over a full tail dropped from 8.6ms to 0.02ms.  The DAG logs tab
+  gets the same treatment.
+- **The multi-tail console** merged and sorted every buffered line of every
+  tail per paint (20,000 tuples for four full tails); it now merges only
+  the slice of each tail that can reach the visible window, which is exact
+  because each tail is already time-ordered: 1.8ms to 0.33ms per paint.
+- **Log search match counts** recompute only when the query or the buffer
+  changed, instead of rescanning the whole tail once per frame while the
+  search box is open.
+
+### Election gates stop re-deriving the same answer
+
+- **The election-derived peer sets** (mutual agreement, eligibility, bridge
+  and vouched contenders, the conflict scans) are pure functions of the
+  last poll round's observations, yet every owner and leader gate check
+  re-derived the whole cascade, about six times per `job_owner` call.  Each
+  derived set is now memoized against a mutation generation that every
+  peer-state write rolls, so the cascade runs once per observation change:
+  a `job_owner` check against 50 agreed peers dropped from 185us to 36us,
+  and the saving repeats per due job at every fire, per job in the
+  once-a-minute claim scan, and per dashboard poll.
+- **Serving `/peer`** rebuilt the full payload and its ETag before it could
+  answer a conditional poll with a 304, so a converged round was only cheap
+  for the network, never the CPU.  The handler now reuses the last built
+  payload and tag while the election state is unchanged and the build is
+  under a second old (a bound indistinguishable from the poller having
+  polled a second earlier): 256us to 1.2us per steady-state conditional
+  response, once per configured peer per poll interval, with the node-stats
+  header still sampled fresh on every request.
+
+### Durable cursors fold instead of rescanning
+
+- **`derive_max`** (the cursor behind catch-up and cross-node retry
+  claims) parsed every retained run record on every call to recompute a
+  maximum that is monotonic by contract.  The filesystem backend now keeps
+  a per-stream watermark and parses only records appended since the last
+  call; a wholesale stream wipe (unlike a bounded prune, which always
+  leaves the newest record standing) is detected and drops the memo, so a
+  recreated stream defines its cursor alone.  A repeat derive over 1,000
+  ten-KB records: 64ms to 1.0ms, paid per catch-up job per service pass at
+  boot.
+
+### DAG advances touch the run document once
+
+- **Reconcile and claim share one read-modify-write**: an advance used to
+  pay one locked full-document pass to recover crash-interrupted tasks and
+  a second to expand, propagate, and claim, even when nothing had changed.
+  The two halves now compose into a single transform in the common case
+  (mapped tasks awaiting expansion still pre-read their upstream lists
+  between two RMWs, the old shape), and a read-only pre-scan skips the
+  transform's full-document copy when it can prove no task is claimable,
+  due, recoverable, or terminalisable, erring toward the full pass on any
+  doubt.  Advancing a quiescent 1,000-instance fan-out dropped from 4.4ms
+  (two locked parses, two deep copies) to 1.8ms (one locked parse, no
+  copy, no rewrite), at least once a minute per active run plus after
+  every task completion.
+- **Launch batches stamp their pids in one write**: recording each launched
+  task's OS pid cost a full-document rewrite per subprocess, up to 32 per
+  pass against a document holding up to 1,000 task entries.  The whole
+  batch now lands in one RMW under the same per-entry proc-token and
+  attempt fences (a stale entry is dropped alone while the rest applies):
+  stamping 32 launches into a 1,000-entry document fell from 364ms to 11ms
+  of store traffic per pass.
+
+### The trends endpoint leaves the event loop alone
+
+- **`GET /jobs/{name}/trends`** (and MCP `cron_get_job_trends`) parsed up
+  to 5,000 ledger records and made four full window-filter passes on the
+  scheduler's event loop, stalling launches, gossip, and output pumping
+  for the duration: a 13.8ms stall per request against a 5,000-record
+  ledger.  The parse and aggregation now run on the executor like the
+  pressure and calendar payloads, each record's age is computed once for
+  all nested windows in a single pass, and the per-record output-stream
+  allocation is gone.  End-to-end latency edged down (244ms to 221ms, the
+  read itself dominating); the loop now spends only thread-switch
+  granularity on the request instead of the whole aggregation.
+
 ## 1.2.23 (2026-07-18)
 
 A performance release: the hot paths flagged by a full efficiency review now

@@ -54,5 +54,6 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [Architecture and Internals](Architecture-and-Internals): How the asyncio scheduler, jobs, and reporters fit together.
 - [MCP Server Design](MCP-Server-Design): The design document behind the MCP server, preserved as written, with the shipped divergences flagged up front.
 - [Contributing and Releasing](Contributing-and-Releasing): Development setup, the test/lint/type-check workflow, and the release process.
+- [Performance Benchmarks](Performance-Benchmarks): The CI benchmark suite: every commit measured against the last release, a per-release diff chart, and a regression gate on publishing.
 - [Migration from yacron](Migration-from-yacron): Moving from gjcarneiro/yacron to cronstable.
 - [Troubleshooting and FAQ](Troubleshooting): Common problems, errors, and answers.

@@ -1027,6 +1027,124 @@ async def test_trends_from_durable_ledger(tmp_path):
         await _stop_state(cron)
 
 
+async def test_trends_single_pass_matches_filter_per_window(
+    tmp_path, monkeypatch
+):
+    """The one-pass window bucketing equals the old filter-per-window math.
+
+    Crafted history spanning every TREND_WINDOWS bucket, with a record
+    sitting exactly ON each window edge (the inclusive `<= seconds` rule
+    must keep it in that window) and one just past it, appended OUT of
+    finished_at order (fire-and-forget persistence and shared-mount merges
+    do not guarantee time order in the ledger).  The payload's windows must
+    match a reference computed with the original per-window filter over the
+    same rehydrated infos, including the order-sensitive last_* fields.
+    """
+    from cronstable.cron import (
+        TREND_WINDOWS,
+        _job_run_info_from_dict,
+        _run_stats,
+    )
+
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    cron.web_config = {}
+    try:
+        now = _now_utc()
+        # freeze the module seam so "exactly at the edge" stays exact when
+        # the builder computes ages
+        monkeypatch.setattr("cronstable.cron.get_now", lambda tz: now)
+
+        async def put(seconds_ago, outcome, duration):
+            finished = now - datetime.timedelta(seconds=seconds_ago)
+            await cron.state_backend.append_record(
+                "runs/j",
+                {
+                    "outcome": outcome,
+                    "exit_code": 0 if outcome == "success" else 1,
+                    "started_at": (
+                        finished - datetime.timedelta(seconds=duration)
+                    ).isoformat(),
+                    "finished_at": finished.isoformat(),
+                    "duration": duration,
+                    "fail_reason": None,
+                },
+            )
+
+        # (seconds_ago, outcome): each window edge exactly, each edge just
+        # missed, plus interior points; scrambled so append order differs
+        # from time order. Distinct durations make last_duration/avg detect
+        # any membership or ordering drift.
+        history = [
+            (86400, "success"),  # exactly the 24h edge
+            (60, "success"),  # interior 1h
+            (2592001, "failure"),  # just past 30d: "all" only
+            (3600, "success"),  # exactly the 1h edge
+            (604801, "failure"),  # just past 7d
+            (3601, "failure"),  # just past 1h
+            (2592000, "success"),  # exactly the 30d edge
+            (86401, "failure"),  # just past 24h
+            (604800, "success"),  # exactly the 7d edge
+        ]
+        for i, (seconds_ago, outcome) in enumerate(history):
+            await put(seconds_ago, outcome, duration=float(i + 1))
+        # a poison record is skipped by the parse, not counted anywhere
+        await cron.state_backend.append_record(
+            "runs/j", {"finished_at": "not-a-date"}
+        )
+
+        payload = await cron.job_trends_payload("j")
+        assert payload is not None
+        assert payload["source"] == "durable"
+
+        # reference: the original filter-per-window semantics over the same
+        # rehydrated, append-ordered infos
+        recs = await cron.state_backend.list_records(
+            "runs/j", limit=5000, newest_first=True
+        )
+        recs.reverse()
+        infos = [
+            info
+            for info in (_job_run_info_from_dict(rec) for rec in recs)
+            if info is not None
+        ]
+        expected = {
+            label: _run_stats(
+                [
+                    info
+                    for info in infos
+                    if (now - info.finished_at).total_seconds() <= seconds
+                ]
+            )
+            for label, seconds in TREND_WINDOWS
+        }
+        expected["all"] = _run_stats(infos)
+        assert payload["windows"] == expected
+        # and the inclusive edges landed where the old code put them
+        totals = {
+            label: payload["windows"][label]["total"]
+            for label in ("1h", "24h", "7d", "30d", "all")
+        }
+        assert totals == {"1h": 2, "24h": 4, "7d": 6, "30d": 8, "all": 9}
+    finally:
+        await _stop_state(cron)
+
+
+async def test_trends_cancellation_propagates(tmp_path):
+    # cancellation is not a store failure: it must re-raise, never degrade
+    # to the in-memory history
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+
+        async def _cancelled(*_a, **_k):
+            raise asyncio.CancelledError
+
+        cron.state_backend.list_records = _cancelled  # type: ignore[method-assign]
+        with pytest.raises(asyncio.CancelledError):
+            await cron.job_trends_payload("j")
+    finally:
+        cron.state_backend = None
+
+
 async def test_trends_degrades_to_memory_and_404s(tmp_path):
     cron = await _stateful_cron(tmp_path, _RETRY_JOB)
     cron.web_config = {}

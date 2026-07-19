@@ -58,6 +58,26 @@ uv tool install pre-commit   # or: pip install pre-commit
 pre-commit install
 ```
 
+## Performance benchmarks
+
+CI benchmarks every commit against the latest release (startup time, schedule
+math at 100k-job scale, config parsing, state I/O, memory footprint, and more)
+and, on a release, fails the pipeline if a metric regresses past its declared
+limit. The release notes then carry a per-metric diff chart. Check your own
+changes locally with:
+
+```sh
+python benchmarks/bench.py --quick --json before.json
+# make the change
+python benchmarks/bench.py --quick --json after.json
+python benchmarks/compare.py --baseline before.json --current after.json --md diff.md
+```
+
+To ship an intentional, measured regression, start a pushed commit's subject
+with `[perf:accept]` (subjects only, like the `[release]` marker). The full
+harness reference, including how to add a benchmark, is in
+[benchmarks/README.md](benchmarks/README.md).
+
 ## Releasing
 
 Releases are **automated** by the single [`CI`](.github/workflows/release.yml)

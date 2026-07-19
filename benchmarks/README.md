@@ -119,12 +119,18 @@ group **skips cleanly** when Playwright or its Chromium build is absent, when
 the page predates the `?perf=1` hook (an older release), and in `--smoke`
 (the unit test must not launch a browser). The CI `perf` job installs
 Playwright + Chromium into the current-side venv (best-effort) so `webui.*`
-runs there; to run them locally:
+runs there. Locally they need the same, via the `perf-web` extra (kept out of
+the default dev deps so an ordinary `tox` run never needs a browser, and so a
+package-without-browser install can't turn the web tests' clean skip into a
+launch error):
 
 ```sh
-pip install playwright && playwright install chromium
+pip install -e .[perf-web] && python -m playwright install chromium
 python benchmarks/bench.py --quick --only webui
 ```
+
+Run them with an interpreter that has both installed; under a plain `tox` env
+(or any env without Playwright) the `webui.*` metrics skip, by design.
 
 Because an older release's page carries no `?perf=1` hook, the `webui` metrics
 compare new-against-new (a forward-looking gate and a recorded number), not an

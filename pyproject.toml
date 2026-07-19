@@ -130,6 +130,16 @@ dev = [
     # tox-uv routes tox's env creation + installs through uv (see tox.ini).
     "tox-uv",
 ]
+# Optional: the browser-driven checks -- the webui.* performance benchmarks
+# (benchmarks/bench.py) and the client-engine differential test
+# (tests/test_web_engine_parity.py) -- drive a headless Chromium through
+# Playwright. Deliberately kept OUT of `dev` / requirements_dev.txt: both
+# self-skip when Playwright is absent, so the default test + tox run never
+# needs a browser, and a partial install (the package without the browser
+# binary) would turn that clean skip into a launch error in CI. Enable them
+# with the package AND a one-time browser download:
+#     pip install -e .[perf-web] && python -m playwright install chromium
+perf-web = ["playwright>=1.40"]
 
 [tool.setuptools]
 # The kubernetes/etcd leadership backends talk to their store over plain HTTP

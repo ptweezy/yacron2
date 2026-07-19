@@ -893,6 +893,23 @@ class FilesystemStateBackend(StateBackend):
         # from worker threads, hence the lock.
         self._prune_countdown: Dict[str, int] = {}
         self._prune_gate_lock = threading.Lock()
+        # Derived-cursor memo (see _derive_max_sync): (stream token, field)
+        # to (newest record filename folded so far, best value over every
+        # record at or below that filename).  Lets a repeat derive_max parse
+        # only records that appended since the previous call instead of
+        # re-reading the whole stream (a bounded run ledger holds up to
+        # ~1000 records of tens of KB each, and the catch-up path derives
+        # per job per service pass).  Memory is bounded by the number of
+        # distinct (stream, field) pairs ever derived, a handful per job,
+        # so no eviction is needed.  _derive_wipe_gen counts wholesale
+        # stream deletions (prune keep <= 0, gc): a derive that raced such
+        # a wipe must not write its now-stale fold back into the memo, so
+        # writes are gated on the generation observed before scanning.  It
+        # too is bounded (one small int per wiped stream token).  Read and
+        # written from worker threads, hence the lock.
+        self._derive_memo: Dict[Tuple[str, str], Tuple[str, Any]] = {}
+        self._derive_wipe_gen: Dict[str, int] = {}
+        self._derive_memo_lock = threading.Lock()
 
     # --- paths -----------------------------------------------------------
 
@@ -1630,12 +1647,79 @@ class FilesystemStateBackend(StateBackend):
             "derive-max", self._derive_max_sync, stream, field
         )
 
+    def _derive_max_invalidate(self, token: str) -> None:
+        """Drop the derive_max memo for one stream after a wholesale wipe.
+
+        Needed because the memo's own staleness check (watermark filename
+        gone AND nothing newer) cannot see a wipe that was followed by new
+        appends before the next derive: the new records' filenames sort
+        above the old watermark, which looks exactly like an ordinary
+        prune, and the cached best would then leak values from deleted
+        records into the recreated stream's cursor.  Bumping the wipe
+        generation also fences a derive already in flight on another
+        worker thread: its memo write-back is gated on the generation it
+        observed before scanning, so it cannot resurrect the stale fold.
+        """
+        with self._derive_memo_lock:
+            self._derive_wipe_gen[token] = (
+                self._derive_wipe_gen.get(token, 0) + 1
+            )
+            for key in [k for k in self._derive_memo if k[0] == token]:
+                del self._derive_memo[key]
+
     def _derive_max_sync(self, stream: str, field: str) -> Optional[Any]:
+        stream_dir = self._stream_dir(stream)
+        token = os.path.basename(stream_dir)
+        memo_key = (token, field)
+        try:
+            listing = sorted(
+                n for n in os.listdir(stream_dir) if n.endswith(".json")
+            )
+        except FileNotFoundError:
+            listing = []
+        if not listing:
+            # No records at all: the stream is empty, wiped, or never
+            # written.  Any cached fold describes records that no longer
+            # exist, so it must go (a stale best here would report a cursor
+            # for a stream that is provably empty right now).
+            with self._derive_memo_lock:
+                self._derive_memo.pop(memo_key, None)
+            return None
+        with self._derive_memo_lock:
+            gen = self._derive_wipe_gen.get(token, 0)
+            cached = self._derive_memo.get(memo_key)
         best: Optional[Any] = None
+        to_scan = listing
+        if cached is not None:
+            watermark, best = cached
+            newer = [n for n in listing if n > watermark]
+            if watermark in listing or newer:
+                # Incremental fold, correct because record ids embed the
+                # write epoch (filenames sort chronologically) so appends
+                # only ever create names above the watermark, and because a
+                # bounded prune (keep > 0) only deletes the OLDEST records:
+                # deleting a record whose value is already folded into the
+                # cached best cannot lower a monotonic maximum.  The
+                # watermark itself may have been pruned away once newer
+                # records landed (prune keeps the newest ``keep``, so it
+                # can only outprune the watermark when something newer
+                # exists), which is why a surviving newer name is as good
+                # as the watermark surviving.
+                to_scan = newer
+            else:
+                # The watermark is gone AND nothing newer exists: that is
+                # not a prune (a bounded prune always leaves the newest
+                # record standing), the stream was deleted and recreated
+                # underneath us.  Discard the cache and rescan from
+                # scratch so the recreated records alone define the max.
+                best = None
         # strict=True: an environmental read error must PROPAGATE (fail the
         # whole derive), never silently shrink the max -- see _read_record.
-        for data in self._list_sync(stream, None, False, strict=True):
-            if field not in data:
+        # A raise also skips the memo write-back below, so a half-folded
+        # scan is never cached.
+        for name in to_scan:
+            data = self._read_record(stream_dir, name, strict=True)
+            if data is None or field not in data:
                 continue
             value = data[field]
             if best is None:
@@ -1648,6 +1732,11 @@ class FilesystemStateBackend(StateBackend):
                 # incomparable types in one stream (a caller bug); keep the
                 # first-seen rather than raising out of a cursor read.
                 continue
+        with self._derive_memo_lock:
+            if self._derive_wipe_gen.get(token, 0) == gen:
+                # unchanged generation: no wipe raced this scan, the fold
+                # is anchored to the newest filename in the full listing.
+                self._derive_memo[memo_key] = (listing[-1], best)
         return best
 
     async def prune_records(self, stream: str, *, keep: int) -> int:
@@ -1672,6 +1761,12 @@ class FilesystemStateBackend(StateBackend):
             except OSError:
                 # already gone (raced with another prune/node): ignore.
                 pass
+        if keep <= 0:
+            # A wholesale wipe (unlike a bounded prune, which keeps the
+            # newest records and cannot lower the monotonic max): the
+            # derive_max memo must not survive it, see
+            # _derive_max_invalidate.
+            self._derive_max_invalidate(os.path.basename(stream_dir))
         return deleted
 
     # --- lease -----------------------------------------------------------
@@ -2388,6 +2483,9 @@ class FilesystemStateBackend(StateBackend):
             # non-empty; the rmdir then fails and the next pass converges.
             with contextlib.suppress(OSError):
                 os.rmdir(stream_dir)
+            # a wholesale stream wipe: the derive_max memo must not
+            # survive it, see _derive_max_invalidate.
+            self._derive_max_invalidate(token)
         leases_removed = self._gc_leases_sync(
             cutoff, dry_run, ephemeral_lease_prefixes
         )

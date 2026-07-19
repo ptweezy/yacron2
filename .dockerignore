@@ -24,4 +24,3 @@ target
 tests
 .editorconfig
 .gitignore
-.pre-commit-config.yaml

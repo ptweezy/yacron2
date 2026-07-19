@@ -239,8 +239,8 @@ jobs:
   # parallel. The publish jobs below need every one of these to succeed.
   # ---------------------------------------------------------------------------
 
-  # lint + mypy in one job: each env finishes in well under a minute, so a
-  # second runner spin-up costs more wall clock than running them serially.
+  # lint + mypy + bandit in one job: each env finishes in well under a minute,
+  # so a second runner spin-up costs more wall clock than running them serially.
   tox-static:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -249,7 +249,7 @@ jobs:
       - uses: actions/setup-python@v6.3.0
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install tox tox-uv
-      - run: tox -e lint,mypy
+      - run: tox -e lint,mypy,bandit
 
   tox:
     strategy:

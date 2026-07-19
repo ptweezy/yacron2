@@ -30,16 +30,17 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 
 The editable dev install (`pip install -e ".[dev]"`) and the checks (`pytest`, `ruff`, `mypy`) all run natively on Windows too. Use `.venv\Scripts\activate` to enter the venv as shown above.
 
-The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: `mypy`, `mypy-extensions`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `tox`, and `tox-uv` (the plugin that makes `tox` provision and install with uv). The console entry point `cronstable = cronstable.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
+The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: `bandit`, `mypy`, `mypy-extensions`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `tox`, and `tox-uv` (the plugin that makes `tox` provision and install with uv). The console entry point `cronstable = cronstable.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
 
 ## Running the checks
 
-All CI checks are driven by `tox` (`tox.ini`). The default `envlist` is `py310, py311, py312, py313, py314, lint, mypy`.
+All CI checks are driven by `tox` (`tox.ini`). The default `envlist` is `py310, py311, py312, py313, py314, lint, mypy, bandit`.
 
 ```sh
-tox            # all envs: py310-py314, lint, mypy
+tox            # all envs: py310-py314, lint, mypy, bandit
 tox -e lint    # ruff check + ruff format --check
 tox -e mypy    # mypy
+tox -e bandit  # bandit security lint (medium+ severity)
 tox -e py      # pytest on the current interpreter
 ```
 
@@ -48,10 +49,11 @@ tox -e py      # pytest on the current interpreter
 | `py313`, `py314` | yes (`-rrequirements_dev.txt`, `PYTHONPATH={toxinidir}`) | `pytest --color=yes -vv` |
 | `lint` | no (`skip_install = true`) | `ruff check cronstable` then `ruff format --check cronstable` |
 | `mypy` | no (`skip_install = true`, `basepython=python3`) | `mypy -p cronstable --ignore-missing-imports` |
+| `bandit` | no (`skip_install = true`) | `bandit -c pyproject.toml -r cronstable --severity-level=medium` |
 
 `tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and installs dependencies with uv automatically (much faster; behavior-identical). Force the legacy virtualenv+pip path with `tox --runner virtualenv` if ever needed.
 
-The `lint` and `mypy` envs deliberately skip installing the package: ruff and mypy analyze the source tree directly, so they avoid imposing the project's `requires-python` on the lint/type-check interpreter.
+The `lint`, `mypy`, and `bandit` envs deliberately skip installing the package: ruff, mypy, and bandit analyze the source tree directly, so they avoid imposing the project's `requires-python` on those interpreters.
 
 ### Tool configuration
 
@@ -60,29 +62,11 @@ The `lint` and `mypy` envs deliberately skip installing the package: ruff and my
 - **ruff**: `target-version = "py313"`, `line-length = 79`. Lint rule sets selected: `B`, `B9` (bugbear), `C` (mccabe complexity), `E` (pycodestyle errors), `F` (pyflakes), `W` (pycodestyle warnings), `I` (import sorting). `pyupgrade` (`UP`) is present but commented out. `max-complexity = 20`.
 - **mypy**: `no_implicit_optional = true`, `warn_no_return = true`, `warn_return_any = true`, `strict_optional = true`.
 - **pytest**: `asyncio_mode = "auto"`, `testpaths = ["tests"]`.
-- **bandit**: `exclude_dirs = ["tests"]`.
-
-### pre-commit
-
-`pre-commit` runs ruff and bandit on staged changes (`.pre-commit-config.yaml`):
-
-```sh
-pip install pre-commit
-pre-commit install
-```
-
-Configured hooks:
-
-| Repo | Rev | Hook(s) | Args |
-| --- | --- | --- | --- |
-| `PyCQA/bandit` | `1.9.4` | `bandit` | `-c pyproject.toml --severity-level=medium`, with `bandit[toml]` |
-| `astral-sh/ruff-pre-commit` | `v0.15.18` | `ruff` (lint), `ruff-format` | `ruff` runs with `--fix` |
-
-Note `pre-commit`'s ruff runs with `--fix` (auto-applies fixes), whereas `tox -e lint` runs `ruff check` (no fix) plus `ruff format --check` (verify only). pre-commit is not pinned in the `dev` extra; install it separately as shown.
+- **bandit**: `exclude_dirs = ["tests"]` and `skips = ["B104"]` (B104's only matches are non-bind wildcard-listen host constants in `config.py`). CI runs it at medium severity via `tox -e bandit`.
 
 ### CI for every commit
 
-There is **one** workflow, `.github/workflows/release.yml` (named `CI`), and it runs on every `push` (any branch) and every `pull_request`. On an ordinary commit it builds and tests the whole product in parallel and stops there; only a release (see below) proceeds to publish. The test half is unchanged from before: `tox-lint` (`tox -e lint`) and `tox-mypy` (`tox -e mypy`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py` (`fail-fast: false`) across `os` `[ubuntu-latest, windows-latest]` × Python `3.10`–`3.14`, with an experimental `ubuntu-latest`/`3.15` row (`continue-on-error`, never gates) and a `windows-11-arm`/`3.14` row for **Windows ARM64**.
+There is **one** workflow, `.github/workflows/release.yml` (named `CI`), and it runs on every `push` (any branch) and every `pull_request`. On an ordinary commit it builds and tests the whole product in parallel and stops there; only a release (see below) proceeds to publish. The test half is a `tox-static` job (`tox -e lint,mypy,bandit`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py` (`fail-fast: false`) across `os` `[ubuntu-latest, windows-latest]` × Python `3.10`–`3.14`, with an experimental `ubuntu-latest`/`3.15` row (`continue-on-error`, never gates) and a `windows-11-arm`/`3.14` row for **Windows ARM64**.
 
 Alongside the tests, the same run builds every release artifact at the computed version (all the PyInstaller binaries, the wheel + sdist) and does a **build-only pass over every Docker image** (the `docker` job — all 8 distros at their full published arch sets, no push), so a broken `Dockerfile` fails CI before a release. On an ordinary commit the version is the natural `setuptools_scm` dev version; no **software** is published, pushed, tagged, or signed. The lone exception is documentation: the `wiki` job publishes `wiki/` to the GitHub wiki whenever it changes on `develop` (see [Editing the wiki](#editing-the-wiki)). See [Production and Container Deployment](Production-Deployment).
 

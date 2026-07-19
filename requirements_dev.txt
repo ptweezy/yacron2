@@ -3,6 +3,8 @@
 # OpenSSL), so don't install it there; those tests importorskip it and self-skip
 # when it's absent. Every other platform keeps full coverage.
 cryptography; platform_machine != "ARM64" or sys_platform != "win32"
+# security linter; bandit[toml] reads its config from pyproject.toml.
+bandit[toml]
 mypy
 mypy-extensions
 pytest

@@ -4669,7 +4669,9 @@ class AppRender(AppKeys):
         now = time.monotonic()
         for job in self.jobs:
             name = str(job.get("name", ""))
-            digest = hashlib.md5(name.encode("utf-8")).digest()
+            digest = hashlib.md5(
+                name.encode("utf-8"), usedforsecurity=False
+            ).digest()
             row_idx = 1 + digest[0] % max(1, lines - 3)
             col_idx = 1 + digest[1] % max(1, cols - 3)
             nxt = self.next_run_seconds(job)

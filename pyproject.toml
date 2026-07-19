@@ -118,6 +118,8 @@ dev = [
     # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.
     "cryptography; platform_machine != 'ARM64' or sys_platform != 'win32'",
+    # security linter; bandit[toml] reads [tool.bandit] from pyproject.toml.
+    "bandit[toml]",
     "mypy",
     "mypy-extensions",
     "pytest",
@@ -204,3 +206,9 @@ show_missing = true
 
 [tool.bandit]
 exclude_dirs = ["tests"]
+# B104's only hits are the literal "0.0.0.0"/"::" strings in config.py's
+# wildcard-listen match-sets (_WILDCARD_LISTEN_HOSTS and friends): data used to
+# recognize a wildcard listen address, not a socket bind. The real listen host
+# is user-configured and never a literal here, so B104 yields only false
+# positives. Bandit still runs at medium+; every other check stays active.
+skips = ["B104"]

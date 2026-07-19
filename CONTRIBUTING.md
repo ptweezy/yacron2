@@ -40,9 +40,10 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 Everything CI runs is driven by `tox`:
 
 ```sh
-tox            # all envs: py310, py311, py312, py313, py314, lint, mypy
+tox            # all envs: py310, py311, py312, py313, py314, lint, mypy, bandit
 tox -e lint    # ruff check + ruff format --check
 tox -e mypy    # mypy
+tox -e bandit  # bandit security lint (medium+ severity)
 tox -e py      # pytest on the current interpreter
 ```
 
@@ -50,13 +51,6 @@ tox -e py      # pytest on the current interpreter
 installs dependencies with uv automatically (much faster; behavior-identical).
 Force the legacy virtualenv+pip path with `tox --runner virtualenv` if you ever
 need to.
-
-`pre-commit` runs ruff and bandit on staged changes:
-
-```sh
-uv tool install pre-commit   # or: pip install pre-commit
-pre-commit install
-```
 
 ## Performance benchmarks
 

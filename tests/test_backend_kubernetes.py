@@ -24,6 +24,8 @@ from cronstable.backends.kubernetes import (
     ACTION_WAIT,
     KubernetesBackend,
     LeaseState,
+    _deadline_passed,
+    _file_signature,
     _format_microtime,
     _join_host_port,
     _K8sHttpTransport,
@@ -1198,3 +1200,26 @@ def test_k8s_is_self_demoted_holder():
     assert b._is_self_demoted_holder() is False
     b._is_leader = False
     assert b._is_self_demoted_holder() is False
+
+
+# --- pure helper edge branches: file signature and deadline ----------------
+
+
+def test_k8s_file_signature_missing_is_none(tmp_path):
+    assert _file_signature(str(tmp_path / "absent.crt")) is None
+
+
+def test_lease_is_expired_live_path_without_monotonic_anchor():
+    # live (monotonic-float) path: a lease with a duration but no monotonic
+    # observed-at anchor yet is treated as expired (no wall-clock fallback).
+    state = LeaseState("node-b", NOW, NOW, 15, 0, "1")
+    assert lease_is_expired(state, 100.0, None) is True
+
+
+def test_deadline_passed_branches():
+    # no anchor -> passed; the wall-clock datetime branch compares with a
+    # timedelta.
+    assert _deadline_passed(100.0, None, 15) is True
+    later = NOW + datetime.timedelta(seconds=20)
+    assert _deadline_passed(later, NOW, 15) is True
+    assert _deadline_passed(NOW, NOW, 15) is False

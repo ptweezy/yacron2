@@ -1238,3 +1238,63 @@ def test_bind_target_forms():
     assert _bind_of("127.0.0.1:9123") == ("127.0.0.1", 9123)
     assert _bind_of("http://10.0.0.5:8099") == ("10.0.0.5", 8099)
     assert _bind_of("http://10.0.0.5") == ("10.0.0.5", 0)
+
+
+# ---------------------------------------------------------------------------
+# JobLockManager: CancelledError must propagate, never be swallowed
+# ---------------------------------------------------------------------------
+
+
+async def test_safe_release_propagates_cancellation():
+    # _safe_release swallows ordinary backend errors (the TTL frees the lease
+    # regardless) but must NOT swallow a CancelledError -- cancellation has to
+    # propagate so the awaiting task actually unwinds.
+    class _Cancelling(_ScriptedBackend):
+        async def release_lease(self, lease):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await JobLockManager._safe_release(_Cancelling(), _lease())
+
+
+async def test_renew_loop_propagates_cancellation(monkeypatch):
+    # a CancelledError raised while renewing is re-raised (not treated as a
+    # transient blip that retries), ending the renewer task.
+    backend = _ScriptedBackend(renew_outcomes=[asyncio.CancelledError()])
+    mgr = _manager(backend)
+    _instant_sleep(monkeypatch)
+    got = await mgr.acquire("run", "s", "l")
+    assert got["acquired"] is True
+    renewer = mgr._holds[got["token"]].renewer
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(renewer, 5)
+
+
+async def test_release_hold_propagates_cancellation():
+    # _release_hold cancels the renewer then hands the lease back; a
+    # CancelledError from that release must propagate rather than be swallowed.
+    class _Cancelling(_ScriptedBackend):
+        async def release_lease(self, lease):
+            raise asyncio.CancelledError()
+
+    mgr = _manager(_Cancelling())
+    got = await mgr.acquire("run", "s", "l")
+    with pytest.raises(asyncio.CancelledError):
+        await mgr.release("run", got["token"])
+
+
+async def test_error_mw_maps_unportable_value_to_400():
+    # defence in depth: a handler that lets a non-portable value reach the
+    # serializer raises _json.UnsupportedValue, which the error middleware maps
+    # to a clean 400 (the caller's bad input), not a 500.
+    api = JobStateAPI(
+        lambda: None, host="h", base_holder="h#proc", config={}
+    )
+    mw = api._middlewares()[0]
+
+    async def handler(_request):
+        raise jobapi._json.UnsupportedValue("bad-nan-value")
+
+    resp = await mw(object(), handler)
+    assert resp.status == 400
+    assert b"bad-nan-value" in resp.body

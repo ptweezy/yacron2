@@ -758,3 +758,67 @@ async def test_referenced_blob_digests(tmp_path):
     refs = await jobstate.referenced_blob_digests(backend, ["s1", "s2"])
     assert refs == {d1, d2}
     await backend.stop()
+
+
+# --------------------------------------------------------------------------
+# Logic layer: scope guard and artifact edge branches
+# --------------------------------------------------------------------------
+
+
+async def test_require_scope_rejects_blank(tmp_path):
+    # a blank (or whitespace-only) scope strips to empty and is refused before
+    # any store work -- _require_scope's guard branch.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        with pytest.raises(JobStateError, match="non-empty scope"):
+            await jobstate.kv_get(backend, "   ", "k")
+    finally:
+        await backend.stop()
+
+
+async def test_artifact_put_stores_optional_meta(tmp_path):
+    # the optional meta mapping rides along on the record and reads back.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        rec = await jobstate.artifact_put(
+            backend, "s", "r.csv", b"a,b\n", meta={"kind": "csv"}
+        )
+        assert rec["meta"] == {"kind": "csv"}
+        got = await jobstate.artifact_get(backend, "s", "r.csv")
+        assert got is not None
+        record, data = got
+        assert record["meta"] == {"kind": "csv"}
+        assert data == b"a,b\n"
+    finally:
+        await backend.stop()
+
+
+async def test_artifact_get_record_absent_returns_none(tmp_path):
+    # a name never published reads back as None on both the record and the
+    # (record, payload) accessor -- the exhausted-stream branch.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        assert await jobstate.artifact_get_record(backend, "s", "nope") is None
+        assert await jobstate.artifact_get(backend, "s", "nope") is None
+    finally:
+        await backend.stop()
+
+
+async def test_artifact_get_raises_410_when_blob_swept(tmp_path):
+    # the record survives but its content-addressed blob was garbage-collected:
+    # artifact_get must fail closed with a 410, not return empty bytes.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        await jobstate.artifact_put(backend, "s", "x", b"payload")
+        # sweep with an empty referenced set: nothing is referenced, so the
+        # blob is reclaimed while its record remains in the stream.
+        assert await backend.sweep_orphan_blobs(set(), 0.0) == 1
+        with pytest.raises(JobStateError) as ei:
+            await jobstate.artifact_get(backend, "s", "x")
+        assert ei.value.status == 410
+    finally:
+        await backend.stop()

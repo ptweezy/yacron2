@@ -16,6 +16,7 @@ from cronstable.backends.etcd import (
     EtcdBackend,
     _b64,
     _b64decode,
+    _file_signature,
     build_campaign_txn,
     build_reboot_ran_cas_txn,
     campaign_won,
@@ -210,6 +211,19 @@ def test_campaign_won_camelcase_and_missing_lease():
     assert campaign_won({"succeeded": False}, "5") is False
 
 
+def test_campaign_won_skips_empty_response_entries():
+    # a failed txn whose failure-branch entries carry no range / no kvs is
+    # skipped entry by entry; with nothing bound to our lease, we did not win.
+    resp = {
+        "succeeded": False,
+        "responses": [
+            {},  # no response_range at all -> skip this entry
+            {"response_range": {"kvs": []}},  # a range with no kvs -> skip
+        ],
+    }
+    assert campaign_won(resp, "5") is False
+
+
 # --- backend local state --------------------------------------------------
 
 
@@ -296,6 +310,13 @@ def test_tls_files_changed_false_for_plain_http():
     b._record_tls_files()
     assert b._tls_files == []
     assert b.tls_files_changed() is False
+
+
+def test_etcd_file_signature_missing_is_none(tmp_path):
+    # a stat error (file briefly absent mid-rotation) records None, which then
+    # compares unequal once the file is back -- the safe (spurious-rebuild)
+    # direction.
+    assert _file_signature(str(tmp_path / "absent.pem")) is None
 
 
 def test_is_leader_gated_on_lease_deadline():

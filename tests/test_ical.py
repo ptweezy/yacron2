@@ -16,6 +16,7 @@ from cronstable.ical import (
     _duration_text,
     _escape,
     _fold,
+    _runtime_phrase,
     render_calendar,
 )
 
@@ -149,3 +150,22 @@ def test_summary_escapes_awkward_job_names():
     entry = CalendarEntry("sync; a,b", CronTab("0 0 * * *"), _UTC)
     text = _render([entry], days=2)
     assert "SUMMARY:sync\\; a\\,b" in text
+
+
+# ---------------------------------------------------------------------------
+# _runtime_phrase: the seconds, minutes, and hours arms.
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_phrase_seconds_arm():
+    # sub-minute durations render in seconds, rounded to the nearest whole
+    assert _runtime_phrase(30) == "30s"
+    assert _runtime_phrase(59.4) == "59s"
+    assert _runtime_phrase(0.4) == "0s"
+
+
+def test_runtime_phrase_minutes_and_hours_arms():
+    # the minute arm (kept as a control) and the hour arm (>= 60 minutes)
+    assert _runtime_phrase(300) == "5m"
+    assert _runtime_phrase(5400) == "1.5h"  # 90 min -> 1.5h
+    assert _runtime_phrase(7200) == "2.0h"

@@ -595,8 +595,8 @@ class DagScheduler:
             known = self._terminal_run_keys.get(dagcfg.name)
             if known is not None:
                 known.discard(run_key)
-            # same reason for list_dags' rollup cache: a re-created key must not
-            # keep serving the GC'd predecessor's terminal summary.
+            # same reason for list_dags' rollup cache: a re-created key must
+            # not keep serving the GC'd predecessor's terminal summary.
             summaries = self._dag_summary_cache.get(dagcfg.name)
             if summaries is not None:
                 summaries.pop(run_key, None)
@@ -1417,10 +1417,11 @@ class DagScheduler:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - one failed RMW must not wedge the run
-            # Unlike a pid write, a lost completion is NOT best-effort: unrecorded,
-            # the entry stays RUNNING under our proc token, which reconciliation
-            # trusts forever while this daemon lives (and the lease keeps peers
-            # out). So EVERY entry in the batch is queued for retry, not just one.
+            # Unlike a pid write, a lost completion is NOT best-effort:
+            # unrecorded, the entry stays RUNNING under our proc token, which
+            # reconciliation trusts forever while this daemon lives (and the
+            # lease keeps peers out). So EVERY entry in the batch is queued for
+            # retry, not just one.
             for entry in live:
                 self._queue_completion(
                     ref,
@@ -1827,14 +1828,12 @@ class DagScheduler:
 
     @staticmethod
     def _rollup_from_summaries(
-        summaries: List[Dict[str, Any]]
+        summaries: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """latestRun (newest by createdAt) + runCounts histogram + totalRuns."""
+        """latestRun (newest by createdAt), runCounts histogram, totalRuns."""
         if not summaries:
             return {}
-        latest = max(
-            summaries, key=lambda s: float(s.get("createdAt") or 0)
-        )
+        latest = max(summaries, key=lambda s: float(s.get("createdAt") or 0))
         counts: Dict[str, int] = {}
         for s in summaries:
             counts[s["state"]] = counts.get(s["state"], 0) + 1
@@ -1904,9 +1903,7 @@ class DagScheduler:
         for gone in [k for k in cache if k not in keyset]:
             del cache[gone]
         to_read = [
-            k
-            for k in keys
-            if not (k in cache and cache[k]["terminal"])
+            k for k in keys if not (k in cache and cache[k]["terminal"])
         ]
         if len(to_read) > DAG_ROLLUP_BULK_THRESHOLD:
             return await self._bulk_rollup(backend, ns, name)

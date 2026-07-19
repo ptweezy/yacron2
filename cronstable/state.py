@@ -1400,7 +1400,7 @@ class FilesystemStateBackend(StateBackend):
             # kinds so the countdown is consumed once.
             if self._append_prune_due(stream):
                 try:
-                    if want_keep:
+                    if prune_keep is not None and prune_keep > 0:
                         self._prune_sync(stream, prune_keep)
                     if prune_latest_by:
                         self._prune_latest_by_sync(stream, prune_latest_by)
@@ -1798,9 +1798,9 @@ class FilesystemStateBackend(StateBackend):
 
         The name-keyed prune for the artifact store: records supersede one
         another by ``name``, and only the newest per name is ever read back
-        (see :func:`cronstable.jobstate.artifact_get_record` / ``artifact_list``
-        / ``referenced_blob_digests``), so an older record for a name that has
-        a newer one is pure dead weight -- it only pins its now-orphan blob.
+        (see ``artifact_get_record`` / ``artifact_list`` /
+        ``referenced_blob_digests``), so an older record for a name that has a
+        newer one is pure dead weight -- it only pins its now-orphan blob.
         Deleting those bounds the stream to the number of distinct names, and
         their blobs are reclaimed by the next orphan-blob sweep.
 

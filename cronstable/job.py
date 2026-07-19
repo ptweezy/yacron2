@@ -146,7 +146,9 @@ class JobOutputStream:
         except asyncio.QueueFull:
             try:
                 queue.get_nowait()
-            except asyncio.QueueEmpty:  # pragma: no cover - full implies non-empty
+            except (
+                asyncio.QueueEmpty
+            ):  # pragma: no cover - full implies non-empty
                 pass
             queue.put_nowait(item)
             return True

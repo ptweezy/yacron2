@@ -106,12 +106,12 @@ MAX_CATCHUP_OCCURRENCES = 100
 # In-memory only (like the rest of the run record), and bounded so a frequently
 # scheduled job cannot grow memory without limit.
 RUN_HISTORY_LIMIT = 50
-# First page size the onlyIfLastSucceeded gate reads from the durable run ledger
-# (see _depends_on_past_ok). The gate needs only the newest success/failure
-# record, so it probes this many newest records and widens to the full
-# RUN_HISTORY_LIMIT window only when the whole probe page is non-run outcomes
-# (cancelled/skipped) -- reading a few records instead of 50 on the common path,
-# while preserving the same skip window.
+# First page size the onlyIfLastSucceeded gate reads from the durable run
+# ledger (see _depends_on_past_ok). The gate needs only the newest success/
+# failure record, so it probes this many newest records and widens to the
+# full RUN_HISTORY_LIMIT window only when the whole probe page is non-run
+# outcomes (cancelled/skipped) -- reading a few records instead of 50 on the
+# common path, while preserving the same skip window.
 DEPENDS_GATE_PROBE = 8
 # How many compact run summaries to embed per job in the /jobs payload — enough
 # for the dashboard's inline sparkline without shipping the full detailed
@@ -7724,15 +7724,16 @@ class Cron:
         head must be skipped over.  Probe :data:`DEPENDS_GATE_PROBE` newest
         records first and widen to the full :data:`RUN_HISTORY_LIMIT` window
         ONLY when that page is entirely non-run outcomes -- so the common case
-        (the newest record is a real outcome) materialises a few records instead
-        of all 50, without shrinking the skip window a genuine answer may need.
+        (the newest record is a real outcome) materialises a few records
+        instead of all 50, without shrinking the skip window a real answer
+        may need.
 
         Raises through to the caller's fail-closed/degrade handling on a store
         error or timeout, exactly as the single read it replaces.
         """
         stream = self._run_stream(name)
         probe = min(DEPENDS_GATE_PROBE, RUN_HISTORY_LIMIT)
-        recs = await asyncio.wait_for(
+        recs: List[Dict[str, Any]] = await asyncio.wait_for(
             backend.list_records(stream, limit=probe, newest_first=True),
             timeout=STATE_OP_TIMEOUT,
         )
@@ -7742,12 +7743,13 @@ class Cron:
             r.get("outcome") in ("success", "failure") for r in recs
         ):
             return recs
-        return await asyncio.wait_for(
+        widened: List[Dict[str, Any]] = await asyncio.wait_for(
             backend.list_records(
                 stream, limit=RUN_HISTORY_LIMIT, newest_first=True
             ),
             timeout=STATE_OP_TIMEOUT,
         )
+        return widened
 
     async def _depends_on_past_ok(self, job: JobConfig) -> bool:
         """Whether ``job``'s depends-on-past gate permits a scheduled fire.

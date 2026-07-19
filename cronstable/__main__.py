@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Any
 
 import cronstable.version
 from cronstable import platform
@@ -114,8 +115,8 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     # by importing cronstable.mcpcli / cronstable.tui. Importing tui alone runs
     # its ~7000-line module body and pulls unicodedata's C table plus dozens of
     # other modules (~50ms), and every job-spawned thin client (`state get`,
-    # `lock`, `xcom pull`) builds this parser first, so the eager import taxed a
-    # hot path for two commands that are almost never the one invoked. The real
+    # `lock`, `xcom pull`) builds this parser first, so the eager import
+    # taxed a hot path for two commands almost never the one invoked. The real
     # modules are imported only inside their dispatch branches (see main_loop).
     # A parity test (tests/test_cli_stubs.py) keeps the stub flags in lockstep
     # with the real add_mcp_command / add_tui_command definitions.
@@ -135,7 +136,7 @@ _TUI_ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
 _TUI_THEME_HUES = ["carolina", "amber", "green", "modern", "standard"]
 
 
-def _add_mcp_stub(sub: argparse.ArgumentParser) -> None:
+def _add_mcp_stub(sub: Any) -> None:
     """Register `cronstable mcp` without importing cronstable.mcpcli.
 
     Must stay flag-for-flag identical to mcpcli.add_mcp_command; the parity
@@ -191,7 +192,7 @@ def _add_mcp_stub(sub: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_tui_stub(sub: argparse.ArgumentParser) -> None:
+def _add_tui_stub(sub: Any) -> None:
     """Register `cronstable tui` without importing cronstable.tui.
 
     Must stay flag-for-flag identical to tui.add_tui_command; the parity test

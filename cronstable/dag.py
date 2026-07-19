@@ -1351,7 +1351,10 @@ def mark_tasks_finished(marks: List[Dict[str, Any]], now: float):
                 # no-op (the mark_task_finished state fence).
                 continue
             expected_proc = mark.get("expected_proc")
-            if expected_proc is not None and entry.get("proc") != expected_proc:
+            if (
+                expected_proc is not None
+                and entry.get("proc") != expected_proc
+            ):
                 continue  # superseded attempt (the proc-token fence)
             expected_attempt = mark.get("expected_attempt")
             if (

@@ -1030,7 +1030,8 @@ def _entry_quiescence(
     state = entry.get("state")
     if state in TERMINAL_STATES:
         return _Q_INERT
-    task = spec.by_id.get(entry.get("id"))
+    task_id = entry.get("id")
+    task = spec.by_id.get(task_id) if isinstance(task_id, str) else None
     if task is None:
         # a non-terminal entry of a task the spec no longer has: the claim
         # and terminalise passes ignore it entirely, so it must not hold
@@ -1502,7 +1503,8 @@ def reconcile_and_plan(
     def transform(
         body: Optional[Dict[str, Any]],
     ) -> Tuple[Any, ReconcileAdvanceResult]:
-        result = ReconcileAdvanceResult(advance=AdvanceResult())
+        advance = AdvanceResult()
+        result = ReconcileAdvanceResult(advance=advance)
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, result
         if _is_quiescent(spec, body, now, proc, None):
@@ -1524,7 +1526,6 @@ def reconcile_and_plan(
                 working["updatedAt"] = now
                 return working, result
             return _DOC_KEEP, result
-        advance = result.advance
         _propagate_and_claim(spec, working, now, proc, host, advance)
         _maybe_terminalise(spec, working, now, advance)
         if not advance.changed and not result.reconciled:

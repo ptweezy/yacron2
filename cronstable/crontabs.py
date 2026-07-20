@@ -70,6 +70,36 @@ _ENV_LINE = re.compile(
     r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.*)$"
 )
 
+# Characters refused inside a live (non-blank, non-comment) crontab line:
+# the C0 controls except TAB (a legitimate field separator; LF cannot appear
+# -- lines are split on it), DEL, the C1 controls, and the U+2028/U+2029
+# line separators.  A NUL builds a job the OS can never spawn (exec refuses
+# an argument carrying one) and the resulting ValueError would otherwise
+# escape the scheduler; the others are exactly the ``str.splitlines()``
+# family that renders as ONE line in an editor, ``cat``, ``git diff`` and a
+# code review -- silently truncating a command or smuggling a job into a
+# comment if honoured as separators, and confusing the shell if passed
+# through.  Refusing with a file:line error follows the module's documented
+# bias: refuse rather than half-imitate.
+_CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _physical_lines(data: str) -> List[str]:
+    """``data`` split into physical lines, exactly as cron and editors do.
+
+    A crontab is LF-delimited (``man 5 crontab``; cron splits on LF only),
+    so this splits on ``"\\n"`` alone and strips one trailing ``"\\r"`` (a
+    CRLF file read in binary mode).  ``str.splitlines()`` is deliberately
+    NOT used: it additionally breaks on VT, FF, FS/GS/RS, NEL and
+    U+2028/U+2029, which turned text sitting inside a ``#`` comment into a
+    live job, silently truncated commands, and made every reported line
+    number drift from the file's physical lines.
+    """
+    return [
+        line[:-1] if line.endswith("\r") else line
+        for line in data.split("\n")
+    ]
+
 
 class CrontabError(ValueError):
     """A classic crontab could not be parsed (message carries file:line).
@@ -99,8 +129,11 @@ def looks_like_crontab(data: str) -> bool:
     start with it), or five valid cron fields followed by a command.
     Anything inconclusive is NOT a crontab, so an extensionless YAML file
     keeps its exact pre-crontab-support behavior and error messages.
+    Lines are the same physical (LF-delimited) lines :func:`parse_crontab`
+    reads, so the sniff and the parser can never judge different "first"
+    lines of one file.
     """
-    for line in data.splitlines():
+    for line in _physical_lines(data):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -132,18 +165,30 @@ def parse_crontab(data: str, path: str) -> List[Dict[str, Any]]:
     unique within a file, stable across reloads while the file is
     unchanged, and traceable straight back to the source line.  Editing
     the file can renumber them, exactly as renaming a YAML job would.
+    Lines are physical LF-delimited lines (:func:`_physical_lines`), so
+    the numbers match the editor's and a ``#`` line is a comment for its
+    whole length.
 
-    :raise CrontabError: on the first unparsable line, with a
-        ``path:line`` prefix.
+    :raise CrontabError: on the first unparsable line (or the first live
+        line carrying a control character), with a ``path:line`` prefix.
     """
     label = os.path.basename(path) or CRONTAB_BASENAME
     environment: Dict[str, str] = {}
     jobs: List[Dict[str, Any]] = []
-    for lineno, raw in enumerate(data.splitlines(), start=1):
+    for lineno, raw in enumerate(_physical_lines(data), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         where = "{}:{}".format(path or label, lineno)
+        control = _CONTROL_CHARS.search(line)
+        if control is not None:
+            raise CrontabError(
+                "{}: control character {!r} in a crontab line: it cannot "
+                "be part of a schedule, command or environment value (a "
+                "NUL is unspawnable, and the others read as line breaks "
+                "in some tools but not others). Remove it, or move this "
+                "job to a YAML config.".format(where, control.group())
+            )
         assignment = _ENV_LINE.match(line)
         if assignment is not None:
             value = _unquote(assignment.group("value"))

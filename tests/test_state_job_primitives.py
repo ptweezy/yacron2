@@ -777,6 +777,47 @@ async def test_require_scope_rejects_blank(tmp_path):
         await backend.stop()
 
 
+async def test_require_scope_rejects_unstripped_instead_of_collapsing(
+    tmp_path,
+):
+    # A scope is the isolation boundary; _require_scope used to strip() it
+    # AFTER jobapi authorized the raw string and BEFORE the store's injective
+    # encoder named the on-disk path -- so 'report', 'report ' and
+    # 'report\xa0' all collapsed onto ONE namespace (cross-job reads and
+    # overwrites), and a padded job's on-disk scope token diverged from the
+    # GC keep-set built from the un-stripped config name (live artifacts
+    # deleted).  A non-normalized scope is now rejected outright: distinct
+    # scope strings can never collapse.
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        await jobstate.kv_set(backend, "report", "secret", "PRIVATE")
+        for padded in ("report ", " report", "report\n", "report\xa0"):
+            with pytest.raises(JobStateError, match="whitespace"):
+                await jobstate.kv_set(backend, padded, "secret", "OVERWRITE")
+            with pytest.raises(JobStateError, match="whitespace"):
+                await jobstate.kv_get(backend, padded, "secret")
+            with pytest.raises(JobStateError, match="whitespace"):
+                await jobstate.artifact_put(backend, padded, "a.csv", b"x")
+        # the real scope's value was never touched through a padded variant
+        got = await jobstate.kv_get(backend, "report", "secret")
+        assert got is not None and got["value"] == "PRIVATE"
+        # nothing was ever written under a stripped-away alias, so the GC
+        # keep-set (built from exact config names) can never miss a live
+        # scope's artifacts
+        streams = await backend.list_stream_names(
+            jobstate.ARTIFACT_STREAM_PREFIX
+        )
+        assert streams == []
+        # interior whitespace stays a legal, distinct scope (the encoder is
+        # injective for it)
+        await jobstate.kv_set(backend, "my job", "k", 1)
+        got = await jobstate.kv_get(backend, "my job", "k")
+        assert got is not None and got["value"] == 1
+    finally:
+        await backend.stop()
+
+
 async def test_artifact_put_stores_optional_meta(tmp_path):
     # the optional meta mapping rides along on the record and reads back.
     backend = _backend(tmp_path)

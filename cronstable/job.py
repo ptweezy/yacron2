@@ -25,7 +25,7 @@ from typing import (
 import aiohttp
 
 from cronstable import platform
-from cronstable.config import JobConfig
+from cronstable.config import JobConfig, schedule_object_to_crontab
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
 
@@ -616,7 +616,18 @@ class ShellReporter(Reporter):
                 if not isinstance(job.config.command, list)
                 else " ".join(job.config.command)
             ),
-            "CRONSTABLE_JOB_SCHEDULE": job.config.schedule_unparsed,
+            # Rendered to the crontab line for the OBJECT form (like
+            # cron.schedule_str, the status payload and prometheus do):
+            # ``schedule_unparsed`` is Union[str, dict], and a dict here
+            # dies in os.fsencode at spawn -- silently disabling the shell
+            # reporter for every object-schedule job.  README declares this
+            # variable (str), and the two schedule spellings are documented
+            # as equivalent.
+            "CRONSTABLE_JOB_SCHEDULE": (
+                job.config.schedule_unparsed
+                if isinstance(job.config.schedule_unparsed, str)
+                else schedule_object_to_crontab(job.config.schedule_unparsed)
+            ),
             "CRONSTABLE_FAILED": "1" if job.failed else "0",
             "CRONSTABLE_RETCODE": str(job.retcode),
             "CRONSTABLE_STDERR": std_err_str_safe,
@@ -648,8 +659,11 @@ class ShellReporter(Reporter):
         # OSError for the same reason RunningJob.start catches it: a missing
         # reporter binary (FileNotFoundError) or a spawn-time resource failure
         # (EMFILE/ENOMEM/EAGAIN) is not a SubprocessError subclass, and a
-        # reporting problem must be logged, never propagated.
-        except (subprocess.SubprocessError, OSError):
+        # reporting problem must be logged, never propagated.  TypeError and
+        # ValueError likewise: a non-string env value (fsencode raises
+        # TypeError) or an embedded NUL in argv/env (ValueError) must land
+        # here, not escape to _report_common's gather.
+        except (subprocess.SubprocessError, OSError, TypeError, ValueError):
             logger.exception(
                 "Error executing shell reporter of job %s", job.config.name
             )
@@ -989,7 +1003,13 @@ class RunningJob:
             self.proc = await create(*args, **kwargs)
         except (
             subprocess.SubprocessError,
-            UnicodeEncodeError,
+            # ValueError covers UnicodeEncodeError (unencodable argv) and,
+            # critically, the 'embedded null byte' create_subprocess_exec
+            # raises for a NUL in an argument or environment value.  The
+            # crontab front end now refuses NULs at parse time, but any
+            # unspawnable argv that still reaches here must be recorded as
+            # start_failed for the reaper -- not kill the whole scheduler.
+            ValueError,
             # OSError covers FileNotFoundError (bad argv[0]) AND the resource-
             # exhaustion / permission cases create_subprocess_exec can raise --
             # EMFILE/ENFILE (fd exhaustion), ENOMEM, EPERM/EACCES, EAGAIN (fork

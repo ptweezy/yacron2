@@ -58,6 +58,57 @@ _INT_MAX = 2**64 - 1
 # surrogateescape-decoded OS data or a caller constructing them directly.
 _SURROGATES = re.compile("[\ud800-\udfff]")
 
+# The portable nesting-depth bound, enforced by :func:`ensure_portable` (and
+# the orjson pre-walk) with an explicit counter.  Without one the accepted
+# document set was whatever each backend's encoder happened to tolerate:
+# orjson's encoder hard-fails at depth 256 while its parser reads to 1024 and
+# the stdlib reaches ~1000 both ways -- so a stdlib node could persist a
+# 256..1023-deep document every orjson node could READ but never WRITE BACK,
+# permanently wedging any read-modify-write path (a DAG run advance, a kv
+# update).  128 sits safely below orjson's 256 even after the store's own
+# wrapper layers, and far above any real cronstable document.  The gate
+# itself counts depth instead of recursing to a stack overflow, so an
+# adversarial ~2KB deep-nested body is a clean UnsupportedValue, not a
+# RecursionError.
+MAX_DEPTH = 128
+
+# Read-side guard for out-of-window INTEGER LITERALS.  The two parsers
+# disagree about them: the stdlib preserves ``18446744073709551616`` as an
+# exact (unportable) int that :func:`ensure_portable` then rejects, while
+# orjson silently narrows it to a lossy finite FLOAT the gate happily
+# accepts -- blinding the very pre-check built to catch the value, and
+# making a mapped fan-out (or any consumer) see different data depending on
+# which host parsed the bytes.  :func:`loads` therefore rejects such
+# literals UNIFORMLY: a cheap prescan for a 19-digit run (the shortest an
+# out-of-window literal can be: ``-(2**63)-1`` has 19 digits; every
+# in-window literal of 19+ digits still passes the precise check) gates a
+# stdlib verification parse whose ``parse_int`` hook applies the exact
+# 64-bit-window rule.  Digit runs inside strings or float literals can trip
+# the prescan; they only cost the verification parse, never a false reject
+# (``parse_int`` sees integer tokens alone, and float literals already
+# parse identically on both backends).
+_WIDE_INT_RUN_B = re.compile(rb"\d{19}")
+_WIDE_INT_RUN_S = re.compile(r"\d{19}")
+
+
+def _checked_parse_int(text: str) -> int:
+    value = int(text)
+    if value < _INT_MIN or value > _INT_MAX:
+        raise UnsupportedValue(
+            "integer literal {} is outside the portable signed/unsigned "
+            "64-bit range [{}, {}] (the stdlib parser preserves it exactly "
+            "while orjson silently narrows it to a lossy float)".format(
+                value, _INT_MIN, _INT_MAX
+            )
+        )
+    return value
+
+
+def _has_wide_int_run(data: Union[bytes, str]) -> bool:
+    if isinstance(data, str):
+        return _WIDE_INT_RUN_S.search(data) is not None
+    return _WIDE_INT_RUN_B.search(data) is not None
+
 
 class UnsupportedValue(ValueError):
     """A value that cannot be encoded identically across a mixed-orjson fleet.
@@ -65,22 +116,35 @@ class UnsupportedValue(ValueError):
     Raised by :func:`dumps_bytes` (and available as a standalone pre-check via
     :func:`ensure_portable`) for a non-finite float (``NaN`` / ``Infinity``),
     an integer outside the 64-bit window orjson supports, a string (or object
-    key) containing a lone surrogate, or a non-string object key.  Rejecting
-    at write time is what keeps a record readable by every node regardless of
-    which ones have orjson.
+    key) containing a lone surrogate, a non-string object key, or nesting
+    deeper than :data:`MAX_DEPTH`.  Also raised by :func:`loads` for an
+    out-of-window integer LITERAL, which the two parsers would otherwise
+    read back differently (exact int vs. silently narrowed float).
+    Rejecting at write time is what keeps a record readable by every node
+    regardless of which ones have orjson.
     """
 
 
-def _ensure_finite(obj: Any) -> None:
-    """The non-finite-float half of :func:`ensure_portable`, standalone.
+def _depth_error(depth: int) -> "UnsupportedValue":
+    return UnsupportedValue(
+        "nesting depth exceeds the portable bound of {} (a deeper document "
+        "is writable by the stdlib encoder but a hard error on orjson's, "
+        "so it could never be rewritten by every node)".format(MAX_DEPTH)
+    )
 
-    Under orjson this is the ONLY portability hazard that needs a Python-level
-    pre-walk: orjson itself already REJECTS out-of-window integers and
-    non-string keys (its ``dumps_bytes`` translates those into
+
+def _ensure_finite(obj: Any, _depth: int = 0) -> None:
+    """The float-and-depth half of :func:`ensure_portable`, standalone.
+
+    Under orjson these are the ONLY portability hazards that need a
+    Python-level pre-walk: orjson itself already REJECTS out-of-window
+    integers and non-string keys (its ``dumps_bytes`` translates those into
     :class:`UnsupportedValue` after the fact), but it silently rewrites a
-    non-finite float to ``null``, the one corruption only a walk can catch
-    before the bytes are written.  Kept float-only so the per-node work of the
-    walk is a couple of isinstance checks, not the full rule set.
+    non-finite float to ``null``, and it happily WRITES a document between
+    :data:`MAX_DEPTH` and its own 256-deep encoder limit that the full gate
+    (and so every stdlib node) rejects -- the two corruptions only a walk
+    can catch before the bytes are written.  Kept light so the per-node work
+    is a couple of isinstance checks, not the full rule set.
     """
     if isinstance(obj, float):
         if not math.isfinite(obj):
@@ -90,14 +154,18 @@ def _ensure_finite(obj: Any) -> None:
                 "orjson)".format(obj)
             )
     elif isinstance(obj, dict):
+        if _depth >= MAX_DEPTH:
+            raise _depth_error(_depth)
         for value in obj.values():
-            _ensure_finite(value)
+            _ensure_finite(value, _depth + 1)
     elif isinstance(obj, (list, tuple)):
+        if _depth >= MAX_DEPTH:
+            raise _depth_error(_depth)
         for value in obj:
-            _ensure_finite(value)
+            _ensure_finite(value, _depth + 1)
 
 
-def ensure_portable(obj: Any) -> None:
+def ensure_portable(obj: Any, _depth: int = 0) -> None:
     """Raise :class:`UnsupportedValue` if ``obj`` is not fleet-portable JSON.
 
     A recursive, backend-independent pre-check so the accept/reject decision is
@@ -109,6 +177,11 @@ def ensure_portable(obj: Any) -> None:
     classify a failed serialize.  A boundary that wants the full check without
     serializing (to translate the failure into its own error type) invokes it
     directly.
+
+    Depth is bounded at :data:`MAX_DEPTH` by an explicit counter, so a
+    too-deep value -- including one far beyond the interpreter's own stack --
+    is a clean :class:`UnsupportedValue`, never a RecursionError out of the
+    gate itself.
     """
     if isinstance(obj, bool):
         return  # a bool is an int subclass but always in range and portable
@@ -134,6 +207,8 @@ def ensure_portable(obj: Any) -> None:
                 "neither emit nor parse)".format(match.group())
             )
     elif isinstance(obj, dict):
+        if _depth >= MAX_DEPTH:
+            raise _depth_error(_depth)
         for key, value in obj.items():
             if not isinstance(key, str):
                 raise UnsupportedValue(
@@ -142,11 +217,13 @@ def ensure_portable(obj: Any) -> None:
                         key
                     )
                 )
-            ensure_portable(key)
-            ensure_portable(value)
+            ensure_portable(key, _depth + 1)
+            ensure_portable(value, _depth + 1)
     elif isinstance(obj, (list, tuple)):
+        if _depth >= MAX_DEPTH:
+            raise _depth_error(_depth)
         for value in obj:
-            ensure_portable(value)
+            ensure_portable(value, _depth + 1)
 
 
 if orjson is not None:
@@ -184,8 +261,26 @@ if orjson is not None:
             raise
 
     def loads(data: Union[bytes, str]) -> Any:
-        """Parse JSON from ``bytes`` or ``str``."""
-        return orjson.loads(data)
+        """Parse JSON from ``bytes`` or ``str``.
+
+        Raises :class:`UnsupportedValue` for an integer literal outside the
+        portable 64-bit window, identically on both backends (orjson alone
+        would silently narrow it to a lossy float -- see the prescan notes
+        above).
+        """
+        result = orjson.loads(data)
+        if _has_wide_int_run(data):
+            # verification parse: only its parse_int hook can raise
+            # UnsupportedValue; any OTHER disagreement with orjson (e.g. a
+            # deeper nesting tolerance) must not turn a document orjson
+            # already accepted into a new error, so it is swallowed.
+            try:
+                _stdlib.loads(data, parse_int=_checked_parse_int)
+            except UnsupportedValue:
+                raise
+            except Exception:  # noqa: BLE001 - see comment above
+                pass
+        return result
 
     def deepcopy_json(obj: Any) -> Any:
         """Deep-copy a JSON-shaped value via a serialize+parse round trip.
@@ -223,7 +318,16 @@ else:
         return text.encode("utf-8")
 
     def loads(data: Union[bytes, str]) -> Any:
-        """Parse JSON from ``bytes`` or ``str``."""
+        """Parse JSON from ``bytes`` or ``str``.
+
+        Raises :class:`UnsupportedValue` for an integer literal outside the
+        portable 64-bit window, identically on both backends (see the
+        prescan notes above; without the check a stdlib host would hand
+        back an exact big int where an orjson host hands back a lossy
+        float).
+        """
+        if _has_wide_int_run(data):
+            return _stdlib.loads(data, parse_int=_checked_parse_int)
         return _stdlib.loads(data)
 
     def deepcopy_json(obj: Any) -> Any:

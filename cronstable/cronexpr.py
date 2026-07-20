@@ -926,6 +926,54 @@ class CronTab:
     # ------------------------------------------------------------------
     # Next occurrence
     # ------------------------------------------------------------------
+    @staticmethod
+    def _gap_rewound_seed(
+        now: datetime.datetime, now_utc: datetime.datetime
+    ) -> datetime.datetime:
+        """The naive civil seed for an aware forward scan from ``now``.
+
+        Normally just ``now``'s wall-clock label -- but a spring-forward
+        transition shortly before ``now`` moves every fire whose civil
+        label sat inside the gap to a REAL instant up to a full shift
+        LATER, so such a fire can still be in the FUTURE while its label
+        is already behind ``now``'s (e.g. ``59 2 * * *`` in New York on
+        the changeover day: label 02:59 does not exist, the fire really
+        happens at 03:59 EDT, and a scan seeded at 03:00 walks straight
+        past it to tomorrow).  When the zone's offset grew within the
+        probe window AND the transition is recent enough for shifted
+        fires to still be pending, rewind the seed by the jump so the
+        forward walk GENERATES those labels; the resolved-UTC guard in
+        :meth:`next` / :meth:`occurrences` discards any candidate whose
+        real instant is not in the future, so over-generation costs a few
+        wasted iterations, never a wrong answer.
+
+        The probe spans 26 hours: wider than every IANA offset jump,
+        including the date-line hops (Samoa 2011, +24h), and no real zone
+        transitions twice inside one window.  Outside the brief
+        post-transition window the fast path is a single extra offset
+        probe.
+        """
+        civil = now.replace(tzinfo=None)
+        try:
+            earlier = (now_utc - datetime.timedelta(hours=26)).astimezone(
+                now.tzinfo
+            )
+        except (OverflowError, OSError):  # pragma: no cover - datetime.min
+            return civil
+        off_now = now.utcoffset()
+        off_then = earlier.utcoffset()
+        if off_now is None or off_then is None or off_now <= off_then:
+            return civil  # no spring-forward inside the window
+        jump = off_now - off_then
+        # Only rewind while shifted fires can still be pending: gap labels
+        # resolve to instants within [transition, transition + jump), so
+        # once the offset ``jump`` seconds ago already equals ``now``'s,
+        # the whole affected window is behind us.
+        at_edge = (now_utc - jump).astimezone(now.tzinfo).utcoffset()
+        if at_edge == off_now:
+            return civil
+        return civil - jump
+
     def next(
         self,
         now: Optional[datetime.datetime] = None,
@@ -962,7 +1010,14 @@ class CronTab:
         # leg of a fall-back hour is not offered again on the second leg
         # (comparisons between datetimes sharing a tzinfo ignore ``fold``,
         # which is why the civil answer alone can come out negative).
+        # The seed may sit BEFORE now's label: right after a spring-forward
+        # a gap-shifted fire's label is already behind now's while its real
+        # instant is still ahead, and a scan starting at now's label would
+        # skip that fire for the whole length of the gap (the resolved-UTC
+        # guard below keeps the earlier seed from ever RETURNING a past
+        # instant).  See _gap_rewound_seed.
         now_utc = now.astimezone(datetime.timezone.utc)
+        civil = self._gap_rewound_seed(now, now_utc)
         while True:
             target = self._next_civil(civil)
             if target is None:
@@ -1235,6 +1290,25 @@ class CronTab:
                 start = datetime.datetime.now()
         tz = start.tzinfo
         civil = start.replace(tzinfo=None)
+        if tz is not None:
+            # Mirror next()'s aware framing exactly, so the first yield IS
+            # start + next(now=start):
+            #
+            # * ``start_utc`` honours start.fold -- when start sits on the
+            #   SECOND leg of a fall-back hour (what datetime.now(zone)
+            #   returns for one hour each autumn), the fold=0 resolutions
+            #   of that hour's labels are real instants already in the
+            #   PAST, and yielding them would replay fires the scheduler
+            #   performed up to a full DST shift ago;
+            # * the seed may be rewound below start's label right after a
+            #   spring-forward, so a gap-shifted fire whose label is behind
+            #   start's but whose real instant is still ahead is offered
+            #   (see _gap_rewound_seed).
+            #
+            # The guard in the loop then admits exactly the candidates
+            # whose resolved instant is strictly after start.
+            start_utc = start.astimezone(datetime.timezone.utc)
+            civil = self._gap_rewound_seed(start, start_utc)
         while True:
             target = self._next_civil(civil)
             if target is None:
@@ -1248,10 +1322,15 @@ class CronTab:
             # as the label the wall clock actually shows at that instant,
             # and continuing the civil search from the rendered label steps
             # past both the skipped hour and a fall-back repeat.
-            resolved = (
-                target.replace(tzinfo=tz)
-                .astimezone(datetime.timezone.utc)
-                .astimezone(tz)
+            resolved_utc = target.replace(tzinfo=tz).astimezone(
+                datetime.timezone.utc
             )
+            resolved = resolved_utc.astimezone(tz)
+            if resolved_utc <= start_utc:
+                # already past in REAL time (a fold=1 start, or a rewound
+                # seed's pre-start candidates): advance the civil cursor
+                # without yielding, exactly as next() steps past them.
+                civil = max(target, resolved.replace(tzinfo=None))
+                continue
             yield resolved
             civil = resolved.replace(tzinfo=None)

@@ -2655,3 +2655,71 @@ async def test_report_common_logs_reporter_exceptions(caplog):
     assert any(
         "Problem reporting job" in rec.getMessage() for rec in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# fuzzing findings: unspawnable argv must not kill the scheduler, and the
+# object-form schedule must not disable the shell reporter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_failure_embedded_nul_reported_not_raised():
+    # create_subprocess_exec raises ValueError('embedded null byte') for a
+    # NUL in an argument -- not a SubprocessError, not an OSError -- and it
+    # used to escape start() through the unguarded spawn_jobs path and kill
+    # the daemon.  The crontab front end now refuses NULs at parse time, so
+    # build the config directly: any future unspawnable argv must land as
+    # an ordinary start failure.
+    job_config = cronstable.config.JobConfig(
+        cronstable.config.mergedicts(
+            cronstable.config.DEFAULT_CONFIG,
+            {
+                "name": "nul",
+                "command": "echo\x00hi",
+                "schedule": "* * * * *",
+            },
+        )
+    )
+    job = cronstable.job.RunningJob(job_config, None)
+
+    await job.start()  # must NOT raise
+    assert job.proc is None
+    assert job.start_failed
+
+    await job.wait()
+    assert job.retcode == 127
+    assert job.failed
+
+
+async def test_shell_report_runs_for_object_form_schedule(tmp_path):
+    # schedule_unparsed is Union[str, dict]; the dict used to be placed
+    # verbatim into the reporter's child env, dying in os.fsencode at spawn
+    # -- so onFailure/onSuccess shell reports never executed for ANY job
+    # whose schedule: was written in the object form.  The env value is now
+    # the rendered crontab line, same as every other consumer.
+    marker = tmp_path / "reporter-ran"
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n"
+        "  - name: objsched\n"
+        "    command: echo hi\n"
+        "    schedule:\n"
+        '      minute: "*/5"\n'
+        "    onFailure:\n"
+        "      report:\n"
+        "        shell:\n"
+        '          command: "true"\n',
+        "",
+    )
+    report = conf.jobs[0].onFailure["report"]
+    report["shell"]["shell"] = PYTHON
+    report["shell"]["command"] = (
+        "import os, pathlib; pathlib.Path({}).write_text("
+        "os.environ['CRONSTABLE_JOB_SCHEDULE'])".format(repr(str(marker)))
+    )
+    job = _shell_job_mock(conf.jobs[0])
+
+    await cronstable.job.ShellReporter().report(False, job, report)
+
+    # the reporter really ran, and saw the rendered 5-field line
+    assert marker.read_text() == "*/5 * * * *"

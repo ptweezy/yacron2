@@ -7410,7 +7410,15 @@ class Cron:
         redact = job.redactArchivedSecrets
         raw = list(info.output.lines)
         if redact:
-            texts = redact_lines([line for _stream, line in raw])
+            # Executor-offloaded: the scrub is pure CPU over job-controlled
+            # text (up to LIVE_LOG_LIMIT lines of maxLineLength each), and a
+            # pathological line must degrade THIS archive write, not stall
+            # job dispatch, the web server and cluster heartbeats.  The
+            # patterns themselves are kept linear (see cronstable.redact),
+            # so this is defence in depth against a future regex regression.
+            texts = await asyncio.get_running_loop().run_in_executor(
+                None, redact_lines, [line for _stream, line in raw]
+            )
         else:
             texts = [line for _stream, line in raw]
         lines = [

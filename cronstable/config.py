@@ -1073,14 +1073,26 @@ def schedule_object_to_crontab(spec: Dict[str, Any]) -> str:
     shared by parsing (:meth:`JobConfig._parse_schedule`), the web UI's
     schedule label (:func:`cronstable.cron.schedule_str`) and the fingerprint
     (:func:`cronstable.fingerprint._schedule_repr`), so those cannot drift.
+
+    Every provided value must render as exactly ONE non-empty,
+    whitespace-free token (the object form's whole point is one field per
+    key); anything else raises :class:`ConfigError` naming the key.  The
+    rendered line is re-read by the cron engine under a whitespace split, so
+    a BLANK value would silently delete its column and shift every later
+    field one position left (``second: "0"`` plus an empty ``year:`` turns
+    "fire every second at :00" into "fire every hour at minute 0" -- a 60x
+    rate change with no error), and an embedded space would inject an extra
+    column and shift fields right (``minute: "0 12"`` pins the HOUR to 12).
+    ``str.split()`` is the exact predicate the engine splits with, so every
+    exotic Unicode whitespace it honours is refused here too.
     """
-    minute = spec.get("minute", "*")
-    hour = spec.get("hour", "*")
-    day = spec.get("dayOfMonth", "*")
-    month = spec.get("month", "*")
-    dow = spec.get("dayOfWeek", "*")
-    second = spec.get("second")
-    year = spec.get("year")
+    minute = _schedule_field(spec, "minute")
+    hour = _schedule_field(spec, "hour")
+    day = _schedule_field(spec, "dayOfMonth")
+    month = _schedule_field(spec, "month")
+    dow = _schedule_field(spec, "dayOfWeek")
+    second = _schedule_field(spec, "second", default=None)
+    year = _schedule_field(spec, "year", default=None)
     if second is not None:
         # 7-field: an explicit seconds column. year defaults to "*" (any).
         return "{} {} {} {} {} {} {}".format(
@@ -1098,6 +1110,33 @@ def schedule_object_to_crontab(spec: Dict[str, Any]) -> str:
     return "{} {} {} {} {}".format(minute, hour, day, month, dow)
 
 
+def _schedule_field(
+    spec: Dict[str, Any], key: str, default: Optional[str] = "*"
+) -> Optional[str]:
+    """One validated cron column of an object-form ``schedule:``.
+
+    ``default`` when the key is absent (or set to null); otherwise the
+    value rendered to a string, required to be a single non-empty token
+    with no whitespace of any kind -- see
+    :func:`schedule_object_to_crontab` for why anything looser corrupts
+    neighbouring columns.
+    """
+    value = spec.get(key)
+    if value is None:
+        return default
+    token = "{}".format(value)
+    if token.split() != [token]:
+        raise ConfigError(
+            "schedule.{}: must be a single non-empty cron field with no "
+            "whitespace, got {!r} (a blank value would drop this column "
+            "and an embedded space would add one, silently shifting every "
+            "later field; omit the key entirely for its default)".format(
+                key, value
+            )
+        )
+    return token
+
+
 def schedule_has_seconds(
     schedule_unparsed: Union[str, Dict[str, Any]],
 ) -> bool:
@@ -1111,12 +1150,13 @@ def schedule_has_seconds(
     """
     if isinstance(schedule_unparsed, dict):
         # Derive from the ACTUAL rendered field count, not mere key presence:
-        # a blank/whitespace ``second:`` value (e.g. a leftover ``second:``
-        # with no value) renders a leading empty column that vanishes under
-        # the cron engine's whitespace split, leaving a minute-granular 5-/6-
-        # field line. Keying off presence alone would set has_seconds True for
-        # such a line and force the whole scheduler to tick per-second for a
-        # job that only ever fires once a minute.
+        # ``second: null`` (a key with no value) renders no seconds column at
+        # all, and keying off presence alone would then force the whole
+        # scheduler to tick per-second for a job that only ever fires once a
+        # minute.  (A blank or whitespace-bearing value no longer gets this
+        # far: schedule_object_to_crontab rejects it, because a vanishing or
+        # split column silently shifts every later field into the wrong
+        # position.)
         return len(schedule_object_to_crontab(schedule_unparsed).split()) == 7
     if isinstance(schedule_unparsed, str):
         stripped = schedule_unparsed.strip()
@@ -2310,17 +2350,30 @@ def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
         try:
             with open(spec["fromFile"], "rt") as secret_file:
                 secret = secret_file.read().strip()
-        # UnicodeDecodeError alongside OSError: a fromFile pointing at binary
-        # data (a .p12 bundle, a gzip, a key with a stray high byte) raises it
-        # from read(), and callers only handle ConfigError -- on the job-secret
-        # staging path (cron._prepare_job_api_run) anything else escapes the
-        # scheduler loop and crash-loops the daemon at every fire of that job.
-        except (OSError, UnicodeDecodeError) as ex:
+        # Broad on purpose: callers only handle ConfigError -- on the
+        # job-secret staging path (cron._prepare_job_api_run) anything else
+        # escapes the scheduler loop and crash-loops the daemon at every
+        # fire of that job.  Beyond OSError, open()/read() raise ValueError
+        # for a NUL in the path, UnicodeDecodeError (a ValueError subclass)
+        # for binary data (a .p12 bundle, a gzip, a stray high byte), and
+        # UnicodeEncodeError (likewise) for a lone surrogate in the path --
+        # reachable from a pure-ASCII config via YAML \u escapes -- plus
+        # TypeError for a non-string path.
+        except (OSError, ValueError, TypeError) as ex:
             raise ConfigError(
                 "{}.fromFile could not be read: {}".format(what, ex)
             ) from ex
     elif spec.get("fromEnvVar"):
-        secret = os.environ.get(spec["fromEnvVar"], "")
+        try:
+            secret = os.environ.get(spec["fromEnvVar"], "")
+        # same stakes as fromFile above: os.environ.get raises
+        # UnicodeEncodeError (a ValueError) for a lone-surrogate name and
+        # TypeError for a non-string one, neither of which the callers on
+        # the per-fire staging path survive.
+        except (ValueError, TypeError) as ex:
+            raise ConfigError(
+                "{}.fromEnvVar could not be read: {}".format(what, ex)
+            ) from ex
     else:
         return None  # no source configured
     if not secret:
@@ -2982,6 +3035,19 @@ def parse_config_string(
         doc = strictyaml.load(data, CONFIG_SCHEMA, label=path).data
     except YAMLError as ex:
         raise ConfigError(str(ex)) from ex
+    except (ValueError, AttributeError) as ex:
+        # strictyaml's own scalar validators raise BARE ValueError for
+        # values their is_decimal/is_integer prefilters accept but
+        # float()/int() reject ('' -- a key left with no value -- '.',
+        # '-', '_', ...), reaching every Float()/Int() config key; and its
+        # reader raises AttributeError (a ReaderError missing context_mark)
+        # for a control character or lone surrogate anywhere in the file.
+        # Config parsing must only ever raise ConfigError: without this,
+        # startup dies with a raw traceback instead of 'Configuration
+        # error: ...', the reload loop logs the operator's typo as a
+        # cronstable bug, and one bad file aborts a whole config-directory
+        # load.
+        raise ConfigError("{}: {}".format(path, ex)) from ex
     return _config_from_doc(doc, path, _seen, _sources)
 
 

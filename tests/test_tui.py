@@ -164,6 +164,33 @@ def test_compute_view_filters_and_sorts():
     assert compute_view(jobs, "", "all", "name", -1)[0]["name"] == ("charlie")
 
 
+def test_compute_view_name_sort_matches_web_locale_collation():
+    # The web sorts with a.name.localeCompare(b.name): CLDR root collation,
+    # case-insensitive at the primary level, lowercase before uppercase on
+    # a pure case tie.  The TUI's raw str compare was code-point order --
+    # every uppercase-initial name first -- so the DEFAULT first screen of
+    # the two frontends disagreed for any mixed-case fleet.  These fleets
+    # (and expected orders) are cross-checked against localeCompare under
+    # node for the default locale and en-US/en-GB/de-DE/fr-FR/ja-JP.
+    jobs = [_job(n) for n in ("backup", "Backup")]
+    got = [j["name"] for j in compute_view(jobs, "", "all", "name", 1)]
+    assert got == ["backup", "Backup"]  # lowercase first on a case tie
+
+    jobs = [_job(n) for n in ("Backup", "apple", "Deploy", "zeta")]
+    got = [j["name"] for j in compute_view(jobs, "", "all", "name", 1)]
+    assert got == ["apple", "Backup", "Deploy", "zeta"]
+    # descending is the same order reversed wholesale (the web's r * dir)
+    got_desc = [j["name"] for j in compute_view(jobs, "", "all", "name", -1)]
+    assert got_desc == ["zeta", "Deploy", "Backup", "apple"]
+
+    # the bare name is also the trailing tie-break of EVERY other sort key,
+    # so a fleet tying on the primary key (all "ok" here) must collate the
+    # same way in the status column
+    jobs = [_job(n, outcome="success") for n in ("Zeta", "alpha", "Beta")]
+    got = [j["name"] for j in compute_view(jobs, "", "all", "status", 1)]
+    assert got == ["alpha", "Beta", "Zeta"]
+
+
 def test_verdict_single_failure_is_a_warn():
     jobs = [
         _job("ok-1", outcome="success"),

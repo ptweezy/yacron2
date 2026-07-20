@@ -198,3 +198,88 @@ def test_orjson_flavour_deepcopy_json_round_trips():
     original = {"x": [1, {"y": 2}]}
     copy = _json.deepcopy_json(original)
     assert copy == original and copy is not original
+
+
+# ---------------------------------------------------------------------------
+# fuzzing findings: the depth bound, and out-of-window integer LITERALS
+# ---------------------------------------------------------------------------
+
+
+def _nested_list(depth):
+    root = current = []
+    for _ in range(depth - 1):
+        child = []
+        current.append(child)
+        current = child
+    return root
+
+
+@pytest.mark.parametrize("flavour", ["installed", "stdlib"])
+def test_depth_bound_is_uniform_and_never_a_recursion_error(flavour):
+    # orjson's encoder hard-fails at depth 256 while its parser reads to
+    # 1024 and the stdlib reaches ~1000 both ways, so without a shared
+    # bound a stdlib node could persist a document every orjson node could
+    # READ but never WRITE BACK -- wedging every read-modify-write path.
+    # MAX_DEPTH is enforced by an explicit counter in the gate (and in the
+    # orjson pre-walk), identically on both backends.
+    mod = _json if flavour == "installed" else _load_json_without_orjson()
+    ok = _nested_list(mod.MAX_DEPTH)
+    mod.ensure_portable(ok)
+    assert mod.loads(mod.dumps_bytes(ok)) == ok
+    for too_deep in (
+        _nested_list(mod.MAX_DEPTH + 1),
+        _nested_list(255),  # previously: stdlib-writable, orjson-unwritable
+        _nested_list(100_000),  # far beyond the interpreter stack
+    ):
+        with pytest.raises(mod.UnsupportedValue):
+            mod.ensure_portable(too_deep)
+        with pytest.raises(mod.UnsupportedValue):
+            mod.dumps_bytes(too_deep)
+    # dict nesting counts too
+    deep_dict = tip = {}
+    for _ in range(mod.MAX_DEPTH):
+        tip["k"] = {}
+        tip = tip["k"]
+    with pytest.raises(mod.UnsupportedValue):
+        mod.ensure_portable(deep_dict)
+
+
+def test_gate_on_a_parsed_deep_body_raises_unsupported_not_recursion():
+    # a ~2KB request body parses fine (loads limit is deeper than the
+    # gate's), and the gate must classify it cleanly: dagrun's fan-out
+    # guard catches UnsupportedValue only, so a RecursionError here used to
+    # crash the whole run advance.
+    parsed = _json.loads(("[" * 1000 + "]" * 1000).encode())
+    with pytest.raises(_json.UnsupportedValue):
+        _json.ensure_portable(parsed)
+
+
+@pytest.mark.parametrize("flavour", ["installed", "stdlib"])
+def test_loads_rejects_out_of_window_integer_literals_uniformly(flavour):
+    # the stdlib preserves 2**64 as an exact (unportable) int the gate then
+    # rejects, while orjson silently narrowed it to a lossy FLOAT the gate
+    # happily accepted -- so a mapped fan-out saw different data depending
+    # on which host parsed the bytes.  loads() now rejects such literals
+    # identically on both backends.
+    mod = _json if flavour == "installed" else _load_json_without_orjson()
+    for blob in (
+        b"[18446744073709551616]",  # 2**64, one past the unsigned max
+        b'{"v": -9223372036854775809}',  # one below the signed min
+        b"[99999999999999999999999999]",
+        '{"v": 18446744073709551616}',  # str input too
+    ):
+        with pytest.raises(mod.UnsupportedValue):
+            mod.loads(blob)
+    # boundary and near-boundary literals still parse EXACTLY
+    assert mod.loads(b"[9223372036854775807]") == [2**63 - 1]
+    assert mod.loads(b"[-9223372036854775808]") == [-(2**63)]
+    assert mod.loads(b"[18446744073709551615]") == [2**64 - 1]
+    # 19+ digit runs inside strings or float literals are not integer
+    # literals: the prescan may trip, the verification must not reject
+    assert mod.loads(b'{"id": "12345678901234567890123"}') == {
+        "id": "12345678901234567890123"
+    }
+    assert mod.loads(b"[1234567890123456789.5]") == [1234567890123456789.5]
+    assert mod.loads(b'{"t": 1752900000000000000}') == {
+        "t": 1752900000000000000  # 19-digit epoch-nanos, in-window
+    }

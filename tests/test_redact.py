@@ -265,3 +265,55 @@ def test_starts_mid_pem_dashes_but_never_a_marker_is_not_mid_block():
     # dashes present but no real PEM marker anywhere: falls through to False.
     lines = ["----- decorative banner -----", "an ordinary log line"]
     assert _starts_mid_pem(lines) is False
+
+
+# ---------------------------------------------------------------------------
+# fuzzing findings: alnum-prefixed compound keys, and the userinfo ReDoS
+# ---------------------------------------------------------------------------
+
+
+def test_unseparated_compound_key_names_redacted():
+    # PGPASSWORD is libpq's standard password variable and appears verbatim
+    # in any job running under `set -x`; the old `(?<![a-z0-9])` lookbehind
+    # (case-insensitive) rejected the alnum prefix and leaked it -- while
+    # the archive was stamped redacted.
+    for line, secret in [
+        ("PGPASSWORD=hunter2sekrit psql -h db", "hunter2sekrit"),
+        ("+ PGPASSWORD=hunter2sekrit", "hunter2sekrit"),  # set -x shape
+        ("DBPASSWORD=hunter2sekrit", "hunter2sekrit"),
+        ("MYSQLPWD=hunter2sekrit", "hunter2sekrit"),
+        ("REDISCLI_AUTH=hunter2sekrit", "hunter2sekrit"),
+    ]:
+        out = redact_secrets(line)
+        assert secret not in out, (line, out)
+        assert REDACTED in out
+    # the whole compound key survives as context
+    assert (
+        redact_secrets("PGPASSWORD=hunter2") == "PGPASSWORD=" + REDACTED
+    )
+    # ...and the separator forms behave exactly as before
+    assert redact_secrets("MY_PASSWORD=hunter2") == "MY_PASSWORD=" + REDACTED
+    assert redact_secrets("count=5") == "count=5"
+
+
+def test_url_userinfo_pattern_is_linear_not_quadratic():
+    # a long run of scheme characters + "://" + a long '@'-less tail made
+    # the userinfo pattern restart its failing tail scan at every offset in
+    # the run: O(n^2), event-loop starvation on job-controlled stdout.  The
+    # anchored+bounded scheme keeps it amortised linear; assert via growth
+    # ratio (4x runtime per 2x input before the fix, ~2x after) rather than
+    # wall-clock, so a slow CI box cannot flake this.
+    import time
+
+    timings = []
+    for n in (16_000, 32_000, 64_000):
+        line = "cdn-node." * (n // 9) + "://" + "x" * n
+        started = time.perf_counter()
+        redact_secrets(line)
+        timings.append(time.perf_counter() - started)
+    assert timings[2] < timings[0] * 8, timings  # quadratic would be ~16x
+    # the anchor loses no real redactions
+    out = redact_secrets("postgres://user:s3cret@db:5432/app")
+    assert "s3cret" not in out and "user:" + REDACTED + "@db" in out
+    out = redact_secrets("x redis://:SuperSecret123@cache:6379")
+    assert "SuperSecret123" not in out

@@ -17,6 +17,15 @@ from runner noise.  All figures below are from an A/B benchmark of this
 release against 1.2.24 on the same machine, interleaved rounds, with the
 scenario sizes noted per figure.
 
+The hardening half comes from a property-based fuzzing campaign that
+drove the parsers, encoders and state machines with several million
+generated inputs across 38 surfaces, then re-argued every candidate
+against the module's own documented contract.  The four critical and
+seventeen high-severity defects it confirmed are fixed in the sections
+below ("A fuzzing campaign..." onward), each with a regression test
+pinning the fuzzer's repro; the medium- and low-severity findings are
+catalogued for a follow-up pass.
+
 ### DAG completions land in one write per flush
 
 - **A mapped fan-in used to pay a full run-document rewrite per finished
@@ -168,6 +177,228 @@ scenario sizes noted per figure.
   crafted `sha256` field in a restored archive cannot escape the blob
   directory.
 
+### A fuzzing campaign: shared state survives hostile values
+
+- **A job can no longer brick a named lock for the entire fleet.**
+  `lock acquire` coerced its caller-supplied TTL with a bare `float()`,
+  so `--ttl inf` (which argparse accepts without complaint) flowed into
+  `expires_at = now + inf`; orjson persists that as `expiresAt: null`,
+  every later read then failed as unreadable, acquire failed closed,
+  release could not repair it and the sweeper refused to reclaim it --
+  one request left the lock denied to everyone, forever.  A non-finite
+  `ttl` or `blockSeconds` is now a 400, a finite TTL is clamped into
+  [5s, `MAX_LOCK_TTL`] (30 days), and the idempotency-claim TTL gets the
+  same finiteness check.
+- **Lone surrogates are stopped at the portability gate.**
+  `ensure_portable` had no string branch at all, so a value holding an
+  unpaired surrogate (surrogateescape-decoded OS data is enough) passed
+  the gate on every host -- and a stdlib node then persisted a record no
+  orjson node could ever write or parse, splitting the fleet.  Strings
+  and object keys are now walked and a codepoint in U+D800..U+DFFF is
+  rejected at write time, identically on both backends.
+- **Durable JSON gains a nesting-depth ceiling.**  No depth bound was
+  defined anywhere, so the accepted-document set was whatever each
+  backend's encoder happened to tolerate: orjson's encoder hard-fails
+  at 256 while its parser reads to 1024 and the stdlib reaches ~1000
+  both ways, so a stdlib node could persist a 256..1023-deep document
+  every orjson node could read but never write back -- permanently
+  wedging any read-modify-write path, a DAG run advance included.  The
+  gate itself recursed unboundedly and blew the stack (a ~2KB body is
+  1,000 levels deep).  One `MAX_DEPTH` (128) is now enforced with an
+  explicit counter on both backends, so a too-deep value is a clean
+  rejection -- never a RecursionError, and never a document only half
+  the fleet can rewrite.
+- **An integer wider than 64 bits is a parse error on every host.**
+  The stdlib parser preserves `18446744073709551616` as an exact int
+  the portability gate rejects, while orjson silently narrowed it to a
+  lossy *float* the gate happily accepted -- so the same upstream bytes
+  produced a mapped fan-out on one node and an empty one on another,
+  and the very pre-check built to catch the value could not see it.
+  `loads()` now rejects out-of-window integer literals uniformly (a
+  cheap 19-digit prescan gates a verified parse); every boundary value,
+  19-digit timestamp and big float literal parses exactly as before.
+- **A state scope is matched exactly, never normalised.**  The scope --
+  the isolation boundary between jobs' durable state -- was `strip()`ed
+  after authorization checked the raw string and before the store named
+  the on-disk path, so `report`, `report␠` and `report\xa0` silently
+  collapsed onto one namespace (a job could read and overwrite another
+  job's private state without appearing in any `stateAllowedScopes`),
+  and a whitespace-padded job's on-disk scope diverged from the GC
+  keep-set built from its exact config name, letting collection delete
+  a live job's artifacts.  A scope that is not equal to its own
+  `strip()` is now refused with a clear 400; distinct scope strings can
+  never share a namespace.  A job whose YAML name carries a quoted
+  leading/trailing space loses state access until renamed -- previously
+  it was silently sharing another job's.
+
+### A fuzzing campaign: the cron engine tells one story at a DST edge
+
+- **`prev()` no longer starves the event loop for a far-future query.**
+  For an aware anchor past the 2099 horizon the backward scan stepped
+  one fire instant at a time from the anchor down to the horizon --
+  measured ~1.8s of CPU per year for a per-minute schedule, roughly
+  four hours for `at: 9999-01-01` -- and `cron_why_no_run` runs it
+  synchronously on the scheduler's event loop, so one schema-valid MCP
+  argument (an LLM's hallucinated year is enough) froze dispatch, the
+  web server and cluster heartbeats until the node lost leadership.
+  The scan now starts at the horizon's edge, where the answer lives.
+- **`occurrences()` honours the fold of its start.**  `datetime.now()`
+  in a DST zone returns `fold=1` for one hour every autumn, and the
+  iterator dropped it, re-offering the repeated hour's first-leg fires
+  -- instants up to a full DST shift in the *past*, while `next()`
+  correctly named the future one.  The schedule preview, the job-explain
+  payload and the TUI all read `occurrences()`, so the dashboard showed
+  a "next" fire that had already happened and missed-run detection
+  reported a run the scheduler never performed.  Candidates are now
+  compared through UTC against the fold-aware start, exactly as
+  `next()` compares them.
+- **A spring-forward no longer swallows the shifted fire.**  A fire
+  whose civil label sits inside the gap (`59 2 * * *` on changeover day)
+  really happens one shift later -- but once `now`'s wall label passed
+  the schedule's label, `next()` abandoned the day even though the real
+  instant was still ahead, silently dropping that day's run for every
+  daemon start, reload or re-seed landing in the window; 252 of 598
+  IANA zones were affected, by up to three hours.  The scan now rewinds
+  its seed by the offset jump when a recent transition makes that
+  necessary (one extra offset probe otherwise), and discards candidates
+  through the same resolved-UTC guard, so an already-past instant is
+  never returned.  `next()`, `occurrences()` and `prev()` now agree on
+  one fire set in absolute time, and a regression test holds that
+  identity across both transition days, both folds and five zones.
+
+### A fuzzing campaign: the redactor closes its own gaps
+
+- **The credential guard redacts what the detector detects.**  The two
+  URL-userinfo helpers -- written specifically to keep passwords out of
+  logs -- located the authority by splitting on a literal `://`, with
+  two subtly different fallbacks: a protocol-relative
+  `//user:pass@host` endpoint was invisible to both (the password went
+  verbatim into a ConfigError the reload loop re-logs every cycle), and
+  a trailing-`://` shape made the detector and redactor disagree, so
+  the "always redacted" error path echoed the cleartext secret.  Both
+  helpers now share one RFC 3986 authority locator, so nothing the
+  detector flags can reach a log unredacted; the campaign's enumeration
+  of 81 credentialed endpoint shapes had found 31 leaking.
+- **Output redaction is linear again -- and off the event loop.**  The
+  URL-password pattern backtracked quadratically on a long
+  scheme-character run followed by `://` and an `@`-less tail: a clean
+  4.0x runtime per input doubling on job-controlled stdout, blocking
+  the entire event loop from inside the archive path (extrapolating to
+  days at the default 16MiB line cap).  The scheme is now anchored and
+  bounded, restoring amortised-linear scans (2.0x per doubling, 1.35s
+  to 2.5ms at 32KB), and the archive scrub runs in a thread executor so
+  a future pattern regression degrades that one write, not job
+  dispatch.
+- **`PGPASSWORD=` and friends are recognised as the credentials they
+  are.**  The key pattern's word-boundary lookbehind rejected an
+  alphanumeric prefix, so the *separated* compound forms
+  (`MY_PASSWORD=`) redacted while the unseparated vendor forms libpq
+  and friends actually use -- `PGPASSWORD=`, `DBPASSWORD=`,
+  `MYSQLPWD=`, exactly what `set -x` echoes -- passed through verbatim
+  into an archive stamped `redacted: true`.  The key may now carry a
+  compound prefix (with the scan still provably linear), and
+  `REDISCLI_AUTH` joins the list explicitly.
+
+### A fuzzing campaign: classic crontabs parse as the file reads
+
+- **Crontab lines are physical, LF-delimited lines.**  Parsing split on
+  `str.splitlines()`, whose Unicode line-boundary set (VT, FF, FS/GS/RS,
+  NEL, U+2028/U+2029) is wider than cron's LF-only model -- so text
+  sitting inside a `#` comment (one line in every editor, `cat`, `git
+  diff` and code review) became a live job, a mid-line FF silently
+  truncated a command, and error line numbers drifted from the file's.
+  FF is the classic Emacs page separator, so this needed no malice --
+  and doubled as a review-evasion vector.  Both the parser and the
+  content sniffer now split on LF alone (one trailing CR tolerated), so
+  a comment is a comment for its whole length and every job name and
+  error names the physical line.
+- **Control characters in a live crontab line are refused, with
+  file:line.**  A NUL in a command, environment value or `SHELL=` built
+  a job the OS can never spawn, and the `ValueError` out of the spawn
+  call escaped every guard on the launch path and killed the whole
+  scheduler -- re-fired on every tick.  The crontab front end (the sole
+  route to that shape; the YAML reader already refuses control
+  characters) now rejects C0/C1 controls (tab excepted) in live lines
+  with a clear per-line error, and the spawn guard additionally treats
+  `ValueError` as an ordinary start failure so any future unspawnable
+  argv is retried by the reaper rather than fatal.  A command with a
+  mid-line FF, previously truncated silently, is now refused rather
+  than half-honoured.
+
+### A fuzzing campaign: configuration mistakes fail closed
+
+- **A schedule-object value must be exactly one cron field.**  The
+  object form rendered its values into a whitespace-joined line that
+  the engine re-splits, so a *blank* value deleted its column and
+  shifted every later field left -- `second: "0"` plus a leftover
+  `year:` turned "every second at :00" into "hourly at minute 0", a
+  silent 60x rate change with no error, no warning and no lint finding
+  -- and an embedded space injected a column and shifted fields right.
+  Every provided value must now render as one non-empty,
+  whitespace-free token or the parse fails naming the offending key.
+- **Secret resolution cannot crash-loop the daemon.**  `_resolve_secret`
+  caught `OSError` and `UnicodeDecodeError`, but a NUL in a `fromFile`
+  path raises `ValueError` and a lone-surrogate path or env-var name
+  raises `UnicodeEncodeError` (reachable from a pure-ASCII file via
+  YAML `\u` escapes) -- and on the per-fire job-secret staging path
+  anything but ConfigError escapes the scheduler loop and recurs at
+  every fire of that job.  Both source branches now catch broadly and
+  re-raise as ConfigError naming the key.
+- **strictyaml's own validators can no longer escape config parsing.**
+  Its numeric prefilters accept `''`, `'.'`, `'-'` and `'_'`, which
+  `float()`/`int()` then reject with a bare `ValueError` -- so an
+  `executionTimeout:` left with no value (an ordinary typo, reaching
+  every one of ~26 Float/Int keys) surfaced as a raw traceback at
+  startup and as "please report this as a bug" in the reload log, and
+  a control character anywhere in a file aborted a whole
+  config-directory load via a strictyaml `AttributeError`.  Both are
+  now translated to the ConfigError every caller already handles.
+
+### A fuzzing campaign: gates and dispatchers stop wedging
+
+- **A destructive MCP gate tests identity, not truthiness.**
+  `cron_backfill_dag` read `args.get("dry_run", True)`, which applies
+  the default only when the key is *absent* -- and `dry_run: null` is
+  precisely how an MCP client or LLM encodes "unspecified", so the two
+  encodings of the same intent diverged into opposite outcomes and a
+  present-but-falsy value started a real backfill on a tool the
+  registry itself marks destructive.  Only the literal `false` now
+  takes the executing branch, mirroring the existing confirm gate.
+- **Non-finite numeric arguments clamp instead of erroring.**  `1e999`
+  is a well-formed JSON number the stdlib parser reads as infinity, and
+  `int(inf)` raises `OverflowError` -- which none of the MCP numeric
+  coercion helpers caught, turning a schema-valid `limit`/`offset`/
+  `tail` on fifteen tool/argument pairs into an opaque -32603 protocol
+  fault the model cannot self-correct from.  All three helpers now fall
+  back to their documented clamp or default.
+- **A task retyped to mapped mid-flight fails cleanly instead of
+  wedging its run forever.**  Adding `expand:` to a task while an
+  entry sat parked `up_for_retry` routed it exclusively through the
+  mapped placeholder path, which only handles fresh pending entries --
+  so the retry never fired, the run never terminalised, its advance
+  lease was held for the life of the daemon and every advance paid a
+  full document copy to do nothing.  Such a stale-shaped entry is now
+  failed with an explanatory reason so the run finishes and the next
+  run expands normally; genuinely in-flight attempts and parked
+  approval gates keep their own recovery paths.
+- **The object-form `schedule:` reaches the shell reporter.**  The
+  reporter's child environment carried `schedule_unparsed` verbatim,
+  and for the object form that is a dict -- the spawn died in
+  `os.fsencode`, so `onFailure`/`onSuccess` shell reports silently
+  never executed for any job whose schedule was spelled as an object.
+  The environment now carries the rendered crontab line, as the status
+  payload and Prometheus already do, and the reporter's spawn guard
+  catches the type errors the "never propagated" contract promises to
+  absorb.
+- **The TUI sorts like the web dashboard.**  The terminal port compared
+  names by code point -- every uppercase-initial name first -- where
+  the web uses `localeCompare`'s root collation, so the two frontends'
+  *default* first screen disagreed for any mixed-case fleet, on the
+  name column and on every column's tie-break.  The TUI now sorts on a
+  collation-equivalent key (case-insensitive primary, lowercase first
+  on a pure case tie), verified against the browser's collation for
+  mixed-case fleets.
+
 ### The benchmark gate learns what noise looks like
 
 - **A regression must now clear the measurement's own scatter to gate.**
@@ -220,6 +451,13 @@ scenario sizes noted per figure.
   metric-name gutter; a label that will not fit outside its bar is now
   drawn inside the bar's end, in a near-black that clears contrast
   against both fills in light and dark themes.
+- **The release chart draws every compared metric.**  The diverging bar
+  chart cut the suite to a top-N of movers, so the release image showed
+  a slice rather than the run; it now grows to fit all compared rows,
+  with an alternate-row wash to carry a name across the gutter, tick
+  labels at both ends of the (now taller) plot, and a footnote counting
+  metrics measured on only one side, whose numbers stay in the
+  release-notes table.
 
 ### Build, test and release plumbing
 

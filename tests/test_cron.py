@@ -2671,6 +2671,43 @@ async def test_deferred_reboot_runs_on_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_deferred_reboot_paused_owner_keeps_it_pending(monkeypatch):
+    # A pause defers a deferred @reboot one-shot's boot run instead of
+    # forfeiting it: the cluster's once-per-boot token must not be spent on
+    # a run the launcher's pause gate would only skip.
+    cron = cronstable.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron,
+        "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    cron._paused["boot"] = cronstable.cron.PauseInfo(
+        since=datetime.datetime.now(UTC),
+        until=datetime.datetime.now(UTC) + datetime.timedelta(hours=1),
+        note="",
+        by="op",
+        channel="api",
+    )
+    mgr = _reboot_mgr(leader="node-a")  # we are the owner
+    cron.cluster_manager = mgr
+    await cron._process_pending_reboots()
+    assert launched == []
+    assert "boot" in cron._pending_reboot_jobs  # still owed
+    assert mgr.reboot_ran("boot") is False  # token not burnt
+    # the pause lifts -> the boot run happens, exactly once
+    cron._paused.pop("boot")
+    await cron._process_pending_reboots()
+    assert launched == ["boot"]
+    assert "boot" not in cron._pending_reboot_jobs
+    assert mgr.reboot_ran("boot") is True
+
+
+@pytest.mark.asyncio
 async def test_deferred_reboot_disabled_on_owner_is_not_run(monkeypatch):
     # A deferred @reboot Leader/PreferLeader job DISABLED via a reload while it
     # sat pending must be retired without running, even on the elected owner --
@@ -5066,7 +5103,13 @@ def test_reload_keeps_pause_and_prunes_removed_jobs(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_catch_up_owes_nothing_while_paused(monkeypatch):
+async def test_catch_up_defers_a_paused_job_instead_of_latching_it(
+    monkeypatch,
+):
+    # A pause is transient and excuses only the slots inside its own window,
+    # so catch-up must DEFER a paused job (like a transient cluster denial),
+    # never latch it done: latching forfeits a backlog owed from before the
+    # pause began, and catch-up is one-shot per process.
     holder = {"now": DT(2020, 1, 1, 0, 10, 0)}
     _set_now(monkeypatch, holder)
     yaml = (
@@ -5078,10 +5121,16 @@ async def test_catch_up_owes_nothing_while_paused(monkeypatch):
     unresolved = await cron._evaluate_catch_up(
         DT(2020, 1, 1, 0, 10, 0, tzinfo=UTC)
     )
-    assert unresolved is False
-    # the decision is final: paused means nothing is owed, no deferral
-    assert "p" in cron._catchup_done
+    assert unresolved is True
+    assert "p" not in cron._catchup_done
     assert not cron._catchup_tasks
+    # once the pause lifts the job is evaluated for real
+    await cron.resume_job_by_name("p")
+    unresolved = await cron._evaluate_catch_up(
+        DT(2020, 1, 1, 0, 10, 0, tzinfo=UTC)
+    )
+    assert unresolved is False
+    assert "p" in cron._catchup_done
 
 
 @pytest.mark.asyncio
@@ -5350,8 +5399,14 @@ async def test_sla_paused_and_disabled_jobs_are_exempt(monkeypatch):
     await cron._drain_completions()
     assert reports == []
 
-    # resume: the same condition now latches, proving it was real
+    # resume: the same condition latches again, proving it was real. The
+    # hour it spent paused is credited against the staleness measurement
+    # (see test_sla_pause_time_is_credited_against_staleness), so the clock
+    # has to move past the threshold once more before it can page.
     await cron.resume_job_by_name("pd")
+    cron._sla_periodic()
+    assert not cron._sla_state
+    holder["now"] = DT(2020, 1, 1, 13, 30, 0)
     cron._sla_periodic()
     assert ("pd", STALE) in cron._sla_state
     assert ("dd", STALE) not in cron._sla_state
@@ -5550,3 +5605,558 @@ def test_reload_prunes_sla_trackers(tmp_path, monkeypatch):
     assert "drop" not in cron._sla_due
     assert "drop" not in cron._sla_last_start
     assert ("drop", STALE) not in cron._sla_state
+
+
+# ---------------------------------------------------------------------------
+# SLA: exemption clears the latch, and false lateAfter pages
+# ---------------------------------------------------------------------------
+
+_SLA_CLUSTER_LATE_JOB = """
+jobs:
+  - name: s
+    command: echo hi
+    schedule: "* * * * *"
+    concurrencyScope: cluster
+    concurrencyPolicy: Forbid
+    sla:
+      lateAfterSeconds: 120
+"""
+
+_SLA_FORBID_LATE_JOB = """
+jobs:
+  - name: s
+    command: echo hi
+    schedule: "*/10 * * * *"
+    concurrencyPolicy: Forbid
+    sla:
+      lateAfterSeconds: 300
+"""
+
+
+@pytest.mark.asyncio
+async def test_sla_pause_clears_a_latch_taken_before_the_pause(monkeypatch):
+    # regression (#17/#33/#38): a job that latched a breach and is THEN
+    # paused was skipped whole by the monitor, so cronstable_job_late, the
+    # /jobs sla block and the OVERDUE chip stayed pinned at breached for the
+    # entire pause window, for a job the operator deliberately silenced.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    _sla_report_recorder(monkeypatch)
+    cron._sla_last_success["s"] = DT(2020, 1, 1, 10, 0, 0, tzinfo=UTC)
+
+    cron._sla_periodic()
+    assert ("s", STALE) in cron._sla_state
+    assert cron.metrics._job("s").sla_late == {STALE: 1}
+
+    # the pause drops the latch on the API call itself, not a minute later
+    await cron.pause_job_by_name("s", duration=86400)
+    assert not cron._sla_state
+    assert cron.metrics._job("s").sla_late == {STALE: 0}
+    payload = cron._job_to_dict("s", cron.cron_jobs["s"])
+    assert payload["sla"]["state"] == "ok"
+    assert payload["paused"] is not None
+
+    # and the monitor keeps it clear for the whole window
+    holder["now"] = DT(2020, 1, 1, 23, 0, 0)
+    cron._sla_periodic()
+    assert not cron._sla_state
+    assert cron.metrics._job("s").sla_late == {STALE: 0}
+    await cron._drain_completions()
+
+
+@pytest.mark.asyncio
+async def test_sla_latch_clears_when_disabled_or_not_owned(monkeypatch):
+    # regression (#17): the same freeze through the other two exemptions.
+    # Disabling a job, or losing it to another node under election, must
+    # drop its latch rather than leave the gauge asserting a live breach.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    _sla_report_recorder(monkeypatch)
+    cron._sla_last_success["s"] = DT(2020, 1, 1, 10, 0, 0, tzinfo=UTC)
+    cron._sla_periodic()
+    assert ("s", STALE) in cron._sla_state
+
+    cron.cron_jobs["s"].enabled = False
+    cron._sla_periodic()
+    assert not cron._sla_state
+    assert cron.metrics._job("s").sla_late == {STALE: 0}
+
+    # re-enabled and still breaching: it re-latches and pages once
+    cron.cron_jobs["s"].enabled = True
+    cron._sla_periodic()
+    assert ("s", STALE) in cron._sla_state
+
+    # losing ownership excuses it the same way, and drops the lateAfter
+    # reference with it so regaining ownership cannot page for a slot the
+    # owner of the day ran on time
+    cron._sla_due["s"] = DT(2020, 1, 1, 11, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(cron, "_cluster_allows", lambda job: False)
+    cron._sla_periodic()
+    assert not cron._sla_state
+    assert cron.metrics._job("s").sla_late == {STALE: 0}
+    assert "s" not in cron._sla_due
+    await cron._drain_completions()
+
+
+@pytest.mark.asyncio
+async def test_sla_due_is_only_recorded_by_the_owning_node(monkeypatch):
+    # regression (#18): _launch_plan recorded the due slot BEFORE the
+    # ownership gate, so a follower accumulated due slots it never launched
+    # and had no matching _sla_last_start. The first leader failover then
+    # paged a false lateAfter breach on the incoming owner, for slots the
+    # dead leader had run on time.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_LATE_JOB)
+    reports = _sla_report_recorder(monkeypatch)
+    launched = []
+
+    async def fake_launch(job):
+        launched.append(job.name)
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+    monkeypatch.setattr(cron, "_cluster_allows", lambda job: False)
+
+    job = cron.cron_jobs["s"]
+    for minute in (55, 56, 57, 58, 59):
+        slot = DT(2020, 1, 1, 11, minute, 0, tzinfo=UTC)
+        await cron._launch_plan([(job, [slot])])
+    assert launched == []
+    # the follower launched nothing, so it owes nothing: no due reference
+    assert "s" not in cron._sla_due
+    # ...but the slot bookkeeping the status payload reads still advances
+    assert cron._last_run_slot["s"] == DT(2020, 1, 1, 11, 59, 0, tzinfo=UTC)
+
+    # this node wins the election three minutes later: nothing to page for
+    monkeypatch.setattr(cron, "_cluster_allows", lambda job: True)
+    holder["now"] = DT(2020, 1, 1, 12, 3, 0)
+    cron._sla_periodic()
+    assert ("s", LATE) not in cron._sla_state
+    assert cron.metrics._job("s").sla_late == {LATE: 0}
+    await cron._drain_completions()
+    assert reports == []
+
+
+@pytest.mark.asyncio
+async def test_sla_due_excused_when_a_peer_holds_the_cluster_slot(monkeypatch):
+    # regression (#16): a node that records the slot as due and is then
+    # denied the cluster concurrency slot by a LIVE peer never launches, so
+    # its _sla_last_start never advances and lateAfter latches on every node
+    # that lost the race, for a job the fleet is running normally.
+    import cronstable.state as state_mod
+
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_CLUSTER_LATE_JOB)
+    reports = _sla_report_recorder(monkeypatch)
+
+    class _PeerHeldBackend:
+        async def read_lease(self, name):
+            return state_mod.Lease(
+                name=name, holder="peer#1", fence=1, expires_at=1e12
+            )
+
+    async def no_reason():
+        return None
+
+    async def denied(backend, lease_name):
+        return None
+
+    cron.state_backend = _PeerHeldBackend()
+    cron._state_configured = True
+    monkeypatch.setattr(cron, "_slot_fidelity_reason", no_reason)
+    monkeypatch.setattr(cron, "_acquire_slot_lease", denied)
+
+    cron._sla_due["s"] = DT(2020, 1, 1, 12, 0, 0, tzinfo=UTC)
+    assert await cron.maybe_launch_job(cron.cron_jobs["s"]) is False
+    assert "s" not in cron._sla_due
+
+    holder["now"] = DT(2020, 1, 1, 12, 5, 0)
+    cron._sla_periodic()
+    assert ("s", LATE) not in cron._sla_state
+    await cron._drain_completions()
+    assert reports == []
+
+
+@pytest.mark.asyncio
+async def test_sla_late_after_excused_while_an_instance_runs(monkeypatch):
+    # regression (#23): a slot Forbid dropped because the previous instance
+    # is STILL RUNNING was counted as a late slot, so one healthy long run
+    # paged twice: once as lateAfter, once as maxRuntime.
+    holder = {"now": DT(2020, 1, 1, 12, 16, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_FORBID_LATE_JOB)
+    reports = _sla_report_recorder(monkeypatch)
+
+    class _FakeRun:
+        started_at = DT(2020, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    cron.running_jobs["s"] = [_FakeRun()]
+    cron._sla_due["s"] = DT(2020, 1, 1, 12, 10, 0, tzinfo=UTC)
+    cron._sla_last_start["s"] = DT(2020, 1, 1, 12, 0, 0, tzinfo=UTC)
+    cron._sla_periodic()
+    assert ("s", LATE) not in cron._sla_state
+    assert cron.metrics._job("s").sla_late == {LATE: 0}
+    await cron._drain_completions()
+    assert reports == []
+
+    # the run ends without serving the slot: now it is genuinely unserved
+    cron.running_jobs["s"] = []
+    cron._sla_periodic()
+    assert ("s", LATE) in cron._sla_state
+    await cron._drain_completions()
+    assert len(reports) == 1
+
+
+# ---------------------------------------------------------------------------
+# SLA: the maxTimeSinceSuccess staleness baseline
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sla_first_seen_baselines_a_reload_added_job(
+    tmp_path, monkeypatch
+):
+    # regression (#19): a job ADDED by a reload was baselined on process
+    # start, so on a long-running daemon it paged maxTimeSinceSuccess on the
+    # very tick it appeared, before it had any chance to run.
+    holder = {"now": DT(2020, 1, 1, 9, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(
+        "jobs:\n  - name: other\n    command: echo hi\n"
+        '    schedule: "* * * * *"\n'
+    )
+    cron = cronstable.cron.Cron(str(cfg))
+    _sla_report_recorder(monkeypatch)
+
+    # a week of uptime, then the operator adds a job with a 25h threshold
+    holder["now"] = DT(2020, 1, 8, 9, 0, 0)
+    cfg.write_text(
+        "jobs:\n  - name: other\n    command: echo hi\n"
+        '    schedule: "* * * * *"\n'
+        "  - name: db-vacuum\n    command: echo hi\n"
+        '    schedule: "0 3 * * *"\n'
+        "    sla:\n      maxTimeSinceSuccessSeconds: 90000\n"
+    )
+    cron.update_config()
+    assert cron._sla_first_seen["db-vacuum"] == DT(
+        2020, 1, 8, 9, 0, 0, tzinfo=UTC
+    )
+    cron._sla_periodic()
+    assert not cron._sla_state
+
+    # it ages into the breach from when it appeared, like any other job
+    holder["now"] = DT(2020, 1, 9, 10, 30, 0)
+    cron._sla_periodic()
+    assert ("db-vacuum", STALE) in cron._sla_state
+    await cron._drain_completions()
+
+
+def test_reload_prunes_sla_first_seen_and_pause_windows(tmp_path, monkeypatch):
+    holder = {"now": DT(2020, 1, 1, 0, 0, 30)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_RELOAD_BEFORE)
+    cron = cronstable.cron.Cron(str(cfg))
+    at = DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+    assert set(cron._sla_first_seen) == {"keep", "drop"}
+    for name in ("keep", "drop"):
+        cron._sla_pause_windows[name] = [(at, at)]
+    holder["now"] = DT(2020, 1, 1, 0, 1, 30)
+    cfg.write_text(_RELOAD_AFTER)
+    cron.update_config()
+    # the removed job's entries are pruned, and the job the reload ADDED gets
+    # its own first-seen baseline rather than inheriting the process start
+    assert set(cron._sla_first_seen) == {"keep", "added"}
+    assert cron._sla_first_seen["keep"] == DT(2020, 1, 1, 0, 0, 30, tzinfo=UTC)
+    assert cron._sla_first_seen["added"] == DT(
+        2020, 1, 1, 0, 1, 30, tzinfo=UTC
+    )
+    assert set(cron._sla_pause_windows) == {"keep"}
+
+
+@pytest.mark.asyncio
+async def test_sla_pause_time_is_credited_against_staleness(monkeypatch):
+    # regression (#22): the staleness clock ran at full rate across a pause,
+    # so an unattended job paged the first pass after the window expired,
+    # for time the operator had declared it should not run.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    _sla_report_recorder(monkeypatch)
+    cron._sla_last_success["s"] = DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    # paused for four hours, well past the 1h threshold
+    await cron.pause_job_by_name("s", duration=14400)
+    holder["now"] = DT(2020, 1, 1, 4, 0, 1)
+    cron._pause_and_sla_periodic()
+    assert "s" not in cron._paused  # the window was swept
+    assert not cron._sla_state  # ...and did not page as it lifted
+
+    # the credit is exactly the window: half a threshold later, still quiet
+    holder["now"] = DT(2020, 1, 1, 4, 30, 1)
+    cron._sla_periodic()
+    assert not cron._sla_state
+
+    # a full threshold after the resume it pages, as a stale job should
+    holder["now"] = DT(2020, 1, 1, 5, 0, 30)
+    cron._sla_periodic()
+    assert ("s", STALE) in cron._sla_state
+    await cron._drain_completions()
+
+
+@pytest.mark.asyncio
+async def test_sla_pause_credit_never_counts_a_window_twice(monkeypatch):
+    # regression (#22): repeated and OVERLAPPING pauses must each be
+    # credited once. Re-pausing a paused job replaces the window, so the
+    # stretch the two share would otherwise be banked by both.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    _sla_report_recorder(monkeypatch)
+    cron._sla_last_success["s"] = DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    # pause 00:00 to 02:00, then re-pause at 01:00 for another two hours
+    await cron.pause_job_by_name("s", duration=7200)
+    holder["now"] = DT(2020, 1, 1, 1, 0, 0)
+    await cron.pause_job_by_name("s", duration=7200)
+    holder["now"] = DT(2020, 1, 1, 3, 0, 0)
+    await cron.resume_job_by_name("s")
+    # 00:00 to 03:00 held once, not 2h + 2h
+    assert cron._sla_pause_windows["s"] == [
+        (
+            DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC),
+            DT(2020, 1, 1, 3, 0, 0, tzinfo=UTC),
+        )
+    ]
+
+    # a second, disjoint pause banks its own span
+    holder["now"] = DT(2020, 1, 1, 3, 30, 0)
+    await cron.pause_job_by_name("s", duration=1800)
+    holder["now"] = DT(2020, 1, 1, 4, 0, 0)
+    await cron.resume_job_by_name("s")
+    assert len(cron._sla_pause_windows["s"]) == 2
+
+    # 4h elapsed, 3.5h of it paused: half an hour of real staleness
+    now = DT(2020, 1, 1, 4, 0, 0, tzinfo=UTC)
+    obs = cron._sla_observations("s", cron.cron_jobs["s"], now)
+    assert obs[STALE] == (3600, 1800.0, False)
+
+    # and the credit retires once a success moves the reference past it
+    info = cronstable.cron.JobRunInfo(
+        outcome="success",
+        exit_code=0,
+        started_at=now,
+        finished_at=now,
+        fail_reason=None,
+        output=JobOutputStream(),
+    )
+    cron._record_run("s", info)
+    holder["now"] = DT(2020, 1, 1, 5, 30, 0)
+    cron._sla_periodic()
+    assert ("s", STALE) in cron._sla_state
+    await cron._drain_completions()
+
+
+@pytest.mark.asyncio
+async def test_sla_pause_credit_covers_a_window_spanning_a_restart(
+    monkeypatch,
+):
+    # regression (#22): a pause rehydrated from the store after a restart
+    # carries its original `since`, so the part of the window that elapsed
+    # before the restart is credited too.
+    holder = {"now": DT(2020, 1, 1, 6, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    _sla_report_recorder(monkeypatch)
+    # the ledger warm supplies a last success from before the pause began
+    cron._sla_last_success["s"] = DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+    # ...and the pause refresh a window that started five hours ago
+    cron._paused["s"] = cronstable.cron.PauseInfo(
+        since=DT(2020, 1, 1, 1, 0, 0, tzinfo=UTC),
+        until=DT(2020, 1, 1, 6, 30, 0, tzinfo=UTC),
+        note="",
+        by="op",
+        channel="api",
+    )
+    holder["now"] = DT(2020, 1, 1, 6, 30, 0)
+    cron._pause_and_sla_periodic()
+    # 6.5h since the success, 5.5h of it paused: an hour of real staleness,
+    # exactly at the threshold rather than six times past it
+    assert "s" not in cron._paused
+    assert not cron._sla_state
+    holder["now"] = DT(2020, 1, 1, 7, 0, 30)
+    cron._sla_periodic()
+    assert ("s", STALE) in cron._sla_state
+    await cron._drain_completions()
+
+
+# ---------------------------------------------------------------------------
+# SLA: warming the staleness reference from the durable ledger
+# ---------------------------------------------------------------------------
+
+
+class _RecordBackend:
+    """A ledger stub for the rehydrate warm-up: run records, nothing else."""
+
+    def __init__(self, records):
+        self._records = list(records)
+        self.reads = []
+
+    async def list_records(self, stream, limit=None, newest_first=False):
+        self.reads.append((stream, limit))
+        if not stream.startswith("runs/"):
+            return []
+        recs = sorted(
+            self._records, key=lambda r: r["_seq"], reverse=newest_first
+        )
+        return recs[: limit or len(recs)]
+
+    async def list_stream_names(self, prefix):
+        return []
+
+
+def _run_record(seq, outcome, finished_at):
+    return {
+        "_seq": seq,
+        "outcome": outcome,
+        "exit_code": 0 if outcome == "success" else 1,
+        "started_at": finished_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "fail_reason": None,
+    }
+
+
+async def _warm_ledger(cron, records):
+    backend = _RecordBackend(records)
+    cron.state_backend = backend
+    cron._state_rehydrated = False
+    await cron._rehydrate_from_state()
+    return backend
+
+
+@pytest.mark.asyncio
+async def test_sla_warm_takes_the_newest_success_by_finished_at(monkeypatch):
+    # regression (#21): the warm walked the ledger by APPEND position, but
+    # record files are named on write time and run-record writes are
+    # unserialized, so the last-appended success can be older than one
+    # appended before it. The reference must be the newest by finished_at.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    _sla_report_recorder(monkeypatch)
+    await _warm_ledger(
+        cron,
+        [
+            _run_record(1, "success", DT(2020, 1, 1, 10, 5, 0, tzinfo=UTC)),
+            _run_record(2, "success", DT(2020, 1, 1, 10, 0, 0, tzinfo=UTC)),
+        ],
+    )
+    assert cron._sla_last_success["s"] == DT(2020, 1, 1, 10, 5, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_sla_warm_widens_past_a_success_free_window(monkeypatch):
+    # regression (#20): a job failing more often than the warm window is
+    # wide has no success among the newest RUN_HISTORY_LIMIT records, and
+    # the reference was left unset, re-baselining maxTimeSinceSuccess on
+    # process start: every restart bought a genuinely stale job another
+    # silent threshold.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    _sla_report_recorder(monkeypatch)
+    success_at = DT(2019, 12, 29, 12, 0, 0, tzinfo=UTC)
+    records = [_run_record(0, "success", success_at)]
+    records += [
+        _run_record(
+            n,
+            "failure",
+            DT(2019, 12, 30, 0, 0, 0, tzinfo=UTC)
+            + datetime.timedelta(minutes=5 * n),
+        )
+        for n in range(1, 61)
+    ]
+    backend = await _warm_ledger(cron, records)
+    # the restart does not buy it another silent threshold
+    cron._sla_periodic()
+    assert ("s", STALE) in cron._sla_state
+    assert cron._sla_last_success["s"] == success_at
+    # exactly one deep re-read, on top of the ordinary warm read
+    assert len([r for r in backend.reads if r[0] == "runs/s"]) == 2
+    await cron._drain_completions()
+
+
+@pytest.mark.asyncio
+async def test_sla_warm_floors_on_the_oldest_record_without_a_success(
+    monkeypatch,
+):
+    # regression (#20): with no success anywhere in the ledger the oldest
+    # record still bounds the staleness from below (the true last success is
+    # at or before it), which beats resetting the clock to process start.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    _sla_report_recorder(monkeypatch)
+    oldest = DT(2019, 12, 31, 0, 0, 0, tzinfo=UTC)
+    records = [
+        _run_record(n, "failure", oldest + datetime.timedelta(hours=n))
+        for n in range(6)
+    ]
+    await _warm_ledger(cron, records)
+    cron._sla_periodic()
+    assert ("s", STALE) in cron._sla_state
+    assert cron._sla_last_success["s"] == oldest
+    await cron._drain_completions()
+
+
+# ---------------------------------------------------------------------------
+# SLA: report ordering against real run completions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sla_report_never_blocks_a_run_completion(monkeypatch):
+    # regression (#4): the onLate report installed itself as the job's
+    # _completion_tail, which _queue_job_completion blocks on, so a slow
+    # onLate reporter delayed the finished run's failure report AND its
+    # retry arming. maxRuntime makes that the ordinary case: it breaches
+    # while the run is still executing.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_RUNTIME_JOB)
+    gate = asyncio.Event()
+    handled = []
+
+    async def hanging_report(ctx, report_config):
+        await gate.wait()
+
+    async def fake_failure(job):
+        handled.append(job)
+
+    monkeypatch.setattr(cronstable.cron, "report_sla_breach", hanging_report)
+    monkeypatch.setattr(cron, "handle_job_failure", fake_failure)
+
+    class _FakeRun:
+        started_at = DT(2020, 1, 1, 11, 30, 0, tzinfo=UTC)
+        config = cron.cron_jobs["s"]
+
+    cron.running_jobs["s"] = [_FakeRun()]
+    cron._sla_periodic()
+    assert ("s", RUNTIME) in cron._sla_state
+
+    # that same run now finishes while the reporter is still hung
+    cron._queue_job_completion(_FakeRun(), failed=True)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(handled) == 1
+
+    # the report waits on its own tail; the completion tail stays owned by
+    # real completions
+    assert "s" in cron._sla_report_tail
+    gate.set()
+    await cron._drain_completions()
+    assert cron._sla_report_tail == {}

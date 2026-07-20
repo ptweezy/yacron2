@@ -1671,3 +1671,254 @@ async def test_dag_logs_tab_transforms_only_the_visible_slice(tmp_path):
     app.panel_scroll = 999
     rows = [strip_ansi(r) for r in app._dag_logs_tab(paint, 80, 6)]
     assert rows[1:] == [" ▏row %02d" % n for n in range(5)]
+
+
+# ===================================================================
+#  pause / SLA surfaces: table layout, drawer text, web parity
+# ===================================================================
+def test_pause_and_overdue_widths_never_cost_the_command_column(tmp_path):
+    """The OVERDUE badge and the "til HH:MM" pause cell are fleet-wide
+    column widths driven by a single job's transient state. They are
+    bonuses paid out of leftover slack: at a narrow terminal one paused
+    job must not shed the whole command column for the other 39."""
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("job-%02d" % i, outcome="success") for i in range(40)]
+    plain = app._columns(80)
+    assert "cmd" in [c for c, _ in plain]
+    app.jobs[3]["paused"] = _job("x", paused=True)["paused"]
+    app.jobs[4].update(_job("y", late=True))
+    mixed = app._columns(80)
+    assert [c for c, _ in mixed] == [c for c, _ in plain]
+    assert dict(mixed)["cmd"] >= 20
+    # with room to spare the bonuses are actually paid out
+    wide = dict(app._columns(160))
+    assert wide["status"] == 19 and wide["next"] == 12
+    assert dict(_bare_app(tmp_path)._columns(160))["status"] == 11
+
+
+def test_drawer_pause_note_cannot_smuggle_control_chars(tmp_path):
+    """``note``/``by`` are operator free text that the daemon stores and
+    serves verbatim; a bare CR in the drawer line would yank the cursor
+    back to column 1 and let the note overwrite cronstable's own row."""
+    job = _job(
+        "nightly",
+        paused={
+            "since": "2026-07-20T00:00:00+00:00",
+            "until": "2026-07-20T01:00:00+00:00",
+            "note": "ok\rPAUSED BY SECURITY\b\b",
+            "by": "alice\nbob\x1b[31m",
+        },
+    )
+    app = _bare_app(tmp_path)
+    app.jobs = [job]
+    app.by_name = {"nightly": job}
+    app.drawer_job = "nightly"
+    blob = "".join(app.render_drawer_panel(tui.Painter(app.theme), 60, 24))
+    for ch in ("\r", "\n", "\b"):
+        assert ch not in blob, repr(blob)
+    plain = strip_ansi(blob)
+    assert "ok PAUSED BY SECURITY" in plain
+    assert "by alice bob" in plain
+
+
+def _web_page():
+    """The shipped dashboard's source. ``docs/demo/index.html`` needs no
+    separate pass: test_web_demo_mirror pins it to this file byte for
+    byte outside its fake-backend block."""
+    import pathlib
+
+    page = pathlib.Path(tui.__file__).parent / "web" / "index.html"
+    return str(page), page.read_text(encoding="utf-8")
+
+
+def test_web_outcome_mapping_has_exactly_one_home():
+    """A run outcome maps to its state class in ``outcomeCls`` and nowhere
+    else. Hand-rolled copies drift: two of them missed the ``skipped`` arm
+    and painted a pause-held fire as a green OK."""
+    import re
+
+    path, html = _web_page()
+    mapper = re.search(r"const outcomeCls = \(o\) =>(.*)", html)
+    assert mapper, path
+    arms = set(re.findall(r'o === "(\w+)"', mapper.group(1)))
+    assert arms == {"failure", "cancelled", "unknown", "skipped"}, path
+    # any OTHER expression enumerating outcomes is a divergent copy
+    for num, line in enumerate(html.split("\n"), 1):
+        if "outcomeCls" in line:
+            continue
+        hits = len(re.findall(r'outcome === "\w+"', line))
+        where = "%s:%d" % (path, num)
+        assert hits < 2, "%s outcome ladder outside outcomeCls" % where
+
+
+def test_web_styles_every_class_outcome_cls_can_return():
+    """Each consumer of ``outcomeCls`` needs a colour rule per class, or
+    a state renders in the default ink and reads as an ordinary one."""
+    path, html = _web_page()
+    for cls in ("ok", "fail", "cancelled", "unknown", "skipped"):
+        assert "#fleetPanel .cell.%s {" % cls in html, (path, cls)
+        assert ".tlrow.%s .tlg {" % cls in html, (path, cls)
+
+
+def test_tui_outcome_mapping_has_exactly_one_home():
+    """The terminal dashboard's twin of the web guard above. Five panels
+    each carried their own copy of the outcome ladder and every one of
+    them had dropped the ``skipped`` arm, so a slot a pause held back
+    painted in the green a real success earns. One mapper, no copies."""
+    import pathlib
+    import re
+
+    path = pathlib.Path(tui.__file__)
+    source = path.read_text(encoding="utf-8")
+    assert set(tui.OUTCOME_KEY) == {
+        "failure",
+        "cancelled",
+        "unknown",
+        "skipped",
+    }
+    # every key the mapper can return needs a colour, or a state paints
+    # in the default ink and reads as an ordinary one
+    for key in set(tui.OUTCOME_KEY.values()) | {"ok"}:
+        assert key in tui.OUTCOME_COLOR, key
+        assert key in tui.GLYPH, key
+        assert key in tui.GLYPH_ASCII, key
+    # ``health`` maps an outcome onto a ROW status (its own labels, and
+    # the web's health() likewise); every other enumeration of outcomes
+    # is a divergent copy of outcome_key
+    lines = source.split("\n")
+    start = next(
+        i for i, ln in enumerate(lines) if ln.startswith("def health")
+    )
+    end = next(
+        i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln == ""
+    )
+    for num, line in enumerate(lines, 1):
+        if start < num <= end + 1:
+            continue
+        where = "%s:%d" % (path, num)
+        assert '.get(outcome, "ok")' not in line, (
+            "%s outcome ladder outside outcome_key" % where
+        )
+        hits = len(re.findall(r'outcome == "\w+"', line))
+        assert hits < 2, "%s outcome ladder outside outcome_key" % where
+
+
+def test_tui_paints_a_pause_held_slot_as_skipped_not_ok():
+    """#28 residual: the web fix routed both of its outcome ladders
+    through ``outcomeCls``, but the TUI's five copies were untouched, so
+    a paused job's held slots still painted success-green in the
+    terminal. Every panel that paints a run is checked here."""
+    assert tui.outcome_key("skipped") == "skipped"
+    assert tui.outcome_color("skipped") != tui.outcome_color("success")
+
+    # 1. sparkline (job rows and wallboard tiles)
+    cells = spark_cells(
+        [
+            {"outcome": "success", "duration": 1.0},
+            {"outcome": "skipped", "duration": 1.0},
+        ]
+    )
+    assert cells[0][1] == "ok"
+    assert cells[1][1] != "ok"
+
+
+async def test_tui_panels_paint_a_pause_held_slot_as_skipped(tmp_path):
+    """The rendering half of the check above: timeline, fleet matrix,
+    heatmap and the drawer's run history must not emit the theme's ok
+    ink for a ``skipped`` row."""
+    app = _bare_app(tmp_path)
+    paint = tui.Painter(app.theme)
+    ok_ink = app.theme.fg("ok")
+    when = "2020-01-01T10:00:00+00:00"
+
+    def ok_spans(rows: List[str], needle: str) -> List[str]:
+        return [r for r in rows if needle in strip_ansi(r) and ok_ink in r]
+
+    # 2. incident timeline
+    app.jobs = [
+        {
+            "name": "held",
+            "enabled": True,
+            "last_run": {"outcome": "skipped", "finished_at": when},
+        },
+        {
+            "name": "real",
+            "enabled": True,
+            "last_run": {"outcome": "success", "finished_at": when},
+        },
+    ]
+    rows = app.render_timeline(paint, 110, 24)
+    assert ok_spans(rows, "real"), "a real success still paints ok"
+    assert not ok_spans(rows, "held")
+
+    # 3. fleet matrix: the cell reads "skip", not a truncated "skippe"
+    app.fleet = {
+        "enabled": True,
+        "nodes": [
+            {
+                "name": "n1",
+                "jobs": {
+                    "held": {
+                        "last": {"outcome": "skipped", "finished_at": when}
+                    },
+                    "real": {
+                        "last": {"outcome": "success", "finished_at": when}
+                    },
+                },
+            }
+        ],
+    }
+    rows = app.render_fleet(paint, 110, 24)
+    assert ok_spans(rows, "real")
+    assert not ok_spans(rows, "held")
+    assert "skip " in strip_ansi("".join(rows))
+    assert "skippe" not in strip_ansi("".join(rows))
+
+    # 4. activity heatmap: an hour of nothing but pause holds is not green,
+    # but one real success in that same hour still outranks the holds
+    now = time.time()
+    stamp = (
+        datetime.datetime.fromtimestamp(now - 60, tz=datetime.timezone.utc)
+    ).isoformat()
+    app.heat_data = {
+        "held": [{"outcome": "skipped", "finished_at": stamp}],
+        "mixed": [
+            {"outcome": "skipped", "finished_at": stamp},
+            {"outcome": "success", "finished_at": stamp},
+        ],
+    }
+    rows = app.render_heat(paint, 110, 24)
+    assert not ok_spans(rows, "held")
+    assert ok_spans(rows, "mixed"), "a real success outranks the holds"
+
+    # 5. drawer run history / duration bars
+    app.drawer_runs = {
+        "stats": {"total": 2},
+        "runs": [
+            {"outcome": "skipped", "started_at": when, "duration": 1.0},
+            {"outcome": "success", "started_at": when, "duration": 1.0},
+        ],
+    }
+    rows = app._drawer_history(paint, 80, 24)
+    painted = [r for r in rows if ok_ink in r]
+    assert len(painted) == 1, "only the real success paints ok"
+
+
+def test_web_drawer_shows_the_sla_state_the_wiki_promises():
+    """``wiki/Web-Dashboard.md`` sends operators to the drawer to read an
+    overdue job's breached checks, so the drawer has to render them."""
+    import pathlib
+    import re
+
+    path, html = _web_page()
+    body = re.search(r"function renderDrawerMeta\(\)(.*?)\n  \}\n", html, re.S)
+    assert body, path
+    drawer = body.group(1)
+    assert 'job.sla.state === "late"' in drawer, path
+    assert "OVERDUE" in drawer, path
+    assert ".breaches" in drawer, path
+    assert ".drawer-head .meta .overdue" in html, path
+    wiki = (
+        pathlib.Path(tui.__file__).parent.parent / "wiki" / "Web-Dashboard.md"
+    ).read_text(encoding="utf-8")
+    assert "**OVERDUE** badge on its row, drawer, and wallboard tile" in wiki

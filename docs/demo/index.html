@@ -658,6 +658,7 @@
   .drawer-head h2 { margin: 0; font-size: 15px; font-weight: 700; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .drawer-head .meta { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 5px 12px; font-size: 11.5px; color: var(--fg-dim); }
   .drawer-head .meta b { color: var(--fg); font-weight: 700; }
+  .drawer-head .meta .overdue, .drawer-head .meta .overdue b { color: var(--fail); }
 
   .tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--bg2); }
   .tabs button {
@@ -1125,6 +1126,7 @@
   #fleetPanel .cell.fail { color: var(--fail); font-weight: 700; }
   #fleetPanel .cell.cancelled { color: var(--fg-dim); }
   #fleetPanel .cell.unknown { color: var(--unknown); }
+  #fleetPanel .cell.skipped { color: var(--fg-dim); }
   #fleetPanel .cell.run { color: var(--accent); }
   #fleetPanel .cell.none { color: var(--fg-faint); }
   #fleetPanel td.owner { box-shadow: inset 2px 0 0 var(--accent); }
@@ -1198,6 +1200,7 @@
   .tlrow .tlt { color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .tlrow .tlg { text-align: center; }
   .tlrow.ok .tlg { color: var(--ok); } .tlrow.fail .tlg { color: var(--fail); } .tlrow.cancelled .tlg { color: var(--cancelled); } .tlrow.unknown .tlg { color: var(--unknown); }
+  .tlrow.skipped .tlg { color: var(--fg-dim); }
   .tlrow .tlnm { font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tlrow .tlre { color: var(--fg-faint); font-size: 11px; }
   .tlrow .tlmeta { color: var(--fg-dim); font-size: 11px; white-space: nowrap; }
@@ -5874,7 +5877,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         else if (s.running) { cls = "cell run"; body = GLYPH.run + " running"; tip = "running now"; }
         else if (s.last) {
           const k = outcomeCls(s.last.outcome);
-          const g = s.last.outcome === "failure" ? GLYPH.fail : s.last.outcome === "cancelled" ? GLYPH.cancelled : s.last.outcome === "unknown" ? GLYPH.unknown : GLYPH.ok;
+          const g = GLYPH[k];
           cls = "cell " + k;
           body = g + " " + esc(s.last.outcome === "success" ? "ok" : s.last.outcome) +
             '<span class="age" data-ago-short="' + escAttr(s.last.finished_at || "") + '">' + esc(agoShort(s.last.finished_at)) + "</span>";
@@ -6159,6 +6162,13 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       const p = job.paused;
       parts.push("<span>⏸ paused until <b>" + esc(fmtAt(new Date(p.until).getTime())) + "</b>" +
         (p.by ? " by " + esc(p.by) : "") + (p.note ? ' · <span class="faint">' + esc(p.note) + "</span>" : "") + "</span>");
+    }
+    // the row chip buries the breached checks in a tooltip; the drawer is
+    // where an operator lands to read them, so spell them out here
+    if (job.sla && job.sla.state === "late") {
+      const checks = (job.sla.breaches || []).map((b) => b.check).join(", ");
+      parts.push('<span class="overdue">⚠ <b>OVERDUE</b>' +
+        (checks ? ' · <span class="faint">' + esc(checks) + "</span>" : "") + "</span>");
     }
     $("dMeta").innerHTML = parts.join("");
     $("dRun").disabled = !job.enabled || job.running;
@@ -9380,7 +9390,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     for (const j of state.jobs) {
       const lr = j.last_run;
       if (!lr || !lr.finished_at) continue;
-      const cls = lr.outcome === "failure" ? "fail" : lr.outcome === "cancelled" ? "cancelled" : "ok";
+      const cls = outcomeCls(lr.outcome);
       if (state.timeline.failOnly && cls !== "fail") continue;
       events.push({ name: j.name, cls: cls, fin: Date.parse(lr.finished_at) || 0, iso: lr.finished_at, x: lr.exit_code, d: lr.duration, r: lr.fail_reason || "" });
     }

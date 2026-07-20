@@ -22,6 +22,7 @@ from typing import (  # noqa
     Deque,
     Dict,
     FrozenSet,
+    Iterable,
     List,
     Optional,
     Set,
@@ -284,6 +285,17 @@ PAUSE_STREAM_KEEP = 8
 SLA_CHECK_STALE = "maxTimeSinceSuccess"
 SLA_CHECK_LATE = "lateAfter"
 SLA_CHECK_RUNTIME = "maxRuntime"
+# How deep the boot rehydrate re-reads a job's run ledger when the warmed
+# RUN_HISTORY_LIMIT window holds no success at all. Only jobs configuring
+# maxTimeSinceSuccess pay for it, and only when they are failing more often
+# than the warm window is wide (see _warm_last_success_beyond_history).
+SLA_SUCCESS_SCAN_LIMIT = 1000
+# How many finished pause windows are kept per job for the maxTimeSinceSuccess
+# pause credit. Windows the staleness reference has already overtaken are
+# dropped first, so reaching this cap needs that many pauses with no success
+# in between; the oldest is then dropped, understating the credit rather than
+# overstating it (see _sla_bank_pause).
+SLA_PAUSE_SPANS_MAX = 64
 # Aggregation windows served by GET /jobs/{name}/trends over the durable
 # ledger (label, seconds). Bounded by state.maxRunsPerJob retention.
 TREND_WINDOWS: Tuple[Tuple[str, float], ...] = (
@@ -462,8 +474,16 @@ class JobRunInfo:
         chart series: on for the durable ledger record (so charts survive
         restarts) and the dedicated resources endpoint, off for the polled
         payloads (/jobs and /jobs/{name}/runs stay summary-sized).
+
+        ``ranAt`` mirrors ``finished_at`` on every row that represents an
+        actual run, and is omitted entirely (never nulled: ``derive_max``
+        folds over whatever value a present field holds) on a synthetic
+        ``skipped`` one.  That gives the durable superseded-by-run guard a
+        watermark (:meth:`Cron.durable_last_completed_at`) a pause cannot
+        move, while ``finished_at`` stays unfiltered for the catch-up
+        watermark, which intentionally advances over pause-skipped slots.
         """
-        return {
+        data: Dict[str, Any] = {
             "outcome": self.outcome,
             "exit_code": self.exit_code,
             "started_at": (
@@ -484,6 +504,9 @@ class JobRunInfo:
                 else None
             ),
         }
+        if self.outcome != "skipped":
+            data["ranAt"] = self.finished_at.isoformat()
+        return data
 
 
 @dataclass(slots=True)
@@ -588,6 +611,22 @@ def _parse_iso_utc(value: Any) -> Optional[datetime.datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=datetime.timezone.utc)
     return parsed
+
+
+def _in_pause_window(
+    when: datetime.datetime,
+    window: Tuple[Optional[datetime.datetime], datetime.datetime],
+) -> bool:
+    """Whether ``when`` falls inside a durable pause window.
+
+    Half-open ``[since, until)``, the same window :meth:`Cron._pause_active`
+    enforces live (it reports a pause whose ``until`` has arrived as absent),
+    so a slot landing exactly on ``until`` is owed rather than excused.  A
+    ``since`` of ``None`` (a record without the field) means the window has
+    no known start and covers everything before ``until``.
+    """
+    since, until = window
+    return when < until and (since is None or when >= since)
 
 
 def _fold_manifest(
@@ -887,12 +926,32 @@ class Cron:
         # (_pause_active) and swept by the housekeeping pass. Pruned by
         # _apply_reload, so it too must exist before update_config() below.
         self._paused: Dict[str, PauseInfo] = {}
+        # monotonic count of local pause/resume writes per job. The
+        # _pause_write_tail entry below is level-triggered and its own
+        # done-callback deletes it, so a write that starts AND finishes
+        # inside a refresh's store read leaves no trace there; this counter
+        # is edge-triggered, which is what lets the refresh discard a
+        # snapshot taken before a local change landed.
+        self._pause_gen: Dict[str, int] = {}
+        # pause records that could not be written because the store is
+        # configured but down, newest per job, replayed when it comes back
+        # (see _defer_pause_write). Both are pruned by _apply_reload like
+        # _paused, so both must exist before update_config() below.
+        self._pause_pending_writes: Dict[str, Dict[str, Any]] = {}
         # name -> (finished_at, outcome) of the newest success/failure, for
         # the onlyIfLastSucceeded gate (see _depends_on_past_ok). run_history
         # is a bounded ring that a long pause floods with synthetic "skipped"
         # rows, so the gate cannot rely on it alone. Pruned by _apply_reload
         # like the trackers below, so it must exist before update_config().
         self._last_real_outcome: Dict[str, Tuple[datetime.datetime, str]] = {}
+        # name -> finished_at of the newest row that represents an actual
+        # run (anything but a synthetic "skipped"), for the retry ladder's
+        # superseded-by-run guards. last_run alone cannot serve them: a
+        # pause-held slot stamps a fresh finished_at on a row where nothing
+        # ran, which would settle a pending ladder as if the run happened.
+        # Pruned by _apply_reload like the trackers around it, so it must
+        # exist before the update_config() below.
+        self._last_completed_at: Dict[str, datetime.datetime] = {}
         # The SLA monitor's trackers (see _sla_periodic). All name-keyed
         # runtime state pruned by _apply_reload like _last_run_slot, so all
         # four must exist before the update_config() below.
@@ -914,6 +973,20 @@ class Cron:
         self._sla_state = {}  # type: Dict[Tuple[str, str], datetime.datetime]
         # the maxTimeSinceSuccess fallback baseline (see _sla_last_success).
         self._process_start = get_now(datetime.timezone.utc)
+        # name -> when the job first entered cron_jobs; seeded and pruned by
+        # _apply_reload (which runs from update_config() below, so every
+        # boot-present job is baselined on the process start beside it). The
+        # maxTimeSinceSuccess reference for a job with no success on record:
+        # a job a RELOAD added to a long-running daemon must age into the
+        # breach from when it appeared, not from a process start it predates.
+        self._sla_first_seen = {}  # type: Dict[str, datetime.datetime]
+        # name -> the (since, ended_at) of finished pause windows, disjoint and
+        # newest last. Deliberately held time is credited against
+        # maxTimeSinceSuccess, so a resumed job gets a full threshold before it
+        # can page instead of paging the instant the pause lifts.
+        self._sla_pause_windows: Dict[
+            str, List[Tuple[datetime.datetime, datetime.datetime]]
+        ] = {}
         # The next-fire index: name -> the aware-UTC instant the job next
         # fires, for every enabled CronTab job (a @reboot/string schedule or a
         # disabled job is absent). _fire_heap is a min-heap of (when, name)
@@ -993,6 +1066,12 @@ class Cron:
         # finish order. See _queue_job_completion.
         self._completion_tasks: Set[asyncio.Task] = set()
         self._completion_tail: Dict[str, asyncio.Task] = {}
+        # the monitor's onLate reports get their OWN per-job tail: they are
+        # tracked in _completion_tasks (so shutdown drains them) and ordered
+        # behind _completion_tail, but must never BECOME it: a slow reporter
+        # sitting in the completion tail would delay the report and retry
+        # arming of a real run finishing behind it. See _queue_sla_report.
+        self._sla_report_tail: Dict[str, asyncio.Task] = {}
         # whether the in-memory history has been warmed from the durable ledger
         # yet; rehydration runs once, on the first successful backend start.
         self._state_rehydrated = False
@@ -1106,6 +1185,11 @@ class Cron:
         # the cluster had not yet elected an owner; run once on convergence.
         # name -> JobConfig; see _process_pending_reboots.
         self._pending_reboot_jobs = {}  # type: Dict[str, JobConfig]
+        # @reboot jobs whose boot run a pause DEFERRED (never forfeited): the
+        # boot marker is left unwritten, so the run is still owed after a
+        # daemon restart inside the same OS boot, and _process_paused_reboots
+        # fires it once the pause lifts.
+        self._paused_reboot_jobs = set()  # type: Set[str]
         # A per-PROCESS token stamped into in-flight run records (with the
         # host and pid), so reconciliation can tell "a previous daemon on
         # this host wrote this" from "this very process wrote it" -- the
@@ -1366,13 +1450,21 @@ class Cron:
             await self.web_runner.cleanup()
 
     def _cancel_coordination_tasks(self) -> None:
-        """Cancel the Replace pursuits and the retry claim scan, if any."""
+        """Cancel the Replace pursuits, retry claim scan and pause refresh.
+
+        All three are scoped to the current state backend; the pause refresh
+        is cancelled rather than awaited because it mutates the pause gate
+        map, which nothing left in the shutdown path reads.
+        """
         for task in list(self._slot_pursuits.values()):
             task.cancel()
         self._slot_pursuits.clear()
         if self._retry_claim_task is not None:
             self._retry_claim_task.cancel()
             self._retry_claim_task = None
+        if self._pause_refresh_task is not None:
+            self._pause_refresh_task.cancel()
+            self._pause_refresh_task = None
 
     def signal_shutdown(self) -> None:
         logger.debug("Signalling shutdown")
@@ -1549,9 +1641,22 @@ class Cron:
         self._paused = {
             name: info for name, info in self._paused.items() if name in keep
         }
+        self._pause_gen = {
+            name: gen for name, gen in self._pause_gen.items() if name in keep
+        }
+        self._pause_pending_writes = {
+            name: rec
+            for name, rec in self._pause_pending_writes.items()
+            if name in keep
+        }
         self._last_real_outcome = {
             name: outcome
             for name, outcome in self._last_real_outcome.items()
+            if name in keep
+        }
+        self._last_completed_at = {
+            name: at
+            for name, at in self._last_completed_at.items()
             if name in keep
         }
         # The SLA trackers survive a job edit the same way (the thresholds
@@ -1577,6 +1682,23 @@ class Cron:
             for key, since in self._sla_state.items()
             if key[0] in keep
         }
+        self._sla_pause_windows = {
+            name: spans
+            for name, spans in self._sla_pause_windows.items()
+            if name in keep
+        }
+        # first-seen is the one tracker this pass also SEEDS: a job the reload
+        # just added gets its own baseline here, so it ages into
+        # maxTimeSinceSuccess from now rather than from a process start that
+        # may be days old.
+        self._sla_first_seen = {
+            name: at
+            for name, at in self._sla_first_seen.items()
+            if name in keep
+        }
+        seen_at = get_now(datetime.timezone.utc)
+        for name in self.cron_jobs:
+            self._sla_first_seen.setdefault(name, seen_at)
         # Prune the finished-run display data the same way. A removed job's
         # last_run/run_history is unreachable (jobs_payload and the /runs
         # endpoints iterate cron_jobs only), so keeping it is pure leaked
@@ -2532,6 +2654,18 @@ class Cron:
                     "as its boot run; retiring the pending entry",
                     name,
                 )
+        # Same for a boot run a pause deferred: the manual start IS it, so
+        # record the boot marker (the deferral left it unwritten) or the
+        # pause lifting would run the one-shot a second time.
+        if name in self._paused_reboot_jobs:
+            self._paused_reboot_jobs.discard(name)
+            logger.info(
+                "manual start of @reboot job %s counts as the boot run its "
+                "pause deferred",
+                name,
+            )
+            if self._state_configured:
+                await self._reboot_boot_gate(job)
         await self.maybe_launch_job(job)
 
     async def cancel_job_by_name(self, name: str) -> int:
@@ -2626,7 +2760,17 @@ class Cron:
         info = PauseInfo(
             since=now, until=until, note=note, by=by, channel=channel
         )
+        replaced = self._paused.get(name)
+        if replaced is not None:
+            # pausing a paused job overwrites the window: close the old one
+            # out at `now` so the time it already held is still credited, and
+            # so the stretch the two windows share is not credited twice.
+            self._sla_bank_pause(name, replaced, now)
         self._paused[name] = info
+        # the job is excused from here on: drop any breach it latched while it
+        # was still being evaluated, so the late gauge, the /jobs sla block and
+        # the OVERDUE chip clear on this response rather than a minute later.
+        self._sla_clear_latches(name)
         self.metrics.job_pause_state(name, True)
         self._persist_pause(name, info)
         logger.info(
@@ -2657,6 +2801,7 @@ class Cron:
         self.metrics.job_pause_state(name, False)
         self._persist_resume(name, by, channel)
         if was is not None:
+            self._sla_bank_pause(name, was, get_now(datetime.timezone.utc))
             logger.info("Job %s resumed by %s (%s)", name, by, channel)
 
     def _pause_active(self, name: str) -> Optional[PauseInfo]:
@@ -2711,11 +2856,19 @@ class Cron:
         the ``paused/`` streams as a tracked background task so peers
         sharing a store pick up each other's pauses and resumes within
         about a minute (the fire path itself never reads the store).
+
+        Records buffered by a failed append are retried first, so a store
+        that only hiccuped drains the backlog instead of holding those jobs
+        out of the refresh forever.  Retrying BEFORE the refresh is spawned
+        matters: :meth:`_queue_pause_write` installs the write tail
+        synchronously, so the refresh in the same pass already sees the
+        write in flight and leaves the job's memory alone.
         """
         now = get_now(datetime.timezone.utc)
         for name, info in list(self._paused.items()):
             if info.until <= now:
                 del self._paused[name]
+                self._sla_bank_pause(name, info, info.until)
                 self.metrics.job_pause_state(name, False)
                 logger.info(
                     "Job %s: pause expired at %s; scheduled runs resume",
@@ -2724,6 +2877,7 @@ class Cron:
                 )
         if self.state_backend is None:
             return
+        self._replay_pending_pause_writes()
         if self._pause_refresh_task is None or self._pause_refresh_task.done():
             self._pause_refresh_task = self._track_state_write(
                 self._refresh_pauses_from_store()
@@ -2735,13 +2889,16 @@ class Cron:
         Cross-node propagation (and the boot rehydrate): newest record per
         stream wins. A live ``paused`` record installs the window; a
         ``resumed`` (or expired, or absent) record clears it.  A job whose
-        own write chain still has a pause record in flight is skipped: this
-        node's memory is by definition newer than the store for it.  On any
-        store trouble the LAST KNOWN in-memory state is kept and a warning
-        logged, under both onStoreUnavailable policies, deliberately: a
-        pause is an operator convenience, not a correctness fence, so an
-        unreadable store must neither resurrect nor drop pauses at random,
-        and must never block firing.
+        own write chain still has a pause record in flight is skipped, as is
+        one whose write generation moved while its record was being read:
+        this node's memory is by definition newer than the store for it.  On
+        any store trouble the LAST KNOWN in-memory state is kept and a
+        warning logged, under both onStoreUnavailable policies,
+        deliberately: a pause is an operator convenience, not a correctness
+        fence, so an unreadable store must neither resurrect nor drop pauses
+        at random, and must never block firing.  Store trouble reading ONE
+        job's stream keeps only that job's state and the sweep carries on;
+        only a failure to enumerate the streams at all ends the pass.
         """
         backend = self.state_backend
         if backend is None:
@@ -2768,6 +2925,13 @@ class Cron:
             tail = self._pause_write_tail.get(name)
             if tail is not None and not tail.done():
                 continue  # our own newer write has not landed yet
+            if name in self._pause_pending_writes:
+                # a buffered record (store down, or an append that failed)
+                # means memory is newer than the stream for this job and the
+                # write is still owed: applying the record it supersedes
+                # would silently revoke the operator's pause or resume.
+                continue
+            gen = self._pause_gen.get(name, 0)
             try:
                 recs = await asyncio.wait_for(
                     backend.list_records(stream, limit=1, newest_first=True),
@@ -2782,10 +2946,34 @@ class Cron:
                     name,
                     ex,
                 )
-                return
+                # this job only: one unreadable stream must not starve every
+                # job after it in the sweep (the order is the store's sorted
+                # stream list, so it would be the same jobs every pass, and
+                # this sweep is also the boot rehydrate).
+                continue
+            if name not in self.cron_jobs:
+                # a reload removed the job while we were reading its stream.
+                # The generation guard below does not cover this: _apply_reload
+                # prunes _pause_gen along with _paused, so the sampled and the
+                # current generation are both 0 and it passes. Installing here
+                # would leave a permanent stale _paused entry and re-create the
+                # metric series prune() just dropped (PrometheusMetrics._job
+                # auto-creates), and no later sweep cleans either up: they
+                # all skip the stream at the membership test above.
+                continue
+            if self._pause_gen.get(name, 0) != gen:
+                # a local pause/resume landed while we were reading: memory
+                # is newer than the snapshot in hand. Re-checking the write
+                # tail is NOT enough, since a write that also completed
+                # inside that window has already deleted its tail entry.
+                continue
             info = self._pause_info_from_record(recs[0] if recs else None)
             if info is not None and info.until > now:
                 known = self._paused.get(name)
+                if known is not None and known.until != info.until:
+                    # a different window replaces the known one: bank what
+                    # the old one already held (see _sla_bank_pause).
+                    self._sla_bank_pause(name, known, now)
                 self._paused[name] = info
                 self.metrics.job_pause_state(name, True)
                 if known is None or known.until != info.until:
@@ -2794,9 +2982,14 @@ class Cron:
                         name,
                         info.until.isoformat(),
                     )
-            elif self._paused.pop(name, None) is not None:
-                self.metrics.job_pause_state(name, False)
-                logger.info("Job %s: resumed via the shared state store", name)
+            else:
+                was = self._paused.pop(name, None)
+                if was is not None:
+                    self._sla_bank_pause(name, was, now)
+                    self.metrics.job_pause_state(name, False)
+                    logger.info(
+                        "Job %s: resumed via the shared state store", name
+                    )
 
     @staticmethod
     def _pause_info_from_record(
@@ -2832,13 +3025,17 @@ class Cron:
         Called from the housekeeping pass (at most once per wall-clock
         minute) and deliberately NOT from _state_periodic: the checks are
         purely in-memory, so they must run with no state backend
-        configured. A disabled or paused job is excused (skipped whole,
-        latches left as they are), and under election only the job's
-        owning node evaluates it (:meth:`_cluster_allows`), so one breach
-        pages once, not once per node. The (job, check) latch drives the
-        transitions: ok to breached fires onLate ONCE, sets the late
-        gauge, counts the breach and warns; breached to ok clears the
-        gauge and logs, with no report. Reporters are queued through the
+        configured. A disabled or paused job is excused, and so is a job
+        this node does not own under election (:meth:`_cluster_allows`),
+        so one breach pages once, not once per node. Excused means the
+        job's latches are DROPPED, not merely left unevaluated: a job the
+        operator deliberately silenced must stop asserting a live breach,
+        and one still breaching when it becomes eligible again re-latches
+        and pages once, the same trade-off a restart already makes. The
+        (job, check) latch drives the transitions: ok to breached fires
+        onLate ONCE, sets the late gauge, counts the breach and warns;
+        breached to ok clears the gauge and logs, with no report.
+        Reporters are queued through the
         completion-task idiom (:meth:`_queue_sla_report`), never awaited
         here on the scheduler loop. The latch is in-memory only, so after
         a restart a still-breached check re-fires once; that is the
@@ -2852,8 +3049,18 @@ class Cron:
                 self._sla_clear_latches(name)
                 continue
             if not job.enabled or self._pause_active(name) is not None:
+                # excused: a breach latched before the pause/disable would
+                # otherwise pin cronstable_job_late, the /jobs sla block and
+                # the OVERDUE chip at breached for the whole window.
+                self._sla_clear_latches(name)
                 continue
             if not self._cluster_allows(job):
+                # not this node's job right now: same latch drop, and drop
+                # the lateAfter reference too. A slot recorded while this
+                # node owned the job would page the moment ownership came
+                # back, for a slot the owner of the day ran on time.
+                self._sla_clear_latches(name)
+                self._sla_due.pop(name, None)
                 continue
             observations = self._sla_observations(name, job, now)
             for check, (threshold, observed, breached) in observations.items():
@@ -2903,6 +3110,92 @@ class Cron:
             del self._sla_state[key]
             self.metrics.job_sla_late(name, key[1], False)
 
+    def _sla_peer_owns_slot(self, name: str) -> None:
+        """Excuse this node's lateAfter slot: a peer holds the run.
+
+        A cluster-scoped slot denied by a LIVE foreign holder means the
+        job is running somewhere in the fleet, so the slot this node
+        recorded as due was never this node's to launch.  Dropping the
+        reference lands lateAfter on its "nothing to be late for" branch
+        instead of paging every node that lost the race.  The fail-closed
+        denial (the store did not answer) deliberately keeps the
+        reference: no peer is known to have run it, so a breach there is
+        real.
+        """
+        self._sla_due.pop(name, None)
+
+    def _sla_stale_reference(self, name: str) -> datetime.datetime:
+        """The instant maxTimeSinceSuccess measures the job's staleness from.
+
+        The job's newest known success, fed by :meth:`_record_run` and
+        warmed from the durable ledger at rehydrate.  With none on record
+        (a stateless daemon, or a job that has never succeeded) it falls
+        back to when the job was first seen, so a fresh boot and a job a
+        reload just added both age into the breach instead of paging
+        instantly.  Process start is the last resort, for a name that
+        somehow predates the first-seen map.
+        """
+        reference = self._sla_last_success.get(name)
+        if reference is not None:
+            return reference
+        return self._sla_first_seen.get(name, self._process_start)
+
+    def _sla_bank_pause(
+        self, name: str, was: PauseInfo, ended_at: datetime.datetime
+    ) -> None:
+        """Bank a pause window that just ended, for the staleness credit.
+
+        Called wherever a window leaves ``self._paused``: the expiry
+        sweep, an explicit resume, a re-pause that overwrites the window,
+        and a peer's pause/resume arriving through the store refresh.  A
+        window that overlaps the newest banked one EXTENDS it instead of
+        banking the shared stretch twice, so repeated and overlapping
+        pauses each count exactly once; a window rehydrated from the store
+        carries its original ``since``, so a pause spanning a restart is
+        credited whole.  Windows the staleness reference has already
+        passed can never contribute again and are dropped, and what is
+        left is capped: dropping the OLDEST span understates the credit,
+        which fails toward paging.
+        """
+        if ended_at > was.until:
+            ended_at = was.until
+        if ended_at <= was.since:
+            return
+        spans = self._sla_pause_windows.setdefault(name, [])
+        if spans and was.since <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], ended_at))
+        else:
+            spans.append((was.since, ended_at))
+        reference = self._sla_stale_reference(name)
+        spans = [span for span in spans if span[1] > reference]
+        del spans[:-SLA_PAUSE_SPANS_MAX]
+        if spans:
+            self._sla_pause_windows[name] = spans
+        else:
+            del self._sla_pause_windows[name]
+
+    def _sla_paused_seconds(
+        self, name: str, reference: datetime.datetime, now: datetime.datetime
+    ) -> float:
+        """Seconds of ``[reference, now]`` the job spent deliberately paused.
+
+        Credited against maxTimeSinceSuccess so a held job gets a full
+        threshold once the pause lifts, rather than paging unattended the
+        instant it does.  The banked windows are disjoint
+        (:meth:`_sla_bank_pause`) and clamped to the measured interval
+        here, so no window counts twice and none counts before the
+        reference the check is measuring from.
+        """
+        spans = self._sla_pause_windows.get(name)
+        if not spans:
+            return 0.0
+        credit = 0.0
+        for start, end in spans:
+            overlap = (min(now, end) - max(reference, start)).total_seconds()
+            if overlap > 0:
+                credit += overlap
+        return credit
+
     def _sla_observations(
         self, name: str, job: JobConfig, now: datetime.datetime
     ) -> Dict[str, Tuple[int, float, bool]]:
@@ -2917,16 +3210,13 @@ class Cron:
         out: Dict[str, Tuple[int, float, bool]] = {}
         threshold = job.sla.get("maxTimeSinceSuccessSeconds")
         if threshold is not None:
-            reference = self._sla_last_success.get(name)
-            if reference is None:
-                # no success on record (stateless daemon, or the job never
-                # succeeded): baseline on process start, so a fresh boot
-                # ages into the breach instead of paging instantly. With a
-                # durable ledger the rehydrated real value is used, and
-                # paging soon after boot for a genuinely stale job is
-                # correct.
-                reference = self._process_start
-            observed = (now - reference).total_seconds()
+            reference = self._sla_stale_reference(name)
+            # time the operator deliberately held the job is not staleness:
+            # excluding it gives a resumed job a full threshold before it can
+            # page, the same excusal lateAfter already gets in _launch_plan.
+            observed = (now - reference).total_seconds() - (
+                self._sla_paused_seconds(name, reference, now)
+            )
             out[SLA_CHECK_STALE] = (threshold, observed, observed > threshold)
         threshold = job.sla.get("lateAfterSeconds")
         if threshold is not None:
@@ -2942,7 +3232,13 @@ class Cron:
                     threshold,
                     observed,
                     observed > threshold
-                    and (started is None or started < due),
+                    and (started is None or started < due)
+                    # an instance is still running, so the slot the
+                    # concurrency policy dropped is not an unserved slot:
+                    # an overrun is maxRuntime's to report, once. Read with
+                    # .get(): running_jobs is a defaultdict, and a bare
+                    # subscript here would mint a phantom key.
+                    and not self.running_jobs.get(name),
                 )
         threshold = job.sla.get("maxRuntimeSeconds")
         if threshold is not None:
@@ -2970,11 +3266,17 @@ class Cron:
 
         The :meth:`_queue_job_completion` idiom: reporters (SMTP, shell
         commands, webhooks) legitimately take tens of seconds and must
-        never run inline on the scheduler loop. Chaining behind
-        ``_completion_tail`` keeps the breach report ordered after the
-        same job's in-flight completion reports, and ``_completion_tasks``
-        membership means shutdown (and tests) drain it via
-        :meth:`_drain_completions`.
+        never run inline on the scheduler loop. The report waits behind
+        ``_completion_tail`` (so it is ordered after the same job's
+        in-flight completion reports) but installs itself in its OWN
+        ``_sla_report_tail`` instead of becoming the completion tail: a
+        monitor-initiated report must never sit in FRONT of a real run's
+        report+retry-arm sequence, which blocks on the completion tail.
+        maxRuntime makes that the ordinary case rather than a corner: it
+        breaches while the run is still executing, so the report is
+        guaranteed to be in flight when that run finishes.
+        ``_completion_tasks`` membership still means shutdown (and tests)
+        drain it via :meth:`_drain_completions`.
         """
         name = job.name
         last_success = self._sla_last_success.get(name)
@@ -2988,11 +3290,15 @@ class Cron:
             ),
         )
         report_config = job.onLate["report"]
-        prev = self._completion_tail.get(name)
+        earlier = [
+            self._completion_tail.get(name),
+            self._sla_report_tail.get(name),
+        ]
 
         async def _sequenced() -> None:
-            if prev is not None and not prev.done():
-                await asyncio.wait({prev})
+            for prev in earlier:
+                if prev is not None and not prev.done():
+                    await asyncio.wait({prev})
             try:
                 await report_sla_breach(ctx, report_config)
             except asyncio.CancelledError:
@@ -3007,11 +3313,11 @@ class Cron:
         task = asyncio.create_task(_sequenced())
         self._completion_tasks.add(task)
         task.add_done_callback(self._completion_tasks.discard)
-        self._completion_tail[name] = task
+        self._sla_report_tail[name] = task
 
         def _clear(done: asyncio.Task) -> None:
-            if self._completion_tail.get(name) is done:
-                del self._completion_tail[name]
+            if self._sla_report_tail.get(name) is done:
+                del self._sla_report_tail[name]
 
         task.add_done_callback(_clear)
 
@@ -3372,9 +3678,12 @@ class Cron:
                 "breaches": breaches,
             }
         # a deferred @reboot one-shot still awaiting its boot run (the cluster
-        # had not elected an owner at boot): lets the dashboard distinguish
-        # "pending boot run" from "already ran".
-        if name in self._pending_reboot_jobs:
+        # had not elected an owner at boot, or a pause is holding it): lets
+        # the dashboard distinguish "pending boot run" from "already ran".
+        if (
+            name in self._pending_reboot_jobs
+            or name in self._paused_reboot_jobs
+        ):
             result["rebootPending"] = True
         # cluster-wide concurrency slot (concurrencyScope: cluster): whether
         # THIS node holds the job's slot lease and how many live instances
@@ -4696,6 +5005,22 @@ class Cron:
             state_config is None or state_config != backend.config
         ):
             logger.info("state: configuration changed, stopping")
+            # the pause refresh reads the OLD store through a local backend
+            # binding it captured before the swap: left to finish, it
+            # re-installs that store's pauses into the gate map on top of
+            # whatever the new store's rehydrate just resolved. Cancel it
+            # BEFORE the first await of this teardown: both stop() and
+            # _stop_job_api() yield (with a keep-alive connection open the
+            # latter spans several loop turns), and a pass whose store read
+            # resolves in that window runs its whole mutation loop against
+            # the abandoned store before any later cancel is reached. The
+            # new store's rehydrate does not undo it either: that pass
+            # walks only the streams that exist in the NEW store, so a job
+            # with no paused/ stream there stays gated until the dead
+            # window's own `until` elapses.
+            if self._pause_refresh_task is not None:
+                self._pause_refresh_task.cancel()
+                self._pause_refresh_task = None
             await backend.stop()
             self.state_backend = None
             # the loopback job-state API belongs to this backend generation
@@ -4761,6 +5086,10 @@ class Cron:
             # gcGraceSeconds is what protects young state, not a delay here.
             self._manifest_next = 0.0
             self._gc_next = 0.0
+            # land any pause/resume taken while the store was down BEFORE
+            # the rehydrate below re-reads the paused/ streams, so it cannot
+            # revert those jobs to the records they supersede.
+            self._replay_pending_pause_writes()
             # warm the in-memory history from the ledger the first time a
             # backend comes up, so a restart's dashboard/status is populated at
             # once instead of blank until each job next runs.
@@ -5673,19 +6002,24 @@ class Cron:
                 return watermark
         return None
 
-    async def _pause_watermark_floor(
+    async def _pause_excusal_window(
         self, name: str
-    ) -> Optional[datetime.datetime]:
-        """The newest durable pause window's ``until``, for catch-up only.
+    ) -> Optional[Tuple[Optional[datetime.datetime], datetime.datetime]]:
+        """The newest durable pause window ``(since, until)``, for catch-up.
 
         Slots that fell inside a pause window while the daemon was DOWN are
         not owed (a live pause skips them via the ledger rows; being down
-        must not owe more), so catch-up floors its missed-occurrence window
-        here.  Read from the store, not ``self._paused``: an EXPIRED pause
-        is absent from memory at every read site by design, yet its window
-        still excuses the slots it covered.  Degrades to no floor on store
-        trouble (backfilling is the pre-pause behaviour, and pause is an
-        operator convenience, not a correctness fence).
+        must not owe more), so catch-up excuses the occurrences inside this
+        window.  It is a window, NOT a floor: a backlog owed from before
+        ``since`` predates the operator's decision to pause and is still
+        owed once the pause lifts, exactly as the slots after ``until`` are.
+        Read from the store, not ``self._paused``: an EXPIRED pause is
+        absent from memory at every read site by design, yet its window
+        still excuses the slots it covered.  ``since`` reads as ``None`` on
+        a record that does not carry it, which excuses everything up to
+        ``until``.  Degrades to no window on store trouble (backfilling is
+        the pre-pause behaviour, and pause is an operator convenience, not a
+        correctness fence).
         """
         backend = self.state_backend
         if backend is None:
@@ -5699,7 +6033,7 @@ class Cron:
             )
         except asyncio.CancelledError:
             raise
-        except Exception as ex:  # noqa: BLE001 - degrade to no floor
+        except Exception as ex:  # noqa: BLE001 - degrade to no window
             logger.warning(
                 "catch-up: cannot read the %s pause stream (%s); assuming "
                 "no pause window",
@@ -5708,7 +6042,9 @@ class Cron:
             )
             return None
         if recs and recs[0].get("kind") == "paused":
-            return _parse_iso_utc(recs[0].get("until"))
+            until = _parse_iso_utc(recs[0].get("until"))
+            if until is not None:
+                return _parse_iso_utc(recs[0].get("since")), until
         return None
 
     async def _checkpoint_catchup(
@@ -5761,6 +6097,9 @@ class Cron:
         (see :meth:`_pending_catchup_watermark`) -- and steps the schedule
         forward from it (DST-safe, via :meth:`_compute_next_fire`), bounded by
         ``startingDeadlineSeconds`` and :data:`MAX_CATCHUP_OCCURRENCES`.
+        Occurrences inside a durable pause window are stepped over instead of
+        counted (see :meth:`_pause_excusal_window`); occurrences on either
+        side of it stay owed.
         Returns ``(0, ...)`` when nothing was missed or the job never ran
         under this store (no reference point, so -- like anacron/systemd -- a
         first-ever run just schedules forward); ``(1, ...)`` for ``run-once``
@@ -5781,26 +6120,34 @@ class Cron:
         if after is None:
             return 0, None
         # Slots inside a (possibly already expired) pause window are never
-        # owed: floor the window at the pause's `until`. Slots after the
-        # expiry are owed as normal.
-        pause_until = await self._pause_watermark_floor(job.name)
-        if pause_until is not None and pause_until > after:
-            after = pause_until
+        # owed, and ONLY those: the window is skipped over while walking,
+        # never used as a floor on `after`, so slots that came due before
+        # the operator paused stay owed (see _pause_excusal_window).
+        window = await self._pause_excusal_window(job.name)
         deadline = job.startingDeadlineSeconds
         if deadline:
             cutoff = now - datetime.timedelta(seconds=deadline)
             if cutoff > after:
                 after = cutoff  # only the recent window (bounds run-all)
+        count = 0
         nxt = self._compute_next_fire(job, after)
-        if nxt is None or nxt > now:
-            return 0, watermark
-        if job.onMissed == "run-once":
-            return 1, watermark
-        # run-all: count each missed occurrence, hard-capped.
-        count = 1
-        nxt = self._compute_next_fire(job, nxt)
         while nxt is not None and nxt <= now:
+            if window is not None and _in_pause_window(nxt, window):
+                # Jump the cursor to the window's end rather than stepping
+                # over every excused slot: a long pause on a per-minute job
+                # is thousands of them. One microsecond back so a slot
+                # landing exactly on `until` (outside the half-open window)
+                # is not stepped past. There is only ever one window, so
+                # drop it once crossed.
+                nxt = self._compute_next_fire(
+                    job, window[1] - datetime.timedelta(microseconds=1)
+                )
+                window = None
+                continue
             count += 1
+            if job.onMissed == "run-once":
+                return 1, watermark  # all missed slots coalesce into one
+            # run-all: count each missed occurrence, hard-capped.
             if count >= MAX_CATCHUP_OCCURRENCES:
                 logger.warning(
                     "catch-up: %s missed at least %d runs; replaying %d and "
@@ -5827,9 +6174,11 @@ class Cron:
 
         Resolution is NOT latched while it cannot actually happen yet: with a
         configured-but-unstarted backend (start_stop_state retries it every
-        housekeeping pass) or a cluster that has no positive owner for a job
-        yet (still electing at boot), the affected jobs stay pending and are
-        re-evaluated every :data:`CATCHUP_RECHECK_INTERVAL`.  Latching there
+        housekeeping pass), a cluster that has no positive owner for a job
+        yet (still electing at boot), or a live pause (which excuses the
+        slots inside its own window, not a backlog owed from before it), the
+        affected jobs stay pending and are re-evaluated every
+        :data:`CATCHUP_RECHECK_INTERVAL`.  Latching there
         (the old behaviour) forfeited the owed backfill forever.  Per-job
         decisions that ARE final -- backfill scheduled, nothing owed, another
         node positively owns it -- are remembered in ``_catchup_done`` so they
@@ -5920,16 +6269,18 @@ class Cron:
                 self._catchup_done.add(name)
                 continue
             if self._pause_active(name) is not None:
-                # no backfill while paused: live slots are excused by their
-                # skipped ledger rows, and down-time slots inside the pause
-                # window are excused by the watermark floor; either way,
-                # nothing here is owed.
-                logger.info(
-                    "catch-up: %s is paused; nothing is owed for the "
-                    "pause window",
+                # No backfill while paused, but a pause is transient and
+                # excuses only its own window: a backlog owed from before it
+                # began survives it. Defer (like a transient cluster denial),
+                # never latch, or that backlog is forfeited forever. The
+                # deferred retry still counts only the pre-boot downtime:
+                # every pass is anchored to _catchup_reference.
+                logger.debug(
+                    "catch-up: %s is paused; deferring its evaluation until "
+                    "the pause lifts",
                     name,
                 )
-                self._catchup_done.add(name)
+                unresolved = True
                 continue
             # Gate before the durable read: no store I/O for a job this
             # node may not run.
@@ -6106,7 +6457,7 @@ class Cron:
                 if self._pause_active(job.name) is not None:
                     # dropping WITHOUT closing the checkpoint: slots owed
                     # from before the pause stay resumable after it expires
-                    # (the watermark floor excuses only the window itself).
+                    # (the pause window excuses only its own slots).
                     logger.info(
                         "catch-up: %s was paused mid-backfill; dropping "
                         "the remaining runs",
@@ -6210,6 +6561,7 @@ class Cron:
         else:
             await self._spawn_due_jobs(now)
         await self._process_pending_reboots()
+        await self._process_paused_reboots()
 
     async def _spawn_reboot_jobs(self) -> None:
         """Launch ``@reboot`` jobs at start-up, in config order.
@@ -6220,6 +6572,11 @@ class Cron:
         skip it forever (Leader sees no quorum) or run it on every node
         (PreferLeader sees only itself).  ``EveryNode`` @reboot is not
         deferred: it is meant to run on every node at boot.
+
+        A PAUSED @reboot job is deferred too (:meth:`_process_paused_reboots`)
+        instead of being handed to the launcher, whose pause gate would skip
+        it after :meth:`_reboot_boot_gate` had already burnt this OS boot's
+        marker: a pause defers the boot run, it does not forfeit it.
         """
         to_launch = []  # type: List[JobConfig]
         for job in self.cron_jobs.values():
@@ -6236,12 +6593,81 @@ class Cron:
                 )
                 continue
             if self._cluster_allows(job):
+                if self._pause_active(job.name) is not None:
+                    self._defer_paused_reboot(job.name)
+                    continue
                 to_launch.append(job)
         if to_launch and self._state_configured:
             # state-backed boot dedupe (standalone / EveryNode): a daemon
             # restart within one OS boot must not re-run boot one-shots.
             # Deferred Leader/PreferLeader jobs never reach here; their
             # dedupe is the cluster's reboot_ran path.
+            gated = []
+            for job in to_launch:
+                if await self._reboot_boot_gate(job):
+                    gated.append(job)
+            to_launch = gated
+        await self._launch_concurrently(to_launch)
+
+    def _defer_paused_reboot(self, name: str) -> None:
+        """Hold a paused @reboot job's boot run until the pause lifts."""
+        if name in self._paused_reboot_jobs:
+            return
+        self._paused_reboot_jobs.add(name)
+        pause = self._pause_active(name)
+        logger.info(
+            "Job %s (@reboot) is paused%s; its boot run is deferred, not "
+            "lost: no boot marker is recorded, so it runs once the pause "
+            "lifts (or after a restart, still once per OS boot)",
+            name,
+            (
+                " until {}".format(pause.until.isoformat())
+                if pause is not None
+                else ""
+            ),
+        )
+
+    async def _process_paused_reboots(self) -> None:
+        """Run a paused @reboot job's deferred boot run once the pause lifts.
+
+        Called every scheduling pass (:meth:`spawn_jobs`), so an expiry or an
+        explicit resume fires the held one-shot without a restart.  The boot
+        marker is written HERE, by the normal :meth:`_reboot_boot_gate`, so
+        the deferred run is still deduplicated to once per OS boot: a daemon
+        that restarts while the job is still paused finds no marker, defers
+        again, and still owes the run.
+
+        Retirement mirrors :meth:`_process_pending_reboots`: a name that is
+        momentarily absent from ``cron_jobs`` stays owed (never-lose), while
+        one reused for a job that is no longer an enabled ``@reboot`` is
+        dropped without running.
+        """
+        if not self._paused_reboot_jobs:
+            return
+        to_launch = []  # type: List[JobConfig]
+        for name in list(self._paused_reboot_jobs):
+            job = self.cron_jobs.get(name)
+            if job is None:
+                continue  # transiently absent -> still owed, re-check later
+            if (
+                not isinstance(job.schedule, str)
+                or job.schedule != "@reboot"
+                or not job.enabled
+            ):
+                self._paused_reboot_jobs.discard(name)
+                continue
+            if self._pause_active(name) is not None:
+                continue
+            if not self._cluster_allows(job):
+                continue  # ownership moved: keep it owed, as the gated path
+            self._paused_reboot_jobs.discard(name)
+            logger.info(
+                "Job %s (@reboot): its pause lifted; running the boot run "
+                "it deferred",
+                name,
+            )
+            to_launch.append(job)
+        if to_launch and self._state_configured:
             gated = []
             for job in to_launch:
                 if await self._reboot_boot_gate(job):
@@ -6313,11 +6739,16 @@ class Cron:
                 # gate on the cluster -- recorded whether or not this node runs
                 # it, mirroring the old per-slot bookkeeping.
                 self._last_run_slot[job.name] = fires[r]
-                # the lateAfter reference: a slot skipped by a pause is
-                # excused, so it must never become the check's due slot.
-                if self._pause_active(job.name) is None:
-                    self._sla_due[job.name] = fires[r]
                 if self._cluster_allows(job):
+                    # the lateAfter reference, recorded INSIDE the ownership
+                    # gate: only the node that would actually run the slot
+                    # owes it. A follower recording slots it never launches
+                    # has no matching _sla_last_start, so the next failover
+                    # would page a false breach on the incoming owner the
+                    # moment the gate opened. A slot skipped by a pause is
+                    # excused, so it never becomes the check's due slot.
+                    if self._pause_active(job.name) is None:
+                        self._sla_due[job.name] = fires[r]
                     to_launch.append(job)
             await self._launch_concurrently(to_launch)
 
@@ -6547,6 +6978,11 @@ class Cron:
         deferrable @reboot (e.g. it became ``EveryNode`` or a real schedule),
         the pending entry is retired and the new job is left to its own
         scheduling.
+
+        A PAUSED job keeps its pending entry untouched on every branch: a
+        pause defers the boot run rather than forfeiting it, so neither the
+        cluster's ``mark_reboot_ran`` token nor the entry itself is spent on
+        a run the launcher's pause gate would merely skip.
         """
         if not self._pending_reboot_jobs:
             return
@@ -6561,6 +6997,10 @@ class Cron:
                 job = self.cron_jobs.get(name)
                 if job is None:
                     continue  # transiently absent -> keep pending, re-check
+                if self._pause_active(name) is not None:
+                    # a pause DEFERS the boot run: keep it pending rather
+                    # than retiring it unrun, and re-check next wakeup.
+                    continue
                 del self._pending_reboot_jobs[name]
                 # a job disabled (enabled: false) on the reload that also
                 # removed election is retired without running, the same way
@@ -6603,6 +7043,8 @@ class Cron:
                     # refuses a disabled job on the normal scheduled path.
                     del self._pending_reboot_jobs[name]
                     continue
+                if self._pause_active(name) is not None:
+                    continue  # deferred by the pause; still owed
                 if job.clusterPolicy == "PreferLeader":
                     del self._pending_reboot_jobs[name]
                     logger.info(
@@ -6655,6 +7097,12 @@ class Cron:
                     "cluster; standing down here",
                     name,
                 )
+                continue
+            if self._pause_active(name) is not None:
+                # a pause DEFERS the boot run: keep the entry pending so the
+                # one-shot runs when the pause lifts. mark_reboot_ran must
+                # not burn the cluster's once-per-boot token for a run the
+                # launcher's pause gate would only skip.
                 continue
             # Gate on the SAME boolean owner check as a scheduled job
             # (_cluster_allows), not a name comparison: a lease backend's
@@ -6956,7 +7404,10 @@ class Cron:
         # gate already ran, so under election exactly the owning node writes
         # the skip row. The synthetic ledger row is what keeps the derived
         # catch-up watermark advancing across the pause: its finished_at is
-        # the skip instant, so the skipped slots are never owed later.
+        # the skip instant, so the skipped slots are never owed later. It
+        # carries no ``ranAt`` and never enters _last_completed_at, so the
+        # retry ladder's superseded-by-run guards cannot mistake a held
+        # slot for the run that would resolve them.
         pause = self._pause_active(job.name)
         if pause is not None:
             logger.info(
@@ -7333,9 +7784,11 @@ class Cron:
                             name,
                             observed.holder.rsplit("#", 1)[0],
                         )
+                        self._sla_peer_owns_slot(name)
                         return False
                     else:  # Replace
                         self._spawn_slot_pursuit(job, observed)
+                        self._sla_peer_owns_slot(name)
                         return False
                 if got is None and not answered:
                     return _unavailable("the store did not answer")
@@ -7935,6 +8388,10 @@ class Cron:
         }
         if job is None or job.onMissed == "skip":
             data["finished_at"] = started_iso
+            # the run-instant mirror the durable superseded-by-run guard
+            # folds over (see JobRunInfo.to_dict): an interrupted run IS a
+            # run, so a ladder armed before it started is resolved.
+            data["ranAt"] = started_iso
         else:
             data["interruptedAt"] = started_iso
         self._queue_inflight_write(
@@ -7958,6 +8415,13 @@ class Cron:
         )
         self.run_history[name].append(info)
         self.last_run[name] = info
+        # a takeover can reconcile a foreign record older than a run this
+        # node already recorded, so advance the supersede watermark rather
+        # than assigning it (the durable side is a derive_max, i.e. already
+        # monotonic).
+        previous = self._last_completed_at.get(name)
+        if previous is None or finished > previous:
+            self._last_completed_at[name] = finished
         logger.warning(
             "Job %s: reconciled an interrupted run (%s): %s",
             name,
@@ -8116,6 +8580,13 @@ class Cron:
             info.finished_at is not None
         ):
             self._last_real_outcome[name] = (info.finished_at, info.outcome)
+        # the retry ladder's superseded-by-run watermark (see
+        # _validate_pending_retry). Every outcome but "skipped" counts: a
+        # cancelled or crash-reconciled run still resolved the attempt,
+        # while a pause-held slot ran nothing and must not settle a ladder
+        # that is only waiting for the resume.
+        if info.outcome != "skipped" and info.finished_at is not None:
+            self._last_completed_at[name] = info.finished_at
         # and, when a durable state backend is configured, persist the run to
         # the ledger so history/last-run survive a restart. Fire-and-forget: a
         # slow store must never stall run handling, so the write is a tracked
@@ -8287,6 +8758,60 @@ class Cron:
             ),
         )
 
+    async def _warm_last_success_beyond_history(
+        self, name: str, history: Iterable[JobRunInfo]
+    ) -> None:
+        """Find the staleness reference outside the warmed history window.
+
+        The rehydrate warms RUN_HISTORY_LIMIT records; a job failing more
+        often than that since its last success has no success among them,
+        and leaving the reference unset re-baselines maxTimeSinceSuccess
+        on process start, so every restart buys a genuinely stale job
+        another silent threshold.  Re-read the stream once, deeper (the
+        ledger usually still holds the success: maxRunsPerJob defaults an
+        order of magnitude above the warm window), and failing that fall
+        back to the OLDEST record seen by either read.  Every record seen
+        is a non-success, so the true last success is at or before it: a
+        lower bound on staleness, which can only page later than the
+        truth, never earlier.  Only jobs configuring the check reach here,
+        so nothing else pays for the extra read.
+        """
+        backend = self.state_backend
+        seen = [r.finished_at for r in history if r.finished_at is not None]
+        if backend is not None:
+            deeper = max(SLA_SUCCESS_SCAN_LIMIT, self._state_max_runs)
+            try:
+                recs = await asyncio.wait_for(
+                    backend.list_records(
+                        self._run_stream(name),
+                        limit=deeper,
+                        newest_first=True,
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - the floor below stands
+                logger.warning(
+                    "state: cannot widen the last-success scan for %s "
+                    "(falling back to the oldest warmed record): %s",
+                    name,
+                    ex,
+                )
+                recs = []
+            successes = []
+            for restored in (_job_run_info_from_dict(r) for r in recs):
+                if restored is None or restored.finished_at is None:
+                    continue
+                if restored.outcome == "success":
+                    successes.append(restored.finished_at)
+                seen.append(restored.finished_at)
+            if successes:
+                self._sla_last_success.setdefault(name, max(successes))
+                return
+        if seen:
+            self._sla_last_success.setdefault(name, min(seen))
+
     async def _rehydrate_from_state(self) -> None:
         """Warm the in-memory history from the durable ledger, once, on boot.
 
@@ -8352,16 +8877,29 @@ class Cron:
                 # warm the staleness reference too: with a durable ledger
                 # the maxTimeSinceSuccess check must page from the REAL
                 # last success after a restart, not re-baseline on process
-                # start (that grace is only for stateless boots).
-                for restored in reversed(history):
-                    if (
-                        restored.outcome == "success"
-                        and restored.finished_at is not None
+                # start (that grace is only for stateless boots). By
+                # finished_at, not by position: record filenames order on
+                # WRITE time and run-record writes are unserialized, so the
+                # last-APPENDED success can be older than one appended
+                # before it.
+                successes = [
+                    r.finished_at
+                    for r in history
+                    if r.outcome == "success" and r.finished_at is not None
+                ]
+                if successes:
+                    self._sla_last_success.setdefault(name, max(successes))
+                else:
+                    # a reload during one of the awaits above can drop the
+                    # job, so .get() rather than a subscript.
+                    warmed_job = self.cron_jobs.get(name)
+                    if warmed_job is not None and (
+                        warmed_job.sla.get("maxTimeSinceSuccessSeconds")
+                        is not None
                     ):
-                        self._sla_last_success.setdefault(
-                            name, restored.finished_at
+                        await self._warm_last_success_beyond_history(
+                            name, history
                         )
-                        break
                 # and the onlyIfLastSucceeded memo, for the same reason the
                 # gate keeps one: a pause running across the restart would
                 # otherwise leave the warmed ring full of "skipped" rows
@@ -8373,6 +8911,20 @@ class Cron:
                     ):
                         self._last_real_outcome.setdefault(
                             name, (restored.finished_at, restored.outcome)
+                        )
+                        break
+                # and the retry ladder's supersede watermark: last_run is
+                # history[-1], which a pause running across the restart
+                # makes a "skipped" row with a fresh finished_at. Reading
+                # the ladder's guard off that row would settle every
+                # pending retry the pause is merely holding.
+                for restored in reversed(history):
+                    if (
+                        restored.outcome != "skipped"
+                        and restored.finished_at is not None
+                    ):
+                        self._last_completed_at.setdefault(
+                            name, restored.finished_at
                         )
                         break
         if warmed:
@@ -8588,8 +9140,14 @@ class Cron:
             or _parse_iso_utc(rec.get("at"))
             or not_before
         )
-        last = self.last_run.get(name)
-        if last is not None and last.finished_at > armed_at:
+        # the newest ACTUAL run, not last_run: a pause-held slot appends a
+        # "skipped" row stamped now, and reading last_run here would settle
+        # every ladder the pause is only holding until the resume. It must
+        # still be the newest non-skipped instant rather than "ignore the
+        # guard when last_run is skipped", or a real run buried under a
+        # later pause would go unseen and the ladder would double-run.
+        last_at = self._last_completed_at.get(name)
+        if last_at is not None and last_at > armed_at:
             # a run finished AFTER this retry was armed: the ladder was
             # resolved some way (its settle may have been dropped while
             # the store was down). No-run beats double-run.
@@ -8628,6 +9186,44 @@ class Cron:
             self._run_stream(name), "finished_at"
         )
         return result if isinstance(result, str) else None
+
+    async def durable_last_completed_at(self, name: str) -> Optional[str]:
+        """The last ACTUAL-run timestamp for a job, from the durable ledger.
+
+        :meth:`durable_last_run_at`'s skip-blind twin, for the cross-node
+        superseded-by-run guard.  ``finished_at`` is stamped on synthetic
+        ``skipped`` rows too (deliberately: the catch-up watermark must
+        advance over a pause rather than owe every held slot on resume), so
+        folding it here would let a pause settle every ladder the pause is
+        only holding.  This folds ``ranAt`` instead, which
+        :meth:`JobRunInfo.to_dict` writes on run rows only.
+
+        Records appended before ``ranAt`` existed carry only ``finished_at``,
+        and dropping them would re-arm ladders an upgrade's own ledger
+        already proves resolved, so the newest window of them is folded in
+        by outcome.  No pause could have written a ``skipped`` row into that
+        older shape, and a row carrying ``ranAt`` is already folded above.
+
+        Only the claim scan reads this, and only when a foreign stale
+        ladder actually exists, so the second read costs nothing in steady
+        state.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return None
+        stream = self._run_stream(name)
+        derived = await backend.derive_max(stream, "ranAt")
+        best = derived if isinstance(derived, str) else None
+        recs = await backend.list_records(
+            stream, limit=RUN_HISTORY_LIMIT, newest_first=True
+        )
+        for rec in recs:
+            if "ranAt" in rec or rec.get("outcome") == "skipped":
+                continue
+            at = rec.get("finished_at")
+            if isinstance(at, str) and (best is None or at > best):
+                best = at
+        return best
 
     async def _list_gate_records(
         self, backend: Any, name: str
@@ -9286,12 +9882,12 @@ class Cron:
 
         ``host`` is audit info ONLY: unlike retry records, a pause is
         honored by every node sharing the store (see
-        :data:`PAUSE_STREAM_PREFIX`).  No-op without a backend: the pause
-        still holds in this process's memory, exactly like the classic
-        stateless behaviour of every other runtime nicety.
+        :data:`PAUSE_STREAM_PREFIX`).  Without a backend the pause still
+        holds in this process's memory, exactly like the classic stateless
+        behaviour of every other runtime nicety, and when a store IS
+        configured the record is held for replay (see
+        :meth:`_defer_pause_write`).
         """
-        if self.state_backend is None:
-            return
         record = {
             "kind": "paused",
             "since": info.since.isoformat(),
@@ -9302,12 +9898,13 @@ class Cron:
             "at": get_now(datetime.timezone.utc).isoformat(),
             "host": self._state_host,
         }
+        if self.state_backend is None:
+            self._defer_pause_write(name, record)
+            return
         self._queue_pause_write(name, record)
 
     def _persist_resume(self, name: str, by: str, channel: str) -> None:
         """Fire-and-forget append of a durable ``resumed`` record."""
-        if self.state_backend is None:
-            return
         record = {
             "kind": "resumed",
             "by": by,
@@ -9315,7 +9912,66 @@ class Cron:
             "at": get_now(datetime.timezone.utc).isoformat(),
             "host": self._state_host,
         }
+        if self.state_backend is None:
+            self._defer_pause_write(name, record)
+            return
         self._queue_pause_write(name, record)
+
+    def _defer_pause_write(self, name: str, record: Dict[str, Any]) -> None:
+        """Hold a pause record for replay once the store comes back.
+
+        A configured store that is down is transient: ``start_stop_state``
+        retries it every housekeeping pass.  Dropping the record meanwhile
+        would leave the stream's newest record contradicting memory, and the
+        refresh that follows the store's return would then quietly revert
+        the operator's pause (or resume): the exact opposite of the "keep
+        the last known in-memory state" contract, which covers only failed
+        READS.  An append that FAILS against a live store buffers the same
+        way (the record is owed either way) and the housekeeping pass retries
+        it.  Newest-per-job wins here as it does in the stream itself, so
+        a pause/resume pair taken during the outage collapses to the final
+        intent.  Stateless installs (no ``state`` section) buffer nothing
+        and say nothing: memory-only is their contract, but a buffer left
+        from before the ``state`` section was removed is DISCARDED here, or
+        a pause held from the outage would be replayed as fresh intent when
+        the section returns and re-pause a job resumed in between.  Bumping
+        the write generation keeps a refresh already reading this job's
+        stream from applying its now-stale snapshot.
+        """
+        if not self._state_configured:
+            self._pause_pending_writes.pop(name, None)
+            return
+        self._pause_gen[name] = self._pause_gen.get(name, 0) + 1
+        self._pause_pending_writes[name] = record
+        self.metrics.state_write_dropped("pause")
+        logger.warning(
+            "state: cannot write the %s of job %s; it holds in memory only "
+            "and will be written when the store accepts it",
+            record.get("kind"),
+            name,
+        )
+
+    def _replay_pending_pause_writes(self) -> None:
+        """Queue the pause records buffered by an outage or a failed write.
+
+        Called from :meth:`start_stop_state` with a fresh backend in hand and
+        BEFORE the rehydrate's refresh pass, and again from every
+        :meth:`_pause_periodic` pass while a backend is up (which is what
+        retries an append that failed against a live store).  Both callers
+        run it before the refresh, so each replayed write installs its
+        :attr:`_pause_write_tail` entry first and that refresh leaves the
+        job's memory alone instead of reverting it to the stale record still
+        on top of the stream.
+        """
+        pending = list(self._pause_pending_writes.items())
+        self._pause_pending_writes.clear()
+        for name, record in pending:
+            logger.info(
+                "state: writing the %s of job %s held in memory only",
+                record.get("kind"),
+                name,
+            )
+            self._queue_pause_write(name, record)
 
     def _queue_pause_write(
         self, name: str, record: Dict[str, Any]
@@ -9326,8 +9982,10 @@ class Cron:
         ordering load-bearing (a resume racing its pause could land
         filename-inverted and leave ``paused`` newest forever).  The tail
         entry doubles as the "local write in flight" signal the
-        housekeeping refresh consults.
+        housekeeping refresh consults, and the generation bump is the
+        edge-triggered half of that signal (see :attr:`_pause_gen`).
         """
+        self._pause_gen[name] = self._pause_gen.get(name, 0) + 1
         prev = self._pause_write_tail.get(name)
 
         async def _ordered() -> None:
@@ -9351,7 +10009,8 @@ class Cron:
         self, name: str, record: Dict[str, Any]
     ) -> None:
         backend = self.state_backend
-        if backend is None:  # torn down between scheduling and running
+        if backend is None:  # torn down between queueing and running
+            self._defer_pause_write(name, record)
             return
         stream = self._pause_stream(name)
         try:
@@ -9359,10 +10018,15 @@ class Cron:
                 stream, record, prune_keep=PAUSE_STREAM_KEEP
             )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
-            self.metrics.state_write_dropped("pause")
             logger.warning(
                 "state: failed to persist pause state for %s: %s", name, ex
             )
+            # a dropped pause write is not just a lost audit row: the record
+            # this one meant to supersede is still newest in the stream, so
+            # the next refresh would quietly revert the operator's intent.
+            # Buffer it (which also counts the drop and bumps the generation)
+            # and let the housekeeping pass retry the write.
+            self._defer_pause_write(name, record)
 
     async def _retry_consume_ok(
         self, job_name: str, retry_num: int, *, quiet: bool
@@ -9814,8 +10478,11 @@ class Cron:
         # completed); a pending's own ``at`` is its arm time.
         armed_at = rec.get("armedAt") or rec.get("at") or rec.get("notBefore")
         try:
+            # the run-only watermark: a peer holding this job's slots under
+            # a pause stamps skip rows the catch-up watermark counts and
+            # this guard must not (see durable_last_completed_at).
             last_durable = await asyncio.wait_for(
-                self.durable_last_run_at(name),
+                self.durable_last_completed_at(name),
                 timeout=STATE_OP_TIMEOUT,
             )
         except asyncio.CancelledError:
@@ -9902,7 +10569,9 @@ class Cron:
         deadline = job.startingDeadlineSeconds
         if deadline and (now - not_before).total_seconds() > deadline:
             return None
-        last = self.last_run.get(name)
+        # the newest ACTUAL run (see _validate_pending_retry): a pause-held
+        # slot's "skipped" row is not evidence anything ran.
+        last_at = self._last_completed_at.get(name)
         # a handoff carries the original arm time in ``armedAt``; its ``at`` is
         # the hand-off instant, which would hide a run the prior owner already
         # completed (a pending has no ``armedAt`` and its ``at`` is its arm).
@@ -9911,7 +10580,7 @@ class Cron:
             or _parse_iso_utc(rec.get("at"))
             or not_before
         )
-        if last is not None and last.finished_at > armed_at:
+        if last_at is not None and last_at > armed_at:
             return None  # locally-known newer run; the ladder resolved
         if kind == "handoff":
             return attempt, max(not_before, now)

@@ -129,6 +129,7 @@ GLYPH = {
     "paused": "⏸",
     "cancelled": "⊘",
     "unknown": "◍",
+    "skipped": "⊘",
 }
 GLYPH_ASCII = {
     "ok": "o",
@@ -139,6 +140,7 @@ GLYPH_ASCII = {
     "paused": "p",
     "cancelled": "/",
     "unknown": "?",
+    "skipped": "/",
 }
 
 #: Sort rank of each health key in the jobs table (web STATUS_ORDER).
@@ -316,6 +318,40 @@ def utc_clock(now: Optional[float] = None) -> str:
 # ===================================================================
 #  status / health / verdict  (ports of the web page's client logic)
 # ===================================================================
+#: The one place a run outcome becomes a state key, the port of the web
+#: page's ``outcomeCls``. Every panel that paints a run reads it from
+#: here: five hand-rolled copies of this ladder used to live inline, and
+#: all five had dropped the ``skipped`` arm, so a slot a pause held back
+#: painted in the same green a real success earns.
+OUTCOME_KEY = {
+    "failure": "fail",
+    "cancelled": "cancelled",
+    "unknown": "unknown",
+    "skipped": "skipped",
+}
+#: Theme colour for each key ``outcome_key`` can return. "skipped" takes
+#: the neutral "off" ink the web gives it, never "ok".
+OUTCOME_COLOR = {
+    "ok": "ok",
+    "fail": "fail",
+    "cancelled": "off",
+    "unknown": "pending",
+    "skipped": "off",
+}
+
+
+def outcome_key(outcome: Optional[str]) -> str:
+    """State key for a run outcome: ``fail``/``cancelled``/``unknown``/
+    ``skipped``, else ``ok``. Anything painting a run goes through here
+    so a sixth copy of the ladder cannot drift again."""
+    return OUTCOME_KEY.get(outcome or "", "ok")
+
+
+def outcome_color(outcome: Optional[str]) -> str:
+    """Theme colour key for a run outcome, via :func:`outcome_key`."""
+    return OUTCOME_COLOR[outcome_key(outcome)]
+
+
 def health(job: Dict[str, Any]) -> Tuple[str, str]:
     """``(key, label)`` for a /jobs entry: the web ``health()`` port."""
     if not job.get("enabled"):
@@ -1047,18 +1083,7 @@ def spark_cells(
             if top
             else 0
         )
-        outcome = run.get("outcome")
-        color = (
-            "fail"
-            if outcome == "failure"
-            else "cancelled"
-            if outcome == "cancelled"
-            else "unknown"
-            if outcome == "unknown"
-            else "ok"
-        )
-        color = {"cancelled": "off", "unknown": "pending"}.get(color, color)
-        cells.append((_SPARK_BARS[idx], color))
+        cells.append((_SPARK_BARS[idx], outcome_color(run.get("outcome"))))
     return cells
 
 
@@ -4409,17 +4434,18 @@ class AppRender(AppKeys):
         monitored = any(
             j.get("running_resources") is not None for j in self.jobs
         )
-        # room for the OVERDUE badge / the "⏸ til HH:MM" cell, claimed
-        # only while some job actually needs it (spread/monitored idiom)
+        # the OVERDUE badge / the "⏸ til HH:MM" cell want a wider column,
+        # but only as a bonus paid out of leftover slack below: neither is
+        # allowed to price a whole droppable column off the board
         overdue = any(sla_overdue(j) for j in self.jobs)
         paused = any(j.get("paused") for j in self.jobs)
         layout: List[Tuple[str, int]] = [
-            ("status", 19 if overdue else 11),
+            ("status", 11),
             ("name", 24),
         ]
         if not compact:
             layout.append(("schedule", 14))
-        layout += [("last", 10), ("next", 12 if paused else 8), ("dur", 8)]
+        layout += [("last", 10), ("next", 8), ("dur", 8)]
         if not compact:
             layout.append(("spark", 11))
         if monitored:
@@ -4437,8 +4463,24 @@ class AppRender(AppKeys):
                     layout.pop(idx)
                     total -= width + 1
                     break
-        # the name and command columns flex into whatever is left
         slack = cols - (sum(w for _, w in layout) + len(layout))
+        # pay the badge/pause bonuses out of that slack, cheapest first:
+        # the pause cell's content is a timestamp that only reads whole,
+        # while the status cell keeps its fixed-width OVERDUE badge and
+        # squeezes the label beside it, so a partial payout still aligns
+        for col, want in (
+            ("next", 4 if paused else 0),
+            ("status", 8 if overdue else 0),
+        ):
+            if want <= 0 or slack <= 0:
+                continue
+            for idx, (c, width) in enumerate(layout):
+                if c == col:
+                    take = min(want, slack)
+                    layout[idx] = (c, width + take)
+                    slack -= take
+                    break
+        # the name and command columns flex into whatever is left
         if slack > 0:
             names = [
                 i for i, (c, _) in enumerate(layout) if c in ("cmd", "name")
@@ -5082,17 +5124,8 @@ class AppOverlays(AppRender):
         for idx, entry in enumerate(entries[start : start + visible]):
             name, fin, outcome, exit_code, reason, duration = entry
             selected = start + idx == self.timeline_sel
-            key = {
-                "failure": "fail",
-                "cancelled": "cancelled",
-                "unknown": "unknown",
-            }.get(outcome, "ok")
-            color = {
-                "fail": "fail",
-                "cancelled": "off",
-                "unknown": "pending",
-                "ok": "ok",
-            }[key]
+            key = outcome_key(outcome)
+            color = OUTCOME_COLOR[key]
             line = "%s %s %s" % (
                 pad_to(fmt_ago(fin), 9),
                 paint.glyph(key, ascii_mode),
@@ -5628,28 +5661,20 @@ class AppOverlays(AppRender):
                     )
                 elif cell.get("last"):
                     outcome = str((cell["last"] or {}).get("outcome", ""))
-                    key = {
-                        "failure": "fail",
-                        "cancelled": "cancelled",
-                        "unknown": "unknown",
-                    }.get(outcome, "ok")
+                    key = outcome_key(outcome)
                     label = {
                         "success": "ok",
                         "failure": "fail",
                         "cancelled": "cancel",
                         "unknown": "lost",
+                        "skipped": "skip",
                     }.get(outcome, outcome[:6])
                     text = "%s %s %s" % (
                         paint.glyph(key, ascii_mode),
                         label,
                         ago_short((cell["last"] or {}).get("finished_at")),
                     )
-                    color = {
-                        "fail": "fail",
-                        "cancelled": "off",
-                        "unknown": "pending",
-                        "ok": "ok",
-                    }[key]
+                    color = OUTCOME_COLOR[key]
                 elif cell.get("enabled") is False:
                     text, color = (
                         paint.glyph("disabled", ascii_mode) + " off",
@@ -5700,7 +5725,20 @@ class AppOverlays(AppRender):
         )
         for name in names[self.panel_scroll : self.panel_scroll + visible]:
             runs = self.heat_data.get(name, [])
-            cells: List[Tuple[int, str]] = [(0, "ok") for _ in range(buckets)]
+            # "skipped" seeds the bucket and ranks below "ok": an hour that
+            # only ever held slots back for a pause must not shade green,
+            # but one real success in it outranks any number of holds. An
+            # empty bucket paints a blank shade, so its seed never shows.
+            rank = {
+                "skipped": 0,
+                "ok": 1,
+                "unknown": 2,
+                "cancelled": 3,
+                "fail": 4,
+            }
+            cells: List[Tuple[int, str]] = [
+                (0, "skipped") for _ in range(buckets)
+            ]
             for run in runs:
                 t = parse_iso(run.get("finished_at"))
                 if t is None:
@@ -5710,26 +5748,14 @@ class AppOverlays(AppRender):
                     continue
                 idx = buckets - 1 - int(age_h)
                 count, worst = cells[idx]
-                outcome = str(run.get("outcome", ""))
-                rank = {"ok": 0, "unknown": 1, "cancelled": 2, "fail": 3}
-                key = {
-                    "failure": "fail",
-                    "cancelled": "cancelled",
-                    "unknown": "unknown",
-                }.get(outcome, "ok")
-                if rank.get(key, 0) >= rank.get(worst, 0):
+                key = outcome_key(str(run.get("outcome", "")))
+                if rank[key] >= rank[worst]:
                     worst = key
                 cells[idx] = (count + 1, worst)
             spans = [paint.style(pad_to(" " + truncate(name, 22), 24), "fg")]
             for count, worst in cells:
                 shade = shades[min(len(shades) - 1, count)]
-                color = {
-                    "ok": "ok",
-                    "fail": "fail",
-                    "cancelled": "off",
-                    "unknown": "pending",
-                }[worst]
-                spans.append(paint.style(shade, color))
+                spans.append(paint.style(shade, OUTCOME_COLOR[worst]))
             body.append("".join(spans))
         if not names:
             body.append(paint.style("  gathering run history…", "dim"))
@@ -6147,10 +6173,11 @@ class AppDrawers(AppOverlays):
                 )
             ]
             if isinstance(paused, dict):
+                # note/by are free-form operator text straight off the API
                 if paused.get("note"):
-                    bits.append(str(paused["note"]))
+                    bits.append(oneline(paused["note"]))
                 if paused.get("by"):
-                    bits.append("by %s" % paused["by"])
+                    bits.append("by %s" % oneline(paused["by"]))
             rows.append(
                 " "
                 + paint.style(
@@ -6335,17 +6362,8 @@ class AppDrawers(AppOverlays):
         )
         for run in runs[self.panel_scroll : self.panel_scroll + available]:
             outcome = str(run.get("outcome", ""))
-            key = {
-                "failure": "fail",
-                "cancelled": "cancelled",
-                "unknown": "unknown",
-            }.get(outcome, "ok")
-            color = {
-                "fail": "fail",
-                "cancelled": "off",
-                "unknown": "pending",
-                "ok": "ok",
-            }[key]
+            key = outcome_key(outcome)
+            color = OUTCOME_COLOR[key]
             dur = run.get("duration")
             bar_w = 12
             bar = ""

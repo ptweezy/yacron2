@@ -109,6 +109,8 @@ shows "paused until ... by ...". Longer or annotated pauses go through the
 A job whose [SLA check](Late-Run-Detection) is breached carries an
 **OVERDUE** badge on its row, drawer, and wallboard tile, independent of its
 status: a job can be OK by its last run and still overdue for its next one.
+The row badge names the breached checks in its tooltip; the drawer header
+spells them out beside the badge.
 
 ## The job drawer
 

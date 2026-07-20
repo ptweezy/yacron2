@@ -25,6 +25,7 @@ from cronstable.config import parse_config_string
 from cronstable.cron import Cron
 from cronstable.jobapi import (
     MAX_LOCK_PERMITS,
+    MAX_LOCK_TTL,
     JobLockManager,
     JobStateAPI,
     RunContext,
@@ -595,6 +596,68 @@ async def test_lock_acquire_non_numeric_fields_400(tmp_path):
             ):
                 r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
                 assert r.status == 400, body
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
+async def test_lock_acquire_non_finite_ttl_400_lock_not_bricked(tmp_path):
+    # --ttl inf sails through argparse type=float; expires_at = now + inf
+    # would then be persisted by orjson as expiresAt: null -- an unreadable
+    # lease that acquire, release AND the sweeper all fail closed on,
+    # permanently bricking that lock fleet-wide. Non-finite must be the
+    # caller's clean 400 up front, and the lock must remain acquirable.
+    api, backend = await _make_api(tmp_path)
+    api.register_run(_ctx())
+    try:
+        async with aiohttp.ClientSession(headers=_auth()) as s:
+            for bad in ("inf", "-inf", "nan", "1e999"):
+                for body in (
+                    {"name": "L", "ttl": bad},
+                    {"name": "L", "wait": True, "blockSeconds": bad},
+                ):
+                    r = await s.post(
+                        api.base_url + "/v1/lock/acquire", json=body
+                    )
+                    assert r.status == 400, body
+            # a huge but FINITE ttl is clamped to the ceiling, not rejected,
+            # and the reply reports the ttl actually used (finite -> the
+            # lease file stays readable and reclaimable).
+            r = await s.post(
+                api.base_url + "/v1/lock/acquire",
+                json={"name": "L", "ttl": 1e308},
+            )
+            granted = await r.json()
+            assert granted["acquired"] is True
+            assert granted["ttl"] == MAX_LOCK_TTL
+            r = await s.post(
+                api.base_url + "/v1/lock/release",
+                json={"token": granted["token"]},
+            )
+            assert (await r.json())["released"] is True
+            # the lock is not bricked: a normal acquire still succeeds.
+            r = await s.post(
+                api.base_url + "/v1/lock/acquire", json={"name": "L"}
+            )
+            assert (await r.json())["acquired"] is True
+    finally:
+        await api.stop()
+        await backend.stop()
+
+
+async def test_idempotency_claim_non_finite_ttl_400(tmp_path):
+    # inf would make the claim's expiresAt non-finite, which is not
+    # fleet-portable JSON (orjson rewrites it to null): a clean 400 up front.
+    api, backend = await _make_api(tmp_path)
+    api.register_run(_ctx())
+    try:
+        async with aiohttp.ClientSession(headers=_auth()) as s:
+            for bad in ("inf", "nan"):
+                r = await s.post(
+                    api.base_url + "/v1/idempotency/claim",
+                    json={"key": "k", "ttl": bad},
+                )
+                assert r.status == 400, bad
     finally:
         await api.stop()
         await backend.stop()

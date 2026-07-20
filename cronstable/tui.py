@@ -512,23 +512,34 @@ def compute_view(
             continue
         view.append(job)
 
-    def sort_value(job: Dict[str, Any]) -> Tuple[Any, str]:
+    def sort_value(job: Dict[str, Any]) -> Tuple[Any, Any]:
         name = job.get("name", "")
+        # The web sorts (and tie-breaks) names with localeCompare, whose
+        # CLDR root collation is case-insensitive at the primary level and
+        # orders lowercase BEFORE uppercase on a pure case tie ('apple' <
+        # 'Backup' < 'zeta', and 'backup' < 'Backup') -- while a raw
+        # Python str compare is code-point order, which fronts EVERY
+        # uppercase-initial name and inverts case ties.  casefold gives
+        # the primary level, swapcase the lowercase-first tertiary tie,
+        # and the raw name keeps the key total; this applies to the name
+        # column AND to the trailing tie-break of every other column, so
+        # the two frontends render one order.
+        name_key = (name.casefold(), name.swapcase(), name)
         if sort_key == "status":
-            return (STATUS_ORDER.get(health(job)[0], 9), name)
+            return (STATUS_ORDER.get(health(job)[0], 9), name_key)
         if sort_key == "last":
             last = job.get("last_run") or {}
             t = parse_iso(last.get("finished_at"))
             # newest first under ascending sort, like the web table
-            return (-(t or 0.0), name)
+            return (-(t or 0.0), name_key)
         if sort_key == "next":
             sched = job.get("scheduled_in")
-            return (sched if sched is not None else float("inf"), name)
+            return (sched if sched is not None else float("inf"), name_key)
         if sort_key == "duration":
             last = job.get("last_run") or {}
             dur = last.get("duration")
-            return (-(dur if dur is not None else -1.0), name)
-        return (name, name)
+            return (-(dur if dur is not None else -1.0), name_key)
+        return (name_key, name_key)
 
     view.sort(key=sort_value, reverse=sort_dir < 0)
     return view

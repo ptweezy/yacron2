@@ -991,3 +991,68 @@ async def test_ping_round_trips():
     h = _handler()
     resp = await _req(h, "ping")
     assert resp == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+
+# ---------------------------------------------------------------------------
+# fuzzing findings: falsy dry_run must preview, and non-finite numeric
+# arguments must clamp/default instead of -32603
+# ---------------------------------------------------------------------------
+
+
+async def test_backfill_falsy_dry_run_values_still_preview(tmp_path):
+    # `dry_run: null` is exactly how an MCP client or LLM encodes an
+    # unspecified optional parameter; args.get("dry_run", True) applied the
+    # default only when the key was ABSENT, so every present-but-falsy
+    # value (null/[]/{}/""/0) fell through the preview gate into a REAL
+    # backfill on a destructiveHint:true tool.  Only the literal boolean
+    # false may execute.
+    h, cron = await _state_handler(tmp_path)
+    try:
+        args = {
+            "dag": "bf",
+            "from": "2026-01-01T00:00:00+00:00",
+            "to": "2026-01-01T01:30:00+00:00",
+            "confirm": True,  # confirm alone must not defeat the preview
+        }
+        for falsy in (None, [], {}, "", 0):
+            result = await _call(
+                h, "cron_backfill_dag", {**args, "dry_run": falsy}
+            )
+            body = result["structuredContent"]
+            assert body.get("dryRun") is True, (falsy, body)
+            assert body.get("wouldExecute") is False
+            assert "DRY RUN" in result["content"][0]["text"]
+        # the documented real-run spelling still executes
+        result = await _call(
+            h, "cron_backfill_dag", {**args, "dry_run": False}
+        )
+        assert result["structuredContent"]["ok"] is True
+    finally:
+        await _teardown(cron)
+
+
+async def test_numeric_arguments_survive_non_finite_json_numbers():
+    # 1e999 is a well-formed RFC-8259 number the stdlib parser reads as
+    # inf; int(inf) raises OverflowError, which none of the coercion
+    # helpers caught -- turning a schema-valid argument into a -32603
+    # protocol fault (with a server-side traceback) on 15 tool/argument
+    # pairs, instead of the documented clamp-never-error behaviour.
+    import json as stdjson
+
+    inf = stdjson.loads(b'{"limit": 1e999}')["limit"]  # off-the-wire shape
+    assert mcp_mod._opt_int(inf) is None
+    assert mcp_mod._opt_int(float("nan")) is None
+    assert mcp_mod._opt_int(float("-inf")) is None
+
+    h = _handler()
+    for args in (
+        {"limit": inf},
+        {"offset": inf, "limit": 5},
+        {"limit": float("nan")},
+    ):
+        result = await _call(h, "cron_get_status", args)
+        # a normal (possibly clamped) result, never a JSON-RPC error
+        assert "structuredContent" in result, (args, result)
+    # _call itself asserts no JSON-RPC error envelope: reaching a normal
+    # tool result (even an isError one) is the fix for the tail/cursor pair
+    await _call(h, "cron_tail_job_logs", {"job": "hello", "tail": inf})

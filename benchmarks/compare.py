@@ -9,7 +9,7 @@ mask a regression.
 
 Outputs:
   --md PATH          markdown summary (release-notes section)
-  --svg PATH         diverging bar chart of the largest changes
+  --svg PATH         diverging bar chart of every compared metric
   --merged-out PATH  the merged current-side results as one JSON document
 
 Gating: a metric fails when it slows down by more than its declared gate
@@ -40,6 +40,7 @@ _LIGHT = {
     "border": "rgba(11,11,11,0.10)",
     "grid": "#e1e0d9",
     "baseline": "#c3c2b7",
+    "stripe": "rgba(11,11,11,0.035)",
     "ink1": "#0b0b0b",
     "ink2": "#52514e",
     "muted": "#898781",
@@ -51,14 +52,13 @@ _DARK = {
     "border": "rgba(255,255,255,0.10)",
     "grid": "#2c2c2a",
     "baseline": "#383835",
+    "stripe": "rgba(255,255,255,0.045)",
     "ink1": "#ffffff",
     "ink2": "#c3c2b7",
     "muted": "#898781",
     "faster": "#3987e5",
     "slower": "#e66767",
 }
-
-_MAX_CHART_ROWS = 16
 
 # Significance guard for the gate.  A metric's round-to-round scatter is
 # estimated as the coefficient of variation of its per-round estimator values;
@@ -438,12 +438,17 @@ def _bar_path(x0, y, length, height, rightward):
 
 
 def build_svg(rows, base_label, cur_label):
-    """Diverging horizontal bars: % runtime change per metric, vs baseline."""
-    comparable = [r for r in rows if r["delta_pct"] is not None]
-    shown = sorted(comparable, key=lambda r: -abs(r["delta_pct"]))
-    shown = shown[:_MAX_CHART_ROWS]
+    """Diverging horizontal bars: % runtime change per metric, vs baseline.
+
+    Every compared metric gets a row and the chart grows to fit, so the
+    release image is the whole suite rather than a top-N cut of it.  A
+    metric measured on only one side has no change to draw; those are
+    counted in a footnote and their numbers stay in the release-notes
+    table.
+    """
+    shown = [r for r in rows if r["delta_pct"] is not None]
     shown.sort(key=lambda r: -r["delta_pct"])
-    omitted = len(comparable) - len(shown)
+    uncompared = len(rows) - len(shown)
 
     width = 860
     gutter = 230
@@ -454,7 +459,7 @@ def build_svg(rows, base_label, cur_label):
     bar_h = 12
     top = 78
     plot_bottom = top + len(shown) * row_h
-    height = plot_bottom + (46 if omitted > 0 else 30)
+    height = plot_bottom + (46 if uncompared > 0 else 30)
 
     limit = _nice_limit(max((abs(r["delta_pct"]) for r in shown), default=5.0))
     scale = half / limit
@@ -467,6 +472,7 @@ def build_svg(rows, base_label, cur_label):
         ".num{font-variant-numeric:tabular-nums}"
         ".grid{stroke:%(grid)s;stroke-width:1}"
         ".zero{stroke:%(baseline)s;stroke-width:1}"
+        ".stripe{fill:%(stripe)s}"
         ".fast{fill:%(faster)s}.slow{fill:%(slower)s}"
         # a label drawn INSIDE a clamped bar: near-black reads on both the
         # blue and the red fill, in either theme (>=4.5:1), where white would
@@ -479,6 +485,7 @@ def build_svg(rows, base_label, cur_label):
         ".t1{fill:%(ink1)s}.t2{fill:%(ink2)s}.t3{fill:%(muted)s}"
         ".grid{stroke:%(grid)s}"
         ".zero{stroke:%(baseline)s}"
+        ".stripe{fill:%(stripe)s}"
         ".fast{fill:%(faster)s}.slow{fill:%(slower)s}}" % _DARK
     )
 
@@ -493,8 +500,9 @@ def build_svg(rows, base_label, cur_label):
         '<text class="t1" x="20" y="30" font-size="14" font-weight="600">'
         "cronstable %s: performance vs %s</text>" % (cur_label, base_label),
         '<text class="t2" x="20" y="50" font-size="11">'
-        "% change in runtime and memory per benchmark. Lower is better; "
-        "bars left of zero are faster than the previous release.</text>",
+        "% change in runtime and memory for every compared benchmark. "
+        "Lower is better; bars left of zero are faster than the previous "
+        "release.</text>",
         # Legend: identity for the two directions, text in ink tokens.
         '<rect class="fast" x="%d" y="21" width="10" height="10" rx="2"/>'
         % (width - 180),
@@ -506,24 +514,37 @@ def build_svg(rows, base_label, cur_label):
         % (width - 97),
     ]
 
+    # Alternate-row wash, drawn under the grid and bars: at full-suite
+    # height a reader has to carry a metric name across the gutter to its
+    # bar, and the stripe does that without adding data-weight ink.
+    for i in range(1, len(shown), 2):
+        parts.append(
+            '<rect class="stripe" x="12" y="%d" width="%d" height="%d"/>'
+            % (top + i * row_h, width - 24, row_h)
+        )
+
+    # The tick labels sit at BOTH ends of the plot: with every metric shown
+    # the bottom axis can be a full screen below the title.
     for tick in (-limit, -limit / 2.0, limit / 2.0, limit):
         x = center + tick * scale
         parts.append(
             '<line class="grid" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>'
             % (x, top - 6, x, plot_bottom + 4)
         )
-        parts.append(
-            '<text class="t3 num" x="%.1f" y="%d" font-size="10" '
-            'text-anchor="middle">%+g%%</text>' % (x, plot_bottom + 18, tick)
-        )
+        for y in (top - 12, plot_bottom + 18):
+            parts.append(
+                '<text class="t3 num" x="%.1f" y="%d" font-size="10" '
+                'text-anchor="middle">%+g%%</text>' % (x, y, tick)
+            )
     parts.append(
         '<line class="zero" x1="%.1f" y1="%d" x2="%.1f" y2="%d"/>'
         % (center, top - 6, center, plot_bottom + 4)
     )
-    parts.append(
-        '<text class="t3 num" x="%.1f" y="%d" font-size="10" '
-        'text-anchor="middle">0</text>' % (center, plot_bottom + 18)
-    )
+    for y in (top - 12, plot_bottom + 18):
+        parts.append(
+            '<text class="t3 num" x="%.1f" y="%d" font-size="10" '
+            'text-anchor="middle">0</text>' % (center, y)
+        )
 
     for i, row in enumerate(shown):
         y_mid = top + i * row_h + row_h / 2.0
@@ -571,12 +592,11 @@ def build_svg(rows, base_label, cur_label):
             'text-anchor="%s">%s</text>' % (lcls, lx, y_mid + 4, anchor, label)
         )
 
-    if omitted > 0:
+    if uncompared > 0:
         parts.append(
             '<text class="t3" x="20" y="%d" font-size="10">'
-            "%d largest changes shown; %d further metrics changed less "
-            "(full table in the release notes).</text>"
-            % (plot_bottom + 36, len(shown), omitted)
+            "%d metric(s) have no baseline to compare; first numbers in "
+            "the release-notes table.</text>" % (plot_bottom + 36, uncompared)
         )
     parts.append("</svg>")
     return "\n".join(parts) + "\n"

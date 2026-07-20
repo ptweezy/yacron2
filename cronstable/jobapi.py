@@ -34,6 +34,7 @@ the HTTP surface over them.  It is imported only when a ``state`` section with
 import asyncio
 import hmac
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -63,6 +64,18 @@ LOCK_LEASE_PREFIX = "lock/"
 # beyond any sane job-coordination semaphore while keeping a full
 # under-contention pass bounded.
 MAX_LOCK_PERMITS = 1024
+
+# Ceiling on a per-acquire lock TTL, bounding the other caller-supplied
+# dimension of the acquire loop.  ``ttl`` comes straight from the request body
+# (argparse ``type=float`` happily produces ``inf``/``nan``), and a non-finite
+# value is poison: ``expires_at = now + inf`` is ``inf``, which orjson
+# persists as ``expiresAt: null`` in the lease file -- every later read then
+# fails as unreadable, acquire fails CLOSED, release cannot repair it and the
+# sweeper refuses to reclaim it, permanently bricking that lock fleet-wide.
+# Non-finite is rejected outright; a finite TTL is clamped into
+# [5s, MAX_LOCK_TTL] (30 days -- far beyond any sane job-coordination hold,
+# while keeping a crashed holder's lease reclaimable within the epoch).
+MAX_LOCK_TTL = 30 * 86400.0
 
 
 def _bracket_host(host: str) -> str:
@@ -224,7 +237,20 @@ class JobLockManager:
         backend = self._backend_getter()
         if backend is None:
             raise JobStateError("state backend is unavailable", status=503)
-        ttl = self._ttl if ttl is None else max(5.0, float(ttl))
+        if ttl is None:
+            ttl = self._ttl
+        else:
+            ttl = float(ttl)
+            if not math.isfinite(ttl):
+                # inf/nan would flow into expires_at and persist a lease no
+                # code path can ever read, release or reclaim (see
+                # MAX_LOCK_TTL); the lease writer's trusted=True fast path
+                # vouches for exactly this value, so it must be finite here.
+                raise JobStateError("ttl must be a finite number")
+            ttl = min(max(5.0, ttl), MAX_LOCK_TTL)
+        block_seconds = float(block_seconds)
+        if not math.isfinite(block_seconds):
+            raise JobStateError("blockSeconds must be a finite number")
         hold_token = os.urandom(16).hex()
         holder = "{}#{}".format(self._base_holder, hold_token)
         loop = asyncio.get_running_loop()
@@ -744,6 +770,10 @@ class JobStateAPI:
             ttl = float(payload.get("ttl") or 0.0)
         except (TypeError, ValueError) as ex:
             raise JobStateError("ttl must be a number") from ex
+        if not math.isfinite(ttl):
+            # inf would make the claim's expiresAt non-finite, which is not
+            # fleet-portable JSON (orjson rewrites it to null).
+            raise JobStateError("ttl must be a finite number")
         result = await jobstate.idempotency_claim(
             self._backend(), scope, key, ttl=ttl
         )

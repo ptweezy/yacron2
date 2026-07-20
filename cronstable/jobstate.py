@@ -85,9 +85,28 @@ def _now() -> float:
 
 
 def _require_scope(scope: str) -> str:
-    scope = (scope or "").strip()
-    if not scope:
+    """Validate ``scope`` WITHOUT normalizing it.
+
+    A scope is the isolation boundary, so distinct scope strings must never
+    collapse onto one namespace.  This used to ``strip()`` the scope, which
+    quietly merged ``'report'``, ``'report '`` and ``'report\\xa0'`` into ONE
+    namespace AFTER jobapi authorized the raw string and BEFORE the store's
+    injective encoder named the on-disk path -- letting a job whose name
+    differs only by surrounding whitespace read and overwrite another job's
+    private state, and desynchronizing the on-disk scope token from the GC
+    keep-sets (built from the un-stripped config name), which then deleted a
+    live job's artifacts.  A non-normalized scope is therefore REJECTED, not
+    repaired: the authorized string, the boundary name and the keep-set entry
+    stay one and the same string, or the call fails with a clear 400.
+    """
+    if not scope or not scope.strip():
         raise JobStateError("a non-empty scope is required")
+    if scope != scope.strip():
+        raise JobStateError(
+            "scope {!r} carries leading or trailing whitespace; scopes are "
+            "isolation boundaries and are matched exactly (rename the job, "
+            "or pass the exact scope string)".format(scope)
+        )
     return scope
 
 

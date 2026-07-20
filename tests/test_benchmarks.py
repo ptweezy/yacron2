@@ -562,6 +562,51 @@ def test_svg_large_change_labels_stay_within_the_plot():
     assert any("gate" in t for t in inside), inside
 
 
+def test_svg_expanded_chart_includes_every_compared_metric():
+    # The release chart used to cut to the 16 largest changes and wave at
+    # the rest in a footnote. The expanded chart draws one row per compared
+    # metric, repeats the % scale at both ends of the (now tall) plot, and
+    # the only footnote left is for metrics with no baseline side, so
+    # nothing measured is silently absent from the image.
+    import re
+
+    compare = _load_compare()
+
+    def _e(name, value):
+        return {
+            "name": name,
+            "unit": "s",
+            "compare": "min",
+            "gate_pct": 25.0,
+            "gate_floor": 0.01,
+            "value": value,
+            "round_values": [value],
+        }
+
+    names = ["suite.metric_%02d" % i for i in range(40)]
+    base = {n: _e(n, 1.0) for n in names}
+    cur = {n: _e(n, 1.0 + (i - 20) / 100.0) for i, n in enumerate(names)}
+    cur["suite.no_baseline"] = _e("suite.no_baseline", 1.0)
+    rows, _, _ = compare._compare(base, cur)
+    svg = compare.build_svg(rows, "old", "new")
+
+    for name in names:
+        assert ">%s</text>" % name in svg, name
+    assert "largest changes shown" not in svg
+    # a metric with no baseline has no change to draw, so it gets no row;
+    # the footnote owns up to it instead of dropping it silently
+    assert ">suite.no_baseline</text>" not in svg
+    assert "1 metric(s) have no baseline to compare" in svg
+    # the chart grew to hold all 40 rows rather than clipping them
+    height = int(re.search(r'height="(\d+)"', svg).group(1))
+    assert height >= 78 + 40 * 24
+    # the % scale reads at both ends of the tall plot (deltas span -20%..
+    # +19%, so the limit is 20 and +10% is a tick), and the alternate-row
+    # wash that carries a name across to its bar is present
+    assert svg.count(">+10%</text>") == 2
+    assert 'class="stripe"' in svg
+
+
 def test_compare_without_baseline_records_first_release(tmp_path):
     cur = _write(tmp_path / "cur.json", _doc([_entry("startup.version", 0.1)]))
     md = tmp_path / "out.md"

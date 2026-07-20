@@ -2377,3 +2377,79 @@ def test_has_live_process_variants():
     assert dag._has_live_process(entry, "p", "h", lambda pid: True) is True
     # a foreign token whose pid is dead -> not alive.
     assert dag._has_live_process(entry, "p", "h", lambda pid: False) is False
+
+
+# --------------------------------------------------------------------------
+# fuzzing finding: a task parked up_for_retry that a reload retypes to
+# mapped (gains expand:) must not wedge its run forever
+# --------------------------------------------------------------------------
+
+
+def test_reload_retyped_to_mapped_while_up_for_retry_terminalises():
+    # spec A: plain task w (with retries) downstream of src.  w's first
+    # attempt fails and parks up_for_retry.  The operator then adds an
+    # `expand:` block to w and reloads.  The mapped dispatch used to route
+    # the entry exclusively through _propagate_placeholder (which returned
+    # unless PENDING), so nothing could ever re-claim, expand or
+    # terminalise it: the run stayed non-terminal forever, holding its
+    # dagadvance lease and defeating the pruner, while every advance paid
+    # a full deep copy to do nothing.
+    old = _spec(
+        TaskSpec("src"),
+        TaskSpec("w", depends_on=("src",), max_attempts=2, retry_delay=10.0),
+    )
+    body = _body(old)
+    ex = _Executor(old, outcomes={"src": True, "w": False})
+    body = ex.run(body)
+    # first failure parks the retrying task, run still open
+    assert _state(body, "w") == dag.UP_FOR_RETRY
+    assert not dag.is_terminal_run(body)
+
+    reloaded = _spec(
+        TaskSpec("src"),
+        TaskSpec(
+            "w",
+            depends_on=("src",),
+            max_attempts=2,
+            retry_delay=10.0,
+            expand=ExpandSpec(from_task="src", key="items"),
+        ),
+    )
+    # never offered for expansion (not a fresh placeholder) ...
+    assert dag.tasks_awaiting_expansion(reloaded, body) == []
+    # ... and the advance resolves it instead of spinning forever
+    ex2 = _Executor(reloaded)
+    body = ex2.run(body)
+    assert ex2.launched == []  # nothing was launched under the stale shape
+    assert _state(body, "w") == dag.FAILED
+    assert "expand" in body["tasks"]["w"]["failReason"]
+    assert dag.is_terminal_run(body)
+    assert body["state"] == dag.FAILED
+
+
+def test_reload_retyped_to_mapped_while_pending_still_expands():
+    # control: the same reload while w is still PENDING keeps the normal
+    # expansion path -- the stale-shape resolution must only catch entries
+    # that already left PENDING under the old shape.
+    old = _spec(TaskSpec("src"), TaskSpec("w", depends_on=("src",)))
+    body = _body(old)
+    body["tasks"]["src"]["state"] = dag.SUCCESS
+    body["tasks"]["src"]["finishedAt"] = 5.0
+    reloaded = _spec(
+        TaskSpec("src"),
+        TaskSpec(
+            "w",
+            depends_on=("src",),
+            expand=ExpandSpec(from_task="src", key="items"),
+        ),
+    )
+    assert dag.tasks_awaiting_expansion(reloaded, body) == [
+        ("w", "src", "items")
+    ]
+    ex = _Executor(reloaded, outcomes={"w": True}, xcom={"src": ["a", "b"]})
+    body = ex.run(body)
+    assert _state(body, "w") == dag.EXPANDED
+    assert _state(body, "w#0") == dag.SUCCESS
+    assert _state(body, "w#1") == dag.SUCCESS
+    assert dag.is_terminal_run(body)
+    assert body["state"] == dag.SUCCESS

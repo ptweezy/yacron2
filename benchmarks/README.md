@@ -19,7 +19,7 @@ all measured, and a release that regresses past a metric's limit does not ship.
   subprocess tier (cold start, import, peak RSS), selectable with `--tier`.
 - `compare.py` takes baseline and current JSON files (several rounds per
   side), merges the rounds, renders a markdown summary and an SVG diverging
-  bar chart of the largest changes, and exits nonzero when a gated metric
+  bar chart of every compared metric, and exits nonzero when a gated metric
   regressed. A regression gates only when it clears both its declared limit
   and a couple of its measured noise bands (the per-metric round-to-round
   scatter), so jitter alone can never fail the gate.

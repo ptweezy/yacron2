@@ -51,8 +51,9 @@ gated regression stops the release before anything ships.
 
 Each GitHub Release carries the comparison against the previous release:
 
-- a diverging bar chart (`perf-chart.svg`) of the largest per-metric changes,
-  embedded at the top of the performance section of the release notes;
+- a diverging bar chart (`perf-chart.svg`) with a row for every compared
+  metric, embedded at the top of the performance section of the release
+  notes;
 - the full metric table in a collapsed details block;
 - `perf-results.json`, the merged raw numbers for that release, attached as
   an asset.

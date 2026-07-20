@@ -956,15 +956,17 @@ class CronTab:
 
         The probe spans :data:`_GAP_PROBE`.  Outside the brief
         post-transition window the fast path is a single extra offset
-        probe -- and for a FIXED-offset zone not even that: a
+        probe, and for a FIXED-offset zone not even that: a
         :class:`datetime.timezone` carries one immutable offset by
         construction, so ``off_now <= off_then`` is a theorem and the
         whole probe is provably a no-op.  Skipping it there is an exact
         elimination, not an approximation, and it matters because the
-        overwhelmingly common aware call (a UTC ``now``) took the full
-        probe on every invocation.  ``type(...) is`` rather than
-        ``isinstance``: a subclass could override ``utcoffset``, and only
-        the exact class is covered by the theorem.
+        overwhelmingly common aware call (a UTC ``now``) paid for the
+        full probe on every invocation.  ``type(...) is`` rather than
+        ``isinstance`` only to keep the theorem's precondition literal:
+        CPython refuses to subclass :class:`datetime.timezone` at all
+        ("not an acceptable base type"), so the two spellings cannot
+        actually differ here.
         """
         civil = now.replace(tzinfo=None)
         if type(now.tzinfo) is datetime.timezone:

@@ -37,7 +37,7 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     #   ``AWS_SECRET_ACCESS_KEY=`` (the separator forms) AND ``PGPASSWORD=``
     #   / ``MYSQLPWD=`` (libpq's and friends' UNseparated vendor forms) all
     #   redact.  The prefix is left in place because the replacement echoes
-    #   the key verbatim and the prefix was never consumed -- output is
+    #   the key verbatim and the prefix was never consumed, so output is
     #   character-identical either way.  Anchoring here is what the earlier
     #   ``(?<![a-z0-9])`` got wrong (it leaked the unseparated vendor forms),
     #   and the ``(?<![a-z0-9_\-])`` + ``[a-z0-9_\-]*`` pair that replaced it

@@ -91,7 +91,7 @@ _WIDE_INT_RUN_B = re.compile(rb"\d{19}")
 _WIDE_INT_RUN_S = re.compile(r"\d{19}")
 
 # The bytes prescan runs on EVERY loads(), over the whole payload, and a
-# ``\d{19}`` scan has no literal prefix for sre to memchr on -- it cost more
+# ``\d{19}`` scan has no literal prefix for sre to memchr on, so it cost more
 # than the parse it guards.  Translating digits to a single byte and
 # everything else to a separator turns the same predicate into two
 # memcpy-speed C loops (~21x faster): a 19-digit run exists iff the
@@ -116,13 +116,19 @@ def _checked_parse_int(text: str) -> int:
     return value
 
 
-def _has_wide_int_run(data: Union[bytes, str]) -> bool:
+def _has_wide_int_run(
+    data: Union[bytes, bytearray, memoryview, str],
+) -> bool:
+    # Wider than :func:`loads`' own ``Union[bytes, str]`` on purpose: the
+    # translate path below needs a real ``bytes``/``bytearray``, so the
+    # buffer types that only the regex can take are spelled out rather than
+    # left as a statically dead branch.
     if isinstance(data, str):
         return _WIDE_INT_RUN_S.search(data) is not None
     if isinstance(data, (bytes, bytearray)):
         return _RUN19 in data.translate(_DIGIT_RUN_TR)
-    # Any other buffer (memoryview) has no .translate returning bytes; the
-    # regex accepts it directly, so keep the original path for it.
+    # Any other buffer (memoryview) has no ``.translate`` returning bytes;
+    # the regex accepts it directly, so keep the original path for it.
     return _WIDE_INT_RUN_B.search(data) is not None
 
 

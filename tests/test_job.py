@@ -1660,6 +1660,13 @@ GOLDEN_SHELL_ENV_KEYS = frozenset(
         # monitored), see ShellReporter.report / cronstable.resources.
         "CRONSTABLE_CPU_SECONDS",
         "CRONSTABLE_MAX_RSS_BYTES",
+        # SLA breach detail: always exported, empty on run-completion
+        # reports (only an onLate dispatch's SlaBreachContext carries
+        # sla_vars).
+        "CRONSTABLE_SLA_CHECK",
+        "CRONSTABLE_SLA_THRESHOLD_SECONDS",
+        "CRONSTABLE_SLA_OBSERVED_SECONDS",
+        "CRONSTABLE_LAST_SUCCESS_AT",
     }
 )
 
@@ -1743,6 +1750,12 @@ async def test_report_shell_full_env_contract(monkeypatch):
     assert env["CRONSTABLE_STDERR"] == "err"
     assert env["CRONSTABLE_STDOUT_TRUNCATED"] == "0"
     assert env["CRONSTABLE_STDERR_TRUNCATED"] == "0"
+    # a run-completion report carries no SLA context (and the Mock's auto
+    # sla_vars attribute is not a dict): present but empty
+    assert env["CRONSTABLE_SLA_CHECK"] == ""
+    assert env["CRONSTABLE_SLA_THRESHOLD_SECONDS"] == ""
+    assert env["CRONSTABLE_SLA_OBSERVED_SECONDS"] == ""
+    assert env["CRONSTABLE_LAST_SUCCESS_AT"] == ""
 
 
 @pytest.mark.asyncio
@@ -2723,3 +2736,380 @@ async def test_shell_report_runs_for_object_form_schedule(tmp_path):
 
     # the reporter really ran, and saw the rendered 5-field line
     assert marker.read_text() == "*/5 * * * *"
+
+
+# ---------------------------------------------------------------------------
+# SLA breach reporting: SlaBreachContext + report_sla_breach (the onLate
+# hook). The context must satisfy all four reporters without a RunningJob.
+# ---------------------------------------------------------------------------
+
+
+_SLA_MAIL_JOB = """
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+    sla:
+      lateAfterSeconds: 120
+    onLate:
+      report:
+        mail:
+          from: example@foo.com
+          to: example@bar.com
+          smtpHost: smtp1
+          smtpPort: 1025
+"""
+
+_SLA_SHELL_JOB = """
+jobs:
+  - name: test
+    command: echo the-command
+    schedule: "*/5 * * * *"
+    sla:
+      lateAfterSeconds: 120
+    onLate:
+      report:
+        shell:
+          command: "true"
+"""
+
+_SLA_PLAIN_JOB = """
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+    sla:
+      maxRuntimeSeconds: 60
+"""
+
+
+def _breach_ctx(job_config, check="lateAfter"):
+    return cronstable.job.SlaBreachContext(
+        job_config,
+        check=check,
+        threshold_seconds=120,
+        observed_seconds=300.5,
+        last_success_at="2020-01-01T10:00:00+00:00",
+    )
+
+
+def test_sla_breach_context_full_template_var_contract():
+    # the full standard key set with None/False fills, so operator templates
+    # written for onFailure render unchanged on onLate, plus the breach vars.
+    conf = cronstable.config.parse_config_string(_SLA_MAIL_JOB, "")
+    ctx = _breach_ctx(conf.jobs[0])
+    tv = ctx.template_vars
+    assert set(tv) == {
+        "name",
+        "success",
+        "fail_reason",
+        "stdout",
+        "stderr",
+        "exit_code",
+        "command",
+        "shell",
+        "environment",
+        "cpu_seconds",
+        "cpu_user_seconds",
+        "cpu_system_seconds",
+        "max_rss_bytes",
+        "sla_check",
+        "threshold_seconds",
+        "observed_seconds",
+        "last_success_at",
+    }
+    assert tv["name"] == "test"
+    assert tv["success"] is False
+    assert tv["fail_reason"] == "sla: lateAfter breached"
+    assert tv["stdout"] is None
+    assert tv["stderr"] is None
+    assert tv["exit_code"] is None
+    assert tv["cpu_seconds"] is None
+    assert tv["max_rss_bytes"] is None
+    assert tv["sla_check"] == "lateAfter"
+    assert tv["threshold_seconds"] == 120
+    assert tv["observed_seconds"] == 300.5
+    assert tv["last_success_at"] == "2020-01-01T10:00:00+00:00"
+    # HOSTNAME rides env so the default sentry fingerprint's
+    # {{ environment.HOSTNAME }} line keeps its host dimension.
+    assert tv["environment"]["HOSTNAME"] == os.environ["HOSTNAME"]
+    # the explicit run-shaped fills the reporters read directly
+    assert ctx.failed is True
+    assert ctx.retcode is None
+    assert ctx.resource_usage is None
+    assert ctx.stdout_discarded == 0
+    assert ctx.stderr_discarded == 0
+
+
+@pytest.mark.asyncio
+async def test_sla_breach_mail_report_renders_late_templates():
+    # the onLate defaults swap the completed/failed wording for the overdue
+    # templates; success=False means the empty-body suppression cannot bite.
+    conf = cronstable.config.parse_config_string(_SLA_MAIL_JOB, "")
+    job_config = conf.jobs[0]
+    ctx = _breach_ctx(job_config)
+
+    messages_sent = []
+
+    async def connect(self):
+        pass
+
+    async def send_message(self, message):
+        messages_sent.append(message)
+
+    with (
+        patch("aiosmtplib.SMTP.connect", connect),
+        patch("aiosmtplib.SMTP.send_message", send_message),
+    ):
+        await cronstable.job.MailReporter().report(
+            False, ctx, job_config.onLate["report"]
+        )
+
+    assert len(messages_sent) == 1
+    message = messages_sent[0]
+    assert message["Subject"] == "Cron job 'test' is overdue (lateAfter)"
+    body = message.get_payload()
+    assert "SLA check: lateAfter" in body
+    assert "Threshold: 120 seconds" in body
+    assert "Observed: 300.5 seconds" in body
+    assert "Last success: 2020-01-01T10:00:00+00:00" in body
+
+
+@pytest.mark.asyncio
+async def test_sla_breach_mail_body_without_last_success():
+    conf = cronstable.config.parse_config_string(_SLA_MAIL_JOB, "")
+    job_config = conf.jobs[0]
+    ctx = cronstable.job.SlaBreachContext(
+        job_config,
+        check="maxTimeSinceSuccess",
+        threshold_seconds=3600,
+        observed_seconds=7200.0,
+        last_success_at=None,
+    )
+
+    messages_sent = []
+
+    async def connect(self):
+        pass
+
+    async def send_message(self, message):
+        messages_sent.append(message)
+
+    with (
+        patch("aiosmtplib.SMTP.connect", connect),
+        patch("aiosmtplib.SMTP.send_message", send_message),
+    ):
+        await cronstable.job.MailReporter().report(
+            False, ctx, job_config.onLate["report"]
+        )
+
+    (message,) = messages_sent
+    assert message["Subject"] == (
+        "Cron job 'test' is overdue (maxTimeSinceSuccess)"
+    )
+    assert "Last success: (none recorded)" in message.get_payload()
+
+
+@pytest.mark.asyncio
+async def test_sla_breach_shell_report_exports_sla_env(monkeypatch):
+    for key in [k for k in os.environ if k.startswith("CRONSTABLE_")]:
+        monkeypatch.delenv(key, raising=False)
+
+    captured = {}
+
+    async def fake_create(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        proc = Mock()
+
+        async def wait():
+            return 0
+
+        proc.wait = wait
+        return proc
+
+    monkeypatch.setattr("asyncio.create_subprocess_shell", fake_create)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_create)
+
+    conf = cronstable.config.parse_config_string(_SLA_SHELL_JOB, "")
+    job_config = conf.jobs[0]
+    ctx = _breach_ctx(job_config)
+    await cronstable.job.ShellReporter().report(
+        False, ctx, job_config.onLate["report"]
+    )
+
+    env = captured["env"]
+    assert env["CRONSTABLE_SLA_CHECK"] == "lateAfter"
+    assert env["CRONSTABLE_SLA_THRESHOLD_SECONDS"] == "120"
+    assert env["CRONSTABLE_SLA_OBSERVED_SECONDS"] == "300.5"
+    assert env["CRONSTABLE_LAST_SUCCESS_AT"] == "2020-01-01T10:00:00+00:00"
+    # the run-shaped variables render the breach context faithfully: failed
+    # with the sla fail_reason, no retcode ("None" per str(None)), no output
+    assert env["CRONSTABLE_FAILED"] == "1"
+    assert env["CRONSTABLE_RETCODE"] == "None"
+    assert env["CRONSTABLE_FAIL_REASON"] == "sla: lateAfter breached"
+    assert env["CRONSTABLE_STDOUT"] == ""
+    assert env["CRONSTABLE_STDERR"] == ""
+    assert env["CRONSTABLE_CPU_SECONDS"] == ""
+
+
+@pytest.mark.asyncio
+async def test_sla_breach_webhook_report_default_late_body():
+    import json
+
+    server = _WebhookServer()
+    async with server as url:
+        conf = cronstable.config.parse_config_string(
+            f"""
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+    sla:
+      lateAfterSeconds: 120
+    onLate:
+      report:
+        webhook:
+          url:
+            value: {url}
+""",
+            "",
+        )
+        job_config = conf.jobs[0]
+        ctx = _breach_ctx(job_config)
+        await cronstable.job.WebhookReporter().report(
+            False, ctx, job_config.onLate["report"]
+        )
+
+    (request,) = server.requests
+    assert request["method"] == "POST"
+    # the default onLate webhook body renders the overdue subject + breach
+    # detail as valid JSON in the Slack-compatible {"text": ...} shape
+    payload = json.loads(request["body"])
+    assert set(payload.keys()) == {"text"}
+    assert payload["text"].startswith(
+        "Cron job 'test' is overdue (lateAfter)"
+    )
+    assert "SLA check: lateAfter" in payload["text"]
+    assert "Threshold: 120 seconds" in payload["text"]
+
+
+_SLA_SENTRY_JOB = """
+jobs:
+  - name: test
+    command: ls
+    schedule: "* * * * *"
+    sla:
+      lateAfterSeconds: 120
+    onLate:
+      report:
+        sentry:
+          dsn:
+            value: http://xxx:yyy@sentry/1
+"""
+
+
+@pytest.mark.asyncio
+async def test_sla_breach_sentry_report_uses_sla_fingerprint(monkeypatch):
+    # the dsn must be declared in YAML: a parsed job's unoverridden report
+    # subtrees alias DEFAULT_CONFIG, so an in-place dsn write here would
+    # poison every config parsed later in the process
+    conf = cronstable.config.parse_config_string(_SLA_SENTRY_JOB, "")
+    job_config = conf.jobs[0]
+    ctx = _breach_ctx(job_config)
+
+    transports = []
+
+    class FakeSentryTransport:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.messages_sent = []
+            options = args[0] if args else kwargs.get("options", {})
+            dsn = options.get("dsn")
+            self.parsed_dsn = Dsn(dsn) if dsn else None
+
+        def capture_envelope(self, envelope):
+            event = envelope.get_event()
+            if event is not None:
+                self.messages_sent.append(event)
+
+        def capture_event(self, event_opt):
+            self.messages_sent.append(event_opt)
+
+        def record_lost_event(self, *args, **kwargs):
+            pass
+
+        def is_healthy(self):
+            return True
+
+        def kill(self):
+            pass
+
+        def flush(self, *args, **kwargs):
+            pass
+
+    def make_transport(*args, **kwargs):
+        transport = FakeSentryTransport(*args, **kwargs)
+        transports.append(transport)
+        return transport
+
+    monkeypatch.setattr("sentry_sdk.client.make_transport", make_transport)
+
+    await cronstable.job.SentryReporter().report(
+        False, ctx, job_config.onLate["report"]
+    )
+
+    messages_sent = [
+        msg for transport in transports for msg in transport.messages_sent
+    ]
+    assert len(messages_sent) == 1
+    msg = messages_sent[0]
+    # breaches group under their own default fingerprint, never folded into
+    # this job's run failures, and success=False defaults the level to error
+    assert msg["fingerprint"] == ["cronstable", "sla", "test"]
+    assert msg["level"] == "error"
+    assert msg["extra"]["job"] == "test"
+    assert msg["extra"]["exit_code"] is None
+    assert msg["extra"]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_report_sla_breach_runs_all_four_real_reporters():
+    # every real reporter accepts the context and early-returns on its null
+    # default config: the whole default onLate block is a safe no-op.
+    conf = cronstable.config.parse_config_string(_SLA_PLAIN_JOB, "")
+    job_config = conf.jobs[0]
+    ctx = _breach_ctx(job_config, check="maxRuntime")
+    await cronstable.job.report_sla_breach(ctx, job_config.onLate["report"])
+
+
+@pytest.mark.asyncio
+async def test_report_sla_breach_gathers_and_logs_exceptions(
+    monkeypatch, caplog
+):
+    conf = cronstable.config.parse_config_string(_SLA_PLAIN_JOB, "")
+    ctx = _breach_ctx(conf.jobs[0], check="maxRuntime")
+
+    calls = []
+
+    class BoomReporter:
+        async def report(self, success, job, config):
+            raise RuntimeError("kaboom")
+
+    class OkReporter:
+        async def report(self, success, job, config):
+            calls.append((success, job, config))
+
+    monkeypatch.setattr(
+        cronstable.job.RunningJob, "REPORTERS", [BoomReporter(), OkReporter()]
+    )
+    report_config = {"marker": True}
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cronstable.job.report_sla_breach(ctx, report_config)
+
+    # success=False throughout, the config passed along verbatim, and the
+    # raising reporter logged without stopping the others
+    assert calls == [(False, ctx, report_config)]
+    assert any(
+        "Problem reporting job" in rec.getMessage() for rec in caplog.records
+    )

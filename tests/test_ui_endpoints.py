@@ -1519,6 +1519,165 @@ dags:
 """
 
 
+# ---------------------------------------------------------------------------
+# POST /jobs/{name}/pause + /resume: happy paths, 400 shapes, 404, idempotency
+# ---------------------------------------------------------------------------
+
+from cronstable.cron import (  # noqa: E402 - grouped with its test section
+    PAUSE_BY_MAX,
+    PAUSE_DEFAULT_SECONDS,
+    PAUSE_MAX_SECONDS,
+    PAUSE_NOTE_MAX,
+)
+
+_PAUSE_YAML = """
+jobs:
+  - name: p
+    command: echo hi
+    schedule: "* * * * *"
+"""
+
+
+class _PauseReq:
+    """A minimal aiohttp request stand-in with a match slot and JSON body."""
+
+    def __init__(self, name, body=None):
+        self.match_info = {"name": name}
+        self._body = body
+        self.can_read_body = body is not None
+
+    async def json(self):
+        return self._body
+
+
+async def test_web_pause_defaults_to_default_duration():
+    cron = _cron(_PAUSE_YAML)
+    resp = await cron._web_pause_job(_PauseReq("p"))
+    assert resp.status == 200
+    paused = json.loads(resp.body)["paused"]
+    since = datetime.datetime.fromisoformat(paused["since"])
+    until = datetime.datetime.fromisoformat(paused["until"])
+    assert (until - since).total_seconds() == PAUSE_DEFAULT_SECONDS
+    assert paused["channel"] == "api"
+    assert paused["by"] == "api"
+    assert paused["note"] == ""
+    assert cron._pause_active("p") is not None
+
+
+async def test_web_pause_with_duration_note_and_by():
+    cron = _cron(_PAUSE_YAML)
+    resp = await cron._web_pause_job(
+        _PauseReq(
+            "p", {"durationSeconds": 120, "note": "maint", "by": "parker"}
+        )
+    )
+    paused = json.loads(resp.body)["paused"]
+    since = datetime.datetime.fromisoformat(paused["since"])
+    until = datetime.datetime.fromisoformat(paused["until"])
+    assert (until - since).total_seconds() == 120
+    assert paused["note"] == "maint"
+    assert paused["by"] == "parker"
+
+
+async def test_web_pause_with_until():
+    cron = _cron(_PAUSE_YAML)
+    until = datetime.datetime.now(_UTC) + datetime.timedelta(seconds=600)
+    resp = await cron._web_pause_job(
+        _PauseReq("p", {"until": until.isoformat()})
+    )
+    paused = json.loads(resp.body)["paused"]
+    assert paused["until"] == until.isoformat()
+
+
+async def test_web_pause_400_shapes():
+    cron = _cron(_PAUSE_YAML)
+    now = datetime.datetime.now(_UTC)
+    future = (now + datetime.timedelta(seconds=600)).isoformat()
+    past = (now - datetime.timedelta(seconds=600)).isoformat()
+    far = (
+        now + datetime.timedelta(seconds=PAUSE_MAX_SECONDS + 3600)
+    ).isoformat()
+    bad_bodies = [
+        # both keys are exclusive
+        {"durationSeconds": 60, "until": future},
+        # past until
+        {"until": past},
+        # out of range
+        {"durationSeconds": 0},
+        {"durationSeconds": PAUSE_MAX_SECONDS + 1},
+        {"until": far},
+        # oversized audit fields
+        {"note": "x" * (PAUSE_NOTE_MAX + 1)},
+        {"by": "x" * (PAUSE_BY_MAX + 1)},
+        # bad types (bool is an int subclass and must not read as 1 second)
+        {"durationSeconds": "60"},
+        {"durationSeconds": True},
+        {"until": 12345},
+        {"until": "not-a-timestamp"},
+        {"note": 7},
+        {"by": ["ops"]},
+    ]
+    for body in bad_bodies:
+        with pytest.raises(web.HTTPBadRequest):
+            await cron._web_pause_job(_PauseReq("p", body))
+    assert cron._pause_active("p") is None  # nothing invalid stuck
+
+
+async def test_web_pause_and_resume_unknown_job_404():
+    cron = _cron(_PAUSE_YAML)
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_pause_job(_PauseReq("ghost"))
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_resume_job(_PauseReq("ghost"))
+
+
+async def test_web_pause_is_idempotent_overwrite():
+    cron = _cron(_PAUSE_YAML)
+    resp = await cron._web_pause_job(_PauseReq("p", {"durationSeconds": 60}))
+    first = json.loads(resp.body)["paused"]
+    resp = await cron._web_pause_job(_PauseReq("p", {"durationSeconds": 7200}))
+    second = json.loads(resp.body)["paused"]
+    # a re-pause overwrites the window (no 409): the live record is the new one
+    assert second["until"] > first["until"]
+    live = cron._pause_active("p")
+    assert live is not None
+    assert live.until.isoformat() == second["until"]
+
+
+async def test_web_resume_clears_and_is_noop_when_not_paused():
+    cron = _cron(_PAUSE_YAML)
+    await cron._web_pause_job(_PauseReq("p"))
+    resp = await cron._web_resume_job(_PauseReq("p", {"by": "parker"}))
+    assert resp.status == 200
+    assert json.loads(resp.body) == {"paused": None}
+    assert cron._pause_active("p") is None
+    # resuming a job that is not paused is a 200 no-op, not a conflict
+    resp = await cron._web_resume_job(_PauseReq("p"))
+    assert json.loads(resp.body) == {"paused": None}
+
+
+async def test_jobs_payload_carries_paused():
+    cron = _cron(_PAUSE_YAML)
+    (job,) = cron.jobs_payload()
+    assert job["paused"] is None  # always present, null when not paused
+    record = await cron.pause_job_by_name(
+        "p", duration=300, note="maint", by="parker", channel="api"
+    )
+    (job,) = cron.jobs_payload()
+    assert job["paused"] == record
+    assert set(job["paused"]) == {"since", "until", "note", "by", "channel"}
+
+
+async def test_schedule_why_notes_pause():
+    cron = _cron(_PAUSE_YAML)
+    await cron.pause_job_by_name("p", duration=300, note="maint", by="parker")
+    payload = cron.schedule_why_payload("p", "2026-07-15T09:00:00")
+    notes = [n for n in payload["notes"] if n["code"] == "paused"]
+    assert len(notes) == 1
+    assert "parker" in notes[0]["message"]
+    assert "maint" in notes[0]["message"]
+
+
 def test_artifact_scope_names_unions_all_sources(tmp_path):
     from cronstable.jobstate import GLOBAL_SCOPE
 

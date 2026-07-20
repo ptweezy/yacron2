@@ -250,13 +250,14 @@ class MCPHandler:
         instructions = self._instructions or (
             "cronstable's MCP server. Read-only 'observe' tools describe "
             "jobs, DAGs, the cluster/fleet, metrics and durable state. "
-            "Mutating tools (run/cancel a job, trigger/backfill/approve a "
-            "DAG) require confirm=true and appear only when the operator "
-            "disabled readOnly. Start with cron_get_status or "
-            "cron_list_jobs. When authoring a schedule, verify it with "
-            "cron_validate_schedule / cron_explain_schedule (the daemon's "
-            "own engine) before proposing it; cron_why_no_run explains why "
-            "a job's schedule did or did not fire at a given timestamp."
+            "Mutating tools (run/cancel/pause/resume a job, "
+            "trigger/backfill/approve a DAG) require confirm=true and "
+            "appear only when the operator disabled readOnly. Start with "
+            "cron_get_status or cron_list_jobs. When authoring a schedule, "
+            "verify it with cron_validate_schedule / cron_explain_schedule "
+            "(the daemon's own engine) before proposing it; cron_why_no_run "
+            "explains why a job's schedule did or did not fire at a given "
+            "timestamp."
         )
         result["instructions"] = instructions
         return result
@@ -871,6 +872,39 @@ class MCPHandler:
                 True,
                 True,
             ),
+            (
+                "act",
+                True,
+                "cron_pause_job",
+                "Pause job",
+                "Skip a job's scheduled fires until the window expires "
+                "(durationSeconds, default 3600) or the job is resumed; "
+                "manual runs stay allowed. Requires confirm=true.",
+                obj(
+                    {
+                        "name": _STR,
+                        "durationSeconds": _INT,
+                        "note": _STR,
+                        "confirm": _BOOL,
+                    },
+                    ["name"],
+                ),
+                self._t_pause_job,
+                False,
+                True,
+            ),
+            (
+                "act",
+                True,
+                "cron_resume_job",
+                "Resume job",
+                "Lift a job's pause so scheduled fires resume; a no-op when "
+                "the job is not paused. Requires confirm=true.",
+                obj({"name": _STR, "confirm": _BOOL}, ["name"]),
+                self._t_resume_job,
+                False,
+                True,
+            ),
             # ---- dag control (mutating; toolset dags + readOnly:false) ----
             (
                 "dags",
@@ -1341,6 +1375,31 @@ class MCPHandler:
             {"cancelled": name, "instances": count},
             "cancelled {} instance(s) of job {!r}".format(count, name),
         )
+
+    async def _t_pause_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        name = _req_str(args, "name")
+        _require_confirm(args, "pausing")
+        duration: Optional[int] = None
+        if args.get("durationSeconds") is not None:
+            duration = _opt_int(args["durationSeconds"])
+            if duration is None:
+                raise _ToolInputError("durationSeconds must be an integer")
+        note = args.get("note")
+        if note is not None and not isinstance(note, str):
+            raise _ToolInputError("note must be a string")
+        record = await self._cron.pause_job_by_name(
+            name, duration=duration, note=note or "", by="mcp", channel="mcp"
+        )
+        return _result(
+            {"paused": name, "until": record["until"]},
+            "paused job {!r} until {}".format(name, record["until"]),
+        )
+
+    async def _t_resume_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        name = _req_str(args, "name")
+        _require_confirm(args, "resuming")
+        await self._cron.resume_job_by_name(name, by="mcp", channel="mcp")
+        return _result({"resumed": name}, "resumed job {!r}".format(name))
 
     async def _t_trigger_dag(self, args: Dict[str, Any]) -> Dict[str, Any]:
         dag = _req_str(args, "dag")

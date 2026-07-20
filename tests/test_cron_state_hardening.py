@@ -241,6 +241,43 @@ async def test_depends_on_past_skips_non_run_outcomes(tmp_path):
     assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
 
 
+async def test_depends_on_past_survives_a_pause_flooding_the_ring():
+    # A pause writes one synthetic "skipped" row per held slot, and
+    # run_history is a bounded ring: a pause longer than the ring evicts the
+    # failure that closed the gate. Without the eviction-proof memo the gate
+    # would find no real outcome, fall through to "nothing to depend on", and
+    # run the job against exactly the unrepaired state onlyIfLastSucceeded
+    # exists to protect. No backend here, so the ring is the only source.
+    cron = Cron(None, config_yaml=_DEP_JOB)
+    cron._record_run("j", _mem_run("failure", 0))
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is False
+
+    paused_at = datetime.datetime(2026, 7, 1, 11, 0, 0, tzinfo=_UTC)
+    for _ in range(cron_mod.RUN_HISTORY_LIMIT + 5):
+        cron._record_run(
+            "j",
+            JobRunInfo(
+                outcome="skipped",
+                exit_code=None,
+                started_at=None,
+                finished_at=paused_at,
+                fail_reason=None,
+                output=JobOutputStream(),
+                skip_reason="paused",
+            ),
+        )
+    assert not [
+        info
+        for info in cron.run_history["j"]
+        if info.outcome in ("success", "failure")
+    ]
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is False
+
+    # and a genuine success after the pause still reopens the gate
+    cron._record_run("j", _mem_run("success", 30))
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
+
+
 async def test_depends_on_past_widens_past_non_run_probe_page(tmp_path):
     # More than a probe page of cancelled records sits at the head of the
     # ledger, above the decisive failure. The gate probes a small page first;

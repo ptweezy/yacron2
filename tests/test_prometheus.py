@@ -231,6 +231,43 @@ def test_registry_counts_runs_and_outcome_timestamps():
     )
 
 
+def test_registry_counts_skipped_runs_neutrally():
+    # the synthetic ledger row a paused job writes: counted under its own
+    # zero-filled status label, stamping neither last-outcome timestamp.
+    metrics = PrometheusMetrics()
+    metrics.job_run_recorded("j", "skipped", None)
+    metrics.job_run_recorded("other", "success", 1.0)
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_runs_total", job_name="j", status="skipped"
+        )
+        == 1
+    )
+    assert (
+        sample_value(
+            text, "cronstable_job_last_success_timestamp_seconds", job_name="j"
+        )
+        is None
+    )
+    assert (
+        sample_value(
+            text, "cronstable_job_last_failure_timestamp_seconds", job_name="j"
+        )
+        is None
+    )
+    # jobs that never skipped still export the series, zero-filled
+    assert (
+        sample_value(
+            text,
+            "cronstable_job_runs_total",
+            job_name="other",
+            status="skipped",
+        )
+        == 0
+    )
+
+
 def test_registry_accumulates_cpu_and_peak_rss():
     from cronstable.resources import ResourceUsage
 
@@ -368,6 +405,68 @@ def test_seed_counters_skips_corrupt_cpu_sums():
     )
 
 
+def test_counter_snapshot_round_trip_seeds_sla_breaches():
+    metrics = PrometheusMetrics()
+    metrics.job_sla_breach("j", "lateAfter")
+    metrics.job_sla_breach("j", "lateAfter")
+    metrics.job_sla_breach("j", "maxRuntime")
+    snap = metrics.counters_snapshot()
+
+    restored = PrometheusMetrics()
+    # an event recorded before the seed ran must be added, not overwritten
+    restored.job_sla_breach("j", "lateAfter")
+    assert restored.seed_counters(snap, keep=["j"]) == 1
+    text = _registry_text(restored)
+    assert (
+        sample_value(
+            text,
+            "cronstable_job_sla_breaches_total",
+            job_name="j",
+            check="lateAfter",
+        )
+        == 3
+    )
+    assert (
+        sample_value(
+            text,
+            "cronstable_job_sla_breaches_total",
+            job_name="j",
+            check="maxRuntime",
+        )
+        == 1
+    )
+
+
+def test_seed_counters_skips_corrupt_sla_breaches():
+    def snapshot_with(breaches):
+        return {
+            "buckets": list(DEFAULT_DURATION_BUCKETS),
+            "jobs": {"j": {"sla_breaches": breaches}},
+        }
+
+    # corrupt values (negative, bool, non-int) and a non-dict shape are
+    # skipped field-by-field, never fatal, never poisoning the counter
+    for bad in (
+        {"lateAfter": -3},
+        {"lateAfter": True},
+        {"lateAfter": "x"},
+        ["lateAfter"],
+    ):
+        metrics = PrometheusMetrics()
+        metrics.job_sla_breach("j", "lateAfter")
+        metrics.seed_counters(snapshot_with(bad), keep=["j"])
+        text = _registry_text(metrics)
+        assert (
+            sample_value(
+                text,
+                "cronstable_job_sla_breaches_total",
+                job_name="j",
+                check="lateAfter",
+            )
+            == 1
+        )
+
+
 def test_registry_prune_drops_removed_jobs():
     metrics = PrometheusMetrics()
     metrics.job_run_recorded("keep", "success", 1.0)
@@ -376,6 +475,40 @@ def test_registry_prune_drops_removed_jobs():
     text = _registry_text(metrics)
     assert 'job_name="keep"' in text
     assert 'job_name="gone"' not in text
+
+
+def test_registry_prune_drops_pause_and_sla_series():
+    metrics = PrometheusMetrics()
+    metrics.job_pause_state("keep", True)
+    metrics.job_sla_late("keep", "lateAfter", True)
+    metrics.job_pause_state("gone", True)
+    metrics.job_sla_late("gone", "lateAfter", True)
+    metrics.job_sla_breach("gone", "lateAfter")
+    metrics.prune(["keep"])
+    text = _registry_text(metrics)
+    assert sample_value(text, "cronstable_job_paused", job_name="keep") == 1
+    assert (
+        sample_value(
+            text, "cronstable_job_late", job_name="keep", check="lateAfter"
+        )
+        == 1
+    )
+    assert sample_value(text, "cronstable_job_paused", job_name="gone") is None
+    assert (
+        sample_value(
+            text, "cronstable_job_late", job_name="gone", check="lateAfter"
+        )
+        is None
+    )
+    assert (
+        sample_value(
+            text,
+            "cronstable_job_sla_breaches_total",
+            job_name="gone",
+            check="lateAfter",
+        )
+        is None
+    )
 
 
 def test_registry_bucket_change_resets_histograms_not_counters():
@@ -438,6 +571,94 @@ def test_registry_failure_counters():
         )
         == 1
     )
+
+
+def test_registry_pause_gauge_set_clear_and_default():
+    metrics = PrometheusMetrics()
+    metrics.job_pause_state("p", True)
+    metrics.job_run_recorded("q", "success", 1.0)
+    text = _registry_text(metrics)
+    assert sample_value(text, "cronstable_job_paused", job_name="p") == 1
+    # a job never paused still exports the gauge, at 0 (fleet-visible state)
+    assert sample_value(text, "cronstable_job_paused", job_name="q") == 0
+    metrics.job_pause_state("p", False)
+    text = _registry_text(metrics)
+    assert sample_value(text, "cronstable_job_paused", job_name="p") == 0
+
+
+def test_registry_sla_late_gauge_and_breach_counter():
+    metrics = PrometheusMetrics()
+    metrics.job_sla_late("j", "lateAfter", False)
+    text = _registry_text(metrics)
+    # tracking a check emits both series from the first scrape, zero-valued,
+    # so increase() on the counter works before the first breach
+    assert (
+        sample_value(
+            text, "cronstable_job_late", job_name="j", check="lateAfter"
+        )
+        == 0
+    )
+    assert (
+        sample_value(
+            text,
+            "cronstable_job_sla_breaches_total",
+            job_name="j",
+            check="lateAfter",
+        )
+        == 0
+    )
+    # no series for a check the monitor never tracked
+    assert (
+        sample_value(
+            text, "cronstable_job_late", job_name="j", check="maxRuntime"
+        )
+        is None
+    )
+    metrics.job_sla_late("j", "lateAfter", True)
+    metrics.job_sla_breach("j", "lateAfter")
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_late", job_name="j", check="lateAfter"
+        )
+        == 1
+    )
+    assert (
+        sample_value(
+            text,
+            "cronstable_job_sla_breaches_total",
+            job_name="j",
+            check="lateAfter",
+        )
+        == 1
+    )
+    # recovery clears the latch gauge but never the breach counter
+    metrics.job_sla_late("j", "lateAfter", False)
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_late", job_name="j", check="lateAfter"
+        )
+        == 0
+    )
+    assert (
+        sample_value(
+            text,
+            "cronstable_job_sla_breaches_total",
+            job_name="j",
+            check="lateAfter",
+        )
+        == 1
+    )
+
+
+def test_registry_sla_series_absent_without_sla():
+    # a job with plain run activity exports neither SLA family series
+    metrics = PrometheusMetrics()
+    metrics.job_run_recorded("j", "success", 1.0)
+    text = _registry_text(metrics)
+    assert "cronstable_job_late" not in text
+    assert "cronstable_job_sla_breaches" not in text
 
 
 def test_registry_config_parse_tracking():
@@ -651,6 +872,26 @@ async def test_next_run_reads_seeded_next_fire_index():
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_web_metrics_handler_reports_pause_state():
+    # the configured-job warm-up gives every job a paused sample from the
+    # first scrape (0 until the scheduler pushes a pause), and no SLA
+    # series exist for jobs without an sla block
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    resp = await cron._web_metrics(FakeRequest())
+    text = resp.body.decode("utf-8")
+    assert sample_value(text, "cronstable_job_paused", job_name="alpha") == 0
+    assert sample_value(text, "cronstable_job_paused", job_name="beta") == 0
+    assert "cronstable_job_late" not in text
+    assert "cronstable_job_sla_breaches" not in text
+    cron.metrics.job_pause_state("alpha", True)
+    resp = await cron._web_metrics(FakeRequest())
+    text = resp.body.decode("utf-8")
+    assert sample_value(text, "cronstable_job_paused", job_name="alpha") == 1
+    assert sample_value(text, "cronstable_job_paused", job_name="beta") == 0
 
 
 @pytest.mark.asyncio

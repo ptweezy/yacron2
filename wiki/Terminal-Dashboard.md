@@ -58,6 +58,7 @@ one muscle memory. Press `?` at any time for the overlay.
 | `j` / `↓`, `k` / `↑` | Select the next / previous job |
 | `Enter` | Open the selected job |
 | `r` / `x` | Run / cancel the selected job |
+| `p` | Pause or resume the selected job |
 | `c` | Copy the selected job's command |
 | `g` | Refresh now |
 | `t` / `T` | Cycle theme / flip phosphor ↔ paper |
@@ -83,7 +84,11 @@ Everything an operator drives from the web page:
 - the **jobs board** — status glyphs, next-fire countdowns, last-run
   ages, duration sparklines, live CPU/memory chips for monitored jobs,
   the owner column under a spread cluster, filtering, sorting, and the
-  status segments;
+  status segments; a [paused](Pausing-Jobs) job shows the `⏸` glyph
+  (`p` in `--ascii` mode) with `⏸ til HH:MM` in the next-fire column
+  and `p` toggles pause/resume (also in the palette), while a job
+  [late on an SLA check](Late-Run-Detection) carries an OVERDUE suffix
+  in its status cell and wallboard tile;
 - the **job drawer** — the live **SSE log tail** (ANSI colors re-inked
   per theme, search, follow, wrap, timestamps, save-to-file), **run
   history** with success rate and per-run bars, **resources** for
@@ -231,4 +236,8 @@ daemon you can `curl`.
   the TUI mirrors, annotated with screenshots.
 - [HTTP Control API](HTTP-API): the endpoints and authentication both
   frontends are built on.
+- [Pausing Jobs](Pausing-Jobs): the runtime pause behind the `⏸` glyph
+  and the `p` key.
+- [Late-Run Detection](Late-Run-Detection): the `sla:` monitor behind
+  the OVERDUE suffix.
 - [MCP](MCP): the third frontend — the same daemon, for AI agents.

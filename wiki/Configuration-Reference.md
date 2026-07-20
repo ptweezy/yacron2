@@ -584,6 +584,27 @@ Defaults from `_REPORT_DEFAULTS["webhook"]`:
 | `body` | `Str` | default webhook body template | Request body (jinja2). The default is a Slack-compatible `{"text": ...}` JSON payload of the default subject + body text. |
 | `timeout` | `Float` | `10` | Total request timeout, seconds. |
 
+### SLA monitoring and the `onLate` hook
+
+Per-job thresholds for the runs that did *not* happen, evaluated once per
+minute by the in-process monitor; a breach fires the `onLate` reporters once.
+The full semantics live on [Late-Run Detection](Late-Run-Detection); this is
+the schema summary.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `sla.maxTimeSinceSuccessSeconds` | `EmptyNone() \| Int` | `None` (off) | Breach when this many seconds pass without a successful finish. Must be `> 0` when set. |
+| `sla.lateAfterSeconds` | `EmptyNone() \| Int` | `None` (off) | Breach when a due scheduled slot has not started a run within this many seconds. Must be `> 0` when set. |
+| `sla.maxRuntimeSeconds` | `EmptyNone() \| Int` | `None` (off) | Breach while a running instance exceeds this runtime. Observes only, never kills. Must be `> 0` when set. |
+| `onLate.report` | `_report_schema` | overdue-variant defaults | Reporters fired once per latched breach. Same schema as the hooks above; the defaults swap in an overdue subject/body, a Slack-compatible overdue webhook body, and the sentry fingerprint `["cronstable", "sla", "{{ name }}"]`. |
+
+Configuring an `onLate` reporter (a mail `to`/`from`, a sentry `dsn`, a shell
+`command`, a webhook `url`) while all three `sla` keys are unset is a
+load-time `ConfigError` (`onLate requires sla`). Both keys merge normally
+under `defaults:` and are excluded from the [job-set id](Job-Set-ID)
+fingerprint, like the catch-up options. Disabled and
+[paused](Pausing-Jobs) jobs are not evaluated.
+
 ### Durable state and catch-up
 
 These options build on the top-level [`state`](#state) store and only take
@@ -726,6 +747,8 @@ fork.
 | `onFailure.retry.initialDelay >= 0` | only when a `retry` block is present |
 | `onFailure.retry.maximumDelay > 0` | only when a `retry` block is present |
 | `onFailure.retry.backoffMultiplier > 0` | only when a `retry` block is present |
+| `sla.maxTimeSinceSuccessSeconds > 0`, `sla.lateAfterSeconds > 0`, `sla.maxRuntimeSeconds > 0` | each only when set |
+| an `onLate` reporter requires an `sla` threshold | when a reporter is actually configured (a mail `to`/`from`, a sentry `dsn`, a shell `command`, a webhook `url`) while all three `sla` keys are unset |
 | `monitorResources.interval >= 0.1` | always (a sub-100ms cadence would busy-loop the process-table walk) |
 | `0 <= monitorResources.history <= 2000` | always (bounds what one run adds to a durable ledger record) |
 

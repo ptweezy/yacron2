@@ -1606,3 +1606,232 @@ def test_control_character_in_config_is_config_error_not_attributeerror():
     except ConfigError:
         pass  # the expected translation
     # any other exception type propagates and fails the test
+
+
+# ---------------------------------------------------------------------------
+# sla + onLate (per-job SLA thresholds and the late-report hook)
+# ---------------------------------------------------------------------------
+
+
+def _sla_job(snippet):
+    conf = config.parse_config_string(
+        "jobs:\n"
+        "  - name: sla-job\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n' + snippet,
+        "",
+    )
+    return conf.jobs[0]
+
+
+def test_sla_defaults_off():
+    job = _sla_job("")
+    assert job.sla == {
+        "maxTimeSinceSuccessSeconds": None,
+        "lateAfterSeconds": None,
+        "maxRuntimeSeconds": None,
+    }
+
+
+def test_sla_partial_block_merges_over_defaults():
+    job = _sla_job("    sla:\n      lateAfterSeconds: 300\n")
+    assert job.sla == {
+        "maxTimeSinceSuccessSeconds": None,
+        "lateAfterSeconds": 300,
+        "maxRuntimeSeconds": None,
+    }
+
+
+def test_sla_all_keys_parse():
+    job = _sla_job(
+        "    sla:\n"
+        "      maxTimeSinceSuccessSeconds: 86400\n"
+        "      lateAfterSeconds: 300\n"
+        "      maxRuntimeSeconds: 1200\n"
+    )
+    assert job.sla == {
+        "maxTimeSinceSuccessSeconds": 86400,
+        "lateAfterSeconds": 300,
+        "maxRuntimeSeconds": 1200,
+    }
+
+
+def test_sla_empty_value_means_off():
+    # the EmptyNone() arm: an empty scalar disables the check, matching
+    # startingDeadlineSeconds
+    job = _sla_job("    sla:\n      lateAfterSeconds:\n")
+    assert job.sla["lateAfterSeconds"] is None
+
+
+def test_sla_inherited_from_defaults_and_overridable():
+    conf = config.parse_config_string(
+        """
+defaults:
+  sla:
+    maxTimeSinceSuccessSeconds: 3600
+
+jobs:
+  - name: inherits
+    command: foo
+    schedule: "* * * * *"
+  - name: overrides
+    command: bar
+    schedule: "* * * * *"
+    sla:
+      maxTimeSinceSuccessSeconds: 60
+      lateAfterSeconds: 30
+""",
+        "",
+    )
+    by_name = {j.name: j.sla for j in conf.jobs}
+    assert by_name["inherits"] == {
+        "maxTimeSinceSuccessSeconds": 3600,
+        "lateAfterSeconds": None,
+        "maxRuntimeSeconds": None,
+    }
+    assert by_name["overrides"] == {
+        "maxTimeSinceSuccessSeconds": 60,
+        "lateAfterSeconds": 30,
+        "maxRuntimeSeconds": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "maxTimeSinceSuccessSeconds",
+        "lateAfterSeconds",
+        "maxRuntimeSeconds",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -5])
+def test_sla_values_must_be_positive(key, value):
+    with pytest.raises(ConfigError, match="sla.{} must be > 0".format(key)):
+        _sla_job("    sla:\n      {}: {}\n".format(key, value))
+
+
+def test_onlate_defaults_use_late_templates():
+    report = config.DEFAULT_CONFIG["onLate"]["report"]
+    assert report["mail"]["subject"] == config.DEFAULT_LATE_SUBJECT_TEMPLATE
+    assert report["mail"]["body"] == config.DEFAULT_LATE_BODY_TEMPLATE
+    assert report["webhook"]["body"] == (
+        config.DEFAULT_LATE_WEBHOOK_BODY_TEMPLATE
+    )
+    assert report["sentry"]["fingerprint"] == [
+        "cronstable",
+        "sla",
+        "{{ name }}",
+    ]
+    # everything else keeps the standard report defaults
+    assert report["shell"] == config._REPORT_DEFAULTS["shell"]
+    assert report["mail"]["smtpPort"] == (
+        config._REPORT_DEFAULTS["mail"]["smtpPort"]
+    )
+    # and the shared defaults were not repointed at the late templates
+    assert config._REPORT_DEFAULTS["mail"]["subject"] == (
+        config.DEFAULT_SUBJECT_TEMPLATE
+    )
+
+
+def test_onlate_report_defaults_not_aliased():
+    # the onLate report block must be an independent object like the other
+    # three, so mutating one cannot corrupt the others.
+    job = _sla_job("")
+    assert (
+        job.onLate["report"]["sentry"]["fingerprint"]
+        is not job.onFailure["report"]["sentry"]["fingerprint"]
+    )
+    assert (
+        job.onLate["report"]["sentry"]["fingerprint"]
+        is not job.onSuccess["report"]["sentry"]["fingerprint"]
+    )
+
+
+def test_onlate_report_merges_over_late_defaults():
+    job = _sla_job(
+        "    sla:\n"
+        "      lateAfterSeconds: 300\n"
+        "    onLate:\n"
+        "      report:\n"
+        "        mail:\n"
+        "          from: example@foo.com\n"
+        "          to: example@bar.com\n"
+    )
+    mail = job.onLate["report"]["mail"]
+    assert mail["from"] == "example@foo.com"
+    assert mail["to"] == "example@bar.com"
+    # unset keys inherit the late-specific defaults
+    assert mail["subject"] == config.DEFAULT_LATE_SUBJECT_TEMPLATE
+    assert mail["body"] == config.DEFAULT_LATE_BODY_TEMPLATE
+
+
+def test_sla_and_onlate_via_defaults_block():
+    conf = config.parse_config_string(
+        """
+defaults:
+  sla:
+    lateAfterSeconds: 300
+  onLate:
+    report:
+      mail:
+        from: example@foo.com
+        to: example@bar.com
+
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    job = conf.jobs[0]
+    assert job.sla["lateAfterSeconds"] == 300
+    assert job.onLate["report"]["mail"]["to"] == "example@bar.com"
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "        sentry:\n          dsn:\n            value: https://k@e/1\n",
+        (
+            "        sentry:\n          dsn:\n"
+            "            fromEnvVar: SENTRY_DSN\n"
+        ),
+        "        mail:\n          from: a@b.com\n          to: c@d.com\n",
+        "        shell:\n          command: notify\n",
+        "        webhook:\n          url:\n            value: https://h/x\n",
+        "        webhook:\n          url:\n            fromFile: /run/hook\n",
+    ],
+)
+def test_onlate_without_sla_is_rejected(snippet):
+    # a configured onLate reporter with no sla thresholds would never fire;
+    # that is a config mistake, not a silent no-op.
+    with pytest.raises(ConfigError, match="onLate requires sla"):
+        _sla_job("    onLate:\n      report:\n" + snippet)
+
+
+def test_onlate_with_sla_is_accepted():
+    job = _sla_job(
+        "    sla:\n"
+        "      maxRuntimeSeconds: 600\n"
+        "    onLate:\n"
+        "      report:\n"
+        "        shell:\n"
+        "          command: notify\n"
+    )
+    assert job.onLate["report"]["shell"]["command"] == "notify"
+    assert job.sla["maxRuntimeSeconds"] == 600
+
+
+def test_onlate_with_no_reporter_configured_needs_no_sla():
+    # an onLate block whose reporters are all left at their null defaults
+    # would never fire, so it does not demand an sla block (a defaults block
+    # may carry an onLate skeleton that only some jobs activate).
+    job = _sla_job(
+        "    onLate:\n"
+        "      report:\n"
+        "        mail:\n"
+        "          from:\n"
+        "          to:\n"
+    )
+    assert job.sla["lateAfterSeconds"] is None

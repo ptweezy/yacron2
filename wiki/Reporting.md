@@ -3,13 +3,14 @@
 cronstable can report a job's outcome through four reporters - Sentry, e-mail
 (SMTP), an arbitrary shell command, and an HTTP webhook (Slack-compatible out
 of the box) - configured under the `report` block of the `onFailure`,
-`onPermanentFailure`, and `onSuccess` hooks. This page documents every reporter
+`onPermanentFailure`, `onSuccess`, and `onLate` hooks. This page documents
+every reporter
 option, its type and default, the secret-resolution rules, the jinja2 template
 variables, and the environment variables passed to the shell reporter.
 
 ## Hooks and when each fires
 
-Each job has three reporting hooks, each containing a `report` block with the
+Each job has four reporting hooks, each containing a `report` block with the
 same schema:
 
 | Hook | Fires when |
@@ -17,11 +18,18 @@ same schema:
 | `onFailure` | A job run is detected as failed (see [Failure Detection and Retries](Failure-Detection-and-Retries)). When retries are configured, this fires on each failed attempt. |
 | `onPermanentFailure` | A job has failed and all configured retries are exhausted. |
 | `onSuccess` | A job run is detected as succeeded. |
+| `onLate` | The in-process SLA monitor latches a breach of one of the job's `sla:` thresholds: too long without a success, a due slot that never started, or a run exceeding its runtime bound. Fires once per breach, not per evaluation. See [Late-Run Detection](Late-Run-Detection). |
 
-All three hooks accept the identical `report` block (`sentry`, `mail`, `shell`,
-`webhook`). The default report configuration is applied independently to each of
-the three hooks (`_REPORT_DEFAULTS` is deep-copied into each), so configuring one
-hook does not affect the others.
+All four hooks accept the identical `report` block (`sentry`, `mail`, `shell`,
+`webhook`). The default report configuration is applied independently to each
+hook (`_REPORT_DEFAULTS` is deep-copied into each), so configuring one
+hook does not affect the others. `onLate`'s defaults differ in wording only:
+an SLA breach has no run outcome to describe, so its default mail subject is
+`Cron job '{{name}}' is overdue ({{sla_check}})`, its default body names the
+check, threshold, observed value, and last success, its default webhook body
+wraps the same text in the Slack-compatible `{"text": ...}` shape, and its
+default sentry fingerprint is `["cronstable", "sla", "{{ name }}"]`, grouping
+breaches apart from run failures.
 
 A run that is deliberately terminated to make way for a newer instance
 (`concurrencyPolicy: Replace`) is not treated as a failure and is neither
@@ -66,6 +74,12 @@ The following variables are available when rendering any report template:
 | `cpu_seconds` | float or None | Total CPU time (user + system) of the run's process tree, or `None` when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `cpu_user_seconds` / `cpu_system_seconds` | float or None | The user- and system-mode components of `cpu_seconds`. |
 | `max_rss_bytes` | int or None | Peak resident-set size (bytes) observed during the run, or `None` when unmonitored. |
+
+An [`onLate`](Late-Run-Detection) dispatch renders the same variable set with
+the run-shaped fields empty (`success` is `False`, `fail_reason` is
+`sla: <check> breached`, `stdout`/`stderr`/`exit_code` are `None`) plus four
+breach variables: `sla_check`, `threshold_seconds`, `observed_seconds`, and
+`last_success_at`. See [Late-Run Detection](Late-Run-Detection#the-onlate-report).
 
 The README's variable list omits `fail_reason`; the code provides it (it is
 also used by the default body template). To capture output for inclusion in reports, enable `captureStderr`
@@ -300,6 +314,10 @@ following variables describing the job outcome:
 | `CRONSTABLE_STDOUT_TRUNCATED` | `"1"` if `CRONSTABLE_STDOUT` was truncated, `"0"` otherwise. |
 | `CRONSTABLE_CPU_SECONDS` | Total CPU seconds of the run's process tree, or empty string when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `CRONSTABLE_MAX_RSS_BYTES` | Peak resident-set size in bytes, or empty string when unmonitored. |
+| `CRONSTABLE_SLA_CHECK` | On an [`onLate`](Late-Run-Detection) dispatch, the breached check (`maxTimeSinceSuccess`, `lateAfter`, or `maxRuntime`); empty string on run reports. |
+| `CRONSTABLE_SLA_THRESHOLD_SECONDS` | The breached check's configured threshold; empty string on run reports. |
+| `CRONSTABLE_SLA_OBSERVED_SECONDS` | The measured value that breached it; empty string on run reports. |
+| `CRONSTABLE_LAST_SUCCESS_AT` | ISO-8601 instant of the job's last known success, or empty string (on run reports, and when no success is on record). |
 
 **Truncation:** stdout and stderr can be large, and there are OS limits on
 argument/environment sizes. cronstable truncates each stream to a maximum of
@@ -457,6 +475,7 @@ the logs (it is tied to a secret); for sentry, the DSN env-var name is logged.
 
 - [Configuration Reference](Configuration-Reference)
 - [Failure Detection and Retries](Failure-Detection-and-Retries)
+- [Late-Run Detection](Late-Run-Detection): the `sla:` thresholds behind the `onLate` hook
 - [Output Capturing](Output-Capturing)
 - [Metrics with statsd](Metrics-with-Statsd)
 - [Resource Monitoring](Resource-Monitoring)

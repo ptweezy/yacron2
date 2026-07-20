@@ -4,8 +4,9 @@ cronstable ships an optional [Model Context Protocol](https://modelcontextprotoc
 server, so an AI agent (Claude Desktop / Code, Cursor, VS Code Copilot,
 ChatGPT connectors) can drive cronstable the way an operator drives the
 [dashboard](Web-Dashboard): **observe** every job, DAG, the cluster/fleet,
-metrics and the durable state store, and, when you opt in, **act** (run or
-cancel a job, trigger / backfill / approve a DAG).
+metrics and the durable state store, and, when you opt in, **act** (run,
+cancel, [pause or resume](Pausing-Jobs) a job, trigger / backfill / approve
+a DAG).
 
 It is served two ways from the same code:
 
@@ -65,13 +66,22 @@ default) strips every mutating tool regardless of toolset.
 | `observe` (read) | `cron_get_status`, `cron_list_jobs`, `cron_get_job`, `cron_list_runs`, `cron_get_job_trends`, `cron_get_job_resources`, `cron_get_cluster`, `cron_get_fleet`, `cron_get_node`, `cron_query_metrics`, `cron_get_version`, `cron_tail_job_logs`, `cron_schedule_pressure`, `cron_schedule_duplicates`, `cron_suggest_slot`, `cron_validate_schedule`, `cron_explain_schedule`, `cron_why_no_run` |
 | `dags` (read) | `cron_list_dags`, `cron_list_dag_runs`, `cron_get_dag_run`, `cron_get_dag_xcom`, `cron_tail_dag_task_logs` |
 | `state` (read) | `cron_inspect_state` (store overview / a namespace's documents / a stream's records; KV values and secrets redacted) |
-| `act` (**mutating**) | `cron_run_job`, `cron_cancel_job` |
+| `act` (**mutating**) | `cron_run_job`, `cron_cancel_job`, `cron_pause_job`, `cron_resume_job` |
 | `dags` (**mutating**) | `cron_trigger_dag`, `cron_backfill_dag`, `cron_decide_gate` |
 
 Mutating tools require an explicit `confirm: true` argument, carry honest
 `destructiveHint` annotations, and re-check the same authorization as the REST
 API. `cron_backfill_dag` defaults to `dry_run: true`. It previews the range
 and only executes on `dry_run: false` **and** `confirm: true`.
+
+`cron_pause_job` takes `name` plus an optional `durationSeconds` and `note`
+and holds the job's scheduled fires for the window (one hour when
+`durationSeconds` is omitted); `cron_resume_job` takes `name` and ends the
+pause. Both call the daemon's own pause path with the acting channel recorded
+as `mcp`, so a pause taken by an agent reads as such in the audit fields.
+The observe tools report the resulting `paused` and `sla` state on every job
+payload. Semantics: [Pausing Jobs](Pausing-Jobs) and
+[Late-Run Detection](Late-Run-Detection).
 
 The three schedule-authoring tools make an agent a competent schedule
 **author**, not just a reader, with the daemon's own engine as the

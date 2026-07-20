@@ -1534,7 +1534,17 @@ def test_resolve_secret_nul_and_surrogate_sources_are_config_errors():
         config._resolve_secret(
             {"name": "s", "fromFile": "/tmp/A\ud800.txt"}, "what"
         )
-    with pytest.raises(ConfigError, match="fromEnvVar could not be read"):
+    # POSIX encodes environ to bytes, so a lone surrogate in the name fails
+    # to encode; Windows environ is native UTF-16, where that name is merely
+    # absent and the empty result fails closed on the same ConfigError path.
+    with pytest.raises(
+        ConfigError,
+        match=(
+            "resolved to an empty secret"
+            if IS_WINDOWS
+            else "fromEnvVar could not be read"
+        ),
+    ):
         config._resolve_secret(
             {"name": "s", "fromEnvVar": "A\ud800B"}, "what"
         )

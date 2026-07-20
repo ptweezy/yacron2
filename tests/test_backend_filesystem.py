@@ -1126,26 +1126,37 @@ async def test_renew_loop_warns_and_survives_store_error(
             logging.WARNING, logger="cronstable.backends.filesystem"
         )
         task = asyncio.create_task(a._renew_loop())
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        assert not task.done()  # survived the raising round
-        assert any(
-            "election round failed" in r.getMessage() for r in caplog.records
-        )
-        # The behaviour this test is named for: the loop RAN AGAIN after the
-        # raising round rather than merely staying alive. Neither
-        # `task.done()` nor `task.cancelled() or task.exception() is None`
-        # could show that; both are true by construction after an awaited
-        # cancel, whatever the loop did.
-        for _ in range(2000):
-            if rounds["n"] >= 2:
-                break
-            await asyncio.sleep(0.001)
-        assert rounds["n"] >= 2, "the loop did not run again after the raise"
-        a._stop.set()
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        try:
+            # Poll for the outcome instead of counting `sleep(0)` hops: on
+            # 3.11 and older, `asyncio.wait_for` wraps the coroutine in a
+            # Task, so the raise takes one more loop iteration to surface
+            # than on 3.12+, where `wait_for` awaits the coroutine inline.
+            #
+            # The behaviour this test is named for: the loop RAN AGAIN after
+            # the raising round rather than merely staying alive. Neither
+            # `task.done()` nor `task.cancelled() or task.exception() is
+            # None` could show that; both are true by construction after an
+            # awaited cancel, whatever the loop did.
+            for _ in range(2000):
+                if rounds["n"] >= 2:
+                    break
+                await asyncio.sleep(0.001)
+            assert not task.done()  # survived the raising round
+            assert any(
+                "election round failed" in r.getMessage()
+                for r in caplog.records
+            )
+            assert (
+                rounds["n"] >= 2
+            ), "the loop did not run again after the raise"
+        finally:
+            # Cancel in `finally`: a failing assertion above must not leak a
+            # loop still spinning at the patched 1ms cadence, which wedges
+            # the whole session rather than just failing this test.
+            a._stop.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     finally:
         await _stop(a)
 
@@ -1174,28 +1185,37 @@ async def test_renew_loop_logs_unexpected_error_and_survives(
             logging.ERROR, logger="cronstable.backends.filesystem"
         )
         task = asyncio.create_task(a._renew_loop())
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        assert not task.done()
-        assert any(
-            "unexpected error in the filesystem election loop"
-            in r.getMessage()
-            for r in caplog.records
-        )
-        # The behaviour this test is named for: the loop RAN AGAIN after the
-        # raising round rather than merely staying alive. Neither
-        # `task.done()` nor `task.cancelled() or task.exception() is None`
-        # could show that; both are true by construction after an awaited
-        # cancel, whatever the loop did.
-        for _ in range(2000):
-            if rounds["n"] >= 2:
-                break
-            await asyncio.sleep(0.001)
-        assert rounds["n"] >= 2, "the loop did not run again after the raise"
-        a._stop.set()
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        try:
+            # Poll for the outcome instead of counting `sleep(0)` hops: see
+            # test_renew_loop_warns_and_survives_store_error for why the hop
+            # count differs on 3.11 and older.
+            #
+            # The behaviour this test is named for: the loop RAN AGAIN after
+            # the raising round rather than merely staying alive. Neither
+            # `task.done()` nor `task.cancelled() or task.exception() is
+            # None` could show that; both are true by construction after an
+            # awaited cancel, whatever the loop did.
+            for _ in range(2000):
+                if rounds["n"] >= 2:
+                    break
+                await asyncio.sleep(0.001)
+            assert not task.done()
+            assert any(
+                "unexpected error in the filesystem election loop"
+                in r.getMessage()
+                for r in caplog.records
+            )
+            assert (
+                rounds["n"] >= 2
+            ), "the loop did not run again after the raise"
+        finally:
+            # Cancel in `finally`: a failing assertion above must not leak a
+            # loop still spinning at the patched 1ms cadence, which wedges
+            # the whole session rather than just failing this test.
+            a._stop.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     finally:
         await _stop(a)
 

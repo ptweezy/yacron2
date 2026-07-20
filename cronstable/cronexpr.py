@@ -167,6 +167,13 @@ _YEAR_HORIZON = 2099
 #: the backward mirror of ``_YEAR_HORIZON``.
 _YEAR_FLOOR = 1970
 
+#: How far back :meth:`CronTab._gap_rewound_seed` probes for a spring-forward.
+#: 26 hours is wider than every IANA offset jump, including the date-line hops
+#: (Samoa 2011, +24h), and no real zone transitions twice inside one window.
+#: Module scope because the probe runs on every aware ``next()``: a shared
+#: immutable timedelta is indistinguishable from a freshly built one.
+_GAP_PROBE = datetime.timedelta(hours=26)
+
 
 def _is_quartz_w(item: str) -> bool:
     """A day-field item in the nearest-weekday shape (``15W``, ``LW``): valid
@@ -947,17 +954,25 @@ class CronTab:
         real instant is not in the future, so over-generation costs a few
         wasted iterations, never a wrong answer.
 
-        The probe spans 26 hours: wider than every IANA offset jump,
-        including the date-line hops (Samoa 2011, +24h), and no real zone
-        transitions twice inside one window.  Outside the brief
+        The probe spans :data:`_GAP_PROBE`.  Outside the brief
         post-transition window the fast path is a single extra offset
-        probe.
+        probe, and for a FIXED-offset zone not even that: a
+        :class:`datetime.timezone` carries one immutable offset by
+        construction, so ``off_now <= off_then`` is a theorem and the
+        whole probe is provably a no-op.  Skipping it there is an exact
+        elimination, not an approximation, and it matters because the
+        overwhelmingly common aware call (a UTC ``now``) paid for the
+        full probe on every invocation.  ``type(...) is`` rather than
+        ``isinstance`` only to keep the theorem's precondition literal:
+        CPython refuses to subclass :class:`datetime.timezone` at all
+        ("not an acceptable base type"), so the two spellings cannot
+        actually differ here.
         """
         civil = now.replace(tzinfo=None)
+        if type(now.tzinfo) is datetime.timezone:
+            return civil
         try:
-            earlier = (now_utc - datetime.timedelta(hours=26)).astimezone(
-                now.tzinfo
-            )
+            earlier = (now_utc - _GAP_PROBE).astimezone(now.tzinfo)
         except (OverflowError, OSError):  # pragma: no cover - datetime.min
             return civil
         off_now = now.utcoffset()

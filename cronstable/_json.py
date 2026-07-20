@@ -90,6 +90,18 @@ MAX_DEPTH = 128
 _WIDE_INT_RUN_B = re.compile(rb"\d{19}")
 _WIDE_INT_RUN_S = re.compile(r"\d{19}")
 
+# The bytes prescan runs on EVERY loads(), over the whole payload, and a
+# ``\d{19}`` scan has no literal prefix for sre to memchr on, so it cost more
+# than the parse it guards.  Translating digits to a single byte and
+# everything else to a separator turns the same predicate into two
+# memcpy-speed C loops (~21x faster): a 19-digit run exists iff the
+# translated buffer contains nineteen ``0`` bytes in a row.
+_DIGIT_RUN_TR = bytes.maketrans(
+    bytes(range(256)),
+    bytes((0x30 if 0x30 <= c <= 0x39 else 0x20) for c in range(256)),
+)
+_RUN19 = b"0" * 19
+
 
 def _checked_parse_int(text: str) -> int:
     value = int(text)
@@ -104,9 +116,19 @@ def _checked_parse_int(text: str) -> int:
     return value
 
 
-def _has_wide_int_run(data: Union[bytes, str]) -> bool:
+def _has_wide_int_run(
+    data: Union[bytes, bytearray, memoryview, str],
+) -> bool:
+    # Wider than :func:`loads`' own ``Union[bytes, str]`` on purpose: the
+    # translate path below needs a real ``bytes``/``bytearray``, so the
+    # buffer types that only the regex can take are spelled out rather than
+    # left as a statically dead branch.
     if isinstance(data, str):
         return _WIDE_INT_RUN_S.search(data) is not None
+    if isinstance(data, (bytes, bytearray)):
+        return _RUN19 in data.translate(_DIGIT_RUN_TR)
+    # Any other buffer (memoryview) has no ``.translate`` returning bytes;
+    # the regex accepts it directly, so keep the original path for it.
     return _WIDE_INT_RUN_B.search(data) is not None
 
 
@@ -123,6 +145,14 @@ class UnsupportedValue(ValueError):
     Rejecting at write time is what keeps a record readable by every node
     regardless of which ones have orjson.
     """
+
+
+def _surrogate_error(found: str) -> "UnsupportedValue":
+    return UnsupportedValue(
+        "string containing lone surrogate {!r} is not portable "
+        "across the fleet (the stdlib writes an escape orjson can "
+        "neither emit nor parse)".format(found)
+    )
 
 
 def _depth_error(depth: int) -> "UnsupportedValue":
@@ -156,13 +186,15 @@ def _ensure_finite(obj: Any, _depth: int = 0) -> None:
     elif isinstance(obj, dict):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
+        _next = _depth + 1
         for value in obj.values():
-            _ensure_finite(value, _depth + 1)
+            _ensure_finite(value, _next)
     elif isinstance(obj, (list, tuple)):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
+        _next = _depth + 1
         for value in obj:
-            _ensure_finite(value, _depth + 1)
+            _ensure_finite(value, _next)
 
 
 def ensure_portable(obj: Any, _depth: int = 0) -> None:
@@ -199,16 +231,18 @@ def ensure_portable(obj: Any, _depth: int = 0) -> None:
                 "range [{}, {}]".format(obj, _INT_MIN, _INT_MAX)
             )
     elif isinstance(obj, str):
-        match = _SURROGATES.search(obj)
-        if match is not None:
-            raise UnsupportedValue(
-                "string containing lone surrogate {!r} is not portable "
-                "across the fleet (the stdlib writes an escape orjson can "
-                "neither emit nor parse)".format(match.group())
-            )
+        # ``isascii`` is an O(1) flag read on CPython, and a lone surrogate
+        # is never ASCII, so the scan below can only matter for a non-ASCII
+        # string.  This walk visits every string node in the document; the
+        # unconditional regex was a third of the gate's cost.
+        if not obj.isascii():
+            match = _SURROGATES.search(obj)
+            if match is not None:
+                raise _surrogate_error(match.group())
     elif isinstance(obj, dict):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
+        _next = _depth + 1
         for key, value in obj.items():
             if not isinstance(key, str):
                 raise UnsupportedValue(
@@ -217,13 +251,20 @@ def ensure_portable(obj: Any, _depth: int = 0) -> None:
                         key
                     )
                 )
-            ensure_portable(key, _depth + 1)
-            ensure_portable(value, _depth + 1)
+            # The str branch above, inlined: a proven-str can reach nothing
+            # else (no depth guard applies to it), and recursing per KEY as
+            # well as per value doubled the node count of the whole walk.
+            if not key.isascii():
+                match = _SURROGATES.search(key)
+                if match is not None:
+                    raise _surrogate_error(match.group())
+            ensure_portable(value, _next)
     elif isinstance(obj, (list, tuple)):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
+        _next = _depth + 1
         for value in obj:
-            ensure_portable(value, _depth + 1)
+            ensure_portable(value, _next)
 
 
 if orjson is not None:

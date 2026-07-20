@@ -31,14 +31,21 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     # and separator, redacts the value.  Deliberately loose around the key:
     #
     # * the key may be a SUFFIX of a compound name, with or without a
-    #   separator: the match starts at a word boundary (the lookbehind, whose
-    #   class mirrors the prefix run so a word has exactly ONE start
-    #   position -- keeping the scan linear) and an explicit ``[a-z0-9_\-]*``
-    #   run carries it across the compound prefix to the keyword, so
-    #   ``MY_PASSWORD=`` and ``AWS_SECRET_ACCESS_KEY=`` (the separator forms)
-    #   AND ``PGPASSWORD=`` / ``MYSQLPWD=`` (libpq's and friends' UNseparated
-    #   vendor forms, which a bare ``(?<![a-z0-9])`` before the keyword
-    #   silently leaked) all redact;
+    #   separator.  There is NO left anchor at all: the keyword matches
+    #   wherever it sits inside the token, and any compound prefix simply
+    #   falls OUTSIDE the match, so ``MY_PASSWORD=`` and
+    #   ``AWS_SECRET_ACCESS_KEY=`` (the separator forms) AND ``PGPASSWORD=``
+    #   / ``MYSQLPWD=`` (libpq's and friends' UNseparated vendor forms) all
+    #   redact.  The prefix is left in place because the replacement echoes
+    #   the key verbatim and the prefix was never consumed, so output is
+    #   character-identical either way.  Anchoring here is what the earlier
+    #   ``(?<![a-z0-9])`` got wrong (it leaked the unseparated vendor forms),
+    #   and the ``(?<![a-z0-9_\-])`` + ``[a-z0-9_\-]*`` pair that replaced it
+    #   redacted correctly but cost ~150%: a variable-length run in front of
+    #   the alternation defeats sre's literal-prefix prescan and backtracks
+    #   per token.  The ``(?=[pstacr])`` lookahead is a pure prescan aid --
+    #   every branch below starts with one of those letters, so it can never
+    #   narrow what matches;
     # * the key may be quoted (JSON bodies): an optional closing quote is
     #   allowed between the key and the ``=``/``:`` separator;
     # * the value may be quoted: a quoted value is redacted to its closing
@@ -58,14 +65,14 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     # multi-word passphrase has no reliable delimiter).
     (
         re.compile(
-            r"(?i)(?<![a-z0-9_\-])([a-z0-9_\-]*(?:"
+            r"(?i)(?=[pstacr])("
             r"password|passwd|pwd|secret|token|api[_-]?key|apikey|"
             r"access[_-]?key|secret[_-]?key|auth[_-]?token|credential|"
             r"private[_-]?key"
             # known vendor keys whose credential suffix is not on the
             # generic list ("auth" alone would swallow e.g. "oauth: on").
             r"|rediscli[_-]?auth"
-            r"))(s?)([\"']?\s*[=:]\s*)"
+            r")(s?)([\"']?\s*[=:]\s*)"
             r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'"
             r"|[^\s,}\]]+(?=\s*[,}\]])|[^\r\n]+)"
         ),

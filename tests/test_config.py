@@ -967,15 +967,18 @@ def test_bad_schedule_string_reports_config_error():
 
 
 @pytest.mark.parametrize("blank", ['""', '" "'])
-def test_blank_second_is_not_second_granular(blank):
-    # A blank/whitespace `second:` value collapses to a minute-granular line;
-    # has_seconds must be False so it does not force the whole scheduler to
-    # tick per-second for a job that only fires once a minute. has_seconds is
-    # derived from the actual rendered field count, not mere key presence.
-    job = _one_job(
-        "    schedule:\n      second: {}\n      minute: \"5\"\n".format(blank)
-    )
-    assert job.has_seconds is False
+def test_blank_second_is_rejected_not_column_shifted(blank):
+    # A blank/whitespace `second:` value used to render a vanishing column
+    # (so has_seconds quietly read False); but the same collapse silently
+    # shifted every LATER field one column left -- a 60x fire-rate change
+    # with no error -- so the renderer now rejects any value that is not
+    # exactly one whitespace-free token, naming the offending key.
+    with pytest.raises(ConfigError, match="schedule.second"):
+        _one_job(
+            "    schedule:\n      second: {}\n      minute: \"5\"\n".format(
+                blank
+            )
+        )
 
 
 # ---- monitorResources: bool-or-map forms ------------------------------------
@@ -1455,3 +1458,141 @@ def test_etcd_endpoints_must_be_non_empty():
         config._build_etcd_cluster_config(
             {"backend": "etcd", "nodeName": "node-a", "etcd": {"endpoints": []}}
         )
+
+
+# ---------------------------------------------------------------------------
+# fuzzing findings: schedule-object token validation, _resolve_secret's
+# except tuple, and strictyaml's bare-ValueError escape
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec, key",
+    [
+        ({"second": "0", "year": ""}, "year"),  # blank drops a column
+        ({"minute": ""}, "minute"),
+        ({"minute": " "}, "minute"),
+        ({"minute": "0 12"}, "minute"),  # embedded space adds a column
+        ({"dayOfWeek": "* 2030"}, "dayOfWeek"),  # would pin the YEAR
+        ({"minute": "0\xa0"}, "minute"),  # NBSP: str.split() eats it too
+        ({"minute": "0 "}, "minute"),
+        ({"hour": "1\t2"}, "hour"),
+    ],
+)
+def test_schedule_object_rejects_blank_or_split_values(spec, key):
+    # the rendered line is re-read under a whitespace split, so a blank
+    # value used to DELETE its column and an embedded space to ADD one --
+    # silently shifting every later field (second: "0" + a leftover year:
+    # turned "every second at :00" into "hourly at minute 0", a 60x rate
+    # change with no error and no lint finding).
+    with pytest.raises(ConfigError, match="schedule.{}".format(key)):
+        config.schedule_object_to_crontab(spec)
+
+
+def test_schedule_object_valid_forms_render_exactly_as_before():
+    assert config.schedule_object_to_crontab({}) == "* * * * *"
+    assert config.schedule_object_to_crontab({"minute": "*/5"}) == (
+        "*/5 * * * *"
+    )
+    assert config.schedule_object_to_crontab({"second": "0"}) == (
+        "0 * * * * * *"
+    )
+    assert config.schedule_object_to_crontab({"year": "2030"}) == (
+        "* * * * * 2030"
+    )
+    assert config.schedule_object_to_crontab(
+        {"second": "30", "year": "2030"}
+    ) == "30 * * * * * 2030"
+    assert config.schedule_has_seconds({"second": "0"}) is True
+    assert config.schedule_has_seconds({"minute": "5"}) is False
+
+
+def test_blank_schedule_object_value_is_config_error_from_yaml():
+    # reachable straight from a config file: a leftover `year:` with no
+    # value used to silently retarget the second column into the minute
+    # column; now it is a parse-time ConfigError naming the key.
+    with pytest.raises(ConfigError, match="schedule.year"):
+        parse_config_string(
+            "jobs:\n"
+            "  - name: heartbeat\n"
+            "    command: echo tick\n"
+            "    schedule:\n"
+            '      second: "0"\n'
+            "      year:\n",
+            "",
+        )
+
+
+def test_resolve_secret_nul_and_surrogate_sources_are_config_errors():
+    # open() raises ValueError for a NUL in the path and UnicodeEncodeError
+    # for a lone surrogate; os.environ.get raises UnicodeEncodeError too.
+    # None is an OSError, and on the per-fire job-secret staging path
+    # anything but ConfigError crash-loops the daemon at every fire.
+    with pytest.raises(ConfigError, match="fromFile could not be read"):
+        config._resolve_secret({"name": "s", "fromFile": "a\x00b"}, "what")
+    with pytest.raises(ConfigError, match="fromFile could not be read"):
+        config._resolve_secret(
+            {"name": "s", "fromFile": "/tmp/A\ud800.txt"}, "what"
+        )
+    with pytest.raises(ConfigError, match="fromEnvVar could not be read"):
+        config._resolve_secret(
+            {"name": "s", "fromEnvVar": "A\ud800B"}, "what"
+        )
+
+
+@pytest.mark.parametrize(
+    "yaml_escape_block",
+    [
+        # config-parse route, from a PURE-ASCII file via YAML \u escapes
+        '    password:\n      fromFile: "/tmp/A\\uD800.txt"\n',
+        '    password:\n      fromEnvVar: "A\\uD800B"\n',
+        '    password:\n      fromFile: "a\\u0000b"\n',
+    ],
+)
+def test_resolve_secret_yaml_escaped_sources_stay_config_errors(
+    yaml_escape_block,
+):
+    yaml = (
+        "cluster:\n  backend: etcd\n  etcd:\n"
+        "    endpoints:\n      - https://127.0.0.1:2379\n"
+        "    username: u\n" + yaml_escape_block
+    )
+    with pytest.raises(ConfigError):
+        parse_config_string(yaml, "cronstable.yaml")
+
+
+@pytest.mark.parametrize(
+    "snippet, label",
+    [
+        ("    executionTimeout:\n", "empty Float"),
+        ('    killTimeout: "."\n', "lone dot Float"),
+        ('    saveLimit: "_"\n', "underscore Int"),
+        ('    catchupJitterSeconds: "__"\n', "double underscore Int"),
+    ],
+)
+def test_strictyaml_scalar_validator_valueerror_is_config_error(
+    snippet, label
+):
+    # strictyaml's is_decimal/is_integer prefilters accept '', '.', '_' ...
+    # which float()/int() then reject with a BARE ValueError -- previously
+    # escaping parse_config_string entirely: a raw traceback at startup and
+    # a 'please report this as a bug' log on every reload, for an ordinary
+    # config typo.  ~26 Float()/Int() keys shared this escape.
+    yaml = (
+        "jobs:\n  - name: j\n    command: x\n"
+        '    schedule: "* * * * *"\n' + snippet
+    )
+    with pytest.raises(ConfigError):
+        parse_config_string(yaml, "t.yaml")
+
+
+def test_control_character_in_config_is_config_error_not_attributeerror():
+    # strictyaml's reader raises AttributeError (its ReaderError lacks
+    # context_mark) for a control character in the file; it must surface as
+    # ConfigError so a config-directory load reports the one bad file
+    # instead of aborting wholesale.
+    try:
+        parse_config_string("jobs:\x07\n", "t.yaml")
+    except ConfigError:
+        pass  # the expected translation
+    # any other exception type propagates and fails the test

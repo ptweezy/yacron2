@@ -732,7 +732,19 @@ def _propagate_and_claim(
 
 def _propagate_placeholder(spec, body, task, now, result) -> None:
     entry = body["tasks"].get(task.id)
-    if entry is None or entry.get("state") != PENDING:
+    if entry is None:
+        return
+    if entry.get("state") != PENDING:
+        # Not a fresh placeholder.  Terminal (or expanded) is fine -- but a
+        # NON-terminal, non-pending entry here is a task a config reload
+        # retyped to mapped (gained ``expand:``) while it was mid-flight
+        # under its OLD shape: no path can ever advance it again (the
+        # mapped dispatch never reaches _advance_task, so an elapsed
+        # up_for_retry backoff is never re-claimed; tasks_awaiting_expansion
+        # only offers PENDING placeholders; and _maybe_terminalise demands a
+        # terminal state) -- the run would hold its lease and defeat the
+        # pruner forever.  Resolve it so the run can finish.
+        _resolve_stale_placeholder(task, entry, now, result)
         return
     # A mapped task can only fan out once its expand source SUCCEEDS (that is
     # what produces the item list).  If the source is terminal-but-not-success
@@ -753,6 +765,41 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
         _terminalise_task(entry, UPSTREAM_FAILED, now, result)
     elif verdict == "skip":
         _terminalise_task(entry, SKIPPED, now, result)
+
+
+def _resolve_stale_placeholder(task, entry, now, result) -> None:
+    """Fail an un-expanded mapped task's entry stranded in an OLD shape.
+
+    Reached only from :func:`_propagate_placeholder` for an entry that is
+    neither PENDING nor terminal: the task was retyped to mapped across a
+    reload while parked ``up_for_retry`` (or similar).  Its recorded state
+    belongs to the old shape and cannot be meaningfully resumed under the
+    new one -- relaunching it as an unmapped instance would run the NEW
+    spec's command without the map item it may now expect -- so it is
+    terminalised as FAILED with an explanatory reason, letting the run
+    reach a terminal state, release its lease and be pruned; the next run,
+    created wholly under the new spec, expands cleanly.
+
+    Two live sub-shapes are deliberately left alone: an entry with a
+    ``proc`` token (a genuinely in-flight attempt -- its completion or the
+    reconcile pass will move it to terminal or ``up_for_retry``, which the
+    next advance resolves here) and a parked approval gate
+    (``awaitingApproval`` -- an operator decision can still resolve it).
+    """
+    state = entry.get("state")
+    if state in TERMINAL_STATES or state == EXPANDED:
+        return
+    if state == RUNNING and (
+        entry.get("proc") is not None or entry.get("awaitingApproval")
+    ):
+        return
+    entry["failReason"] = (
+        "task gained expand: across a config reload while parked "
+        "{}; its pre-reload state cannot be resumed under the mapped "
+        "shape, so it is failed to let the run finish (the next run "
+        "expands normally)".format(state)
+    )
+    _terminalise_task(entry, FAILED, now, result)
 
 
 def _advance_task(

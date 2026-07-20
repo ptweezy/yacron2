@@ -463,7 +463,11 @@ class MCPHandler:
             return self._max_rows
         try:
             n = int(requested)
-        except (TypeError, ValueError):
+        # OverflowError alongside the usual two: int(float("inf")) raises
+        # it, and the stdlib JSON parser produces inf from the well-formed
+        # literal 1e999 -- without it a schema-valid argument became a
+        # -32603 protocol fault instead of the documented clamp.
+        except (TypeError, ValueError, OverflowError):
             return self._max_rows
         return max(1, min(n, self._max_rows))
 
@@ -473,7 +477,8 @@ class MCPHandler:
         total = len(items)
         try:
             off = max(0, int(offset or 0))
-        except (TypeError, ValueError):
+        # OverflowError: see _clamp_limit.
+        except (TypeError, ValueError, OverflowError):
             off = 0
         lim = self._clamp_limit(limit)
         page = items[off : off + lim]
@@ -1354,8 +1359,13 @@ class MCPHandler:
         end = _req_str(args, "to")
         if dag not in self._cron.cron_dags:
             return _tool_error("dag not found: {!r}".format(dag))
-        # dry_run defaults TRUE: a plain call previews rather than executing.
-        if args.get("dry_run", True):
+        # dry_run defaults TRUE, tested by IDENTITY like _require_confirm:
+        # only the literal boolean false may take the destructive branch.
+        # ``args.get("dry_run", True)`` applied the default only when the
+        # key was ABSENT, so a present-but-falsy value -- null (exactly how
+        # an MCP client or LLM encodes "unspecified"), [], {}, "", 0 --
+        # fell through the preview gate into a real backfill.
+        if args.get("dry_run") is not False:
             return _result(
                 {
                     "dag": dag,
@@ -1899,7 +1909,10 @@ def _opt_int(value: Any) -> Optional[int]:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    # OverflowError: int(float("inf")) raises it, and stdlib json parses
+    # the legal literal 1e999 to inf -- fall back to the default like any
+    # other unusable value instead of surfacing a -32603 internal error.
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

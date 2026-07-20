@@ -242,6 +242,28 @@ def test_prev_aware_returns_true_elapsed_across_fall_back():
     assert ago == 2.5 * 3600
 
 
+def test_prev_aware_past_horizon_is_bounded_and_correct():
+    # No occurrence lives past the 2099 horizon, so an aware ``now`` far
+    # beyond it must NOT step the backward scan one fire at a time from
+    # ``now`` down to 2099 (~1.8s of CPU per year for a per-minute schedule
+    # -- hours of event-loop starvation for at=9999, reachable via a
+    # schema-valid MCP/web ``at`` argument): the scan starts at the
+    # horizon's edge instead.
+    import time as _time
+
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("* * * * *")
+    started = _time.perf_counter()
+    ago = ct.prev(now=datetime.datetime(9999, 1, 1, tzinfo=ny))
+    assert _time.perf_counter() - started < 2.0
+    # the answer is the real fire set's last member: 2099-12-31 23:59 local
+    now_utc = datetime.datetime(9999, 1, 1, tzinfo=ny).astimezone(
+        datetime.timezone.utc
+    )
+    last = (now_utc - datetime.timedelta(seconds=ago)).astimezone(ny)
+    assert last.replace(tzinfo=None) == datetime.datetime(2099, 12, 31, 23, 59)
+
+
 def test_prev_next_round_trip():
     ct = CronTab("*/15 2-4 * * mon-fri")
     now = datetime.datetime(2026, 7, 15, 13, 37, 21)
@@ -836,3 +858,105 @@ def test_non_integer_step_is_rejected():
 def test_hash_step_must_be_positive():
     with pytest.raises(ValueError, match="positive"):
         CronTab("H/0 * * * *", hash_key="x")
+
+
+# ---------------------------------------------------------------------------
+# fuzzing findings: fold-aware occurrences(), and the spring-forward-shifted
+# fire next()/occurrences() used to lose
+# ---------------------------------------------------------------------------
+
+
+def test_occurrences_honours_start_fold_no_past_fires_replayed():
+    # datetime.now(zone) returns fold=1 for one hour every autumn.  The old
+    # occurrences() dropped start.fold and resolved every candidate at
+    # fold=0 (the FIRST leg), so from 01:30 fold=1 (06:30Z) it yielded
+    # 05:45Z -- 45 minutes in the PAST -- while next() correctly said
+    # 07:00Z: the dashboard preview showed a "next" fire that had already
+    # happened, and missed-run detection reported a run the scheduler never
+    # performed.
+    utc = datetime.timezone.utc
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("*/15 * * * *")
+    start = datetime.datetime(2026, 11, 1, 1, 30, tzinfo=ny, fold=1)
+    start_utc = start.astimezone(utc)
+    first = next(iter(ct.occurrences(start)))
+    assert first.astimezone(utc) > start_utc
+    assert first.astimezone(utc) == datetime.datetime(
+        2026, 11, 1, 7, 0, tzinfo=utc
+    )
+    # the cross-entry-point identity: first yield == start + next(start)
+    delay = ct.next(now=start)
+    assert start_utc + datetime.timedelta(seconds=delay) == first.astimezone(
+        utc
+    )
+    # fold=0 at the same wall time is one real hour earlier and still sees
+    # the remaining first-leg fires
+    start0 = start.replace(fold=0)
+    first0 = next(iter(ct.occurrences(start0))).astimezone(utc)
+    assert first0 == datetime.datetime(2026, 11, 1, 5, 45, tzinfo=utc)
+
+
+def test_next_finds_gap_shifted_fire_after_spring_forward():
+    # "59 2 * * *" in New York on 2015-03-08: the 02:59 label does not
+    # exist; the fire really happens at 07:59Z (wall label 03:59 EDT).
+    # next() used to abandon the day as soon as now's civil label (03:00)
+    # passed the schedule's label (02:59), silently dropping a fire that
+    # was 59 minutes in the future -- while prev() afterwards reported it
+    # as having happened.  Any daemon start or reload inside the window
+    # [gap end, shifted label) lost that day's run.
+    utc = datetime.timezone.utc
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("59 2 * * *")
+    fire_utc = datetime.datetime(2015, 3, 8, 7, 59, tzinfo=utc)
+
+    now = datetime.datetime(2015, 3, 8, 7, 0, tzinfo=utc).astimezone(ny)
+    assert now.fold == 0  # this is the gap defect, not the fold defect
+    delay = ct.next(now=now)
+    assert delay == 3540.0
+    assert now.astimezone(utc) + datetime.timedelta(seconds=delay) == fire_utc
+    # occurrences agrees with next ...
+    assert next(iter(ct.occurrences(now))).astimezone(utc) == fire_utc
+    # ... and prev one second after the fire reports exactly that fire, so
+    # all three entry points now describe one fire set (now converted into
+    # the schedule's zone: prev() evaluates in now.tzinfo)
+    ago = ct.prev(
+        now=(fire_utc + datetime.timedelta(seconds=1)).astimezone(ny)
+    )
+    assert ago == 1.0
+    # past the shifted label the fire is genuinely over: tomorrow is next
+    later = datetime.datetime(2015, 3, 8, 8, 0, tzinfo=utc).astimezone(ny)
+    landed = later.astimezone(utc) + datetime.timedelta(
+        seconds=ct.next(now=later)
+    )
+    assert landed == datetime.datetime(2015, 3, 9, 6, 59, tzinfo=utc)
+
+
+@pytest.mark.parametrize(
+    "expr", ["*/15 * * * *", "30 2 * * *", "59 2 * * *", "30 1 * * 0"]
+)
+@pytest.mark.parametrize("fold", [0, 1])
+def test_next_first_occurrence_prev_agree_across_dst_edges(expr, fold):
+    # the invariant the two DST defects broke, swept over both transition
+    # days and both folds: next(now) == the first occurrences(now) yield,
+    # every yield is strictly future, and prev() one second after a fire
+    # finds it.
+    utc = datetime.timezone.utc
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab(expr)
+    for base in (
+        datetime.datetime(2026, 3, 8),  # spring forward
+        datetime.datetime(2026, 11, 1),  # fall back
+    ):
+        for hour in (0, 1, 2, 3, 4):
+            now = base.replace(hour=hour, minute=10, tzinfo=ny, fold=fold)
+            delay = ct.next(now=now)
+            if delay is None:
+                continue
+            want = now.astimezone(utc) + datetime.timedelta(seconds=delay)
+            got = next(iter(ct.occurrences(now))).astimezone(utc)
+            assert got == want, (expr, now, got, want)
+            assert got > now.astimezone(utc)
+            ago = ct.prev(
+                now=(want + datetime.timedelta(seconds=1)).astimezone(ny)
+            )
+            assert ago == 1.0, (expr, now, ago)

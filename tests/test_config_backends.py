@@ -15,6 +15,7 @@ from cronstable.config import (
     DEFAULT_K8S,
     ConfigError,
     _redact_userinfo,
+    _url_has_userinfo,
     _validate_cross_sections,
     cluster_config_warnings,
     parse_config_string,
@@ -806,6 +807,54 @@ def test_etcd_rejects_schemeless_credentialed_endpoint_without_leak():
         "  etcd:\n"
         "    endpoints:\n"
         "      - user:s3cret@etcd.internal:2379\n"
+    )
+    with pytest.raises(ConfigError) as ei:
+        _cluster(yaml)
+    assert "s3cret" not in str(ei.value)
+
+
+def test_userinfo_detector_and_redactor_share_one_authority():
+    # a protocol-relative //user:pass@host was invisible to BOTH helpers
+    # (the '://' split came up empty), and a malformed trailing '://' made
+    # them DISAGREE: the detector took the credential branch while the
+    # redactor returned the URL untouched, so the "always redacted" error
+    # carried the cleartext password into the log the reload loop rewrites
+    # every cycle.  One shared authority locator now feeds both, so anything
+    # detected is by construction redacted.
+    for url in (
+        "//user:s3cret@etcd.internal:2379",  # protocol-relative
+        "user:s3cret@etcd.internal://",  # malformed trailing '://'
+        "user:s3cret@etcd.internal:2379",  # scheme-less
+        "https://user:s3cret@etcd.internal:2379",  # ordinary
+        "https://user:s3cret@host/path?q=1#frag",
+    ):
+        assert _url_has_userinfo(url), url
+        redacted = _redact_userinfo(url)
+        assert "s3cret" not in redacted, url
+        assert redacted != url, url
+    # and an '@' outside the authority never triggers either helper
+    for url in ("https://host:2379", "//host:2379", "https://host/p@th"):
+        assert not _url_has_userinfo(url), url
+        assert _redact_userinfo(url) == url, url
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "//user:s3cret@etcd.internal:2379",
+        "user:s3cret@etcd.internal://",
+    ],
+)
+def test_etcd_rejects_odd_credentialed_endpoint_shapes_without_leak(endpoint):
+    # the endpoint shapes that used to fall past the credential guard (or
+    # past the redactor) must be rejected AND keep the password out of the
+    # ConfigError text.
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        '      - "{}"\n'.format(endpoint)
     )
     with pytest.raises(ConfigError) as ei:
         _cluster(yaml)

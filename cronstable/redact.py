@@ -30,10 +30,15 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     # key = value / key: value where the key names a secret.  Keeps the key
     # and separator, redacts the value.  Deliberately loose around the key:
     #
-    # * the key may be a SUFFIX of a compound name -- `(?<![a-z0-9])` (not
-    #   ``\b``) so an underscore prefix still matches: ``MY_PASSWORD=`` and
-    #   ``AWS_SECRET_ACCESS_KEY=`` are the single most common shapes real job
-    #   output leaks, and ``\b`` never fires between ``_`` and a letter;
+    # * the key may be a SUFFIX of a compound name, with or without a
+    #   separator: the match starts at a word boundary (the lookbehind, whose
+    #   class mirrors the prefix run so a word has exactly ONE start
+    #   position -- keeping the scan linear) and an explicit ``[a-z0-9_\-]*``
+    #   run carries it across the compound prefix to the keyword, so
+    #   ``MY_PASSWORD=`` and ``AWS_SECRET_ACCESS_KEY=`` (the separator forms)
+    #   AND ``PGPASSWORD=`` / ``MYSQLPWD=`` (libpq's and friends' UNseparated
+    #   vendor forms, which a bare ``(?<![a-z0-9])`` before the keyword
+    #   silently leaked) all redact;
     # * the key may be quoted (JSON bodies): an optional closing quote is
     #   allowed between the key and the ``=``/``:`` separator;
     # * the value may be quoted: a quoted value is redacted to its closing
@@ -53,11 +58,14 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     # multi-word passphrase has no reliable delimiter).
     (
         re.compile(
-            r"(?i)(?<![a-z0-9])("
+            r"(?i)(?<![a-z0-9_\-])([a-z0-9_\-]*(?:"
             r"password|passwd|pwd|secret|token|api[_-]?key|apikey|"
             r"access[_-]?key|secret[_-]?key|auth[_-]?token|credential|"
             r"private[_-]?key"
-            r")(s?)([\"']?\s*[=:]\s*)"
+            # known vendor keys whose credential suffix is not on the
+            # generic list ("auth" alone would swallow e.g. "oauth: on").
+            r"|rediscli[_-]?auth"
+            r"))(s?)([\"']?\s*[=:]\s*)"
             r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'"
             r"|[^\s,}\]]+(?=\s*[,}\]])|[^\r\n]+)"
         ),
@@ -69,8 +77,19 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     # carry a password with no user -- has an empty username, and requiring a
     # username here leaked those passwords verbatim.  The ``@`` anchor keeps a
     # plain ``host:port`` URL (no userinfo) from matching.
+    # The scheme is ANCHORED (the lookbehind) and BOUNDED ({0,31}): without
+    # the anchor, a long run of scheme characters followed by ``://`` and a
+    # long ``@``-less tail restarts the failing tail scan at every offset in
+    # the run -- O(run) x O(tail) backtracking, a job-controlled ReDoS that
+    # measured a clean 4x per input doubling and blocks the event loop for
+    # the whole archive pass.  With one viable start per run the scan is
+    # amortised linear; the bound is belt-and-braces (real schemes are
+    # < 12 chars) so a pathological run also fails in O(32).
     (
-        re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s@]*:)([^@/\s]+)(@)"),
+        re.compile(
+            r"(?<![a-zA-Z0-9+.\-])"
+            r"([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^:/\s@]*:)([^@/\s]+)(@)"
+        ),
         lambda m: f"{m.group(1)}{REDACTED}{m.group(3)}",
     ),
     # Authorization: Bearer <token> / Basic <base64 user:pass>.  The Basic

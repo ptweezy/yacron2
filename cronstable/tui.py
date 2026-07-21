@@ -57,6 +57,7 @@ import textwrap
 import time
 import unicodedata
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Coroutine,
@@ -93,11 +94,29 @@ else:
     import termios
     import tty
 
+if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost
+    # Only _resolve_tls' return annotation needs the name.  Importing ssl
+    # for real would pull it (and socket underneath) into every `cronstable
+    # tui` start, including the overwhelmingly common http:// one, for the
+    # same reason aiohttp is imported lazily; the context itself is built
+    # inside cronstable.tlsutil, imported at the call site.
+    import ssl
+
 logger = logging.getLogger("tui")
 
 #: Client-side conventions shared with the web dashboard (same values).
 DEFAULT_URL = "http://127.0.0.1:8080"
 ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
+
+#: TLS material for an https:// listener, resolved flag-then-env exactly
+#: like the token.  The names are identical in every cronstable client, so
+#: one exported set of variables serves the TUI, the MCP bridge and the
+#: thin CLIs at once; a shell that can reach the daemon can reach it from
+#: any of them without re-teaching the paths.
+ENV_CACERT = "CRONSTABLE_WEB_CACERT"
+ENV_CLIENT_CERT = "CRONSTABLE_WEB_CLIENT_CERT"
+ENV_CLIENT_KEY = "CRONSTABLE_WEB_CLIENT_KEY"
+ENV_INSECURE = "CRONSTABLE_WEB_INSECURE"
 
 #: Poll cadence choices (ms), mirroring the web settings sheet; 0 = paused.
 POLL_CHOICES = [1000, 2000, 3000, 5000, 10000, 0]
@@ -1593,11 +1612,21 @@ class Api:
     CLI's subcommand registration stays light; see the module
     docstring.  A missing/wrong token surfaces as :class:`Unauthorized`
     exactly where the web page would pop its token modal.
+
+    ``ssl_context`` (from :func:`_resolve_tls`) is applied once, to the
+    session's connector; ``None`` leaves aiohttp's default transport in
+    place, which is what every http:// daemon wants.
     """
 
-    def __init__(self, url: str, token: Optional[str]) -> None:
+    def __init__(
+        self,
+        url: str,
+        token: Optional[str],
+        ssl_context: Optional[Any] = None,
+    ) -> None:
         self.url = url.rstrip("/")
         self.token = token
+        self._ssl = ssl_context
         self._session: Any = None
 
     async def _ensure(self) -> Any:
@@ -1606,9 +1635,20 @@ class Api:
 
             # No total timeout: SSE streams are held open indefinitely.
             # Individual JSON calls pass their own per-request timeout.
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=None)
-            )
+            kwargs: Dict[str, Any] = {
+                "timeout": aiohttp.ClientTimeout(total=None)
+            }
+            if self._ssl is not None:
+                # Connector level, not per request: aiohttp's per-request
+                # ssl= would have to be repeated on get_json, get_text,
+                # post AND stream, and the easiest one to forget is
+                # stream(), the SSE path, whose connection is both the
+                # longest-lived and the one carrying the log traffic.  One
+                # connector means a new request method cannot be born
+                # unverified.  The session owns the connector and closes
+                # it in close(), so no extra teardown is needed.
+                kwargs["connector"] = aiohttp.TCPConnector(ssl=self._ssl)
+            self._session = aiohttp.ClientSession(**kwargs)
         return self._session
 
     def _headers(self, accept: str = "application/json") -> Dict[str, str]:
@@ -7079,6 +7119,38 @@ def add_tui_command(sub: Any) -> None:
         ),
     )
     parser.add_argument(
+        "--cacert",
+        default=None,
+        metavar="PATH",
+        help=(
+            "verify an https:// listener against this CA file instead "
+            "of the system trust store (env: %s)" % ENV_CACERT
+        ),
+    )
+    parser.add_argument(
+        "--client-cert",
+        default=None,
+        metavar="PATH",
+        help=(
+            "certificate to present to a listener that requires one "
+            "(web.tls.clientCa is set) (env: %s)" % ENV_CLIENT_CERT
+        ),
+    )
+    parser.add_argument(
+        "--client-key",
+        default=None,
+        metavar="PATH",
+        help="private key for --client-cert (env: %s)" % ENV_CLIENT_KEY,
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help=(
+            "skip certificate verification; the token is still sent, so "
+            "it reaches whoever answers (env: %s)" % ENV_INSECURE
+        ),
+    )
+    parser.add_argument(
         "--theme",
         default=None,
         choices=list(THEME_HUES) + [h + "-light" for h in THEME_HUES],
@@ -7127,6 +7199,74 @@ def _resolve_token(args: Any) -> Optional[str]:
     return value or None
 
 
+def _resolve_tls(args: Any) -> Optional["ssl.SSLContext"]:
+    """Flag then environment, like :func:`_resolve_token`, into a client
+    SSL context (or ``None`` to leave the default transport alone).
+
+    tlsutil is imported here rather than at module scope so an http://
+    session never pays for ssl; it is a stdlib-only leaf, so this cannot
+    reach back into the daemon's import graph.
+
+    Raises :exc:`OSError` on an unreadable path or malformed PEM, named
+    with the material in play; the caller turns that into a one-line CLI
+    error.
+    """
+    from cronstable import tlsutil
+
+    ca = getattr(args, "cacert", None) or os.environ.get(ENV_CACERT) or None
+    cert = (
+        getattr(args, "client_cert", None)
+        or os.environ.get(ENV_CLIENT_CERT)
+        or None
+    )
+    key = (
+        getattr(args, "client_key", None)
+        or os.environ.get(ENV_CLIENT_KEY)
+        or None
+    )
+    insecure = bool(getattr(args, "insecure", False)) or (
+        os.environ.get(ENV_INSECURE, "").lower() in ("1", "true", "yes")
+    )
+    if insecure:
+        # Never silent: verification is off but the Authorization header
+        # is not, so the bearer token is handed to whatever answers the
+        # connection, including whatever is impersonating the daemon.
+        # stderr keeps it out of anything piping the TUI's stdout.
+        print(
+            "warning: --insecure disables certificate verification; the "
+            "bearer token is still sent, so it reaches whoever answers",
+            file=sys.stderr,
+        )
+    try:
+        return tlsutil.build_verifying_client_ssl_context(
+            ca=ca, cert=cert, key=key, insecure=insecure
+        )
+    except (OSError, ValueError) as err:
+        # OSError is a missing/unreadable file or a malformed PEM
+        # (ssl.SSLError subclasses it); ValueError is --client-key with no
+        # --client-cert, which tlsutil refuses rather than ignore.
+        #
+        # The stdlib throws the offending path away: a mistyped cafile
+        # arrives as a bare "[Errno 2] No such file or directory" with
+        # err.filename None, which across three separate paths (two of
+        # which may have come from the environment, not the command line)
+        # tells the operator nothing.  Name them.
+        material = ", ".join(
+            "%s=%s" % (flag, value)
+            for flag, value in (
+                ("--cacert", ca),
+                ("--client-cert", cert),
+                ("--client-key", key),
+            )
+            if value
+        )
+        if not material:
+            raise
+        # Re-raised as OSError either way: dispatch's caller reports it as a
+        # transport-material problem, and the ValueError case is one too.
+        raise OSError("%s (%s)" % (err, material)) from err
+
+
 def dispatch(args: Any) -> int:
     """Run the TUI; returns a process exit code."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -7135,6 +7275,16 @@ def dispatch(args: Any) -> int:
             "(stdin/stdout are not a tty)",
             file=sys.stderr,
         )
+        return 2
+    try:
+        ssl_context = _resolve_tls(args)
+    except OSError as err:
+        # A missing/unreadable file or a malformed PEM; ssl.SSLError is an
+        # OSError subclass, so the one clause covers both.  Resolved here,
+        # before the terminal is put into raw mode, so the operator reads a
+        # plain line on an intact screen instead of a traceback painted
+        # over a half-drawn dashboard.
+        print("cronstable tui: %s" % err, file=sys.stderr)
         return 2
     prefs = load_prefs()
     if getattr(args, "theme", None):
@@ -7159,7 +7309,7 @@ def dispatch(args: Any) -> int:
         else:
             keys = PosixKeyReader(loop, sys.stdin.fileno())
         app = TuiApp(
-            Api(str(args.url), _resolve_token(args)),
+            Api(str(args.url), _resolve_token(args), ssl_context),
             Term(),
             keys,
             prefs,

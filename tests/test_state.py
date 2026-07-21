@@ -2847,3 +2847,676 @@ async def test_inventory_reports_counts_leases_and_quarantine(
     assert leader["expired"] is False
 
     assert inv["quarantine"] == 1
+
+
+# =====================================================================
+# Base-backend defaults, platform-gated retry
+# loops, and the best-effort OSError branches of the maintenance sweeps
+# =====================================================================
+
+
+def _os_raiser(monkeypatch, attr, target_paths, exc=OSError):
+    # Make ``os.<attr>`` raise for a fixed set of exact paths and delegate
+    # to the real function for every other path, so a single sweep step can
+    # be pushed down its OSError branch without disturbing the rest.
+    real = getattr(os, attr)
+    wanted = {os.path.abspath(str(p)) for p in target_paths}
+
+    def _w(path, *a, **k):
+        if os.path.abspath(str(path)) in wanted:
+            raise exc("injected failure")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(os, attr, _w)
+
+
+def _os_one_shot(monkeypatch, attr, target, exc=OSError):
+    # Like _os_raiser but only for the FIRST call against ``target``; every
+    # later call (including the retry that the caller makes) delegates.
+    real = getattr(os, attr)
+    tgt = os.path.abspath(str(target))
+    seen = {"fired": False}
+
+    def _w(path, *a, **k):
+        if not seen["fired"] and os.path.abspath(str(path)) == tgt:
+            seen["fired"] = True
+            raise exc("one-shot failure")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(os, attr, _w)
+    return seen
+
+
+class _DummyLock:
+    # A stand-in for FilesystemStateBackend._locked that runs a mutation on
+    # the lock path at acquire time, so a test can simulate a concurrent
+    # actor winning the race between the pre-check and the re-judge.
+    def __init__(self, path, mutation):
+        self._path = path
+        self._mutation = mutation
+
+    def __enter__(self):
+        self._mutation(self._path)
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _MinimalBackend(state.StateBackend):
+    # The smallest concrete StateBackend: every abstract op is a trivial
+    # stub, so the base class's non-abstract DEFAULTS (the ones a future
+    # native-S3 backend inherits unchanged) can be exercised directly.
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def append_record(
+        self, stream, data, *, prune_keep=None, prune_latest_by=None
+    ):
+        return "r"
+
+    async def list_records(
+        self, stream, *, limit=None, newest_first=False, strict=False
+    ):
+        return []
+
+    async def list_stream_names(self, prefix):
+        return []
+
+    async def derive_max(self, stream, field):
+        return None
+
+    async def prune_records(self, stream, *, keep):
+        return 0
+
+    async def read_document(self, namespace, key):
+        return None
+
+    async def mutate_document(self, namespace, key, transform):
+        return (None, None)
+
+    async def delete_document(self, namespace, key):
+        return False
+
+    async def list_documents(self, namespace):
+        return []
+
+    async def put_blob(self, data):
+        return ""
+
+    async def get_blob(self, digest):
+        return None
+
+    async def acquire_lease(self, name, holder, ttl):
+        return None
+
+    async def renew_lease(self, lease, ttl):
+        return None
+
+    async def release_lease(self, lease):
+        return None
+
+    async def read_lease(self, name):
+        return None
+
+    @property
+    def topology(self):
+        return "unknown"
+
+
+async def test_base_backend_defaults_are_inert():
+    # The base StateBackend cannot enumerate or coordinate, so every
+    # optional surface reports its empty/incomplete shape rather than
+    # pretending to have done work.
+    backend = _MinimalBackend()
+    assert await backend.list_stream_names_audit("x") == ([], False)
+    assert await backend.list_document_keys("ns") is None
+    assert await backend.list_document_namespaces("p") == ([], False)
+    assert await backend.collect_garbage(keep={}, grace=1.0) == {}
+    assert await backend.migrate_schema() == {}
+    assert await backend.sweep_orphan_blobs(set(), 1.0) == 0
+    assert await backend.verify_locking() is None
+    assert backend.stats() == {}
+    assert backend.view_dict() == {
+        "backend": "state",
+        "topology": "unknown",
+    }
+    assert backend.supports_shared_locking() is False
+    inv = await backend.inventory()
+    assert inv["enumerable"] is False
+    assert inv["records"] == {}
+    assert inv["documents"] == {}
+    assert inv["leases"] == []
+    assert inv["quarantine"] == 0
+
+
+def test_mount_entry_skips_malformed_short_lines(monkeypatch):
+    # A /proc/mounts line with fewer than four space-separated fields (a
+    # truncated/garbled entry) is skipped, not indexed out of bounds.
+    mounts = (
+        "short-junk-line\n"  # only one field: skipped by the len guard
+        "rootfs / rootfs rw 0 0\n"
+    )
+
+    def fake_open(path, *a, **k):
+        assert path == "/proc/mounts"
+        import io
+
+        return io.StringIO(mounts)
+
+    monkeypatch.setattr(state, "open", fake_open, raising=False)
+    monkeypatch.setattr(os.path, "realpath", lambda p: p)
+    # the malformed line is ignored; the valid rootfs line still resolves.
+    assert state._mount_entry("/anything") == ("rootfs", "rw")
+
+
+async def test_call_releases_slot_when_thread_spawn_fails(tmp_path):
+    # If the per-call worker thread cannot even be started, the worker slot
+    # it reserved is released (never leaked) and the failure propagates.
+    backend = _backend(tmp_path)
+    await backend.start()
+
+    class _BoomThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot spawn a thread")
+
+    original = state.threading.Thread
+    state.threading.Thread = _BoomThread
+    try:
+        with pytest.raises(RuntimeError, match="cannot spawn"):
+            await backend.derive_max("runs/j", "ts")
+    finally:
+        state.threading.Thread = original
+
+    # the slot was returned: a normal op still completes afterwards.
+    assert await backend.derive_max("runs/j", "ts") is None
+    await backend.stop()
+
+
+def test_replace_windows_retry_loop_forced(tmp_path, monkeypatch):
+    # Drive the Windows sharing-violation retry loop of _replace on a
+    # non-Windows host by forcing IS_WINDOWS: a transient PermissionError is
+    # retried and then succeeds; a persistent one exhausts and re-raises.
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    monkeypatch.setattr(state.time, "sleep", lambda _s: None)
+
+    src = tmp_path / "src"
+    src.write_text("payload")
+    dest = tmp_path / "dest"
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(a, b):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError("sharing violation")
+        return real_replace(a, b)
+
+    monkeypatch.setattr(state.os, "replace", flaky)
+    FilesystemStateBackend._replace(str(src), str(dest))
+    assert dest.read_text() == "payload"
+    assert calls["n"] == 3
+
+    def always(a, b):
+        raise PermissionError("held forever")
+
+    monkeypatch.setattr(state.os, "replace", always)
+    with pytest.raises(PermissionError):
+        FilesystemStateBackend._replace("a", "b")
+
+
+def test_unlink_windows_retry_loop_forced(tmp_path, monkeypatch):
+    # The delete-side twin: _unlink's Windows retry loop, forced on Linux.
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    monkeypatch.setattr(state.time, "sleep", lambda _s: None)
+
+    victim = tmp_path / "victim"
+    victim.write_text("bye")
+    real_unlink = os.unlink
+    calls = {"n": 0}
+
+    def flaky(p):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise PermissionError("sharing violation")
+        return real_unlink(p)
+
+    monkeypatch.setattr(state.os, "unlink", flaky)
+    FilesystemStateBackend._unlink(str(victim))
+    assert not victim.exists()
+
+    def always(p):
+        raise PermissionError("held forever")
+
+    monkeypatch.setattr(state.os, "unlink", always)
+    with pytest.raises(PermissionError):
+        FilesystemStateBackend._unlink("nope")
+
+
+def test_makedirs_durable_walk_breaks_at_self_referential_root(
+    tmp_path, monkeypatch
+):
+    # Force the walk-up loop to reach a self-referential root (dirname(cur) ==
+    # cur) so its ``break`` fires before makedirs raises for the unreachable
+    # ancestor.  The whole ancestor chain, up to and including the filesystem
+    # root the walk converges on, is reported absent; makedirs then raises.
+    # The root is derived from the path itself, so this resolves identically
+    # on POSIX ("/") and Windows (a drive root such as "C:\\").
+    backend = _backend(tmp_path)
+    target = os.path.join(str(tmp_path), "no_such_root", "a", "b")
+
+    chain = set()
+    cur = os.path.abspath(target)
+    while True:
+        chain.add(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    real_isdir = os.path.isdir
+
+    def isdir(p):
+        return False if os.path.abspath(str(p)) in chain else real_isdir(p)
+
+    def boom(*a, **k):
+        raise OSError("unreachable ancestor")
+
+    monkeypatch.setattr(os.path, "isdir", isdir)
+    monkeypatch.setattr(os, "makedirs", boom)
+    with pytest.raises(OSError):
+        backend._makedirs_durable(target)
+
+
+async def test_prune_tolerates_unlink_oserror(tmp_path, monkeypatch):
+    # A prune whose individual unlink races another node (or a Windows
+    # sharing hold) swallows the OSError and simply reports fewer deletes.
+    backend = _backend(tmp_path)
+    await backend.start()
+    for i in range(3):
+        await backend.append_record("runs/p", {"n": i})
+    stream_dir = backend._stream_dir("runs/p")
+    names = [
+        os.path.join(stream_dir, n)
+        for n in os.listdir(stream_dir)
+        if n.endswith(".json")
+    ]
+    _os_raiser(monkeypatch, "unlink", names)
+    # keep=1 would delete two records, but every unlink raises: none counted.
+    assert await backend.prune_records("runs/p", keep=1) == 0
+    await backend.stop()
+
+
+async def test_locked_reopens_on_ghost_inode(tmp_path, monkeypatch):
+    # After winning the flock, _locked re-verifies the path still names the
+    # locked inode; when the identity stat cannot be taken (a ghost inode
+    # reclaimed underneath a waiter) it re-opens and contends afresh.
+    backend = _backend(tmp_path)
+    await backend.start()
+    lock_path = os.path.join(backend.base, state.LEASES_DIR, "ghost.lock")
+    _os_one_shot(monkeypatch, "stat", lock_path)
+    # the first samestat's os.stat raises -> loop retries and then acquires.
+    with backend._locked(lock_path):
+        pass
+    assert os.path.exists(lock_path)
+    await backend.stop()
+
+
+async def test_locked_touch_without_fd_utime_support(tmp_path, monkeypatch):
+    # On a platform whose os.utime cannot take a file descriptor, the
+    # touch=True path refreshes the lock's mtime by PATH instead.
+    backend = _backend(tmp_path)
+    await backend.start()
+    lock_path = os.path.join(backend.base, state.LEASES_DIR, "touch.lock")
+    monkeypatch.setattr(os, "supports_fd", set())
+    with backend._locked(lock_path, touch=True):
+        pass
+    assert os.path.exists(lock_path)
+    await backend.stop()
+
+
+async def test_gc_keeps_stream_when_listdir_fails(tmp_path, monkeypatch):
+    # A managed candidate stream whose directory cannot be listed (a
+    # transient I/O error mid-sweep) is kept, never partially collected.
+    backend = _backend(tmp_path)
+    await backend.start()
+    now = time.time()
+    monkeypatch.setattr(state, "_now", lambda: now + 30 * 86400.0)
+    await backend.append_record("runs/unreadable", {"x": 1})
+    stream_dir = backend._stream_dir("runs/unreadable")
+    _os_raiser(monkeypatch, "listdir", [stream_dir])
+    result = await backend.collect_garbage(
+        keep={"runs/": set()}, grace=7 * 86400.0
+    )
+    assert result["streams_removed"] == 0
+    assert os.path.isdir(stream_dir)
+    await backend.stop()
+
+
+async def test_gc_empty_stream_dir_vanishing_mid_scan_is_kept(
+    tmp_path, monkeypatch
+):
+    # An empty managed dir whose stat fails (it was rmdir'd between the
+    # listing and the age check) is treated as brand new (newest == +inf)
+    # and kept, not deleted on sight.
+    backend = _backend(tmp_path)
+    await backend.start()
+    now = time.time()
+    monkeypatch.setattr(state, "_now", lambda: now + 30 * 86400.0)
+    stream_dir = backend._stream_dir("runs/ghost")
+    os.makedirs(stream_dir, exist_ok=True)
+    target = os.path.abspath(stream_dir)
+    real_listdir = os.listdir
+
+    def vanishing_listdir(path, *a, **k):
+        if os.path.abspath(str(path)) == target:
+            result = real_listdir(path, *a, **k)
+            # empty listing, then the dir disappears before its stat.
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+            return result
+        return real_listdir(path, *a, **k)
+
+    monkeypatch.setattr(os, "listdir", vanishing_listdir)
+    result = await backend.collect_garbage(
+        keep={"runs/": set()}, grace=7 * 86400.0
+    )
+    assert result["streams_removed"] == 0
+    await backend.stop()
+
+
+async def test_lease_dead_past_grace_false_when_read_returns_none(
+    tmp_path, monkeypatch
+):
+    # The dead-past-grace judge returns False (never reclaim) when the lease
+    # stats fine but reads back positively absent -- an ambiguous state that
+    # must not be classified as safely dead.
+    backend = _backend(tmp_path)
+    await backend.start()
+    lease_path = os.path.join(backend.base, state.LEASES_DIR, "x.lease")
+    with open(lease_path, "wb") as fobj:
+        fobj.write(b"{}")
+    monkeypatch.setattr(backend, "_read_lease_file", lambda *a, **k: None)
+    assert backend._lease_dead_past_grace(lease_path, time.time() + 100) is False
+    await backend.stop()
+
+
+async def test_gc_leases_rejudge_keeps_revived_lease(tmp_path, monkeypatch):
+    # An ephemeral lease that passes the cheap pre-check but is re-judged
+    # NOT-dead under the lock (a concurrent re-acquire revived it) is left
+    # untouched.
+    backend = _backend(tmp_path)
+    await backend.start()
+    lease = await backend.acquire_lease("dagadvance/d/r", "A", ttl=10.0)
+    assert lease is not None
+    _lock, lease_path = backend._lease_paths("dagadvance/d/r")
+
+    verdicts = iter([True, False])
+    monkeypatch.setattr(
+        backend,
+        "_lease_dead_past_grace",
+        lambda *a, **k: next(verdicts, False),
+    )
+    r = await backend.collect_garbage(
+        keep={}, grace=3600.0, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
+    assert r["leases_removed"] == 0
+    assert os.path.exists(lease_path)
+    await backend.stop()
+
+
+async def test_gc_leases_windows_post_release_unlink(tmp_path, monkeypatch):
+    # On Windows the dead ephemeral lease's .lock sibling is unlinked AFTER
+    # releasing the flock (own handle closed), best-effort.
+    backend = _backend(tmp_path)
+    await backend.start()
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    lease = await backend.acquire_lease("dagadvance/d/w", "A", ttl=10.0)
+    assert lease is not None
+    lock_path, lease_path = backend._lease_paths("dagadvance/d/w")
+
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    clock["t"] = t0 + 3600.0 + 120.0
+    r = await backend.collect_garbage(
+        keep={}, grace=3600.0, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
+    assert r["leases_removed"] == 1
+    assert not os.path.exists(lease_path)
+    assert not os.path.exists(lock_path)
+    await backend.stop()
+
+
+async def test_gc_orphan_locks_skips_unreadable_namespace(
+    tmp_path, monkeypatch
+):
+    # The orphan-lock sweep skips a document namespace directory it cannot
+    # list rather than crashing the whole pass.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("kv/ns", "k", lambda _c: ({"v": 1}, None))
+    ns_dir = os.path.dirname(backend._doc_paths("kv/ns", "k")[0])
+    _os_raiser(monkeypatch, "listdir", [ns_dir])
+    # must not raise; the (unlistable) namespace simply contributes nothing.
+    r = await backend.collect_garbage(keep={}, grace=3600.0)
+    assert r["locks_removed"] == 0
+    await backend.stop()
+
+
+async def test_reclaim_idle_lock_absent_lock_is_noop(tmp_path):
+    # A .lock whose stat fails (already gone / unreadable) cannot be
+    # classified, so it is not reclaimed.
+    backend = _backend(tmp_path)
+    await backend.start()
+    missing = os.path.join(backend.base, state.LEASES_DIR, "vanished.lock")
+    sibling = os.path.join(backend.base, state.LEASES_DIR, "vanished.lease")
+    assert (
+        backend._reclaim_idle_lock_sync(
+            missing, sibling, time.time(), False
+        )
+        is False
+    )
+    await backend.stop()
+
+
+async def test_reclaim_idle_lock_rejudge_touched_under_lock(
+    tmp_path, monkeypatch
+):
+    # Under the flock the lock's mtime is re-read; a concurrent acquire that
+    # just touched it (mtime now past the cutoff) aborts the reclaim.
+    backend = _backend(tmp_path)
+    await backend.start()
+    now = time.time()
+    lock_path = os.path.join(backend.base, state.LEASES_DIR, "touched.lock")
+    sibling = os.path.join(backend.base, state.LEASES_DIR, "touched.lease")
+    with open(lock_path, "wb") as fobj:
+        fobj.write(b"\0")
+    os.utime(lock_path, (now - 1000.0, now - 1000.0))
+
+    def touch(path):
+        os.utime(path, (now + 1000.0, now + 1000.0))
+
+    monkeypatch.setattr(
+        backend, "_locked", lambda p, **k: _DummyLock(p, touch)
+    )
+    assert (
+        backend._reclaim_idle_lock_sync(lock_path, sibling, now, False)
+        is False
+    )
+    assert os.path.exists(lock_path)
+    await backend.stop()
+
+
+async def test_reclaim_idle_lock_vanishes_under_lock(tmp_path, monkeypatch):
+    # Under the flock the lock's re-stat can fail (it vanished): abort.
+    backend = _backend(tmp_path)
+    await backend.start()
+    now = time.time()
+    lock_path = os.path.join(backend.base, state.LEASES_DIR, "gone.lock")
+    sibling = os.path.join(backend.base, state.LEASES_DIR, "gone.lease")
+    with open(lock_path, "wb") as fobj:
+        fobj.write(b"\0")
+    os.utime(lock_path, (now - 1000.0, now - 1000.0))
+
+    def remove(path):
+        os.unlink(path)
+
+    monkeypatch.setattr(
+        backend, "_locked", lambda p, **k: _DummyLock(p, remove)
+    )
+    assert (
+        backend._reclaim_idle_lock_sync(lock_path, sibling, now, False)
+        is False
+    )
+    await backend.stop()
+
+
+async def test_reclaim_idle_lock_sibling_reappears_under_lock(
+    tmp_path, monkeypatch
+):
+    # Under the flock the sibling data file is re-checked; if a concurrent
+    # actor re-created it, the lock is no longer orphaned: abort.
+    backend = _backend(tmp_path)
+    await backend.start()
+    now = time.time()
+    lock_path = os.path.join(backend.base, state.LEASES_DIR, "resurrect.lock")
+    sibling = os.path.join(backend.base, state.LEASES_DIR, "resurrect.lease")
+    with open(lock_path, "wb") as fobj:
+        fobj.write(b"\0")
+    os.utime(lock_path, (now - 1000.0, now - 1000.0))
+
+    def recreate_sibling(_path):
+        with open(sibling, "wb") as fobj:
+            fobj.write(b"\0")
+
+    monkeypatch.setattr(
+        backend, "_locked", lambda p, **k: _DummyLock(p, recreate_sibling)
+    )
+    assert (
+        backend._reclaim_idle_lock_sync(lock_path, sibling, now, False)
+        is False
+    )
+    assert os.path.exists(lock_path)
+    await backend.stop()
+
+
+async def test_reclaim_idle_lock_windows_post_release_unlink(
+    tmp_path, monkeypatch
+):
+    # On Windows the reclaim's unlink happens AFTER the flock is released,
+    # best-effort, and still reports the lock reclaimed.
+    backend = _backend(tmp_path)
+    await backend.start()
+    now = time.time()
+    lock_path = os.path.join(backend.base, state.LEASES_DIR, "winlock.lock")
+    sibling = os.path.join(backend.base, state.LEASES_DIR, "winlock.lease")
+    with open(lock_path, "wb") as fobj:
+        fobj.write(b"\0")
+    os.utime(lock_path, (now - 1000.0, now - 1000.0))
+    monkeypatch.setattr(state, "IS_WINDOWS", True)
+    assert (
+        backend._reclaim_idle_lock_sync(lock_path, sibling, now, False)
+        is True
+    )
+    assert not os.path.exists(lock_path)
+    await backend.stop()
+
+
+async def test_sweep_dir_tolerates_unlink_oserror(tmp_path, monkeypatch):
+    # _sweep_dir_sync swallows a per-file OSError (a racing delete / hold)
+    # and moves on rather than aborting the whole sweep.
+    backend = _backend(tmp_path)
+    await backend.start()
+    sweep_dir = os.path.join(backend.base, state.TMP_DIR)
+    os.makedirs(sweep_dir, exist_ok=True)
+    aged = os.path.join(sweep_dir, "aged.tmp")
+    with open(aged, "wb") as fobj:
+        fobj.write(b"x")
+    old = time.time() - 10000.0
+    os.utime(aged, (old, old))
+    _os_raiser(monkeypatch, "unlink", [aged])
+    # the unlink raises and is swallowed: nothing counted, file survives.
+    assert backend._sweep_dir_sync(sweep_dir, time.time(), False) == 0
+    assert os.path.exists(aged)
+    await backend.stop()
+
+
+async def test_migrate_skips_unreadable_stream_dir(tmp_path, monkeypatch):
+    # migrate_schema skips a stream directory it cannot list rather than
+    # failing the whole migration pass.  A convertible legacy record sits in
+    # the unlistable stream: because the stream is skipped it is never read,
+    # so nothing is converted (proving the skip, not a silent read).
+    backend = _backend(tmp_path)
+    await backend.start()
+    monkeypatch.setitem(
+        state.RECORD_MIGRATIONS, "v0", lambda data: {"outcome": "x"}
+    )
+    _write_raw_record(
+        backend,
+        "runs/m",
+        "00000000000000000001-old-000000000001.json",
+        {"schemaVersion": "v0", "data": {"result": "ok"}},
+    )
+    stream_dir = backend._stream_dir("runs/m")
+    _os_raiser(monkeypatch, "listdir", [stream_dir])
+    result = await backend.migrate_schema()
+    # the unlistable stream is skipped: its convertible record is untouched.
+    assert result["converted"] == 0
+    assert result["unreadable"] == 0
+    await backend.stop()
+
+
+async def test_blob_sweep_tolerates_unlink_oserror(tmp_path, monkeypatch):
+    # An aged, unreferenced blob whose unlink raises is left in place and
+    # not counted; the sweep does not abort.
+    backend = _backend(tmp_path)
+    await backend.start()
+    digest = await backend.put_blob(b"orphaned-artifact")
+    blob_path = backend._blob_path(digest)
+    old = time.time() - 10000.0
+    os.utime(blob_path, (old, old))
+    _os_raiser(monkeypatch, "unlink", [blob_path])
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 0
+    assert await backend.get_blob(digest) == b"orphaned-artifact"
+    await backend.stop()
+
+
+async def test_inventory_skips_unreadable_stream_node(tmp_path, monkeypatch):
+    # The inventory walk skips a stream directory it cannot list rather than
+    # failing the whole snapshot.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("runs/inv", {"x": 1})
+    stream_dir = backend._stream_dir("runs/inv")
+    _os_raiser(monkeypatch, "listdir", [stream_dir])
+    inv = await backend.inventory()
+    # the unreadable node drops out of the grouping; the snapshot returns.
+    assert inv["enumerable"] is True
+    assert "runs" not in inv["records"]
+    await backend.stop()
+
+
+async def test_inventory_tolerates_lease_read_exception(tmp_path, monkeypatch):
+    # A lease file that raises on read during the inventory walk is observed
+    # best-effort (None) and skipped, never crashing the snapshot.
+    backend = _backend(tmp_path)
+    await backend.start()
+    lease = await backend.acquire_lease("leader", "node-a", ttl=30.0)
+    assert lease is not None
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("lease read blew up")
+
+    monkeypatch.setattr(backend, "_read_lease_file", _boom)
+    inv = await backend.inventory()
+    assert inv["leases"] == []
+    await backend.stop()

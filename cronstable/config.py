@@ -225,10 +225,16 @@ DEFAULT_JOB_API: Dict[str, Any] = {
     # slotTtlSeconds, for the same renew-latency reason.
     "lockTtlSeconds": 30,
     # explicit opt-in required for a `listen` host that is not loopback. The
-    # endpoint serves per-run bearer tokens and staged job secrets in
-    # plaintext HTTP, so binding it to a routable interface without this set
-    # would serve them to anything that can reach the port.
+    # endpoint serves per-run bearer tokens and staged job secrets, so binding
+    # it to a routable interface without this set would serve them to anything
+    # that can reach the port. Pair it with `tls` below to encrypt them.
     "allowNonLoopbackBind": False,
+    # native TLS for an `https://` listen. `cert` + `key` are all-or-nothing.
+    # `ca` is the trust anchor path handed to jobs as CRONSTABLE_STATE_CACERT,
+    # so the job CLI can verify a certificate no public root signed (the
+    # normal case for an internally-issued one). Empty by default: the
+    # endpoint is loopback and plaintext unless the operator asks otherwise.
+    "tls": {"cert": None, "key": None, "ca": None},
 }
 
 # The toolsets the MCP server groups its tools into (see cronstable.mcp). The
@@ -820,6 +826,22 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 ),
                 # octal permissions to apply to a unix:// listen socket
                 Opt("socketMode"): Str(),
+                # native TLS for the `https://` entries in `listen`.
+                # `cert`/`key` are required together and serve every https://
+                # address; http:// and unix:// entries stay plaintext on the
+                # same runner. `clientCa` additionally REQUIRES a client
+                # certificate signed by that CA (mutual TLS), so the CA file
+                # is the caller allowlist: point it at a dedicated CA, never
+                # a shared organisational one. An in-place rotation of these
+                # files is noticed and restarts the listener; see
+                # cronstable.cron.Cron._web_tls_files_changed.
+                Opt("tls"): Map(
+                    {
+                        Opt("cert"): EmptyNone() | Str(),
+                        Opt("key"): EmptyNone() | Str(),
+                        Opt("clientCa"): EmptyNone() | Str(),
+                    }
+                ),
                 # serve the browser dashboard at "/" (default true)
                 Opt("ui"): Bool(),
                 # native Prometheus exposition at GET /metrics (default on
@@ -1014,6 +1036,19 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("maxArtifactBytes"): Int(),
                         Opt("lockTtlSeconds"): Int() | Float(),
                         Opt("allowNonLoopbackBind"): Bool(),
+                        # native TLS for an `https://` listen. Only meaningful
+                        # alongside allowNonLoopbackBind: a loopback endpoint
+                        # is already unreachable off-host. Note `ca` here is
+                        # the CLIENT-side trust anchor handed to jobs as
+                        # CRONSTABLE_STATE_CACERT, the opposite direction from
+                        # web.tls.clientCa (which authenticates callers).
+                        Opt("tls"): Map(
+                            {
+                                Opt("cert"): EmptyNone() | Str(),
+                                Opt("key"): EmptyNone() | Str(),
+                                Opt("ca"): EmptyNone() | Str(),
+                            }
+                        ),
                     }
                 ),
             }
@@ -2176,6 +2211,14 @@ def _build_state_config(raw: dict) -> StateConfig:
     # DEFAULT_JOB_API keys of a partially-specified `jobApi:` block).
     job_api = dict(DEFAULT_JOB_API)
     job_api.update(cfg.get("jobApi") or {})
+    # jobApi.tls is a third nesting level, so it needs its own explicit merge
+    # for the same reason: the update above is shallow and would drop the
+    # untouched DEFAULT_JOB_API["tls"] keys of a partially-specified `tls:`
+    # block (mirrors _build_etcd_cluster_config).
+    job_api["tls"] = {
+        **DEFAULT_JOB_API["tls"],
+        **(job_api.get("tls") or {}),
+    }
     cfg["jobApi"] = job_api
     lock_ttl = float(job_api.get("lockTtlSeconds") or 0)
     if not math.isfinite(lock_ttl) or lock_ttl < 5:
@@ -2190,11 +2233,11 @@ def _build_state_config(raw: dict) -> StateConfig:
     if (
         listen is not None
         and "://" in str(listen)
-        and not str(listen).startswith("http://")
+        and not str(listen).startswith(("http://", "https://"))
     ):
         raise ConfigError(
-            "state.jobApi.listen must be an http:// URL or a bare host:port "
-            "(the job CLI reaches the loopback endpoint over TCP only)"
+            "state.jobApi.listen must be an http:// or https:// URL or a "
+            "bare host:port (the job CLI reaches the endpoint over TCP only)"
         )
     if listen:
         # validate the port the same way the runtime bind parses it
@@ -2223,6 +2266,7 @@ def _build_state_config(raw: dict) -> StateConfig:
                 "must be an integer in 0-65535 (0 or omitted binds an "
                 "OS-assigned ephemeral port)".format(text)
             )
+    _validate_job_api_tls(job_api, listen)
     if listen and not job_api.get("allowNonLoopbackBind"):
         text = str(listen)
         parsed = _safe_urlparse(
@@ -2234,12 +2278,106 @@ def _build_state_config(raw: dict) -> StateConfig:
             msg = (
                 "state.jobApi.listen host {!r} is not loopback; this "
                 "endpoint serves per-run bearer tokens and staged job "
-                "secrets over plaintext HTTP, so binding it beyond this "
-                "host needs state.jobApi.allowNonLoopbackBind: true (and "
-                "should be paired with a reverse proxy adding TLS/auth)"
+                "secrets, so binding it beyond this host needs "
+                "state.jobApi.allowNonLoopbackBind: true"
             )
             raise ConfigError(msg.format(host))
     return StateConfig(cfg)
+
+
+def _is_wildcard_host(host: str) -> bool:
+    """True for a bind address meaning "every interface".
+
+    Spelled several ways: ``0.0.0.0``, ``::``, ``[::]``, the long form
+    ``0:0:0:0:0:0:0:0``, ``::0``, and an empty host. ``ipaddress`` normalises
+    all of the IP forms to the one unspecified address per family, so this
+    compares parsed values rather than the handful of strings someone
+    happened to think of.
+
+    Shared with :mod:`cronstable.jobapi`, which imports it to decide what
+    address to advertise to jobs (a wildcard is not one a job can dial);
+    here it also gates a wildcard bind over ``https://`` (no certificate SAN
+    can cover an unspecified address).
+    """
+    text = host.strip().strip("[]")
+    if not text:
+        return True
+    try:
+        return ipaddress.ip_address(text).is_unspecified
+    except ValueError:
+        # a name, not a literal: a job can resolve it, and a certificate SAN
+        # can cover it
+        return False
+
+
+def _validate_job_api_tls(job_api: Dict[str, Any], listen: Any) -> None:
+    """Cross-checks between ``state.jobApi.listen``'s scheme and its `tls`.
+
+    Same shape as the etcd client-TLS checks in
+    :func:`_build_etcd_cluster_config`: material with no transport that
+    uses it, and a transport with no material, are silent-downgrade
+    misconfigurations rather than typos to shrug at. Here
+    the downgrade is specific: this endpoint hands every job a per-run bearer
+    token and stages its secrets, so a `tls` block that turns out to be inert
+    puts exactly those bytes on the wire in the clear.
+    """
+    tls = job_api.get("tls") or {}
+    cert, key, ca = tls.get("cert"), tls.get("key"), tls.get("ca")
+    text = str(listen) if listen else ""
+    is_https = text.startswith("https://")
+    if bool(cert) != bool(key):
+        raise ConfigError(
+            "state.jobApi.tls.cert and state.jobApi.tls.key must be set "
+            "together (a server certificate needs its private key); got "
+            "cert={!r}, key={!r}".format(bool(cert), bool(key))
+        )
+    if (cert or ca) and not is_https:
+        # `ca` is caught by the same check as `cert`: it is injected into
+        # every job as CRONSTABLE_STATE_CACERT, so left set against a
+        # plaintext endpoint it is both inert and actively misleading, and a
+        # bad path in it fails the job CLI on a channel it was never used on.
+        raise ConfigError(
+            "state.jobApi.tls is configured but state.jobApi.listen is not "
+            "an https:// URL, so the TLS material would be ignored and "
+            "per-run bearer tokens sent in cleartext; use an https:// listen "
+            "address or remove state.jobApi.tls"
+        )
+    if is_https and not cert:
+        raise ConfigError(
+            "state.jobApi.listen is https:// but state.jobApi.tls.cert and "
+            "state.jobApi.tls.key are not set, so the endpoint has no "
+            "certificate to serve"
+        )
+    if is_https and _is_wildcard_host(
+        (_safe_urlparse(text, "state.jobApi.listen").hostname or "")
+    ):
+        # A wildcard bind is advertised to jobs verbatim, and no certificate
+        # can carry a SAN for "every interface", so every job would fail
+        # hostname verification against the URL it was handed.
+        raise ConfigError(
+            "state.jobApi.listen cannot bind a wildcard host over "
+            "https:// : jobs dial the address they are given, and no "
+            "certificate covers an unspecified address; name the interface "
+            "explicitly, e.g. https://10.0.0.5:9000"
+        )
+    if listen and job_api.get("allowNonLoopbackBind") and not is_https:
+        # Warn, not fail: the opt-in predates native TLS and the documented
+        # pairing was a reverse proxy, which is still a valid answer. But the
+        # combination is worth naming every boot, because the flag's own
+        # rationale is that these bytes are worth protecting.
+        parsed = _safe_urlparse(
+            text if "://" in text else "http://" + text,
+            "state.jobApi.listen",
+        )
+        host = parsed.hostname or ""
+        if host != "localhost" and _loopback_ip_version(host) is None:
+            logger.warning(
+                "state.jobApi.listen binds %r off-host without TLS, so "
+                "per-run bearer tokens and staged job secrets cross the "
+                "network in cleartext; set an https:// listen address with "
+                "state.jobApi.tls, or terminate TLS in front of it",
+                host,
+            )
 
 
 def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
@@ -3022,10 +3160,64 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
     return warnings
 
 
+def _validate_web_tls(webconf: WebConfig) -> None:
+    """Cross-checks between the `web.listen` schemes and the `web.tls` block.
+
+    Mirrors the etcd client-TLS checks: material with no transport that uses
+    it, and a transport with no material, are both silent-downgrade
+    misconfigurations rather than typos to shrug at. Fails at parse time so
+    ``--validate-config`` catches them, because the runtime bind loop is
+    designed to skip a bad listener with a warning; an unvalidated
+    certificate problem would otherwise degrade to "the dashboard is just
+    gone" with the reason buried in the log.
+
+    Whether the files exist or load is deliberately NOT checked here. Nothing
+    in this module touches the filesystem (not even for ``cluster.tls``),
+    ``--validate-config`` may run somewhere that is not the deployment
+    target, and a Kubernetes-mounted secret need not exist yet at first boot.
+    That gate lives at the listener, in
+    :meth:`cronstable.cron.Cron.start_stop_web_app`.
+    """
+    tls = webconf.get("tls") or {}
+    cert, key = tls.get("cert"), tls.get("key")
+    client_ca = tls.get("clientCa")
+    listen = webconf.get("listen") or []
+    https = [a for a in listen if str(a).startswith("https://")]
+
+    if bool(cert) != bool(key):
+        raise ConfigError(
+            "web.tls.cert and web.tls.key must be set together (a server "
+            "certificate needs its private key); got cert={!r}, "
+            "key={!r}".format(bool(cert), bool(key))
+        )
+    if client_ca and not cert:
+        raise ConfigError(
+            "web.tls.clientCa is set but web.tls.cert and web.tls.key are "
+            "not; a listener cannot require client certificates without "
+            "serving one of its own"
+        )
+    if (cert or client_ca) and not https:
+        raise ConfigError(
+            "web.tls is configured but no web.listen address uses https:// , "
+            "so the TLS material would be ignored and the API served in "
+            "cleartext; use an https:// listen address or remove web.tls"
+        )
+    if https and not cert:
+        raise ConfigError(
+            "web.listen has https:// address(es) {} but no web.tls.cert / "
+            "web.tls.key, so those listeners have no certificate to serve "
+            "and would be skipped at startup; set web.tls.cert and "
+            "web.tls.key, or use http:// addresses".format(", ".join(https))
+        )
+
+
 def _validate_web_config(webconf: WebConfig) -> None:
     """Range checks the schema cannot express, mirroring the cluster
     builders: fail at parse time (so ``--validate-config`` catches it)
     rather than when the first scrape arrives."""
+    # First, before the early returns below (no nodeHistory map, no metrics
+    # map) skip everything appended after them.
+    _validate_web_tls(webconf)
     history = webconf.get("nodeHistory")
     if isinstance(history, dict):
         interval = history.get("interval")
@@ -3130,14 +3322,26 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
         )
     if mcp.get("allowUnauthenticated") or web.get("authToken"):
         return
-    routable = [a for a in web["listen"] if not _is_local_listener(a)]
+    # An https listener with web.tls.clientCa authenticates its callers at the
+    # transport (CERT_REQUIRED against that CA), which is the same guarantee
+    # this gate already accepts from an mTLS-terminating proxy. Plain https
+    # only encrypts, so it stays routable-and-unauthenticated: transport
+    # encryption is not caller authentication.
+    mtls = bool((web.get("tls") or {}).get("clientCa"))
+    routable = [
+        a
+        for a in web["listen"]
+        if not _is_local_listener(a)
+        and not (mtls and str(a).startswith("https://"))
+    ]
     if routable:
         raise ConfigError(
             "mcp.enabled is set but web.authToken is not, and the web API "
             "listens on non-loopback address(es) {}: /mcp would be served "
             "without authentication (with no token the web app installs no "
             "auth middleware at all). Set web.authToken, restrict web.listen "
-            "to loopback/unix-socket addresses, or set "
+            "to loopback/unix-socket addresses, set web.tls.clientCa so the "
+            "listener authenticates callers by certificate, or set "
             "mcp.allowUnauthenticated: true when the endpoint is protected "
             "by other means (an mTLS-terminating proxy, a network "
             "policy).".format(", ".join(routable))

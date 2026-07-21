@@ -1465,3 +1465,207 @@ def test_check_inventory_lists_streams_and_quarantine(
     assert "is writable" in out
     assert "runs: 2 record(s)" in out
     assert "quarantined: 1 record(s)" in out
+
+
+# ===========================================================================
+# Rare error-handler branches: commonpath drive mismatch, an unextractable
+# archive member, the temp-file cleanup failing after a replace/copy error,
+# and check's inventory listdir failures.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# _safe_members: commonpath raising (mixed drives/UNC roots) skips the member
+# ---------------------------------------------------------------------------
+
+
+def test_safe_members_skips_member_when_commonpath_raises(
+    tmp_path, monkeypatch
+):
+    # os.path.commonpath raises ValueError on mixed drives/UNC roots (the
+    # Windows case the skipif test cannot exercise on Linux): such a member
+    # cannot be inside dest, so it is skipped, never aborting the restore.
+    tar = _tar_with([("records/runs/ok.json", "file")])
+
+    def _boom(_paths):
+        raise ValueError("mixed drive roots")
+
+    monkeypatch.setattr(state_admin.os.path, "commonpath", _boom)
+    assert list(state_admin._safe_members(tar, str(tmp_path))) == []
+
+
+# ---------------------------------------------------------------------------
+# cmd_restore: a member with no extractable content is skipped
+# ---------------------------------------------------------------------------
+
+
+def test_restore_skips_member_with_no_extractable_content(
+    tmp_path, monkeypatch, capsys
+):
+    # tar.extractfile returns None for a member that carries no readable
+    # stream; the restore skips it rather than crash on the missing payload.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    archive = str(tmp_path / "backup.tar.gz")
+    assert (
+        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        == 0
+    )
+
+    dest = tmp_path / "restored"
+    config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", lambda self, m: None)
+    code = _cli(
+        monkeypatch, ["state", "restore", "-c", config2, archive]
+    )
+    assert code == 0
+    # every member's stream was None, so all were skipped: 0 files restored.
+    assert "restored 0 file(s)" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# cmd_restore: a failed temp cleanup after a replace error is swallowed
+# ---------------------------------------------------------------------------
+
+
+def _raise_replace(src, dst):
+    raise OSError("replace blocked")
+
+
+def test_restore_swallows_temp_cleanup_failure(
+    tmp_path, monkeypatch, capsys
+):
+    # when the atomic replace fails AND removing the leftover temp file also
+    # fails, the restore still surfaces the original per-member error and a
+    # non-zero exit rather than letting the cleanup OSError escape.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    archive = str(tmp_path / "backup.tar.gz")
+    assert (
+        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        == 0
+    )
+
+    dest = tmp_path / "restored"
+    config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
+    monkeypatch.setattr(
+        state_admin.FilesystemStateBackend, "_replace", _raise_replace
+    )
+    real_unlink = os.unlink
+
+    def _bad_unlink(path, *args, **kwargs):
+        if isinstance(path, str) and path.endswith(".restoring"):
+            raise OSError("cannot remove temp file")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", _bad_unlink)
+    code = _cli(
+        monkeypatch, ["state", "restore", "-c", config2, archive]
+    )
+    assert code == 1
+    assert "failed to restore" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# cmd_migrate: a failed temp cleanup after a copy error is swallowed
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_swallows_temp_cleanup_failure(
+    tmp_path, monkeypatch, capsys
+):
+    # the migrate copy mirrors restore: if the atomic replace fails AND the
+    # leftover temp file cannot be removed, the per-file "failed to copy"
+    # error and a non-zero exit still stand, with the cleanup OSError eaten.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    dest = tmp_path / "dest"
+    monkeypatch.setattr(
+        state_admin.FilesystemStateBackend, "_replace", _raise_replace
+    )
+    real_unlink = os.unlink
+
+    def _bad_unlink(path, *args, **kwargs):
+        if isinstance(path, str) and path.endswith(".migrating"):
+            raise OSError("cannot remove temp file")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", _bad_unlink)
+    code = _cli(
+        monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
+    )
+    assert code == 1
+    assert "failed to copy" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# cmd_check: unreadable inventory directories degrade to zero, never crash
+# ---------------------------------------------------------------------------
+
+
+def _listdir_raising_on(target):
+    """Wrap os.listdir so it raises OSError for one exact directory."""
+    real = os.listdir
+    tgt = os.path.realpath(target)
+
+    def _wrapper(path, *args, **kwargs):
+        if isinstance(path, (str, bytes, os.PathLike)):
+            if os.path.realpath(os.fspath(path)) == tgt:
+                raise OSError("listdir blocked")
+        return real(path, *args, **kwargs)
+
+    return _wrapper
+
+
+def test_check_records_root_unreadable_reports_zero_streams(
+    tmp_path, monkeypatch, capsys
+):
+    # if the records root cannot be listed the inventory reports zero streams
+    # rather than aborting the writable-store check.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    base = os.path.join(str(store), "default")
+    records_root = os.path.join(base, RECORDS_DIR)
+    monkeypatch.setattr(os, "listdir", _listdir_raising_on(records_root))
+    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    out = capsys.readouterr().out
+    assert "is writable" in out
+    assert "streams: 0 (0 record(s))" in out
+
+
+def test_check_unreadable_stream_dir_is_skipped(
+    tmp_path, monkeypatch, capsys
+):
+    # a single stream directory that cannot be listed is skipped (its records
+    # go uncounted) without failing the whole inventory.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    base = os.path.join(str(store), "default")
+    stream_dir = os.path.join(base, RECORDS_DIR, "runs%2Fj")
+    monkeypatch.setattr(os, "listdir", _listdir_raising_on(stream_dir))
+    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    out = capsys.readouterr().out
+    # both streams are still enumerated; the unreadable runs stream counts as
+    # zero, so only the meta stream's single record is tallied.
+    assert "streams: 2 (1 record(s))" in out
+    assert "runs:" not in out
+
+
+def test_check_unreadable_quarantine_reports_zero(
+    tmp_path, monkeypatch, capsys
+):
+    # an unreadable quarantine directory tallies as zero quarantined records
+    # rather than crashing the check.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    base = os.path.join(str(store), "default")
+    quarantine = os.path.join(base, "quarantine")
+    monkeypatch.setattr(os, "listdir", _listdir_raising_on(quarantine))
+    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    assert "quarantined: 0 record(s)" in capsys.readouterr().out

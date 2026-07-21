@@ -39,7 +39,7 @@ import aiohttp
 from aiohttp import web
 
 import cronstable.version
-from cronstable import platform
+from cronstable import platform, tlsutil
 from cronstable.config import (
     ClusterConfig,
     ConfigError,
@@ -852,17 +852,52 @@ def schedule_slot(
     return now.replace(second=0, microsecond=0)
 
 
-def web_site_from_url(runner: web.AppRunner, url: str) -> web.BaseSite:
+def web_site_from_url(
+    runner: web.AppRunner,
+    url: str,
+    ssl_context: Optional[ssl.SSLContext] = None,
+) -> web.BaseSite:
+    """One listener for ``url``, TLS-wrapped when the url says ``https``.
+
+    ``ssl_context`` is built once per app (re)start and shared by every
+    ``https://`` entry; it is applied per *site*, not per runner, so a listen
+    list mixing ``http://`` and ``https://`` serves the same app plaintext on
+    one port and over TLS on another. ``unix://`` listeners are always
+    plaintext: they are already confined to the host's filesystem, where the
+    socket's own permissions (``web.socketMode``) are the access control.
+    """
     parsed = urlparse(url)
-    if parsed.scheme == "http":
+    if parsed.scheme in ("http", "https"):
         if parsed.hostname is None or parsed.port is None:
-            # raise ValueError (not AssertionError) so a malformed http url is
+            # raise ValueError (not AssertionError) so a malformed url is
             # treated as a skippable bad-config entry, not an internal bug.
+            # An explicit port is required for https too: aiohttp would
+            # otherwise silently default a TLS site to 8443, which is not
+            # what an operator who typed "https://0.0.0.0" meant.
             logger.warning(
-                "Ignoring web listen url %s: http url needs host and port", url
+                "Ignoring web listen url %s: %s url needs host and port",
+                url,
+                parsed.scheme,
             )
             raise ValueError(url)
-        return web.TCPSite(runner, parsed.hostname, parsed.port)
+        if parsed.scheme == "https" and ssl_context is None:
+            # Config validation normally catches this (config._validate_web_tls
+            # refuses an https listen with no web.tls), so reaching here means
+            # the context failed to BUILD. Skip the listener; serving it in
+            # cleartext on the port an operator asked to encrypt would be the
+            # one failure mode worse than not serving it.
+            logger.warning(
+                "Ignoring web listen url %s: no usable web.tls material for "
+                "an https listener",
+                url,
+            )
+            raise ValueError(url)
+        return web.TCPSite(
+            runner,
+            parsed.hostname,
+            parsed.port,
+            ssl_context=ssl_context if parsed.scheme == "https" else None,
+        )
     elif parsed.scheme == "unix":
         if not platform.supports_unix_sockets():
             # asyncio's Windows Proactor loop can't serve a unix socket; skip
@@ -1048,6 +1083,14 @@ class Cron:
         self.retry_state = {}  # type: Dict[str, JobRetryState]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
+        # On-disk fingerprint of the web.tls files as the RUNNING listener
+        # loaded them. The SSLContext is built once per (re)start and never
+        # reloaded, so an in-place rotation (same paths, new bytes, which is
+        # how cert-manager / Vault / a Kubernetes secret refresh renews) is
+        # otherwise invisible and the daemon serves the old certificate until
+        # it expires. Only meaningful while web_runner is not None, which is
+        # why every teardown clears it. See _web_tls_files_changed.
+        self._web_tls_signature = None  # type: Optional[Dict[str, Any]]
         # the optional MCP server config and its handler. Both track the web
         # app's lifecycle: the handler is (re)built inside start_stop_web_app
         # so it always reflects the current config after a reload.
@@ -1245,6 +1288,15 @@ class Cron:
         # with it). None keeps the classic behaviour: no endpoint, no injected
         # CRONSTABLE_STATE_* env, jobs unaware of the store.
         self._job_api: Optional["JobStateAPI"] = None
+        # On-disk fingerprint of the job API's TLS files (cert/key) as the
+        # RUNNING listener loaded them, or None for a plaintext endpoint. The
+        # SSLContext is built once inside JobStateAPI.start() and never
+        # reloaded, so an in-place rotation (same paths, new bytes) is
+        # otherwise invisible and the endpoint keeps serving the old
+        # certificate until it expires. The web-app analogue is
+        # _web_tls_signature; only meaningful while _job_api is not None, which
+        # is why _stop_job_api clears it. See _job_api_tls_files_changed.
+        self._job_api_tls_signature = None  # type: Optional[Dict[str, Any]]
         # the durable DAG orchestrator (cronstable.dagrun.DagScheduler);
         # inert until a `dags:` section and a state backend are configured. It
         # holds a back-reference to this Cron and reuses its state/lease/launch
@@ -4520,29 +4572,126 @@ class Cron:
         await self._pump_output(resp, output)
         return resp
 
+    def _web_restart_reason(
+        self,
+        web_config: Optional[WebConfig],
+        mcp_config: Optional[MCPConfig],
+    ) -> Optional[str]:
+        """Why the running web app must be torn down, or None to keep it.
+
+        The same reason-string triage :meth:`start_stop_cluster` uses, for the
+        same reasons: three distinguishable causes, one of which (a
+        certificate rotation) is gated on the new material actually loading.
+        """
+        if web_config is None or web_config != self.web_config:
+            reason = "configuration changed"
+        # an mcp-only change (e.g. readOnly flipped, a toolset added) must
+        # also restart the app: the /mcp route set is fixed at build time,
+        # so it only picks up config through a fresh routes list.
+        elif mcp_config != self.mcp_config:
+            reason = "mcp configuration changed"
+        # an in-place certificate rotation leaves the config bytes identical
+        # but the on-disk material new; without this the listener keeps
+        # serving the old certificate until it expires.
+        elif self._web_tls_files_changed():
+            reason = "TLS certificate files changed"
+        else:
+            return None
+        if web_config is not None and not tlsutil.listener_tls_loadable(
+            web_config.get("tls")
+        ):
+            # Make-before-break is infeasible here for the same reason it is
+            # for gossip: the new runner binds the same port / socket path the
+            # old one still holds. So only proceed once the NEW material
+            # loads. A half-written rotation (cert-manager, Vault and
+            # Kubernetes secret refreshes are not atomic across the files), or
+            # a config edit racing one, would otherwise tear down a working
+            # listener and then fail to rebuild, leaving nothing serving until
+            # the next reload.
+            logger.warning(
+                "web: new TLS material is not yet loadable (a "
+                "partial/half-written rotation, or a config edit racing "
+                "one?); keeping the running listener and retrying next reload"
+            )
+            return None
+        return reason
+
+    def _build_web_tls(
+        self, web_tls: Optional[Dict[str, Any]]
+    ) -> "tuple[Optional[ssl.SSLContext], Optional[Dict[str, Any]], bool]":
+        """``(context, file signature, failed)`` for a listener about to start.
+
+        On failure the caller must NOT fall back to a plaintext listener and
+        must NOT latch ``web_config``: leaving it unchanged is exactly what
+        makes the next reload retry, instead of concluding "nothing changed"
+        and never trying again.
+        """
+        # Callers gate on tlsutil.listener_tls_configured, so cert and key
+        # are present here; the Optional is only so the guarded call site
+        # type-checks.
+        assert web_tls is not None
+        # Snapshot the files BEFORE loading them: a rotation landing in the
+        # gap then compares unequal on the next reload, which is a spurious
+        # restart rather than a missed one. (cluster.py latches AFTER its
+        # load; this order is the safer one.)
+        signature = tlsutil.tls_file_signature(
+            web_tls, tlsutil.LISTENER_TLS_KEYS
+        )
+        try:
+            context = tlsutil.build_listener_ssl_context(
+                web_tls["cert"],
+                web_tls["key"],
+                client_ca=web_tls.get("clientCa"),
+            )
+        except (OSError, ssl.SSLError) as ex:
+            logger.error(
+                "web: TLS material is not loadable, so the web API is not "
+                "starting (retrying on the next config reload): %s",
+                ex,
+            )
+            return None, None, True
+        return context, signature, False
+
     async def start_stop_web_app(
         self,
         web_config: Optional[WebConfig],
         mcp_config: Optional[MCPConfig] = None,
     ):
-        if self.web_runner is not None and (
-            web_config is None
-            or web_config != self.web_config
-            # an mcp-only change (e.g. readOnly flipped, a toolset added) must
-            # also restart the app: the /mcp route set is fixed at build time,
-            # so it only picks up config through a fresh routes list.
-            or mcp_config != self.mcp_config
-        ):
-            # assert self.web_runner is not None
-            logger.info("Stopping http server")
-            await self.web_runner.cleanup()
-            self.web_runner = None
+        if self.web_runner is not None:
+            reason = self._web_restart_reason(web_config, mcp_config)
+            if reason is not None:
+                logger.info("web: %s, stopping http server", reason)
+                await self.web_runner.cleanup()
+                self.web_runner = None
+                self._web_tls_signature = None
 
-        if (
+        # Build the listener's TLS context ONCE per (re)start, before anything
+        # is bound, so a context failure never leaves a half-built runner.
+        # Guarded on a start actually being about to happen: a healthy running
+        # listener must not re-read and re-parse the PEMs every housekeeping
+        # tick.
+        start_wanted = bool(
             web_config is not None
             and web_config["listen"]
             and self.web_runner is None
-        ):
+        )
+        web_tls = web_config.get("tls") if web_config is not None else None
+        # listener_tls_configured, not a bare truthiness test on the dict: a
+        # `tls:` block whose values are blank parses to a truthy dict of
+        # Nones, and building a context from that would raise a TypeError
+        # rather than the OSError the failure path expects. Such a block also
+        # cannot coexist with an https:// listener (config validation refuses
+        # that pair), so skipping it here serves the plaintext listeners the
+        # config actually asks for.
+        tls_context, tls_signature, tls_failed = (
+            self._build_web_tls(web_tls)
+            if start_wanted and tlsutil.listener_tls_configured(web_tls)
+            else (None, None, False)
+        )
+
+        # `web_config is not None` is implied by start_wanted; it is repeated
+        # so the narrowing survives for the whole start branch below.
+        if start_wanted and not tls_failed and web_config is not None:
             ui_enabled = web_config.get("ui", True)
             metrics_config = resolve_metrics_config(web_config)
             middlewares = []
@@ -4667,7 +4816,9 @@ class Cron:
             socket_mode = web_config.get("socketMode")
             for addr in web_config["listen"]:
                 try:
-                    site = web_site_from_url(self.web_runner, addr)
+                    site = web_site_from_url(
+                        self.web_runner, addr, tls_context
+                    )
                     await site.start()
                 except (ValueError, OSError) as ex:
                     # bad scheme/url (ValueError) or bind failure (OSError):
@@ -4680,6 +4831,7 @@ class Cron:
                     self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
             self.mcp_config = mcp_config
+            self._web_tls_signature = tls_signature
 
         # Node history sampling follows the web API's lifecycle: the ring
         # only feeds the dashboard's node chart, so it runs whenever the web
@@ -5048,14 +5200,20 @@ class Cron:
     ) -> None:
         """(Re)build the durable state backend to match the config.
 
-        Mirrors :meth:`start_stop_cluster` but simpler: the backend has no
-        election, TLS, or convergence to reason about.  It is rebuilt only when
-        the ``state`` section is added, removed, or changed (the backend tracks
-        the job-set id itself via ``self.job_set_id``, so an ordinary reload
-        that only edits jobs does not disturb it).  A start failure -- an
-        unwritable path, a bad mount -- is logged and swallowed, exactly like a
-        cluster start failure, so durability being misconfigured never stops
-        cronstable from running jobs in memory.
+        Mirrors :meth:`start_stop_cluster` but simpler: the store backend has
+        no election or convergence to reason about, and is rebuilt only when
+        the ``state`` section is added, removed, or changed (the backend
+        tracks the job-set id itself via ``self.job_set_id``, so an ordinary
+        reload that only edits jobs does not disturb it).  A start failure --
+        an unwritable path, a bad mount -- is logged and swallowed, exactly
+        like a cluster start failure, so durability being misconfigured never
+        stops cronstable from running jobs in memory.
+
+        The loopback job API in front of the backend *can* serve TLS (an
+        off-host ``state.jobApi.listen`` over ``https://``); an in-place
+        rotation of its certificate is picked up by restarting just that
+        listener, without disturbing the backend or its leases (see
+        :meth:`_maybe_restart_job_api_for_tls`).
         """
         self._state_configured = state_config is not None
         if state_config is not None:
@@ -5124,6 +5282,11 @@ class Cron:
             # TTL) so the new store's active runs are re-adopted from scratch
             # by reconcile_on_boot (re-run because _state_rehydrated cleared).
             self._dag.forget()
+        elif backend is not None and state_config is not None:
+            # config byte-identical, so the teardown above did not fire: the
+            # store backend stays, but the job API's TLS certificate may have
+            # rotated in place under it. Cheap stat-compare once per pass.
+            await self._maybe_restart_job_api_for_tls(state_config)
         if state_config is not None and self.state_backend is None:
             try:
                 # Construct INSIDE the try: building the backend resolves and
@@ -5179,6 +5342,21 @@ class Cron:
         # never enters the graph unless a job API is actually configured.
         from cronstable.jobapi import JobStateAPI
 
+        # Snapshot the TLS files BEFORE api.start() loads them, mirroring
+        # _build_web_tls: a rotation landing in the gap then compares unequal
+        # on the next pass, which is a spurious restart (the safe direction),
+        # not a missed one. None for a plaintext endpoint (no cert/key), which
+        # therefore never triggers a rotation restart.
+        job_api_tls = job_api_cfg.get("tls")
+        tls_signature: Optional[Dict[str, Any]] = None
+        if tlsutil.listener_tls_configured(job_api_tls):
+            # listener_tls_configured is truthy only when cert and key are
+            # present, so the block is non-None here; the assert is only so
+            # the call type-checks (it is not a TypeGuard).
+            assert job_api_tls is not None
+            tls_signature = tlsutil.tls_file_signature(
+                job_api_tls, tlsutil.JOB_API_TLS_KEYS
+            )
         api = JobStateAPI(
             lambda: self.state_backend,
             host=self._state_host,
@@ -5195,16 +5373,86 @@ class Cron:
             )
             return
         self._job_api = api
+        self._job_api_tls_signature = tls_signature
 
     async def _stop_job_api(self) -> None:
         api = self._job_api
         if api is None:
             return
         self._job_api = None
+        self._job_api_tls_signature = None
         try:
             await asyncio.wait_for(api.stop(), timeout=STATE_OP_TIMEOUT)
         except (OSError, asyncio.TimeoutError) as ex:
             logger.warning("state: job API did not stop cleanly: %s", ex)
+
+    def _job_api_tls_files_changed(
+        self, tls: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Whether the running job API's TLS files differ from what it loaded.
+
+        The job-state analogue of :meth:`_web_tls_files_changed`, and the only
+        thing that makes an in-place certificate rotation of the job API
+        listener visible: the state config is byte-identical across such a
+        rotation, so the ``state_config != backend.config`` gate never fires
+        for it.
+
+        Only the server material is watched, via
+        :data:`cronstable.tlsutil.JOB_API_TLS_KEYS` (``cert``/``key``): the
+        ``ca`` is handed to jobs as a path and read fresh by each one, so
+        nothing the daemon holds goes stale when it rotates.
+
+        Gated on ``_job_api_tls_signature`` (``None`` for a plaintext
+        endpoint, which therefore never restarts on this) rather than on the
+        config, so a loopback endpoint is untouched.
+        """
+        if self._job_api_tls_signature is None or not tls:
+            return False
+        return (
+            tlsutil.tls_file_signature(tls, tlsutil.JOB_API_TLS_KEYS)
+            != self._job_api_tls_signature
+        )
+
+    async def _maybe_restart_job_api_for_tls(
+        self, state_config: StateConfig
+    ) -> None:
+        """Restart the job API listener if its TLS cert/key rotated in place.
+
+        Called on an otherwise no-op reload (state config byte-identical). The
+        web-app analogue is the TLS arm of :meth:`_web_restart_reason`; this
+        is lighter because only the listener is rebuilt: the store backend,
+        its leases and its renewers are untouched.
+
+        Restarting is gated on the new material actually loading. A
+        half-written rotation (cert-manager, Vault and Kubernetes secret
+        refreshes are not atomic across the files), or a config edit racing
+        one, would otherwise tear a working endpoint down and then fail to
+        rebuild it, leaving jobs with no state endpoint until the next reload;
+        keeping the old listener up and retrying is the safe direction.
+
+        The loadability gate covers the material; the rebind itself is not
+        pre-validated (make-before-break is infeasible, since the new listener
+        wants the same port the old one holds). A rebind that fails leaves the
+        endpoint down with the error :meth:`_start_job_api` logs, the same
+        degraded state as a failed initial start, until the ``state`` config
+        next changes.
+        """
+        tls = (state_config.get("jobApi") or {}).get("tls")
+        if self._job_api is None or not self._job_api_tls_files_changed(tls):
+            return
+        if not tlsutil.listener_tls_loadable(tls):
+            logger.warning(
+                "state: new job API TLS material is not yet loadable (a "
+                "partial/half-written rotation, or a config edit racing "
+                "one?); keeping the running endpoint and retrying next reload"
+            )
+            return
+        logger.info(
+            "state: job API TLS certificate files changed, restarting the "
+            "loopback state endpoint"
+        )
+        await self._stop_job_api()
+        await self._start_job_api(state_config)
 
     def _track_state_write(
         self, coro: Coroutine[Any, Any, None]
@@ -5828,6 +6076,28 @@ class Cron:
             )
 
         return origin_middleware
+
+    def _web_tls_files_changed(self) -> bool:
+        """Whether the running listener's TLS files differ from what it loaded.
+
+        The web-app analogue of
+        :meth:`cronstable.cluster.ClusterManager.tls_files_changed`, and the
+        only thing that makes an in-place certificate rotation visible: the
+        config bytes are identical across such a rotation, so the ordinary
+        ``web_config != self.web_config`` gate never fires for it.
+
+        Gated on ``_web_tls_signature`` rather than on ``web_config``, because
+        a teardown leaves ``web_config`` stale while clearing the signature.
+        """
+        if self.web_config is None or self._web_tls_signature is None:
+            return False
+        tls = self.web_config.get("tls")
+        if not tls:
+            return False
+        return (
+            tlsutil.tls_file_signature(tls, tlsutil.LISTENER_TLS_KEYS)
+            != self._web_tls_signature
+        )
 
     @staticmethod
     def _apply_socket_mode(addr: str, socket_mode: str) -> None:
@@ -7839,7 +8109,7 @@ class Cron:
             secrets=secrets,
         )
         api.register_run(ctx)
-        return ctx.token, run_environment(ctx, api.base_url)
+        return ctx.token, run_environment(ctx, api.base_url, api.cacert)
 
     @staticmethod
     def _slot_name(name: str) -> str:

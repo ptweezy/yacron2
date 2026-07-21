@@ -3193,3 +3193,1177 @@ async def test_gc_removed_dags_deletes_old_terminal_keeps_recent_and_owned(
         }
     finally:
         await _teardown(cron)
+
+
+# ===========================================================================
+# service() / _run_service() gating, cadence branches, and error isolation.
+# ===========================================================================
+
+
+async def test_service_skips_when_a_pass_is_in_flight_or_nothing_due(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        # a pass already in flight: service() is a no-op (does not spawn a
+        # second one).
+        async def _sleep():
+            await asyncio.sleep(3600)
+
+        running = asyncio.ensure_future(_sleep())
+        d._service_task = running
+        d._next_sched_check = 0.0  # would otherwise be due
+        d.service()
+        assert d._service_task is running  # not replaced
+        running.cancel()
+        try:
+            await running
+        except asyncio.CancelledError:
+            pass
+        d._service_task = None
+
+        # nothing due: every cadence is in the future and no wake / completion /
+        # logical fire is pending, so service() returns without spawning.
+        future = dagrun._now() + 3600.0
+        d._next_sched_check = future
+        d._next_adopt = future
+        d._next_gc = future
+        d._wake.clear()
+        d._pending_completions.clear()
+        d._next_logical.clear()
+        d.service()
+        assert d._service_task is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_run_service_cadence_branches(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        # defaults (all cadences 0.0): seed, adopt and gc all run.
+        await d._run_service()
+        # all cadences pushed into the future: each guard's false branch is
+        # taken (fire_scheduled / retry_completions / advance_owned still run).
+        future = dagrun._now() + 3600.0
+        d._next_sched_check = future
+        d._next_adopt = future
+        d._next_gc = future
+        await d._run_service()
+    finally:
+        await _teardown(cron)
+
+
+async def test_run_service_isolates_and_propagates_errors(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+
+        async def _boom(now):
+            raise RuntimeError("seed blew up")
+
+        monkeypatch.setattr(d, "_seed_dags", _boom)
+        d._next_sched_check = 0.0
+        await d._run_service()  # a bad pass is logged, never kills the loop
+
+        async def _cancel(now):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(d, "_seed_dags", _cancel)
+        d._next_sched_check = 0.0
+        with pytest.raises(asyncio.CancelledError):
+            await d._run_service()  # cancellation propagates
+    finally:
+        await _teardown(cron)
+
+
+async def test_next_wake_delay_prunes_unowned_wake(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        ref = ("lin", "manual-unowned")
+        d._wake[ref] = 0.0  # a stale wake for a run this node does not own
+        assert ref not in d._owned
+        d.next_wake_delay()
+        assert ref not in d._wake  # pruned so it cannot pin the loop at 0
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Seeding branches: seed_failed pruning, cluster denial, catch-up isolation.
+# ===========================================================================
+
+
+async def test_seed_dags_prunes_failed_denies_cluster_and_propagates_cancel(
+    tmp_path, monkeypatch
+):
+    yaml = (
+        "dags:\n  - name: sd\n    schedule: '0 * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        d = cron._dag
+        # a stale seed_failed entry for a dag no longer present is pruned.
+        d._seed_failed["ghost"] = "old-sig"
+        # this node's cluster does not own the schedule: the dag is skipped.
+        monkeypatch.setattr(cron, "_cluster_allows", lambda sched: False)
+        await d._seed_dags(dagrun._now())
+        assert "ghost" not in d._seed_failed
+        assert "sd" not in d._seeded  # cluster denied
+        monkeypatch.undo()
+
+        # a seed raising CancelledError propagates out of the pass.
+        async def _cancel(dagcfg, now_dt):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(d, "_seed_dag", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await d._seed_dags(dagrun._now())
+    finally:
+        await _teardown(cron)
+
+
+async def test_seed_dag_catch_up_error_is_isolated(tmp_path, monkeypatch):
+    yaml = (
+        "dags:\n  - name: cs\n    schedule: '0 * * * *'\n"
+        "    onMissed: run-all\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        d = cron._dag
+        dagcfg = cron.cron_dags["cs"]
+        now_dt = _utcnow()
+
+        async def _boom(cfg, nd):
+            raise RuntimeError("catch-up blew up")
+
+        monkeypatch.setattr(d, "_catch_up", _boom)
+        await d._seed_dag(dagcfg, now_dt)  # swallowed: the dag still seeds
+        assert "cs" in d._seeded
+
+        async def _cancel(cfg, nd):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(d, "_catch_up", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await d._seed_dag(dagcfg, now_dt)
+    finally:
+        await _teardown(cron)
+
+
+async def test_fire_scheduled_cluster_deny_and_cancel(tmp_path, monkeypatch):
+    yaml = (
+        "dags:\n  - name: fs\n    schedule: '* * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        d = cron._dag
+        d._seeded["fs"] = d._sched_sig(cron.cron_dags["fs"])
+        d._next_logical["fs"] = _utcnow() - datetime.timedelta(seconds=90)
+        # cluster denies: the seeded, due dag is skipped (no run created).
+        monkeypatch.setattr(cron, "_cluster_allows", lambda sched: False)
+        await d._fire_scheduled(dagrun._now())
+        assert await d.list_runs("fs") == []
+        monkeypatch.undo()
+
+        # a firing raising CancelledError propagates.
+        async def _cancel(dagcfg, now_dt):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(d, "_fire_forward", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await d._fire_scheduled(dagrun._now())
+    finally:
+        await _teardown(cron)
+
+
+async def test_fire_forward_stops_at_catchup_cap(tmp_path, monkeypatch):
+    yaml = (
+        "dags:\n  - name: ff\n    schedule: '* * * * *'\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        d = cron._dag
+        dagcfg = cron.cron_dags["ff"]
+        created = []
+
+        async def _noop(cfg, when, kind):
+            created.append(when)
+
+        monkeypatch.setattr(d, "_create_run", _noop)
+        # far enough back that the per-minute schedule has many more due
+        # instants than the cap: the fire loop stops at DAG_MAX_CATCHUP.
+        d._next_logical["ff"] = _utcnow() - datetime.timedelta(hours=5)
+        await d._fire_forward(dagcfg, _utcnow())
+        assert len(created) == dagrun.DAG_MAX_CATCHUP
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Catch-up + durable watermark branches.
+# ===========================================================================
+
+
+async def test_catch_up_deadline_not_binding(tmp_path):
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        sched = dagcfg.schedule_job
+        sched.startingDeadlineSeconds = 1000000.0  # far wider than the gap
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 2, 30, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        # the cutoff falls before the watermark, so it never advances `after`:
+        # both missed slots (01:00, 02:00) are still replayed.
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 2
+    finally:
+        await _teardown(cron)
+
+
+async def test_catch_up_no_missed_slots_returns(tmp_path):
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        # the only prior run is the current slot; the next fire is in the
+        # future, so nothing is missed.
+        now_dt = datetime.datetime(2026, 1, 1, 3, 0, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, now_dt, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 0
+    finally:
+        await _teardown(cron)
+
+
+async def test_durable_watermark_no_backend_and_skips_undated(tmp_path):
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        backend = cron.state_backend
+        cron.state_backend = None
+        assert await cron._dag._durable_watermark(dagcfg) is None
+        cron.state_backend = backend
+
+        # a manual run has no logicalDate and is skipped by the scan; the
+        # scheduled run's date is the watermark.
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        await cron._dag._create_doc(dagcfg, "manual-x", None, "manual")
+        await cron._dag._create_doc(dagcfg, "sched-x", base.isoformat(), "sc")
+        wm = await cron._dag._durable_watermark(dagcfg)
+        assert wm == base
+    finally:
+        await _teardown(cron)
+
+
+async def test_create_run_naive_datetime_is_read_as_utc(tmp_path):
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        _set_cmd(cron, "cu", "a", [_PY, "-c", "pass"])
+        dagcfg = cron.cron_dags["cu"]
+        naive = datetime.datetime(2026, 5, 1, 12, 0)  # no tzinfo
+        ref = await cron._dag._create_run(dagcfg, naive, "backfill")
+        assert ref[1].startswith("2026-05-01T12")  # keyed canonically as UTC
+        await _drive(cron, "cu", ref[1])
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Ownership plumbing: _try_own / _renew_loop / _release degraded branches.
+# ===========================================================================
+
+
+async def test_try_own_without_backend_fails_closed(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        dagcfg = cron.cron_dags["lin"]
+        backend = cron.state_backend
+        cron.state_backend = None
+        assert await cron._dag._try_own(dagcfg, ("lin", "rk")) is False
+        cron.state_backend = backend
+    finally:
+        await _teardown(cron)
+
+
+async def test_renew_loop_exits_when_ref_no_longer_owned(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _instant_sleep(monkeypatch)
+        # the ref is not in _owned, so the first wake finds no lease and returns.
+        await asyncio.wait_for(cron._dag._renew_loop(("lin", "gone")), 5)
+    finally:
+        await _teardown(cron)
+
+
+async def test_renew_loop_propagates_cancel(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        ref = ("lin", "rk-cancel")
+        cron._dag._owned[ref] = Lease(
+            "dagadvance/lin/rk-cancel", "h#1", 1, 9e18
+        )
+
+        async def _cancel(lease, ttl):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron.state_backend, "renew_lease", _cancel)
+        _instant_sleep(monkeypatch)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(cron._dag._renew_loop(ref), 5)
+    finally:
+        await _teardown(cron)
+
+
+async def test_release_unowned_is_noop_and_propagates_cancel(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        # a ref this node never owned: nothing to release, no crash.
+        await cron._dag._release(("lin", "never-owned"))
+
+        ref = ("lin", "rk-rel")
+        cron._dag._owned[ref] = Lease("dagadvance/lin/rk-rel", "h#1", 1, 9e18)
+
+        async def _cancel(lease):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron.state_backend, "release_lease", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag._release(ref)
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Adoption: full/incremental gating, error isolation, degraded read branches.
+# ===========================================================================
+
+
+async def test_adopt_orphans_incremental_pass_and_isolation(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        # push the full refresh into the future so this pass is incremental.
+        d._next_full_adopt = dagrun._now() + 3600.0
+        seen = []
+
+        async def _spy(backend, name, dagcfg, *, full):
+            seen.append(full)
+
+        monkeypatch.setattr(d, "_adopt_one_dag", _spy)
+        await d._adopt_orphans()
+        assert seen == [False]
+        monkeypatch.undo()
+
+        # a per-dag adoption failure is isolated, not raised.
+        async def _boom(backend, name, dagcfg, *, full):
+            raise RuntimeError("adopt blew up")
+
+        monkeypatch.setattr(d, "_adopt_one_dag", _boom)
+        await d._adopt_orphans()
+        monkeypatch.undo()
+
+        # a CancelledError propagates.
+        async def _cancel(backend, name, dagcfg, *, full):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(d, "_adopt_one_dag", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await d._adopt_orphans()
+    finally:
+        await _teardown(cron)
+
+
+async def test_adopt_one_dag_keys_timeout_returns(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        dagcfg = cron.cron_dags["lin"]
+
+        async def _timeout(ns):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(cron.state_backend, "list_document_keys", _timeout)
+        await cron._dag._adopt_one_dag(
+            cron.state_backend, "lin", dagcfg, full=False
+        )
+    finally:
+        await _teardown(cron)
+
+
+async def test_adopt_one_dag_keys_none_falls_back_to_full(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        d = cron._dag
+        dagcfg = cron.cron_dags["lin"]
+        open_key = await d.trigger_run("lin")
+        for ref in list(d._owned):
+            d._drop_owned(ref)
+
+        async def _no_keys(ns):
+            return None
+
+        monkeypatch.setattr(cron.state_backend, "list_document_keys", _no_keys)
+        # keys None: the pass falls through to the full body listing, which
+        # still adopts the active run.
+        await d._adopt_one_dag(cron.state_backend, "lin", dagcfg, full=False)
+        assert ("lin", open_key) in d._owned
+        monkeypatch.undo()
+        await _drive(cron, "lin", open_key)
+    finally:
+        await _teardown(cron)
+
+
+async def test_adopt_one_dag_read_timeout_returns(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        dagcfg = cron.cron_dags["lin"]
+        assert await d._create_doc(dagcfg, "active-k", None, "manual")
+        d._terminal_run_keys.pop("lin", None)
+
+        async def _timeout(ns, key):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(cron.state_backend, "read_document", _timeout)
+        await d._adopt_one_dag(cron.state_backend, "lin", dagcfg, full=False)
+    finally:
+        await _teardown(cron)
+
+
+async def test_adopt_one_dag_skips_deleted_and_nonstr_runkey(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        dagcfg = cron.cron_dags["lin"]
+        assert await d._create_doc(dagcfg, "gone-k", None, "manual")
+        assert await d._create_doc(dagcfg, "weird-k", None, "manual")
+        d._terminal_run_keys.pop("lin", None)
+
+        async def _read(ns, key):
+            if key == "gone-k":
+                return None  # deleted since the listing
+            return {"state": dag.RUNNING, "runKey": 123, "tasks": {}}
+
+        monkeypatch.setattr(cron.state_backend, "read_document", _read)
+        await d._adopt_one_dag(cron.state_backend, "lin", dagcfg, full=False)
+        assert ("lin", "weird-k") not in d._owned  # non-str runKey never owned
+    finally:
+        await _teardown(cron)
+
+
+async def test_adopt_one_dag_full_timeout_and_nonstr_runkeys(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        dagcfg = cron.cron_dags["lin"]
+
+        async def _timeout(ns):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _timeout)
+        await d._adopt_one_dag(cron.state_backend, "lin", dagcfg, full=True)
+        monkeypatch.undo()
+
+        async def _docs(ns):
+            return [
+                {"state": dag.SUCCESS, "runKey": 1, "tasks": {}},  # terminal
+                {"state": dag.RUNNING, "runKey": 2, "tasks": {}},  # active
+            ]
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _docs)
+        await d._adopt_one_dag(cron.state_backend, "lin", dagcfg, full=True)
+        # neither non-str run key is cached or owned.
+        assert d._terminal_run_keys["lin"] == set()
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Advancing: _advance_owned, unusable-lease back-off, exception-after-drop,
+# _lease_usable cancel.
+# ===========================================================================
+
+
+async def test_advance_owned_advances_due_ref(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("lin")
+        ref = ("lin", run_key)
+        if ref in cron._dag._owned:
+            cron._dag._wake[ref] = 0.0
+            await cron._dag._advance_owned(dagrun._now())
+        await _drive(cron, "lin", run_key)
+    finally:
+        await _teardown(cron)
+
+
+async def test_advance_locked_backs_off_on_unusable_lease(tmp_path):
+    yaml = (
+        "dags:\n  - name: ul\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        dagcfg = cron.cron_dags["ul"]
+        run_key = "manual-ul"
+        assert await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+        ref = ("ul", run_key)
+        lease_name = cron._dag._lease_name(ref)
+        lease = await cron.state_backend.acquire_lease(
+            lease_name, cron._slot_holder(), 30.0
+        )
+        cron._dag._owned[ref] = lease
+        cron._dag._locks.setdefault(ref, asyncio.Lock())
+        # expired but nobody took it over: _lease_usable fails closed yet keeps
+        # ownership, so the advance backs off instead of touching the run.
+        lease.expires_at = dagrun._now() - 5.0
+        await cron._dag.advance_one(ref)
+        assert ref in cron._dag._owned
+        assert cron._dag._wake[ref] > dagrun._now()
+    finally:
+        await _teardown(cron)
+
+
+async def test_advance_locked_exception_after_ownership_lost(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        ref = ("lin", "rk-exc")
+        d._owned[ref] = Lease("dagadvance/lin/rk-exc", "h#1", 1, 9e18)
+        d._locks.setdefault(ref, asyncio.Lock())
+
+        async def _boom(dagcfg, r):
+            d._drop_owned(r)  # ownership lost mid-advance
+            raise RuntimeError("advance blew up")
+
+        monkeypatch.setattr(d, "_do_advance", _boom)
+        await d.advance_one(ref)  # swallowed; no wake set (no longer owned)
+        assert ref not in d._owned
+        assert ref not in d._wake
+    finally:
+        await _teardown(cron)
+
+
+async def test_lease_usable_propagates_cancel(tmp_path, monkeypatch):
+    yaml = (
+        "dags:\n  - name: lc\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        ref = ("lc", "rk")
+        lease = Lease(
+            cron._dag._lease_name(ref), "h#1", 1, dagrun._now() - 5.0
+        )
+
+        async def _cancel(name):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron.state_backend, "read_lease", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag._lease_usable(ref, lease)
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# _do_advance: expansion second-RMW edge cases, wide fan-out defer, empty
+# fan-out terminalising after the claim, and a launch CancelledError.
+# ===========================================================================
+
+_EXPAND = (
+    "dags:\n  - name: xd\n    tasks:\n"
+    "      - id: gen\n        command: 'x'\n"
+    "      - id: work\n        command: 'x'\n        dependsOn:\n"
+    "          - gen\n        expand:\n"
+    "          fromTask: gen\n          key: items\n"
+)
+
+
+async def _advance_expand_setup(cron, tmp_path):
+    """Push a one-item list from gen, let gen finish, and quiesce the
+    spawned auto-advance so a counted advance is the only one that runs."""
+    items_file = tmp_path / "items.json"
+    items_file.write_text('["only"]')
+    _set_cmd(
+        cron, "xd", "gen",
+        [_PY, "-m", "cronstable", "xcom", "push", "--key", "items",
+         str(items_file)],
+    )
+    _set_cmd(cron, "xd", "work", [_PY, "-c", "pass"])
+    run_key = await cron._dag.trigger_run("xd")
+    await _reap_running(cron)  # gen finishes; its completion lands
+    pend = [t for t in list(cron._pending_state_writes) if not t.done()]
+    for t in pend:
+        t.cancel()
+    await asyncio.gather(*pend, return_exceptions=True)
+    return run_key
+
+
+async def test_do_advance_expansion_second_rmw_edge_cases(tmp_path):
+    cron = await _make_cron(tmp_path, _EXPAND)
+    try:
+        run_key = await _advance_expand_setup(cron, tmp_path)
+        ref = ("xd", run_key)
+        body = await cron._dag.get_run("xd", run_key)
+        assert body["tasks"]["gen"]["state"] == dag.SUCCESS
+        orig = cron._dag._mutate
+
+        # 1. the plan_and_claim RMW gets no backend answer (result None): the
+        # advance returns without expanding.
+        calls = {"n": 0}
+
+        async def _no_answer(dag_name, key, transform):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                return None, None
+            return await orig(dag_name, key, transform)
+
+        cron._dag._mutate = _no_answer
+        await cron._dag.advance_one(ref)
+        body = await cron._dag.get_run("xd", run_key)
+        assert "work" not in body.get("mapped", {})
+
+        # 2. the plan_and_claim RMW returns a result but no stored body
+        # (claimed None): the launch loop runs over an empty result and the
+        # advance schedules a wake without crashing.
+        calls2 = {"n": 0}
+
+        async def _no_body(dag_name, key, transform):
+            calls2["n"] += 1
+            if calls2["n"] == 2:
+                return None, dag.AdvanceResult()
+            return await orig(dag_name, key, transform)
+
+        cron._dag._mutate = _no_body
+        await cron._dag.advance_one(ref)
+        cron._dag._mutate = orig
+
+        # the blips clear and the run finishes normally.
+        body = await _drive(cron, "xd", run_key)
+        assert body["state"] == dag.SUCCESS, _states(body)
+    finally:
+        await _teardown(cron)
+
+
+async def test_launch_cancel_propagates_out_of_advance(tmp_path, monkeypatch):
+    yaml = (
+        "dags:\n  - name: lp\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "lp", "a", [_PY, "-c", "pass"])
+
+        async def _cancel(dagcfg, ref, run_id, intent):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron._dag, "_launch_task", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag.trigger_run("lp")
+    finally:
+        await _teardown(cron)
+
+
+async def test_wide_fanout_defers_then_completes(tmp_path):
+    cron = await _make_cron(tmp_path, _EXPAND)
+    try:
+        n = dag.MAX_CLAIMS_PER_PASS + 2
+        items_file = tmp_path / "items.json"
+        items_file.write_text(json.dumps(list(range(n))))
+        _set_cmd(
+            cron, "xd", "gen",
+            [_PY, "-m", "cronstable", "xcom", "push", "--key", "items",
+             str(items_file)],
+        )
+        _set_cmd(cron, "xd", "work", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("xd")
+        # a fan-out wider than the claim quota defers the surplus to a prompt
+        # re-service, then converges.
+        body = await _drive(cron, "xd", run_key, max_rounds=200)
+        assert body["state"] == dag.SUCCESS, _states(body)
+        assert len(body["mapped"]["work"]["items"]) == n
+    finally:
+        await _teardown(cron)
+
+
+async def test_empty_fanout_terminalises_after_claim(tmp_path):
+    yaml = (
+        "dags:\n  - name: ez\n    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: work\n        command: 'x'\n        dependsOn:\n"
+        "          - gen\n        expand:\n"
+        "          fromTask: gen\n          key: items\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "ez", "gen", [_PY, "-c", "pass"])  # publishes nothing
+        _set_cmd(cron, "ez", "work", [_PY, "-c", "pass"])
+        run_key = await cron._dag.trigger_run("ez")
+        # gen succeeds without a list, so the mapped task expands to zero
+        # instances and the run terminalises on the claim RMW.
+        body = await _drive(cron, "ez", run_key)
+        assert body["state"] == dag.SUCCESS
+        assert body["mapped"]["work"]["items"] == []
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Completion routing: unknown-dag no-op, flush/finish/queue/retry branches.
+# ===========================================================================
+
+
+async def test_on_task_finished_unknown_dag_is_noop(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        class _FakeRunning:
+            dag_ref = dagrun._DagRef(
+                dag_name="ghost", run_key="rk", run_id="rid",
+                task_id="a", taskkey="a", proc="p", attempt=0,
+            )
+            fail_reason = None
+            resource_usage = None
+            retcode = 0
+
+        await cron._dag.on_task_finished(_FakeRunning())
+        assert not cron._dag._completion_buffer
+    finally:
+        await _teardown(cron)
+
+
+async def test_flush_completions_propagates_cancel(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        ref = ("lin", "rk-fc")
+        cron._dag._completion_buffer[ref] = [{"taskkey": "a", "taskId": "a"}]
+
+        async def _cancel(r, entries):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron._dag, "_flush_run_completions", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag.flush_completions()
+    finally:
+        await _teardown(cron)
+
+
+async def test_flush_run_completions_propagates_cancel(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        dagcfg = cron.cron_dags["lin"]
+        run_key = "manual-frc"
+        assert await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+        ref = ("lin", run_key)
+        entry = {
+            "taskkey": "a", "taskId": "a", "success": True, "exitCode": 0,
+            "failReason": None, "proc": "tok", "attempt": 0, "poke": None,
+            "resources": None,
+        }
+
+        async def _cancel(name, key, transform):
+            raise asyncio.CancelledError()
+
+        cron._dag._mutate = _cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag._flush_run_completions(ref, [entry])
+    finally:
+        await _teardown(cron)
+
+
+async def test_finish_task_queues_on_error_and_propagates_cancel(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        dagcfg = cron.cron_dags["lin"]
+        run_key = "manual-ft"
+        assert await cron._dag._create_doc(dagcfg, run_key, None, "manual")
+        ref = ("lin", run_key)
+        orig = cron._dag._mutate
+
+        async def _boom(name, key, transform):
+            raise RuntimeError("store stall")
+
+        cron._dag._mutate = _boom
+        await cron._dag._finish_task(
+            dagcfg, ref, "a", "a", success=True, exit_code=0,
+            fail_reason=None, proc="tok", attempt=0,
+        )
+        assert (ref, "a") in cron._dag._pending_completions
+
+        async def _cancel(name, key, transform):
+            raise asyncio.CancelledError()
+
+        cron._dag._mutate = _cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag._finish_task(
+                dagcfg, ref, "a", "a", success=True, exit_code=0,
+                fail_reason=None, proc="tok", attempt=0,
+            )
+        cron._dag._mutate = orig
+        await _drain_pending(cron)
+    finally:
+        await _teardown(cron)
+
+
+async def test_queue_completion_backs_off_on_repeat(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        ref = ("lin", "rk-q")
+        d._queue_completion(
+            ref, "a", "a", success=True, exit_code=0, fail_reason=None,
+            proc="tok", attempt=0, poke=None,
+        )
+        first = d._pending_completions[(ref, "a")]["delay"]
+        d._queue_completion(
+            ref, "a", "a", success=True, exit_code=0, fail_reason=None,
+            proc="tok", attempt=0, poke=None,
+        )
+        second = d._pending_completions[(ref, "a")]["delay"]
+        assert second == min(first * 2.0, dagrun.COMPLETION_RETRY_MAX_DELAY)
+        assert second > first
+    finally:
+        await _teardown(cron)
+
+
+async def test_retry_completions_skips_not_due_and_removed_dag(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        # not yet due: left queued.
+        not_due = (("lin", "rk"), "a")
+        d._pending_completions[not_due] = {
+            "ref": ("lin", "rk"), "taskkey": "a", "taskId": "a",
+            "success": True, "exitCode": 0, "failReason": None, "proc": "tok",
+            "attempt": 0, "poke": None, "resources": None, "delay": 5.0,
+            "nextTryAt": dagrun._now() + 3600.0,
+        }
+        # due, but for a dag the reload removed: dropped.
+        gone = (("ghost", "rk"), "a")
+        d._pending_completions[gone] = {
+            "ref": ("ghost", "rk"), "taskkey": "a", "taskId": "a",
+            "success": True, "exitCode": 0, "failReason": None, "proc": "tok",
+            "attempt": 0, "poke": None, "resources": None, "delay": 5.0,
+            "nextTryAt": 0.0,
+        }
+        await d._retry_completions(dagrun._now())
+        assert not_due in d._pending_completions
+        assert gone not in d._pending_completions
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# reconcile_on_boot / approve / backfill / get_run degraded guards.
+# ===========================================================================
+
+
+async def test_reconcile_on_boot_no_backend_and_nonstr_runkey(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        backend = cron.state_backend
+        cron.state_backend = None
+        await cron._dag.reconcile_on_boot()  # no backend: early return
+        cron.state_backend = backend
+
+        async def _docs(ns):
+            return [{"state": dag.RUNNING, "runKey": 123, "tasks": {}}]
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _docs)
+        cron._dag.forget()
+        await cron._dag.reconcile_on_boot()  # non-str runKey skipped
+        assert not cron._dag._owned
+    finally:
+        await _teardown(cron)
+
+
+async def test_approve_unknown_dag(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        res = await cron._dag.approve(
+            "ghost", "rk", "gate", approved=True, by="x"
+        )
+        assert res == {"ok": False, "reason": "no such dag"}
+    finally:
+        await _teardown(cron)
+
+
+async def test_backfill_unscheduled_or_unknown_dag(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)  # lin has no schedule
+    try:
+        res = await cron._dag.backfill(
+            "lin", "2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+00:00"
+        )
+        assert res == {"ok": False, "reason": "no such scheduled dag"}
+        res2 = await cron._dag.backfill(
+            "ghost", "2026-01-01T00:00:00+00:00", "2026-01-01T01:00:00+00:00"
+        )
+        assert res2["ok"] is False
+    finally:
+        await _teardown(cron)
+
+
+async def test_get_run_unknown_dag_is_none(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        assert await cron._dag.get_run("ghost", "rk") is None
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Rollup / xcom_for_run cancellation propagation (never swallowed).
+# ===========================================================================
+
+
+async def test_bulk_rollup_propagates_cancel(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        async def _cancel(ns):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _cancel)
+        ns = cron._dag._ns("xc")
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag._bulk_rollup(cron.state_backend, ns, "xc")
+    finally:
+        await _teardown(cron)
+
+
+async def test_dag_run_rollup_propagates_cancel_on_keys_and_read(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+
+        async def _cancel_keys(ns):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            cron.state_backend, "list_document_keys", _cancel_keys
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        monkeypatch.undo()
+
+        async def _cancel_read(ns, key):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron.state_backend, "read_document", _cancel_read)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+    finally:
+        await _teardown(cron)
+
+
+async def test_xcom_for_run_propagates_cancel_on_list_and_blob(
+    tmp_path, monkeypatch
+):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        run_id = await _mint_run(cron, "r1")
+        scope = dag.xcom_scope("xc", str(run_id))
+        await jobstate.artifact_put(cron.state_backend, scope, "a/k", b"hi")
+
+        async def _cancel_list(*a, **k):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(jobstate, "artifact_list", _cancel_list)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag.xcom_for_run("xc", "r1")
+        monkeypatch.undo()
+
+        async def _cancel_blob(digest):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron.state_backend, "get_blob", _cancel_blob)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag.xcom_for_run("xc", "r1")
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# GC branches: no-backend, isolation, empty run key, prune-error swallow,
+# removed-dag non-str run key + cancellation.
+# ===========================================================================
+
+
+async def test_gc_runs_no_backend_isolation_and_cancel(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        d = cron._dag
+        backend = cron.state_backend
+        cron.state_backend = None
+        await d._gc_runs()  # no backend: early return
+        cron.state_backend = backend
+
+        async def _boom(backend_, name, dagcfg):
+            raise RuntimeError("gc blew up")
+
+        monkeypatch.setattr(d, "_gc_one_dag", _boom)
+        await d._gc_runs()  # a per-dag failure is isolated
+        monkeypatch.undo()
+
+        async def _cancel(backend_, name, dagcfg):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(d, "_gc_one_dag", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await d._gc_runs()
+    finally:
+        await _teardown(cron)
+
+
+async def test_gc_one_dag_skips_empty_run_key(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _RETAIN_ONE)  # retainRuns 1
+    try:
+        dagcfg = cron.cron_dags["rt"]
+
+        async def _docs(ns):
+            return [
+                {"runKey": "", "state": dag.SUCCESS, "createdAt": 1.0,
+                 "tasks": {}},
+                {"runKey": "keep", "state": dag.SUCCESS, "createdAt": 2.0,
+                 "tasks": {}},
+            ]
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _docs)
+        deleted = []
+
+        async def _spy_delete(backend, name, run_key, run_id):
+            deleted.append(run_key)
+
+        monkeypatch.setattr(cron._dag, "_delete_run", _spy_delete)
+        # excess is 1; the oldest terminal run has an empty run key and is
+        # skipped rather than deleted.
+        await cron._dag._gc_one_dag(cron.state_backend, "rt", dagcfg)
+        assert deleted == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_delete_run_swallows_prune_error(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        dagcfg = cron.cron_dags["lin"]
+        assert await cron._dag._create_doc(dagcfg, "del-k", None, "manual")
+
+        async def _boom(stream, keep):
+            raise RuntimeError("prune blew up")
+
+        monkeypatch.setattr(cron.state_backend, "prune_records", _boom)
+        # a run_id present means the XCom prune is attempted; its failure is
+        # swallowed while the document itself is still deleted.
+        await cron._dag._delete_run(
+            cron.state_backend, "lin", "del-k", "some-run-id"
+        )
+        assert await cron._dag.get_run("lin", "del-k") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_gc_removed_dags_nonstr_runkey_and_cancel(tmp_path, monkeypatch):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        del cron.cron_dags["lin"]  # gone from every live config
+
+        async def _docs(ns):
+            return [{"state": dag.SUCCESS, "runKey": 123, "tasks": {}}]
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _docs)
+        deleted = []
+
+        async def _spy(backend, name, run_key, run_id):
+            deleted.append(run_key)
+
+        monkeypatch.setattr(cron._dag, "_delete_run", _spy)
+        await cron._dag.gc_removed_dags(cron.state_backend, {"lin"}, grace=0.0)
+        assert deleted == []  # non-str run key skipped
+        monkeypatch.undo()
+
+        async def _cancel(ns):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(cron.state_backend, "list_documents", _cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._dag.gc_removed_dags(
+                cron.state_backend, {"lin"}, grace=0.0
+            )
+    finally:
+        await _teardown(cron)
+
+
+# ===========================================================================
+# Lifecycle teardown: shutdown / forget cancel a live service task; _parse_iso.
+# ===========================================================================
+
+
+async def test_shutdown_cancels_live_service_task(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        async def _sleep():
+            await asyncio.sleep(3600)
+
+        task = asyncio.ensure_future(_sleep())
+        cron._dag._service_task = task
+        await cron._dag.shutdown()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert task.cancelled()
+    finally:
+        await _teardown(cron)
+
+
+async def test_forget_cancels_live_service_task(tmp_path):
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        async def _sleep():
+            await asyncio.sleep(3600)
+
+        task = asyncio.ensure_future(_sleep())
+        cron._dag._service_task = task
+        cron._dag.forget()
+        assert cron._dag._service_task is None
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert task.cancelled()
+    finally:
+        await _teardown(cron)
+
+
+def test_parse_iso_edge_cases():
+    assert dagrun._parse_iso(None) is None
+    assert dagrun._parse_iso("") is None
+    assert dagrun._parse_iso("not-a-date") is None
+    dt = dagrun._parse_iso("2026-01-01T00:00:00")  # naive: read as UTC
+    assert dt.tzinfo == datetime.timezone.utc

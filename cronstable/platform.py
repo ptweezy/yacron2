@@ -57,7 +57,7 @@ DEFAULT_SHELL = "" if IS_WINDOWS else "/bin/sh"
 
 # --- Default config location (the ``-c`` default) -------------------------
 def _default_config_path() -> str:
-    if IS_WINDOWS:
+    if IS_WINDOWS:  # pragma: no cover - Windows-only path
         # Per-user config under roaming AppData, e.g.
         # ``C:\Users\<you>\AppData\Roaming\cronstable``.  Falls back to the
         # user profile if APPDATA is somehow unset (rare; e.g. a bare service
@@ -93,7 +93,7 @@ def encode_argv(argv: List[str]) -> List[Union[str, bytes]]:
     rejects ``bytes`` (``subprocess`` would fail building the command line), so
     the strings are passed through unchanged.
     """
-    if IS_WINDOWS:
+    if IS_WINDOWS:  # pragma: no cover - Windows-only path
         return list(argv)
     return [arg.encode() for arg in argv]
 
@@ -123,7 +123,7 @@ def new_process_group_kwargs() -> Dict[str, Any]:
     has no equivalent at spawn time; descendants are reached through the
     process tree instead, so no creation flag is needed there.
     """
-    if IS_WINDOWS:
+    if IS_WINDOWS:  # pragma: no cover - Windows-only path
         return {}
     return {"start_new_session": True}
 
@@ -230,9 +230,24 @@ def install_shutdown_handlers(
 
         return remove_loop_handlers
 
-    # Windows: install plain C-level handlers and hop onto the loop thread.
-    # (getattr, not signal.SIGBREAK, so this module also type-checks on POSIX,
-    # where SIGBREAK does not exist.)
+    # Windows path lives in its own helper so it is measured only where it can
+    # run (like :func:`_taskkill_tree`); this delegation never executes on
+    # POSIX, where the branch above has already returned.
+    return _install_windows_shutdown_handlers(  # pragma: no cover - Windows
+        loop, callback
+    )
+
+
+def _install_windows_shutdown_handlers(  # pragma: no cover - Windows-only
+    loop: asyncio.AbstractEventLoop, callback: Callable[[], None]
+) -> Callable[[], None]:
+    """Windows fallback for :func:`install_shutdown_handlers`.
+
+    Installs plain C-level handlers and hops onto the loop thread, because
+    ``loop.add_signal_handler`` raises ``NotImplementedError`` on the Proactor
+    loop.  (getattr, not signal.SIGBREAK, so this module also type-checks on
+    POSIX, where SIGBREAK does not exist.)
+    """
     win_sigs = [signal.SIGINT]
     sigbreak = getattr(signal, "SIGBREAK", None)
     if sigbreak is not None:

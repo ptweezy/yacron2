@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import io
 import json
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -583,6 +584,117 @@ def test_http_unreachable_raises_cli_error(monkeypatch):
     err = urllib.error.URLError(ConnectionRefusedError(61, "refused"))
     with pytest.raises(jobcli._CliError, match="cannot reach"):
         _post(monkeypatch, err)
+
+
+# ---------------------------------------------------------------------------
+# CRONSTABLE_STATE_CACERT: verifying the endpoint the daemon handed us
+# ---------------------------------------------------------------------------
+
+
+def _write_ca(tmp_path):
+    """Mint a self-signed CA under ``tmp_path``; return its path.
+
+    Only a CA is needed, and no handshake is ever completed here: the whole
+    requirement is a file ``ssl.create_default_context()`` can actually
+    parse.  The ``importorskip`` lives in the helper so every caller
+    self-skips, matching tests/test_web_tls.py (cryptography has no
+    win-arm64 wheel and cannot build from source on that runner).
+    """
+    pytest.importorskip(
+        "cryptography",
+        reason="cryptography unavailable on this platform (e.g. win-arm64)",
+    )
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "job-ca")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=None), critical=True
+        )
+        .sign(key, hashes.SHA256())
+    )
+    path = tmp_path / "job-ca.pem"
+    path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    return str(path)
+
+
+def test_opener_without_cacert_is_the_shared_opener(monkeypatch):
+    # the plaintext loopback path must be EXACTLY what it was before the
+    # endpoint could speak TLS: the same module-global opener object, not a
+    # freshly built equivalent (which would be a second place for the
+    # no-proxy posture to drift out of).
+    monkeypatch.delenv(jobcli.ENV_CACERT, raising=False)
+    assert jobcli._opener() is jobcli._OPENER
+
+
+def test_opener_with_cacert_verifies_against_it(monkeypatch, tmp_path):
+    ca = _write_ca(tmp_path)
+    monkeypatch.setenv(jobcli.ENV_CACERT, ca)
+    opener = jobcli._opener()
+    assert opener is not jobcli._OPENER
+    https = [
+        h
+        for h in opener.handlers
+        if isinstance(h, urllib.request.HTTPSHandler)
+    ]
+    assert len(https) == 1
+    # the injected CA is the ENTIRE trust set: create_default_context(cafile=)
+    # skips load_default_certs(), so a certificate signed by some public root
+    # cannot verify by accident.
+    assert "job-ca" in str(https[0]._context.get_ca_certs())
+    # and _OPENER's no-proxy posture survives: a verifying opener must not
+    # quietly regain the http_proxy honoring that would route the bearer run
+    # token to an external proxy (see test_http_opener_carries_no_proxies).
+    assert not any(
+        isinstance(h, urllib.request.ProxyHandler) for h in opener.handlers
+    )
+    # built once per CA path: `lock run` makes two requests (acquire, then
+    # release in its finally) and must not re-parse the PEM for the second.
+    assert jobcli._opener() is opener
+
+
+def test_opener_with_unloadable_cacert_is_a_clean_error(monkeypatch, tmp_path):
+    # a CA path that does not resolve is the job environment's problem. Left
+    # to propagate, the OSError would be caught by _http's OSError arm and
+    # reported as "cannot reach the state endpoint", blaming a daemon that is
+    # listening and answering.
+    monkeypatch.setenv(jobcli.ENV_CACERT, str(tmp_path / "no-such-ca.pem"))
+    with pytest.raises(jobcli._CliError, match="cannot load the CA bundle"):
+        jobcli._opener()
+
+
+def test_tls_verification_failure_has_its_own_message(monkeypatch):
+    # a certificate that does not verify reaches _http WRAPPED (urllib turns
+    # the OSError the handshake raised into a URLError), so it used to land
+    # in the generic arm and report as "cannot reach the state endpoint" for
+    # an endpoint that answered fine. It gets its own message, naming the
+    # env var whose value is the thing actually in question.
+    monkeypatch.delenv(jobcli.ENV_CACERT, raising=False)
+    err = urllib.error.URLError(
+        ssl.SSLCertVerificationError(
+            1, "certificate verify failed: self-signed certificate"
+        )
+    )
+    with pytest.raises(jobcli._CliError) as ei:
+        _post(monkeypatch, err)
+    message = str(ei.value)
+    assert "TLS handshake" in message
+    assert jobcli.ENV_CACERT in message
+    assert "cannot reach" not in message
 
 
 def test_parse_body_wraps_non_object_json():

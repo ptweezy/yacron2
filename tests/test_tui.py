@@ -1922,3 +1922,1940 @@ def test_web_drawer_shows_the_sla_state_the_wiki_promises():
         pathlib.Path(tui.__file__).parent.parent / "wiki" / "Web-Dashboard.md"
     ).read_text(encoding="utf-8")
     assert "**OVERDUE** badge on its row, drawer, and wallboard tile" in wiki
+
+
+# ===================================================================
+#  TLS: flag/env resolution and where the context is applied
+# ===================================================================
+class _TlsArgs:
+    """The four TLS flags argparse would hand dispatch, all unset."""
+
+    cacert = None
+    client_cert = None
+    client_key = None
+    insecure = False
+
+
+def _clear_tls_env(monkeypatch) -> None:
+    for var in (
+        tui.ENV_CACERT,
+        tui.ENV_CLIENT_CERT,
+        tui.ENV_CLIENT_KEY,
+        tui.ENV_INSECURE,
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+async def test_api_builds_a_connector_only_for_a_tls_context(monkeypatch):
+    """The context is applied once, at the connector, never per request:
+    a request method added later cannot quietly skip verification, and
+    stream() (SSE, the longest-lived connection) cannot be forgotten."""
+    import aiohttp
+
+    seen: List[Dict[str, Any]] = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            seen.append(kwargs)
+
+    class FakeConnector:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(aiohttp, "TCPConnector", FakeConnector)
+
+    await Api("http://daemon", None)._ensure()
+    assert "connector" not in seen[-1], "plain http keeps aiohttp's default"
+
+    ctx = object()
+    await Api("https://daemon", None, ctx)._ensure()
+    assert seen[-1]["connector"].kwargs == {"ssl": ctx}
+
+
+def test_resolve_tls_is_none_until_something_is_set(monkeypatch):
+    """No flags and no env means no context at all, so the session stays
+    on aiohttp's default transport (and its system trust store)."""
+    _clear_tls_env(monkeypatch)
+    assert tui._resolve_tls(_TlsArgs()) is None
+
+
+def test_resolve_tls_prefers_the_flag_over_the_env(monkeypatch):
+    """Flag-then-env, per field, exactly like _resolve_token."""
+    from cronstable import tlsutil
+
+    seen: Dict[str, Any] = {}
+
+    def _record(**kwargs):
+        seen.update(kwargs)
+        return "context"
+
+    monkeypatch.setattr(tlsutil, "build_verifying_client_ssl_context", _record)
+    _clear_tls_env(monkeypatch)
+    monkeypatch.setenv(tui.ENV_CACERT, "/env/ca.pem")
+    monkeypatch.setenv(tui.ENV_CLIENT_CERT, "/env/client.pem")
+    monkeypatch.setenv(tui.ENV_CLIENT_KEY, "/env/client.key")
+
+    class Args(_TlsArgs):
+        cacert = "/flag/ca.pem"
+
+    assert tui._resolve_tls(Args()) == "context"
+    # the flag wins where one was given; the env fills the rest in
+    assert seen == {
+        "ca": "/flag/ca.pem",
+        "cert": "/env/client.pem",
+        "key": "/env/client.key",
+        "insecure": False,
+    }
+
+
+def test_insecure_warns_that_the_token_still_travels(monkeypatch, capsys):
+    """--insecure must never be silent: verification is off but the
+    Authorization header is not, so the token goes to whoever answers."""
+    from cronstable import tlsutil
+
+    monkeypatch.setattr(
+        tlsutil,
+        "build_verifying_client_ssl_context",
+        lambda **kwargs: "context",
+    )
+    _clear_tls_env(monkeypatch)
+
+    class Args(_TlsArgs):
+        insecure = True
+
+    assert tui._resolve_tls(Args()) == "context"
+    err = capsys.readouterr().err
+    assert "--insecure" in err
+    assert "token" in err
+
+    # the env form is the same switch, and warns just as loudly
+    monkeypatch.setenv(tui.ENV_INSECURE, "YES")
+    assert tui._resolve_tls(_TlsArgs()) == "context"
+    assert "token" in capsys.readouterr().err
+
+
+def test_dispatch_reports_a_bad_ca_path_without_a_traceback(
+    monkeypatch, capsys, tmp_path
+):
+    """An unreadable CA is an operator typo, not a crash: dispatch exits
+    2 with one line, before the terminal ever goes into raw mode."""
+
+    class IsATty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("sys.stdin", IsATty())
+    monkeypatch.setattr("sys.stdout", IsATty())
+    _clear_tls_env(monkeypatch)
+    missing = tmp_path / "absent-ca.pem"
+
+    class Args(_TlsArgs):
+        url = tui.DEFAULT_URL
+        token = None
+        token_env = tui.ENV_TOKEN
+        cacert = str(missing)
+
+    assert tui.dispatch(Args()) == 2
+    assert "absent-ca.pem" in capsys.readouterr().err
+#  Pure helpers, plumbing, and the CLI entry point
+# ===================================================================
+def _iso_ago(seconds: float) -> str:
+    return datetime.datetime.fromtimestamp(
+        time.time() - seconds, tz=datetime.timezone.utc
+    ).isoformat()
+
+
+def _paint(app):
+    return tui.Painter(app.theme)
+
+
+def _txt(rows):
+    return strip_ansi("\n".join(rows))
+
+
+def test_more_format_helpers_branches():
+    from cronstable.tui import ago_short, fmt_percent, parse_iso, segment_of
+
+    now = 1_000_000.0
+    assert fmt_in(200000) == "in 2d"
+    # a future stamp clamps to zero rather than going negative
+    future = datetime.datetime.fromtimestamp(
+        now + 100, tz=datetime.timezone.utc
+    ).isoformat()
+    assert fmt_ago(future, now) == "0s ago"
+    two_h = datetime.datetime.fromtimestamp(
+        now - 7200, tz=datetime.timezone.utc
+    ).isoformat()
+    assert fmt_ago(two_h, now) == "2h ago"
+    two_d = datetime.datetime.fromtimestamp(
+        now - 200000, tz=datetime.timezone.utc
+    ).isoformat()
+    assert fmt_ago(two_d, now) == "2d ago"
+    assert ago_short(None) == "?"
+    assert ago_short(
+        datetime.datetime.fromtimestamp(
+            now - 30, tz=datetime.timezone.utc
+        ).isoformat(),
+        now,
+    ) == "30s"
+    assert ago_short(two_h, now) == "2h"
+    assert ago_short(two_d, now) == "2d"
+    assert fmt_percent(None) == "—"
+    assert fmt_percent(5.0) == "5.0%"
+    assert fmt_percent(55) == "55%"
+    assert fmt_bytes(None) == "—"
+    # a naive ISO stamp is pinned to UTC rather than rejected
+    assert parse_iso("2026-01-01T00:00:00") is not None
+    assert segment_of("disabled") == "off"
+    assert segment_of("ok") == "ok"
+    assert segment_of("pending") == ""
+
+
+def test_compute_view_last_and_next_sort_keys():
+    jobs = [
+        _job("old", outcome="success", finished_ago=1000),
+        _job("recent", outcome="success", finished_ago=5),
+        _job("never"),
+    ]
+    jobs[2]["last_run"] = None
+    by_last = compute_view(jobs, "", "all", "last", 1)
+    assert by_last[0]["name"] == "recent"  # newest finish first
+    nexts = [
+        _job("soon", scheduled_in=5.0),
+        _job("later", scheduled_in=500.0),
+        _job("none", scheduled_in=None),
+    ]
+    by_next = compute_view(nexts, "", "all", "next", 1)
+    assert by_next[0]["name"] == "soon"
+    assert by_next[-1]["name"] == "none"  # None sorts to the end (inf)
+
+
+def test_verdict_correlated_with_shared_reason():
+    jobs = [
+        _job(
+            "a",
+            outcome="failure",
+            exit_code=69,
+            fail_reason="disk full",
+            finished_ago=10,
+        ),
+        _job(
+            "b",
+            outcome="failure",
+            exit_code=69,
+            fail_reason="disk full",
+            finished_ago=12,
+        ),
+    ]
+    verdict, incident = verdict_info(jobs, None)
+    assert "(disk full)" in verdict["sub"]
+    assert "within" in verdict["sub"]
+    assert sorted(incident) == ["a", "b"]
+
+
+def test_verdict_cluster_alert_without_failures():
+    alert = {"bad": True, "reason": "no quorum", "node": None}
+    verdict, _ = verdict_info([_job("ok", outcome="success")], alert)
+    assert "leadership / quorum degraded" in verdict["sub"]
+
+
+def test_rewrite_sgr_intensity_and_default_codes():
+    theme = Theme("carolina", light=False)
+    out = rewrite_sgr("\x1b[1mbold\x1b[0m tail", theme)
+    assert "\x1b[1m" in out  # bold intensity kept verbatim
+    out2 = rewrite_sgr("\x1b[91mbright\x1b[39mdefault", theme)
+    assert strip_ansi(out2) == "brightdefault"
+    assert theme.fg("fg") in out2  # code 39 -> the theme default ink
+
+
+def test_sparkline_returns_a_plain_string():
+    from cronstable.tui import sparkline
+
+    s = sparkline(
+        [
+            {"outcome": "success", "duration": 1.0},
+            {"outcome": "failure", "duration": 3.0},
+        ],
+        6,
+    )
+    assert isinstance(s, str) and strip_ansi(s) == s and s
+
+
+def test_prefs_path_and_cvd_fallback(tmp_path):
+    from cronstable.tui import prefs_path
+
+    assert prefs_path().endswith("tui.json")
+    path = str(tmp_path / "p.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"cvd": "notamode"}, fh)
+    assert load_prefs(path)["cvd"] == "none"
+
+
+def test_key_decoder_extra_branches():
+    from cronstable.tui import KeyDecoder, _decode_control
+
+    assert _decode_control("\x1b") == "esc"
+    assert _decode_control("\x1c") == "\x1c"  # an unmapped control passes
+    dec = KeyDecoder()
+    assert dec.feed(b"\x1c") == ["\x1c"]
+    # a single buffered escape byte is incomplete on its own
+    assert KeyDecoder._try_escape("\x1b") == (False, None)
+    # a modified tilde key ("5;3~") collapses to the plain navigation key
+    assert KeyDecoder().feed(b"\x1b[5;3~") == ["pgup"]
+    # an unrecognised tilde CSI is swallowed
+    assert KeyDecoder().feed(b"\x1b[99~") == []
+
+
+def test_painter_and_frame_helpers(tmp_path):
+    from cronstable.tui import Finding, finding_rows, scroll_window
+
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    assert tui.DIM_SGR in paint.style("x", dim=True)
+    assert tui.REVERSE in paint.style("x", reverse=True)
+    assert scroll_window(5, 10, 0, 0) == 0
+    assert scroll_window(100, 10, 5, 50) == 5  # cursor above the window
+    assert scroll_window(100, 10, 80, 0) == 71  # cursor below the window
+    rows = finding_rows(
+        [
+            Finding("never-fires", "warning", "this can never fire"),
+            Finding("uneven", "warning", "warn " * 40),
+            Finding("note", "note", "a gentle note"),
+        ],
+        paint,
+        40,
+        4,
+    )
+    body = _txt(rows)
+    assert "never fire" in body and "gentle note" in body
+
+
+def test_term_exit_headless_screen_and_clipboard(monkeypatch):
+    import io
+
+    out = io.StringIO()
+    term = tui.Term(stream=out)
+    term.exit()  # never entered: writes the reset without touching termios
+    assert tui.RESET in out.getvalue()
+    assert tui.HeadlessTerm().screen() == ""
+    ht = tui.HeadlessTerm()
+    monkeypatch.setattr(tui.shutil, "which", lambda name: "/usr/bin/" + name)
+
+    class Proc:
+        returncode = 0
+
+    monkeypatch.setattr(tui.subprocess, "run", lambda *a, **k: Proc())
+    assert tui.copy_to_clipboard(ht, "hello")
+    assert ht.copied == ["hello"]
+
+
+def test_add_tui_command_registers_all_flags():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers()
+    tui.add_tui_command(sub)
+    args = parser.parse_args(
+        [
+            "tui",
+            "--url",
+            "http://x:1",
+            "--tv",
+            "--ascii",
+            "--boot",
+            "--poll",
+            "0",
+            "--theme",
+            "amber",
+            "--job",
+            "j",
+        ]
+    )
+    assert args.tv and args.ascii and args.boot
+    assert args.theme == "amber" and args.job == "j"
+
+
+def test_resolve_token_sources(monkeypatch):
+    class WithToken:
+        token = "explicit"
+        token_env = "SOME_VAR"
+
+    assert tui._resolve_token(WithToken) == "explicit"
+
+    class FromEnv:
+        token = None
+        token_env = "CS_TUI_TOK"
+
+    monkeypatch.setenv("CS_TUI_TOK", "fromenv")
+    assert tui._resolve_token(FromEnv) == "fromenv"
+    monkeypatch.delenv("CS_TUI_TOK", raising=False)
+
+    class Missing:
+        token = None
+        token_env = "CS_TUI_TOK"
+
+    assert tui._resolve_token(Missing) is None
+
+
+def test_dispatch_runs_amain(monkeypatch):
+    class Tty:
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return 0
+
+    monkeypatch.setattr("sys.stdin", Tty())
+    monkeypatch.setattr("sys.stdout", Tty())
+    seen = {}
+
+    class FakeApp:
+        def __init__(self, *a, **k):
+            seen["kwargs"] = k
+
+        async def run(self):
+            seen["ran"] = True
+
+    monkeypatch.setattr(tui, "TuiApp", FakeApp)
+    monkeypatch.setattr(tui, "Term", lambda *a, **k: object())
+    monkeypatch.setattr(tui, "PosixKeyReader", lambda *a, **k: object())
+
+    class Args:
+        url = tui.DEFAULT_URL
+        token = None
+        token_env = tui.ENV_TOKEN
+        theme = "amber-light"
+        tv = True
+        job = "watched"
+        boot = True
+        no_boot = False
+        ascii = True
+        poll = 0.0
+
+    assert tui.dispatch(Args()) == 0
+    assert seen.get("ran")
+    assert seen["kwargs"]["start_job"] == "watched"
+    assert seen["kwargs"]["boot"] is True
+
+    class ArgsNoBoot(Args):
+        no_boot = True
+        boot = False
+        theme = None
+        ascii = False
+        poll = None
+        tv = False
+
+    assert tui.dispatch(ArgsNoBoot()) == 0
+    assert seen["kwargs"]["boot"] is False
+
+
+# ===================================================================
+#  Job / DAG action error and status branches
+# ===================================================================
+def _post_status(status, payload=None):
+    async def _post(*a, **k):
+        return status, (payload if payload is not None else {})
+
+    return _post
+
+
+async def _raise_unauth(*a, **k):
+    raise tui.Unauthorized()
+
+
+async def _raise_boom(*a, **k):
+    raise RuntimeError("boom")
+
+
+def _reset_token(app):
+    app.open_overlays = []
+    app.focus = None
+
+
+def _msgs(app):
+    return [m for _, m, _ in app.toasts]
+
+
+async def test_job_action_error_and_status_paths(tmp_path):
+    app = _bare_app(tmp_path)
+    job = _job("j", outcome="success")
+    app.jobs = [job]
+    app.by_name = {"j": job}
+
+    for action in (app.run_job, app.cancel_job, app.pause_job, app.resume_job):
+        app.toasts = []
+        app.api.post = _raise_unauth
+        await action("j")
+        assert app.is_open("token") and app.focus == "token"
+        _reset_token(app)
+        app.api.post = _raise_boom
+        await action("j")
+        assert _msgs(app)  # an exception surfaces as a toast
+
+    # run_job status ladder: 409 disabled, 404 missing, other -> HTTP N
+    app.toasts = []
+    app.api.post = _post_status(409)
+    await app.run_job("j")
+    assert any("disabled" in m for m in _msgs(app))
+    app.api.post = _post_status(404)
+    await app.run_job("j")
+    assert any("no such job" in m for m in _msgs(app))
+    app.api.post = _post_status(503)
+    await app.run_job("j")
+    assert any("HTTP 503" in m for m in _msgs(app))
+
+    # cancel_job: 409 not running, other -> HTTP N
+    app.toasts = []
+    app.api.post = _post_status(409)
+    await app.cancel_job("j")
+    assert any("not running" in m for m in _msgs(app))
+    app.api.post = _post_status(503)
+    await app.cancel_job("j")
+    assert any("HTTP 503" in m for m in _msgs(app))
+
+    # pause_job / resume_job: 404 missing, other -> HTTP N
+    for action, verb in ((app.pause_job, "pause"), (app.resume_job, "resume")):
+        app.toasts = []
+        app.api.post = _post_status(404)
+        await action("j")
+        assert any("no such job" in m for m in _msgs(app))
+        app.api.post = _post_status(503)
+        await action("j")
+        assert any("HTTP 503" in m for m in _msgs(app))
+
+
+async def test_run_all_failing_iterates(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [
+        _job("bad", outcome="failure"),
+        _job("good", outcome="success"),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    posted = []
+
+    async def post(path, body=None):
+        posted.append(path)
+        return 200, {}
+
+    app.api.post = post
+    await app.run_all_failing()
+    assert any("bad" in p for p in posted)
+    assert not any("good" in p for p in posted)
+
+
+async def test_dag_action_error_and_status_paths(tmp_path):
+    app = _bare_app(tmp_path)
+    app.dag_name = "d"
+    app.dag_run_key = "rk"
+
+    # dag_trigger
+    app.api.post = _raise_unauth
+    await app.dag_trigger("d")
+    assert app.is_open("token")
+    _reset_token(app)
+    app.api.post = _raise_boom
+    await app.dag_trigger("d")
+    assert any("trigger" in m for m in _msgs(app))
+    app.api.post = _post_status(500)
+    await app.dag_trigger("d")
+    assert any("HTTP 500" in m for m in _msgs(app))
+
+    # dag_decision: guard, unauthorized, exception, HTTP fail
+    app.dag_run_key = None
+    await app.dag_decision("t", "approve")  # no run key -> silent return
+    app.dag_run_key = "rk"
+    app.api.post = _raise_unauth
+    await app.dag_decision("t", "approve")
+    _reset_token(app)
+    app.api.post = _raise_boom
+    await app.dag_decision("t", "approve")
+    app.api.post = _post_status(500)
+    await app.dag_decision("t", "approve")
+    assert any("HTTP 500" in m for m in _msgs(app))
+
+    # dag_backfill: guard, bad spec, unauthorized, exception, HTTP+detail
+    app.toasts = []
+    app.dag_name = None
+    await app.dag_backfill("2026-01-01..2026-01-02")  # no dag -> return
+    app.dag_name = "d"
+    await app.dag_backfill("only-one")  # not two parts -> warn
+    assert any("FROM..TO" in m for m in _msgs(app))
+    app.api.post = _raise_unauth
+    await app.dag_backfill("2026-01-01..2026-01-02")
+    _reset_token(app)
+    app.api.post = _raise_boom
+    await app.dag_backfill("2026-01-01..2026-01-02")
+    app.api.post = _post_status(500, {"error": "range too wide"})
+    await app.dag_backfill("2026-01-01..2026-01-02")
+    assert any("range too wide" in m for m in _msgs(app))
+
+
+async def test_save_log_success_and_oserror(tmp_path, monkeypatch):
+    app = _bare_app(tmp_path)
+    # no tail / no drawer job -> silent no-op
+    app.log_tail = None
+    app.drawer_job = "x"
+    app.save_log()
+    assert not app.toasts
+    monkeypatch.setattr(
+        "os.path.expanduser", lambda p: p.replace("~", str(tmp_path))
+    )
+    app.log_tail = _stub_tail(app, [("stdout", "hi", 1.0)])
+    app.drawer_job = "job"
+    app.save_log()
+    assert any("saved" in m for m in _msgs(app))
+    real_open = open
+
+    def boom_open(path, *a, **k):
+        if "cronstable-job" in str(path):
+            raise OSError("disk full")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", boom_open)
+    app.toasts = []
+    app.save_log()
+    assert any("save failed" in m for m in _msgs(app))
+
+
+async def test_mitigate_bulk_edge_paths(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [
+        _job("runner", running=True, scheduled_in=None),
+        _job("off", enabled=False),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    # nothing eligible to start, and a name not in by_name is skipped
+    app.open_mitigate(["off", "runner", "ghost"], "set")
+    await app.mitigate_bulk("start")
+    assert any("nothing to start" in ln for ln in app.mitigate_log)
+
+    # the running guard makes a second call a no-op
+    app.mitigate_running = True
+    before = list(app.mitigate_log)
+    await app.mitigate_bulk("start")
+    assert app.mitigate_log == before
+    app.mitigate_running = False
+
+    # a real sweep with an HTTP failure then an exception
+    app.jobs = [_job("s1"), _job("s2")]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    calls = [0]
+
+    async def flaky(path, body=None):
+        calls[0] += 1
+        if calls[0] == 1:
+            return 500, {}
+        raise RuntimeError("net")
+
+    app.api.post = flaky
+    app.open_mitigate(["s1", "s2", "ghost"], "set")
+    await app.mitigate_bulk("start")
+    assert any("HTTP 500" in ln for ln in app.mitigate_log)
+    assert any("error" in ln for ln in app.mitigate_log)
+
+    # the abort path breaks the sweep partway
+    app.api.post = None
+
+    async def abort_after_one(path, body=None):
+        app.mitigate_abort = True
+        return 200, {}
+
+    app.api.post = abort_after_one
+    app.open_mitigate(["s1", "s2"], "set")
+    await app.mitigate_bulk("start")
+    assert any("aborted" in ln for ln in app.mitigate_log)
+
+    # unauthorized stops the sweep with a note
+    app.api.post = _raise_unauth
+    app.open_mitigate(["s1"], "set")
+    await app.mitigate_bulk("start")
+    assert any("unauthorized" in ln for ln in app.mitigate_log)
+
+
+def test_tail_preset_and_add_tail_guards(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("only", outcome="success")]
+    app.by_name = {"only": app.jobs[0]}
+    # no failing jobs right now
+    app.tail_preset("fail")
+    assert any("no fail jobs" in m for m in _msgs(app))
+
+
+# ===================================================================
+#  Overlay / panel render paths (direct, bare app)
+# ===================================================================
+def test_render_table_paints_every_column(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.fetched_mono = time.monotonic()
+    mon = _job(
+        "monitored",
+        outcome="success",
+        history=[
+            {"outcome": "success", "duration": 1.0},
+            {"outcome": "failure", "duration": 3.0},
+        ],
+    )
+    mon["running_resources"] = {"cpu_percent": 50.0, "rss_bytes": 1024}
+    owned = _job("owned", outcome="success")
+    owned["clusterOwner"] = "node-b"
+    unowned = _job("unowned", outcome="success")
+    unowned["clusterOwner"] = None  # renders the ∅ placeholder
+    runner = _job("runner", running=True, scheduled_in=None)  # · · · + no res
+    off = _job("mothballed", enabled=False)  # next "—"
+    held = _job("held", outcome="success", paused=True)
+    retry = _job("retry", outcome="failure")
+    retry["retry"] = {"attempt": 3}
+    app.jobs = [mon, owned, unowned, runner, off, held, retry]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.recompute_view()
+    rows = app.render_table(paint, 170, 24)  # wide: every column survives
+    body = _txt(rows)
+    for name in ("monitored", "owned", "unowned", "runner", "retry"):
+        assert name in body
+    assert "∅" in body  # the unowned owner cell
+    assert "try 3" in body  # the retry job's last column
+
+
+def test_render_overlay_unknown_returns_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    assert app.render_overlay(_paint(app), "nonesuch", 80, 24) == []
+
+
+def test_render_help_and_palette(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.panel_scroll = 3
+    help_body = _txt(app.render_help(paint, 110, 18))
+    assert "keyboard shortcuts" in help_body
+    # a populated palette paints the selected row
+    app.jobs = [_job("deploy", outcome="success")]
+    app.by_name = {"deploy": app.jobs[0]}
+    app.inputs["palette"] = "logs deploy"
+    app.palette_sel = 0
+    pal = app.render_palette(paint, 110, 30)
+    assert any("deploy" in strip_ansi(r) for r in pal)
+    # an unmatched query shows the empty note
+    app.inputs["palette"] = "zzz-no-such-command"
+    assert "no matching command" in _txt(app.render_palette(paint, 110, 30))
+
+
+def test_render_settings_zen_idle_reset(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.prefs["zen_idle_s"] = 999  # not a cycle choice -> ValueError path
+    rows = app.settings_rows()
+    idle = next(r for r in rows if r[0] == "Zen idle")
+    idle[2]()  # cycle: falls back to the first choice
+    assert app.prefs["zen_idle_s"] == 30
+    assert "prefs file" in _txt(app.render_settings(paint, 110, 30))
+
+
+def test_render_cluster_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.cluster = {"enabled": False}
+    assert "single node" in _txt(app.render_cluster(paint, 110, 30))
+    app.cluster = {
+        "enabled": True,
+        "elect_leader": True,
+        "conflict": True,
+        "conflict_names": ["dup"],
+        "node_name": "n1",
+        "backend": "gossip",
+        "quorate": True,
+        "is_leader": False,
+        "leader": "n2",
+        "node_stats": {"cpu_percent": 10.0, "mem_percent": 20.0},
+        "peers": [
+            {
+                "node_name": "n2",
+                "status": "alive",
+                "agree": True,
+                "node_stats": {"cpu_percent": 5.0, "mem_percent": 8.0},
+                "owns": 3,
+            },
+            {"node_name": "n3", "status": "lost", "agree": False},
+            {"host": "n4", "status": "unknown"},  # agreed None -> "·"
+            "not-a-dict",
+        ],
+        "lease": {
+            "holder": "n1",
+            "identity": "n1",
+            "expiry": _iso_ago(-3600),  # an hour out -> fmt_in
+            "fence": 7,
+            "path": "/leases/x",
+        },
+    }
+    body = _txt(app.render_cluster(paint, 110, 30))
+    assert "follower (leader: n2)" in body
+    assert "duplicate nodeName" in body  # the conflict alert
+    assert "held by" in body and "owns 3" in body
+
+    # follower with no named leader, then a no-quorum node with an expired
+    # lease
+    app.cluster = {
+        "enabled": True,
+        "elect_leader": True,
+        "quorate": True,
+        "is_leader": False,
+        "node_name": "n1",
+    }
+    assert "follower" in _txt(app.render_cluster(paint, 110, 30))
+    app.cluster = {
+        "enabled": True,
+        "elect_leader": True,
+        "quorate": False,
+        "backend": "etcd",
+        "node_name": "n1",
+        "lease": {"holder": "other", "identity": "n1", "expiry": _iso_ago(60)},
+    }
+    body2 = _txt(app.render_cluster(paint, 110, 30))
+    assert "no quorum" in body2 and "expired" in body2
+
+
+def test_render_state_and_fleet_edges(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.state_data = {"enabled": False}
+    assert "not configured" in _txt(app.render_state(paint, 110, 30))
+    app.state_data = {"enabled": True, "documents": {}, "records": {}}
+    app.state_tab = "documents"
+    assert "nothing here yet" in _txt(app.render_state(paint, 110, 30))
+    app.fleet = {"enabled": False}
+    assert "needs a cluster" in _txt(app.render_fleet(paint, 110, 30))
+    # a fleet whose only jobs are filtered out shows the empty note
+    app.fleet = {
+        "enabled": True,
+        "nodes": [
+            {
+                "node_name": "a",
+                "jobs": {
+                    "ok-job": {
+                        "running": False,
+                        "enabled": True,
+                        "last": {"outcome": "success"},
+                    }
+                },
+            }
+        ],
+    }
+    app.fleet_fail_only = True
+    assert "nothing failing" in _txt(app.render_fleet(paint, 110, 30))
+
+
+def test_render_heat_bucket_edges(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    assert "gathering run history" in _txt(app.render_heat(paint, 110, 30))
+    app.heat_data = {
+        "j": [
+            {"outcome": "success", "finished_at": None},  # unparseable -> skip
+            {"outcome": "failure", "finished_at": _iso_ago(3600)},
+            {"outcome": "success", "finished_at": _iso_ago(48 * 3600)},  # aged
+        ]
+    }
+    assert "activity heatmap" in _txt(app.render_heat(paint, 110, 30))
+
+
+def test_render_press_full_grid(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    assert "computing the fire forecast" in _txt(
+        app.render_press(paint, 110, 30)
+    )
+    fires = [0] * 60
+    fires[0] = 3
+    fires[15] = 1
+    grid = [[0] * 60 for _ in range(24)]
+    grid[0][0] = 3
+    grid[9][15] = 1
+    app.pressure = {
+        "hours": 24,
+        "total_fires": 4,
+        "jobs": 5,
+        "busiest_minute": {"minute": 0, "jobs": 3},
+        "empty_minutes": list(range(1, 60)),
+        "by_minute_fires": fires,
+        "timezone": "UTC",
+        "grid": grid,
+    }
+    app.press_suggest = {
+        "hourly": {"expression": "17 * * * *"},
+        "daily": {"expression": "17 3 * * *"},
+    }
+    app.press_dups = [
+        {
+            "expression": "0 * * * *",
+            "count": 7,
+            "jobs": ["dup-%d" % i for i in range(7)],
+        }
+    ]
+    body = _txt(app.render_press(paint, 110, 40))
+    assert "duplicate schedules" in body
+    assert "+2 more" in body  # the >5 group preview
+    assert "suggest" in body
+
+
+def test_render_week_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    assert "enumerating the week" in _txt(app.render_week(paint, 110, 30))
+    start = datetime.datetime.now(datetime.timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    app.week = {
+        "items": [],
+        "frequent": [],
+        "start": start,
+        "schedules": 0,
+        "grid": [[0] * 24 for _ in range(7)],
+    }
+    assert "no scheduled fires" in _txt(app.render_week(paint, 110, 30))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    app.week = {
+        "items": [
+            (now + datetime.timedelta(hours=2), "future-job"),
+            (now - datetime.timedelta(hours=2), "past-job"),
+        ],
+        "frequent": [("hum-job", 120, True)],
+        "start": start,
+        "schedules": 2,
+        "grid": [[1] * 24 for _ in range(7)],
+    }
+    body = _txt(app.render_week(paint, 110, 40))
+    assert "upcoming fires" in body and "background hum" in body
+    assert "future-job" in body
+
+
+def test_render_radar_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.fetched_mono = time.monotonic()
+    app.jobs = [
+        _job("disabled", enabled=False),
+        _job("running", running=True, scheduled_in=None),
+    ]
+    assert "no jobs scheduled" in _txt(app.render_radar(paint, 110, 30))
+    app.jobs = [
+        _job("soon", scheduled_in=120.0),
+        _job("null", scheduled_in=None),
+    ]
+    app.fetched_mono = time.monotonic()
+    assert "1 upcoming" in _txt(app.render_radar(paint, 110, 30))
+
+
+def test_render_node_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.node = {"node_name": "n", "resources": None}
+    assert "sampling unavailable" in _txt(app.render_node(paint, 110, 30))
+    app.node = {
+        "node_name": "n",
+        "resources": {
+            "cpu_percent": 12.5,
+            "rss_bytes": 2048,
+            "pids": 42,
+            "host": "h",  # a non-numeric value renders as a string
+        },
+    }
+    app.node_history = {
+        "points": [[time.time() + i, 10.0 + i, 20.0 + i] for i in range(20)]
+    }
+    body = _txt(app.render_node(paint, 110, 30))
+    assert "node: n" in body and "cpu" in body
+
+
+def test_render_dags_index_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dags = []
+    assert "no DAGs configured" in _txt(app.render_dags(paint, 110, 30))
+    app.dags = [
+        {
+            "name": "pipeline",
+            "taskCount": 5,  # no tasks list -> falls back to taskCount
+            "schedule": "0 * * * *",
+            "latestRun": {"state": "failed"},
+        }
+    ]
+    body = _txt(app.render_dags(paint, 110, 30))
+    assert "pipeline" in body and "0 * * * *" in body
+
+
+def test_render_mitigate_overflow_and_running(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.mitigate_names = ["job-%d" % i for i in range(8)]
+    app.mitigate_label = "lots"
+    app.mitigate_log = ["  ✓ start job-0", "  ✕ job-1 (HTTP 500)", "note"]
+    app.mitigate_running = True
+    body = _txt(app.render_mitigate(paint, 110, 30))
+    assert "+2 more" in body
+    assert "running (a to abort)" in body
+
+
+def test_render_sandbox_hashed_and_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.inputs["sandbox"] = ""
+    assert "type a cron expression" in _txt(app.render_sandbox(paint, 110, 30))
+    app.inputs["sandbox"] = "H * * * *"
+    assert "stable hash" in _txt(app.render_sandbox(paint, 110, 30))
+    # a never-fires expression parses but lints with a finding
+    app.inputs["sandbox"] = "0 0 30 2 *"
+    body = _txt(app.render_sandbox(paint, 110, 40))
+    assert "cron sandbox" in body
+
+
+def test_render_timeline_blast_and_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.jobs = [
+        _job(
+            "bad",
+            outcome="failure",
+            exit_code=7,
+            fail_reason="nope",
+            duration=2.0,
+        ),
+    ]
+    app.incident_set = ["bad"]
+    body = _txt(app.render_timeline(paint, 110, 30))
+    assert "blast radius" in body
+    # fail-only with nothing failing shows the clear-filter hint
+    app.jobs = [_job("fine", outcome="success")]
+    app.timeline_fail_only = True
+    assert "clear the filter" in _txt(app.render_timeline(paint, 110, 30))
+
+
+# ===================================================================
+#  Drawer and DAG-panel render paths
+# ===================================================================
+def test_drawer_logs_suffix_and_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # a no-output end shows its own separator
+    tail = _stub_tail(app, [])
+    tail.ended = "no-output"
+    app.log_tail = tail
+    assert "no-output" in _txt(app._drawer_logs(paint, 90, 12))
+    # a still-open empty tail shows the waiting hint
+    tail2 = _stub_tail(app, [])
+    app.log_tail = tail2
+    assert "waiting for output" in _txt(app._drawer_logs(paint, 90, 12))
+    # no stream at all
+    app.log_tail = None
+    assert "no stream" in _txt(app._drawer_logs(paint, 90, 12))
+
+
+def test_drawer_history_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # not loaded yet
+    app.drawer_runs = None
+    assert "loading run history" in _txt(app._drawer_history(paint, 80, 20))
+    # empty run list
+    app.drawer_runs = {"stats": {"total": 0}, "runs": []}
+    assert "no runs retained yet" in _txt(app._drawer_history(paint, 80, 20))
+    # full stats block with cpu line + a failure run with resources
+    app.drawer_runs = {
+        "stats": {
+            "total": 2,
+            "success": 1,
+            "failure": 1,
+            "cancelled": 0,
+            "unknown": 0,
+            "success_rate": 0.5,
+            "avg_duration": 2.0,
+            "min_duration": 1.0,
+            "max_duration": 3.0,
+            "avg_cpu_seconds": 1.5,
+            "max_rss_bytes": 4096,
+        },
+        "runs": [
+            {
+                "outcome": "failure",
+                "started_at": _iso_ago(120),
+                "duration": 3.0,
+                "exit_code": 7,
+                "fail_reason": "boom",
+                "resources": {"cpu_total_seconds": 1.2},
+            },
+            {
+                "outcome": "success",
+                "started_at": _iso_ago(60),
+                "duration": 1.0,
+            },
+        ],
+    }
+    body = _txt(app._drawer_history(paint, 90, 24))
+    assert "peak rss" in body and "exit 7" in body and "cpu" in body
+
+
+def test_drawer_resources_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.drawer_res = None
+    loading = _txt(app._drawer_resources(paint, 80, 20))
+    assert "loading resource data" in loading
+    app.drawer_res = {"monitored": False}
+    none_body = _txt(app._drawer_resources(paint, 80, 20))
+    assert "no resource monitoring" in none_body
+    app.drawer_res = {
+        "monitored": True,
+        "live": [{"cpu_percent": 40.0, "rss_bytes": 2048}],
+        "runs": [
+            {
+                "started_at": _iso_ago(120),
+                "resources": {
+                    "cpu_total_seconds": 1.5,
+                    "max_rss_bytes": 4096,
+                },
+            }
+        ],
+    }
+    body = _txt(app._drawer_resources(paint, 90, 20))
+    assert "live:" in body and "peak rss" in body
+
+
+def test_drawer_schedule_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # an @reboot job has no upcoming fires but its own note
+    reboot = _job("boot", schedule="@reboot", scheduled_in=None)
+    app.jobs = [reboot]
+    app.by_name = {"boot": reboot}
+    app.drawer_job = "boot"
+    assert "runs once, at daemon start" in _txt(
+        app._drawer_schedule(paint, 60, 24)
+    )
+    # a resolved H schedule with a timezone and shipped findings
+    tz_job = _job("tz", schedule="H * * * *", scheduled_in=45.0)
+    tz_job["schedule_resolved"] = "18 * * * *"
+    tz_job["timezone"] = "America/New_York"
+    tz_job["utc"] = False
+    tz_job["schedule_findings"] = [
+        {"code": "uneven", "level": "warning", "message": "uneven cadence"}
+    ]
+    app.jobs = [tz_job]
+    app.by_name = {"tz": tz_job}
+    app.drawer_job = "tz"
+    app.fetched_mono = time.monotonic()
+    body = _txt(app._drawer_schedule(paint, 70, 24))
+    assert "resolves to 18 * * * *" in body
+    assert "next runs:" in body
+    assert "uneven cadence" in body
+    assert "daemon says: next fire" in body
+
+
+def test_render_drawer_panel_dispatches_tabs(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    job = _job("d", outcome="success")
+    app.jobs = [job]
+    app.by_name = {"d": job}
+    app.drawer_job = "d"
+    for tab in ("logs", "history", "resources", "schedule"):
+        app.drawer_tab = tab
+        rows = app.render_drawer_panel(paint, 70, 24)
+        assert any(strip_ansi(r).strip() for r in rows)
+
+
+def test_dag_panel_tabs_render(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dag_name = "pipeline"
+    app.dags = [
+        {
+            "name": "pipeline",
+            "tasks": [
+                {"id": "extract", "dependsOn": []},
+                {"id": "load", "dependsOn": "extract"},  # string dep form
+                {"id": "report", "dependsOn": ["load"]},
+            ],
+        }
+    ]
+    # runs tab: empty then populated
+    app.dag_tab = "runs"
+    app.dag_runs = []
+    assert "no runs yet" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_runs = [
+        {"runKey": "manual-1", "state": "running", "createdAt": time.time()}
+    ]
+    assert "manual-1" in _txt(app.render_dag_panel(paint, 70, 24))
+
+    # graph tab lays out layers with edges
+    app.dag_tab = "graph"
+    app.dag_run = {
+        "tasks": {
+            "extract": {"state": "success"},
+            "load": {"state": "running"},
+        }
+    }
+    graph = _txt(app.render_dag_panel(paint, 70, 24))
+    assert "extract" in graph and ("─▶" in graph or "->" in graph)
+
+    # tasks tab: no run key -> hint; then a run with an awaiting gate
+    app.dag_tab = "tasks"
+    app.dag_run_key = None
+    assert "open a run first" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_run_key = "manual-1"
+    app.dag_run = {
+        "tasks": {
+            "extract": {"state": "success", "attempt": 0},
+            "approve": {
+                "state": "running",
+                "awaitingApproval": True,
+                "attempts": 1,
+            },
+        }
+    }
+    tasks = _txt(app.render_dag_panel(paint, 70, 24))
+    assert "awaiting" in tasks and "a approve" in tasks
+
+    # xcom tab: no run key, loading, values, and empty
+    app.dag_tab = "xcom"
+    app.dag_run_key = None
+    assert "open a run first" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_run_key = "manual-1"
+    app.dag_xcom = None
+    assert "loading xcom" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_xcom = {"xcom": {"rows": 42}}
+    assert "rows" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_xcom = {"xcom": {}}
+    assert "no xcom values" in _txt(app.render_dag_panel(paint, 70, 24))
+
+    # logs tab: no tail selected
+    app.dag_tab = "logs"
+    app.dag_task_tail = None
+    assert "pick a task" in _txt(app.render_dag_panel(paint, 70, 24))
+    tail = _stub_tail(app, [])
+    tail.ended = "no-output"
+    app.dag_task_tail = tail
+    assert "no output" in _txt(app.render_dag_panel(paint, 70, 24))
+
+
+def test_dag_graph_no_task_metadata(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dag_name = "empty"
+    app.dags = [{"name": "empty"}]
+    app.dag_tab = "graph"
+    assert "no task metadata" in _txt(app.render_dag_panel(paint, 70, 24))
+
+
+def test_render_tail_input_and_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # empty console with the add-input focused
+    app.focus = "tailadd"
+    app.inputs["tailadd"] = "abc"
+    body = _txt(app.render_tail(paint, 110, 24))
+    assert "empty — a to add a job" in body
+    assert "add:" in body
+
+
+# ===================================================================
+#  Key handlers (direct, bare app)
+# ===================================================================
+def _stub_api(app):
+    async def gj(path, **k):
+        return {"enabled": True, "nodes": [], "points": [], "runs": []}
+
+    async def gt(path, **k):
+        return ""
+
+    async def post(path, body=None):
+        return 200, {}
+
+    async def stream(path):
+        if False:  # an empty async generator
+            yield
+
+    app.api.get_json = gj
+    app.api.get_text = gt
+    app.api.post = post
+    app.api.stream = stream
+
+
+async def test_list_extra_and_move_keys(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("a", outcome="failure"), _job("b", outcome="success")]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.recompute_view()
+    await app.handle_key("s")  # cycle sort key
+    assert app.sort_key != "name"
+    await app.handle_key("S")  # flip direction
+    assert app.sort_dir == -1
+    before = app.status_filter
+    await app.handle_key("f")  # cycle status filter
+    assert app.status_filter != before
+    for key in ("pgdn", "pgup", "home", "end", "j", "k", "down", "up"):
+        await app.handle_key(key)
+    await app.handle_key("m")  # multi-tail console
+    assert app.is_open("tail")
+    app.close("tail")
+
+
+async def test_help_and_token_and_settings_keys(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("a")]
+    app.by_name = {"a": app.jobs[0]}
+    app.recompute_view()
+    app.open("help")
+    for key in ("j", "down", "k", "up"):
+        await app.handle_key(key)
+    await app.handle_key("?")  # closes help
+    assert not app.is_open("help")
+    # token modal: keys type into the field
+    app.open("token")
+    await app.handle_key("z")
+    assert app.inputs["token"] == "z"
+    app.close("token")
+
+
+async def test_overlay_scroll_and_reload_keys(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("a", outcome="failure"), _job("b")]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.dags = [{"name": "d", "tasks": []}]
+    app.recompute_view()
+    _stub_api(app)
+    # panel-scroll overlays (radar/node/cluster/heat/press/week/fleet/state)
+    for name in ("radar", "node", "cluster"):
+        app.open(name)
+        for key in ("j", "k", "down", "up", "pgdn", "pgup", "home"):
+            await app.handle_key(key)
+        app.close(name)
+    # press / week reload keys recompute locally
+    app.open("press")
+    await app.handle_key("r")
+    await app.handle_key("j")
+    app.close("press")
+    app.open("week")
+    await app.handle_key("r")
+    await app.handle_key("k")
+    app.close("week")
+    # heat / fleet / state / dags reload keys spawn a fetch (stubbed)
+    app.open("heat")
+    await app.handle_key("r")
+    app.close("heat")
+    app.open("fleet")
+    await app.handle_key("f")  # failing-only toggle
+    await app.handle_key("r")
+    await app.handle_key("j")
+    app.close("fleet")
+    app.state_data = {
+        "enabled": True,
+        "documents": {"kv/a": 1},
+        "records": {"runs/x": 2},
+    }
+    app.open("state")
+    for key in ("right", "left", "tab", "shift+tab", "j", "k", "enter", "r"):
+        await app.handle_key(key)
+    app.close("state")
+    app.open("dags")
+    for key in ("j", "k", "t", "r"):
+        await app.handle_key(key)
+    app.close("dags")
+    await asyncio.sleep(0.05)  # let spawned fetches settle
+
+
+async def test_timeline_keys_open_drawer_and_mitigate(tmp_path):
+    app = _bare_app(tmp_path)
+    _stub_api(app)
+    app.jobs = [
+        _job("bad", outcome="failure", exit_code=1),
+        _job("good", outcome="success"),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.incident_set = ["bad"]
+    app.recompute_view()
+    app.open("timeline")
+    for key in ("j", "k", "f"):
+        await app.handle_key(key)
+    app.timeline_fail_only = False
+    await app.handle_key("m")  # hand the blast radius to mitigate
+    assert app.is_open("mitigate")
+    app.close("mitigate")
+    # enter opens the selected job's drawer
+    app.open("timeline")
+    app.timeline_sel = 0
+    await app.handle_key("enter")
+    assert app.is_open("drawer")
+    app.close("drawer")
+
+
+async def test_mitigate_keys_abort_and_writeup(tmp_path, monkeypatch):
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("a", outcome="failure", exit_code=2)]
+    app.by_name = {"a": app.jobs[0]}
+    app.open_mitigate(["a"], "set")
+    # abort only fires while a sweep is running
+    app.mitigate_running = True
+    await app.handle_key("a")
+    assert app.mitigate_abort
+    app.mitigate_running = False
+    # writeup: an OSError on the file still copies to the clipboard
+    real_open = open
+
+    def boom_open(path, *a, **k):
+        if "cronstable-incident" in str(path):
+            raise OSError("nope")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", boom_open)
+    await app.handle_key("y")
+    assert any("clipboard" in m for m in _msgs(app))
+    assert app.term.copied  # the writeup reached the clipboard
+
+
+async def test_drawer_key_handlers(tmp_path):
+    app = _bare_app(tmp_path)
+    _stub_api(app)
+    job = _job("d", outcome="success")
+    app.jobs = [job]
+    app.by_name = {"d": job}
+    app.drawer_job = "d"
+    app.drawer_tab = "logs"
+    app.log_tail = _stub_tail(
+        app, [("stdout", "one", 1.0), ("stderr", "two", 2.0)]
+    )
+    app.open("drawer")
+    for key in (
+        "j",
+        "down",
+        "k",
+        "up",
+        "pgup",
+        "pgdn",
+        "end",
+        "home",
+        "n",
+        "N",
+        "f",  # follow toggle
+        "t",  # timestamps
+        "w",  # wrap
+    ):
+        await app.handle_key(key)
+    await app.handle_key("r")  # run the drawer job
+    await app.handle_key("x")  # cancel the drawer job
+    # tab switching pulls history and resources lazily
+    for key in ("tab", "right", "left", "shift+tab"):
+        await app.handle_key(key)
+    # non-logs tab scroll + run/cancel
+    app.drawer_tab = "history"
+    app.drawer_runs = {"stats": {"total": 0}, "runs": []}
+    for key in ("j", "k", "pgdn", "pgup", "r", "x"):
+        await app.handle_key(key)
+    app.close("drawer")
+    await asyncio.sleep(0.05)
+
+
+async def test_dag_drawer_key_handlers(tmp_path):
+    app = _bare_app(tmp_path)
+    _stub_api(app)
+    app.dag_name = "pipeline"
+    app.dags = [
+        {
+            "name": "pipeline",
+            "tasks": [
+                {"id": "extract", "dependsOn": []},
+                {"id": "load", "dependsOn": ["extract"]},
+            ],
+        }
+    ]
+    app.dag_tab = "runs"
+    app.dag_runs = [
+        {"runKey": "r1", "state": "running", "createdAt": time.time()}
+    ]
+    app.open("dag")
+    await app.handle_key("j")
+    await app.handle_key("k")
+    await app.handle_key("enter")  # open the selected run -> tasks tab
+    assert app.dag_run_key == "r1"
+    app.dag_run = {
+        "tasks": {
+            "extract": {"state": "success"},
+            "approve": {"state": "running", "awaitingApproval": True},
+        }
+    }
+    await app.handle_key("j")
+    await app.handle_key("k")
+    await app.handle_key("a")  # approve the selected task
+    await app.handle_key("R")  # reject
+    await app.handle_key("enter")  # open the task's logs -> logs tab
+    assert app.dag_tab == "logs"
+    for key in ("left", "right", "j", "k"):
+        await app.handle_key(key)
+    await app.handle_key("t")  # trigger
+    await app.handle_key("b")  # backfill input focus
+    assert app.focus == "backfill"
+    app.focus = None
+    # xcom tab lazily loads on switch
+    app.dag_tab = "runs"
+    app.dag_xcom = None
+    await app.handle_key("left")  # runs -> logs; keep cycling to xcom
+    while app.dag_tab != "xcom":
+        await app.handle_key("left")
+    app.close("dag")
+    await asyncio.sleep(0.05)
+
+
+async def test_dag_run_tasks_list_form(tmp_path):
+    app = _bare_app(tmp_path)
+    app.dag_run = {"tasks": [{"key": "t1", "state": "success"}]}
+    assert app.dag_run_tasks() == [{"key": "t1", "state": "success"}]
+    app.dag_run = {"tasks": "weird"}
+    assert app.dag_run_tasks() == []
+
+
+async def test_log_search_recompute_empty_and_jump_guards(tmp_path):
+    app = _bare_app(tmp_path)
+    app.log_tail = None
+    app.inputs["logsearch"] = ""
+    app._log_search_recompute(reset=True)  # no needle / no tail -> clears
+    assert app.log_matches == []
+    app._log_search_jump(1)  # no matches -> no-op
+    assert app.log_match_idx == 0
+
+
+# ===================================================================
+#  Palette, toggles, input-commit, and misc state
+# ===================================================================
+async def test_palette_commands_toggles_and_acts(tmp_path):
+    app = _bare_app(tmp_path)
+    _stub_api(app)
+    app.jobs = [
+        _job("run1", running=True, scheduled_in=None),
+        _job("pausable", outcome="success", paused=True),
+        _job("normal", outcome="success"),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.dags = [{"name": "pipe"}]
+    labels = [c[1] for c in app.palette_commands()]
+    assert any("DAG: pipe" in ln for ln in labels)
+    assert any("Trigger DAG: pipe" in ln for ln in labels)
+    assert any("Resume: pausable" in ln for ln in labels)
+    assert any("Pause: normal" in ln for ln in labels)
+    assert any("Cancel: run1" in ln for ln in labels)
+    assert any("Run: normal" in ln for ln in labels)
+    # the small action shims each spawn their coroutine
+    app._act_trigger_dag("pipe")
+    app._act_run_job("normal")
+    app._act_cancel_job("run1")
+    app._act_pause_job("normal")
+    app._act_resume_job("pausable")
+    app._act_tail_one("normal")
+    assert app.is_open("tail")
+    app.close("tail")
+    # panel toggles that spawn a fetch (all stubbed)
+    for name in ("fleet", "state", "heat", "press", "week", "node"):
+        app._toggle(name)
+        assert app.is_open(name)
+        app._toggle(name)
+        assert not app.is_open(name)
+    app._toggle_dags()
+    assert app.is_open("dags")
+    app._toggle_dags()
+    assert not app.is_open("dags")
+    app._toggle_compact()
+    app._toggle_sound()
+    app._toggle_boot()
+    app._copy_chip("")  # empty value copies nothing
+    app._copy_chip("v1.2")
+    app._focus_filter()
+    assert app.focus == "filter"
+    await asyncio.sleep(0.05)
+
+
+async def test_handle_key_ctrl_c_and_booting_guard(tmp_path):
+    app = _bare_app(tmp_path)
+    await app.handle_key("ctrl+c")
+    assert app.quit
+    app.quit = False
+    app.booting = True
+    await app.handle_key("j")  # swallowed during boot
+    app.booting = False
+
+
+async def test_list_key_incident_toggle_and_copy(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("a", outcome="failure", command="echo hi")]
+    app.by_name = {"a": app.jobs[0]}
+    app.recompute_view()
+    await app.handle_key("i")
+    assert app.is_open("timeline")
+    # the toggle-close arm (reached only via direct list dispatch)
+    await app._list_key("i")
+    assert not app.is_open("timeline")
+    await app.handle_key("c")  # copy the selected command
+    assert app.term.copied
+    # an unhandled printable key in a focused field is ignored
+    app._edit_input("filter", "up")
+
+
+async def test_input_commit_all_fields(tmp_path):
+    app = _bare_app(tmp_path)
+    _stub_api(app)
+    app.jobs = [_job("alpha"), _job("beta")]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.recompute_view()
+    # filter commit blurs the field
+    app.focus = "filter"
+    app.inputs["filter"] = "al"
+    await app.handle_key("enter")
+    assert app.focus is None
+    # token commit stores the token
+    app.open("token")
+    app.focus = "token"
+    app.inputs["token"] = "sekret"
+    await app.handle_key("enter")
+    assert app.api.token == "sekret"
+    # logsearch commit releases and lands on the first match
+    app.log_tail = _stub_tail(app, [("stdout", "find me", 1.0)])
+    app.open("drawer")
+    app.focus = "logsearch"
+    app.inputs["logsearch"] = "find"
+    await app.handle_key("enter")
+    assert app.focus is None
+    app.close("drawer")
+    # tailadd: exact match, fuzzy match, and no match
+    app.open("tail")
+    app.focus = "tailadd"
+    app.inputs["tailadd"] = "beta"  # exact
+    await app.handle_key("enter")
+    app.focus = "tailadd"
+    app.inputs["tailadd"] = "alp"  # fuzzy
+    await app.handle_key("enter")
+    assert {t.label for t in app.tails} == {"alpha", "beta"}
+    app.focus = "tailadd"
+    app.inputs["tailadd"] = "zzzzz"  # no match
+    await app.handle_key("enter")
+    assert any("no job matches" in m for m in _msgs(app))
+    app.close("tail")
+    # sandbox commit just settles
+    app.open("sandbox")
+    app.focus = "sandbox"
+    app.inputs["sandbox"] = "* * * * *"
+    await app.handle_key("enter")
+    assert app.focus is None
+    app.close("sandbox")
+    # backfill commit forwards to dag_backfill
+    app.dag_name = "d"
+    app.open("dag")
+    app.focus = "backfill"
+    app.inputs["backfill"] = "2026-01-01..2026-01-02"
+    await app.handle_key("enter")
+    app.close("dag")
+    await asyncio.sleep(0.05)
+
+
+def test_close_blurs_input_and_stale(tmp_path):
+    app = _bare_app(tmp_path)
+    app.open("sandbox")
+    app.focus = "sandbox"
+    app.close("sandbox")  # closing the home overlay blurs the input
+    assert app.focus is None
+    assert app.stale()  # no fetch yet -> stale
+
+
+def test_cut_to_width_zero():
+    assert cut_to_width("abc", 0) == tui.RESET
+
+
+async def test_open_dag_task_logs_guards(tmp_path):
+    app = _bare_app(tmp_path)
+    _stub_api(app)
+    app.dag_name = None
+    app._open_dag_task_logs("t")  # missing name/run key -> no-op
+    assert app.dag_task_tail is None
+    app.dag_name = "d"
+    app.dag_run_key = "r"
+    app.dag_task_tail = _stub_tail(app, [])  # an existing tail is stopped
+    app._open_dag_task_logs("t")
+    assert app.dag_task_tail is not None and app.dag_tab == "logs"
+    app._close_dag_streams()
+
+
+def test_render_zen_dot_field(tmp_path):
+    app = _bare_app(tmp_path)
+    app.fetched_mono = time.monotonic()
+    app.jobs = [
+        _job("soon", scheduled_in=10.0),
+        _job("later", scheduled_in=None),
+    ]
+    rows = app.render_zen(_paint(app), 80, 24)
+    assert "all clear" in _txt(rows)
+
+
+def test_render_tail_with_streams(tmp_path):
+    app = _bare_app(tmp_path)
+    app.timestamps = True
+    tail = tui.LogTail(app.api, "/x", "lab", app.mark)
+    tail.lines = [
+        ("stdout", "hello there", 100.0),
+        ("meta", "end of run output", 101.0),
+    ]
+    app.tails = [tail]
+    assert "hello there" in _txt(app.render_tail(_paint(app), 110, 24))
+    empty = tui.LogTail(app.api, "/y", "lab2", app.mark)
+    app.tails = [empty]
+    assert "waiting for output" in _txt(app.render_tail(_paint(app), 110, 24))
+
+
+def test_drawer_logs_timestamps_search_and_wrap(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.timestamps = True
+    app.inputs["logsearch"] = "needle"
+    tail = _stub_tail(
+        app,
+        [
+            ("stdout", "a needle here", 100.0),
+            ("stderr", "unrelated", 101.0),
+            ("meta", "end of run output", 102.0),
+        ],
+    )
+    app.log_tail = tail
+    body = _txt(app._drawer_logs(paint, 90, 12))
+    assert "needle" in body
+    # a wrapped long line spans several rows
+    app.timestamps = False
+    app.inputs["logsearch"] = ""
+    app.wrap = True
+    wide = _stub_tail(app, [("stdout", "x" * 300, 100.0)])
+    app.log_tail = wide
+    rows = app._drawer_logs(paint, 60, 12)
+    assert any("xxxx" in strip_ansi(r) for r in rows)
+
+
+def test_log_search_prev_beyond_matches(tmp_path):
+    app = _bare_app(tmp_path)
+    app.log_tail = _stub_tail(
+        app,
+        [("stdout", "a err", 1.0), ("stdout", "b err", 2.0)],
+    )
+    app.inputs["logsearch"] = "err"
+    app._log_search_recompute(reset=True)
+    assert app.log_matches == [0, 1]
+    app.log_match_idx = 1  # cursor on line index 1
+    # trim to a single matching line; the old cursor is now past every match
+    app.log_tail.lines = [("stdout", "a err", 1.0)]
+    app._log_search_recompute()
+    assert app.log_matches == [0] and app.log_match_idx == 0
+
+
+def test_dag_graph_dict_form_and_cycle(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dag_name = "g"
+    app.dag_tab = "graph"
+    app.dags = [
+        {
+            "name": "g",
+            "tasks": {  # dict form with a dependency cycle
+                "a": {"dependsOn": ["b"]},
+                "b": {"dependsOn": ["a"]},
+            },
+        }
+    ]
+    app.dag_run = {"tasks": {"a": {"state": "running"}}}
+    body = _txt(app.render_dag_panel(paint, 70, 24))
+    assert "[a" in body
+
+
+def test_dag_tasks_loading_and_xcom_barekeys(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dag_name = "g"
+    app.dag_run_key = "r"
+    # tasks tab with a run key but no tasks yet -> loading
+    app.dag_tab = "tasks"
+    app.dag_run = {"tasks": {}}
+    assert "loading run detail" in _txt(app.render_dag_panel(paint, 70, 24))
+    # xcom carried as bare top-level keys (no nested "xcom")
+    app.dag_tab = "xcom"
+    app.dag_xcom = {"dag": "g", "runKey": "r", "rows": 9}
+    assert "rows" in _txt(app.render_dag_panel(paint, 70, 24))
+
+
+async def test_startup_deeplink_and_wallboard(tmp_path):
+    h = Harness()
+    h.daemon.jobs = [_job("watched", outcome="success")]
+    h.daemon.log_lines["watched"] = [{"stream": "stdout", "line": "hi"}]
+    try:
+        app = await h.start(
+            tmp_path, start_wallboard=True, start_job="watched"
+        )
+        await _wait_for(lambda: len(app.jobs) == 1)
+        await _wait_for(lambda: app.is_open("drawer"))
+        assert app.wallboard
+    finally:
+        await h.stop()
+
+
+async def test_boot_with_cluster_enabled(tmp_path):
+    from tests.test_tui_tour import install_fleet_fixtures
+
+    h = Harness()
+    install_fleet_fixtures(h.daemon)
+    try:
+        await h.daemon.start()
+        prefs = dict(tui.PREF_DEFAULTS)
+        prefs["poll_ms"] = 200
+        app = tui.TuiApp(
+            Api(h.daemon.url, None),
+            h.term,
+            h.keys,
+            prefs,
+            boot=True,
+            prefs_file=str(tmp_path / "prefs.json"),
+        )
+        h.app = app
+        h._task = asyncio.get_running_loop().create_task(app.run())
+        await _wait_for(lambda: app.booting, 10)
+        await _wait_for(lambda: not app.booting, 30)
+        text = "\n".join(
+            "\n".join(strip_ansi(r) for r in f) for f in h.term.frames
+        )
+        assert "gossip" in text  # the enabled-cluster boot line
+    finally:
+        await h.stop()
+
+
+async def test_boot_with_token_required(tmp_path):
+    h = Harness()
+    h.daemon.jobs = [_job("a")]
+    h.daemon.token = "need-me"
+    try:
+        await h.daemon.start()
+        prefs = dict(tui.PREF_DEFAULTS)
+        prefs["poll_ms"] = 200
+        app = tui.TuiApp(
+            Api(h.daemon.url, None),  # no token -> /version 401
+            h.term,
+            h.keys,
+            prefs,
+            boot=True,
+            prefs_file=str(tmp_path / "prefs.json"),
+        )
+        h.app = app
+        h._task = asyncio.get_running_loop().create_task(app.run())
+        await _wait_for(lambda: app.booting, 10)
+        await _wait_for(lambda: not app.booting, 30)
+        text = "\n".join(
+            "\n".join(strip_ansi(r) for r in f) for f in h.term.frames
+        )
+        assert "locked (token needed)" in text
+    finally:
+        await h.stop()
+
+
+async def test_posix_key_reader_via_pipe():
+    import os
+    import sys
+
+    if sys.platform == "win32":  # POSIX-only add_reader path
+        return
+    r, w = os.pipe()
+    loop = asyncio.get_running_loop()
+    reader = tui.PosixKeyReader(loop, r)
+    try:
+        os.write(w, b"j")
+        assert await asyncio.wait_for(reader.get(), 2) == "j"
+        # a lone Esc resolves through the quiet-gap flush
+        os.write(w, b"\x1b")
+        assert await asyncio.wait_for(reader.get(), 2) == "esc"
+    finally:
+        reader.close()
+        os.close(w)
+        os.close(r)
+
+
+# ===================================================================
+#  Text metrics and palette navigation
+# ===================================================================
+def test_text_metrics_edges():
+    from cronstable.tui import char_width
+
+    assert char_width("\t") == 1  # tab safety net
+    assert char_width("́") == 0  # a combining mark is zero-width
+    assert truncate("anything", 0) == ""
+
+
+async def test_palette_key_navigation(tmp_path):
+    app = _bare_app(tmp_path)
+    _stub_api(app)
+    app.jobs = [_job("a")]
+    app.by_name = {"a": app.jobs[0]}
+    app.recompute_view()
+    await app.handle_key("ctrl+k")
+    assert app.is_open("palette")
+    for ch in "theme":
+        await app.handle_key(ch)
+    await app.handle_key("down")
+    await app.handle_key("up")
+    await app.handle_key("enter")  # run the top match (Cycle theme)
+    assert not app.is_open("palette")
+    # reopen and dismiss with Esc
+    await app.handle_key("ctrl+k")
+    await app.handle_key("esc")
+    assert not app.is_open("palette")
+
+
+async def test_filter_tab_blurs(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("a")]
+    app.by_name = {"a": app.jobs[0]}
+    app.recompute_view()
+    app.focus = "filter"
+    await app.handle_key("tab")
+    assert app.focus is None
+
+
+def test_mitigate_failing_helper(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [
+        _job("bad", outcome="failure"),
+        _job("ok", outcome="success"),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app._mitigate_failing()
+    assert app.is_open("mitigate")
+    assert app.mitigate_names == ["bad"]
+
+
+def test_render_sandbox_reboot_and_reject(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.inputs["sandbox"] = "@reboot"
+    assert "cronstable starts" in _txt(app.render_sandbox(paint, 110, 30))
+    app.inputs["sandbox"] = "not a cron"
+    rejected = _txt(app.render_sandbox(paint, 110, 30))
+    assert "rejects this expression" in rejected
+
+
+def test_render_state_view_sparse(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # only the "view" section present: the node/documents/records arms skip
+    app.state_data = {"enabled": True, "view": {"records": 3, "bytes": 128}}
+    app.state_tab = "view"
+    body = _txt(app.render_state(paint, 110, 30))
+    assert "state inspector" in body
+
+
+def test_drawer_schedule_bad_timezone(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    job = _job("tz", schedule="0 6 * * *", scheduled_in=None)
+    job["timezone"] = "Not/AZone"  # ZoneInfo raises -> falls back to UTC
+    job["utc"] = False
+    app.jobs = [job]
+    app.by_name = {"tz": job}
+    app.drawer_job = "tz"
+    body = _txt(app._drawer_schedule(paint, 70, 24))
+    assert "reference frame" in body

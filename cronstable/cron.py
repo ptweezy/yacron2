@@ -285,6 +285,13 @@ PAUSE_STREAM_KEEP = 8
 SLA_CHECK_STALE = "maxTimeSinceSuccess"
 SLA_CHECK_LATE = "lateAfter"
 SLA_CHECK_RUNTIME = "maxRuntime"
+# The complete, fixed set of check names any SLA surface can produce (the
+# only second-half values ever keyed into _sla_state).  Because it is a
+# bounded 3-tuple, the per-job latch bookkeeping walks THESE three names
+# rather than scanning the whole (name, check) latch map for a matching
+# name half -- so a widespread breach across many jobs stays O(jobs), not
+# O(jobs x total-latches).
+SLA_CHECKS = (SLA_CHECK_STALE, SLA_CHECK_LATE, SLA_CHECK_RUNTIME)
 # How deep the boot rehydrate re-reads a job's run ledger when the warmed
 # RUN_HISTORY_LIMIT window holds no success at all. Only jobs configuring
 # maxTimeSinceSuccess pay for it, and only when they are failing more often
@@ -3055,9 +3062,12 @@ class Cron:
         """
         now = get_now(datetime.timezone.utc)
         for name, job in self.cron_jobs.items():
-            if all(v is None for v in job.sla.values()):
-                # an sla block removed by a reload must not leave its
-                # latches (and the late gauge) stuck at breached.
+            if not job.has_sla:
+                # a job with no sla check (never had one, or a reload just
+                # blanked its block) must not leave its latches (and the late
+                # gauge) stuck at breached. has_sla is precomputed on the
+                # JobConfig, so a deployment not using the feature does no more
+                # than this O(1) test per job each pass.
                 self._sla_clear_latches(name)
                 continue
             if not job.enabled or self._pause_active(name) is not None:
@@ -3141,23 +3151,27 @@ class Cron:
                         observed,
                         threshold,
                     )
-            # a reload can drop ONE check while keeping the sla block:
-            # clear its stale latch the same way.
-            for key in [
-                k
-                for k in self._sla_state
-                if k[0] == name and k[1] not in observations
-            ]:
-                del self._sla_state[key]
-                self.metrics.job_sla_late(name, key[1], False)
+            # a reload can drop ONE check while keeping the sla block: clear
+            # its stale latch the same way. Walks the fixed SLA_CHECKS set,
+            # not the whole latch map, to stay O(checks) per job.
+            for check in SLA_CHECKS:
+                if check in observations:
+                    continue
+                if self._sla_state.pop((name, check), None) is not None:
+                    self.metrics.job_sla_late(name, check, False)
 
     def _sla_clear_latches(self, name: str) -> None:
-        """Drop every breach latch of ``name`` and clear its late gauge."""
+        """Drop every breach latch of ``name`` and clear its late gauge.
+
+        Walks the fixed :data:`SLA_CHECKS` set rather than scanning the whole
+        (name, check) latch map for this name's half, so clearing one job's
+        latches stays O(checks) even when many other jobs are latched.
+        """
         if not self._sla_state:
             return
-        for key in [k for k in self._sla_state if k[0] == name]:
-            del self._sla_state[key]
-            self.metrics.job_sla_late(name, key[1], False)
+        for check in SLA_CHECKS:
+            if self._sla_state.pop((name, check), None) is not None:
+                self.metrics.job_sla_late(name, check, False)
 
     def _sla_peer_owns_slot(self, name: str) -> None:
         """Excuse this node's lateAfter slot: a peer holds the run.
@@ -3196,32 +3210,39 @@ class Cron:
 
         Called wherever a window leaves ``self._paused``: the expiry
         sweep, an explicit resume, a re-pause that overwrites the window,
-        and a peer's pause/resume arriving through the store refresh.  A
-        window that overlaps the newest banked one EXTENDS it instead of
-        banking the shared stretch twice, so repeated and overlapping
-        pauses each count exactly once; a window rehydrated from the store
-        carries its original ``since``, so a pause spanning a restart is
-        credited whole.  Windows the staleness reference has already
-        passed can never contribute again and are dropped, and what is
-        left is capped: dropping the OLDEST span understates the credit,
+        a peer's pause/resume arriving through the store refresh, and a
+        disabled span crediting itself on re-enable.  The banked spans are
+        kept sorted and disjoint by inserting the new window and coalescing
+        every span it touches, so a shared stretch is never credited twice
+        and a window that arrives OUT OF ``since`` order (a disabled span
+        banked after a later pause that overlaps it) still merges whole
+        rather than dropping the earlier stretch.  A window rehydrated from
+        the store carries its original ``since``, so a pause spanning a
+        restart is credited whole.  Windows the staleness reference has
+        already passed can never contribute again and are dropped, and what
+        is left is capped: dropping the OLDEST span understates the credit,
         which fails toward paging.
         """
         if ended_at > was.until:
             ended_at = was.until
         if ended_at <= was.since:
             return
-        spans = self._sla_pause_windows.setdefault(name, [])
-        if spans and was.since <= spans[-1][1]:
-            spans[-1] = (spans[-1][0], max(spans[-1][1], ended_at))
-        else:
-            spans.append((was.since, ended_at))
+        raw = sorted(
+            self._sla_pause_windows.get(name, []) + [(was.since, ended_at)]
+        )
+        merged: List[Tuple[datetime.datetime, datetime.datetime]] = []
+        for start, end in raw:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
         reference = self._sla_stale_reference(name)
-        spans = [span for span in spans if span[1] > reference]
-        del spans[:-SLA_PAUSE_SPANS_MAX]
-        if spans:
-            self._sla_pause_windows[name] = spans
+        merged = [span for span in merged if span[1] > reference]
+        del merged[:-SLA_PAUSE_SPANS_MAX]
+        if merged:
+            self._sla_pause_windows[name] = merged
         else:
-            del self._sla_pause_windows[name]
+            self._sla_pause_windows.pop(name, None)
 
     def _sla_paused_seconds(
         self, name: str, reference: datetime.datetime, now: datetime.datetime
@@ -5295,6 +5316,72 @@ class Cron:
             self.metrics.state_write_dropped("manifest")
             logger.warning("state: failed to record the job manifest: %s", ex)
 
+    async def _live_pause_keep(
+        self, backend: StateBackend, names: Set[str], now: datetime.datetime
+    ) -> Set[str]:
+        """The pause-stream keep-set: kept jobs that hold a LIVE pause.
+
+        Starts from every kept job name and DROPS only those whose
+        ``paused/<job>`` stream tops out at a non-live record -- a resume, an
+        expired window, or a foreign/corrupt one -- so
+        :meth:`StateBackend.collect_garbage` reclaims the dead stream. That
+        collection stays grace-gated on the record's OWN age, which
+        independently protects a pause a peer wrote moments ago (its fresh
+        record is younger than grace), so this need not re-check the race.
+        Fail-safe throughout: an unenumerable prefix, an unreadable stream,
+        or any doubt keeps the name, so GC never eats a live pause. A job with
+        no pause stream never appears in the listing and is simply kept. Reads
+        only streams that exist, so once the dead ones are collected the cost
+        falls away -- and a later pause re-creates a collected stream, leaving
+        cross-node propagation (:meth:`_refresh_pauses_from_store`) intact.
+        """
+        keep = set(names)
+        try:
+            streams = await asyncio.wait_for(
+                backend.list_stream_names(PAUSE_STREAM_PREFIX),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - keep everything on any doubt
+            logger.warning(
+                "state: not reclaiming dead pause streams this GC pass: "
+                "cannot enumerate them (%s)",
+                ex,
+            )
+            return keep
+        for stream in streams:
+            name = stream[len(PAUSE_STREAM_PREFIX) :]
+            if name not in keep:
+                continue  # a removed job's stream: already collected by name
+            if name in self._paused:
+                # paused right now on THIS node: keep unconditionally, without
+                # a read. Covers the window where the pause write is still in
+                # flight and the stream's newest durable record is the prior
+                # resume -- reading it would drop the stream mid-pause (GC then
+                # grace-keeps it only if that stale resume is young enough).
+                continue
+            try:
+                recs = await asyncio.wait_for(
+                    backend.list_records(stream, limit=1, newest_first=True),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - keep this one on doubt
+                logger.warning(
+                    "state: keeping the pause stream of %s this GC pass "
+                    "(cannot read it): %s",
+                    name,
+                    ex,
+                )
+                continue
+            info = self._pause_info_from_record(recs[0] if recs else None)
+            if info is None or info.until <= now:
+                # resumed / expired / foreign: no live pause to protect.
+                keep.discard(name)
+        return keep
+
     async def _collect_state_garbage(self) -> None:
         """One automatic garbage-collection pass (see state.gcGraceSeconds).
 
@@ -5394,6 +5481,15 @@ class Cron:
         # job names keep their default artifact scope too.
         art_scopes |= names
         scopes_covered = _manifests_cover_scopes(recent)
+        # Restrict pause-stream retention to jobs holding a LIVE pause. A job
+        # paused then resumed (or expired) long ago otherwise keeps a dead
+        # paused/<job> stream forever, which _refresh_pauses_from_store
+        # re-reads every minute just to conclude "not paused"; dropping it
+        # from the keep-set lets this same pass collect it, at GC cadence, once
+        # newest record ages past grace. Fail-safe (any doubt keeps the
+        # stream), and a future pause re-creates a collected stream, so
+        # cross-node pause propagation is unaffected.
+        pause_keep = await self._live_pause_keep(backend, names, now)
         keep: Dict[str, Set[str]] = {
             RUN_STREAM_PREFIX: names,
             LOG_STREAM_PREFIX: names,
@@ -5403,7 +5499,7 @@ class Cron:
             COUNTER_STREAM_PREFIX: hosts,
             INFLIGHT_STREAM_PREFIX: names,
             SLOT_STREAM_PREFIX: names,
-            PAUSE_STREAM_PREFIX: names,
+            PAUSE_STREAM_PREFIX: pause_keep,
             # a host that stops writing (scaled down, renamed) leaves its own
             # manifests/<host> stream behind forever otherwise; sweeping it
             # once it is not among the currently-seen hosts and has aged past

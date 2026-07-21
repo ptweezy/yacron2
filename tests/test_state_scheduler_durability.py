@@ -1649,6 +1649,111 @@ async def test_state_periodic_writes_manifest(tmp_path):
         await _stop_state(cron)
 
 
+_PAUSE_GC_JOBS = """
+jobs:
+  - name: alive
+    command: ls
+    schedule: "0 0 * * *"
+  - name: dead
+    command: ls
+    schedule: "0 0 * * *"
+  - name: held
+    command: ls
+    schedule: "0 0 * * *"
+"""
+
+
+async def test_collect_state_garbage_reclaims_dead_pause_streams(
+    tmp_path, monkeypatch
+):
+    # A job paused then resumed keeps a paused/<job> stream that the
+    # per-minute refresh re-reads forever just to conclude "not paused". GC
+    # reclaims the dead stream (grace-gated) while leaving a live pause alone,
+    # so the steady-state refresh only reads streams with an active pause.
+    import cronstable.state as state_mod
+
+    cron = await _stateful_cron(tmp_path, _PAUSE_GC_JOBS)
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        # a resumed (dead) pause stream for a configured job, written long
+        # enough ago that its newest record is older than the grace window.
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        await backend.append_record(
+            "paused/dead",
+            {
+                "kind": "resumed",
+                "by": "op",
+                "channel": "cli",
+                "at": (
+                    _now_utc() - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+                "host": "h",
+            },
+        )
+        # a job paused on THIS node whose durable stream still tops out at an
+        # OLD resume (the pause write not yet landed): the local-pause guard
+        # must keep it even though the durable record reads as dead.
+        await backend.append_record(
+            "paused/held",
+            {
+                "kind": "resumed",
+                "by": "op",
+                "channel": "cli",
+                "at": (
+                    _now_utc() - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+                "host": "h",
+            },
+        )
+        monkeypatch.undo()
+        cron._paused["held"] = PauseInfo(
+            since=_now_utc(),
+            until=_now_utc() + datetime.timedelta(hours=1),
+            note="",
+            by="op",
+            channel="cli",
+        )
+        # a live pause on another configured job -> must be kept.
+        await backend.append_record(
+            "paused/alive",
+            {
+                "kind": "paused",
+                "since": _now_utc().isoformat(),
+                "until": (
+                    _now_utc() + datetime.timedelta(hours=1)
+                ).isoformat(),
+                "note": "",
+                "by": "op",
+                "channel": "cli",
+                "at": _now_utc().isoformat(),
+                "host": "h",
+            },
+        )
+        # this node's own manifest, old enough to satisfy the depth guard so
+        # GC actually proceeds (see the sibling test above).
+        await backend.append_record(
+            cron._manifest_stream(),
+            {
+                "jobSetId": "v1:self",
+                "host": cron._state_host,
+                "jobs": [],
+                "at": (
+                    _now_utc() - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+            },
+        )
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        # the dead resumed stream is reclaimed; the live pause and the
+        # locally-held job (stale durable record notwithstanding) survive.
+        assert await backend.list_records("paused/dead") == []
+        assert len(await backend.list_records("paused/alive")) == 1
+        assert len(await backend.list_records("paused/held")) == 1
+    finally:
+        await _stop_state(cron)
+
+
 async def test_collect_state_garbage_keeps_manifested_jobs(
     tmp_path, monkeypatch
 ):

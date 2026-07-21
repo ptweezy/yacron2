@@ -6050,6 +6050,58 @@ async def test_sla_reenabled_after_a_disabled_span_credits_a_prior_success(
     assert len(reports) == 1
 
 
+def test_sla_bank_pause_coalesces_out_of_order_overlapping_windows():
+    # regression (#19 residual, the overlap arm): a job can be disabled first
+    # (older since) and paused later (newer since), and _pause_periodic banks
+    # the pause BEFORE _sla_periodic banks the older disabled span, so windows
+    # reach _sla_bank_pause out of `since` order. The old merge only extended
+    # the newest span's END, so the earlier disabled stretch was dropped and
+    # the job paged the whole switched-off span on re-enable. The banked spans
+    # must be the true disjoint union regardless of arrival order.
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    cron._sla_last_success["s"] = DT(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    def pause(since, until):
+        return cronstable.cron.PauseInfo(
+            since=since, until=until, note="", by="", channel="test"
+        )
+
+    # the later pause is banked first (newer since), then the older disabled
+    # span that overlaps it: [10:00,10:05] then [09:00,10:02]
+    cron._sla_bank_pause(
+        "s",
+        pause(DT(2020, 1, 8, 10, 0, tzinfo=UTC), DT(2020, 1, 8, 10, 5, tzinfo=UTC)),
+        DT(2020, 1, 8, 10, 5, tzinfo=UTC),
+    )
+    cron._sla_bank_pause(
+        "s",
+        pause(DT(2020, 1, 8, 9, 0, tzinfo=UTC), DT(2020, 1, 8, 10, 2, tzinfo=UTC)),
+        DT(2020, 1, 8, 10, 2, tzinfo=UTC),
+    )
+    # one coalesced span covering the whole union, not just the pause
+    assert cron._sla_pause_windows["s"] == [
+        (DT(2020, 1, 8, 9, 0, tzinfo=UTC), DT(2020, 1, 8, 10, 5, tzinfo=UTC))
+    ]
+    # and the credit is the full 65 minutes, counted once (no double-count of
+    # the shared 10:00..10:02 stretch, no loss of the 09:00..10:00 stretch)
+    credit = cron._sla_paused_seconds(
+        "s",
+        DT(2020, 1, 8, 8, 0, tzinfo=UTC),
+        DT(2020, 1, 8, 11, 0, tzinfo=UTC),
+    )
+    assert credit == 65 * 60
+
+    # a third window overlapping TWO existing spans coalesces them all
+    cron._sla_bank_pause(
+        "s",
+        pause(DT(2020, 1, 8, 8, 30, tzinfo=UTC), DT(2020, 1, 8, 12, 0, tzinfo=UTC)),
+        DT(2020, 1, 8, 12, 0, tzinfo=UTC),
+    )
+    assert cron._sla_pause_windows["s"] == [
+        (DT(2020, 1, 8, 8, 30, tzinfo=UTC), DT(2020, 1, 8, 12, 0, tzinfo=UTC))
+    ]
+
+
 @pytest.mark.asyncio
 async def test_sla_pause_time_is_credited_against_staleness(monkeypatch):
     # regression (#22): the staleness clock ran at full rate across a pause,

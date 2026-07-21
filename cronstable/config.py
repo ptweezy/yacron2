@@ -1266,6 +1266,7 @@ class JobConfig:
         "onPermanentFailure",
         "onSuccess",
         "sla",
+        "has_sla",
         "onLate",
         "env_file",
         "environment",
@@ -1368,6 +1369,10 @@ class JobConfig:
         self.onPermanentFailure = config.pop("onPermanentFailure")
         self.onSuccess = config.pop("onSuccess")
         self.sla = config.pop("sla")
+        # True iff any sla threshold is set: lets the per-minute monitor skip
+        # the whole evaluation for a job with no check, without re-deriving it
+        # from the sla dict each pass (see cronstable.cron.Cron._sla_periodic).
+        self.has_sla = any(v is not None for v in self.sla.values())
         self.onLate = config.pop("onLate")
 
         self.env_file = config.pop("env_file")

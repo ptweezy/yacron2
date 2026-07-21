@@ -2235,6 +2235,57 @@ class Cron:
             raise ValueError("unknown timezone: {}".format(tz_name)) from None
 
     @staticmethod
+    def _timezone_error(tz_name: Optional[str]) -> Optional[str]:
+        """The 400 message for a ``?tz=`` value that will not resolve, or
+        ``None`` when it does.
+
+        Built from the requested name, never from the caught exception
+        (whose text can carry a server-side ZoneInfo filesystem path): a
+        handler validates here so a schedule endpoint answers 400 without
+        any exception string reaching the response body.  Mirrors
+        :meth:`_zone_from_name`'s own resolve/except so the two agree on
+        which names are unknown.
+        """
+        if not tz_name:
+            return None
+        try:
+            ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError, KeyError, OSError):
+            return "unknown timezone: {}".format(tz_name)
+        return None
+
+    @staticmethod
+    def _period_error(period: str) -> Optional[str]:
+        """The 400 message for an unsupported ``?period=`` value, or
+        ``None`` when it is valid.
+
+        Mirrors :func:`suggest_slot`'s own check so ``/schedule/suggest``
+        can answer 400 from the request value without stringifying the
+        builder's exception.
+        """
+        if period not in ("hourly", "daily"):
+            return "period must be 'hourly' or 'daily', got {!r}".format(
+                period
+            )
+        return None
+
+    @staticmethod
+    def _invalid_timestamp_message(text: str) -> str:
+        """The 400 message for an unparseable ``?at=`` value.
+
+        Built from the requested value (its :func:`repr` plus the accepted
+        forms), so ``/schedule/why`` can answer 400 from the request string
+        without stringifying the parse exception.  Shared with
+        :meth:`_parse_probe_timestamp` so the raised and the handler-built
+        text never diverge.
+        """
+        return (
+            "invalid timestamp {!r}: pass ISO 8601, e.g. "
+            "2026-07-14T09:00, 2026-07-14T09:00:00+02:00 or "
+            "2026-07-14T09:00:00Z".format((text or "").strip())
+        )
+
+    @staticmethod
     def _parse_probe_timestamp(text: str) -> datetime.datetime:
         """An ``at=`` timestamp as a datetime (aware when it has an offset).
 
@@ -2250,11 +2301,7 @@ class Cron:
         try:
             return datetime.datetime.fromisoformat(iso)
         except ValueError:
-            raise ValueError(
-                "invalid timestamp {!r}: pass ISO 8601, e.g. "
-                "2026-07-14T09:00, 2026-07-14T09:00:00+02:00 or "
-                "2026-07-14T09:00:00Z".format(raw)
-            ) from None
+            raise ValueError(Cron._invalid_timestamp_message(raw)) from None
 
     def schedule_preview_payload(
         self,
@@ -2334,18 +2381,20 @@ class Cron:
                 status=400,
                 headers=headers,
             )
-        count = self._web_int_query(request, "count", default=12, lo=1, hi=60)
-        try:
-            payload = self.schedule_preview_payload(
-                expr,
-                request.query.get("tz") or None,
-                count,
-                request.query.get("seed"),
-            )
-        except ValueError as err:
+        tz = request.query.get("tz") or None
+        # Validate the one user input that would raise (the timezone), and
+        # answer 400 from the requested name.  The builder's own parse errors
+        # for the expression come back as payload data (valid=False), so no
+        # exception text ever reaches the response body.
+        tz_error = self._timezone_error(tz)
+        if tz_error is not None:
             return _json_response(
-                {"error": str(err)}, status=400, headers=headers
+                {"error": tz_error}, status=400, headers=headers
             )
+        count = self._web_int_query(request, "count", default=12, lo=1, hi=60)
+        payload = self.schedule_preview_payload(
+            expr, tz, count, request.query.get("seed")
+        )
         return _json_response(payload, headers=headers)
 
     def _job_or_dag_schedule(self, name: str) -> Optional[JobConfig]:
@@ -2488,9 +2537,14 @@ class Cron:
             )
         try:
             payload = self.schedule_why_payload(name, at)
-        except ValueError as err:
+        except ValueError:
+            # The only ValueError here is the unparseable ``at=`` timestamp;
+            # answer 400 from the requested value, not the exception text
+            # (kept inside the try so an unknown job still 404s below).
             return _json_response(
-                {"error": str(err)}, status=400, headers=headers
+                {"error": self._invalid_timestamp_message(at)},
+                status=400,
+                headers=headers,
             )
         if payload is None:
             raise web.HTTPNotFound()
@@ -2651,16 +2705,15 @@ class Cron:
         assert self.web_config is not None
         headers = self.web_config.get("headers", None)
         hours = self._web_int_query(request, "hours", default=24, lo=1, hi=168)
-        try:
-            # run_in_executor surfaces the builder's exceptions at the
-            # await, so the unknown-timezone ValueError still lands here.
-            payload = await self.schedule_pressure_payload_async(
-                hours, request.query.get("tz") or None
-            )
-        except ValueError as err:
+        tz = request.query.get("tz") or None
+        # Validate up front and answer 400 from the requested name, so the
+        # builder's exception text never reaches the response body.
+        tz_error = self._timezone_error(tz)
+        if tz_error is not None:
             return _json_response(
-                {"error": str(err)}, status=400, headers=headers
+                {"error": tz_error}, status=400, headers=headers
             )
+        payload = await self.schedule_pressure_payload_async(hours, tz)
         return _json_response(payload, headers=headers)
 
     async def _web_schedule_duplicates(
@@ -2677,17 +2730,23 @@ class Cron:
     ) -> web.Response:
         assert self.web_config is not None
         headers = self.web_config.get("headers", None)
-        try:
-            # exceptions propagate from the executor to the await, so the
-            # unknown-period/timezone ValueError still lands here.
-            payload = await self.schedule_suggest_payload_async(
-                request.query.get("period") or "hourly",
-                request.query.get("tz") or None,
-            )
-        except ValueError as err:
+        period = request.query.get("period") or "hourly"
+        tz = request.query.get("tz") or None
+        # Validate both user inputs and answer 400 from the requested values,
+        # so no builder exception text reaches the response body.  Timezone
+        # first: the builder resolves the zone (a call argument) before the
+        # period check runs, so a bad zone wins when both are wrong.
+        tz_error = self._timezone_error(tz)
+        if tz_error is not None:
             return _json_response(
-                {"error": str(err)}, status=400, headers=headers
+                {"error": tz_error}, status=400, headers=headers
             )
+        period_error = self._period_error(period)
+        if period_error is not None:
+            return _json_response(
+                {"error": period_error}, status=400, headers=headers
+            )
+        payload = await self.schedule_suggest_payload_async(period, tz)
         return _json_response(payload, headers=headers)
 
     def _avg_duration(self, name: str) -> Optional[float]:

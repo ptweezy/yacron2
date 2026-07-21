@@ -804,3 +804,52 @@ def test_lint_dst_stops_after_two_findings():
     codes = _codes("30 1,2 * * *", tz=_NY)
     assert codes.count("dst-repeated-time") == 1
     assert codes.count("dst-skipped-time") == 1
+
+
+# ---------------------------------------------------------------------------
+# extra tolerant-parser, splitter and describe_cron/_describe_time/_seconds
+# edges that the surface-level suites do not exercise
+# ---------------------------------------------------------------------------
+from cronstable.croninfo import _finish_split  # noqa: E402,F811
+
+
+def test_field_values_dow_range_ending_in_sunday_reads_end_as_seven():
+    # a day-of-week range ending in 0/sun reads its end as Sunday-as-7,
+    # exactly like the engine, so fri-sun spans Fri, Sat, Sun (folded to 0)
+    assert _field_values("fri-sun", 0, 6, _DOW_NAMES) == [0, 5, 6]
+    # the numeric spelling reaches the same branch: 5-0 is fri..sun
+    assert _field_values("5-0", 0, 6, _DOW_NAMES) == [0, 5, 6]
+
+
+def test_finish_split_rejects_when_nothing_usable_remains():
+    # neither plain items nor phrases: the split has nothing to phrase
+    with pytest.raises(ValueError, match="no usable items"):
+        _finish_split("", [], [])
+
+
+def test_describe_cron_six_field_form_names_the_year():
+    # a 6-field expression: the trailing column is the year, so the prose
+    # gains an "in <year>" clause (exercises both the 6-field split and the
+    # year clause)
+    assert describe_cron("0 0 * * * 2030") == "At 00:00, every day, in 2030"
+
+
+def test_describe_time_every_minute_every_n_hours():
+    # minute is an unrestricted star and the hour is an evenly dividing
+    # star-step: "Every minute, every N hours"
+    assert describe_cron("* */6 * * *") == (
+        "Every minute, every 6 hours, every day"
+    )
+
+
+def test_describe_seconds_every_second_and_explicit_second_list():
+    # a fully unrestricted 7-field schedule fires every second
+    assert describe_cron("* * * * * * *") == "Every second"
+    # top-free but an explicit (non-step) seconds list: a plain cadence of
+    # named seconds rather than "every second"
+    assert describe_cron("5,10 * * * * * *") == "At seconds 05, 10"
+    # not top-free (minute and hour restricted): the seconds append as a
+    # qualifying clause instead of setting the frequency
+    assert describe_cron("5,10 30 4 * * * *") == (
+        "At 04:30, every day, at seconds 05, 10"
+    )

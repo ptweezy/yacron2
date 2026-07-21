@@ -180,3 +180,104 @@ def test_fsync_directory_on_existing_and_nested_dir(tmp_path):
 def test_fsync_directory_swallows_missing_path(tmp_path):
     # best-effort: a vanished/never-existed path must not raise.
     platform.fsync_directory(str(tmp_path / "does" / "not" / "exist"))
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="killpg is POSIX-only"
+)
+@pytest.mark.asyncio
+async def test_kill_process_group_falls_back_when_killpg_errors(monkeypatch):
+    # A killpg that fails with a generic OSError (not ProcessLookupError) is
+    # logged and reported as "not signalled" so the caller falls back to
+    # terminating the direct child alone, rather than assuming the kill landed.
+    def boom(pid, sig):
+        raise OSError("no permission to signal that group")
+
+    monkeypatch.setattr(platform.os, "killpg", boom)
+    assert not await platform.kill_process_group(4242, force=True)
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="reads /proc, POSIX-only"
+)
+def test_os_boot_id_reads_the_kernel_value_or_none():
+    # On Linux this file publishes a fresh UUID per boot; the reader returns a
+    # non-empty string (or None where the file is unavailable, e.g. a container
+    # that does not expose it). Either way it must never raise.
+    value = platform.os_boot_id()
+    assert value is None or (isinstance(value, str) and value)
+
+
+def test_os_boot_id_returns_none_when_unreadable(monkeypatch):
+    # A missing/unreadable boot_id file yields None (callers fall back to
+    # os_boot_time), not an exception.
+    import builtins
+
+    real_open = builtins.open
+
+    def refuse(path, *a, **k):
+        if "boot_id" in str(path):
+            raise OSError("no such file")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", refuse)
+    assert platform.os_boot_id() is None
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="reads /proc/uptime, POSIX-only"
+)
+def test_os_boot_time_returns_none_when_uptime_unreadable(monkeypatch):
+    # /proc/uptime unreadable (or garbage) -> cannot tell -> None, so callers
+    # treat the daemon start as a fresh boot instead of crashing.
+    import builtins
+
+    real_open = builtins.open
+
+    def refuse(path, *a, **k):
+        if "uptime" in str(path):
+            raise OSError("no such file")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", refuse)
+    assert platform.os_boot_time() is None
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="uses os.kill(pid, 0), POSIX-only"
+)
+def test_pid_alive_reports_permission_denied_as_alive(monkeypatch):
+    # A pid we cannot signal but that exists (EPERM) counts as alive: existence
+    # is what reconciliation asks, not ownership.
+    def eperm(pid, sig):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(platform.os, "kill", eperm)
+    assert platform.pid_alive(4242) is True
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="uses os.kill(pid, 0), POSIX-only"
+)
+def test_pid_alive_reports_none_on_other_oserror(monkeypatch):
+    # Any other OSError means the platform could not answer -> None ("cannot
+    # tell"), which reconciliation treats as dead.
+    def oserr(pid, sig):
+        raise OSError("something unexpected")
+
+    monkeypatch.setattr(platform.os, "kill", oserr)
+    assert platform.pid_alive(4242) is None
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="POSIX fsync path"
+)
+def test_fsync_directory_swallows_fsync_failure(monkeypatch, tmp_path):
+    # A directory that opens but whose fsync fails (some filesystems reject it)
+    # is swallowed: the data it guards is correct without it, just not
+    # crash-durable for this one write.
+    def refuse(fd):
+        raise OSError("fsync not supported here")
+
+    monkeypatch.setattr(platform.os, "fsync", refuse)
+    platform.fsync_directory(str(tmp_path))

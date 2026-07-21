@@ -1138,3 +1138,307 @@ async def test_node_sampler_history_run_swallows_snapshot_error(monkeypatch,
         await asyncio.wait_for(sampler._history_run(), timeout=5)
     assert any("node history sampler stopped" in r.message
                for r in caplog.records)
+
+
+# ---- additional cgroup-reader edge branches --------------------------------
+
+
+def test_cgroup_reader_init_swallows_resolve_error(tmp_path):
+    # the v2 marker is present but /proc/self/cgroup is unreadable (here it
+    # simply does not exist): the resolve raises, __init__ swallows it, and the
+    # reader stays inert rather than propagating.
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text("cpu memory\n")
+    missing_proc = tmp_path / "does_not_exist"
+    reader = resources._CgroupV2Reader(str(root), str(missing_proc))
+    assert not reader.available
+    assert reader._dir is None
+
+
+def test_cgroup_ancestry_empty_when_inert(tmp_path):
+    # _ancestry short-circuits when no dir resolved (callers check available
+    # first, but the generator guards itself all the same).
+    root, d, proc = _fake_cgroup(tmp_path)
+    (root / "cgroup.controllers").unlink()
+    reader = _reader(root, proc)
+    assert reader._dir is None
+    assert list(reader._ancestry()) == []
+
+
+def test_cgroup_ancestry_stops_at_filesystem_root():
+    # a dir whose parent is itself (the filesystem root) terminates the walk
+    # even when it never equals the configured mount root.
+    reader = resources._CgroupV2Reader("/no-such-root", "/no-such-proc")
+    fs_root = resources.os.path.abspath(resources.os.sep)
+    reader._dir = fs_root
+    reader._root = "/a-mount-root-never-reached"
+    assert list(reader._ancestry()) == [fs_root]
+
+
+def test_cgroup_read_stat_field_absent_field_is_none(tmp_path):
+    # memory.current present but memory.stat carries no inactive_file line: the
+    # field lookup falls off the end and the raw figure is used unchanged.
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "memory.current").write_text(f"{200 * MIB}\n")
+    (d / "memory.stat").write_text(f"anon {100 * MIB}\nfile {90 * MIB}\n")
+    assert _reader(root, proc).memory_used() == 200 * MIB
+
+
+def test_cgroup_memory_used_none_when_current_missing(tmp_path):
+    # no memory.current file at all -> the first-line read is None -> used None.
+    root, d, proc = _fake_cgroup(tmp_path)
+    assert _reader(root, proc).memory_used() is None
+
+
+def test_cgroup_cpu_limit_malformed_quota_is_skipped(tmp_path):
+    # a non-integer quota field raises ValueError inside the parse and that
+    # ancestor is skipped rather than crashing the reader.
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "cpu.max").write_text("banana 100000\n")
+    assert _reader(root, proc).cpu_limit() is None
+
+
+def test_cgroup_cpu_limit_keeps_lowest_when_ancestor_is_higher(tmp_path):
+    # the leaf carries the lower quota; a higher ancestor quota must not
+    # replace it (the "not lower" side of the min comparison).
+    root, d, proc = _fake_cgroup(tmp_path, rel="parent/leaf")
+    (d / "cpu.max").write_text("100000 100000\n")  # 1.0 CPU
+    (root / "parent" / "cpu.max").write_text("200000 100000\n")  # 2.0 CPU
+    assert _reader(root, proc).cpu_limit() == pytest.approx(1.0)
+
+
+# ---- _SharedSampleTicker register / run scheduling branches ----------------
+
+
+async def test_ticker_register_reuses_running_task():
+    # registering a second monitor while the ticker task is already running
+    # must not spawn a second task (the "task exists and is live" skip).
+    ticker = resources._SharedSampleTicker()
+    m1 = _TickMon(1.0, lambda mon, index: None)
+    m2 = _TickMon(1.0, lambda mon, index: None)
+    ticker.register(m1)
+    first = ticker._task
+    assert first is not None
+    ticker.register(m2)  # task still pending -> reused, not recreated
+    assert ticker._task is first
+    # drain and cancel without ever running the loop body.
+    ticker.unregister(m1)
+    ticker.unregister(m2)
+    if first is not None:
+        first.cancel()
+        try:
+            await first
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_ticker_run_exits_when_started_empty():
+    # entering _run with an already-empty schedule takes the while-loop exit
+    # immediately and returns.
+    ticker = resources._SharedSampleTicker()
+    ticker._due = {}
+    await asyncio.wait_for(ticker._run(), timeout=5)
+
+
+async def test_ticker_run_waits_then_drains_on_wake():
+    # a monitor due far in the future leaves nothing due this pass (the empty
+    # "due" branch), so the loop waits on the wake event; draining the schedule
+    # and waking it then exits via the while-loop condition.
+    ticker = resources._SharedSampleTicker()
+    loop = asyncio.get_running_loop()
+    mon = _TickMon(1.0, lambda m, index: None)
+    ticker._due = {mon: loop.time() + 3600.0}
+    task = asyncio.create_task(ticker._run())
+    await asyncio.sleep(0)  # let it reach the wait
+    ticker._due.clear()
+    ticker._wake.set()
+    await asyncio.wait_for(task, timeout=5)
+
+
+async def test_ticker_run_reschedules_without_waiting():
+    # a zero-interval monitor is instantly due again, so the delay is not
+    # positive and the loop re-runs without waiting; the callback drains after
+    # the second sample to end it.
+    ticker = resources._SharedSampleTicker()
+    calls = []
+
+    def on_sample(mon, index):
+        calls.append(1)
+        if len(calls) >= 2:
+            ticker._due.pop(mon, None)
+
+    mon = _TickMon(0.0, on_sample)
+    ticker._due = {mon: 0.0}
+    await asyncio.wait_for(ticker._run(), timeout=5)
+    assert len(calls) == 2
+
+
+async def test_loop_ticker_reuses_existing_ticker():
+    # a second call on the same loop returns the already-registered ticker
+    # rather than building a new one.
+    first = resources._loop_ticker()
+    second = resources._loop_ticker()
+    assert first is second
+
+
+# ---- ResourceMonitor._sample zero-dt live CPU branch -----------------------
+
+
+def test_sample_locked_zero_dt_keeps_previous_cpu_percent(monkeypatch):
+    # two samples at the same monotonic instant give dt == 0, so the live CPU%
+    # is left untouched rather than dividing by zero.
+    monkeypatch.setattr(resources.time, "monotonic", lambda: 500.0)
+    monitor = ResourceMonitor(100, job_name="dt0", interval=1.0, history=0)
+    root = _FakeProc(pid=100, create_time=1000.0, user=1.0, system=0.5,
+                     rss=2048)
+    monitor._proc = root
+    monitor._sample_locked()  # primes _prev_cpu at t=500.0
+    assert monitor._prev_cpu is not None
+    monitor._sample_locked()  # same instant -> dt == 0, no update
+    assert monitor._samples == 2
+    assert monitor._live_cpu_percent == 0.0
+
+
+# ---- NodeResourceSampler init cgroup-priming branches ----------------------
+
+
+def test_node_sampler_init_no_prime_without_cgroup(monkeypatch):
+    # off Linux / without a v2 slice the reader is inert, so the constructor
+    # never primes a CPU baseline.
+    inert = resources._CgroupV2Reader("/no-such-root", "/no-such-proc")
+    assert not inert.available
+    monkeypatch.setattr(resources, "_CgroupV2Reader", lambda *a, **k: inert)
+    sampler = NodeResourceSampler()
+    assert sampler._cgroup_prev_cpu is None
+
+
+def test_node_sampler_init_no_prime_when_usage_unreadable(tmp_path,
+                                                          monkeypatch):
+    # an available slice whose cpu.stat is missing yields no usage, so the
+    # baseline stays unprimed even though the reader is available.
+    reader, _d = _make_cgroup(tmp_path)  # no cpu.stat written
+    assert reader.available
+    assert reader.cpu_usage_seconds() is None
+    monkeypatch.setattr(resources, "_CgroupV2Reader", lambda *a, **k: reader)
+    sampler = NodeResourceSampler()
+    assert sampler._cgroup_prev_cpu is None
+
+
+# ---- NodeResourceSampler.snapshot host-only branches -----------------------
+
+
+def test_node_sampler_snapshot_skips_overlay_without_cgroup(monkeypatch):
+    # an inert cgroup reader means snapshot never calls the overlay: the plain
+    # host-wide psutil readout is returned unchanged.
+    inert = resources._CgroupV2Reader("/no-such-root", "/no-such-proc")
+    sampler = NodeResourceSampler()
+    sampler._cgroup = inert
+    snap = sampler.snapshot()
+    assert snap is not None
+    assert "mem_total_bytes" in snap
+
+
+def test_node_sampler_snapshot_without_own_proc(monkeypatch):
+    # with no own-process handle the snapshot skips the proc_* footprint keys
+    # yet still returns the system-wide numbers.
+    inert = resources._CgroupV2Reader("/no-such-root", "/no-such-proc")
+    sampler = NodeResourceSampler()
+    sampler._cgroup = inert
+    sampler._proc = None
+    snap = sampler.snapshot()
+    assert snap is not None
+    assert "proc_rss_bytes" not in snap
+    assert "mem_total_bytes" in snap
+
+
+# ---- NodeResourceSampler._overlay_cgroup partial branches ------------------
+
+
+def test_overlay_cgroup_memory_limit_but_no_used(tmp_path):
+    # a memory limit with an unreadable memory.current keeps the host-wide
+    # memory values (the "used is None" skip), and with no cpu limit the CPU
+    # side is untouched too.
+    reader, d = _make_cgroup(tmp_path)
+    (d / "memory.max").write_text(f"{512 * MIB}\n")  # no memory.current
+    sampler = NodeResourceSampler()
+    sampler._cgroup = reader
+    data = {
+        "cpu_percent": 3.0, "cpu_count": 4,
+        "mem_percent": 2.0, "mem_used_bytes": 1, "mem_total_bytes": 999,
+    }
+    sampler._overlay_cgroup(data)
+    assert data["mem_total_bytes"] == 999  # unchanged: no usable used figure
+
+
+def test_overlay_cgroup_cpu_quota_but_no_usage(tmp_path):
+    # a CPU quota with no cpu.stat still fixes cpu_count to the quota but leaves
+    # cpu_percent host-wide (the "usage is None" skip).
+    reader, d = _make_cgroup(tmp_path)  # no cpu.stat
+    (d / "cpu.max").write_text("200000 100000\n")  # 2 CPUs
+    sampler = NodeResourceSampler()
+    sampler._cgroup = reader
+    data = {
+        "cpu_percent": 42.0, "cpu_count": 8,
+        "mem_percent": 2.0, "mem_used_bytes": 1, "mem_total_bytes": 999,
+    }
+    sampler._overlay_cgroup(data)
+    assert data["cpu_count"] == 2
+    assert data["cpu_percent"] == 42.0  # unchanged: no usage to measure
+
+
+def test_overlay_cgroup_cpu_first_reading_has_no_baseline(tmp_path):
+    # the first CPU overlay with no prior baseline records one and fixes
+    # cpu_count, but cannot yet compute a percentage (the "prev is None" skip).
+    reader, d = _make_cgroup(tmp_path, cpu_usec=10_000_000)  # 10.0 CPU-seconds
+    (d / "cpu.max").write_text("200000 100000\n")  # 2 CPUs
+    sampler = NodeResourceSampler()
+    sampler._cgroup = reader
+    sampler._cgroup_prev_cpu = None
+    data = {
+        "cpu_percent": 55.0, "cpu_count": 8,
+        "mem_percent": 2.0, "mem_used_bytes": 1, "mem_total_bytes": 999,
+    }
+    sampler._overlay_cgroup(data)
+    assert data["cpu_count"] == 2
+    assert data["cpu_percent"] == 55.0  # unchanged on the first reading
+    assert sampler._cgroup_prev_cpu is not None
+
+
+def test_overlay_cgroup_cpu_zero_window_keeps_host_percent(tmp_path,
+                                                           monkeypatch):
+    # a baseline taken at the same instant gives a zero window, so no CPU%
+    # is derived (the "dt > 0 and delta >= 0" skip) though cpu_count still set.
+    monkeypatch.setattr(resources.time, "monotonic", lambda: 700.0)
+    reader, d = _make_cgroup(tmp_path, cpu_usec=10_000_000)  # 10.0 CPU-seconds
+    (d / "cpu.max").write_text("200000 100000\n")  # 2 CPUs
+    sampler = NodeResourceSampler()
+    sampler._cgroup = reader
+    sampler._cgroup_prev_cpu = (10.0, 700.0)  # same usage, same instant
+    data = {
+        "cpu_percent": 33.0, "cpu_count": 8,
+        "mem_percent": 2.0, "mem_used_bytes": 1, "mem_total_bytes": 999,
+    }
+    sampler._overlay_cgroup(data)
+    assert data["cpu_count"] == 2
+    assert data["cpu_percent"] == 33.0  # unchanged: zero-length window
+
+
+# ---- NodeResourceSampler._history_run none-snapshot branch -----------------
+
+
+async def test_node_sampler_history_run_skips_none_snapshot(monkeypatch):
+    # a snapshot that comes back None is not appended to the ring; the loop
+    # simply sleeps and tries again.
+    sampler = NodeResourceSampler()
+    sampler._history = deque(maxlen=5)
+    sampler._history_interval = 0.01
+    monkeypatch.setattr(sampler, "snapshot", lambda: None)
+    task = asyncio.create_task(sampler._history_run())
+    await asyncio.sleep(0.03)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert list(sampler._history) == []  # nothing recorded from a None snap

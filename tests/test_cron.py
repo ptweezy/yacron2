@@ -6579,3 +6579,5185 @@ async def test_sla_report_never_blocks_a_run_completion(monkeypatch):
     gate.set()
     await cron._drain_completions()
     assert cron._sla_report_tail == {}
+
+
+
+
+# ---------------------------------------------------------------------------
+# Web endpoints, the run loop, config-signature, and schedule helpers.
+# ---------------------------------------------------------------------------
+
+
+def test_webloop_origin_matches_host_no_hostname():
+    # a Host header that parses to no hostname (a bare ":port") can never be a
+    # same-origin match; fail closed.
+    assert (
+        cronstable.cron._origin_matches_host("http://example.com", ":8080")
+        is False
+    )
+    # a real same-origin pair still matches, for contrast.
+    assert (
+        cronstable.cron._origin_matches_host(
+            "http://a.example:80", "a.example"
+        )
+        is True
+    )
+
+
+def test_webloop_http_for_action_error_with_headers():
+    from aiohttp import web
+
+    ex = cronstable.cron.ApiActionError("nope", status=409)
+    resp = cronstable.cron._http_for_action_error(ex, headers={"X-Test": "1"})
+    assert isinstance(resp, web.HTTPConflict)
+    assert resp.headers.get("X-Test") == "1"
+    # and the headerless path maps the status to the matching exception type.
+    assert isinstance(
+        cronstable.cron._http_for_action_error(
+            cronstable.cron.ApiActionError("x", status=404)
+        ),
+        web.HTTPNotFound,
+    )
+
+
+def test_webloop_fold_manifest_ignores_mistyped_fields():
+    names, hosts, scopes, dags = set(), set(), set(), set()
+    # every mistyped field contributes nothing (an older node's record simply
+    # advertises less).
+    cronstable.cron._fold_manifest(
+        {"jobs": "a", "host": 123, "scopes": "s", "dags": None},
+        names,
+        hosts,
+        scopes,
+        dags,
+    )
+    assert (names, hosts, scopes, dags) == (set(), set(), set(), set())
+    # a well-formed record still folds in.
+    cronstable.cron._fold_manifest(
+        {"jobs": ["j"], "host": "h", "scopes": ["sc"], "dags": ["d"]},
+        names,
+        hosts,
+        scopes,
+        dags,
+    )
+    assert names == {"j"}
+    assert hosts == {"h"}
+    assert scopes == {"sc"}
+    assert dags == {"d"}
+
+
+def test_webloop_load_index_html_disk_fallback(monkeypatch):
+    import importlib
+
+    # force the importlib.resources lookup to fail so the on-disk fallback path
+    # is exercised; clear the lru_cache on the way in and out so neither this
+    # test nor its neighbours see a stale cached value.
+    cronstable.cron.load_index_html.cache_clear()
+
+    def boom(*a, **k):
+        raise ModuleNotFoundError("no package data")
+
+    monkeypatch.setattr(importlib.resources, "files", boom)
+    try:
+        html = cronstable.cron.load_index_html()
+    finally:
+        cronstable.cron.load_index_html.cache_clear()
+    assert "<" in html and len(html) > 0
+
+
+def test_webloop_schedule_str_object_form():
+    yaml = """
+jobs:
+  - name: obj
+    command: echo hi
+    schedule:
+      minute: "*/5"
+"""
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    job = cron.cron_jobs["obj"]
+    # an object-form schedule is rebuilt into a crontab line via the shared
+    # builder.
+    s = cronstable.cron.schedule_str(job)
+    assert isinstance(s, str) and s
+
+
+def test_webloop_web_site_from_url_unix_unsupported(monkeypatch):
+    monkeypatch.setattr(
+        cronstable.cron.platform, "supports_unix_sockets", lambda: False
+    )
+    # a unix-socket listener on a platform that cannot serve one is a skippable
+    # bad-config entry (ValueError), not a crash.
+    with pytest.raises(ValueError):
+        cronstable.cron.web_site_from_url(None, "unix:///tmp/whatever.sock")
+
+
+def test_webloop_config_signature_missing_file_and_dir(tmp_path):
+    cron = cronstable.cron.Cron(None)
+    # a vanished file collapses to the (path, None, None) sentinel so a deletion
+    # still registers as a change.
+    missing = str(tmp_path / "gone.yaml")
+    sig = cron._config_signature(frozenset([missing]))
+    assert sig == ((missing, None, None),)
+    # a directory config source folds its own mtime in as well.
+    cron.config_arg = str(tmp_path)
+    sig2 = cron._config_signature(frozenset())
+    assert any(part[0] == "\0dir" for part in sig2)
+
+
+def test_webloop_config_signature_dir_stat_error(monkeypatch):
+    # a directory config source whose own stat fails still records a sentinel
+    # (the dir-vanished-mid-scan branch).
+    cron = cronstable.cron.Cron(None)
+    cron.config_arg = "some-dir"
+    monkeypatch.setattr(cronstable.cron.os.path, "isdir", lambda p: True)
+
+    def raising_stat(path, *a, **k):
+        raise OSError("boom")
+
+    monkeypatch.setattr(cronstable.cron.os, "stat", raising_stat)
+    sig = cron._config_signature(frozenset())
+    assert ("\0dir", None) in sig
+
+
+def test_webloop_update_config_no_source_returns_empty():
+    cron = cronstable.cron.Cron(None)
+    cfg = cron.update_config()
+    assert cfg.jobs == []
+    assert cfg.web_config is None
+
+
+_SUBMINUTE_NOFIRE = """
+jobs:
+  - name: sec
+    command: echo sec
+    schedule: "5/15 * * * * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_webloop_run_skips_subminute_housekeeping(monkeypatch):
+    # a second-level job forces per-second ticking, so after the first pass the
+    # once-a-minute housekeeping is SKIPPED on subsequent same-minute ticks (the
+    # frozen clock keeps now_minute constant). The seconds (5/15) never include
+    # the frozen :00, so the job itself never actually spawns.
+    monkeypatch.setattr(
+        "cronstable.cron.next_sleep_interval", lambda *a: 0.001
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=_SUBMINUTE_NOFIRE)
+    assert cron._needs_subminute() is True
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: cron._last_housekeeping_minute is not None)
+        # let it iterate several more times within the same frozen minute
+        await asyncio.sleep(0.05)
+        assert not task.done()
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch):
+    from tests.test_state import _state_cfg
+
+    # drive run()'s graceful-shutdown teardown across the observability overlay,
+    # the slot renewers / catch-up / slot-pursuit task pools, the state-backend
+    # block (with an empty pending-write set) and the web runner cleanup.
+    monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 30)
+    cron = cronstable.cron.Cron(None)
+    task = asyncio.create_task(cron.run())
+
+    renewer = catchup = pursuit = None
+    stopped = {"mesh": False}
+
+    try:
+        # let the loop finish its first housekeeping pass and park on the long
+        # sleep, then inject the teardown-path fixtures.
+        await asyncio.sleep(0.2)
+
+        await cron.start_stop_state(
+            _state_cfg("state:\n  path: {}\n".format(tmp_path))
+        )
+        assert cron.state_backend is not None
+
+        # drain any writes the backend startup queued, then neutralise
+        # _track_state_write so the final counter snapshot does not repopulate
+        # the pending set: the shutdown flush must see it EMPTY.
+        pend = list(cron._pending_state_writes)
+        if pend:
+            await asyncio.gather(*pend, return_exceptions=True)
+        monkeypatch.setattr(
+            cron, "_track_state_write", lambda coro: coro.close()
+        )
+
+        class Mesh:
+            async def stop(self):
+                stopped["mesh"] = True
+
+        cron.observability_mesh = Mesh()
+
+        class Runner:
+            def __init__(self):
+                self.cleaned = False
+
+            async def cleanup(self):
+                self.cleaned = True
+
+        cron.web_runner = Runner()
+
+        renewer = asyncio.create_task(asyncio.sleep(100))
+        cron._slot_renewers["s"] = renewer
+        catchup = asyncio.create_task(asyncio.sleep(100))
+        cron._catchup_tasks.add(catchup)
+        pursuit = asyncio.create_task(asyncio.sleep(100))
+        cron._slot_pursuits["p"] = pursuit
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+    await asyncio.gather(
+        renewer, catchup, pursuit, return_exceptions=True
+    )
+    assert stopped["mesh"] is True
+    assert cron.observability_mesh is None
+    assert cron.web_runner.cleaned is True
+    assert renewer.cancelled()
+    assert catchup.cancelled()
+    assert pursuit.cancelled()
+    assert cron._slot_renewers == {}
+
+
+_LOGGING_CFG = """
+jobs:
+  - name: a
+    command: echo hi
+    schedule: "0 0 * * *"
+logging:
+    version: 1
+"""
+
+
+@pytest.mark.asyncio
+async def test_webloop_run_applies_logging_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "cronstable.cron.next_sleep_interval", lambda *a: 0.01
+    )
+    applied = []
+    monkeypatch.setattr(
+        "cronstable.cron.logging.config.dictConfig",
+        lambda cfg: applied.append(cfg),
+    )
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_LOGGING_CFG)
+    cron = cronstable.cron.Cron(str(cfg))
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: bool(applied))
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+    assert applied[0] == {"version": 1}
+
+
+@pytest.mark.asyncio
+async def test_webloop_run_survives_logging_config_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "cronstable.cron.next_sleep_interval", lambda *a: 0.01
+    )
+    attempts = []
+
+    def boom(cfg):
+        attempts.append(cfg)
+        raise ValueError("bad logging config")
+
+    monkeypatch.setattr("cronstable.cron.logging.config.dictConfig", boom)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_LOGGING_CFG)
+    cron = cronstable.cron.Cron(str(cfg))
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(lambda: len(attempts) >= 1)
+        # a broken logging section is logged and the daemon keeps running.
+        assert not task.done()
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_webloop_web_get_version():
+    import cronstable.version
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        headers: dict = {}
+
+    resp = await cron._web_get_version(Req())
+    assert resp.text == cronstable.version.version
+
+
+@pytest.mark.asyncio
+async def test_webloop_web_status_text_running_and_disabled():
+    from types import SimpleNamespace
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    cron.running_jobs["alpha"] = [
+        SimpleNamespace(proc=SimpleNamespace(pid=4321))
+    ]
+
+    class Req:
+        headers: dict = {}  # no Accept header -> plain-text renderer
+
+    resp = await cron._web_get_status(Req())
+    assert "alpha: running (pid: 4321)" in resp.text
+    assert "beta: disabled" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_webloop_schedule_why_reboot_with_pause(monkeypatch):
+    from types import SimpleNamespace
+
+    yaml = """
+jobs:
+  - name: boot
+    command: echo hi
+    schedule: "@reboot"
+"""
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    pause = SimpleNamespace(
+        until=DT(2020, 1, 1, tzinfo=UTC), by="op", note=None
+    )
+    monkeypatch.setattr(cron, "_pause_active", lambda name: pause)
+    payload = cron.schedule_why_payload("boot", "2020-01-01T00:00:00")
+    assert payload is not None
+    assert payload["reboot"] is True
+    # the active pause is surfaced as a note on the @reboot payload.
+    assert any(n["code"] == "paused" for n in payload["notes"])
+
+
+@pytest.mark.asyncio
+async def test_webloop_schedule_why_no_previous_fire():
+    yaml = """
+jobs:
+  - name: yr
+    command: echo hi
+    schedule: "0 0 1 1 * * 2035"
+"""
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    payload = cron.schedule_why_payload("yr", "2020-06-15T12:00:00")
+    assert payload is not None
+    # a future-year schedule has no previous fire before the probe.
+    assert payload["previous_fire"] is None
+    assert payload["next_fire"] is not None
+
+
+@pytest.mark.asyncio
+async def test_webloop_schedule_why_previous_fire():
+    yaml = """
+jobs:
+  - name: m
+    command: echo hi
+    schedule: "* * * * *"
+"""
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    payload = cron.schedule_why_payload("m", "2020-06-15T12:00:30")
+    assert payload is not None
+    assert payload["previous_fire"] is not None
+
+
+def test_webloop_schedule_entries_includes_dag():
+    yaml = """
+dags:
+  - name: sch
+    schedule: "*/5 * * * *"
+    tasks:
+      - id: a
+        command: x
+  - name: nosched
+    tasks:
+      - id: a
+        command: x
+"""
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    entries = cron._schedule_entries()
+    # a DAG's schedule rides along as its synthetic dag:<name> entry; a DAG with
+    # no schedule (nosched) contributes nothing.
+    names = [e.name for e in entries]
+    assert "dag:sch" in names
+    assert "dag:nosched" not in names
+
+
+@pytest.mark.asyncio
+async def test_webloop_web_dag_run_and_xcom(monkeypatch):
+    import json as _json
+
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        match_info = {"name": "d", "run_key": "rk"}
+
+    async def none_run(name, run_key):
+        return None
+
+    monkeypatch.setattr(cron._dag, "get_run", none_run)
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_dag_run(Req())
+
+    async def some_run(name, run_key):
+        return {"state": "ok"}
+
+    monkeypatch.setattr(cron._dag, "get_run", some_run)
+    resp = await cron._web_dag_run(Req())
+    assert _json.loads(resp.text)["state"] == "ok"
+
+    async def none_xcom(name, run_key):
+        return None
+
+    monkeypatch.setattr(cron._dag, "xcom_for_run", none_xcom)
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_dag_xcom(Req())
+
+    async def some_xcom(name, run_key):
+        return {"a": 1}
+
+    monkeypatch.setattr(cron._dag, "xcom_for_run", some_xcom)
+    resp = await cron._web_dag_xcom(Req())
+    assert _json.loads(resp.text)["a"] == 1
+
+
+@pytest.mark.asyncio
+async def test_webloop_web_dag_backfill_errors(monkeypatch):
+    import json as _json
+
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        can_read_body = True
+
+        def __init__(self, body):
+            self.match_info = {"name": "d"}
+            self._body = body
+
+        async def json(self):
+            return self._body
+
+    # non-string from/to -> 400
+    with pytest.raises(web.HTTPBadRequest):
+        await cron._web_dag_backfill(Req({"from": 1, "to": 2}))
+
+    async def bad_backfill(name, start, end):
+        return {"ok": False, "reason": "nope"}
+
+    monkeypatch.setattr(cron._dag, "backfill", bad_backfill)
+    with pytest.raises(web.HTTPBadRequest):
+        await cron._web_dag_backfill(
+            Req({"from": "2020-01-01", "to": "2020-01-02"})
+        )
+
+    async def ok_backfill(name, start, end):
+        return {"ok": True, "runs": 2}
+
+    monkeypatch.setattr(cron._dag, "backfill", ok_backfill)
+    resp = await cron._web_dag_backfill(
+        Req({"from": "2020-01-01", "to": "2020-01-02"})
+    )
+    assert _json.loads(resp.text)["runs"] == 2
+
+
+@pytest.mark.asyncio
+async def test_webloop_state_payloads_propagate_cancel():
+    cron = cronstable.cron.Cron(None)
+
+    class CancelBackend:
+        async def inventory(self):
+            raise asyncio.CancelledError()
+
+        def view_dict(self):
+            return {}
+
+        def stats(self):
+            return {}
+
+        async def list_documents(self, ns):
+            raise asyncio.CancelledError()
+
+        async def list_records(self, stream, limit, newest_first):
+            raise asyncio.CancelledError()
+
+    cron.state_backend = CancelBackend()
+    # a cancellation must propagate, never be swallowed by the degrade-to-empty
+    # guard.
+    with pytest.raises(asyncio.CancelledError):
+        await cron.state_payload()
+    with pytest.raises(asyncio.CancelledError):
+        await cron.state_documents_payload("kv/x")
+    with pytest.raises(asyncio.CancelledError):
+        await cron.state_records_payload("s")
+
+
+def test_webloop_tail_payload_with_cursor():
+    out = JobOutputStream()
+    for i in range(5):
+        out.publish("stdout", "line{}\n".format(i))
+    payload = cronstable.cron.Cron._tail_payload(out, 10, 2)
+    # with a cursor, the lines AFTER that offset are returned (not the tail).
+    assert payload["cursor"] == 5
+    assert payload["truncated"] is False
+    assert len(payload["lines"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_webloop_pump_output_handles_disconnect():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    out = JobOutputStream()
+    out.publish("stdout", "x\n")
+    out.close()
+
+    class FakeResp:
+        async def write(self, data):
+            raise ConnectionResetError()
+
+    # a client that vanishes mid-write is swallowed; nothing escapes.
+    await cron._pump_output(FakeResp(), out)
+
+
+@pytest.mark.asyncio
+async def test_webloop_web_job_logs_live_running():
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    out = JobOutputStream()
+    # a currently-running instance exposes its live output buffer.
+    cron.running_jobs["alpha"] = [SimpleNamespace(output=out)]
+
+    app = web.Application()
+    app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/jobs/alpha/logs")
+        assert resp.status == 200
+        # let the handler subscribe and park, then publish a live line so it is
+        # delivered over the queue (not just the replay buffer), and end it.
+        await asyncio.sleep(0.05)
+        out.publish("stdout", "live line\n")
+        out.close()
+        body = await resp.text()
+    assert "live line" in body
+    assert "event: end" in body
+
+
+_DAG_LOGS_YAML = """
+dags:
+  - name: lin
+    tasks:
+      - id: a
+        command: x
+"""
+
+
+@pytest.mark.asyncio
+async def test_webloop_web_dag_task_logs_unknown_dag():
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = cronstable.cron.Cron(None, config_yaml=_DAG_LOGS_YAML)
+    cron.web_config = {}
+    app = web.Application()
+    app.router.add_get(
+        "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
+        cron._web_dag_task_logs,
+    )
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/dags/nope/runs/rk/tasks/a/logs")
+        assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_webloop_web_dag_task_logs_no_output():
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = cronstable.cron.Cron(None, config_yaml=_DAG_LOGS_YAML)
+    cron.web_config = {}
+    app = web.Application()
+    app.router.add_get(
+        "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
+        cron._web_dag_task_logs,
+    )
+    async with TestClient(TestServer(app)) as client:
+        # no running instance -> no reachable buffer.
+        resp = await client.get("/dags/lin/runs/rk/tasks/a/logs")
+        assert resp.status == 200
+        body = await resp.text()
+    assert "no-output" in body
+
+
+@pytest.mark.asyncio
+async def test_webloop_web_dag_task_logs_live_running():
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = cronstable.cron.Cron(None, config_yaml=_DAG_LOGS_YAML)
+    cron.web_config = {}
+    out = JobOutputStream()
+    dref = SimpleNamespace(run_key="rk", taskkey="a")
+    # a running instance under the template name "<dag>.<task_id>" whose dag_ref
+    # matches this run + instance key exposes its live buffer; a non-matching
+    # sibling instance is skipped first (the loop-continue branch).
+    cron.running_jobs["lin.a"] = [
+        SimpleNamespace(
+            output=JobOutputStream(),
+            dag_ref=SimpleNamespace(run_key="other", taskkey="a"),
+        ),
+        SimpleNamespace(output=out, dag_ref=dref),
+    ]
+
+    app = web.Application()
+    app.router.add_get(
+        "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
+        cron._web_dag_task_logs,
+    )
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/dags/lin/runs/rk/tasks/a/logs")
+        assert resp.status == 200
+        await asyncio.sleep(0.05)
+        out.publish("stdout", "task line\n")
+        out.close()
+        body = await resp.text()
+    assert "task line" in body
+    assert "event: end" in body
+
+
+
+
+# ==========================================================================
+# The cron.py start/stop lifecycle and
+# durable-state garbage-collection paths.  Targets start_stop_web_app,
+# start_stop_cluster, start_stop_observability, start_stop_state, the job-API
+# seams (_start_job_api / _stop_job_api), _persist_manifest, _live_pause_keep,
+# and the three GC helpers (_collect_state_garbage / _gc_dag_state /
+# _sweep_orphan_artifact_blobs).  Most of these are degrade-and-survive
+# branches reached by driving a lifecycle transition or by monkeypatching a
+# backend method to raise, then asserting the observable side effect.
+# ==========================================================================
+
+_LIFECYCLE_JOB = (
+    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+)
+
+
+class _LifecycleFakeSite:
+    """A web site whose start() never binds a real socket (isolation)."""
+
+    def __init__(self, url):
+        self.url = url
+
+    async def start(self):
+        return None
+
+
+def _lifecycle_state_config(tmp_path):
+    from tests.test_state import _state_cfg
+
+    return _state_cfg("state:\n  path: " + str(tmp_path))
+
+
+async def _lifecycle_start_state(tmp_path):
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    await cron.start_stop_state(_lifecycle_state_config(tmp_path))
+    assert cron.state_backend is not None
+    return cron
+
+
+async def _lifecycle_stop_state(cron):
+    if cron.state_backend is not None:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+async def _lifecycle_seed_anchor_frozen(cron):
+    # Manifests whose timestamps are relative to the FROZEN clock the autouse
+    # fixture installs (get_now -> 1999-12-31), so a GC pass can prove absence
+    # even though tests/test_cron freezes time.  One manifest older than the
+    # 3600s grace (the history-depth guard) plus one recent, both advertising
+    # scopes/dags so the pass manages artifact streams instead of deferring.
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    backend = cron.state_backend
+    await backend.append_record(
+        "manifests/old-host",
+        {
+            "jobSetId": "v1:old",
+            "host": "old-host",
+            "jobs": [],
+            "scopes": [],
+            "dags": [],
+            "at": (now - datetime.timedelta(seconds=7200)).isoformat(),
+        },
+    )
+    await backend.append_record(
+        "manifests/other-host",
+        {
+            "jobSetId": "v1:other",
+            "host": "other-host",
+            "jobs": [],
+            "scopes": [],
+            "dags": [],
+            "at": now.isoformat(),
+        },
+    )
+
+
+# --- start_stop_web_app ----------------------------------------------------
+
+
+async def test_lifecycle_web_app_wildcard_acao_and_socket_mode(monkeypatch, caplog):
+    # A wildcard Access-Control-Allow-Origin header disables the cross-site
+    # Origin gate (loudly), and socketMode drives the post-listen apply hook.
+    # web_site_from_url is faked so no real socket is bound.
+    import logging
+
+    monkeypatch.setattr(
+        cronstable.cron,
+        "web_site_from_url",
+        lambda runner, url: _LifecycleFakeSite(url),
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    try:
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron.start_stop_web_app(
+                {
+                    "listen": ["http://127.0.0.1:1"],
+                    "headers": {"Access-Control-Allow-Origin": "*"},
+                    "socketMode": "0660",
+                }
+            )
+        assert cron.web_runner is not None
+        assert any(
+            "Access-Control-Allow-Origin" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await cron.start_stop_web_app(None)
+    assert cron.web_runner is None
+
+
+async def test_lifecycle_web_app_specific_acao_folded_into_allowlist(monkeypatch):
+    # A specific (non-wildcard) ACAO response header is folded into the
+    # cross-site allow-list so a deliberate cross-origin dashboard survives.
+    monkeypatch.setattr(
+        cronstable.cron,
+        "web_site_from_url",
+        lambda runner, url: _LifecycleFakeSite(url),
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    try:
+        await cron.start_stop_web_app(
+            {
+                "listen": ["http://127.0.0.1:1"],
+                "headers": {
+                    "Access-Control-Allow-Origin": "https://dash.example"
+                },
+            }
+        )
+        assert cron.web_runner is not None
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+async def test_lifecycle_web_app_mounts_mcp_endpoint(monkeypatch):
+    # An enabled MCP config wires the POST/GET/OPTIONS /mcp routes and builds
+    # the handler against the current config.
+    from cronstable.config import _build_mcp_config
+
+    monkeypatch.setattr(
+        cronstable.cron,
+        "web_site_from_url",
+        lambda runner, url: _LifecycleFakeSite(url),
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    mcp_config = _build_mcp_config({"enabled": True})
+    try:
+        await cron.start_stop_web_app(
+            {"listen": ["http://127.0.0.1:1"]}, mcp_config
+        )
+        assert cron.web_runner is not None
+        assert cron._mcp is not None
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+# --- start_stop_cluster ----------------------------------------------------
+
+
+async def test_lifecycle_cluster_build_installs_providers_and_warns(
+    monkeypatch, caplog
+):
+    # A fresh cluster build installs both fleet providers and starts the
+    # manager, and an even cluster size emits a (once-per-(re)start) advisory.
+    import logging
+
+    from cronstable.config import parse_config_string
+
+    yaml = (
+        "jobs:\n  - name: a\n    command: echo a\n"
+        '    schedule: "* * * * *"\n'
+        "cluster:\n"
+        '  listen: "127.0.0.1:18443"\n'
+        "  tls:\n"
+        "    ca: /nonexistent/ca.pem\n"
+        "    cert: /nonexistent/cert.pem\n"
+        "    key: /nonexistent/key.pem\n"
+        "  peers:\n"
+        "    - host: b:8443\n"
+        "    - host: c:8443\n"
+        "    - host: d:8443\n"
+        "  electLeader: true\n"
+    )
+    cfg = parse_config_string(yaml, "").cluster_config
+    made = []
+    monkeypatch.setattr(
+        cronstable.cron,
+        "make_backend",
+        lambda c, jsid: made.append(_FakeMesh(c)) or made[-1],
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron.start_stop_cluster(cfg)
+    assert cron.cluster_manager is made[0]
+    assert made[0].started is True
+    assert made[0].job_summaries_provider == cron.fleet_job_summaries
+    assert made[0].node_stats_provider == cron.node_resource_snapshot
+    assert cron._elect_leader_configured is True
+    assert any("even cluster size" in r.message for r in caplog.records)
+
+
+async def test_lifecycle_cluster_reload_logs_leader_and_quorum_loss(caplog):
+    # Removing the cluster section stops the running manager; if this node
+    # held leadership/quorum, the ex-leader logs the transition here (before
+    # the flags reset) rather than going silent about why it stopped.
+    import logging
+
+    class _Mgr:
+        def __init__(self):
+            self.config = {"backend": "gossip"}
+            self.stopped = False
+
+        async def stop(self):
+            self.stopped = True
+
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    mgr = _Mgr()
+    cron.cluster_manager = mgr
+    cron._was_leader = True
+    cron._was_quorate = True
+    with caplog.at_level(logging.INFO, logger="cronstable"):
+        await cron.start_stop_cluster(None)
+    assert mgr.stopped is True
+    assert cron.cluster_manager is None
+    assert cron._was_leader is False and cron._was_quorate is False
+    assert any(
+        "lost scheduled-job leadership" in r.message for r in caplog.records
+    )
+    assert any("left quorum" in r.message for r in caplog.records)
+
+
+# --- start_stop_observability ----------------------------------------------
+
+
+async def test_lifecycle_observability_keeps_mesh_when_new_tls_unloadable(
+    monkeypatch, caplog
+):
+    # A TLS-file rotation signals a rebuild, but make-before-break is
+    # infeasible for gossip: while the new material is not yet loadable the
+    # running overlay is kept (serving the valid old cert) and the share flag
+    # is still re-reconciled on it.
+    import logging
+
+    monkeypatch.setattr(
+        "cronstable.cluster.gossip_tls_loadable", lambda cfg: False
+    )
+    mesh_cfg = {"backend": "gossip", "marker": 7}
+
+    class _Mesh:
+        def __init__(self, config):
+            self.config = config
+            self.stopped = False
+            self.share = None
+
+        def tls_files_changed(self):
+            return True
+
+        def set_node_stats_provider(self, provider, share=True):
+            self.share = share
+
+        async def stop(self):
+            self.stopped = True
+
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    mesh = _Mesh(mesh_cfg)
+    cron.observability_mesh = mesh
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron.start_stop_observability(
+            {"observabilityMesh": mesh_cfg, "shareNodeStats": True}
+        )
+    assert cron.observability_mesh is mesh
+    assert mesh.stopped is False
+    assert mesh.share is True
+    assert any("not yet loadable" in r.message for r in caplog.records)
+
+
+async def test_lifecycle_observability_start_failure_swallowed(
+    monkeypatch, caplog
+):
+    # A misconfigured overlay whose start() raises must be logged and
+    # swallowed: durability/observability being broken never stops jobs.
+    import logging
+
+    class _FailMesh:
+        def __init__(self, config):
+            self.config = config
+
+        def set_job_summaries_provider(self, p):
+            pass
+
+        def set_node_stats_provider(self, p, share=True):
+            pass
+
+        async def start(self):
+            raise OSError("overlay bind failed")
+
+    monkeypatch.setattr(
+        cronstable.cron, "make_backend", lambda c, jsid: _FailMesh(c)
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cron.start_stop_observability(
+            {
+                "observabilityMesh": {"backend": "gossip"},
+                "shareNodeStats": False,
+            }
+        )
+    assert cron.observability_mesh is None
+    assert any("failed to start" in r.message for r in caplog.records)
+
+
+# --- start_stop_state teardown ---------------------------------------------
+
+
+async def test_lifecycle_state_teardown_cancels_slot_and_retry_tasks(tmp_path):
+    # Removing the state section tears the backend down and cancels every
+    # per-store background task (slot renewers, Replace pursuits, the
+    # cross-node retry-claim scan): they belong to the old store generation.
+    cron = await _lifecycle_start_state(tmp_path)
+
+    async def _idle():
+        await asyncio.sleep(3600)
+
+    renewer = asyncio.ensure_future(_idle())
+    pursuit = asyncio.ensure_future(_idle())
+    claim = asyncio.ensure_future(_idle())
+    cron._slot_renewers["j"] = renewer
+    cron._slot_pursuits["j"] = pursuit
+    cron._retry_claim_task = claim
+    await asyncio.sleep(0)  # let the tasks reach their await points
+
+    await cron.start_stop_state(None)
+
+    assert cron.state_backend is None
+    assert cron._slot_renewers == {}
+    assert cron._slot_pursuits == {}
+    assert cron._retry_claim_task is None
+    await asyncio.sleep(0)
+    assert renewer.cancelled()
+    assert pursuit.cancelled()
+    assert claim.cancelled()
+
+
+# --- _start_job_api / _stop_job_api ----------------------------------------
+
+
+async def test_lifecycle_start_job_api_swallows_start_failure(
+    monkeypatch, tmp_path, caplog
+):
+    # The loopback job-state API is best-effort: a start failure is logged and
+    # swallowed (jobs run without the endpoint), leaving _job_api unset.
+    import logging
+
+    import cronstable.jobapi
+
+    class _FailApi:
+        def __init__(self, *a, **k):
+            pass
+
+        async def start(self):
+            raise OSError("loopback bind failed")
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr(cronstable.jobapi, "JobStateAPI", _FailApi)
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cron._start_job_api(_lifecycle_state_config(tmp_path))
+    assert cron._job_api is None
+    assert any("job API failed to start" in r.message for r in caplog.records)
+
+
+async def test_lifecycle_stop_job_api_noop_when_absent():
+    # No API running: stop is a clean no-op.
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    assert cron._job_api is None
+    await cron._stop_job_api()
+    assert cron._job_api is None
+
+
+async def test_lifecycle_stop_job_api_warns_on_unclean_stop(caplog):
+    # A stop that raises is logged as an unclean shutdown, and the handle is
+    # cleared regardless so the generation cannot leak.
+    import logging
+
+    class _Api:
+        async def stop(self):
+            raise OSError("did not close")
+
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    cron._job_api = _Api()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron._stop_job_api()
+    assert cron._job_api is None
+    assert any("did not stop cleanly" in r.message for r in caplog.records)
+
+
+# --- _persist_manifest -----------------------------------------------------
+
+
+async def test_lifecycle_persist_manifest_noop_without_backend():
+    # No backend: the manifest write is a no-op.
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    assert cron.state_backend is None
+    await cron._persist_manifest()
+
+
+async def test_lifecycle_persist_manifest_swallows_append_error(
+    tmp_path, caplog
+):
+    # A failed manifest append is counted as a dropped write and logged, not
+    # raised (it runs as a fire-and-forget background task).
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+
+        async def _boom(*a, **k):
+            raise OSError("append failed")
+
+        cron.state_backend.append_record = _boom
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._persist_manifest()
+        assert any(
+            "failed to record the job manifest" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+# --- _live_pause_keep ------------------------------------------------------
+
+
+async def test_lifecycle_live_pause_keep_keeps_all_on_enumerate_error(
+    tmp_path, caplog
+):
+    # If the pause-stream listing cannot be enumerated, every kept job is kept
+    # unconditionally: GC never eats a live pause on doubt.
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+
+        async def _boom(*a, **k):
+            raise OSError("cannot list")
+
+        cron.state_backend.list_stream_names = _boom
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            keep = await cron._live_pause_keep(
+                cron.state_backend, {"j"}, now
+            )
+        assert keep == {"j"}
+        assert any(
+            "not reclaiming dead pause streams" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_live_pause_keep_skips_removed_and_unreadable_streams(
+    tmp_path, caplog
+):
+    # A pause stream for a job not in the keep set is skipped (its name was
+    # already collected), and a kept job's unreadable pause stream is kept on
+    # doubt rather than dropped.
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        backend = cron.state_backend
+        await backend.append_record(
+            cronstable.cron.PAUSE_STREAM_PREFIX + "removed",
+            {"until": "2099-01-01T00:00:00+00:00"},
+        )
+        await backend.append_record(
+            cronstable.cron.PAUSE_STREAM_PREFIX + "keeper",
+            {"until": "2099-01-01T00:00:00+00:00"},
+        )
+
+        async def _boom(*a, **k):
+            raise OSError("cannot read")
+
+        backend.list_records = _boom
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            keep = await cron._live_pause_keep(backend, {"keeper"}, now)
+        assert "keeper" in keep
+        assert any(
+            "keeping the pause stream of keeper" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+# --- _collect_state_garbage ------------------------------------------------
+
+
+async def test_lifecycle_collect_garbage_noop_without_grace():
+    # gcGraceSeconds unset (0) or no backend: the whole pass is a no-op.
+    cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
+    cron._state_gc_grace = 0.0
+    await cron._collect_state_garbage()
+
+
+async def test_lifecycle_collect_garbage_degrades_on_enumerate_error(
+    tmp_path, caplog
+):
+    # Cannot enumerate the manifest streams: collect nothing this pass.
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        cron._state_gc_grace = 3600.0
+
+        async def _boom(*a, **k):
+            raise OSError("cannot enumerate")
+
+        cron.state_backend.list_stream_names = _boom
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._collect_state_garbage()
+        assert any(
+            "cannot enumerate the manifest streams" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_collect_garbage_caps_manifest_hosts(
+    tmp_path, monkeypatch, caplog
+):
+    # More manifest host streams than the cap: warn and read only the first
+    # cap-many this pass (a churning fleet with never-reused host identities).
+    import logging
+
+    from tests.test_cron_state_hardening import _seed_gc_anchor
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        await _seed_gc_anchor(cron)
+        monkeypatch.setattr(cronstable.cron, "MANIFEST_HOSTS_CAP", 1)
+        cron._state_gc_grace = 3600.0
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._collect_state_garbage()
+        assert any(
+            "reading only the first" in r.message for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_collect_garbage_degrades_on_manifest_read_error(
+    tmp_path, caplog
+):
+    # The streams enumerate but a record read fails: collect nothing.
+    import logging
+
+    from tests.test_cron_state_hardening import _seed_gc_anchor
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        await _seed_gc_anchor(cron)
+        cron._state_gc_grace = 3600.0
+
+        async def _boom(*a, **k):
+            raise OSError("cannot read")
+
+        cron.state_backend.list_records = _boom
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._collect_state_garbage()
+        assert any(
+            "cannot read the manifest streams" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_collect_garbage_degrades_on_collect_failure(
+    tmp_path, caplog
+):
+    # The pass reaches the backend collect step (history spans grace, scopes
+    # advertised) and that step raises: degrade to "collected nothing".
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        await _lifecycle_seed_anchor_frozen(cron)
+        cron._state_gc_grace = 3600.0
+
+        async def _boom(*a, **k):
+            raise OSError("collect failed")
+
+        cron.state_backend.collect_garbage = _boom
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._collect_state_garbage()
+        assert any(
+            "garbage collection failed" in r.message for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+# --- _gc_dag_state ---------------------------------------------------------
+
+
+async def test_lifecycle_gc_dag_state_degrades_on_namespace_error(
+    tmp_path, caplog
+):
+    # Cannot enumerate the dag-run namespaces: leave artifact streams wholly
+    # unmanaged this pass (the keep map is untouched).
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        backend = cron.state_backend
+
+        async def _boom(*a, **k):
+            raise OSError("cannot enumerate namespaces")
+
+        backend.list_document_namespaces = _boom
+        keep = {}
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._gc_dag_state(backend, keep, set(), set(), 3600.0)
+        assert "artifacts/" not in keep
+        assert any(
+            "cannot enumerate the dag-run namespaces" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_gc_dag_state_defers_when_namespace_incomplete(
+    tmp_path, caplog
+):
+    # A dag-run namespace exists whose name cannot be recovered: its runs'
+    # XCom scopes cannot be protected, so artifacts stay unmanaged this pass.
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        backend = cron.state_backend
+
+        async def _incomplete(*a, **k):
+            return ([], False)
+
+        backend.list_document_namespaces = _incomplete
+        keep = {}
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._gc_dag_state(backend, keep, set(), set(), 3600.0)
+        assert "artifacts/" not in keep
+        assert any("cannot be recovered" in r.message for r in caplog.records)
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_gc_dag_state_degrades_on_document_read_error(
+    tmp_path, caplog
+):
+    # The namespaces enumerate but a run document read fails: unmanaged.
+    import logging
+
+    from cronstable.dag import DAG_RUN_NS_PREFIX
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        backend = cron.state_backend
+
+        async def _ns(*a, **k):
+            return ([DAG_RUN_NS_PREFIX + "d"], True)
+
+        async def _boom(*a, **k):
+            raise OSError("cannot read documents")
+
+        backend.list_document_namespaces = _ns
+        backend.list_documents = _boom
+        keep = {}
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            # live_dags carries "d" so gc_removed_dags is not invoked and the
+            # test targets only the document-read degrade branch.
+            await cron._gc_dag_state(backend, keep, set(), {"d"}, 3600.0)
+        assert "artifacts/" not in keep
+        assert any(
+            "cannot read the dag-run documents" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+# --- _sweep_orphan_artifact_blobs ------------------------------------------
+
+
+async def test_lifecycle_sweep_blobs_degrades_on_audit_error(tmp_path, caplog):
+    # Cannot enumerate the artifact streams: skip the sweep this pass.
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        backend = cron.state_backend
+
+        async def _boom(*a, **k):
+            raise OSError("cannot audit")
+
+        backend.list_stream_names_audit = _boom
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._sweep_orphan_artifact_blobs(backend, 3600.0)
+        assert any(
+            "cannot enumerate" in r.message and "artifact streams" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_sweep_blobs_degrades_on_sweep_error(tmp_path, caplog):
+    # The reference set builds but the blob sweep itself raises: skip, biased
+    # to keep, so a live payload is never deleted on doubt.
+    import logging
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        backend = cron.state_backend
+
+        async def _boom(*a, **k):
+            raise OSError("cannot sweep")
+
+        backend.sweep_orphan_blobs = _boom
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._sweep_orphan_artifact_blobs(backend, 3600.0)
+        assert any(
+            "skipping the orphan-blob sweep" in r.message
+            and "cannot be ruled" in r.message
+            for r in caplog.records
+        )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+# --- cancellation must propagate (never swallowed as a degrade) ------------
+#
+# Every GC/state degrade block re-raises asyncio.CancelledError ahead of its
+# broad "log and survive" except, so a shutdown cancel is honoured rather than
+# mistaken for a store error.  These drive that re-raise on each block.
+
+
+async def _lifecycle_cancel(*a, **k):
+    raise asyncio.CancelledError()
+
+
+async def test_lifecycle_live_pause_keep_propagates_enumerate_cancel(tmp_path):
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        cron.state_backend.list_stream_names = _lifecycle_cancel
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._live_pause_keep(cron.state_backend, {"j"}, now)
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_live_pause_keep_propagates_read_cancel(tmp_path):
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        backend = cron.state_backend
+        await backend.append_record(
+            cronstable.cron.PAUSE_STREAM_PREFIX + "keeper",
+            {"until": "2099-01-01T00:00:00+00:00"},
+        )
+        backend.list_records = _lifecycle_cancel
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+        with pytest.raises(asyncio.CancelledError):
+            await cron._live_pause_keep(backend, {"keeper"}, now)
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_collect_garbage_propagates_enumerate_cancel(tmp_path):
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        cron._state_gc_grace = 3600.0
+        cron.state_backend.list_stream_names = _lifecycle_cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._collect_state_garbage()
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_collect_garbage_propagates_read_cancel(tmp_path):
+    from tests.test_cron_state_hardening import _seed_gc_anchor
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        await _seed_gc_anchor(cron)
+        cron._state_gc_grace = 3600.0
+        cron.state_backend.list_records = _lifecycle_cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._collect_state_garbage()
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_gc_dag_state_propagates_namespace_cancel(tmp_path):
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        cron.state_backend.list_document_namespaces = _lifecycle_cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._gc_dag_state(
+                cron.state_backend, {}, set(), set(), 3600.0
+            )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_gc_dag_state_propagates_document_cancel(tmp_path):
+    from cronstable.dag import DAG_RUN_NS_PREFIX
+
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        backend = cron.state_backend
+
+        async def _ns(*a, **k):
+            return ([DAG_RUN_NS_PREFIX + "d"], True)
+
+        backend.list_document_namespaces = _ns
+        backend.list_documents = _lifecycle_cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._gc_dag_state(backend, {}, set(), {"d"}, 3600.0)
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_sweep_blobs_propagates_audit_cancel(tmp_path):
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        cron.state_backend.list_stream_names_audit = _lifecycle_cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._sweep_orphan_artifact_blobs(
+                cron.state_backend, 3600.0
+            )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_sweep_blobs_propagates_sweep_cancel(tmp_path):
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        cron.state_backend.sweep_orphan_blobs = _lifecycle_cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._sweep_orphan_artifact_blobs(
+                cron.state_backend, 3600.0
+            )
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+async def test_lifecycle_collect_garbage_propagates_collect_cancel(tmp_path):
+    # Reach the backend collect step (history spans grace, scopes advertised)
+    # and cancel there: the re-raise must win over the broad degrade except.
+    cron = await _lifecycle_start_state(tmp_path)
+    try:
+        await _lifecycle_seed_anchor_frozen(cron)
+        cron._state_gc_grace = 3600.0
+        cron.state_backend.collect_garbage = _lifecycle_cancel
+        with pytest.raises(asyncio.CancelledError):
+            await cron._collect_state_garbage()
+    finally:
+        await _lifecycle_stop_state(cron)
+
+
+
+# =====================================================================
+#  Scheduling, catch-up, and reboot paths in cronstable/cron.py
+# =====================================================================
+
+
+def test_catchup_smoke_sanity():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    assert cron is not None
+
+
+from tests.test_state import (  # noqa: E402
+    _count_launcher,
+    _cron_with_watermark,
+    _NOW,
+    _state_cfg,
+)
+
+_CATCHUP_REBOOT_YAML = """
+jobs:
+  - name: boot
+    command: echo hi
+    schedule: "@reboot"
+"""
+
+
+def _catchup_pause(hours_from=1):
+    # a pause window live against the frozen 1999-12-31 12:00 clock.
+    return cronstable.cron.PauseInfo(
+        since=DT(1999, 12, 31, 11, 0, 0, tzinfo=UTC),
+        until=DT(1999, 12, 31, 12 + hours_from, 0, 0, tzinfo=UTC),
+        note="",
+        by="op",
+        channel="api",
+    )
+
+
+async def _catchup_reboot_cron(tmp_path):
+    cron = cronstable.cron.Cron(None, config_yaml=_CATCHUP_REBOOT_YAML)
+    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    return cron
+
+
+# --- _peek_soonest_fire / _sleep_interval / _due_names ---------------
+
+
+def test_catchup_peek_soonest_fire_discards_stale_top():
+    # a heap entry the next-fire index has since superseded is popped from the
+    # top; the next live entry is returned.
+    cron = cronstable.cron.Cron(None)
+    now = cronstable.cron.get_now(UTC)
+    w1 = now + datetime.timedelta(seconds=10)
+    w2 = now + datetime.timedelta(seconds=20)
+    cron._set_next_fire("a", w1)  # heap holds (w1, a)
+    cron._next_fire["a"] = w2  # supersede without touching the heap
+    cron._set_next_fire("a", w2)  # push the live (w2, a)
+    assert cron._peek_soonest_fire() == w2  # (w1, a) discarded as stale
+
+
+def test_catchup_sleep_interval_capped_by_dag_wake(monkeypatch):
+    # a due DAG wake pulls the sleep below the once-a-minute housekeeping cap.
+    cron = cronstable.cron.Cron(None)
+    monkeypatch.setattr(cron._dag, "next_wake_delay", lambda: 0.3)
+    assert cron._sleep_interval() == pytest.approx(0.3)
+
+
+def test_catchup_due_names_dedupes_duplicate_live_entries():
+    # a name that somehow holds two live heap entries for the same instant is
+    # returned exactly once.
+    cron = cronstable.cron.Cron(None)
+    when = cronstable.cron.get_now(UTC)
+    cron._set_next_fire("a", when)
+    cron._set_next_fire("a", when)  # a second live entry for the same slot
+    assert cron._due_names(when) == ["a"]
+
+
+# --- _pause_excusal_window -------------------------------------------
+
+
+async def test_catchup_pause_excusal_window_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_PAUSABLE_JOB)
+    assert await cron._pause_excusal_window("p") is None
+
+
+async def test_catchup_pause_excusal_window_store_error_degrades(tmp_path, caplog):
+    import logging
+
+    cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
+
+    async def boom(*a, **k):
+        raise RuntimeError("store down")
+
+    cron.state_backend.list_records = boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        assert await cron._pause_excusal_window("j") is None
+    assert any("pause stream" in r.getMessage() for r in caplog.records)
+
+
+# --- _checkpoint_catchup ---------------------------------------------
+
+
+async def test_catchup_checkpoint_catchup_no_backend_is_noop():
+    cron = cronstable.cron.Cron(None, config_yaml=_PAUSABLE_JOB)
+    # no state backend -> returns without touching anything (no raise).
+    await cron._checkpoint_catchup("p", "open", "wm")
+
+
+async def test_catchup_checkpoint_catchup_write_error_is_best_effort(
+    tmp_path, caplog
+):
+    import logging
+
+    cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
+
+    async def boom(*a, **k):
+        raise RuntimeError("append failed")
+
+    cron.state_backend.append_record = boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron._checkpoint_catchup("j", "open", "wm")  # swallowed
+    assert any(
+        "could not checkpoint" in r.getMessage() for r in caplog.records
+    )
+
+
+# --- _catch_up orchestration edges -----------------------------------
+
+
+async def test_catchup_catch_up_defers_before_retry_interval(tmp_path):
+    cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
+    cron._catchup_next_retry = asyncio.get_running_loop().time() + 1000
+    await cron._catch_up(_NOW)
+    assert cron._caught_up is False  # bailed out before evaluating
+    assert cron._catchup_tasks == set()
+
+
+async def test_catchup_catch_up_no_state_warns_archive_and_gate(caplog):
+    import logging
+
+    yaml = (
+        "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+        "    archiveOutput: true\n    onlyIfLastSucceeded: true\n"
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)  # no state backend
+    with caplog.at_level(logging.INFO, logger="cronstable"):
+        await cron._catch_up(_NOW)
+    assert cron._caught_up is True
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("archiveOutput" in m for m in msgs)
+    assert any("onlyIfLastSucceeded" in m for m in msgs)
+
+
+async def test_catchup_catch_up_reraises_cancelled(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+
+    async def boom(now):
+        raise asyncio.CancelledError()
+
+    cron._evaluate_catch_up = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._catch_up(_NOW)
+
+
+async def test_catchup_catch_up_defers_on_unexpected_error(tmp_path, caplog):
+    import logging
+
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+
+    async def boom(now):
+        raise RuntimeError("kaboom")
+
+    cron._evaluate_catch_up = boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cron._catch_up(_NOW)
+    assert cron._caught_up is False  # unresolved -> will retry
+    assert cron._catchup_next_retry > 0
+    assert any("evaluating" in r.getMessage() for r in caplog.records)
+
+
+# --- _evaluate_catch_up edges ----------------------------------------
+
+
+async def test_catchup_evaluate_catch_up_skips_already_done(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
+    )
+    cron._catchup_done.add("j")  # already resolved on an earlier pass
+    assert await cron._evaluate_catch_up(_NOW) is False  # nothing pending
+
+
+async def test_catchup_evaluate_catch_up_pins_pre_pause_watermark(tmp_path):
+    # a paused job with no open checkpoint pins the pre-pause watermark (an
+    # `open` checkpoint) and defers rather than latching.
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    cron._paused["j"] = _catchup_pause()
+    assert await cron._evaluate_catch_up(_NOW) is True  # deferred
+    recs = await cron.state_backend.list_records(cron._catchup_stream("j"))
+    assert recs and recs[0]["kind"] == "open"
+
+
+async def test_catchup_evaluate_catch_up_pause_pin_error_defers(tmp_path, caplog):
+    import logging
+
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    cron._paused["j"] = _catchup_pause()
+
+    async def boom(name):
+        raise RuntimeError("store down")
+
+    cron._pending_catchup_watermark = boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        assert await cron._evaluate_catch_up(_NOW) is True
+    assert any("pin the pre-pause" in r.getMessage() for r in caplog.records)
+
+
+async def test_catchup_evaluate_catch_up_reraises_cancelled(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+
+    async def boom(job, now):
+        raise asyncio.CancelledError()
+
+    cron._missed_occurrences = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._evaluate_catch_up(_NOW)
+
+
+# --- _run_catch_up edges ---------------------------------------------
+
+
+async def test_catchup_run_catch_up_reread_error_drops(tmp_path, caplog):
+    import logging
+
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+
+    async def boom(job, now):
+        raise RuntimeError("watermark read failed")
+
+    cron._missed_occurrences = boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron._run_catch_up(cron.cron_jobs["j"], 3, 0.0, _NOW)
+    assert calls == []
+    assert any("re-read" in r.getMessage() for r in caplog.records)
+
+
+async def test_catchup_run_catch_up_reraises_cancelled(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+
+    async def boom(job, now):
+        raise asyncio.CancelledError()
+
+    cron._missed_occurrences = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._run_catch_up(cron.cron_jobs["j"], 3, 0.0, _NOW)
+
+
+async def test_catchup_run_catch_up_nothing_owed_closes_cycle(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+
+    async def zero(job, now):
+        return 0, "2026-07-01T10:00:00+00:00"
+
+    cron._missed_occurrences = zero  # type: ignore[method-assign]
+    await cron._run_catch_up(cron.cron_jobs["j"], 3, 0.0, _NOW)
+    assert calls == []
+    recs = await cron.state_backend.list_records(cron._catchup_stream("j"))
+    assert recs and recs[0]["kind"] == "close"
+
+
+async def test_catchup_run_catch_up_bails_when_idle_wait_signals_stop(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+
+    async def two(job, now):
+        return 2, "wm"
+
+    async def idle_false(name, *, max_wait=None):
+        return False  # shutdown signalled while draining
+
+    cron._missed_occurrences = two  # type: ignore[method-assign]
+    cron._wait_job_idle = idle_false  # type: ignore[method-assign]
+    await cron._run_catch_up(cron.cron_jobs["j"], 2, 0.0, _NOW)
+    assert calls == []
+
+
+async def test_catchup_run_catch_up_ownership_moves_mid_backfill(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+
+    async def two(job, now):
+        return 2, "wm"
+
+    async def idle_true(name, *, max_wait=None):
+        return True
+
+    seen = {"n": 0}
+
+    def allows(job):
+        seen["n"] += 1
+        return seen["n"] <= 1  # owner after jitter, then ownership moves
+
+    cron._missed_occurrences = two  # type: ignore[method-assign]
+    cron._wait_job_idle = idle_true  # type: ignore[method-assign]
+    cron._cluster_allows = allows  # type: ignore[method-assign]
+    await cron._run_catch_up(cron.cron_jobs["j"], 2, 0.0, _NOW)
+    assert calls == []  # left to the new owner before any launch
+
+
+async def test_catchup_run_catch_up_paused_mid_backfill(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+
+    async def two(job, now):
+        return 2, "wm"
+
+    async def idle_true(name, *, max_wait=None):
+        return True
+
+    cron._missed_occurrences = two  # type: ignore[method-assign]
+    cron._wait_job_idle = idle_true  # type: ignore[method-assign]
+    cron._paused["j"] = _catchup_pause()
+    await cron._run_catch_up(cron.cron_jobs["j"], 2, 0.0, _NOW)
+    assert calls == []  # dropped without closing the checkpoint
+
+
+async def test_catchup_run_catch_up_final_drain_signals_stop(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+
+    async def one(job, now):
+        return 1, "wm"
+
+    idle = {"n": 0}
+
+    async def idle_cb(name, *, max_wait=None):
+        idle["n"] += 1
+        return idle["n"] == 1  # go for the loop, stop on the final drain
+
+    cron._missed_occurrences = one  # type: ignore[method-assign]
+    cron._wait_job_idle = idle_cb  # type: ignore[method-assign]
+    await cron._run_catch_up(cron.cron_jobs["j"], 1, 0.0, _NOW)
+    assert calls == ["j"]  # the one launch happened
+    recs = await cron.state_backend.list_records(cron._catchup_stream("j"))
+    assert not any(r.get("kind") == "close" for r in recs)  # not closed
+
+
+async def test_catchup_run_catch_up_outer_error_never_kills_loop(
+    tmp_path, caplog
+):
+    import logging
+
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+
+    async def two(job, now):
+        return 2, "wm"
+
+    async def idle_boom(name, *, max_wait=None):
+        raise RuntimeError("unexpected")
+
+    cron._missed_occurrences = two  # type: ignore[method-assign]
+    cron._wait_job_idle = idle_boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cron._run_catch_up(cron.cron_jobs["j"], 2, 0.0, _NOW)  # no raise
+    assert calls == []
+    assert any("backfilling" in r.getMessage() for r in caplog.records)
+
+
+# --- _wait_job_idle --------------------------------------------------
+
+
+async def test_catchup_wait_job_idle_returns_false_on_stop():
+    cron = cronstable.cron.Cron(None, config_yaml=_PAUSABLE_JOB)
+    cron.running_jobs["p"] = ["sentinel"]  # still busy
+    cron._stop_event.set()  # shutdown while waiting
+    assert await cron._wait_job_idle("p") is False
+
+
+# --- _defer_paused_reboot / _process_paused_reboots ------------------
+
+
+def test_catchup_defer_paused_reboot_is_idempotent():
+    cron = cronstable.cron.Cron(None)
+    cron._defer_paused_reboot("boot")
+    cron._defer_paused_reboot("boot")  # already held -> early return
+    assert cron._paused_reboot_jobs == {"boot"}
+
+
+async def test_catchup_process_paused_reboots_absent_stays_owed(monkeypatch):
+    cron = cronstable.cron.Cron(None)
+    launched = []
+    monkeypatch.setattr(
+        cron,
+        "launch_scheduled_job",
+        lambda j: launched.append(j.name) or _noop(),
+    )
+    cron._paused_reboot_jobs.add("ghost")  # name not in cron_jobs
+    await cron._process_paused_reboots()
+    assert "ghost" in cron._paused_reboot_jobs  # transiently absent -> owed
+    assert launched == []
+
+
+async def test_catchup_process_paused_reboots_retires_non_reboot(monkeypatch):
+    cron = cronstable.cron.Cron(None)
+    launched = []
+    monkeypatch.setattr(
+        cron,
+        "launch_scheduled_job",
+        lambda j: launched.append(j.name) or _noop(),
+    )
+    cron.cron_jobs["boot"] = _reboot_job(enabled=False)  # disabled on reload
+    cron._paused_reboot_jobs.add("boot")
+    await cron._process_paused_reboots()
+    assert "boot" not in cron._paused_reboot_jobs  # retired without running
+    assert launched == []
+
+
+async def test_catchup_process_paused_reboots_still_paused_keeps_owed(monkeypatch):
+    cron = cronstable.cron.Cron(None)
+    launched = []
+    monkeypatch.setattr(
+        cron,
+        "launch_scheduled_job",
+        lambda j: launched.append(j.name) or _noop(),
+    )
+    cron.cron_jobs["boot"] = _reboot_job()
+    cron._paused_reboot_jobs.add("boot")
+    cron._paused["boot"] = _catchup_pause()  # pause has not lifted yet
+    await cron._process_paused_reboots()
+    assert "boot" in cron._paused_reboot_jobs  # still deferred
+    assert launched == []
+
+
+async def test_catchup_process_paused_reboots_ownership_moved_keeps_owed(
+    monkeypatch,
+):
+    cron = cronstable.cron.Cron(None)
+    launched = []
+    monkeypatch.setattr(
+        cron,
+        "launch_scheduled_job",
+        lambda j: launched.append(j.name) or _noop(),
+    )
+    cron.cron_jobs["boot"] = _reboot_job()
+    cron._paused_reboot_jobs.add("boot")
+    cron._cluster_allows = lambda job: False  # type: ignore[method-assign]
+    await cron._process_paused_reboots()
+    assert "boot" in cron._paused_reboot_jobs  # ownership moved -> still owed
+    assert launched == []
+
+
+# --- _spawn_due_jobs dead schedule / _launch_plan --------------------
+
+
+async def test_catchup_spawn_due_jobs_latches_dead_schedule(monkeypatch, caplog):
+    import logging
+
+    yaml = (
+        "jobs:\n  - name: dead\n    command: echo x\n"
+        "    schedule: '0 0 30 2 *'\n"  # February 30th: never fires again
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    monkeypatch.setattr(cron, "launch_scheduled_job", lambda j: _noop())
+    now = cronstable.cron.get_now(UTC)
+    cron._set_next_fire("dead", now)  # force it due this pass
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron._spawn_due_jobs(now)
+    assert "dead" in cron._dead_schedules
+    assert "dead" not in cron._next_fire
+    assert any("NEVER fire again" in r.getMessage() for r in caplog.records)
+
+
+async def test_catchup_launch_plan_skips_shallow_jobs_in_later_rounds(monkeypatch):
+    cron = cronstable.cron.Cron(None, config_yaml=_THREE_DUE)
+    launched = []
+
+    async def fake(job):
+        launched.append(job.name)
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake)
+    now = cronstable.cron.get_now(UTC)
+    later = now + datetime.timedelta(minutes=1)
+    plan = [
+        (cron.cron_jobs["a"], [now, later]),  # two catch-up rounds
+        (cron.cron_jobs["b"], [now]),  # only one -> skipped in round 2
+    ]
+    await cron._launch_plan(plan)
+    # round 0: a, b concurrently; round 1: a alone (b past its fire list)
+    assert launched == ["a", "b", "a"]
+
+
+# --- _reboot_marker_covers / _reboot_boot_gate -----------------------
+
+
+async def test_catchup_reboot_marker_covers_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_CATCHUP_REBOOT_YAML)
+    assert await cron._reboot_marker_covers(cron.cron_jobs["boot"]) is False
+
+
+async def test_catchup_reboot_marker_covers_ignores_foreign_host(tmp_path):
+    cron = await _catchup_reboot_cron(tmp_path)
+    await cron.state_backend.append_record(
+        cron._reboot_stream("boot"),
+        {"host": "some-other-host", "jobDigest": "x", "bootId": "y"},
+    )
+    # only this host's markers decide; a foreign one is skipped -> not covered.
+    assert await cron._reboot_marker_covers(cron.cron_jobs["boot"]) is False
+
+
+async def test_catchup_reboot_gate_sick_runs_without_dedupe(tmp_path, caplog):
+    import logging
+
+    cron = await _catchup_reboot_cron(tmp_path)
+    cron._reboot_gate_sick = True  # a prior op timed out this pass
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        assert await cron._reboot_boot_gate(cron.cron_jobs["boot"]) is True
+    assert any("without boot-marker" in r.getMessage() for r in caplog.records)
+
+
+async def test_catchup_reboot_gate_reraises_cancelled_read(tmp_path):
+    cron = await _catchup_reboot_cron(tmp_path)
+
+    async def boom(job):
+        raise asyncio.CancelledError()
+
+    cron._reboot_marker_covers = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._reboot_boot_gate(cron.cron_jobs["boot"])
+
+
+async def test_catchup_reboot_gate_read_timeout_marks_sick_then_runs(tmp_path):
+    cron = await _catchup_reboot_cron(tmp_path)
+
+    async def boom(job):
+        raise asyncio.TimeoutError()
+
+    cron._reboot_marker_covers = boom  # type: ignore[method-assign]
+    # default degrade policy: a read timeout latches sick and runs the job.
+    assert await cron._reboot_boot_gate(cron.cron_jobs["boot"]) is True
+    assert cron._reboot_gate_sick is True
+
+
+async def test_catchup_reboot_gate_reraises_cancelled_write(tmp_path):
+    cron = await _catchup_reboot_cron(tmp_path)
+
+    async def not_covered(job):
+        return False
+
+    async def boom(*a, **k):
+        raise asyncio.CancelledError()
+
+    cron._reboot_marker_covers = not_covered  # type: ignore[method-assign]
+    cron.state_backend.append_record = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._reboot_boot_gate(cron.cron_jobs["boot"])
+
+
+async def test_catchup_reboot_gate_write_timeout_fail_closed_recheck_visible(
+    tmp_path,
+):
+    cron = await _catchup_reboot_cron(tmp_path)
+    cron._state_on_unavailable = "fail-closed"
+    seen = {"n": 0}
+
+    async def marker(job):
+        seen["n"] += 1
+        return seen["n"] > 1  # absent at the gate, visible on the re-check
+
+    async def boom(*a, **k):
+        raise asyncio.TimeoutError()
+
+    cron._reboot_marker_covers = marker  # type: ignore[method-assign]
+    cron.state_backend.append_record = boom  # type: ignore[method-assign]
+    # the abandoned append landed late: the re-check sees it -> launch.
+    assert await cron._reboot_boot_gate(cron.cron_jobs["boot"]) is True
+    assert cron._reboot_gate_sick is True
+
+
+async def test_catchup_reboot_gate_write_timeout_fail_closed_recheck_absent(
+    tmp_path, caplog
+):
+    import logging
+
+    cron = await _catchup_reboot_cron(tmp_path)
+    cron._state_on_unavailable = "fail-closed"
+    seen = {"n": 0}
+
+    async def marker(job):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return False  # absent at the gate
+        raise RuntimeError("still unknown")  # re-check cannot decide
+
+    async def boom(*a, **k):
+        raise asyncio.TimeoutError()
+
+    cron._reboot_marker_covers = marker  # type: ignore[method-assign]
+    cron.state_backend.append_record = boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        assert await cron._reboot_boot_gate(cron.cron_jobs["boot"]) is False
+    assert any("cannot record" in r.getMessage() for r in caplog.records)
+
+
+# --- _process_pending_reboots edges ----------------------------------
+
+
+async def test_catchup_pending_reboots_election_removed_paused_keeps_owed(
+    monkeypatch,
+):
+    cron = cronstable.cron.Cron(None)
+    cron._elect_leader_configured = False  # election turned off on reload
+    launched = []
+    monkeypatch.setattr(
+        cron,
+        "launch_scheduled_job",
+        lambda j: launched.append(j.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    cron._paused["boot"] = _catchup_pause()
+    await cron._process_pending_reboots()
+    assert launched == []
+    assert "boot" in cron._pending_reboot_jobs  # pause defers, keeps it owed
+
+
+async def test_catchup_pending_reboots_no_manager_absent_kept():
+    cron = cronstable.cron.Cron(None)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = None  # manager never came up
+    cron._pending_reboot_jobs["ghost"] = _reboot_job("ghost")  # not in jobs
+    await cron._process_pending_reboots()
+    assert "ghost" in cron._pending_reboot_jobs  # never-lose
+
+
+async def test_catchup_pending_reboots_no_manager_paused_keeps_owed(monkeypatch):
+    cron = cronstable.cron.Cron(None)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = None
+    launched = []
+    monkeypatch.setattr(
+        cron,
+        "launch_scheduled_job",
+        lambda j: launched.append(j.name) or _noop(),
+    )
+    job = _reboot_job(policy="PreferLeader")
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    cron._paused["boot"] = _catchup_pause()
+    await cron._process_pending_reboots()
+    assert launched == []
+    assert "boot" in cron._pending_reboot_jobs  # deferred by the pause
+
+
+async def test_catchup_pending_reboots_reboot_ran_error_keeps_owed(caplog):
+    import logging
+
+    cron = cronstable.cron.Cron(None)
+    cron._elect_leader_configured = True
+
+    class _RaisingMgr:
+        node_name = "node-a"
+        distribution = "single-leader"
+
+        def reboot_ran(self, name):
+            raise RuntimeError("backend read failed")
+
+    cron.cluster_manager = _RaisingMgr()
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cron._process_pending_reboots()
+    assert "boot" in cron._pending_reboot_jobs  # kept pending on read error
+    assert any("already ran" in r.getMessage() for r in caplog.records)
+
+
+# --- CancelledError re-raise paths (defensive) -----------------------
+
+
+async def test_catchup_pause_excusal_window_reraises_cancelled(tmp_path):
+    cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
+
+    async def boom(*a, **k):
+        raise asyncio.CancelledError()
+
+    cron.state_backend.list_records = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._pause_excusal_window("j")
+
+
+async def test_catchup_evaluate_catch_up_pause_pin_reraises_cancelled(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    cron._paused["j"] = _catchup_pause()
+
+    async def boom(name):
+        raise asyncio.CancelledError()
+
+    cron._pending_catchup_watermark = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._evaluate_catch_up(_NOW)
+
+
+async def test_catchup_reboot_gate_write_timeout_recheck_reraises_cancelled(
+    tmp_path,
+):
+    cron = await _catchup_reboot_cron(tmp_path)
+    cron._state_on_unavailable = "fail-closed"
+    seen = {"n": 0}
+
+    async def marker(job):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return False  # absent at the gate
+        raise asyncio.CancelledError()  # cancelled during the re-check
+
+    async def boom(*a, **k):
+        raise asyncio.TimeoutError()
+
+    cron._reboot_marker_covers = marker  # type: ignore[method-assign]
+    cron.state_backend.append_record = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._reboot_boot_gate(cron.cron_jobs["boot"])
+
+
+
+
+# --- CancelledError re-raise paths (defensive) -----------------------
+
+
+async def test_catchup_pause_excusal_window_reraises_cancelled(tmp_path):
+    cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
+
+    async def boom(*a, **k):
+        raise asyncio.CancelledError()
+
+    cron.state_backend.list_records = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._pause_excusal_window("j")
+
+
+async def test_catchup_evaluate_catch_up_pause_pin_reraises_cancelled(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    cron._paused["j"] = _catchup_pause()
+
+    async def boom(name):
+        raise asyncio.CancelledError()
+
+    cron._pending_catchup_watermark = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._evaluate_catch_up(_NOW)
+
+
+async def test_catchup_reboot_gate_write_timeout_recheck_reraises_cancelled(
+    tmp_path,
+):
+    cron = await _catchup_reboot_cron(tmp_path)
+    cron._state_on_unavailable = "fail-closed"
+    seen = {"n": 0}
+
+    async def marker(job):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return False  # absent at the gate
+        raise asyncio.CancelledError()  # cancelled during the re-check
+
+    async def boom(*a, **k):
+        raise asyncio.TimeoutError()
+
+    cron._reboot_marker_covers = marker  # type: ignore[method-assign]
+    cron.state_backend.append_record = boom  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await cron._reboot_boot_gate(cron.cron_jobs["boot"])
+
+
+
+
+# ---------------------------------------------------------------------------
+# Cluster concurrency slot leasing.
+#   _log_cluster_role error swallow, maybe_launch_job cluster start-failure
+#   cleanup, _prepare_job_api_run secret staging, _slot_fidelity_reason,
+#   _acquire_slot_lease, _claim_cluster_slot, _spawn_slot_pursuit,
+#   _pursue_replace_slot, _slot_renewer, and the release paths.
+# ---------------------------------------------------------------------------
+
+import cronstable.state as _slotlease_state
+
+_SLOTLEASE_REAL_SLEEP = asyncio.sleep
+
+
+async def _slotlease_fast_sleep(_delay=0, *args, **kwargs):
+    # collapse the slot renewer / pursuit poll waits (floored at 1.0s) so the
+    # loops iterate instantly; loop.time() still advances a hair each pass.
+    await _SLOTLEASE_REAL_SLEEP(0)
+
+
+async def _slotlease_cancel(*tasks):
+    for task in tasks:
+        if task is None:
+            continue
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
+
+def _slotlease_lease(name="slots/s", holder="peer#1", fence=1, expires_at=1e12):
+    return _slotlease_state.Lease(
+        name=name, holder=holder, fence=fence, expires_at=expires_at
+    )
+
+
+_SLOTLEASE_CLUSTER_FORBID = """
+jobs:
+  - name: s
+    command: echo hi
+    schedule: "* * * * *"
+    concurrencyScope: cluster
+    concurrencyPolicy: Forbid
+"""
+
+_SLOTLEASE_CLUSTER_REPLACE = """
+jobs:
+  - name: s
+    command: echo hi
+    schedule: "* * * * *"
+    concurrencyScope: cluster
+    concurrencyPolicy: Replace
+"""
+
+
+class _SlotleaseBackend:
+    """A single-shot fake state backend for the slot-leasing paths."""
+
+    def __init__(
+        self,
+        *,
+        acquire=None,
+        read=None,
+        renew=None,
+        acquire_exc=None,
+        read_exc=None,
+        renew_exc=None,
+        release_exc=None,
+        append_exc=None,
+        records=None,
+    ):
+        self._acquire = acquire
+        self._read = read
+        self._renew = renew
+        self.acquire_exc = acquire_exc
+        self.read_exc = read_exc
+        self.renew_exc = renew_exc
+        self.release_exc = release_exc
+        self.append_exc = append_exc
+        self.records = records if records is not None else []
+        self.released = []
+        self.appended = []
+
+    async def acquire_lease(self, name, holder, ttl):
+        if self.acquire_exc is not None:
+            raise self.acquire_exc
+        return self._acquire
+
+    async def read_lease(self, name):
+        if self.read_exc is not None:
+            raise self.read_exc
+        return self._read
+
+    async def renew_lease(self, lease, ttl):
+        if self.renew_exc is not None:
+            raise self.renew_exc
+        return self._renew
+
+    async def release_lease(self, lease):
+        if self.release_exc is not None:
+            raise self.release_exc
+        self.released.append(lease)
+
+    async def append_record(
+        self, stream, data, *, prune_keep=None, prune_latest_by=None
+    ):
+        if self.append_exc is not None:
+            raise self.append_exc
+        self.appended.append((stream, data))
+        return "rid"
+
+    async def list_records(self, stream, *, limit=None, newest_first=False):
+        return list(self.records)
+
+
+# --- _log_cluster_role: swallow a backend read error (7441-7442) -----------
+
+
+def test_slotlease_log_cluster_role_swallows_backend_error(caplog):
+    import logging
+
+    cron = cronstable.cron.Cron(None)
+    cron._elect_leader_configured = True
+
+    class _Boom:
+        def conflict_names(self):
+            raise RuntimeError("store unreachable")
+
+    cron.cluster_manager = _Boom()
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        cron._log_cluster_role()  # must not raise
+    assert any(
+        "error while logging cluster role" in r.message for r in caplog.records
+    )
+
+
+# --- _prepare_job_api_run: stage secrets, skip an unresolvable one ----------
+
+
+def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
+    monkeypatch, caplog
+):
+    import logging
+    import types
+
+    cron = cronstable.cron.Cron(None)
+    registered = []
+
+    class _Api:
+        base_url = "http://127.0.0.1:65500"
+
+        def register_run(self, ctx):
+            registered.append(ctx)
+
+    cron._job_api = _Api()
+    monkeypatch.delenv("SLOTLEASE_UNSET_SECRET", raising=False)
+    job = types.SimpleNamespace(
+        name="s",
+        secrets=[
+            {"name": "good", "value": "v1"},
+            {"name": "bad", "fromEnvVar": "SLOTLEASE_UNSET_SECRET"},
+        ],
+        stateAllowedScopes=[],
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        token, env = cron._prepare_job_api_run(job, None)
+    assert token is not None
+    assert registered and registered[0].secrets == {"good": "v1"}
+    assert any(
+        "could not stage secret" in r.message for r in caplog.records
+    )
+    assert "CRONSTABLE_STATE_URL" in env or env  # env was built
+
+
+# --- _slot_fidelity_reason -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_fidelity_reason_no_backend():
+    cron = cronstable.cron.Cron(None)
+    cron.state_backend = None
+    assert await cron._slot_fidelity_reason() is None
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_fidelity_reason_probe_error_is_inconclusive():
+    cron = cronstable.cron.Cron(None)
+
+    class _B:
+        async def verify_locking(self):
+            raise RuntimeError("probe blip")
+
+    cron.state_backend = _B()
+    cron._slot_fidelity = None
+    assert await cron._slot_fidelity_reason() is None
+    assert cron._slot_fidelity is None  # nothing latched; retried next claim
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_fidelity_reason_cancelled_propagates():
+    cron = cronstable.cron.Cron(None)
+
+    class _B:
+        async def verify_locking(self):
+            raise asyncio.CancelledError
+
+    cron.state_backend = _B()
+    cron._slot_fidelity = None
+    with pytest.raises(asyncio.CancelledError):
+        await cron._slot_fidelity_reason()
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_fidelity_reason_latches_and_logs(caplog):
+    import logging
+
+    cron = cronstable.cron.Cron(None)
+
+    class _B:
+        async def verify_locking(self):
+            return "locks are advisory only"
+
+    cron.state_backend = _B()
+    cron._slot_fidelity = None
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        assert await cron._slot_fidelity_reason() == "locks are advisory only"
+    assert cron._slot_fidelity == "locks are advisory only"
+    assert any(
+        "file locks cannot be trusted" in r.message for r in caplog.records
+    )
+
+
+# --- _acquire_slot_lease: map timeout/error to None, re-raise cancel --------
+
+
+@pytest.mark.asyncio
+async def test_slotlease_acquire_slot_lease_maps_failures_to_none():
+    cron = cronstable.cron.Cron(None)
+    timed_out = _SlotleaseBackend(acquire_exc=asyncio.TimeoutError())
+    errored = _SlotleaseBackend(acquire_exc=RuntimeError("flock ENOLCK"))
+    assert await cron._acquire_slot_lease(timed_out, "slots/s") is None
+    assert await cron._acquire_slot_lease(errored, "slots/s") is None
+
+
+@pytest.mark.asyncio
+async def test_slotlease_acquire_slot_lease_cancel_propagates():
+    cron = cronstable.cron.Cron(None)
+    cancelling = _SlotleaseBackend(acquire_exc=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await cron._acquire_slot_lease(cancelling, "slots/s")
+
+
+# --- _claim_cluster_slot ---------------------------------------------------
+
+
+def _slotlease_cluster_cron(policy_yaml=_SLOTLEASE_CLUSTER_FORBID, monkeypatch=None):
+    cron = cronstable.cron.Cron(None, config_yaml=policy_yaml)
+    cron._state_configured = True
+    cron._slot_fidelity = ""  # verified: locks fence, skip the probe
+    if monkeypatch is not None:
+        async def _noop_reconcile(job):
+            return None
+
+        monkeypatch.setattr(
+            cron, "_reconcile_takeover_inflight", _noop_reconcile
+        )
+    return cron
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_returns_true_when_state_not_configured():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._state_configured = False
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_degrades_when_backend_is_none():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._state_configured = True
+    cron.state_backend = None
+    cron._state_on_unavailable = "degrade"
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+    assert cron._slot_refs["s"] == 1  # node-local enforcement refcount
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_fails_closed_when_backend_is_none():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._state_configured = True
+    cron.state_backend = None
+    cron._state_on_unavailable = "fail-closed"
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    assert "s" not in cron._slot_refs
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_degrades_when_locks_cannot_fence(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron.state_backend = _SlotleaseBackend()
+
+    async def _bad_fidelity():
+        return "locks are advisory only"
+
+    monkeypatch.setattr(cron, "_slot_fidelity_reason", _bad_fidelity)
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+    assert cron._slot_refs["s"] == 1
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_adopts_live_local_lease(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron.state_backend = _SlotleaseBackend()
+    live = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder())
+    cron._slot_renewers["s"] = live
+    cron._slot_refs["s"] = 1
+    try:
+        assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+        assert cron._slot_refs["s"] == 2  # adopted the live lease
+    finally:
+        await _slotlease_cancel(live)
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_forbid_when_peer_holds_slot(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron.state_backend = _SlotleaseBackend(acquire=None, read=_slotlease_lease())
+    seen = []
+    monkeypatch.setattr(cron, "_sla_peer_owns_slot", lambda name: seen.append(name))
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    assert seen == ["s"]
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_replace_spawns_pursuit(monkeypatch):
+    cron = _slotlease_cluster_cron(_SLOTLEASE_CLUSTER_REPLACE, monkeypatch=monkeypatch)
+    cron.state_backend = _SlotleaseBackend(acquire=None, read=_slotlease_lease())
+    spawned = []
+
+    async def _fake_pursue(job, observed):
+        spawned.append((job.name, observed))
+
+    monkeypatch.setattr(cron, "_pursue_replace_slot", _fake_pursue)
+    monkeypatch.setattr(cron, "_sla_peer_owns_slot", lambda name: None)
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+    pursuit = cron._slot_pursuits.get("s")
+    if pursuit is not None:
+        await pursuit
+    assert spawned and spawned[0][0] == "s"
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_adopts_own_late_acquire(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    # acquire timed out (None) but the read shows OUR holder landed the write.
+    cron.state_backend = _SlotleaseBackend(
+        acquire=None, read=_slotlease_lease(holder=cron._slot_holder())
+    )
+    try:
+        assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+        assert cron._slot_leases["s"].holder == cron._slot_holder()
+        assert cron._slot_refs["s"] == 1
+    finally:
+        await _slotlease_cancel(cron._slot_renewers.get("s"))
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_expired_unreclaimed_falls_to_policy(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    # a foreign lease whose TTL already lapsed: treated as unanswered, so the
+    # degrade policy grants a node-local run.
+    cron.state_backend = _SlotleaseBackend(
+        acquire=None, read=_slotlease_lease(expires_at=1.0)
+    )
+    cron._state_on_unavailable = "degrade"
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+    assert cron._slot_refs["s"] == 1
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_read_timeout_is_unanswered(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron.state_backend = _SlotleaseBackend(
+        acquire=None, read_exc=asyncio.TimeoutError()
+    )
+    cron._state_on_unavailable = "fail-closed"
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_read_error_is_unanswered(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron.state_backend = _SlotleaseBackend(
+        acquire=None, read_exc=RuntimeError("EIO")
+    )
+    cron._state_on_unavailable = "fail-closed"
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is False
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_success_cancels_stale_renewer(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron.state_backend = _SlotleaseBackend(acquire=_slotlease_lease(holder=cron._slot_holder()))
+    # a live renewer with no recorded lease (the adoption branch is skipped):
+    # the fresh acquire must cancel it and install a replacement.
+    stale = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
+    cron._slot_renewers["s"] = stale
+    try:
+        assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+        new = cron._slot_renewers["s"]
+        assert new is not stale  # replaced by a fresh renewer
+        await _slotlease_cancel(stale, new)
+        assert stale.cancelled()
+    finally:
+        await _slotlease_cancel(stale, cron._slot_renewers.get("s"))
+
+
+# --- _spawn_slot_pursuit: single-flight ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_slotlease_spawn_slot_pursuit_is_single_flight():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    job = cron.cron_jobs["s"]
+    existing = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
+    cron._slot_pursuits["s"] = existing
+    try:
+        cron._spawn_slot_pursuit(job, _slotlease_lease())
+        assert cron._slot_pursuits["s"] is existing  # not replaced
+    finally:
+        await _slotlease_cancel(existing)
+
+
+# --- _pursue_replace_slot --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_slotlease_pursue_replace_no_backend_returns():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    cron.state_backend = None
+    await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
+
+
+@pytest.mark.asyncio
+async def test_slotlease_pursue_replace_append_failure_gives_up(caplog):
+    import logging
+
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    cron.state_backend = _SlotleaseBackend(append_exc=RuntimeError("no write"))
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
+    assert any(
+        "could not record the cluster Replace cancel" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_slotlease_pursue_replace_stops_on_shutdown():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    backend = _SlotleaseBackend(read=_slotlease_lease())
+    cron.state_backend = backend
+    cron._stop_event.set()
+    await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
+    assert backend.appended  # the cancel request was recorded before stopping
+
+
+@pytest.mark.asyncio
+async def test_slotlease_pursue_replace_relaunches_when_slot_frees(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    # append ok, then the slot reads back free (holder released) -> relaunch.
+    cron.state_backend = _SlotleaseBackend(read=None)
+    relaunched = []
+
+    async def _fake_launch(job, **kwargs):
+        relaunched.append(job.name)
+        return True
+
+    monkeypatch.setattr(cron, "maybe_launch_job", _fake_launch)
+    await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
+    assert relaunched == ["s"]
+
+
+@pytest.mark.asyncio
+async def test_slotlease_pursue_replace_read_error_is_ignored(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    # append ok; read raises (kept as observed = still foreign held), the
+    # deadline (2 * ttl == 0) then trips and the launch is skipped.
+    cron.state_backend = _SlotleaseBackend(read_exc=RuntimeError("blip"))
+    cron._slot_ttl = 0.0
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
+    assert any("did not yield" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_slotlease_pursue_replace_read_cancel_propagates(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    cron.state_backend = _SlotleaseBackend(read_exc=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
+
+
+# --- _slot_renewer ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_returns_when_lease_gone(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron.state_backend = _SlotleaseBackend()
+    # no lease recorded -> the renewer stands down on its first cycle.
+    await asyncio.wait_for(cron._slot_renewer("s"), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_retires_when_superseded(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron.state_backend = _SlotleaseBackend(renew=_slotlease_lease(holder="me#x"))
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder(), fence=5)
+    # _slot_renewers has NO entry for "s": the renewer sees it was retired
+    # mid-renew and stands down without touching _slot_leases.
+    await asyncio.wait_for(cron._slot_renewer("s"), timeout=5)
+    assert "s" in cron._slot_leases  # left for the finish path to release
+
+
+class _SlotleaseRenewBackend:
+    """Stateful renewer backend driven by a per-call script."""
+
+    def __init__(self, cron, *, list_script, renew_script, read_script):
+        self.cron = cron
+        self.list_script = list(list_script)
+        self.renew_script = list(renew_script)
+        self.read_script = list(read_script)
+        self.n = 0
+
+    async def list_records(self, stream, *, limit=None, newest_first=False):
+        self.n += 1
+        item = self.list_script[min(self.n - 1, len(self.list_script) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def renew_lease(self, lease, ttl):
+        item = self.renew_script[min(self.n - 1, len(self.renew_script) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def read_lease(self, name):
+        item = self.read_script[min(self.n - 1, len(self.read_script) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_list_error_then_taken_over(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    mine = _slotlease_lease(holder=cron._slot_holder(), fence=5)
+    cron._slot_leases["s"] = mine
+    backend = _SlotleaseRenewBackend(
+        cron,
+        # cycle 1: list raises -> recs=[]; renew succeeds -> stored, continue.
+        # cycle 2: list ok empty; renew denied (None) -> read shows a peer
+        #          took the slot over -> pop + return.
+        list_script=[RuntimeError("list blip"), []],
+        renew_script=[_slotlease_lease(holder=cron._slot_holder(), fence=6), None],
+        read_script=[None, _slotlease_lease(holder="peer#9", fence=9)],
+    )
+    cron.state_backend = backend
+    task = asyncio.create_task(cron._slot_renewer("s"))
+    cron._slot_renewers["s"] = task
+    await asyncio.wait_for(task, timeout=5)
+    assert "s" not in cron._slot_leases  # dropped on the takeover
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_renew_timeout_then_error_then_taken_over(
+    monkeypatch,
+):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    mine = _slotlease_lease(holder=cron._slot_holder(), fence=5)
+    cron._slot_leases["s"] = mine
+    backend = _SlotleaseRenewBackend(
+        cron,
+        list_script=[[], [], []],
+        # cycle 1: renew times out -> continue; cycle 2: renew errors ->
+        # warn+continue; cycle 3: renew denied -> read shows takeover -> return.
+        renew_script=[asyncio.TimeoutError(), RuntimeError("EIO"), None],
+        read_script=[None, None, _slotlease_lease(holder="peer#3", fence=7)],
+    )
+    cron.state_backend = backend
+    task = asyncio.create_task(cron._slot_renewer("s"))
+    cron._slot_renewers["s"] = task
+    await asyncio.wait_for(task, timeout=5)
+    assert "s" not in cron._slot_leases
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_replace_request_cancels_instance(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    mine = _slotlease_lease(holder=cron._slot_holder(), fence=5)
+    cron._slot_leases["s"] = mine
+
+    class _FakeRun:
+        def __init__(self):
+            self.replaced = False
+            self.cancelled = False
+
+        async def cancel(self):
+            self.cancelled = True
+
+    run = _FakeRun()
+    cron.running_jobs["s"] = [run]
+    backend = _SlotleaseRenewBackend(
+        cron,
+        # cycle 1: a cancel record aimed at our fence -> cancel the instance;
+        #          renew denied -> read shows our own lease -> keep going.
+        # cycle 2: no record; renew denied -> read shows takeover -> return.
+        list_script=[
+            [{"kind": "cancel", "fence": 5, "by": "peerZ"}],
+            [],
+        ],
+        renew_script=[None, None],
+        read_script=[
+            _slotlease_lease(holder=cron._slot_holder(), fence=5),
+            _slotlease_lease(holder="peer#4", fence=8),
+        ],
+    )
+    cron.state_backend = backend
+    task = asyncio.create_task(cron._slot_renewer("s"))
+    cron._slot_renewers["s"] = task
+    await asyncio.wait_for(task, timeout=5)
+    assert run.replaced is True and run.cancelled is True
+
+
+# --- release paths ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_cluster_slot_decrements_refcount():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_refs["s"] = 2
+    await cron._release_cluster_slot(cron.cron_jobs["s"])
+    assert cron._slot_refs["s"] == 1  # still one user; lease kept
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_cluster_slot_kept_while_instance_runs():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_refs["s"] = 1
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder())
+    cron.running_jobs["s"] = [object()]  # a spawning instance still present
+    await cron._release_cluster_slot(cron.cron_jobs["s"])
+    assert "s" in cron._slot_leases  # not released out from under the run
+    assert "s" not in cron._slot_refs
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_cluster_slot_releases_lease():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    lease = _slotlease_lease(holder=cron._slot_holder())
+    backend = _SlotleaseBackend()
+    cron.state_backend = backend
+    cron._slot_refs["s"] = 1
+    cron._slot_leases["s"] = lease
+    renewer = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
+    cron._slot_renewers["s"] = renewer
+    await cron._release_cluster_slot(cron.cron_jobs["s"])
+    for task in list(cron._pending_state_writes):
+        await task
+    assert renewer.cancelled() or renewer.done()
+    assert backend.released == [lease]
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_cluster_slot_phantom_cleanup():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    backend = _SlotleaseBackend(read=None)  # no lease on disk -> nothing to free
+    cron.state_backend = backend
+    cron._slot_refs["s"] = 1  # a degraded launch left a ref but no lease
+    await cron._release_cluster_slot(cron.cron_jobs["s"])
+    for task in list(cron._pending_state_writes):
+        await task
+    assert backend.released == []
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_slot_lease_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron.state_backend = None
+    await cron._release_slot_lease("s", _slotlease_lease())  # returns, no error
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_slot_lease_skips_when_reclaimed():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    backend = _SlotleaseBackend()
+    cron.state_backend = backend
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder())
+    await cron._release_slot_lease("s", _slotlease_lease())
+    assert backend.released == []  # a fresh claim adopted the on-disk lease
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_slot_lease_warns_on_error(caplog):
+    import logging
+
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron.state_backend = _SlotleaseBackend(release_exc=RuntimeError("EROFS"))
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron._release_slot_lease("s", _slotlease_lease())
+    assert any(
+        "failed to release the concurrency slot" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_phantom_slot_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron.state_backend = None
+    await cron._release_phantom_slot("s")  # returns, no error
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_phantom_slot_releases_own_lease():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    mine = _slotlease_lease(holder=cron._slot_holder())
+    backend = _SlotleaseBackend(read=mine)
+    cron.state_backend = backend
+    await cron._release_phantom_slot("s")
+    assert backend.released == [mine]
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_phantom_slot_swallows_error():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron.state_backend = _SlotleaseBackend(read_exc=RuntimeError("EIO"))
+    await cron._release_phantom_slot("s")  # best-effort; no raise
+
+
+# --- maybe_launch_job: cluster start-failure hands the slot back -----------
+
+
+@pytest.mark.asyncio
+async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
+    monkeypatch,
+):
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    job = cron.cron_jobs["s"]
+
+    async def _claim(j):
+        return True
+
+    monkeypatch.setattr(cron, "_claim_cluster_slot", _claim)
+    released = []
+
+    async def _release(j):
+        released.append(j.name)
+
+    monkeypatch.setattr(cron, "_release_cluster_slot", _release)
+    finished = []
+
+    class _Api:
+        async def finish_run(self, token):
+            finished.append(token)
+
+    cron._job_api = _Api()
+    monkeypatch.setattr(
+        cron,
+        "_prepare_job_api_run",
+        lambda j, rs: ("tok123", {"CRONSTABLE_RUN_ID": "rid"}),
+    )
+
+    class _BoomRun:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(cronstable.cron, "RunningJob", _BoomRun)
+    with pytest.raises(RuntimeError):
+        await cron.maybe_launch_job(job)
+    assert released == ["s"]
+    assert finished == ["tok123"]
+
+
+# --- cancellation propagates through every store call (never swallowed) -----
+
+
+@pytest.mark.asyncio
+async def test_slotlease_claim_read_lease_cancel_propagates(monkeypatch):
+    cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
+    cron.state_backend = _SlotleaseBackend(
+        acquire=None, read_exc=asyncio.CancelledError()
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await cron._claim_cluster_slot(cron.cron_jobs["s"])
+
+
+@pytest.mark.asyncio
+async def test_slotlease_pursue_replace_append_cancel_propagates():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    cron.state_backend = _SlotleaseBackend(append_exc=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_list_cancel_propagates(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder())
+
+    class _B:
+        async def list_records(self, stream, *, limit=None, newest_first=False):
+            raise asyncio.CancelledError
+
+    cron.state_backend = _B()
+    with pytest.raises(asyncio.CancelledError):
+        await cron._slot_renewer("s")
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_renew_cancel_propagates(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder())
+
+    class _B:
+        async def list_records(self, stream, *, limit=None, newest_first=False):
+            return []
+
+        async def renew_lease(self, lease, ttl):
+            raise asyncio.CancelledError
+
+    cron.state_backend = _B()
+    with pytest.raises(asyncio.CancelledError):
+        await cron._slot_renewer("s")
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_readback_error_then_takeover(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder(), fence=5)
+    backend = _SlotleaseRenewBackend(
+        cron,
+        list_script=[[], []],
+        # renew denied both cycles; cycle 1 read-back errors -> continue,
+        # cycle 2 read-back shows a takeover -> pop + return.
+        renew_script=[None, None],
+        read_script=[RuntimeError("blip"), _slotlease_lease(holder="peer#2", fence=8)],
+    )
+    cron.state_backend = backend
+    task = asyncio.create_task(cron._slot_renewer("s"))
+    cron._slot_renewers["s"] = task
+    await asyncio.wait_for(task, timeout=5)
+    assert "s" not in cron._slot_leases
+
+
+@pytest.mark.asyncio
+async def test_slotlease_slot_renewer_readback_cancel_propagates(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder(), fence=5)
+
+    class _B:
+        async def list_records(self, stream, *, limit=None, newest_first=False):
+            return []
+
+        async def renew_lease(self, lease, ttl):
+            return None  # denied -> falls through to the read-back
+
+        async def read_lease(self, name):
+            raise asyncio.CancelledError
+
+    cron.state_backend = _B()
+    task = asyncio.create_task(cron._slot_renewer("s"))
+    cron._slot_renewers["s"] = task
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_slot_lease_cancel_propagates():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron.state_backend = _SlotleaseBackend(release_exc=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await cron._release_slot_lease("s", _slotlease_lease())
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_phantom_slot_skips_when_claim_present():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    backend = _SlotleaseBackend(read=_slotlease_lease(holder=cron._slot_holder()))
+    cron.state_backend = backend
+    cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder())
+    await cron._release_phantom_slot("s")
+    assert backend.released == []  # a live claim owns the slot; not a phantom
+
+
+@pytest.mark.asyncio
+async def test_slotlease_release_phantom_slot_cancel_propagates():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    cron.state_backend = _SlotleaseBackend(read_exc=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await cron._release_phantom_slot("s")
+
+
+# Non-cluster start-failure cleanup and the slot pursuit poll loop.
+
+_SLOTLEASE_NODE_JOB = """
+jobs:
+  - name: s
+    command: echo hi
+    schedule: "* * * * *"
+"""
+
+
+@pytest.mark.asyncio
+async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
+    monkeypatch,
+):
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_NODE_JOB)
+    job = cron.cron_jobs["s"]
+    released = []
+
+    async def _release(j):
+        released.append(j.name)
+
+    monkeypatch.setattr(cron, "_release_cluster_slot", _release)
+    finished = []
+
+    class _Api:
+        async def finish_run(self, token):
+            finished.append(token)
+
+    cron._job_api = _Api()
+    monkeypatch.setattr(cron, "_prepare_job_api_run", lambda j, rs: ("tokN", {}))
+
+    class _BoomRun:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(cronstable.cron, "RunningJob", _BoomRun)
+    with pytest.raises(RuntimeError):
+        await cron.maybe_launch_job(job)
+    assert released == []  # node scope: no cluster slot to hand back
+    assert finished == ["tokN"]  # but the job-API run registration is dropped
+
+
+@pytest.mark.asyncio
+async def test_slotlease_maybe_launch_start_failure_without_job_api(monkeypatch):
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_NODE_JOB)
+    job = cron.cron_jobs["s"]
+    monkeypatch.setattr(cron, "_prepare_job_api_run", lambda j, rs: (None, {}))
+    cron._job_api = None
+
+    class _BoomRun:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(cronstable.cron, "RunningJob", _BoomRun)
+    with pytest.raises(RuntimeError):
+        await cron.maybe_launch_job(job)
+
+
+@pytest.mark.asyncio
+async def test_slotlease_pursue_replace_polls_until_slot_frees(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
+    cron._slot_ttl = 100.0  # deadline is far off, so the poll loop iterates
+    reads = [_slotlease_lease(), None]  # foreign held, then the holder yields
+
+    class _B:
+        async def append_record(self, stream, data, *, prune_keep=None,
+                                 prune_latest_by=None):
+            return "rid"
+
+        async def read_lease(self, name):
+            return reads.pop(0) if reads else None
+
+    cron.state_backend = _B()
+    relaunched = []
+
+    async def _launch(job, **kwargs):
+        relaunched.append(job.name)
+        return True
+
+    monkeypatch.setattr(cron, "maybe_launch_job", _launch)
+    await cron._pursue_replace_slot(cron.cron_jobs["s"], _slotlease_lease())
+    assert relaunched == ["s"]
+
+
+
+# ===================== rehydrate additions =====================
+#
+# The durable-state plumbing in cronstable/cron.py:
+# the inflight open/close persistence, crash reconciliation, run-record and
+# counter-snapshot writes, the rehydrate/reconcile boot paths, retry re-arming
+# and validation, and the completion/failure handlers. The degrade branches
+# (backend torn down, store error, timeout, cancellation) are exercised
+# alongside the real happy-path behaviour so the in-memory maps are asserted.
+
+from cronstable.cron import JobRunInfo as _JRI5
+from cronstable.cron import _job_run_info_from_dict as _from_dict5
+from cronstable.fingerprint import job_digest as _job_digest5
+from tests.test_state import _UTC as _UTC5
+from tests.test_state import _state_cfg as _scfg5
+
+_ONE_JOB_REHYDRATE = (
+    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+)
+
+_RUNALL_REHYDRATE = (
+    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+    "    onMissed: run-all\n"
+)
+
+_DEP_REHYDRATE = (
+    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+    "    onlyIfLastSucceeded: true\n"
+)
+
+_RETRY_REHYDRATE = (
+    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+    "    onFailure:\n"
+    "      retry:\n"
+    "        maximumRetries: 2\n"
+    "        initialDelay: 0.1\n"
+    "        maximumDelay: 1\n"
+    "        backoffMultiplier: 2\n"
+)
+
+_REBOOT_RETRY_REHYDRATE = (
+    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '@reboot'\n"
+    "    onFailure:\n"
+    "      retry:\n"
+    "        maximumRetries: 2\n"
+    "        initialDelay: 0.1\n"
+    "        maximumDelay: 1\n"
+    "        backoffMultiplier: 2\n"
+)
+
+
+def _rehydrate_cfg(tmp_path):
+    return _scfg5("state:\n  path: " + str(tmp_path))
+
+
+async def _rehydrate_state_cron(tmp_path, yaml=_ONE_JOB_REHYDRATE):
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    await cron.start_stop_state(_rehydrate_cfg(tmp_path))
+    return cron
+
+
+async def _raise_oserror5(*args, **kwargs):
+    raise OSError("state store went away")
+
+
+async def _raise_cancelled5(*args, **kwargs):
+    raise asyncio.CancelledError
+
+
+async def _raise_timeout5(*args, **kwargs):
+    raise asyncio.TimeoutError
+
+
+def _mem_run5(outcome, minute):
+    dt = datetime.datetime(2026, 7, 1, 10, minute, 0, tzinfo=_UTC5)
+    return _JRI5(
+        outcome=outcome,
+        exit_code=0 if outcome == "success" else 1,
+        started_at=dt,
+        finished_at=dt,
+        fail_reason=None,
+        output=JobOutputStream(),
+    )
+
+
+async def _rehydrate_seed_pending_retry(
+    cron, *, attempt=1, not_before="2026-07-01T10:00:00+00:00", host=None
+):
+    job = cron.cron_jobs["j"]
+    await cron.state_backend.append_record(
+        cron._retry_stream("j"),
+        {
+            "kind": "pending",
+            "attempt": attempt,
+            "notBefore": not_before,
+            "host": host if host is not None else cron._state_host,
+            "jobDigest": _job_digest5(job),
+            "at": not_before,
+        },
+    )
+
+
+class _FakeRun5:
+    """A minimal RunningJob stand-in carrying just a config with a name."""
+
+    def __init__(self, config, *, state_token=None):
+        self.config = config
+        self.state_token = state_token
+
+
+# --- inflight open/closed persistence --------------------------------------
+
+
+async def test_rehydrate_persist_inflight_open_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    assert cron.state_backend is None
+    await cron._persist_inflight_open(cron.cron_jobs["j"], object())
+
+
+async def test_rehydrate_persist_inflight_open_degrades_on_error(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.append_record = _raise_oserror5
+
+    class _RJ:
+        proc = None
+
+    await cron._persist_inflight_open(cron.cron_jobs["j"], _RJ())  # no raise
+
+
+async def test_rehydrate_persist_inflight_closed_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._persist_inflight_closed("j")
+
+
+async def test_rehydrate_persist_inflight_closed_degrades_on_error(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.append_record = _raise_oserror5
+    await cron._persist_inflight_closed("j")  # no raise
+
+
+# --- inflight reconciliation ------------------------------------------------
+
+
+async def test_rehydrate_reconcile_inflight_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._reconcile_inflight()
+
+
+async def test_rehydrate_reconcile_inflight_skips_running(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.running_jobs["j"].append(object())
+    await cron._reconcile_inflight()  # the only job is running -> skipped
+    assert "j" not in cron.last_run
+
+
+async def test_rehydrate_reconcile_inflight_timeout_breaks(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.list_records = _raise_timeout5
+    await cron._reconcile_inflight()  # a hung store aborts the whole pass
+    assert "j" not in cron.last_run
+
+
+async def test_rehydrate_reconcile_inflight_error_continues(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.list_records = _raise_oserror5
+    await cron._reconcile_inflight()  # a store error skips the job, no crash
+    assert "j" not in cron.last_run
+
+
+async def test_rehydrate_reconcile_inflight_cancelled_propagates(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.list_records = _raise_cancelled5
+    with pytest.raises(asyncio.CancelledError):
+        await cron._reconcile_inflight()
+
+
+# --- takeover reconciliation ------------------------------------------------
+
+
+async def test_rehydrate_reconcile_takeover_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])
+
+
+async def test_rehydrate_reconcile_takeover_error_returns(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.list_records = _raise_oserror5
+    await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])  # no raise
+
+
+async def test_rehydrate_reconcile_takeover_cancelled_propagates(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.list_records = _raise_cancelled5
+    with pytest.raises(asyncio.CancelledError):
+        await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])
+
+
+async def test_rehydrate_reconcile_takeover_skips_own_live_run(tmp_path):
+    # a record this very process wrote (same host AND proc token) is our own
+    # live run: the takeover must stand down and reconcile nothing.
+    cron = await _rehydrate_state_cron(tmp_path)
+    await cron.state_backend.append_record(
+        cron._inflight_stream("j"),
+        {
+            "kind": "open",
+            "host": cron._state_host,
+            "proc": cron._proc_token,
+            "pid": None,
+            "startedAt": "2026-07-01T10:00:00+00:00",
+        },
+    )
+    await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])
+    assert "j" not in cron.last_run
+
+
+async def test_rehydrate_reconcile_takeover_closes_foreign_orphan(tmp_path):
+    # a foreign host's open record is judged purely by fence supersession:
+    # the takeover closes it and surfaces a synthetic unknown-outcome run.
+    cron = await _rehydrate_state_cron(tmp_path)
+    await cron.state_backend.append_record(
+        cron._inflight_stream("j"),
+        {
+            "kind": "open",
+            "host": "other-host",
+            "proc": "deadbeef",
+            "pid": None,
+            "startedAt": "2026-07-01T10:00:00+00:00",
+        },
+    )
+    await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])
+    assert cron.last_run["j"].outcome == "unknown"
+    assert cron._last_completed_at["j"].isoformat() == (
+        "2026-07-01T10:00:00+00:00"
+    )
+    await asyncio.gather(*list(cron._pending_state_writes))
+
+
+async def test_rehydrate_reconcile_open_record_defaults_missing_started(tmp_path):
+    # a record with no startedAt string falls back to "now" for the
+    # interruption instant rather than crashing the reconcile.
+    cron = await _rehydrate_state_cron(tmp_path)
+    await cron.state_backend.append_record(
+        cron._inflight_stream("j"),
+        {"kind": "open", "host": "other-host", "proc": "deadbeef", "pid": None},
+    )
+    await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])
+    assert cron.last_run["j"].outcome == "unknown"
+    await asyncio.gather(*list(cron._pending_state_writes))
+
+
+async def test_rehydrate_reconcile_open_record_runall_leaves_watermark(tmp_path):
+    # under onMissed run-all the interrupted slot is still owed to catch-up,
+    # so the synthetic row carries interruptedAt (no finished_at) and the
+    # rehydrated info's outcome is still unknown.
+    cron = await _rehydrate_state_cron(tmp_path, _RUNALL_REHYDRATE)
+    await cron.state_backend.append_record(
+        cron._inflight_stream("j"),
+        {
+            "kind": "open",
+            "host": "other-host",
+            "proc": "deadbeef",
+            "pid": None,
+            "startedAt": "2026-07-01T10:00:00+00:00",
+        },
+    )
+    await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])
+    assert cron.last_run["j"].outcome == "unknown"
+    await asyncio.gather(*list(cron._pending_state_writes))
+    (rec,) = await cron.state_backend.list_records(cron._run_stream("j"))
+    assert rec.get("finished_at") is None
+    assert rec["interruptedAt"] == "2026-07-01T10:00:00+00:00"
+
+
+async def test_rehydrate_persist_reconciled_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._persist_reconciled_record("j", {"outcome": "unknown"})
+
+
+async def test_rehydrate_persist_reconciled_degrades_on_error(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.append_record = _raise_oserror5
+    await cron._persist_reconciled_record("j", {"outcome": "unknown"})
+
+
+# --- run record / counter snapshot / archive: no-backend guards -------------
+
+
+async def test_rehydrate_persist_run_record_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._persist_run_record("j", _mem_run5("success", 0))
+
+
+async def test_rehydrate_persist_counter_snapshot_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._persist_counter_snapshot()
+
+
+async def test_rehydrate_persist_counter_snapshot_unseeded(tmp_path):
+    # the seed gate: a run finishing before _rehydrate_counters ran must not
+    # write a snapshot the seed would then double-ingest.
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._counters_seeded = False
+    await cron._persist_counter_snapshot()
+    assert await cron.state_backend.list_records(cron._counters_stream()) == []
+
+
+async def test_rehydrate_archive_output_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._archive_output(cron.cron_jobs["j"], _mem_run5("success", 0))
+
+
+# --- SLA last-success warm scan ---------------------------------------------
+
+
+async def test_rehydrate_warm_last_success_cancelled(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.list_records = _raise_cancelled5
+    with pytest.raises(asyncio.CancelledError):
+        await cron._warm_last_success_beyond_history("j", [])
+
+
+async def test_rehydrate_warm_last_success_error_falls_back_to_oldest(tmp_path):
+    # the deeper re-read errors: the reference falls back to the oldest
+    # finished_at seen in the warmed history (a lower bound on staleness).
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron.state_backend.list_records = _raise_oserror5
+    history = [_mem_run5("failure", 5), _mem_run5("failure", 2)]
+    await cron._warm_last_success_beyond_history("j", history)
+    assert cron._sla_last_success["j"] == datetime.datetime(
+        2026, 7, 1, 10, 2, 0, tzinfo=_UTC5
+    )
+
+
+async def test_rehydrate_warm_last_success_finds_deeper_success(tmp_path):
+    # a poison record (no finished_at) is skipped; a real deeper success is
+    # taken as the staleness reference.
+    cron = await _rehydrate_state_cron(tmp_path)
+    await cron.state_backend.append_record(
+        cron._run_stream("j"), {"outcome": "success"}
+    )
+    await cron.state_backend.append_record(
+        cron._run_stream("j"),
+        {"outcome": "success", "finished_at": "2026-07-01T09:00:00+00:00"},
+    )
+    await cron._warm_last_success_beyond_history("j", [])
+    assert cron._sla_last_success["j"].isoformat() == (
+        "2026-07-01T09:00:00+00:00"
+    )
+
+
+# --- rehydrate-from-state degrade branches ----------------------------------
+
+
+async def test_rehydrate_rehydrate_from_state_timeout_breaks(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._state_rehydrated = False
+
+    async def _list(stream, **kw):
+        if stream.startswith("runs/"):
+            raise asyncio.TimeoutError
+        return []
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()  # a hung store aborts the warm-up
+    assert not cron.run_history.get("j")
+
+
+async def test_rehydrate_rehydrate_from_state_oserror_continues(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._state_rehydrated = False
+
+    async def _list(stream, **kw):
+        if stream.startswith("runs/"):
+            raise OSError("boom")
+        return []
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()  # a store error skips this job
+    assert not cron.run_history.get("j")
+
+
+async def test_rehydrate_rehydrate_from_state_warms_history(tmp_path):
+    # the happy path: seeded run records warm run_history and last_run, and
+    # the real onlyIfLastSucceeded / last-completed memos are seeded too.
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._state_rehydrated = False
+    await cron.state_backend.append_record(
+        cron._run_stream("j"),
+        {
+            "outcome": "failure",
+            "exit_code": 1,
+            "finished_at": "2026-07-01T09:00:00+00:00",
+            "ranAt": "2026-07-01T09:00:00+00:00",
+        },
+    )
+    await cron.state_backend.append_record(
+        cron._run_stream("j"),
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "finished_at": "2026-07-01T09:05:00+00:00",
+            "ranAt": "2026-07-01T09:05:00+00:00",
+        },
+    )
+    await cron._rehydrate_from_state()
+    assert len(cron.run_history["j"]) == 2
+    assert cron.last_run["j"].outcome == "success"
+    assert cron._last_real_outcome["j"][1] == "success"
+    assert cron._last_completed_at["j"].isoformat() == (
+        "2026-07-01T09:05:00+00:00"
+    )
+
+
+# --- rehydrate counters -----------------------------------------------------
+
+
+async def test_rehydrate_rehydrate_counters_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._rehydrate_counters()
+
+
+async def test_rehydrate_rehydrate_counters_cancelled(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._counters_seeded = False
+    cron.state_backend.list_records = _raise_cancelled5
+    with pytest.raises(asyncio.CancelledError):
+        await cron._rehydrate_counters()
+
+
+async def test_rehydrate_rehydrate_counters_error_forfeits_seed(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._counters_seeded = False
+    cron.state_backend.list_records = _raise_oserror5
+    await cron._rehydrate_counters()  # the seed is forfeited, latch still set
+    assert cron._counters_seeded is True
+
+
+# --- rehydrate retries ------------------------------------------------------
+
+
+async def test_rehydrate_rehydrate_retries_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    await cron._rehydrate_retries()
+
+
+async def test_rehydrate_rehydrate_retries_skips_live_ladder(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path, _RETRY_REHYDRATE)
+    cron.retry_state["j"] = JobRetryState(1.0, 2.0, 10.0)
+    await cron._rehydrate_retries()  # live in-memory ladder outranks ledger
+    assert cron.retry_state["j"].task is None
+
+
+async def test_rehydrate_rehydrate_retries_timeout_breaks(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path, _RETRY_REHYDRATE)
+
+    async def _list(stream, **kw):
+        if stream.startswith("retries/"):
+            raise asyncio.TimeoutError
+        return []
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_retries()  # hung store aborts the re-arm pass
+    assert "j" not in cron.retry_state
+
+
+async def test_rehydrate_rehydrate_retries_cancelled_propagates(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path, _RETRY_REHYDRATE)
+
+    async def _list(stream, **kw):
+        if stream.startswith("retries/"):
+            raise asyncio.CancelledError
+        return []
+
+    cron.state_backend.list_records = _list
+    with pytest.raises(asyncio.CancelledError):
+        await cron._rehydrate_retries()
+
+
+async def test_rehydrate_rehydrate_retries_error_continues(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path, _RETRY_REHYDRATE)
+
+    async def _list(stream, **kw):
+        if stream.startswith("retries/"):
+            raise OSError("boom")
+        return []
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_retries()  # a store error skips the job
+    assert "j" not in cron.retry_state
+
+
+async def test_rehydrate_rehydrate_retries_durable_lookup_error(tmp_path):
+    # the superseded-by-run memo seed errors: durable_at stays None (guard
+    # left open) and the invalid pending record is then settled, not re-armed.
+    cron = await _rehydrate_state_cron(tmp_path, _RETRY_REHYDRATE)
+    await _rehydrate_seed_pending_retry(cron, attempt=0)  # invalid -> no re-arm
+    cron.durable_last_completed_at = _raise_oserror5
+    await cron._rehydrate_retries()
+    assert "j" not in cron.retry_state
+
+
+async def test_rehydrate_rehydrate_retries_durable_lookup_cancelled(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path, _RETRY_REHYDRATE)
+    await _rehydrate_seed_pending_retry(cron, attempt=0)
+    cron.durable_last_completed_at = _raise_cancelled5
+    with pytest.raises(asyncio.CancelledError):
+        await cron._rehydrate_retries()
+
+
+async def test_rehydrate_rehydrate_retries_reboot_marker_error(tmp_path):
+    # an @reboot pending whose boot-marker probe errors reads as not-covered:
+    # the stale ladder is settled (superseded-by-reboot), never re-armed.
+    cron = await _rehydrate_state_cron(tmp_path, _REBOOT_RETRY_REHYDRATE)
+    await _rehydrate_seed_pending_retry(cron, attempt=1)
+    cron._reboot_marker_covers = _raise_oserror5
+    await cron._rehydrate_retries()
+    assert "j" not in cron.retry_state
+
+
+async def test_rehydrate_rehydrate_retries_reboot_marker_cancelled(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path, _REBOOT_RETRY_REHYDRATE)
+    await _rehydrate_seed_pending_retry(cron, attempt=1)
+    cron._reboot_marker_covers = _raise_cancelled5
+    with pytest.raises(asyncio.CancelledError):
+        await cron._rehydrate_retries()
+
+
+# --- _validate_pending_retry verdicts ---------------------------------------
+
+
+def test_rehydrate_validate_pending_retry_invalid_record(tmp_path):
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRY_REHYDRATE)
+    job = cron.cron_jobs["j"]
+    assert cron._validate_pending_retry("j", job, {"attempt": 0}) is None
+
+
+def test_rehydrate_validate_pending_retry_config_changed(tmp_path):
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRY_REHYDRATE)
+    job = cron.cron_jobs["j"]
+    rec = {
+        "attempt": 1,
+        "notBefore": "1999-01-01T00:00:00+00:00",
+        "jobDigest": "stale-digest",
+    }
+    assert cron._validate_pending_retry("j", job, rec) is None
+
+
+def test_rehydrate_validate_pending_retry_ok(tmp_path):
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRY_REHYDRATE)
+    job = cron.cron_jobs["j"]
+    rec = {
+        "attempt": 1,
+        "notBefore": "1999-01-01T00:00:00+00:00",
+        "jobDigest": _job_digest5(job),
+    }
+    validated = cron._validate_pending_retry("j", job, rec)
+    assert validated is not None
+    attempt, not_before = validated
+    assert attempt == 1
+    assert not_before == datetime.datetime(1999, 1, 1, tzinfo=_UTC5)
+
+
+# --- depends-on-past cancellation propagation -------------------------------
+
+
+async def test_rehydrate_depends_on_past_cancelled_propagates(tmp_path):
+    cron = await _rehydrate_state_cron(tmp_path, _DEP_REHYDRATE)
+    cron.state_backend.list_records = _raise_cancelled5
+    with pytest.raises(asyncio.CancelledError):
+        await cron._depends_on_past_ok(cron.cron_jobs["j"])
+
+
+# --- completion sequencing --------------------------------------------------
+
+
+async def test_rehydrate_queue_completion_chains_behind_prev():
+    # the second completion for one job waits on the first: the serial
+    # per-job retry-arm ordering the reaper used to give inline.
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    job = _FakeRun5(cron.cron_jobs["j"])
+    gate = asyncio.Event()
+    calls = []
+
+    async def _slow(j):
+        calls.append("slow-start")
+        await gate.wait()
+        calls.append("slow-end")
+
+    async def _fast(j):
+        calls.append("fast")
+
+    cron.handle_job_success = _slow
+    cron._queue_job_completion(job, failed=False)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    cron.handle_job_success = _fast
+    cron._queue_job_completion(job, failed=False)  # chains behind the slow one
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert calls == ["slow-start"]  # the fast one is blocked on its prev
+    gate.set()
+    await cron._drain_completions()
+    assert calls == ["slow-start", "slow-end", "fast"]
+
+
+async def test_rehydrate_queue_completion_reraises_cancelled():
+    # a cancellation inside the sequenced handler propagates (it is not
+    # swallowed by the defensive except), ending the task cancelled.
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    job = _FakeRun5(cron.cron_jobs["j"])
+    cron.handle_job_failure = _raise_cancelled5
+    cron._queue_job_completion(job, failed=True)
+    await cron._drain_completions()
+    assert cron._completion_tasks == set()
+
+
+# --- finished DAG task reaping ----------------------------------------------
+
+
+async def test_rehydrate_handle_finished_dag_task_survives_dag_error():
+    # a DAG scheduler error while recording a task completion is logged, never
+    # allowed to kill the reaper; the task is still removed from running_jobs.
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    rj = _FakeRun5(cron.cron_jobs["j"], state_token=None)
+    cron.running_jobs["j"].append(rj)
+
+    async def _boom(job):
+        raise RuntimeError("dag exploded")
+
+    cron._dag.on_task_finished = _boom
+    await cron._handle_finished_dag_task(rj)  # no raise
+    assert "j" not in cron.running_jobs
+
+
+# --- handle_job_failure: stderr log + live retry-task cancel ----------------
+
+
+async def test_rehydrate_handle_job_failure_logs_stderr_and_cancels_task():
+    # a failing run with captured stderr logs it, then an armed-but-live
+    # retry task is cancelled before the exhausted ladder is settled.
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRY_REHYDRATE)
+
+    async def _sleeper():
+        await asyncio.sleep(100)
+
+    state = JobRetryState(0.1, 2.0, 1.0)
+    state.count = 5  # already past maximumRetries (2): exhausted branch
+    state.task = asyncio.create_task(_sleeper())
+
+    class _FailJob5:
+        def __init__(self, config, retry_state):
+            self.config = config
+            self.retry_state = retry_state
+            self.stdout = ""
+            self.stderr = "an error happened"
+
+        async def report_failure(self):
+            return None
+
+        async def report_permanent_failure(self):
+            return None
+
+    job = _FailJob5(cron.cron_jobs["j"], state)
+    await cron.handle_job_failure(job)
+    # the live task was cancelled; let the cancellation settle, then confirm.
+    try:
+        await state.task
+    except asyncio.CancelledError:
+        pass
+    assert state.task.cancelled()
+
+
+
+
+# ===================================================================
+# Job start/pause/resume, SLA, and the cross-node retry claim machinery
+# (start_job_by_name, pause/resume, pause-store refresh, SLA banking/
+# observations/report, and the cross-node retry claim/consume machinery)
+# ===================================================================
+
+_RETRYCLAIM_RETRY_JOB = """
+jobs:
+  - name: j
+    command: ls
+    schedule: "0 0 * * *"
+    onFailure:
+      retry:
+        maximumRetries: 3
+        initialDelay: 1
+        maximumDelay: 60
+        backoffMultiplier: 2
+"""
+
+_RETRYCLAIM_RETRY_JOB_DEADLINE = """
+jobs:
+  - name: j
+    command: ls
+    schedule: "0 0 * * *"
+    startingDeadlineSeconds: 60
+    onFailure:
+      retry:
+        maximumRetries: 3
+        initialDelay: 1
+        maximumDelay: 60
+        backoffMultiplier: 2
+"""
+
+_RETRYCLAIM_RETRY_JOB_NO_RETRY = """
+jobs:
+  - name: j
+    command: ls
+    schedule: "0 0 * * *"
+"""
+
+
+async def _retryclaim_stateful(tmp_path, yaml, extra=""):
+    from tests.test_state import _state_cfg
+
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    cfg = _state_cfg("state:\n  path: {}\n{}".format(tmp_path, extra))
+    await cron.start_stop_state(cfg)
+    assert cron.state_backend is not None
+    return cron
+
+
+async def _retryclaim_stop(cron):
+    from tests.test_state import _drain_state_writes
+
+    await _drain_state_writes(cron)
+    if cron.state_backend is not None:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+def _retryclaim_foreign(cron, job, host="node-a", secs_stale=120):
+    from cronstable.fingerprint import job_digest
+
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    stale = now - datetime.timedelta(seconds=secs_stale)
+    return {
+        "kind": "pending",
+        "attempt": 1,
+        "notBefore": stale.isoformat(),
+        "jobDigest": job_digest(job),
+        "host": host,
+        "at": stale.isoformat(),
+    }
+
+
+# --- start_job_by_name ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_start_job_unknown_raises_404():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    with pytest.raises(cronstable.cron.ApiActionError) as ei:
+        await cron.start_job_by_name("ghost")
+    assert ei.value.status == 404
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_start_job_counts_as_pause_deferred_boot_run(monkeypatch):
+    # a manual start of a job whose boot run a pause deferred IS the boot run:
+    # the paused-reboot entry is retired and the durable boot marker written.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron._paused_reboot_jobs.add("alpha")
+    cron._state_configured = True
+    gated = []
+
+    async def _gate(job):
+        gated.append(job.name)
+        return True
+
+    monkeypatch.setattr(cron, "_reboot_boot_gate", _gate)
+    launched = []
+    monkeypatch.setattr(
+        cron, "maybe_launch_job", lambda j: launched.append(j.name) or _noop()
+    )
+    await cron.start_job_by_name("alpha")
+    assert "alpha" not in cron._paused_reboot_jobs
+    assert gated == ["alpha"]
+    assert launched == ["alpha"]
+
+
+# --- pause_job_by_name / _refresh_pauses_from_store / _pause_info ----------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_pause_job_naive_until_gets_utc():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    naive = DT(1999, 12, 31, 13, 0, 0)  # naive, one hour past the frozen now
+    await cron.pause_job_by_name("alpha", until=naive)
+    got = cron._paused["alpha"].until
+    assert got.tzinfo is not None
+    assert got == DT(1999, 12, 31, 13, 0, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_refresh_pauses_no_backend_returns():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    assert cron.state_backend is None
+    # returns immediately with no backend (no raise)
+    await cron._refresh_pauses_from_store()
+
+
+def test_retryclaim_pause_info_from_record_variants():
+    f = cronstable.cron.Cron._pause_info_from_record
+    assert f(None) is None
+    assert f({"kind": "resumed"}) is None
+    # a paused record with an unparseable `until` reads as not paused
+    assert f({"kind": "paused", "until": "not-a-date"}) is None
+    info = f(
+        {
+            "kind": "paused",
+            "until": "1999-12-31T13:00:00+00:00",
+            "since": None,
+            "note": 5,
+            "by": None,
+            "channel": 7,
+        }
+    )
+    assert info is not None
+    # non-string audit fields normalise to ""; a missing since defaults to until
+    assert info.note == "" and info.by == "" and info.channel == ""
+    assert info.since == info.until
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_refresh_pauses_from_store_skip_removed_and_replace(
+    tmp_path,
+):
+    cron = await _retryclaim_stateful(tmp_path, TWO_JOBS)
+    try:
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+        until1 = now + datetime.timedelta(hours=1)
+        until2 = now + datetime.timedelta(hours=2)
+        # a stream for a job not in the config: the sweep skips it entirely
+        await cron.state_backend.append_record(
+            "paused/ghost",
+            {
+                "kind": "paused",
+                "since": now.isoformat(),
+                "until": until1.isoformat(),
+                "note": "",
+                "by": "",
+                "channel": "",
+                "at": now.isoformat(),
+                "host": "h",
+            },
+        )
+        # alpha already paused in memory with a DIFFERENT window: the store's
+        # newer window replaces it and banks the one it superseded.
+        cron._paused["alpha"] = cronstable.cron.PauseInfo(
+            since=now - datetime.timedelta(minutes=30),
+            until=until1,
+            note="",
+            by="",
+            channel="",
+        )
+        await cron.state_backend.append_record(
+            "paused/alpha",
+            {
+                "kind": "paused",
+                "since": now.isoformat(),
+                "until": until2.isoformat(),
+                "note": "",
+                "by": "",
+                "channel": "",
+                "at": now.isoformat(),
+                "host": "h",
+            },
+        )
+        await cron._refresh_pauses_from_store()
+        assert "ghost" not in cron._paused  # removed-job stream skipped
+        assert cron._paused["alpha"].until == until2  # window replaced
+    finally:
+        await _retryclaim_stop(cron)
+
+
+# --- SLA banking / observations / report ----------------------------------
+
+
+def test_retryclaim_sla_bank_pause_clamps_ended_at_to_until():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    cron._sla_last_success["s"] = now  # pin the staleness reference at `now`
+    was = cronstable.cron.PauseInfo(
+        since=now,
+        until=now + datetime.timedelta(hours=1),
+        note="",
+        by="",
+        channel="",
+    )
+    # ended_at AFTER `until`: it is clamped down to `until` before banking
+    cron._sla_bank_pause("s", was, now + datetime.timedelta(hours=2))
+    spans = cron._sla_pause_windows.get("s")
+    assert spans is not None
+    assert spans[-1][1] == now + datetime.timedelta(hours=1)
+
+
+def test_retryclaim_sla_observations_skips_runjob_without_started_at():
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_RUNTIME_JOB)
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+
+    class _R:
+        started_at = None
+
+    cron.running_jobs["s"] = [_R()]
+    obs = cron._sla_observations("s", cron.cron_jobs["s"], now)
+    threshold, observed, breached = obs[RUNTIME]
+    assert observed == 0.0 and breached is False
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_queue_sla_report_waits_for_earlier_tail(monkeypatch):
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+    reports = _sla_report_recorder(monkeypatch)
+    gate = asyncio.Event()
+
+    async def _blocked():
+        await gate.wait()
+
+    prev = asyncio.create_task(_blocked())
+    cron._completion_tail["s"] = prev  # an in-flight completion report
+    cron._queue_sla_report(cron.cron_jobs["s"], STALE, 3600, 4000.0)
+    task = cron._sla_report_tail["s"]
+    await asyncio.sleep(0)
+    assert not task.done()  # ordered behind the earlier tail
+    assert reports == []
+    gate.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert len(reports) == 1
+    prev.cancel()
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_queue_sla_report_reraises_cancelled(monkeypatch):
+    cron = cronstable.cron.Cron(None, config_yaml=_SLA_STALE_JOB)
+
+    async def _cancel(ctx, cfg):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(cronstable.cron, "report_sla_breach", _cancel)
+    cron._queue_sla_report(cron.cron_jobs["s"], STALE, 3600, 4000.0)
+    task = cron._sla_report_tail["s"]
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+# --- web resume validation ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_web_resume_job_rejects_nonstring_by():
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        can_read_body = True
+        match_info = {"name": "alpha"}
+
+        async def json(self):
+            return {"by": 123}
+
+    with pytest.raises(web.HTTPBadRequest):
+        await cron._web_resume_job(Req())
+
+
+# --- schedule_retry_job gate/pause returns --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_schedule_retry_paused_returns_when_state_gone():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    cron._paused["alpha"] = cronstable.cron.PauseInfo(
+        since=now,
+        until=now + datetime.timedelta(hours=1),
+        note="",
+        by="",
+        channel="",
+    )
+    # no retry_state entry: the paused branch sees state None and returns
+    await cron.schedule_retry_job("alpha", 0.0, 1)
+    assert "alpha" not in cron.retry_state
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_schedule_retry_transient_gate_returns_when_cancelled(
+    monkeypatch,
+):
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = None  # Leader fails closed; no positive owner
+    state = JobRetryState(0.01, 1, 0.01)
+    state.cancelled = True
+    cron.retry_state["alpha"] = state
+    launched = []
+    monkeypatch.setattr(
+        cron, "maybe_launch_job", lambda j: launched.append(j.name) or _noop()
+    )
+    await cron.schedule_retry_job("alpha", 0.0, 1)
+    assert launched == []  # returned at the cancelled-state guard, no launch
+
+
+# --- retry write plumbing -------------------------------------------------
+
+
+def test_retryclaim_note_retry_write_dropped_warns_when_state_configured(caplog):
+    import logging
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron._state_configured = True
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        cron._note_retry_write_dropped("alpha", "pending")
+    assert any(
+        "dropping retry-ladder record" in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_queue_retry_write_orders_behind_prev_no_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    gate = asyncio.Event()
+
+    async def _blocked():
+        await gate.wait()
+
+    prev = asyncio.create_task(_blocked())
+    cron._retry_write_tail["alpha"] = prev
+    task = cron._queue_retry_write("alpha", {"kind": "settled"})
+    await asyncio.sleep(0)
+    assert not task.done()  # ordered behind the in-flight previous write
+    gate.set()
+    # the append runs with no backend: it notes the drop and returns cleanly
+    await asyncio.wait_for(task, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_append_retry_record_survives_backend_error(
+    tmp_path, caplog
+):
+    import logging
+
+    cron = await _retryclaim_stateful(tmp_path, TWO_JOBS)
+    try:
+
+        async def _boom(*a, **k):
+            raise OSError("disk gone")
+
+        cron.state_backend.append_record = _boom
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await cron._append_retry_record("alpha", {"kind": "settled"})
+        assert any(
+            "failed to persist retry state" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        await _retryclaim_stop(cron)
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_append_pause_record_defers_without_backend():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron._state_configured = True  # a store is configured but torn down
+    assert cron.state_backend is None
+    await cron._append_pause_record(
+        "alpha", {"kind": "paused", "until": "1999-12-31T13:00:00+00:00"}
+    )
+    assert "alpha" in cron._pause_pending_writes
+
+
+# --- _retry_consume_ok ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_retry_consume_ok_tolerates_slow_prev_tail(monkeypatch):
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    appended = []
+
+    async def _append(stream, record, **k):
+        appended.append(record)
+
+    cron.state_backend = types.SimpleNamespace(append_record=_append)
+    slow = asyncio.create_task(asyncio.sleep(10))
+    cron._retry_write_tail["alpha"] = slow
+    monkeypatch.setattr(cronstable.cron, "STATE_OP_TIMEOUT", 0.02)
+    ok = await cron._retry_consume_ok("alpha", 1, quiet=True)
+    assert ok is True  # the settle wrote once the prev-wait timed out
+    assert appended and appended[0]["reason"] == "launched"
+    slow.cancel()
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_retry_consume_ok_reraises_cancelled():
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+
+    async def _append(stream, record, **k):
+        raise asyncio.CancelledError()
+
+    cron.state_backend = types.SimpleNamespace(append_record=_append)
+    with pytest.raises(asyncio.CancelledError):
+        await cron._retry_consume_ok("alpha", 1, quiet=True)
+
+
+# --- _acquire_retry_claim -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_acquire_retry_claim_timeout_returns_none(monkeypatch):
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+
+    async def _slow(*a, **k):
+        await asyncio.sleep(10)
+
+    backend = types.SimpleNamespace(acquire_lease=_slow)
+    monkeypatch.setattr(cronstable.cron, "STATE_OP_TIMEOUT", 0.02)
+    got = await cron._acquire_retry_claim(
+        backend, cron.cron_jobs["j"], 1, quiet=True
+    )
+    assert got is None
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_acquire_retry_claim_error_returns_none(caplog):
+    import logging
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+
+    async def _boom(*a, **k):
+        raise OSError("no locks")
+
+    backend = types.SimpleNamespace(acquire_lease=_boom)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        got = await cron._acquire_retry_claim(
+            backend, cron.cron_jobs["j"], 1, quiet=False
+        )
+    assert got is None
+    assert any(
+        "retry-claim store call raised" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+# --- _retry_consume_decision (cross-node) ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_consume_decision_eligible_but_no_backend(monkeypatch):
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    assert cron.state_backend is None
+    decision = await cron._retry_consume_decision(
+        cron.cron_jobs["j"], 1, quiet=True
+    )
+    assert decision == "launch"  # degrades to the classic consume_ok
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_consume_decision_aborts_on_foreign_record(monkeypatch):
+    import types
+
+    from cronstable.state import Lease
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    released = []
+    lease = Lease(
+        name="l", holder=cron._slot_holder(), fence=1, expires_at=9e18
+    )
+
+    async def _acq(*a, **k):
+        return lease
+
+    async def _list(*a, **k):
+        return [{"host": "another-node", "kind": "pending"}]
+
+    async def _rel(lz):
+        released.append(lz)
+        raise OSError("release failed")  # swallowed by the finally guard
+
+    cron.state_backend = types.SimpleNamespace(
+        acquire_lease=_acq, list_records=_list, release_lease=_rel
+    )
+    decision = await cron._retry_consume_decision(
+        cron.cron_jobs["j"], 1, quiet=True
+    )
+    assert decision == "abort"  # a foreign newest record moved the ladder
+    assert released == [lease]
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_consume_decision_defers_for_live_claimer(monkeypatch):
+    import types
+
+    from cronstable.state import Lease
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+
+    async def _acq_none(*a, **k):
+        return None
+
+    async def _read(name):
+        return Lease(name=name, holder="rival#1", fence=1, expires_at=9e18)
+
+    cron.state_backend = types.SimpleNamespace(
+        acquire_lease=_acq_none, read_lease=_read
+    )
+    decision = await cron._retry_consume_decision(
+        cron.cron_jobs["j"], 1, quiet=True
+    )
+    assert decision == "defer"  # a live claimer holds the lease
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_consume_decision_read_timeout_fail_closed_defers(
+    monkeypatch,
+):
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    cron._state_on_unavailable = "fail-closed"
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+
+    async def _acq_none(*a, **k):
+        return None
+
+    async def _read_timeout(name):
+        raise asyncio.TimeoutError()
+
+    cron.state_backend = types.SimpleNamespace(
+        acquire_lease=_acq_none, read_lease=_read_timeout
+    )
+    decision = await cron._retry_consume_decision(
+        cron.cron_jobs["j"], 1, quiet=True
+    )
+    assert decision == "defer"  # cannot serialize + fail-closed
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_consume_decision_read_cancelled_propagates(monkeypatch):
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+
+    async def _acq_none(*a, **k):
+        return None
+
+    async def _read_cancel(name):
+        raise asyncio.CancelledError()
+
+    cron.state_backend = types.SimpleNamespace(
+        acquire_lease=_acq_none, read_lease=_read_cancel
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await cron._retry_consume_decision(cron.cron_jobs["j"], 1, quiet=True)
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_consume_decision_adopts_late_lease_and_launches(
+    monkeypatch,
+):
+    import types
+
+    from cronstable.state import Lease
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    released = []
+    own = Lease(
+        name="l", holder=cron._slot_holder(), fence=1, expires_at=9e18
+    )
+
+    async def _acq_none(*a, **k):
+        return None
+
+    async def _read(name):
+        return own  # our own late-landing acquire, observed on read-back
+
+    async def _list_boom(*a, **k):
+        raise OSError("read fail")  # degrade -> recs=[]
+
+    async def _append(stream, record, **k):
+        pass
+
+    async def _rel(lz):
+        released.append(lz)
+
+    cron.state_backend = types.SimpleNamespace(
+        acquire_lease=_acq_none,
+        read_lease=_read,
+        list_records=_list_boom,
+        release_lease=_rel,
+        append_record=_append,
+    )
+    decision = await cron._retry_consume_decision(
+        cron.cron_jobs["j"], 1, quiet=True
+    )
+    assert decision == "launch"
+    assert released == [own]  # the adopted lease is released
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_consume_decision_list_error_fail_closed_defers(
+    monkeypatch,
+):
+    import types
+
+    from cronstable.state import Lease
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    cron._state_on_unavailable = "fail-closed"
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    lease = Lease(
+        name="l", holder=cron._slot_holder(), fence=1, expires_at=9e18
+    )
+
+    async def _acq(*a, **k):
+        return lease
+
+    async def _list_boom(*a, **k):
+        raise OSError("read fail")
+
+    async def _rel(lz):
+        pass
+
+    cron.state_backend = types.SimpleNamespace(
+        acquire_lease=_acq, list_records=_list_boom, release_lease=_rel
+    )
+    decision = await cron._retry_consume_decision(
+        cron.cron_jobs["j"], 1, quiet=True
+    )
+    assert decision == "defer"  # unreadable ladder + fail-closed
+
+
+# --- _retry_claim_scan ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_retry_claim_scan_inactive_returns():
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    # cross-node resume inactive (no backend) -> returns without scanning
+    await cron._retry_claim_scan()
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_retry_claim_scan_logs_and_continues_on_error(
+    monkeypatch, caplog
+):
+    import logging
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    monkeypatch.setattr(cron, "_retry_resume_active", lambda: True)
+
+    async def _boom(name, job):
+        raise RuntimeError("scan bug")
+
+    monkeypatch.setattr(cron, "_maybe_claim_retry", _boom)
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cron._retry_claim_scan()
+    assert any("scanning job" in r.getMessage() for r in caplog.records)
+
+
+# --- _maybe_claim_retry ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_maybe_claim_retry_guards(monkeypatch):
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    job = cron.cron_jobs["j"]
+    # no backend -> returns
+    await cron._maybe_claim_retry("j", job)
+
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    cron.state_backend = types.SimpleNamespace()  # non-None sentinel
+    # a running instance outranks a claim
+    cron.running_jobs["j"] = ["run"]
+    await cron._maybe_claim_retry("j", job)
+    cron.running_jobs["j"] = []
+    # a live local ladder (count > 0) outranks
+    st = JobRetryState(1, 2, 60)
+    st.next_delay()
+    cron.retry_state["j"] = st
+    await cron._maybe_claim_retry("j", job)
+    cron.retry_state.pop("j")
+    # the cluster does not currently allow this node to run it
+    monkeypatch.setattr(cron, "_cluster_allows", lambda job: False)
+    await cron._maybe_claim_retry("j", job)
+    assert "j" not in cron.retry_state
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_maybe_claim_retry_disabled_or_no_retries(monkeypatch):
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB_NO_RETRY)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    cron.state_backend = types.SimpleNamespace()
+    # maximumRetries defaults to 0 for a job with no onFailure.retry block
+    await cron._maybe_claim_retry("j", cron.cron_jobs["j"])
+    assert "j" not in cron.retry_state
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_maybe_claim_retry_list_error_returns(monkeypatch):
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    monkeypatch.setattr(cron, "_cluster_allows", lambda job: True)
+
+    async def _list_boom(*a, **k):
+        raise OSError("read fail")
+
+    cron.state_backend = types.SimpleNamespace(list_records=_list_boom)
+    await cron._maybe_claim_retry("j", cron.cron_jobs["j"])
+    assert "j" not in cron.retry_state
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_maybe_claim_retry_acquire_timeout_returns(monkeypatch):
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    monkeypatch.setattr(cron, "_cluster_allows", lambda job: True)
+    cron._state_host = "node-b"
+    job = cron.cron_jobs["j"]
+    foreign = _retryclaim_foreign(cron, job)
+
+    async def _list_ok(*a, **k):
+        return [foreign]
+
+    async def _acq_slow(*a, **k):
+        await asyncio.sleep(10)
+
+    cron.state_backend = types.SimpleNamespace(
+        list_records=_list_ok, acquire_lease=_acq_slow
+    )
+    monkeypatch.setattr(cronstable.cron, "STATE_OP_TIMEOUT", 0.02)
+    await cron._maybe_claim_retry("j", job)  # acquire times out -> no claim
+    assert "j" not in cron.retry_state
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_maybe_claim_retry_release_error_swallowed(monkeypatch):
+    import types
+
+    from cronstable.state import Lease
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
+    monkeypatch.setattr(cron, "_cluster_allows", lambda job: True)
+    cron._state_host = "node-b"
+    job = cron.cron_jobs["j"]
+    foreign = _retryclaim_foreign(cron, job)
+
+    async def _list_ok(*a, **k):
+        return [foreign]
+
+    async def _acq(*a, **k):
+        return Lease(name="l", holder="x", fence=1, expires_at=9e18)
+
+    async def _rel_boom(lz):
+        raise OSError("release failed")
+
+    async def _claim_false(*a, **k):
+        return False
+
+    cron.state_backend = types.SimpleNamespace(
+        list_records=_list_ok, acquire_lease=_acq, release_lease=_rel_boom
+    )
+    monkeypatch.setattr(cron, "_claim_retry_under_lease", _claim_false)
+    await cron._maybe_claim_retry("j", job)  # release error is swallowed
+    assert "j" not in cron.retry_state
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_maybe_claim_retry_claims_and_arms(tmp_path, monkeypatch):
+    import types
+
+    from cronstable.fingerprint import job_digest
+
+    cron = await _retryclaim_stateful(
+        tmp_path, _RETRYCLAIM_RETRY_JOB, extra="  topology: shared\n"
+    )
+    try:
+        cron._elect_leader_configured = True
+        cron.cluster_manager = types.SimpleNamespace(
+            distribution="single-leader",
+            is_leader=lambda: True,
+            is_quorate=lambda: True,
+            has_conflict=lambda: False,
+            view_settled=lambda: True,
+            is_available_leader=lambda: True,
+        )
+        assert cron._retry_resume_active() is True
+        cron._state_host = "node-b"
+        job = cron.cron_jobs["j"]
+        foreign = _retryclaim_foreign(cron, job, host="node-a")
+        await cron.state_backend.append_record("retries/j", foreign)
+        armed = []
+
+        async def _fake_sched(name, delay, attempt):
+            armed.append((name, delay, attempt))
+
+        monkeypatch.setattr(cron, "schedule_retry_job", _fake_sched)
+        await cron._maybe_claim_retry("j", job)
+        assert "j" in cron.retry_state  # claimed and armed a local ladder
+        # the ladder arms via asyncio.create_task; let it run once so the
+        # scheduling call lands before we assert on it.
+        await cron.retry_state["j"].task
+        assert armed and armed[0][0] == "j" and armed[0][2] == 1
+        from tests.test_state import _drain_state_writes
+
+        await _drain_state_writes(cron)
+        recs = await cron.state_backend.list_records(
+            "retries/j", limit=1, newest_first=True
+        )
+        assert recs[0]["host"] == "node-b"
+        assert recs[0]["claimedFrom"] == "node-a"
+        assert recs[0]["jobDigest"] == job_digest(job)
+    finally:
+        await _retryclaim_stop(cron)
+
+
+# --- _claim_retry_under_lease ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_claim_under_lease_no_backend_false():
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    ok = await cron._claim_retry_under_lease(
+        "j", cron.cron_jobs["j"], {}, 1, now
+    )
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_claim_under_lease_recheck_mismatch_false(tmp_path):
+    cron = await _retryclaim_stateful(tmp_path, _RETRYCLAIM_RETRY_JOB)
+    try:
+        cron._state_host = "node-b"
+        job = cron.cron_jobs["j"]
+        foreign = _retryclaim_foreign(cron, job, host="node-a")
+        await cron.state_backend.append_record("retries/j", foreign)
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+        # the record we "saw" differs from what is now newest -> declined
+        stale_view = dict(foreign, attempt=2)
+        ok = await cron._claim_retry_under_lease(
+            "j", job, stale_view, 2, now
+        )
+        assert ok is False
+    finally:
+        await _retryclaim_stop(cron)
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_claim_under_lease_list_error_false(tmp_path, monkeypatch):
+    cron = await _retryclaim_stateful(tmp_path, _RETRYCLAIM_RETRY_JOB)
+    try:
+        job = cron.cron_jobs["j"]
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+
+        async def _boom(*a, **k):
+            raise OSError("read fail")
+
+        cron.state_backend.list_records = _boom
+        ok = await cron._claim_retry_under_lease("j", job, {}, 1, now)
+        assert ok is False
+    finally:
+        await _retryclaim_stop(cron)
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_claim_under_lease_durable_read_error_false(
+    tmp_path, monkeypatch
+):
+    cron = await _retryclaim_stateful(tmp_path, _RETRYCLAIM_RETRY_JOB)
+    try:
+        cron._state_host = "node-b"
+        job = cron.cron_jobs["j"]
+        foreign = _retryclaim_foreign(cron, job, host="node-a")
+        await cron.state_backend.append_record("retries/j", foreign)
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+
+        async def _boom(name):
+            raise OSError("ledger read fail")
+
+        monkeypatch.setattr(cron, "durable_last_completed_at", _boom)
+        ok = await cron._claim_retry_under_lease(
+            "j", job, foreign, 1, foreign_notbefore(foreign)
+        )
+        assert ok is False
+    finally:
+        await _retryclaim_stop(cron)
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_claim_under_lease_superseded_by_run(tmp_path, monkeypatch):
+    cron = await _retryclaim_stateful(tmp_path, _RETRYCLAIM_RETRY_JOB)
+    try:
+        cron._state_host = "node-b"
+        job = cron.cron_jobs["j"]
+        foreign = _retryclaim_foreign(cron, job, host="node-a")
+        await cron.state_backend.append_record("retries/j", foreign)
+        now = cronstable.cron.get_now(datetime.timezone.utc)
+        later = (now + datetime.timedelta(minutes=1)).isoformat()
+
+        async def _durable(name):
+            return later  # a run finished AFTER the ladder was armed
+
+        monkeypatch.setattr(cron, "durable_last_completed_at", _durable)
+        ok = await cron._claim_retry_under_lease(
+            "j", job, foreign, 1, foreign_notbefore(foreign)
+        )
+        assert ok is False
+        from tests.test_state import _drain_state_writes
+
+        await _drain_state_writes(cron)
+        recs = await cron.state_backend.list_records(
+            "retries/j", limit=1, newest_first=True
+        )
+        assert recs[0]["kind"] == "settled"
+        assert recs[0]["reason"] == "superseded-by-run"
+    finally:
+        await _retryclaim_stop(cron)
+
+
+def foreign_notbefore(rec):
+    return datetime.datetime.fromisoformat(rec["notBefore"])
+
+
+# --- _retry_record_claimable ----------------------------------------------
+
+
+def test_retryclaim_retry_record_claimable_variants():
+    from cronstable.fingerprint import job_digest
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    job = cron.cron_jobs["j"]
+    f = cron._retry_record_claimable
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    stale = (now - datetime.timedelta(seconds=120)).isoformat()
+    dig = job_digest(job)
+    # not a pending/handoff record
+    assert f("j", job, {"kind": "settled"}) is None
+    # a bool attempt (bool is an int subclass) is rejected
+    assert (
+        f("j", job, {"kind": "pending", "attempt": True, "notBefore": stale})
+        is None
+    )
+    # attempt beyond maximumRetries
+    assert (
+        f(
+            "j",
+            job,
+            {
+                "kind": "pending",
+                "attempt": 99,
+                "notBefore": stale,
+                "jobDigest": dig,
+                "host": "node-a",
+            },
+        )
+        is None
+    )
+    # our own pending is rehydration's business, not the scan's
+    assert (
+        f(
+            "j",
+            job,
+            {
+                "kind": "pending",
+                "attempt": 1,
+                "notBefore": stale,
+                "jobDigest": dig,
+                "host": cron._state_host,
+            },
+        )
+        is None
+    )
+    # a foreign pending still within the staleness grace: too fresh to claim
+    fresh = (now - datetime.timedelta(seconds=1)).isoformat()
+    assert (
+        f(
+            "j",
+            job,
+            {
+                "kind": "pending",
+                "attempt": 1,
+                "notBefore": fresh,
+                "jobDigest": dig,
+                "host": "node-a",
+                "at": fresh,
+            },
+        )
+        is None
+    )
+    # a handoff record is immediately claimable (no grace)
+    claim = f(
+        "j",
+        job,
+        {
+            "kind": "handoff",
+            "attempt": 2,
+            "notBefore": stale,
+            "jobDigest": dig,
+            "fromHost": "node-a",
+            "at": stale,
+        },
+    )
+    assert claim is not None and claim[0] == 2
+
+
+def test_retryclaim_retry_record_claimable_deadline_exceeded():
+    from cronstable.fingerprint import job_digest
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB_DEADLINE)
+    job = cron.cron_jobs["j"]
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    # notBefore is older than startingDeadlineSeconds (60): past its deadline
+    old = (now - datetime.timedelta(seconds=600)).isoformat()
+    rec = {
+        "kind": "pending",
+        "attempt": 1,
+        "notBefore": old,
+        "jobDigest": job_digest(job),
+        "host": "node-a",
+        "at": old,
+    }
+    assert cron._retry_record_claimable("j", job, rec) is None
+
+
+# --- _cluster_owner_moved -------------------------------------------------
+
+
+def test_retryclaim_cluster_owner_moved_variants():
+    import types
+
+    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB)
+    job = cron.cron_jobs["j"]
+    # a nodeName conflict: nobody positively owns it -> transient, not a move
+    cron.cluster_manager = types.SimpleNamespace(
+        has_conflict=lambda: True,
+        is_quorate=lambda: True,
+        view_settled=lambda: True,
+        distribution="single-leader",
+        is_available_leader=lambda: False,
+    )
+    assert cron._cluster_owner_moved(job) is False
+    # spread distribution consults the per-job availability owner
+    cron.cluster_manager = types.SimpleNamespace(
+        has_conflict=lambda: False,
+        is_quorate=lambda: True,
+        view_settled=lambda: True,
+        distribution="spread",
+        is_available_job_owner=lambda n: False,
+    )
+    assert cron._cluster_owner_moved(job) is True
+    # a raising manager is a transient fail-closed condition, never a move
+    def _boom():
+        raise RuntimeError("mgr bug")
+
+    cron.cluster_manager = types.SimpleNamespace(
+        has_conflict=_boom,
+        is_quorate=lambda: True,
+        view_settled=lambda: True,
+        distribution="single-leader",
+        is_available_leader=lambda: False,
+    )
+    assert cron._cluster_owner_moved(job) is False
+
+
+# --- _reap_retry_task -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_reap_retry_task_ignores_cancelled():
+    async def _forever():
+        await asyncio.sleep(100)
+
+    task = asyncio.create_task(_forever())
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    # a cancelled retry task is retrieved without logging or re-raising
+    cronstable.cron.Cron._reap_retry_task("j", task)
+
+
+@pytest.mark.asyncio
+async def test_retryclaim_reap_retry_task_logs_exception(caplog):
+    import logging
+
+    async def _die():
+        raise RuntimeError("retry boom")
+
+    task = asyncio.create_task(_die())
+    await asyncio.wait({task})
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        cronstable.cron.Cron._reap_retry_task("j", task)
+    assert any("retry task died" in r.getMessage() for r in caplog.records)

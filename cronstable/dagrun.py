@@ -1279,7 +1279,7 @@ class DagScheduler:
             secrets=secrets,
         )
         api.register_run(ctx)
-        env = run_environment(ctx, api.base_url)
+        env = run_environment(ctx, api.base_url, api.cacert)
         env.update(dag_env)
         return ctx.token, env
 

@@ -28,6 +28,13 @@
 > - **Resources and prompts are toolset-scoped** (§5.3/§5.4): the `dags`
 >   resource templates and the `why_did_dag_run_fail` / `backfill_plan`
 >   prompts require the `dags` toolset.
+> - **TLS is served natively, not only by a reverse proxy** (§6): where the
+>   body says to terminate TLS/mTLS in a reverse proxy (and cites
+>   `wiki/HTTP-API.md` for it), `web.listen` now accepts `https://` addresses
+>   served from a `web.tls` block, and `web.tls.clientCa` makes those
+>   listeners require a client certificate. That mTLS listener satisfies the
+>   fail-closed token gate on its own, exactly as a proxy-terminated one
+>   does; plain `https://` does not. See [Listener TLS](Listener-TLS).
 
 ---
 

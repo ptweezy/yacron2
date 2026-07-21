@@ -5,6 +5,157 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.27 (2026-07-21)
+
+A transport release.  Every HTTP surface cronstable serves could previously
+be encrypted only by putting a reverse proxy in front of it; now the daemon
+can do it itself.  `web.listen` accepts `https://` addresses, the job-facing
+state API accepts one too, the certificates behind both are declared in
+config rather than in a sidecar, a web certificate replaced in place is
+picked up while the daemon runs, and every client that dials a web listener
+gained the same four options for saying which CA to trust and what
+certificate to present.  The listener can also be told to require a client
+certificate, so it authenticates its callers at the transport instead of
+only encrypting them.  Each block below is optional and empty by default.
+
+The machinery is the cluster mesh's, which has spoken mutual TLS since
+1.1.x: its context builders, its on-disk certificate fingerprint and its
+"does the new material load yet?" dry run moved into a shared
+`cronstable/tlsutil.py`, a standard-library-only leaf module, and the
+cluster's own functions delegate to it under their existing names.
+`cluster.tls` is unchanged.
+
+### Web listeners speak TLS, optionally mutual
+
+- **`web.listen` accepts `https://` entries**, served from a new `web.tls`
+  block whose `cert` and `key` are required together.  The context is built
+  once per app start and applied per listener, not per runner, so a listen
+  list can mix `http://` and `https://` entries serving the same app on one
+  process, each with its own transport.  `unix://` listeners stay plaintext:
+  they are confined to the host's filesystem, where the socket's own
+  permissions (`web.socketMode`) are the access control.
+- **`web.tls.clientCa` requires a client certificate signed by that CA**
+  (mutual TLS).  It is required, never merely requested: a client that
+  presents nothing is refused at the handshake rather than completing it and
+  being sorted out later.  The CA file is consequently the caller allowlist,
+  because a server does no hostname verification and accepts any certificate
+  that CA ever signed, so it wants to be a CA minted for this purpose rather
+  than a shared organisational one.
+- **`mcp.enabled` is now allowed on a routable listener with no
+  `web.authToken` when `web.tls.clientCa` is set**, since mTLS authenticates
+  the caller.  Plain `https://` does not qualify and still raises the
+  original configuration error: encryption is not authentication.
+- **Misconfigurations fail at parse time**, so `--validate-config` catches
+  them: a cert without its key or a key without its cert, a `clientCa` with
+  no certificate of the listener's own, TLS material with no `https://`
+  listener to use it (it would be silently ignored), and an `https://`
+  listener with no material to serve.  Whether the files exist or load is
+  deliberately not checked there; config parsing touches no filesystem,
+  `--validate-config` may run somewhere that is not the deployment target,
+  and a mounted Kubernetes secret need not exist at first boot.  That check
+  happens at the listener, which logs and declines to start rather than
+  falling back to cleartext on a port an operator asked to encrypt.
+
+### The job state API no longer has to be plaintext
+
+- **`state.jobApi.listen` accepts an `https://` URL** served from
+  `state.jobApi.tls.cert` and `.key`, with the same paired validation.  The
+  endpoint hands every run a bearer token and stages that job's secrets, so
+  it is the surface where cleartext cost the most.
+- **Jobs are handed a trust anchor.**  `state.jobApi.tls.ca` is injected into
+  every run as `CRONSTABLE_STATE_CACERT` and read by the in-job CLI, so
+  `cronstable state|cursor|lock|artifact|idempotent|secret` can verify a
+  certificate no public root signed, which is the normal case for an
+  internally-issued one.  Note the asymmetry with `web.tls.clientCa`: this
+  `ca` is the client-side anchor the daemon gives its jobs, not a CA that
+  authenticates callers.  The in-job CLI has no TLS flags at all and no way
+  to switch verification off, by design: nothing running inside a job should
+  be able to downgrade the channel carrying that job's own secrets.
+- **An in-place rotation of the endpoint's certificate is picked up while
+  the daemon runs**, the same as a web certificate.  The `cert`/`key` files
+  are fingerprinted as the listener loaded them; a change (same paths, new
+  bytes, which is how cert-manager, Vault and Kubernetes secret refreshes
+  renew) rebuilds just this listener on the next housekeeping pass, without
+  disturbing the store backend or its leases, and gated on the new material
+  loading first so a half-written refresh keeps the old certificate up.
+  `state.jobApi.tls.ca` is exempt, because jobs read it fresh by path.
+- **A wildcard host over `https://` is a configuration error.**  Jobs dial
+  the address they are handed and no certificate carries a SAN for every
+  interface, so `https://0.0.0.0:9000` could only ever fail verification.
+  Name the interface explicitly.
+- **The advertised URL now prefers the configured host over the bound one**,
+  which also fixes a latent bug: a plaintext `listen: 0.0.0.0:9000` used to
+  advertise `CRONSTABLE_STATE_URL=http://0.0.0.0:9000`, which happened to
+  work on Linux and failed on Windows.  The bound address is still used when
+  nothing was configured, where the ephemeral loopback default makes it the
+  right answer.
+- **Mutual TLS is deliberately not offered on this endpoint.**  The per-run
+  bearer token already authenticates the caller, and requiring client
+  certificates would mean injecting key material into every job's
+  environment.
+- **`allowNonLoopbackBind` changed its wording, and gained a warning.**  Its
+  configuration error no longer asserts that the endpoint is plaintext or
+  tells the reader to add a reverse proxy, because TLS is now available in
+  process.  Enabling it alongside a plaintext off-host listen logs a warning
+  naming the exposure at every boot.  It is a warning and not an error: the
+  documented pairing was a reverse proxy, and that remains a valid answer.
+
+### Certificates rotate in place
+
+- **An in-place rotation restarts the web listener.**  The SSL context is
+  built once and never reloaded, so new bytes at the same paths, which is
+  exactly how cert-manager, Vault and a Kubernetes secret refresh renew,
+  would otherwise be invisible until the old certificate expired.  An
+  `(mtime, size)` fingerprint of the configured files is compared on the
+  ordinary housekeeping reload and a change restarts the listener.
+- **The restart is gated on the new material loading.**  Make before break is
+  impossible here, because the new runner binds the port the old one still
+  holds, so a half-written rotation (none of those refreshes is atomic across
+  the files) would otherwise tear down a working listener and then fail to
+  rebuild it.  When the new material does not load, the running listener is
+  kept, a warning says why, and the next reload retries.
+- **The restart drops connections open at that moment**, including the SSE
+  log streams the dashboard and the terminal dashboard hold open.  They
+  reconnect on their own; a live log tail blips.
+- **The job state API listener does not do any of this.**  It builds its
+  context once at startup, so rotating its certificate needs a daemon
+  restart.
+
+### The clients gained a consistent verification surface
+
+- **`--cacert`, `--client-cert`, `--client-key` and `--insecure`**, with the
+  identical names and meanings in `cronstable tui` and the `cronstable mcp`
+  stdio bridge (and in the thin `__main__` stubs that advertise them without
+  importing either).  Each falls back to an environment variable
+  (`CRONSTABLE_WEB_CACERT`, `CRONSTABLE_WEB_CLIENT_CERT`,
+  `CRONSTABLE_WEB_CLIENT_KEY`, `CRONSTABLE_WEB_INSECURE`), the same flag then
+  env precedence the bearer token already used, so one exported set of
+  variables serves every client.  With none of them set the clients build no
+  context at all and keep exactly the transport they had.
+- **`--insecure` warns on stderr every time.**  Verification is off but the
+  `Authorization` header is still sent, so the bearer token goes to whoever
+  answers the connection.
+- **`--client-key` without `--client-cert` is refused.**  A key alone cannot
+  present an identity, so the only alternative to failing is accepting the
+  flag and ignoring it, which would leave the caller believing it had
+  authenticated to a listener that had in fact refused it.
+- **A failed handshake reads as a failed handshake.**  `urllib` delivers one
+  wrapped as a generic connection error, which would have sent an operator
+  hunting a firewall or a wrong port while the socket connected fine; both
+  the MCP bridge and the in-job CLI now tell the two apart and name the CA
+  variable or flag involved.
+- **Client hostname verification is on**, so a certificate must cover the
+  name actually dialled: `https://127.0.0.1:8443` needs an IP SAN for
+  `127.0.0.1` and `https://localhost:8443` needs a DNS SAN.  This is the most
+  likely first-run failure.
+- **The webhook reporter has no CA option yet.**  `report.webhook` still
+  verifies against the system trust store only, so an endpoint holding an
+  internally-issued or self-signed certificate cannot be reported to.
+
+See [Listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS)
+in the wiki for the full configuration, certificate requirements and the
+trust models.
+
 ## 1.2.26 (2026-07-20)
 
 Two operator features land this release: a runtime job pause and per-job SLA

@@ -3774,7 +3774,7 @@ async def test_web_app_restarts_on_config_change(monkeypatch):
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url: FakeSite(url),
+        lambda runner, url, ssl_context=None: FakeSite(url),
     )
 
     cron = cronstable.cron.Cron(None)
@@ -7334,7 +7334,7 @@ async def test_lifecycle_web_app_wildcard_acao_and_socket_mode(monkeypatch, capl
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url: _LifecycleFakeSite(url),
+        lambda runner, url, ssl_context=None: _LifecycleFakeSite(url),
     )
     cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
     try:
@@ -7362,7 +7362,7 @@ async def test_lifecycle_web_app_specific_acao_folded_into_allowlist(monkeypatch
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url: _LifecycleFakeSite(url),
+        lambda runner, url, ssl_context=None: _LifecycleFakeSite(url),
     )
     cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
     try:
@@ -7387,7 +7387,7 @@ async def test_lifecycle_web_app_mounts_mcp_endpoint(monkeypatch):
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url: _LifecycleFakeSite(url),
+        lambda runner, url, ssl_context=None: _LifecycleFakeSite(url),
     )
     cron = cronstable.cron.Cron(None, config_yaml=_LIFECYCLE_JOB)
     mcp_config = _build_mcp_config({"enabled": True})
@@ -9079,6 +9079,7 @@ def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
 
     class _Api:
         base_url = "http://127.0.0.1:65500"
+        cacert = None
 
         def register_run(self, ctx):
             registered.append(ctx)

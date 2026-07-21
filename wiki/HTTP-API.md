@@ -48,11 +48,12 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `cronstable/con
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port` or `unix:///path`. An empty list disables the server. |
+| `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port`, `https://host:port`, or `unix:///path`. An empty list disables the server. |
 | `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response (all routes, including `/cluster` and `/job-set-id`) and to the 409 conflict body, but not the 404 or 401. |
 | `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [Cross-site request defense](#cross-site-request-defense)). |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes (see [Authentication](#authentication)). |
 | `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
+| `tls` | map (`cert`/`key`/`clientCa`) | (none) | Certificate and key served by every `https://` listen address, plus an optional CA that makes those listeners require a client certificate (mutual TLS). `cert` and `key` are required together; the block and the `https://` addresses are validated against each other at load. See [Listener TLS](Listener-TLS). |
 | `ui` | bool | `true` | Serve the [Web Dashboard](Web-Dashboard) page at `/` (see [`GET /`](#get--the-dashboard-page)); `ui: false` exposes only the REST endpoints. |
 | `metrics` | bool or map | `true` | Serve the Prometheus exposition at `/metrics`; the map form tunes buckets or exempts the endpoint from `authToken` (see [`GET /metrics`](#get-metrics)). |
 | `nodeHistory` | bool or map | `true` | Background node CPU/memory sampling that feeds [`GET /node/history`](#get-nodehistory); the map form tunes cadence and window size (see [`web.nodeHistory`](Configuration-Reference#web)). |
@@ -62,15 +63,21 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `cronstable/con
 | Scheme | Form | Requirements |
 | --- | --- | --- |
 | `http` | `http://host:port` | Both host and port are required. An `http` URL missing either is logged as a warning (`Ignoring web listen url ...: http url needs host and port`) and skipped. |
+| `https` | `https://host:port` | The same `web.TCPSite`, wrapped in an `SSLContext` built from `web.tls`. Both host and port are required (no port is assumed), and `web.tls.cert`/`web.tls.key` must be set, which the config loader enforces. If the material turns out to be unloadable at startup, the web API stays down with a logged error and is retried on the next reload; an `https` address is never downgraded to plaintext. See [Listener TLS](Listener-TLS). |
 | `unix` | `unix:///path/to/socket` | Binds an `aiohttp` `UnixSite` at the given filesystem path. POSIX-only: on Windows `UnixSite` is unavailable (no `create_unix_server` on the Proactor loop), so such a URL is skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`. Use an `http://` listener instead. |
 
 Any other scheme is logged (`scheme ... not supported`) and skipped. Binding maps to
-`web.TCPSite` for `http` and `web.UnixSite` for `unix` (`web_site_from_url` in
-`cronstable/cron.py`).
+`web.TCPSite` for `http` and `https` and `web.UnixSite` for `unix`
+(`web_site_from_url` in `cronstable/cron.py`).
 
-`https` is not a recognized scheme. To serve the API over TLS, bind to a loopback
-`http` address or a `unix` socket (POSIX-only; on Windows use a loopback `http`
-address) and terminate TLS in a reverse proxy.
+The API speaks TLS natively: an `https://` address is served in-process from
+the certificate and key in `web.tls`, and setting `web.tls.clientCa` makes
+those listeners require a client certificate signed by that CA. One listen
+list may mix schemes, so the same app can answer plaintext on loopback and
+over TLS on a routable address; `unix://` listeners are always plaintext, with
+`socketMode` as their access control. Certificates, mutual TLS, rotation
+behavior, and the client-side flags are documented in
+[Listener TLS](Listener-TLS).
 
 ## Endpoints
 
@@ -1173,8 +1180,12 @@ web:
 ## Authentication
 
 By default the API is unauthenticated; anyone who can reach a `listen` address can
-call every endpoint. Restrict access at the network or socket level, or enable
-bearer-token authentication with `web.authToken`.
+call every endpoint. Restrict access at the network or socket level, enable
+bearer-token authentication with `web.authToken`, or require a client
+certificate with `web.tls.clientCa` (see
+[Client certificates](#client-certificates-mutual-tls) below). The latter two
+are independent checks and compose: a token authenticates the caller inside
+the request, a client certificate authenticates it at the handshake.
 
 `authToken` resolves the token from exactly one source, in this precedence order
 (`_resolve_web_token`):
@@ -1219,6 +1230,28 @@ web:
 $ http get http://127.0.0.1:8080/status "Authorization:Bearer s3cr3t"
 $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 ```
+
+### Client certificates (mutual TLS)
+
+Setting `web.tls.clientCa` makes every `https://` listener **require** a client
+certificate signed by that CA: a caller that presents nothing, or presents a
+certificate from another CA, fails the TLS handshake and never reaches a
+route. Because a server does no hostname verification, that CA file is the
+allowlist itself, so it should be a dedicated CA issued only to cronstable
+clients.
+
+This is caller authentication at the transport, which is why it also satisfies
+the `mcp.enabled` gate: an enabled `/mcp` on a routable listener normally
+raises a `ConfigError` without `web.authToken`, and `web.tls.clientCa` on an
+`https://` listener lifts that requirement for those addresses. Plain
+`https://` does not, because encryption is not authentication (see
+[MCP](MCP#security)).
+
+`web.authToken` and `web.tls.clientCa` are enforced independently, so a request
+over an mTLS listener still carries the bearer token when one is configured.
+cronstable's own clients (`cronstable tui`, `cronstable mcp`) present a
+certificate with `--client-cert`/`--client-key`. See
+[Listener TLS](Listener-TLS).
 
 ### Cross-site request defense
 
@@ -1315,6 +1348,11 @@ reload from the scheduler loop:
   `socketMode`) thus triggers a restart of the server on reload.
 - The server is (re)started only when `web` is present, `listen` is non-empty, and no
   server is currently running.
+- A reload also restarts the server when the `web.tls` files changed on disk
+  under unchanged config (an in-place certificate rotation), because the
+  `SSLContext` is built once per start. In-flight connections, including open
+  SSE log streams, are dropped and reconnect. See
+  [Listener TLS](Listener-TLS).
 - Each `listen` address is bound independently. A bad URL (`ValueError`) or a bind
   failure (`OSError`, e.g. address already in use) on one address is logged as a
   warning (`web: could not listen on <addr>: ...`) and skipped; the remaining
@@ -1360,11 +1398,12 @@ section but `jobApi.enabled: false`, never starts it and injects nothing.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Serve the loopback endpoint and inject the `CRONSTABLE_*` environment into every job. |
-| `listen` | string | (ephemeral) | Address to bind, as `host:port` or `http://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; an explicit port must be in `0`-`65535` (`0` = OS-assigned), and a non-loopback host needs `allowNonLoopbackBind`. |
+| `listen` | string | (ephemeral) | Address to bind, as `host:port`, `http://host:port`, or `https://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; an explicit port must be in `0`-`65535` (`0` = OS-assigned), and a non-loopback host needs `allowNonLoopbackBind`. `https://` needs `tls.cert`/`tls.key` and a named host (a wildcard bind is a `ConfigError`). |
 | `maxValueBytes` | int | `1048576` (1 MiB) | Reject a KV or cursor value larger than this many bytes (JSON-encoded) with `413`. `0` means no limit. |
 | `maxArtifactBytes` | int | `67108864` (64 MiB) | Reject an artifact payload larger than this many bytes with `413`. `0` means no limit. |
 | `lockTtlSeconds` | float | `30` | Default lease TTL for a job lock (floored at `5`); the daemon renews it at a third of the TTL while the job holds it. |
-| `allowNonLoopbackBind` | bool | `false` | Explicit opt-in for a non-loopback `listen` host; without it such a host is a `ConfigError` (the endpoint serves per-run tokens and staged secrets over plaintext HTTP). |
+| `allowNonLoopbackBind` | bool | `false` | Explicit opt-in for a non-loopback `listen` host; without it such a host is a `ConfigError` (the endpoint serves per-run tokens and staged secrets). Combined with a plaintext `http://` listen it logs a warning at startup naming the exposure. |
+| `tls` | map (`cert`/`key`/`ca`) | (none) | Serves an `https://` `listen` from `cert`/`key` (required together). `ca` is the trust anchor injected into jobs as `CRONSTABLE_STATE_CACERT` so the job CLI can verify an internally-issued certificate. The context is built once at startup: rotating these files needs a daemon restart. See [Listener TLS](Listener-TLS). |
 
 The server's own transport-level body cap is derived from these limits (the
 larger of the two, plus envelope headroom), so an oversized request body is
@@ -1379,8 +1418,9 @@ job can test the variable instead of guessing whether it was set.
 
 | Variable | Meaning |
 | --- | --- |
-| `CRONSTABLE_STATE_URL` | The loopback base URL, e.g. `http://127.0.0.1:54321`. |
+| `CRONSTABLE_STATE_URL` | The endpoint's base URL, e.g. `http://127.0.0.1:54321`, or the configured `https://` address. |
 | `CRONSTABLE_STATE_TOKEN` | A per-run bearer token, revoked the instant the run ends. |
+| `CRONSTABLE_STATE_CACERT` | Path to the CA the job CLI verifies the endpoint against. Injected only when `state.jobApi.tls.ca` is set; absent otherwise. |
 | `CRONSTABLE_RUN_ID` | A unique id for this run. |
 | `CRONSTABLE_JOB_NAME` | The job's name (also its default scope). |
 | `CRONSTABLE_ATTEMPT` | The retry attempt number (`0` on the first fire). |
@@ -1479,6 +1519,7 @@ those commands read the injected environment for you.
 ## See also
 
 - [Web Dashboard](Web-Dashboard): the built-in browser UI served by this interface.
+- [Listener TLS](Listener-TLS): serving these listeners over `https://`, requiring client certificates, certificate rotation, and the client-side flags.
 - [Pausing Jobs](Pausing-Jobs): the semantics behind `POST /jobs/{name}/pause` and `/resume`.
 - [Late-Run Detection](Late-Run-Detection): the `sla` payload field and the monitor behind it.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the full metric reference behind `GET /metrics` and Prometheus scrape configuration.

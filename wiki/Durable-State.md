@@ -115,11 +115,14 @@ serve otherwise) takes these sub-keys:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Run the loopback endpoint and inject its address into every job. Set `false` to keep the durable scheduler features but expose nothing to job commands. |
-| `listen` | *(ephemeral)* | Override the bind, as an `http://host:port` URL. Unset binds an OS-assigned ephemeral port on `127.0.0.1`, reachable only from this host's jobs. A `unix://` path is not accepted (the job CLI speaks TCP only). A non-loopback host is refused unless `allowNonLoopbackBind` is also set: the endpoint serves per-run bearer tokens and staged job secrets over plaintext HTTP. |
+| `listen` | *(ephemeral)* | Override the bind, as an `http://host:port` or `https://host:port` URL. Unset binds an OS-assigned ephemeral port on `127.0.0.1`, reachable only from this host's jobs. A `unix://` path is not accepted (the job CLI speaks TCP only). A non-loopback host is refused unless `allowNonLoopbackBind` is also set: the endpoint serves per-run bearer tokens and staged job secrets. An `https://` address needs `tls.cert`/`tls.key` below and a named host, since jobs dial the address they are handed and no certificate covers a wildcard bind. The configured host is what jobs are given as `CRONSTABLE_STATE_URL`. |
 | `maxValueBytes` | `1048576` | Cap on one KV / cursor value in bytes; a larger set is refused. |
 | `maxArtifactBytes` | `67108864` | Cap on one artifact payload in bytes; a larger put is refused. |
 | `lockTtlSeconds` | `30` | TTL of a [job mutex/semaphore](#mutex-and-semaphore) lease, renewed by the daemon at a third of the TTL. Must be `>= 5`, for the same reason as `slotTtlSeconds`. |
-| `allowNonLoopbackBind` | `false` | Explicit opt-in required for `listen` to bind a non-loopback host. Pair with a reverse proxy adding TLS/auth -- the endpoint itself speaks plaintext HTTP. |
+| `allowNonLoopbackBind` | `false` | Explicit opt-in required for `listen` to bind a non-loopback host. Left on a plaintext `http://` address it logs a warning at startup: per-run bearer tokens and staged job secrets then cross the network in the clear. Give the endpoint an `https://` address with `tls` below, or terminate TLS in front of it. |
+| `tls.cert` | *(none)* | Certificate (chain) an `https://` `listen` serves; required together with `tls.key`. The TLS context is built once at startup, so replacing these files takes effect on the next daemon restart. Client certificates are not required here: the per-run bearer token already authenticates the caller. See [Listener TLS](Listener-TLS). |
+| `tls.key` | *(none)* | Private key for `tls.cert`. |
+| `tls.ca` | *(none)* | Trust anchor handed to every job as `CRONSTABLE_STATE_CACERT`, so the [job-facing CLI](CLI-Reference#job-facing-state-commands) can verify a certificate no public root signed. It verifies the endpoint; it does not authenticate jobs, and a job has no way to turn verification off. |
 
 ### Per-job stateful options
 
@@ -788,8 +791,9 @@ strings; an unknown scheduled time is the empty string):
 
 | Variable | Meaning |
 | --- | --- |
-| `CRONSTABLE_STATE_URL` | Base URL of the loopback endpoint, e.g. `http://127.0.0.1:54321`. |
+| `CRONSTABLE_STATE_URL` | Base URL of the endpoint, e.g. `http://127.0.0.1:54321`, or the configured `https://` address. |
 | `CRONSTABLE_STATE_TOKEN` | The per-run bearer token, revoked when the run ends. |
+| `CRONSTABLE_STATE_CACERT` | Path to the CA the commands verify the endpoint against, injected only when `state.jobApi.tls.ca` is set. |
 | `CRONSTABLE_RUN_ID` | A unique id for this run. |
 | `CRONSTABLE_JOB_NAME` | The job name (the default *scope*, below). |
 | `CRONSTABLE_ATTEMPT` | The retry attempt number (`0` on the first fire). |
@@ -1041,5 +1045,6 @@ documents the UI.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the owner gate catch-up and retries re-check.
 - [Output Capturing](Output-Capturing): what `archiveOutput` persists.
 - [HTTP Control API](HTTP-API): `GET /jobs/{name}/trends`, the run endpoints, and the job-facing `/v1/` loopback endpoints.
+- [Listener TLS](Listener-TLS): serving this endpoint (and the web API) over `https://`, and the CA jobs verify it against.
 - [Web Dashboard](Web-Dashboard): the rehydrated history views, the separate browser-side run ledger, and the durable state inspector.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the `cronstable_state_*` families and the restart-durable job counters.

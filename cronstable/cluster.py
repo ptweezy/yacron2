@@ -177,7 +177,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import ssl
 import time
 import uuid
@@ -199,7 +198,7 @@ from typing import (
 import aiohttp
 from aiohttp import web
 
-from cronstable import _json
+from cronstable import _json, tlsutil
 from cronstable.config import ClusterConfig
 from cronstable.fingerprint import SCHEME_VERSION
 from cronstable.leadership import LeadershipBackend
@@ -1204,14 +1203,15 @@ class ClusterView:
 
 
 def build_client_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
-    """Client context: verify peer certs vs the CA, pin the hostname."""
-    ctx = ssl.create_default_context(cafile=tls["ca"])
-    ctx.load_cert_chain(tls["cert"], tls["key"])
-    # create_default_context already sets check_hostname=True and
-    # verify_mode=CERT_REQUIRED for the client purpose; be explicit anyway.
-    ctx.check_hostname = True
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    return ctx
+    """Client context: verify peer certs vs the CA, pin the hostname.
+
+    Kept as a named function in this module (rather than callers reaching
+    into :mod:`cronstable.tlsutil` directly) because the whole test suite
+    neuters the cluster's TLS by patching this name.
+    """
+    return tlsutil.build_mutual_client_ssl_context(
+        tls["ca"], tls["cert"], tls["key"]
+    )
 
 
 def build_server_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
@@ -1242,11 +1242,17 @@ def build_server_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
     future opt-in could pin the client cert SAN/CN against an allowed-name
     list; not enabled by default because a peer's cert SAN has no required
     relationship to its listed address.)
+
+    The context itself comes from
+    :func:`cronstable.tlsutil.build_listener_ssl_context`, shared with the
+    web listeners.  ``cluster.tls.ca`` is schema-required, so the client CA
+    is never absent here and the helper's CERT_REQUIRED arm always applies;
+    a cluster listener that accepted an unauthenticated peer would not be a
+    membership boundary at all.
     """
-    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH, cafile=tls["ca"])
-    ctx.load_cert_chain(tls["cert"], tls["key"])
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    return ctx
+    return tlsutil.build_listener_ssl_context(
+        tls["cert"], tls["key"], client_ca=tls["ca"]
+    )
 
 
 def _tls_file_signature(tls: Dict[str, str]) -> Dict[str, Any]:
@@ -1265,15 +1271,11 @@ def _tls_file_signature(tls: Dict[str, str]) -> Dict[str, Any]:
     picked up too.  A stat error (e.g. a file briefly absent mid-rotation) is
     recorded as ``None`` and simply compares unequal once the file is back,
     which is the safe direction -- a spurious restart, not a missed one.
+
+    The per-file stat lives in :func:`cronstable.tlsutil.tls_file_signature`,
+    shared with the web listeners' rotation check.
     """
-    signature: Dict[str, Any] = {}
-    for key in ("ca", "cert", "key"):
-        try:
-            st = os.stat(tls[key])
-            signature[key] = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            signature[key] = None
-    return signature
+    return tlsutil.tls_file_signature(tls, ("ca", "cert", "key"))
 
 
 def gossip_tls_loadable(cluster_config: ClusterConfig) -> bool:

@@ -241,6 +241,16 @@ table for the full signal set.
 
 ### Cluster certificate operations
 
+> **Two different `tls:` blocks.** This section is about `cluster.tls`, the
+> **peer** certificates the gossip mesh presents to other cronstable nodes on
+> the `cluster.listen` port. They are unrelated to `web.tls`, the **listener**
+> certificates the HTTP control API serves to operators, browsers and clients
+> on the `web.listen` addresses, and to `state.jobApi.tls`, which serves the
+> job-facing state endpoint. Keep their PKI separate: the cluster CA is a
+> membership allowlist (below), so a certificate issued for a dashboard user
+> must not chain to it. Provision each from its own issuer. The listener side
+> is documented in [Listener TLS](Listener-TLS).
+
 This applies to the `gossip` backend only (the lease backends use no per-node
 mTLS certs). The day-2 story is mostly hands-off, because cronstable reloads its
 mTLS contexts **in place**: on each config-reload pass it compares the on-disk

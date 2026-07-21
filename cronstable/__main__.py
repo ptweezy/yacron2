@@ -129,10 +129,18 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
 # modules; the parity test asserts these match the originals.
 _MCP_DEFAULT_URL = "http://127.0.0.1:8080"
 _MCP_ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
+_MCP_ENV_CACERT = "CRONSTABLE_WEB_CACERT"
+_MCP_ENV_CLIENT_CERT = "CRONSTABLE_WEB_CLIENT_CERT"
+_MCP_ENV_CLIENT_KEY = "CRONSTABLE_WEB_CLIENT_KEY"
+_MCP_ENV_INSECURE = "CRONSTABLE_WEB_INSECURE"
 _MCP_DEFAULT_PROTOCOL_VERSION = "2025-11-25"
 _MCP_DEFAULT_TIMEOUT = 30.0
 _TUI_DEFAULT_URL = "http://127.0.0.1:8080"
 _TUI_ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
+_TUI_ENV_CACERT = "CRONSTABLE_WEB_CACERT"
+_TUI_ENV_CLIENT_CERT = "CRONSTABLE_WEB_CLIENT_CERT"
+_TUI_ENV_CLIENT_KEY = "CRONSTABLE_WEB_CLIENT_KEY"
+_TUI_ENV_INSECURE = "CRONSTABLE_WEB_INSECURE"
 _TUI_THEME_HUES = ["carolina", "amber", "green", "modern", "standard"]
 
 
@@ -166,6 +174,40 @@ def _add_mcp_stub(sub: Any) -> None:
         metavar="VAR",
         help="env var holding the bearer token (default: {} if set)".format(
             _MCP_ENV_TOKEN
+        ),
+    )
+    parser.add_argument(
+        "--cacert",
+        default=None,
+        metavar="PATH",
+        help="verify the listener against this CA file instead of the system "
+        "trust store, for an internally-issued or self-signed certificate "
+        "(default: {} if set)".format(_MCP_ENV_CACERT),
+    )
+    parser.add_argument(
+        "--client-cert",
+        default=None,
+        metavar="PATH",
+        help="client certificate to present to a listener configured with "
+        "web.tls.clientCa, which requires one (default: {} if set)".format(
+            _MCP_ENV_CLIENT_CERT
+        ),
+    )
+    parser.add_argument(
+        "--client-key",
+        default=None,
+        metavar="PATH",
+        help="private key for --client-cert (default: {} if set)".format(
+            _MCP_ENV_CLIENT_KEY
+        ),
+    )
+    parser.add_argument(
+        "--insecure",
+        default=False,
+        action="store_true",
+        help="skip TLS verification entirely; the bearer token is still sent, "
+        "so it goes to whoever answers (set {}=1 for the same)".format(
+            _MCP_ENV_INSECURE
         ),
     )
     parser.add_argument(
@@ -229,6 +271,38 @@ def _add_tui_stub(sub: Any) -> None:
         help=(
             "environment variable to read the token from when --token "
             "is not given (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--cacert",
+        default=None,
+        metavar="PATH",
+        help=(
+            "verify an https:// listener against this CA file instead "
+            "of the system trust store (env: %s)" % _TUI_ENV_CACERT
+        ),
+    )
+    parser.add_argument(
+        "--client-cert",
+        default=None,
+        metavar="PATH",
+        help=(
+            "certificate to present to a listener that requires one "
+            "(web.tls.clientCa is set) (env: %s)" % _TUI_ENV_CLIENT_CERT
+        ),
+    )
+    parser.add_argument(
+        "--client-key",
+        default=None,
+        metavar="PATH",
+        help="private key for --client-cert (env: %s)" % _TUI_ENV_CLIENT_KEY,
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help=(
+            "skip certificate verification; the token is still sent, so "
+            "it reaches whoever answers (env: %s)" % _TUI_ENV_INSECURE
         ),
     )
     parser.add_argument(

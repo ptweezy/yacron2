@@ -80,7 +80,7 @@ def test_jobapi_lock_ttl_floor():
 
 
 def test_jobapi_listen_rejects_unix():
-    with pytest.raises(ConfigError, match="must be an http:// URL"):
+    with pytest.raises(ConfigError, match="http:// or https:// URL"):
         _cfg(
             "state:\n  path: /x\n  jobApi:\n"
             "    listen: unix:///run/y.sock\n"

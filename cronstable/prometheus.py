@@ -28,12 +28,15 @@ locking is needed anywhere here.
 
 import logging
 import math
+import re
 import time
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Optional,
     Sequence,
@@ -94,8 +97,17 @@ PEER_STATUSES = (
 )
 
 
+#: The four characters :func:`escape_label_value` rewrites.  A label value
+#: with none of them (job names, statuses, ``le`` bounds -- almost every
+#: value in practice) needs no work, so one C-level scan replaces four
+#: full-string passes on the exposition hot path.
+_LABEL_SPECIAL_RE = re.compile(r'[\\"\n\r]')
+
+
 def escape_label_value(value: str) -> str:
     """Escape a label value per the exposition formats (\\, ", CR, LF)."""
+    if _LABEL_SPECIAL_RE.search(value) is None:
+        return value
     # Escape CR as well as LF. A raw carriage return inside a quoted label
     # value is not valid in the OpenMetrics exposition grammar and can
     # confuse strict scrapers, though LF is the only line delimiter.
@@ -165,6 +177,84 @@ class MetricFamily:
         self.samples.append((suffix, labels, float(value)))
 
 
+def _sample_base(family: MetricFamily) -> str:
+    """The sample-name stem a family's rows carry (type-mandated suffix
+    folded in), format-independent: only the ``# TYPE`` line spells a
+    counter without ``_total`` under OpenMetrics, never its samples."""
+    if family.mtype == "counter":
+        return family.name + "_total"
+    if family.mtype == "info":
+        return family.name + "_info"
+    return family.name
+
+
+def _make_label_escaper() -> Callable[[Any], str]:
+    """A label-value escaper that memoizes each distinct value it sees.
+
+    One job name recurs across dozens of samples in a scrape (every
+    counter, the histogram's buckets, the gauges), so escaping is done
+    once per distinct value rather than once per occurrence.  The memo is
+    private to the returned closure -- i.e. to one render/iteration pass --
+    so there is no cross-scrape state to invalidate on reload or prune.
+    """
+    cache: Dict[str, str] = {}
+
+    def esc(val: Any) -> str:
+        text = val if type(val) is str else str(val)
+        cached = cache.get(text)
+        if cached is None:
+            cached = escape_label_value(text)
+            cache[text] = cached
+        return cached
+
+    return esc
+
+
+def _sample_fields(
+    sample_base: str,
+    suffix: str,
+    labels: Dict[str, str],
+    esc: Callable[[Any], str],
+) -> Tuple[str, str]:
+    """One sample's ``(name, label_block)`` where ``label_block`` is the
+    brace-wrapped ``{k="v",...}`` string, or ``""`` when unlabelled."""
+    name = sample_base + suffix
+    if not labels:
+        return name, ""
+    block = (
+        "{"
+        + ",".join(
+            '{}="{}"'.format(key, esc(val)) for key, val in labels.items()
+        )
+        + "}"
+    )
+    return name, block
+
+
+def iter_family_samples(
+    families: Iterable[MetricFamily],
+) -> Iterator[Tuple[str, str, str]]:
+    """Yield ``(sample_name, label_block, value)`` for every sample.
+
+    ``label_block`` is ``{...}`` (braces included) or ``""``; ``value`` is
+    the exposition-formatted number.  This is the structured form of each
+    text-exposition sample LINE -- the ``# HELP``/``# TYPE`` metadata
+    aside -- so a consumer (the MCP metrics query) can filter samples
+    straight from the model instead of rendering the whole blob and
+    re-parsing it line by line.  Formatting is shared with
+    :func:`render_families`, so a name, label or value can never disagree
+    between the two.
+    """
+    esc = _make_label_escaper()
+    for family in families:
+        if not family.samples:
+            continue
+        base = _sample_base(family)
+        for suffix, labels, value in family.samples:
+            name, block = _sample_fields(base, suffix, labels, esc)
+            yield name, block, format_value(value)
+
+
 def render_families(
     families: Iterable[MetricFamily], openmetrics: bool = False
 ) -> str:
@@ -177,15 +267,11 @@ def render_families(
     the ``# EOF`` terminator.
     """
     out: List[str] = []
+    esc = _make_label_escaper()
     for family in families:
         if not family.samples:
             continue
-        if family.mtype == "counter":
-            sample_base = family.name + "_total"
-        elif family.mtype == "info":
-            sample_base = family.name + "_info"
-        else:
-            sample_base = family.name
+        sample_base = _sample_base(family)
         if openmetrics:
             type_name, mtype = family.name, family.mtype
         else:
@@ -198,17 +284,8 @@ def render_families(
         )
         out.append("# TYPE {} {}".format(type_name, mtype))
         for suffix, labels, value in family.samples:
-            name = sample_base + suffix
-            if labels:
-                label_str = ",".join(
-                    '{}="{}"'.format(key, escape_label_value(str(val)))
-                    for key, val in labels.items()
-                )
-                out.append(
-                    "{}{{{}}} {}".format(name, label_str, format_value(value))
-                )
-            else:
-                out.append("{} {}".format(name, format_value(value)))
+            name, block = _sample_fields(sample_base, suffix, labels, esc)
+            out.append("{}{} {}".format(name, block, format_value(value)))
     if openmetrics:
         out.append("# EOF")
     return "\n".join(out) + "\n"
@@ -583,6 +660,12 @@ class PrometheusMetrics:
 
     def render(self, cron: "Cron", openmetrics: bool = False) -> str:
         return render_families(self._families(cron), openmetrics)
+
+    def iter_samples(self, cron: "Cron") -> Iterator[Tuple[str, str, str]]:
+        """This scrape's samples as ``(name, label_block, value)`` triples,
+        built straight from the metric families -- no exposition render and
+        no re-parse (see :func:`iter_family_samples`)."""
+        return iter_family_samples(self._families(cron))
 
     def _families(self, cron: "Cron") -> List[MetricFamily]:
         families = self._daemon_families(cron)

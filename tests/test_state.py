@@ -224,6 +224,43 @@ async def test_list_newest_first_and_limit(tmp_path):
     assert [r["i"] for r in oldest] == [0, 1, 2]
 
 
+async def test_list_records_predicate_and_max_matches(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    for i in range(10):
+        await backend.append_record(
+            "s", {"i": i, "kind": "even" if i % 2 == 0 else "odd"}
+        )
+    # predicate + max_matches=1: the single newest matching record, and the
+    # scan stops at it (the early-stop the artifact-name lookup relies on).
+    newest_odd = await backend.list_records(
+        "s",
+        newest_first=True,
+        predicate=lambda r: r.get("kind") == "odd",
+        max_matches=1,
+    )
+    assert [r["i"] for r in newest_odd] == [9]
+    # predicate with no max_matches: the whole filtered window, newest first.
+    evens = await backend.list_records(
+        "s", newest_first=True, predicate=lambda r: r.get("kind") == "even"
+    )
+    assert [r["i"] for r in evens] == [8, 6, 4, 2, 0]
+    # `limit` still bounds the WINDOW of records considered, so a predicate
+    # only ever matches within the newest `limit`: no "even" in {9, 8} beyond
+    # index 8, so limiting to 2 yields just index 8.
+    limited = await backend.list_records(
+        "s",
+        newest_first=True,
+        limit=2,
+        predicate=lambda r: r.get("kind") == "even",
+    )
+    assert [r["i"] for r in limited] == [8]
+    # no predicate/max_matches => unchanged behaviour.
+    assert [
+        r["i"] for r in await backend.list_records("s", limit=3)
+    ] == [0, 1, 2]
+
+
 async def test_records_are_immutable_and_versioned(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()

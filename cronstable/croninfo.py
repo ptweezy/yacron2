@@ -37,6 +37,7 @@ same payloads locally from its ``/jobs`` snapshot.
 
 import calendar
 import datetime
+import functools
 import itertools
 import re
 from collections import Counter
@@ -601,10 +602,11 @@ _MONTH_MAX = {
 
 
 def lint_schedule(
-    expression: str,
+    expression: Optional[str] = None,
     timezone: Optional[datetime.tzinfo] = None,
     now: Optional[datetime.datetime] = None,
     hash_key: Optional[str] = None,
+    tab: Optional[CronTab] = None,
 ) -> List[Finding]:
     """Advisory findings for a schedule the engine accepts.
 
@@ -618,14 +620,25 @@ def lint_schedule(
     defaults to the current time in ``timezone`` (or UTC).  ``hash_key``
     (the job name) resolves ``H`` items; a schedule that uses them gains
     a note naming the concrete slots they hashed to.
+
+    Pass an already-parsed ``tab`` (with ``expression``/``hash_key``
+    unset) to lint the very :class:`CronTab` the caller holds instead of
+    re-parsing its text: :class:`~cronstable.config.JobConfig` builds the
+    schedule once for the scheduler and would otherwise pay a second,
+    identical parse here on every load and reload.
     """
-    text = (expression or "").strip()
-    if text.lower() == "@reboot":
-        return []
-    try:
-        tab = CronTab(text, hash_key=hash_key)
-    except (ValueError, KeyError):
-        return []
+    if tab is None:
+        text = (expression or "").strip()
+        if text.lower() == "@reboot":
+            return []
+        try:
+            tab = CronTab(text, hash_key=hash_key)
+        except (ValueError, KeyError):
+            return []
+    else:
+        # the canonical text the step/day-field linters read, identical to
+        # str(tab) the re-parsing branch would have produced from it
+        text = str(tab)
     if now is None:
         now = datetime.datetime.now(timezone or datetime.timezone.utc)
     findings: List[Finding] = []
@@ -869,22 +882,25 @@ def _lint_dst(
         day0 = now.astimezone(timezone).date()
     else:
         day0 = now.date()
+    # The transition days in the coming year are a pure function of
+    # (zone, calendar year), independent of this job's `now` or hours, so
+    # the ~365-probe offset scan is memoized per (zone, year) and shared
+    # across every zoned job in the parse (and every later reload) instead
+    # of being re-walked once per job.  `_dst_finding` then runs only on
+    # the handful of real transitions (typically two a year), and the
+    # two-finding cap below is preserved exactly.
+    lo = day0.toordinal()  # exclusive: the walk started at day0 + 1 day
+    hi = (day0 + datetime.timedelta(days=366)).toordinal()  # inclusive
     findings: List[Finding] = []
-    prev_offset = _offset_at(timezone, day0)
-    for i in range(1, 367):
-        day = day0 + datetime.timedelta(days=i)
-        offset = _offset_at(timezone, day)
-        if offset != prev_offset:
-            # the offset changed somewhere in the 24h before `day` 00:00;
-            # scan both civil dates the window can touch
-            finding = _dst_finding(
-                tab, timezone, day - datetime.timedelta(days=1)
-            )
-            if finding is not None:
-                findings.append(finding)
-                if len(findings) >= 2:
-                    break
-        prev_offset = offset
+    for ordinal in _zone_transitions_in_range(timezone, lo, hi):
+        day = datetime.date.fromordinal(ordinal)
+        # the offset changed somewhere in the 24h before `day` 00:00;
+        # _dst_finding scans both civil dates the window can touch
+        finding = _dst_finding(tab, timezone, day - datetime.timedelta(days=1))
+        if finding is not None:
+            findings.append(finding)
+            if len(findings) >= 2:
+                break
     return findings
 
 
@@ -896,6 +912,58 @@ def _offset_at(
         .replace(tzinfo=timezone)
         .utcoffset()
     )
+
+
+@functools.lru_cache(maxsize=512)
+def _zone_transition_ordinals(
+    timezone: datetime.tzinfo, year: int
+) -> Tuple[int, ...]:
+    """Proleptic-Gregorian ordinals of every day in ``year`` whose 00:00
+    UTC offset differs from the previous day's, for ``timezone``.
+
+    This is exactly the step-function boundary detection :func:`_lint_dst`
+    used to walk inline (``offset(d) != offset(d - 1 day)``), but computed
+    once per (zone, year) and cached.  A calendar year has at most a
+    handful of transitions, so the returned tuple is tiny; the cache is
+    bounded and keyed on the ``ZoneInfo`` (hashable, and interned by the
+    ``zoneinfo`` module, so equal zones share an entry).
+    """
+    one = datetime.timedelta(days=1)
+    day = datetime.date(year, 1, 1)
+    end = datetime.date(year, 12, 31)
+    prev = _offset_at(timezone, day - one)
+    days: List[int] = []
+    while day <= end:
+        offset = _offset_at(timezone, day)
+        if offset != prev:
+            days.append(day.toordinal())
+        prev = offset
+        day += one
+    return tuple(days)
+
+
+def _zone_transitions_in_range(
+    timezone: datetime.tzinfo, lo: int, hi: int
+) -> List[int]:
+    """Ascending transition ordinals ``d`` with ``lo < d <= hi``.
+
+    Gathers the memoized per-year scans for every calendar year the
+    (lo, hi] window can touch, reproducing :func:`_lint_dst`'s original
+    forward walk over ``day0 + 1 .. day0 + 366`` day-for-day.  Falls back
+    to an uncached scan for the (vanishingly rare) unhashable ``tzinfo``
+    that cannot key the cache.
+    """
+    first_year = datetime.date.fromordinal(lo + 1).year
+    last_year = datetime.date.fromordinal(hi).year
+    out: List[int] = []
+    for year in range(first_year, last_year + 1):
+        try:
+            ordinals = _zone_transition_ordinals(timezone, year)
+        except TypeError:  # unhashable tzinfo: skip the cache, still correct
+            ordinals = _zone_transition_ordinals.__wrapped__(timezone, year)
+        out.extend(d for d in ordinals if lo < d <= hi)
+    out.sort()
+    return out
 
 
 def _dst_finding(
@@ -1295,21 +1363,44 @@ def _fire_cells(
     cell_jobs: Dict[Tuple[int, int], List[str]] = {}
     minute_jobs: List[Set[str]] = [set() for _ in range(60)]
     cap = hours * 60 + 2  # backstop; a minute-granular walk cannot exceed it
+    # A fleet duplicates schedules heavily (the whole reason this heatmap
+    # exists), and the occurrence walk depends only on the schedule and the
+    # zone -- never the job name.  So walk each distinct (resolved_source,
+    # zone) ONCE into a list of civil (hour, minute) labels and replay that
+    # per entry, turning an O(jobs x fires) enumeration into O(distinct
+    # schedules x fires) + O(jobs x fires) cheap replay.  ``None`` marks a
+    # schedule that failed :func:`_minute_tab`, so its entries are skipped
+    # without re-raising.  The cache is per call: no cross-request state.
+    walk_cache: Dict[
+        Tuple[str, Optional[datetime.tzinfo]],
+        Optional[Tuple[List[Tuple[int, int]], int]],
+    ] = {}
     for entry in entries:
         zone = entry.timezone or local_tz
-        try:
-            mtab, weight = _minute_tab(entry.tab)
-        except (ValueError, KeyError):  # pragma: no cover - defensive
+        key = (entry.tab.resolved_source, zone)
+        if key not in walk_cache:
+            try:
+                mtab, weight = _minute_tab(entry.tab)
+            except (ValueError, KeyError):  # pragma: no cover - defensive
+                walk_cache[key] = None
+                continue
+            cells: List[Tuple[int, int]] = []
+            walked = 0
+            for when in mtab.occurrences(start.astimezone(zone)):
+                if when >= end or walked >= cap:
+                    break
+                walked += 1
+                label = when.astimezone(tz)
+                cells.append((label.hour, label.minute))
+            walk_cache[key] = (cells, weight)
+        cached = walk_cache[key]
+        if cached is None:
             continue
-        walked = 0
-        for when in mtab.occurrences(start.astimezone(zone)):
-            if when >= end or walked >= cap:
-                break
-            walked += 1
-            label = when.astimezone(tz)
-            grid[label.hour][label.minute] += weight
-            minute_jobs[label.minute].add(entry.name)
-            names = cell_jobs.setdefault((label.hour, label.minute), [])
+        cells, weight = cached
+        for hour, minute in cells:
+            grid[hour][minute] += weight
+            minute_jobs[minute].add(entry.name)
+            names = cell_jobs.setdefault((hour, minute), [])
             if len(names) < _NAME_CAP and entry.name not in names:
                 names.append(entry.name)
     return grid, cell_jobs, minute_jobs

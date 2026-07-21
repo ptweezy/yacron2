@@ -5,6 +5,111 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.28 (2026-07-21)
+
+A performance and hardening release.  The cron engine, the config loader, the
+web and metrics endpoints, the cluster mesh and the durable store each do the
+same work with fewer CPU cycles, fewer allocations and fewer redundant reads,
+and two guards bound memory on the durable write and mapped read paths.  It
+introduces no new configuration.
+
+### The cron engine and schedule analytics
+
+- **The fire walk stops recomputing the month length for every candidate
+  day.**  `CronTab._day_matches` now receives the month's last day from the
+  caller that already holds it (`test`, and the forward and backward civil
+  walks), rather than calling `calendar.monthrange` again per day.  On a
+  schedule-pressure scan over a thousand per-minute jobs that removed on the
+  order of a million redundant calls per request.  The result is byte for byte
+  the same, checked by a differential fuzz against the previous engine across
+  221k cases spanning next, prev, test and occurrences in naive and DST-aware
+  frames.
+- **The DST linter scans each zone once instead of once per job.**  The
+  schedule linter used to walk 366 days of UTC offsets for every zoned job on
+  every config load.  The transition days in a year are now computed once per
+  (zone, year) and cached, so a fleet sharing a zone pays the scan a single
+  time and every later reload reuses it.  The findings are unchanged.
+- **The collision heatmap walks each distinct schedule once.**  A fleet
+  duplicates schedules heavily, and the fire enumeration depends only on the
+  schedule and the zone, never on the job name, so `schedule_pressure` now
+  walks each distinct (schedule, zone) once and replays the resulting cells
+  for the jobs that share it.
+
+### Config loading
+
+- **A one-file edit no longer reparses the whole config directory.**  When a
+  watched file changes, the reload used to rebuild every job in the directory
+  through strictyaml.  A per-file cache now returns the unchanged files'
+  already-parsed configs and reruns the parser only for the file that changed.
+  An entry is validated by hashing each input's bytes (the file, its
+  transitive `include`s and its jobs' `env_file`s), so a size-preserving edit
+  whose modification time is pinned back (a coarse-granularity network
+  filesystem, or tooling such as `rsync -a`, `cp --preserve=timestamps` or a
+  backup restore) is still picked up.  Reading the bytes is work the reload
+  already did; only the parse is skipped.
+- **A job's schedule is compiled once per load.**  The linter reads the
+  `CronTab` the scheduler already built instead of parsing the expression a
+  second time.
+- **A shared `env_file` is read once per document** rather than once per job
+  that names it.
+
+### The web API
+
+- **JSON responses are encoded with orjson.**  A shared response helper
+  serializes the data endpoints with orjson and compact separators, falling
+  back to the standard library for any value orjson rejects, and every web
+  route, the cluster `/peer` body and the server-sent-events line encoder go
+  through it.
+- **`GET /jobs` answers conditional requests.**  The response carries a content
+  `ETag` and honors `If-None-Match` with a `304`, so a poll that finds nothing
+  changed does not re-encode or re-send the body.  The tag is computed over the
+  payload with each job's relative countdown swapped for its absolute next-fire
+  instant, so it holds steady while the countdown ticks and moves the moment a
+  fire lands or any other field changes.  For a large fleet the encode runs off
+  the event loop.
+- **The SLA trends drawer stops rescanning the ledger on every poll.**
+  `GET /jobs/{name}/trends` serves its built payload for a few seconds and
+  drops that cache the instant a run for the job finishes, so a drawer several
+  clients are watching reads up to `TREND_SCAN_LIMIT` ledger records at most
+  once per window instead of once per poll.
+
+### Metrics
+
+- **Label escaping is skipped when there is nothing to escape,** and each
+  distinct label value is escaped once per scrape rather than once per sample,
+  so a job name that appears across dozens of series is processed a single
+  time.
+- **The MCP metrics query filters structured samples directly.**
+  `cron_query_metrics` reads the metric families in place rather than rendering
+  the full exposition text and parsing it back with a regular expression.
+
+### The cluster mesh
+
+- **Ownership is derived once per pass, not once per job.**  The spread-owner
+  and available-member sets are memoized and the member names are pre-encoded,
+  so `job_owner` and `available_job_owner` no longer rebuild the member list
+  for every job; the per-job, per-peer encoding collapses to one derivation a
+  pass.
+
+### The durable store
+
+- **The newest-record lookup stops at the first match.**
+  `artifact_get_record` scans the stream once and stops early instead of
+  paging the whole listing twice, cutting a representative newest-record read
+  by close to a third.
+- **`_derive_max` no longer sorts the whole listing;** it anchors on the
+  maximum and sorts only the small set of newer records the fold needs for its
+  tie-break.
+- **Durable writes are bounded in time and in number.**  Every run-record,
+  inflight, counter and archive write runs under the state-operation timeout,
+  and the pending-write set is capped: past the cap a write is shed and counted
+  as `cronstable_state_dropped_writes{kind="overflow"}` rather than queued
+  without limit.
+- **Mapped-XCom reads are bounded in size.**  A mapped fan-in checks a
+  record's declared size and refuses an oversized blob before fetching it, and
+  a list past the item cap is returned unwalked, so one runaway upstream cannot
+  exhaust a downstream task's memory.
+
 ## 1.2.27 (2026-07-21)
 
 A transport release.  Every HTTP surface cronstable serves could previously

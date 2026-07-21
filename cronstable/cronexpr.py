@@ -875,18 +875,30 @@ class CronTab:
     # ------------------------------------------------------------------
     def test(self, entry: datetime.datetime) -> bool:
         """Whether ``entry``'s civil fields match (microseconds ignored)."""
-        return (
+        if not (
             entry.second in self._seconds
             and entry.minute in self._minutes
             and entry.hour in self._hours
             and entry.month in self._months
             and (self._years is None or entry.year in self._years)
-            and self._day_matches(entry.year, entry.month, entry.day)
-        )
+        ):
+            return False
+        # monthrange is reached only once the cheaper column checks pass,
+        # exactly as when _day_matches sat last in the old `and` chain.
+        month_end = calendar.monthrange(entry.year, entry.month)[1]
+        return self._day_matches(entry.year, entry.month, entry.day, month_end)
 
-    def _day_matches(self, year: int, month: int, day: int) -> bool:
-        """The AND of the day-of-month and day-of-week constraints."""
-        month_end = calendar.monthrange(year, month)[1]
+    def _day_matches(
+        self, year: int, month: int, day: int, month_end: int
+    ) -> bool:
+        """The AND of the day-of-month and day-of-week constraints.
+
+        ``month_end`` (``calendar.monthrange(year, month)[1]``) is passed
+        in rather than recomputed: every caller already holds it for the
+        very ``(year, month)`` under test, and this runs per candidate day
+        in the hottest civil walk, so the once-per-day monthrange lookup
+        was pure redundant work on top of an otherwise trivial check.
+        """
         if not self._dom_matches(year, month, day, month_end):
             return False
         # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
@@ -1072,7 +1084,7 @@ class CronTab:
                 continue
             month_end = calendar.monthrange(year, month)[1]
             while day <= month_end:
-                if self._day_matches(year, month, day):
+                if self._day_matches(year, month, day, month_end):
                     t = self._first_time(tod)
                     if t is not None:
                         return datetime.datetime.combine(
@@ -1223,7 +1235,7 @@ class CronTab:
             if day > month_end:
                 day = month_end  # clamp the rollback sentinel into the month
             while day >= 1:
-                if self._day_matches(year, month, day):
+                if self._day_matches(year, month, day, month_end):
                     t = self._last_time(tod)
                     if t is not None:
                         return datetime.datetime.combine(

@@ -589,6 +589,8 @@ class StateBackend(abc.ABC):
         limit: Optional[int] = None,
         newest_first: bool = False,
         strict: bool = False,
+        predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        max_matches: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Read back a stream's records (corrupt ones quarantined).
 
@@ -598,6 +600,13 @@ class StateBackend(abc.ABC):
         a missed record is worse than a failed read (the orphan-blob sweep,
         which must not mistake "a reference I could not read" for "no
         reference").  The default stays best-effort.
+
+        ``limit`` bounds the window of readable records considered (its
+        historical meaning).  ``predicate`` optionally filters which of that
+        window is returned, and ``max_matches`` stops the scan early once that
+        many matching records are collected -- so a caller after "the newest
+        record satisfying P" parses only down to the first match rather than
+        the whole window.  With both unset the result is unchanged.
         """
 
     @abc.abstractmethod
@@ -1558,9 +1567,18 @@ class FilesystemStateBackend(StateBackend):
         limit: Optional[int] = None,
         newest_first: bool = False,
         strict: bool = False,
+        predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        max_matches: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         return await self._call(
-            "list", self._list_sync, stream, limit, newest_first, strict
+            "list",
+            self._list_sync,
+            stream,
+            limit,
+            newest_first,
+            strict,
+            predicate,
+            max_matches,
         )
 
     async def list_stream_names(self, prefix: str) -> List[str]:
@@ -1668,6 +1686,8 @@ class FilesystemStateBackend(StateBackend):
         limit: Optional[int],
         newest_first: bool,
         strict: bool = False,
+        predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        max_matches: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         stream_dir = self._stream_dir(stream)
         try:
@@ -1679,12 +1699,26 @@ class FilesystemStateBackend(StateBackend):
         if newest_first:
             names.reverse()
         out: List[Dict[str, Any]] = []
+        # `limit` bounds the WINDOW of good (readable) records considered --
+        # its historical meaning, so an all-None-predicate call is byte-for-
+        # byte the old behaviour. `predicate` filters which of that window is
+        # returned, and `max_matches` stops the scan once enough matching
+        # records are in hand, so a caller wanting "the newest record that
+        # satisfies P" parses only down to the first match instead of the
+        # whole window (the artifact-name lookup below is the beneficiary).
+        considered = 0
         for name in names:
-            if limit is not None and len(out) >= limit:
+            if limit is not None and considered >= limit:
                 break
             data = self._read_record(stream_dir, name, strict=strict)
-            if data is not None:
-                out.append(data)
+            if data is None:
+                continue
+            considered += 1
+            if predicate is not None and not predicate(data):
+                continue
+            out.append(data)
+            if max_matches is not None and len(out) >= max_matches:
+                break
         return out
 
     async def derive_max(self, stream: str, field: str) -> Optional[Any]:
@@ -1717,9 +1751,14 @@ class FilesystemStateBackend(StateBackend):
         token = os.path.basename(stream_dir)
         memo_key = (token, field)
         try:
-            listing = sorted(
+            # Unsorted: the anchor is max(listing) and the scan set is filtered
+            # by watermark, both order-independent, so the O(n log n) sort that
+            # used to run on EVERY call (including memo hits, 2-3x per job per
+            # service pass) is not needed here. The fold's tie-break still
+            # needs a deterministic order, so `to_scan` alone is sorted below.
+            listing = [
                 n for n in os.listdir(stream_dir) if n.endswith(".json")
-            )
+            ]
         except FileNotFoundError:
             listing = []
         if not listing:
@@ -1762,7 +1801,12 @@ class FilesystemStateBackend(StateBackend):
         # whole derive), never silently shrink the max -- see _read_record.
         # A raise also skips the memo write-back below, so a half-folded
         # scan is never cached.
-        for name in to_scan:
+        # Fold in chronological (filename-sorted) order so the incomparable-
+        # types tie-break below (keep first-seen) is deterministic regardless
+        # of os.listdir() order. Only the scan set is sorted: on the hot
+        # incremental path it is `newer` (usually empty), so this is O(k log k)
+        # in the new records, not O(n log n) over the whole listing each call.
+        for name in sorted(to_scan):
             data = self._read_record(stream_dir, name, strict=True)
             if data is None or field not in data:
                 continue
@@ -1781,7 +1825,8 @@ class FilesystemStateBackend(StateBackend):
             if self._derive_wipe_gen.get(token, 0) == gen:
                 # unchanged generation: no wipe raced this scan, the fold
                 # is anchored to the newest filename in the full listing.
-                self._derive_memo[memo_key] = (listing[-1], best)
+                # max() == sorted(listing)[-1], and listing is non-empty here.
+                self._derive_memo[memo_key] = (max(listing), best)
         return best
 
     async def prune_records(self, stream: str, *, keep: int) -> int:

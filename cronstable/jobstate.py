@@ -52,11 +52,6 @@ ARTIFACT_STREAM_PREFIX = "artifacts/"
 # agree on the default.
 GLOBAL_SCOPE = "global"
 
-# The newest-first probe page of :func:`artifact_get_record`'s two-step
-# scan.  Sized so the common lookup -- a recently published name --
-# resolves in one page without reading the scope's whole publish history.
-_GET_RECORD_PAGE = 64
-
 
 class JobStateError(Exception):
     """A caller-provoked failure, carrying the status the API should return.
@@ -423,28 +418,32 @@ async def artifact_get_record(
     """
     scope = _require_scope(scope)
     stream = ARTIFACT_STREAM_PREFIX + scope
-    # Two-step scan: the wanted name is usually among the newest few
-    # records (a stream accumulates one immutable record per publish
-    # until GC, newest last), so probe one small newest-first page before
-    # falling back to the single full read this replaces.  The common
-    # lookup then costs O(page) instead of O(all versions ever
-    # published), while a miss or a deeply-buried name costs at most one
-    # extra page over the old full scan.  A page shorter than its limit
-    # already proves the stream exhausted.
-    for limit in (_GET_RECORD_PAGE, None):
-        records = await backend.list_records(
-            stream, limit=limit, newest_first=True, strict=strict
-        )
-        for record in records:
-            if record.get("name") == name:
-                return record
-        if limit is None or len(records) < limit:
-            return None
-    return None
+    # Newest-first early-stopping scan: a stream accumulates one immutable
+    # record per publish (newest last, so newest_first reads the current
+    # version first), and the wanted name is usually the newest record. The
+    # predicate + max_matches=1 makes the backend stop parsing at the first
+    # record carrying ``name`` -- one parse in the common case -- instead of
+    # materialising a whole page and iterating it here. A miss still scans the
+    # stream (no record matched), exactly as the full read did; strictness
+    # still spans every record from the newest down to the match, since each
+    # is read before the predicate sees it.
+    matches = await backend.list_records(
+        stream,
+        newest_first=True,
+        strict=strict,
+        predicate=lambda record: record.get("name") == name,
+        max_matches=1,
+    )
+    return matches[0] if matches else None
 
 
 async def artifact_get(
-    backend: StateBackend, scope: str, name: str, *, strict: bool = False
+    backend: StateBackend,
+    scope: str,
+    name: str,
+    *,
+    strict: bool = False,
+    max_bytes: Optional[int] = None,
 ) -> Optional[Tuple[Dict[str, Any], bytes]]:
     """The newest ``(record, payload)`` published under ``name``, or ``None``.
 
@@ -453,10 +452,26 @@ async def artifact_get(
     returning empty bytes.  ``strict`` is passed through to
     :func:`artifact_get_record`: see there for when an unreadable record must
     raise rather than read back as absent.
+
+    ``max_bytes`` caps the payload the caller is willing to load: when the
+    record's stored ``size`` exceeds it, a :class:`JobStateError` (413) is
+    raised BEFORE the blob is fetched, so an oversized artifact never enters
+    memory.  This is the consumer-side guard for a publisher that opted out of
+    the publish-time size limit (``maxArtifactBytes: 0``); the DAG mapped
+    fan-out read uses it so one upstream cannot OOM the daemon.
     """
     record = await artifact_get_record(backend, scope, name, strict=strict)
     if record is None:
         return None
+    if max_bytes is not None:
+        size = record.get("size")
+        if isinstance(size, int) and size > max_bytes:
+            raise JobStateError(
+                "artifact {!r} is {} bytes, over the {}-byte budget".format(
+                    name, size, max_bytes
+                ),
+                status=413,
+            )
     digest = record.get("sha256")
     data = await backend.get_blob(str(digest)) if digest else None
     if data is None:

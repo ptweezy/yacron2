@@ -137,6 +137,43 @@ def test_parse_prometheus_unfiltered_keeps_values_as_strings():
     assert by_name["process_cpu_seconds_total"]["value"] == "NaN"
 
 
+def test_filter_metric_samples_matches_render_then_parse():
+    # The MCP metrics query now filters structured samples straight from the
+    # families (mcp._filter_metric_samples over prometheus.iter_family_samples)
+    # instead of rendering the whole exposition and regex-reparsing it. Pin
+    # the two paths together so they cannot drift: over a mix of counters,
+    # gauges, info and histogram-bucket samples -- including special-char
+    # label values, unlabelled samples and +Inf/NaN -- the structured result
+    # must equal _parse_prometheus(render_families(...)) for every match/cap.
+    from cronstable import prometheus
+
+    fam_runs = prometheus.MetricFamily(
+        "cronstable_job_runs", "counter", "runs"
+    )
+    fam_runs.add({"job_name": 'a"b\\c', "status": "success"}, 3)
+    fam_runs.add({"job_name": "nightly", "status": "failure"}, 1)
+    fam_up = prometheus.MetricFamily("cronstable_up", "gauge", "up")
+    fam_up.add({}, 1)
+    fam_info = prometheus.MetricFamily("cronstable_build", "info", "build")
+    fam_info.add({"version": "1.2.3"}, 1)
+    fam_dur = prometheus.MetricFamily(
+        "cronstable_job_duration_seconds", "histogram", "dur"
+    )
+    fam_dur.add({"job_name": "nightly", "le": "1.0"}, 2, suffix="_bucket")
+    fam_dur.add({"job_name": "nightly", "le": "+Inf"}, 5, suffix="_bucket")
+    fam_empty = prometheus.MetricFamily("cronstable_none", "gauge", "none")
+    families = [fam_runs, fam_up, fam_info, fam_dur, fam_empty]
+
+    text = prometheus.render_families(families, openmetrics=False)
+    for match in (None, "runs", "job", "up", "build", "nomatch"):
+        for limit in (1, 3, 100):
+            expected = mcp_mod._parse_prometheus(text, match, limit)
+            got = mcp_mod._filter_metric_samples(
+                prometheus.iter_family_samples(families), match, limit
+            )
+            assert got == expected, (match, limit, got, expected)
+
+
 # ---------------------------------------------------------------------------
 # handle_message protocol edges
 # ---------------------------------------------------------------------------

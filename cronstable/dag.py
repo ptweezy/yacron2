@@ -109,6 +109,15 @@ ALL_DONE = "all_done"
 #: explanatory reason instead of expanding.
 MAX_MAPPED_ITEMS = 1000
 
+#: Byte ceiling on a mapped fan-out's serialized XCom blob, enforced by the
+#: consumer (:meth:`DagRunner._read_xcom_list`) BEFORE the blob is fetched or
+#: decoded.  MAX_MAPPED_ITEMS bounds the item COUNT but only after the list is
+#: in memory; a publisher that set ``maxArtifactBytes: 0`` (no publish-time
+#: limit) could otherwise hand the fan-out an arbitrarily large blob that OOMs
+#: the daemon during fetch/decode.  Sized generously above any legitimate
+#: MAX_MAPPED_ITEMS fan-out of small pointer-sized items (~16 KiB/item).
+MAX_MAPPED_XCOM_BYTES = 16 * 1024 * 1024
+
 #: At most this many instances are claimed -- and therefore launched -- by one
 #: advance pass; the rest stays claimable and the driver re-services promptly
 #: (``AdvanceResult.deferred``), bounding any single pass's spawn burst.

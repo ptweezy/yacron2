@@ -1,5 +1,6 @@
 import copy
 import datetime
+import hashlib
 import ipaddress
 import logging
 import math
@@ -7,13 +8,14 @@ import os
 import re
 import socket
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import (
     Any,
     Dict,
     FrozenSet,
     List,
+    NamedTuple,
     NewType,
     Optional,
     Tuple,
@@ -1317,7 +1319,11 @@ class JobConfig:
         "username",
     )
 
-    def __init__(self, config: dict) -> None:
+    def __init__(
+        self,
+        config: dict,
+        env_cache: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> None:
         self.name = config["name"]  # type: str
         self.command = config["command"]  # type: Union[str, List[str]]
         self.schedule_unparsed = config.pop("schedule")
@@ -1379,11 +1385,7 @@ class JobConfig:
         # year is also the working idiom for parking a job, and failing the
         # whole config load over it would turn an upgrade into an outage.
         self.schedule_findings: List[Finding] = (
-            lint_schedule(
-                str(self.schedule),
-                timezone=self.timezone,
-                hash_key=self.name,
-            )
+            lint_schedule(timezone=self.timezone, tab=self.schedule)
             if isinstance(self.schedule, CronTab)
             else []
         )
@@ -1416,7 +1418,7 @@ class JobConfig:
         self._validate_secrets()
         self.stateAllowedScopes = config.pop("stateAllowedScopes")
         if self.env_file is not None:
-            self._merge_env_file()
+            self._merge_env_file(env_cache)
 
         self.executionTimeout = config.pop("executionTimeout")
         self.killTimeout = config.pop("killTimeout")
@@ -1494,11 +1496,26 @@ class JobConfig:
                     "fromEnvVar source".format(self.name, entry.get("name"))
                 )
 
-    def _merge_env_file(self) -> None:
-        try:
-            file_environs = parse_environment_file(self.env_file)
-        except OSError as e:
-            raise ConfigError("Could not load env_file: {}".format(e)) from e
+    def _merge_env_file(
+        self, env_cache: Optional[Dict[str, Dict[str, str]]] = None
+    ) -> None:
+        # Within one parse many jobs commonly share an env_file; read+parse
+        # it once and reuse the result.  The cached dict is treated as
+        # immutable (the config-var overlay below runs on a private copy),
+        # and abspath keying matches how parse_config_with_sources records
+        # the file so a later edit still busts the reparse signature.
+        abspath = os.path.abspath(self.env_file)
+        cached = env_cache.get(abspath) if env_cache is not None else None
+        if cached is None:
+            try:
+                cached = parse_environment_file(self.env_file)
+            except OSError as e:
+                raise ConfigError(
+                    "Could not load env_file: {}".format(e)
+                ) from e
+            if env_cache is not None:
+                env_cache[abspath] = cached
+        file_environs = dict(cached)
         # config-defined variables override those loaded from the file
         config_environs = {
             env["key"]: env["value"] for env in self.environment
@@ -3473,9 +3490,12 @@ def _config_from_doc(
             logging_conf = inc_config.logging_config
     defaults = mergedicts(DEFAULT_CONFIG, inc_defaults_merged)
     defaults = mergedicts(defaults, doc.get("defaults", {}))
+    # One env_file is frequently shared by many jobs in a doc; a per-doc
+    # cache reads and parses each such file once instead of once per job.
+    env_cache: Dict[str, Dict[str, str]] = {}
     for config_job in doc.get("jobs", []):
         job_dict = mergedicts(defaults, config_job)
-        jobs.append(JobConfig(job_dict))
+        jobs.append(JobConfig(job_dict, env_cache=env_cache))
     # DAGs are self-contained (tasks carry their own launch fields), so a
     # top-level `defaults:` block is not applied to them; each DAG builds its
     # per-task templates over DEFAULT_CONFIG in DagConfig.
@@ -3705,6 +3725,106 @@ def parse_config_with_sources(
     return config, frozenset(sources)
 
 
+class _CachedDirFile(NamedTuple):
+    """A remembered per-file parse for the config-dir per-file cache.
+
+    ``sources`` is every on-disk file the file's parse read (itself, its
+    transitive ``include``s, and the ``env_file`` of each job and DAG task
+    it defines); ``sig`` is the sorted ``(abspath, content_digest)``
+    fingerprint of exactly those, and ``config`` is the parsed result to
+    hand back untouched when they are all still byte-for-byte current.
+    """
+
+    sources: FrozenSet[str]
+    sig: Tuple[Tuple[str, Optional[str]], ...]
+    config: CronstableConfig
+
+
+#: Per-file config-dir parse cache.  A one-line edit to one file in a
+#: config directory reopens the scheduler's whole-config reparse
+#: (cronstable.cron._config_signature), which then rebuilds EVERY file's
+#: JobConfigs even though only one changed.  Keyed by absolute path and
+#: validated by hashing each source's CONTENT, this hands back the
+#: unchanged files' already-parsed configs and re-runs strictyaml only for
+#: the file that actually changed -- so a cache hit is byte-exact with a
+#: full reparse, never merely mtime-close.  Bounded LRU so a process that
+#: parses many distinct configs (tests) does not grow it without limit; a
+#: stale or evicted entry only costs a reparse, never correctness.
+_DIR_FILE_CACHE: "OrderedDict[str, _CachedDirFile]" = OrderedDict()
+_DIR_FILE_CACHE_MAX = 1024
+
+
+def _dir_file_content_sig(
+    sources: FrozenSet[str],
+) -> Tuple[Tuple[str, Optional[str]], ...]:
+    """Sorted ``(abspath, content_digest)`` fingerprint of a parse's inputs.
+
+    Hashes each source's bytes -- the file itself, its transitive
+    includes, and its jobs'/tasks' env_files -- rather than trusting a
+    ``(mtime_ns, size)`` stat, so a size-preserving edit that also
+    preserves mtime (coarse-granularity network/container filesystems, or
+    mtime-pinning tooling such as ``rsync -a`` / ``cp --preserve=timestamps``
+    / backup-restore) still invalidates the cache.  Reading the bytes is
+    the cheap part the pre-cache code paid on EVERY reparse anyway; the
+    strictyaml parse and JobConfig build are what the cache skips.  A
+    vanished or unreadable source hashes to ``None`` so a deletion still
+    reads as a change.
+    """
+    parts: List[Tuple[str, Optional[str]]] = []
+    for src in sorted(sources):
+        try:
+            with open(src, "rb") as handle:
+                digest: Optional[str] = hashlib.blake2b(
+                    handle.read(), digest_size=16
+                ).hexdigest()
+        except OSError:
+            digest = None
+        parts.append((src, digest))
+    return tuple(parts)
+
+
+def _parse_config_dir_file(
+    path: str,
+) -> Tuple[CronstableConfig, FrozenSet[str]]:
+    """Parse one config-dir entry, reusing an unchanged prior parse.
+
+    Returns ``(config, sources)`` where ``sources`` is every file the
+    parse depended on (the entry, its includes, and its jobs'/tasks'
+    env_files) so the caller can fold it into the dir-level source set the
+    scheduler stat-watches.  ConfigError/OSError propagate unchanged (and
+    nothing is cached) so the dir loop records them exactly as before.
+    """
+    abspath = os.path.abspath(path)
+    cached = _DIR_FILE_CACHE.get(abspath)
+    if (
+        cached is not None
+        and _dir_file_content_sig(cached.sources) == cached.sig
+    ):
+        _DIR_FILE_CACHE.move_to_end(abspath)
+        return cached.config, cached.sources
+    file_sources: set = set()
+    config = parse_config_file(path, _sources=file_sources)
+    # env_files are read at parse time (JobConfig._merge_env_file / DAG task
+    # templates), so a change to one must invalidate the cached parse too --
+    # fold them into the fingerprint exactly as parse_config_with_sources
+    # folds them into the scheduler's stat-watch set.
+    for job in config.jobs:
+        if job.env_file is not None:
+            file_sources.add(os.path.abspath(job.env_file))
+    for dag_cfg in config.dags:
+        for template in dag_cfg.task_templates.values():
+            if template.env_file is not None:
+                file_sources.add(os.path.abspath(template.env_file))
+    frozen = frozenset(file_sources)
+    _DIR_FILE_CACHE[abspath] = _CachedDirFile(
+        frozen, _dir_file_content_sig(frozen), config
+    )
+    _DIR_FILE_CACHE.move_to_end(abspath)
+    while len(_DIR_FILE_CACHE) > _DIR_FILE_CACHE_MAX:
+        _DIR_FILE_CACHE.popitem(last=False)
+    return config, frozen
+
+
 def _parse_config_dir(
     config_arg: str, _sources: Optional[set] = None
 ) -> CronstableConfig:
@@ -3736,13 +3856,15 @@ def _parse_config_dir(
         ):
             continue
         try:
-            config = parse_config_file(direntry.path, _sources=_sources)
+            config, file_sources = _parse_config_dir_file(direntry.path)
         except ConfigError as err:
             config_errors[direntry.path] = str(err)
             continue
         except OSError as ex:
             config_errors[config_arg] = str(ex)
             continue
+        if _sources is not None:
+            _sources.update(file_sources)
         jobs.extend(config.jobs)
         dags.extend(config.dags)
         if config.web_config is not None:

@@ -1301,6 +1301,48 @@ def bench_artifact_list_churn():
     return asyncio.run(run())
 
 
+@bench(
+    "state.artifact_get_newest",
+    "state",
+    detail="artifact_get_record newest-name lookup x200",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.005,
+)
+def bench_artifact_get_newest():
+    # The mapped-XCom / artifact-pull read path: artifact_get_record scans the
+    # scope's records newest-first for a name. The early-stopping predicate
+    # (list_records predicate + max_matches=1) stops at the first record
+    # carrying the name -- one parse in the common case -- where the old
+    # two-step page scan materialised and iterated a whole page. Times the
+    # newest name, so the match is the first record read.
+    import asyncio
+
+    try:
+        from cronstable import jobstate
+    except ImportError as exc:
+        raise Skip("cronstable.jobstate unavailable: %r" % exc) from None
+    if not hasattr(jobstate, "artifact_get_record"):
+        raise Skip("jobstate.artifact_get_record not present")
+    path = _artifact_scope_churned()
+    n = _n(200)
+
+    async def run():
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            t0 = time.perf_counter()
+            for _ in range(n):
+                await jobstate.artifact_get_record(backend, "bench", "report-0")
+            dt = time.perf_counter() - t0
+        except TypeError as exc:
+            raise Skip("artifact_get_record signature changed: %r" % exc)
+        await backend.stop()
+        return dt
+
+    return asyncio.run(run())
+
+
 _BENCH_GATE_YAML = (
     "jobs:\n  - name: gated\n    command: 'x'\n"
     "    schedule: '* * * * *'\n    onlyIfLastSucceeded: true\n"

@@ -37,6 +37,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    Iterator,
     List,
     Optional,
     Tuple,
@@ -145,6 +146,32 @@ def _parse_prometheus(
                 }
             )
     return samples, total
+
+
+def _filter_metric_samples(
+    samples: Iterator[Tuple[str, str, str]],
+    match: Optional[str],
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Filter structured ``(name, label_block, value)`` samples by a
+    case-insensitive name substring, capping the returned list at ``limit``
+    while still counting every match.
+
+    The model-level twin of :func:`_parse_prometheus` (same filter, same
+    output shape), but fed the metric families directly via
+    :meth:`prometheus...iter_samples`, so the metrics query skips rendering
+    the whole exposition text only to regex it back apart.
+    """
+    needle = match.lower() if match else None
+    out: List[Dict[str, Any]] = []
+    total = 0
+    for name, labels, value in samples:
+        if needle is not None and needle not in name.lower():
+            continue
+        total += 1
+        if len(out) < limit:
+            out.append({"name": name, "labels": labels, "value": value})
+    return out, total
 
 
 class MCPHandler:
@@ -1098,8 +1125,9 @@ class MCPHandler:
         if match is not None and not isinstance(match, str):
             raise _ToolInputError("`match` must be a string")
         limit = self._clamp_limit(args.get("limit"))
-        text = self._cron.metrics.render(self._cron, openmetrics=False)
-        samples, total = _parse_prometheus(text, match, limit)
+        samples, total = _filter_metric_samples(
+            self._cron.metrics.iter_samples(self._cron), match, limit
+        )
         return _result(
             {
                 "samples": samples,

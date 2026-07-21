@@ -1051,12 +1051,33 @@ class DagScheduler:
             # skipped, with downstream tasks seeing success. Strict turns that
             # blip back into the exception this returns None for.
             got = await asyncio.wait_for(
-                jobstate.artifact_get(backend, scope, name, strict=True),
+                jobstate.artifact_get(
+                    backend,
+                    scope,
+                    name,
+                    strict=True,
+                    max_bytes=dag.MAX_MAPPED_XCOM_BYTES,
+                ),
                 timeout=STATE_OP_TIMEOUT,
             )
         except asyncio.TimeoutError:
             return None  # transient: retry next pass
-        except jobstate.JobStateError:
+        except jobstate.JobStateError as ex:
+            if getattr(ex, "status", None) == 413:
+                # the blob is larger than a fan-out can safely materialise
+                # (an upstream with maxArtifactBytes: 0): refuse it BEFORE it
+                # is loaded rather than OOM the daemon, and map to empty like
+                # the other definitively-unusable-output cases below.  The
+                # blob was never fetched.
+                logger.warning(
+                    "dag %s: xcom %r from %r is too large to fan out (%s); "
+                    "mapping to an empty fan-out",
+                    dag_name,
+                    key,
+                    taskkey,
+                    ex,
+                )
+                return []
             # the record survives but its blob is gone (410): definitively
             # unrecoverable, so map to empty rather than retry forever.  The
             # orphan-blob sweep never deletes a blob a surviving record
@@ -1099,6 +1120,12 @@ class DagScheduler:
             )
             return []
         if isinstance(parsed, list):
+            if len(parsed) > dag.MAX_MAPPED_ITEMS:
+                # too many items to materialise; _apply_expansions fails the
+                # task at its own MAX_MAPPED_ITEMS check.  Return it directly
+                # and skip the O(len) portability walk -- pure waste on a list
+                # that is about to be rejected, never embedded in the run doc.
+                return parsed
             try:
                 _json.ensure_portable(parsed)
             except _json.UnsupportedValue as exc:

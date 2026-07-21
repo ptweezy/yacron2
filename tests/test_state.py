@@ -3439,16 +3439,26 @@ async def test_sweep_dir_tolerates_unlink_oserror(tmp_path, monkeypatch):
 
 async def test_migrate_skips_unreadable_stream_dir(tmp_path, monkeypatch):
     # migrate_schema skips a stream directory it cannot list rather than
-    # failing the whole migration pass.
+    # failing the whole migration pass.  A convertible legacy record sits in
+    # the unlistable stream: because the stream is skipped it is never read,
+    # so nothing is converted (proving the skip, not a silent read).
     backend = _backend(tmp_path)
     await backend.start()
-    await backend.append_record("runs/m", {"x": 1})
+    monkeypatch.setitem(
+        state.RECORD_MIGRATIONS, "v0", lambda data: {"outcome": "x"}
+    )
+    _write_raw_record(
+        backend,
+        "runs/m",
+        "00000000000000000001-old-000000000001.json",
+        {"schemaVersion": "v0", "data": {"result": "ok"}},
+    )
     stream_dir = backend._stream_dir("runs/m")
     _os_raiser(monkeypatch, "listdir", [stream_dir])
     result = await backend.migrate_schema()
-    # the unlistable stream contributes nothing; the pass still returns.
-    assert result["current"] == 0
+    # the unlistable stream is skipped: its convertible record is untouched.
     assert result["converted"] == 0
+    assert result["unreadable"] == 0
     await backend.stop()
 
 

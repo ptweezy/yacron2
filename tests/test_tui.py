@@ -2447,3 +2447,577 @@ def test_tail_preset_and_add_tail_guards(tmp_path):
     # no failing jobs right now
     app.tail_preset("fail")
     assert any("no fail jobs" in m for m in _msgs(app))
+
+
+# ===================================================================
+#  added coverage: overlay / panel render paths (direct, bare app)
+# ===================================================================
+def test_render_table_paints_every_column(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.fetched_mono = time.monotonic()
+    mon = _job(
+        "monitored",
+        outcome="success",
+        history=[
+            {"outcome": "success", "duration": 1.0},
+            {"outcome": "failure", "duration": 3.0},
+        ],
+    )
+    mon["running_resources"] = {"cpu_percent": 50.0, "rss_bytes": 1024}
+    owned = _job("owned", outcome="success")
+    owned["clusterOwner"] = "node-b"
+    unowned = _job("unowned", outcome="success")
+    unowned["clusterOwner"] = None  # renders the ∅ placeholder
+    runner = _job("runner", running=True, scheduled_in=None)  # · · · + no res
+    off = _job("mothballed", enabled=False)  # next "—"
+    held = _job("held", outcome="success", paused=True)
+    retry = _job("retry", outcome="failure")
+    retry["retry"] = {"attempt": 3}
+    app.jobs = [mon, owned, unowned, runner, off, held, retry]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.recompute_view()
+    rows = app.render_table(paint, 170, 24)  # wide: every column survives
+    body = _txt(rows)
+    for name in ("monitored", "owned", "unowned", "runner", "retry"):
+        assert name in body
+    assert "∅" in body  # the unowned owner cell
+    assert "try 3" in body  # the retry job's last column
+
+
+def test_render_overlay_unknown_returns_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    assert app.render_overlay(_paint(app), "nonesuch", 80, 24) == []
+
+
+def test_render_help_and_palette(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.panel_scroll = 3
+    help_body = _txt(app.render_help(paint, 110, 18))
+    assert "keyboard shortcuts" in help_body
+    # a populated palette paints the selected row
+    app.jobs = [_job("deploy", outcome="success")]
+    app.by_name = {"deploy": app.jobs[0]}
+    app.inputs["palette"] = "logs deploy"
+    app.palette_sel = 0
+    pal = app.render_palette(paint, 110, 30)
+    assert any("deploy" in strip_ansi(r) for r in pal)
+    # an unmatched query shows the empty note
+    app.inputs["palette"] = "zzz-no-such-command"
+    assert "no matching command" in _txt(app.render_palette(paint, 110, 30))
+
+
+def test_render_settings_zen_idle_reset(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.prefs["zen_idle_s"] = 999  # not a cycle choice -> ValueError path
+    rows = app.settings_rows()
+    idle = next(r for r in rows if r[0] == "Zen idle")
+    idle[2]()  # cycle: falls back to the first choice
+    assert app.prefs["zen_idle_s"] == 30
+    assert "prefs file" in _txt(app.render_settings(paint, 110, 30))
+
+
+def test_render_cluster_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.cluster = {"enabled": False}
+    assert "single node" in _txt(app.render_cluster(paint, 110, 30))
+    app.cluster = {
+        "enabled": True,
+        "elect_leader": True,
+        "conflict": True,
+        "conflict_names": ["dup"],
+        "node_name": "n1",
+        "backend": "gossip",
+        "quorate": True,
+        "is_leader": False,
+        "leader": "n2",
+        "node_stats": {"cpu_percent": 10.0, "mem_percent": 20.0},
+        "peers": [
+            {
+                "node_name": "n2",
+                "status": "alive",
+                "agree": True,
+                "node_stats": {"cpu_percent": 5.0, "mem_percent": 8.0},
+                "owns": 3,
+            },
+            {"node_name": "n3", "status": "lost", "agree": False},
+            {"host": "n4", "status": "unknown"},  # agreed None -> "·"
+            "not-a-dict",
+        ],
+        "lease": {
+            "holder": "n1",
+            "identity": "n1",
+            "expiry": _iso_ago(-3600),  # an hour out -> fmt_in
+            "fence": 7,
+            "path": "/leases/x",
+        },
+    }
+    body = _txt(app.render_cluster(paint, 110, 30))
+    assert "follower (leader: n2)" in body
+    assert "duplicate nodeName" in body  # the conflict alert
+    assert "held by" in body and "owns 3" in body
+
+    # follower with no named leader, then a no-quorum node with an expired
+    # lease
+    app.cluster = {
+        "enabled": True,
+        "elect_leader": True,
+        "quorate": True,
+        "is_leader": False,
+        "node_name": "n1",
+    }
+    assert "follower" in _txt(app.render_cluster(paint, 110, 30))
+    app.cluster = {
+        "enabled": True,
+        "elect_leader": True,
+        "quorate": False,
+        "backend": "etcd",
+        "node_name": "n1",
+        "lease": {"holder": "other", "identity": "n1", "expiry": _iso_ago(60)},
+    }
+    body2 = _txt(app.render_cluster(paint, 110, 30))
+    assert "no quorum" in body2 and "expired" in body2
+
+
+def test_render_state_and_fleet_edges(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.state_data = {"enabled": False}
+    assert "not configured" in _txt(app.render_state(paint, 110, 30))
+    app.state_data = {"enabled": True, "documents": {}, "records": {}}
+    app.state_tab = "documents"
+    assert "nothing here yet" in _txt(app.render_state(paint, 110, 30))
+    app.fleet = {"enabled": False}
+    assert "needs a cluster" in _txt(app.render_fleet(paint, 110, 30))
+    # a fleet whose only jobs are filtered out shows the empty note
+    app.fleet = {
+        "enabled": True,
+        "nodes": [
+            {
+                "node_name": "a",
+                "jobs": {
+                    "ok-job": {
+                        "running": False,
+                        "enabled": True,
+                        "last": {"outcome": "success"},
+                    }
+                },
+            }
+        ],
+    }
+    app.fleet_fail_only = True
+    assert "nothing failing" in _txt(app.render_fleet(paint, 110, 30))
+
+
+def test_render_heat_bucket_edges(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    assert "gathering run history" in _txt(app.render_heat(paint, 110, 30))
+    app.heat_data = {
+        "j": [
+            {"outcome": "success", "finished_at": None},  # unparseable -> skip
+            {"outcome": "failure", "finished_at": _iso_ago(3600)},
+            {"outcome": "success", "finished_at": _iso_ago(48 * 3600)},  # aged
+        ]
+    }
+    assert "activity heatmap" in _txt(app.render_heat(paint, 110, 30))
+
+
+def test_render_press_full_grid(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    assert "computing the fire forecast" in _txt(
+        app.render_press(paint, 110, 30)
+    )
+    fires = [0] * 60
+    fires[0] = 3
+    fires[15] = 1
+    grid = [[0] * 60 for _ in range(24)]
+    grid[0][0] = 3
+    grid[9][15] = 1
+    app.pressure = {
+        "hours": 24,
+        "total_fires": 4,
+        "jobs": 5,
+        "busiest_minute": {"minute": 0, "jobs": 3},
+        "empty_minutes": list(range(1, 60)),
+        "by_minute_fires": fires,
+        "timezone": "UTC",
+        "grid": grid,
+    }
+    app.press_suggest = {
+        "hourly": {"expression": "17 * * * *"},
+        "daily": {"expression": "17 3 * * *"},
+    }
+    app.press_dups = [
+        {
+            "expression": "0 * * * *",
+            "count": 7,
+            "jobs": ["dup-%d" % i for i in range(7)],
+        }
+    ]
+    body = _txt(app.render_press(paint, 110, 40))
+    assert "duplicate schedules" in body
+    assert "+2 more" in body  # the >5 group preview
+    assert "suggest" in body
+
+
+def test_render_week_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    assert "enumerating the week" in _txt(app.render_week(paint, 110, 30))
+    start = datetime.datetime.now(datetime.timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    app.week = {
+        "items": [],
+        "frequent": [],
+        "start": start,
+        "schedules": 0,
+        "grid": [[0] * 24 for _ in range(7)],
+    }
+    assert "no scheduled fires" in _txt(app.render_week(paint, 110, 30))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    app.week = {
+        "items": [
+            (now + datetime.timedelta(hours=2), "future-job"),
+            (now - datetime.timedelta(hours=2), "past-job"),
+        ],
+        "frequent": [("hum-job", 120, True)],
+        "start": start,
+        "schedules": 2,
+        "grid": [[1] * 24 for _ in range(7)],
+    }
+    body = _txt(app.render_week(paint, 110, 40))
+    assert "upcoming fires" in body and "background hum" in body
+    assert "future-job" in body
+
+
+def test_render_radar_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.fetched_mono = time.monotonic()
+    app.jobs = [
+        _job("disabled", enabled=False),
+        _job("running", running=True, scheduled_in=None),
+    ]
+    assert "no jobs scheduled" in _txt(app.render_radar(paint, 110, 30))
+    app.jobs = [
+        _job("soon", scheduled_in=120.0),
+        _job("null", scheduled_in=None),
+    ]
+    app.fetched_mono = time.monotonic()
+    assert "1 upcoming" in _txt(app.render_radar(paint, 110, 30))
+
+
+def test_render_node_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.node = {"node_name": "n", "resources": None}
+    assert "sampling unavailable" in _txt(app.render_node(paint, 110, 30))
+    app.node = {
+        "node_name": "n",
+        "resources": {
+            "cpu_percent": 12.5,
+            "rss_bytes": 2048,
+            "pids": 42,
+            "host": "h",  # a non-numeric value renders as a string
+        },
+    }
+    app.node_history = {
+        "points": [[time.time() + i, 10.0 + i, 20.0 + i] for i in range(20)]
+    }
+    body = _txt(app.render_node(paint, 110, 30))
+    assert "node: n" in body and "cpu" in body
+
+
+def test_render_dags_index_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dags = []
+    assert "no DAGs configured" in _txt(app.render_dags(paint, 110, 30))
+    app.dags = [
+        {
+            "name": "pipeline",
+            "taskCount": 5,  # no tasks list -> falls back to taskCount
+            "schedule": "0 * * * *",
+            "latestRun": {"state": "failed"},
+        }
+    ]
+    body = _txt(app.render_dags(paint, 110, 30))
+    assert "pipeline" in body and "0 * * * *" in body
+
+
+def test_render_mitigate_overflow_and_running(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.mitigate_names = ["job-%d" % i for i in range(8)]
+    app.mitigate_label = "lots"
+    app.mitigate_log = ["  ✓ start job-0", "  ✕ job-1 (HTTP 500)", "note"]
+    app.mitigate_running = True
+    body = _txt(app.render_mitigate(paint, 110, 30))
+    assert "+2 more" in body
+    assert "running (a to abort)" in body
+
+
+def test_render_sandbox_hashed_and_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.inputs["sandbox"] = ""
+    assert "type a cron expression" in _txt(app.render_sandbox(paint, 110, 30))
+    app.inputs["sandbox"] = "H * * * *"
+    assert "stable hash" in _txt(app.render_sandbox(paint, 110, 30))
+    # a never-fires expression parses but lints with a finding
+    app.inputs["sandbox"] = "0 0 30 2 *"
+    body = _txt(app.render_sandbox(paint, 110, 40))
+    assert "cron sandbox" in body
+
+
+def test_render_timeline_blast_and_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.jobs = [
+        _job(
+            "bad",
+            outcome="failure",
+            exit_code=7,
+            fail_reason="nope",
+            duration=2.0,
+        ),
+    ]
+    app.incident_set = ["bad"]
+    body = _txt(app.render_timeline(paint, 110, 30))
+    assert "blast radius" in body
+    # fail-only with nothing failing shows the clear-filter hint
+    app.jobs = [_job("fine", outcome="success")]
+    app.timeline_fail_only = True
+    assert "clear the filter" in _txt(app.render_timeline(paint, 110, 30))
+
+
+# ===================================================================
+#  added coverage: drawer + DAG-panel render paths
+# ===================================================================
+def test_drawer_logs_suffix_and_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # a no-output end shows its own separator
+    tail = _stub_tail(app, [])
+    tail.ended = "no-output"
+    app.log_tail = tail
+    assert "no-output" in _txt(app._drawer_logs(paint, 90, 12))
+    # a still-open empty tail shows the waiting hint
+    tail2 = _stub_tail(app, [])
+    app.log_tail = tail2
+    assert "waiting for output" in _txt(app._drawer_logs(paint, 90, 12))
+    # no stream at all
+    app.log_tail = None
+    assert "no stream" in _txt(app._drawer_logs(paint, 90, 12))
+
+
+def test_drawer_history_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # not loaded yet
+    app.drawer_runs = None
+    assert "loading run history" in _txt(app._drawer_history(paint, 80, 20))
+    # empty run list
+    app.drawer_runs = {"stats": {"total": 0}, "runs": []}
+    assert "no runs retained yet" in _txt(app._drawer_history(paint, 80, 20))
+    # full stats block with cpu line + a failure run with resources
+    app.drawer_runs = {
+        "stats": {
+            "total": 2,
+            "success": 1,
+            "failure": 1,
+            "cancelled": 0,
+            "unknown": 0,
+            "success_rate": 0.5,
+            "avg_duration": 2.0,
+            "min_duration": 1.0,
+            "max_duration": 3.0,
+            "avg_cpu_seconds": 1.5,
+            "max_rss_bytes": 4096,
+        },
+        "runs": [
+            {
+                "outcome": "failure",
+                "started_at": _iso_ago(120),
+                "duration": 3.0,
+                "exit_code": 7,
+                "fail_reason": "boom",
+                "resources": {"cpu_total_seconds": 1.2},
+            },
+            {
+                "outcome": "success",
+                "started_at": _iso_ago(60),
+                "duration": 1.0,
+            },
+        ],
+    }
+    body = _txt(app._drawer_history(paint, 90, 24))
+    assert "peak rss" in body and "exit 7" in body and "cpu" in body
+
+
+def test_drawer_resources_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.drawer_res = None
+    assert "loading resource data" in _txt(app._drawer_resources(paint, 80, 20))
+    app.drawer_res = {"monitored": False}
+    none_body = _txt(app._drawer_resources(paint, 80, 20))
+    assert "no resource monitoring" in none_body
+    app.drawer_res = {
+        "monitored": True,
+        "live": [{"cpu_percent": 40.0, "rss_bytes": 2048}],
+        "runs": [
+            {
+                "started_at": _iso_ago(120),
+                "resources": {
+                    "cpu_total_seconds": 1.5,
+                    "max_rss_bytes": 4096,
+                },
+            }
+        ],
+    }
+    body = _txt(app._drawer_resources(paint, 90, 20))
+    assert "live:" in body and "peak rss" in body
+
+
+def test_drawer_schedule_variants(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # an @reboot job has no upcoming fires but its own note
+    reboot = _job("boot", schedule="@reboot", scheduled_in=None)
+    app.jobs = [reboot]
+    app.by_name = {"boot": reboot}
+    app.drawer_job = "boot"
+    assert "runs once, at daemon start" in _txt(
+        app._drawer_schedule(paint, 60, 24)
+    )
+    # a resolved H schedule with a timezone and shipped findings
+    tz_job = _job("tz", schedule="H * * * *", scheduled_in=45.0)
+    tz_job["schedule_resolved"] = "18 * * * *"
+    tz_job["timezone"] = "America/New_York"
+    tz_job["utc"] = False
+    tz_job["schedule_findings"] = [
+        {"code": "uneven", "level": "warning", "message": "uneven cadence"}
+    ]
+    app.jobs = [tz_job]
+    app.by_name = {"tz": tz_job}
+    app.drawer_job = "tz"
+    app.fetched_mono = time.monotonic()
+    body = _txt(app._drawer_schedule(paint, 70, 24))
+    assert "resolves to 18 * * * *" in body
+    assert "next runs:" in body
+    assert "uneven cadence" in body
+    assert "daemon says: next fire" in body
+
+
+def test_render_drawer_panel_dispatches_tabs(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    job = _job("d", outcome="success")
+    app.jobs = [job]
+    app.by_name = {"d": job}
+    app.drawer_job = "d"
+    for tab in ("logs", "history", "resources", "schedule"):
+        app.drawer_tab = tab
+        rows = app.render_drawer_panel(paint, 70, 24)
+        assert any(strip_ansi(r).strip() for r in rows)
+
+
+def test_dag_panel_tabs_render(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dag_name = "pipeline"
+    app.dags = [
+        {
+            "name": "pipeline",
+            "tasks": [
+                {"id": "extract", "dependsOn": []},
+                {"id": "load", "dependsOn": "extract"},  # string dep form
+                {"id": "report", "dependsOn": ["load"]},
+            ],
+        }
+    ]
+    # runs tab: empty then populated
+    app.dag_tab = "runs"
+    app.dag_runs = []
+    assert "no runs yet" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_runs = [
+        {"runKey": "manual-1", "state": "running", "createdAt": time.time()}
+    ]
+    assert "manual-1" in _txt(app.render_dag_panel(paint, 70, 24))
+
+    # graph tab lays out layers with edges
+    app.dag_tab = "graph"
+    app.dag_run = {
+        "tasks": {
+            "extract": {"state": "success"},
+            "load": {"state": "running"},
+        }
+    }
+    graph = _txt(app.render_dag_panel(paint, 70, 24))
+    assert "extract" in graph and ("─▶" in graph or "->" in graph)
+
+    # tasks tab: no run key -> hint; then a run with an awaiting gate
+    app.dag_tab = "tasks"
+    app.dag_run_key = None
+    assert "open a run first" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_run_key = "manual-1"
+    app.dag_run = {
+        "tasks": {
+            "extract": {"state": "success", "attempt": 0},
+            "approve": {
+                "state": "running",
+                "awaitingApproval": True,
+                "attempts": 1,
+            },
+        }
+    }
+    tasks = _txt(app.render_dag_panel(paint, 70, 24))
+    assert "awaiting" in tasks and "a approve" in tasks
+
+    # xcom tab: no run key, loading, values, and empty
+    app.dag_tab = "xcom"
+    app.dag_run_key = None
+    assert "open a run first" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_run_key = "manual-1"
+    app.dag_xcom = None
+    assert "loading xcom" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_xcom = {"xcom": {"rows": 42}}
+    assert "rows" in _txt(app.render_dag_panel(paint, 70, 24))
+    app.dag_xcom = {"xcom": {}}
+    assert "no xcom values" in _txt(app.render_dag_panel(paint, 70, 24))
+
+    # logs tab: no tail selected
+    app.dag_tab = "logs"
+    app.dag_task_tail = None
+    assert "pick a task" in _txt(app.render_dag_panel(paint, 70, 24))
+    tail = _stub_tail(app, [])
+    tail.ended = "no-output"
+    app.dag_task_tail = tail
+    assert "no output" in _txt(app.render_dag_panel(paint, 70, 24))
+
+
+def test_dag_graph_no_task_metadata(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.dag_name = "empty"
+    app.dags = [{"name": "empty"}]
+    app.dag_tab = "graph"
+    assert "no task metadata" in _txt(app.render_dag_panel(paint, 70, 24))
+
+
+def test_render_tail_input_and_empty(tmp_path):
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    # empty console with the add-input focused
+    app.focus = "tailadd"
+    app.inputs["tailadd"] = "abc"
+    body = _txt(app.render_tail(paint, 110, 24))
+    assert "empty — a to add a job" in body
+    assert "add:" in body

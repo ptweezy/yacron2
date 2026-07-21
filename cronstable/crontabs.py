@@ -86,9 +86,12 @@ _ENV_LINE = re.compile(
 # py/overly-large-range) as a possible typo, and enumerating the points
 # keeps the TAB/LF carve-out visible at the spot the class is defined.
 _REFUSED_CONTROLS = (
-    [c for c in range(0x00, 0x20) if c not in (0x09, 0x0A)]  # C0 controls, minus TAB and LF
-    + list(range(0x7F, 0xA0))                                # DEL and the C1 controls
-    + [0x2028, 0x2029]                                       # Unicode line/paragraph separators
+    # C0 controls, minus TAB (0x09) and LF (0x0a)
+    [c for c in range(0x00, 0x20) if c not in (0x09, 0x0A)]
+    # DEL and the C1 controls
+    + list(range(0x7F, 0xA0))
+    # the Unicode line/paragraph separators
+    + [0x2028, 0x2029]
 )
 _CONTROL_CHARS = re.compile(
     "[" + "".join(chr(c) for c in _REFUSED_CONTROLS) + "]"

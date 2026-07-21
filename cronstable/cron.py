@@ -5344,8 +5344,8 @@ class Cron:
 
         # Snapshot the TLS files BEFORE api.start() loads them, mirroring
         # _build_web_tls: a rotation landing in the gap then compares unequal
-        # on the next pass -- a spurious restart, the safe direction, not a
-        # missed one. None for a plaintext endpoint (no cert/key), which
+        # on the next pass, which is a spurious restart (the safe direction),
+        # not a missed one. None for a plaintext endpoint (no cert/key), which
         # therefore never triggers a rotation restart.
         job_api_tls = job_api_cfg.get("tls")
         tls_signature: Optional[Dict[str, Any]] = None
@@ -5402,8 +5402,8 @@ class Cron:
         ``ca`` is handed to jobs as a path and read fresh by each one, so
         nothing the daemon holds goes stale when it rotates.
 
-        Gated on ``_job_api_tls_signature`` -- ``None`` for a plaintext
-        endpoint, which therefore never restarts on this -- rather than on the
+        Gated on ``_job_api_tls_signature`` (``None`` for a plaintext
+        endpoint, which therefore never restarts on this) rather than on the
         config, so a loopback endpoint is untouched.
         """
         if self._job_api_tls_signature is None or not tls:
@@ -5420,7 +5420,7 @@ class Cron:
 
         Called on an otherwise no-op reload (state config byte-identical). The
         web-app analogue is the TLS arm of :meth:`_web_restart_reason`; this
-        is lighter because only the listener is rebuilt -- the store backend,
+        is lighter because only the listener is rebuilt: the store backend,
         its leases and its renewers are untouched.
 
         Restarting is gated on the new material actually loading. A
@@ -5431,7 +5431,7 @@ class Cron:
         keeping the old listener up and retrying is the safe direction.
 
         The loadability gate covers the material; the rebind itself is not
-        pre-validated (make-before-break is infeasible -- the new listener
+        pre-validated (make-before-break is infeasible, since the new listener
         wants the same port the old one holds). A rebind that fails leaves the
         endpoint down with the error :meth:`_start_job_api` logs, the same
         degraded state as a failed initial start, until the ``state`` config

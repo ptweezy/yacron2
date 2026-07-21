@@ -974,7 +974,7 @@ async def test_job_api_in_place_rotation_restarts_only_the_listener(tmp_path):
     # The jobApi https listener's analogue of
     # test_in_place_rotation_restarts_the_listener: the state config is
     # byte-identical across a rotation, so only the file signature notices it.
-    # The restart rebuilds ONLY the listener -- the store backend, and the
+    # The restart rebuilds ONLY the listener: the store backend, and the
     # object identity that proves it, are untouched.
     from tests.test_state import _state_cfg
 

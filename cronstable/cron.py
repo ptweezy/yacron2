@@ -1,6 +1,7 @@
 import asyncio
 import asyncio.subprocess
 import datetime
+import hashlib
 import heapq
 import hmac
 import importlib.resources
@@ -807,6 +808,69 @@ def _json_response(
         headers=headers,
         content_type="application/json",
     )
+
+
+#: Job count at or above which GET /jobs computes its ETag and serializes
+#: its body on the default executor instead of inline.  Below it the
+#: thread hop costs more than the encode; above it a large fleet's encode
+#: must not stall the scheduling loop.
+_JOBS_SERIALIZE_OFFLOAD_MIN = 200
+
+
+def _etag_matches(header: Optional[str], etag: str) -> bool:
+    """Whether an ``If-None-Match`` header carries ``etag``.
+
+    Handles the comma-separated list form, the ``*`` wildcard, and a
+    ``W/`` weak-validator prefix a cache may echo (``If-None-Match`` uses
+    the weak comparison, so a strong/weak difference on the same opaque
+    value still matches).
+    """
+    if not header:
+        return False
+    for token in header.split(","):
+        token = token.strip()
+        if token == "*":
+            return True
+        if token.startswith("W/"):
+            token = token[2:]
+        if token == etag:
+            return True
+    return False
+
+
+def _jobs_conditional_response(
+    payload: List[Dict[str, Any]],
+    next_fire_iso: Dict[str, Optional[str]],
+    if_none_match: Optional[str],
+) -> Tuple[str, Optional[bytes]]:
+    """The ETag for a ``/jobs`` payload and, unless the client already has
+    it, the serialized body.
+
+    The tag is a strong hash of the payload with each job's volatile
+    relative ``scheduled_in`` swapped for its STABLE absolute next-fire
+    instant.  So it changes exactly when the displayed data changes -- a
+    fire advancing, a run starting/finishing, a pause, a reload, a live
+    resource sample -- but NOT merely because the countdown ticked down
+    between two polls (every client recomputes that locally from the
+    poll it holds, so a 304 that keeps the old body stays correct).  Pure
+    and free of scheduler state, so it can run on an executor for a large
+    fleet without a cross-thread read of ``self``.
+    """
+    canonical = [
+        {**job, "scheduled_in": next_fire_iso.get(job["name"])}
+        for job in payload
+    ]
+    raw = json.dumps(
+        canonical, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    etag = '"' + hashlib.blake2b(raw, digest_size=16).hexdigest() + '"'
+    if _etag_matches(if_none_match, etag):
+        return etag, None
+    try:
+        body = _json.dumps_bytes(payload)
+    except _json.UnsupportedValue:
+        body = json.dumps(payload, default=str).encode("utf-8")
+    return etag, body
 
 
 async def _sse_send_line(
@@ -3906,9 +3970,41 @@ class Cron:
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        return _json_response(
-            self.jobs_payload(), headers=self.web_config.get("headers", None)
+        # Build on the loop (it reads live scheduler state), then hash +
+        # serialize off it for a large fleet.  A content-hash ETag lets a
+        # conditional client (or a cache/proxy) 304 an unchanged poll,
+        # skipping the body encode and transfer; the tag is keyed on the
+        # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
+        # put while the countdown ticks and moves the instant a fire lands.
+        payload = self.jobs_payload()
+        next_fire_iso: Dict[str, Optional[str]] = {}
+        for name in self.cron_jobs:
+            when = self._next_fire.get(name)
+            next_fire_iso[name] = when.isoformat() if when is not None else None
+        inm = request.headers.get("If-None-Match")
+        if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+            etag, body = await asyncio.get_running_loop().run_in_executor(
+                None, _jobs_conditional_response, payload, next_fire_iso, inm
+            )
+        else:
+            etag, body = _jobs_conditional_response(payload, next_fire_iso, inm)
+        headers = self._web_jobs_headers(etag)
+        if body is None:
+            return web.Response(status=304, headers=headers)
+        return web.Response(
+            body=body,
+            status=200,
+            headers=headers,
+            content_type="application/json",
         )
+
+    def _web_jobs_headers(self, etag: str) -> Dict[str, str]:
+        """The configured web response headers plus the ``/jobs`` ETag."""
+        assert self.web_config is not None
+        base = self.web_config.get("headers", None)
+        headers: Dict[str, str] = dict(base) if base else {}
+        headers["ETag"] = etag
+        return headers
 
     # --- DAG introspection + control --------------------------------------
 

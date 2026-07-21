@@ -5991,6 +5991,66 @@ async def test_sla_reenabled_after_a_disabled_span_gets_a_fresh_baseline(
 
 
 @pytest.mark.asyncio
+async def test_sla_reenabled_after_a_disabled_span_credits_a_prior_success(
+    tmp_path, monkeypatch
+):
+    # regression (#19 residual, the previously-succeeded arm): a job that HAD
+    # recorded a success, then sat disabled longer than
+    # maxTimeSinceSuccessSeconds, then re-enabled, paged the whole disabled
+    # span instantly on the first tick. The _sla_first_seen roll-forward only
+    # reaches the never-succeeded arm; _sla_stale_reference here returns the
+    # week-old _sla_last_success. The disabled span must be banked as a
+    # staleness credit (the same #22 pause-credit machinery) so a job the
+    # operator deliberately switched off does not page for that span.
+    holder = {"now": DT(2020, 1, 1, 9, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(_SLA_DISABLED_STALE_JOB)
+    cron = cronstable.cron.Cron(str(cfg))
+    reports = _sla_report_recorder(monkeypatch)
+    # the job succeeded once, an hour before the first disabled housekeeping
+    # tick records the disabled-span start
+    cron._sla_last_success["db-vacuum"] = DT(2020, 1, 1, 8, 0, 0, tzinfo=UTC)
+
+    # a week switched off: a disabled job never pages, and the disabled-span
+    # start is banked from the first disabled tick (2020-01-01 09:00)
+    for day in range(1, 9):
+        holder["now"] = DT(2020, 1, day, 9, 0, 0)
+        cron._sla_periodic()
+        assert not cron._sla_state
+    assert cron._sla_disabled_since["db-vacuum"] == DT(
+        2020, 1, 1, 9, 0, 0, tzinfo=UTC
+    )
+
+    # the operator re-enables it; the first tick must NOT page for the week it
+    # was off: the disabled span is banked as a credit against the old success
+    holder["now"] = DT(2020, 1, 8, 9, 1, 0)
+    cfg.write_text(_SLA_ENABLED_STALE_JOB)
+    cron.update_config()
+    assert cron.cron_jobs["db-vacuum"].enabled is True
+    cron._sla_periodic()
+    assert ("db-vacuum", STALE) not in cron._sla_state
+    await cron._drain_completions()
+    assert reports == []
+    # the span was banked and the tracker cleared at the transition
+    assert "db-vacuum" not in cron._sla_disabled_since
+    assert cron._sla_pause_windows["db-vacuum"] == [
+        (
+            DT(2020, 1, 1, 9, 0, 0, tzinfo=UTC),
+            DT(2020, 1, 8, 9, 1, 0, tzinfo=UTC),
+        )
+    ]
+
+    # ...but it still ages into the breach a full threshold (25h) after
+    # re-enabling, measured from re-enable rather than the old success
+    holder["now"] = DT(2020, 1, 9, 10, 30, 0)
+    cron._sla_periodic()
+    assert ("db-vacuum", STALE) in cron._sla_state
+    await cron._drain_completions()
+    assert len(reports) == 1
+
+
+@pytest.mark.asyncio
 async def test_sla_pause_time_is_credited_against_staleness(monkeypatch):
     # regression (#22): the staleness clock ran at full rate across a pause,
     # so an unattended job paged the first pass after the window expired,
@@ -6356,6 +6416,68 @@ async def test_sla_warm_last_real_outcome_is_newest_by_finished_at(monkeypatch):
         DT(2020, 1, 1, 10, 5, 0, tzinfo=UTC),
         "failure",
     )
+
+
+@pytest.mark.asyncio
+async def test_depends_on_past_folds_all_ledger_records_by_finished_at(
+    monkeypatch,
+):
+    # regression (#21 residual, the peer / shared-mount arm): the ledger arm
+    # of _depends_on_past_ok took the FIRST real record newest-by-SEQUENCE
+    # then broke, so an out-of-order write (a peer on the shared mount, or two
+    # concurrencyPolicy: Allow runs racing) that landed a newer success ahead
+    # of the true-newest failure cleared the gate on the stale success. The
+    # memo cannot cover it (only THIS node's runs update the memo). The arm
+    # must fold ALL records and pick the max by finished_at.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONLY_IF_LAST_JOB)
+    # this node saw only its own success@10:00; that seeds the local memo
+    await _warm_ledger(
+        cron,
+        [_run_record(1, "success", DT(2020, 1, 1, 10, 0, 0, tzinfo=UTC))],
+    )
+    assert cron._last_real_outcome["s"] == (
+        DT(2020, 1, 1, 10, 0, 0, tzinfo=UTC),
+        "success",
+    )
+    # a peer then appended to the shared ledger out of order: the TRUE newest
+    # real outcome is a failure@10:20, but a later-sequence success@10:10 sits
+    # ahead of it in newest-by-sequence order.
+    cron.state_backend = _RecordBackend(
+        [
+            _run_record(1, "success", DT(2020, 1, 1, 10, 0, 0, tzinfo=UTC)),
+            _run_record(2, "failure", DT(2020, 1, 1, 10, 20, 0, tzinfo=UTC)),
+            _run_record(3, "success", DT(2020, 1, 1, 10, 10, 0, tzinfo=UTC)),
+        ]
+    )
+    # the gate must BLOCK: the newest real outcome by finished_at is a failure
+    assert await cron._depends_on_past_ok(cron.cron_jobs["s"]) is False
+
+
+@pytest.mark.asyncio
+async def test_depends_on_past_picks_newest_in_memory_run_by_finished_at(
+    monkeypatch,
+):
+    # regression (#21 residual, the in-memory arm): the ring walk took the
+    # first real outcome by reversed() list position then broke. Two
+    # concurrencyPolicy: Allow runs whose unserialized record writes land out
+    # of order put an older success LAST in the ring behind a newer failure,
+    # so the positional walk cleared the gate on the stale success. With no
+    # backend this arm decides alone; it must pick the max by finished_at.
+    holder = {"now": DT(2020, 1, 1, 12, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONLY_IF_LAST_JOB)
+    assert cron.state_backend is None
+    # the failure finished LATER (10:20) but the success was appended AFTER it
+    # (10:10), so the success sits last in the ring
+    cron.run_history["s"].append(
+        _mem_run("failure", DT(2020, 1, 1, 10, 20, 0, tzinfo=UTC))
+    )
+    cron.run_history["s"].append(
+        _mem_run("success", DT(2020, 1, 1, 10, 10, 0, tzinfo=UTC))
+    )
+    assert await cron._depends_on_past_ok(cron.cron_jobs["s"]) is False
 
 
 # ---------------------------------------------------------------------------

@@ -721,6 +721,47 @@ async def test_real_run_under_a_long_pause_still_settles_the_ladder(
         await _stop_state(second)
 
 
+@pytest.mark.parametrize("held", [49, 50, 55])
+async def test_pre_ranat_run_under_a_long_pause_still_settles_the_ladder(
+    tmp_path, held
+):
+    # #7 residual: the resolving run was written BEFORE the ``ranAt`` field
+    # existed (finished_at only), so derive_max("ranAt") sees nothing and the
+    # pre-ranAt compatibility fold in durable_last_completed_at must find it.
+    # That fold reads only the newest RUN_HISTORY_LIMIT (50) rows, so once the
+    # pause holds >= 50 slots the real run falls outside that window and the
+    # capped fold returns None, re-arming a resolved ladder into a double-run
+    # unless the deeper pre-ranAt re-read fires. AT and ACROSS the boundary:
+    # held=49 keeps the run inside the capped window (settles today), 50/55
+    # push it out (needs the deep re-read). Reached through the LOCAL retry
+    # rehydrate seeding _last_completed_at, not a peer claim scan.
+    armed = _now_utc() - datetime.timedelta(seconds=900)
+    ran = _now_utc() - datetime.timedelta(seconds=300)
+    not_before = _now_utc() + datetime.timedelta(seconds=600)
+    first = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        await _seed_pending_armed_at(first, "j", 1, not_before, armed)
+        await _seed_run_record(first, "j", ran, "success", ran_at=False)
+        await _hold_slots(first, "j", held)
+        rows = await first.state_backend.list_records("runs/j")
+        assert sum(1 for r in rows if r["outcome"] == "skipped") == held
+        assert sum(1 for r in rows if r["outcome"] == "success") == 1
+        # the resolving run carries no ``ranAt`` (the pre-upgrade shape).
+        assert not any("ranAt" in r for r in rows)
+    finally:
+        await _stop_state(first)
+
+    second = await _stateful_cron(tmp_path, _RETRY_JOB)  # the restart
+    try:
+        assert "j" not in second.retry_state  # settled, never re-armed
+        await _drain_state_writes(second)
+        rec = await _newest(second, "retries/j")
+        assert rec["kind"] == "settled"
+        assert rec["reason"] == "superseded-by-run"
+    finally:
+        await _stop_state(second)
+
+
 async def test_claim_scan_ignores_a_peers_pause_skip_rows(tmp_path):
     # The scan's in-memory half: every node rehydrates the SHARED ledger, so
     # the pausing owner's held slots become this node's last_run as well.
@@ -2248,6 +2289,49 @@ async def test_catch_up_pins_partial_window_backlog_against_held_rows(
         await asyncio.sleep(0)
         assert cron._caught_up is True
         assert backfills == [("p", 5)]
+    finally:
+        await _stop_state(cron)
+
+
+@pytest.mark.parametrize("n_held", [0, 1, 5])
+async def test_missed_occurrences_backstops_an_unpinned_pause_window(
+    tmp_path, n_held
+):
+    # #9 residual: a pause whose whole lifetime slipped between two startup
+    # catch-up passes is never pinned by _evaluate_catch_up (its pause branch
+    # only fires for a LIVE pause it reaches). With no pin, held-slot skip
+    # rows advance durable_last_run_at past the pre-pause backlog and
+    # _missed_occurrences forfeits it. The read-time backstop must fall back
+    # to the skip-blind durable_last_completed_at when a durable pause window
+    # exists and it is older. Here NO in-memory pause is ever set (never
+    # _make_pause_live), so nothing pins the checkpoint; only the backstop can
+    # save the backlog. AT (1) and ACROSS (5) the one-held-row boundary the
+    # owed count must stay 11; n_held=0 is the control (no skip row advanced
+    # the watermark, so nothing is forfeited either way).
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+        # window [10:05:30, 10:20): 10:01..10:05 predate it (owed),
+        # 10:06..10:19 fall inside (excused), 10:20..10:25 follow it (owed).
+        await _seed_pause_window(
+            cron, "2026-07-01T10:05:30+00:00", "2026-07-01T10:20:00+00:00"
+        )
+        # the held slots fired while paused; the pause has since expired from
+        # memory unpinned (the pin never ran because it was never live here).
+        for i in range(n_held):
+            await _seed_held_slot(
+                cron,
+                datetime.datetime(
+                    2026, 7, 1, 10, 6 + i, 0, tzinfo=_UTC
+                ).isoformat(),
+            )
+        assert await cron._pending_catchup_watermark("p") is None
+        ref = datetime.datetime(2026, 7, 1, 10, 25, 0, tzinfo=_UTC)
+        count, watermark = await cron._missed_occurrences(
+            cron.cron_jobs["p"], ref
+        )
+        assert count == 11  # 5 pre-pause + 6 post-window: backlog preserved
+        assert watermark == "2026-07-01T10:00:00+00:00"
     finally:
         await _stop_state(cron)
 

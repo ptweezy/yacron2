@@ -987,6 +987,13 @@ class Cron:
         self._sla_pause_windows: Dict[
             str, List[Tuple[datetime.datetime, datetime.datetime]]
         ] = {}
+        # name -> when a job's current DISABLED span began. Banked as a
+        # staleness credit (through _sla_bank_pause, the same machinery a
+        # pause uses) when the job is re-enabled, so a job that HAD succeeded
+        # then sat disabled past maxTimeSinceSuccess does not page the whole
+        # switched-off span the instant it is switched back on. Node-local,
+        # like _sla_pause_windows.
+        self._sla_disabled_since = {}  # type: Dict[str, datetime.datetime]
         # The next-fire index: name -> the aware-UTC instant the job next
         # fires, for every enabled CronTab job (a @reboot/string schedule or a
         # disabled job is absent). _fire_heap is a min-heap of (when, name)
@@ -1685,6 +1692,11 @@ class Cron:
         self._sla_pause_windows = {
             name: spans
             for name, spans in self._sla_pause_windows.items()
+            if name in keep
+        }
+        self._sla_disabled_since = {
+            name: at
+            for name, at in self._sla_disabled_since.items()
             if name in keep
         }
         # first-seen is the one tracker this pass also SEEDS: a job the reload
@@ -3056,14 +3068,41 @@ class Cron:
                 if not job.enabled:
                     # a disabled job cannot run, so its staleness baseline
                     # rolls forward with the clock: re-enabling then gives it
-                    # a full threshold to succeed in -- the same credit a
-                    # pause banks -- instead of paging maxTimeSinceSuccess for
-                    # the whole span it was deliberately switched off. This
+                    # a full threshold to succeed in, the same credit a pause
+                    # banks, instead of paging maxTimeSinceSuccess for the
+                    # whole span it was deliberately switched off. This roll
                     # covers the never-succeeded fallback (the _sla_first_seen
                     # arm of _sla_stale_reference); a job that HAS succeeded
-                    # takes the _sla_last_success arm and is out of scope here.
+                    # takes the _sla_last_success arm, whose disabled span is
+                    # banked as a credit at the re-enable transition below.
+                    # Record the span start on the first disabled tick.
                     self._sla_first_seen[name] = now
+                    self._sla_disabled_since.setdefault(name, now)
                 continue
+            # Reaching here, the job is enabled and not paused. If it just
+            # left a disabled span, bank that span as a staleness credit,
+            # exactly as a lifted pause: _sla_paused_seconds then subtracts it
+            # from observed in _sla_observations against the _sla_last_success
+            # reference, so a previously-succeeded job does not page
+            # maxTimeSinceSuccess for the whole span it was switched off (the
+            # _sla_first_seen roll-forward above only reaches the
+            # never-succeeded arm). Banked once at the transition, mirroring
+            # _sla_bank_pause on resume, and before the cluster gate below so
+            # the credit is recorded on every node whether or not this one
+            # owns the job now.
+            disabled_since = self._sla_disabled_since.pop(name, None)
+            if disabled_since is not None:
+                self._sla_bank_pause(
+                    name,
+                    PauseInfo(
+                        since=disabled_since,
+                        until=now,
+                        note="",
+                        by="",
+                        channel="",
+                    ),
+                    now,
+                )
             if not self._cluster_allows(job):
                 # not this node's job right now: same latch drop, and drop
                 # the lateAfter reference too. A slot recorded while this
@@ -6134,6 +6173,27 @@ class Cron:
         # never used as a floor on `after`, so slots that came due before
         # the operator paused stay owed (see _pause_excusal_window).
         window = await self._pause_excusal_window(job.name)
+        if window is not None and after is not None:
+            # Belt and braces beside the open-checkpoint pin in
+            # _evaluate_catch_up: a pause whose whole lifetime slipped between
+            # two startup catch-up passes (a sub-CATCHUP_RECHECK_INTERVAL
+            # pause, or catch-up deferred for cluster-election / backend
+            # startup while a short pause came and went) is never pinned, so
+            # held-slot skip rows can have walked durable_last_run_at past the
+            # pre-pause backlog. When a window exists, fall back to the
+            # skip-blind durable_last_completed_at if it is OLDER, restoring
+            # `after` to the last real run so the pre-pause slots stay owed.
+            # The `real < after` guard keeps the (older) checkpoint hoist
+            # above winning when both apply; the extra read fires only when a
+            # window exists.
+            real = _parse_iso_utc(
+                await asyncio.wait_for(
+                    self.durable_last_completed_at(job.name),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            )
+            if real is not None and real < after:
+                after, watermark = real, real.isoformat()
         deadline = job.startingDeadlineSeconds
         if deadline:
             cutoff = now - datetime.timedelta(seconds=deadline)
@@ -9334,9 +9394,13 @@ class Cron:
         by outcome.  No pause could have written a ``skipped`` row into that
         older shape, and a row carrying ``ranAt`` is already folded above.
 
-        Only the claim scan reads this, and only when a foreign stale
-        ladder actually exists, so the second read costs nothing in steady
-        state.
+        Read by the claim scan (only when a foreign stale ladder actually
+        exists) AND by the local retry rehydrate
+        (:meth:`_rehydrate_retries`), so both the cross-node and single-node
+        superseded-by-run paths see the same resolved-ladder truth.  The
+        ``ranAt`` fold above is one ``derive_max`` and the capped fold below
+        one bounded read, so steady state pays two reads; the deeper re-read
+        fires ONLY on the pre-``ranAt`` None path, off that steady state.
         """
         backend = self.state_backend
         if backend is None:
@@ -9344,24 +9408,44 @@ class Cron:
         stream = self._run_stream(name)
         derived = await backend.derive_max(stream, "ranAt")
         best = derived if isinstance(derived, str) else None
-        # KNOWN BOUND: the pre-ranAt compatibility fold below reads only the
-        # newest RUN_HISTORY_LIMIT records. A ledger written entirely before
-        # ``ranAt`` existed, then buried under at least RUN_HISTORY_LIMIT
-        # pause-skip rows, folds to None here (the real rows fall outside this
-        # window and carry no ``ranAt`` for the derive_max above to catch), so
-        # a peer could claim a ladder that resolved. Only reachable inside the
-        # upgrade window: any post-upgrade run row carries ``ranAt`` and
-        # restores the unbounded derive_max path. Left as a bound rather than
-        # a second deep re-read on every claim scan.
+
+        def _fold_pre_ranat(
+            records: List[Dict[str, Any]], acc: Optional[str]
+        ) -> Optional[str]:
+            # A row with no ``ranAt`` and outcome != skipped is a real run
+            # from before ``ranAt`` existed (a pause-skip row never took that
+            # older shape); fold its finished_at, a row carrying ``ranAt`` is
+            # already in the derive_max above.
+            for rec in records:
+                if "ranAt" in rec or rec.get("outcome") == "skipped":
+                    continue
+                at = rec.get("finished_at")
+                if isinstance(at, str) and (acc is None or at > acc):
+                    acc = at
+            return acc
+
         recs = await backend.list_records(
             stream, limit=RUN_HISTORY_LIMIT, newest_first=True
         )
-        for rec in recs:
-            if "ranAt" in rec or rec.get("outcome") == "skipped":
-                continue
-            at = rec.get("finished_at")
-            if isinstance(at, str) and (best is None or at > best):
-                best = at
+        best = _fold_pre_ranat(recs, best)
+        if best is None:
+            # KNOWN BOUND, now closed for the common case: a ledger written
+            # entirely before ``ranAt`` existed, then buried under at least
+            # RUN_HISTORY_LIMIT pause-skip rows, leaves every real row outside
+            # the capped window above and carrying no ``ranAt`` for derive_max
+            # to catch, so it folds to None. Both the LOCAL retry rehydrate
+            # (via _rehydrate_retries) and a peer's claim scan would then
+            # re-arm a ladder the ledger already proves resolved. Re-read ONCE,
+            # deeper, on this None path only, mirroring
+            # _warm_last_success_beyond_history: any post-upgrade run row
+            # carries ``ranAt`` and keeps this off the steady-state path. A
+            # residual bound survives only past `deeper` pre-``ranAt`` rows,
+            # which one post-upgrade real run heals.
+            deeper = max(SLA_SUCCESS_SCAN_LIMIT, self._state_max_runs)
+            deep = await backend.list_records(
+                stream, limit=deeper, newest_first=True
+            )
+            best = _fold_pre_ranat(deep, best)
         return best
 
     async def _list_gate_records(
@@ -9446,11 +9530,24 @@ class Cron:
             job.name
         ):
             return False
-        latest: Optional[Tuple[datetime.datetime, str]] = None
-        for info in reversed(self.run_history.get(job.name) or ()):
-            if info.outcome in ("success", "failure"):
-                latest = (info.finished_at, info.outcome)
-                break
+        # The newest real outcome by finished_at, NOT by list position: run
+        # records are written unserialized (two concurrencyPolicy: Allow
+        # instances, or a peer node on a shared mount), so the last-APPENDED
+        # real run can be OLDER than one appended before it. A positional
+        # `reversed(...); break` walk would take that newer-by-position stale
+        # record and clear the gate on a failure that is actually the newest.
+        reals = [
+            info
+            for info in (self.run_history.get(job.name) or ())
+            if info.outcome in ("success", "failure")
+            and info.finished_at is not None
+        ]
+        newest = max(reals, key=lambda i: i.finished_at, default=None)
+        latest: Optional[Tuple[datetime.datetime, str]] = (
+            (newest.finished_at, newest.outcome)
+            if newest is not None
+            else None
+        )
         # the ring above is bounded, so enough consecutive non-run rows (a
         # pause writes one per held slot) evict the last real outcome from
         # it entirely. The memo survives that eviction; take whichever is
@@ -9502,17 +9599,22 @@ class Cron:
                 if outcome not in ("success", "failure"):
                     continue
                 finished = _parse_iso_utc(rec.get("finished_at"))
-                if latest is None or (
-                    finished is not None and finished > latest[0]
-                ):
-                    latest = (
-                        finished
-                        or datetime.datetime.min.replace(
-                            tzinfo=datetime.timezone.utc
-                        ),
-                        str(outcome),
-                    )
-                break  # newest real run in the ledger; older ones are moot
+                candidate = (
+                    finished
+                    or datetime.datetime.min.replace(
+                        tzinfo=datetime.timezone.utc
+                    ),
+                    str(outcome),
+                )
+                # Fold over ALL real records (already bounded to
+                # RUN_HISTORY_LIMIT) and keep the max by finished_at, NOT the
+                # first-by-sequence then break: an out-of-order write (a peer,
+                # or two Allow instances racing) can land a newer success
+                # ahead of the true-newest failure by sequence, and a
+                # first-real-then-break would clear the gate on that stale
+                # success while never examining the newer failure behind it.
+                if latest is None or candidate[0] > latest[0]:
+                    latest = candidate
         if latest is None:
             return True
         return latest[1] == "success"

@@ -22,7 +22,7 @@ import pytest
 from aiohttp import web
 
 import cronstable.platform as platform_mod
-from cronstable.cron import Cron
+from cronstable.cron import Cron, PauseInfo
 from cronstable.fingerprint import job_digest
 from cronstable.job import JobRetryState
 from cronstable.prometheus import PrometheusMetrics
@@ -680,6 +680,47 @@ async def test_real_run_under_a_pause_still_settles_the_ladder(tmp_path):
         await _stop_state(second)
 
 
+@pytest.mark.parametrize("held", [48, 49, 50, 55])
+async def test_real_run_under_a_long_pause_still_settles_the_ladder(
+    tmp_path, held
+):
+    # The warmed ring is capped at RUN_HISTORY_LIMIT (50), so once a pause
+    # holds that many slots the real run that resolved the ladder is flooded
+    # out of the ring and _last_completed_at is never seeded from history.
+    # The re-arm must then fall back to the flood-independent durable fold,
+    # or a ladder a real run already superseded is re-armed and double-runs.
+    # This is a REGRESSION from the memo switch: pre-memo the skip row's own
+    # fresh finished_at settled this case by accident. AT and ACROSS the
+    # boundary: 48/49 keep the run inside the ring (still correct today),
+    # 50/55 push it out (broken without the durable seed).
+    armed = _now_utc() - datetime.timedelta(seconds=900)
+    ran = _now_utc() - datetime.timedelta(seconds=300)
+    not_before = _now_utc() + datetime.timedelta(seconds=600)
+    first = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        await _seed_pending_armed_at(first, "j", 1, not_before, armed)
+        await _seed_run_record(first, "j", ran, "success")
+        await _hold_slots(first, "j", held)
+        # nothing was pruned (maxRunsPerJob defaults to 0/unlimited): the real
+        # run is still in the ledger, just below the newest-50 window the
+        # warm-up reads.
+        rows = await first.state_backend.list_records("runs/j")
+        assert sum(1 for r in rows if r["outcome"] == "skipped") == held
+        assert sum(1 for r in rows if r["outcome"] == "success") == 1
+    finally:
+        await _stop_state(first)
+
+    second = await _stateful_cron(tmp_path, _RETRY_JOB)  # the restart
+    try:
+        assert "j" not in second.retry_state  # settled, never re-armed
+        await _drain_state_writes(second)
+        rec = await _newest(second, "retries/j")
+        assert rec["kind"] == "settled"
+        assert rec["reason"] == "superseded-by-run"
+    finally:
+        await _stop_state(second)
+
+
 async def test_claim_scan_ignores_a_peers_pause_skip_rows(tmp_path):
     # The scan's in-memory half: every node rehydrates the SHARED ledger, so
     # the pausing owner's held slots become this node's last_run as well.
@@ -1145,6 +1186,67 @@ async def test_paused_reboot_defers_its_boot_run_across_a_restart(
             assert calls3 == []
         finally:
             await _stop_state(cron3)
+    finally:
+        await _stop_state(cron)
+
+
+async def test_paused_reboot_in_the_record_then_run_window_still_runs(
+    tmp_path, monkeypatch
+):
+    # #8 residual (a REGRESSION-adjacent loss the defer fix did not close):
+    # a pause that arrives DURING the record-then-run window -- after
+    # _reboot_boot_gate has burnt this OS boot's marker, before the launcher's
+    # pause gate -- must NOT forfeit the boot run. The once-per-boot token is
+    # already spent and cannot be un-spent, so an @reboot job is exempt from
+    # launch_scheduled_job's pause gate. Standalone path (via
+    # _spawn_reboot_jobs); the cluster path shares the same launcher exemption.
+    monkeypatch.setattr(platform_mod, "os_boot_id", lambda: "boot-A")
+    monkeypatch.setattr(platform_mod, "os_boot_time", lambda: None)
+    cron = await _stateful_cron(tmp_path, _REBOOT_JOB)
+    try:
+        calls, fake = _count_launcher()
+        cron.maybe_launch_job = fake  # type: ignore[method-assign]
+
+        real_gate = cron._reboot_boot_gate
+
+        async def gate_then_pause(job):
+            # spend the token (write the marker) via the real gate, then a
+            # concurrent pause task installs the pause mid-window -- exactly
+            # what _pause_periodic / a web pause handler can do at any await
+            # point between the gate and the launcher.
+            allowed = await real_gate(job)
+            await cron.pause_job_by_name(job.name, duration=3600)
+            return allowed
+
+        cron._reboot_boot_gate = gate_then_pause  # type: ignore[method-assign]
+        await cron._spawn_reboot_jobs()
+        await _drain_state_writes(cron)
+
+        # the token WAS spent (the marker is present)...
+        assert await _newest(cron, "reboot/r") is not None
+        # ...so the boot run must actually happen, not be skipped
+        assert calls == ["r"]
+        # and no synthetic "skipped" row stands in for a lost run
+        rows = await cron.state_backend.list_records("runs/r")
+        assert [r for r in rows if r.get("outcome") == "skipped"] == []
+    finally:
+        await _stop_state(cron)
+
+
+async def test_launch_gate_still_skips_a_paused_non_reboot_job(tmp_path):
+    # The @reboot pause-gate exemption is NARROW: an ordinary scheduled job
+    # that is paused still skips at the launcher and writes its synthetic
+    # skip row, so the catch-up watermark keeps advancing. Guards the fix
+    # against over-broadening the exemption.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        calls, fake = _count_launcher()
+        cron.maybe_launch_job = fake  # type: ignore[method-assign]
+        await cron.pause_job_by_name("j", duration=3600)
+        await _drain_state_writes(cron)
+        await cron.launch_scheduled_job(cron.cron_jobs["j"])
+        assert calls == []  # never launched
+        assert cron.last_run["j"].outcome == "skipped"
     finally:
         await _stop_state(cron)
 
@@ -1972,6 +2074,180 @@ async def test_catch_up_defers_a_paused_job_and_backfills_on_resume(tmp_path):
         await asyncio.sleep(0)  # let the backfill task run
         assert cron._caught_up is True
         assert backfills == [("p", 10)]
+    finally:
+        await _stop_state(cron)
+
+
+async def _seed_real_run(cron, when):
+    # a real run carries `ranAt` (JobRunInfo.to_dict); a skip row never does.
+    await cron.state_backend.append_record(
+        "runs/p",
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": None,
+            "finished_at": when,
+            "duration": None,
+            "fail_reason": None,
+            "ranAt": when,
+        },
+    )
+
+
+async def _seed_held_slot(cron, when):
+    # the synthetic row launch_scheduled_job writes for a slot held by a live
+    # pause: no `ranAt`, but a `finished_at` that advances durable_last_run_at.
+    await cron.state_backend.append_record(
+        "runs/p",
+        {
+            "outcome": "skipped",
+            "exit_code": None,
+            "started_at": None,
+            "finished_at": when,
+            "duration": None,
+            "fail_reason": None,
+            "skip_reason": "paused",
+        },
+    )
+
+
+async def _seed_pause_window(cron, since, until):
+    await cron.state_backend.append_record(
+        "paused/p",
+        {
+            "kind": "paused",
+            "since": since,
+            "until": until,
+            "note": "",
+            "by": "parker",
+            "channel": "api",
+            "at": since,
+            "host": "elsewhere",
+        },
+    )
+
+
+def _make_pause_live(cron):
+    # a live in-memory pause so _pause_active (wall-clock) routes the catch-up
+    # evaluation into the deferral branch, independent of the FIXED durable
+    # window the store carries for the excusal walk.
+    real_now = _now_utc()
+    cron._paused["p"] = PauseInfo(
+        since=real_now,
+        until=real_now + datetime.timedelta(hours=1),
+        note="",
+        by="parker",
+        channel="api",
+    )
+
+
+@pytest.mark.parametrize("n_held", [0, 1, 10])
+async def test_catch_up_pins_backlog_against_held_slot_rows(tmp_path, n_held):
+    # #37 residual: while a job is paused every held slot writes a synthetic
+    # "skipped" ledger row whose finished_at advances durable_last_run_at (the
+    # watermark _missed_occurrences reads). Merely deferring the evaluation is
+    # not enough: by the time the pause lifts the derived watermark has walked
+    # past _catchup_reference and the pre-pause backlog reads as nothing owed,
+    # forfeited forever. The deferral must PIN the pre-pause watermark (an open
+    # checkpoint at the last real run, which is skip-blind) so the backlog
+    # survives however many held rows land. AT (1) and ACROSS (10) the
+    # one-held-row boundary the owed count must stay 9.
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+        # since=10:10 == the reference below, so 10:01..10:09 predate the pause
+        # (owed) and only 10:10 is inside the window (excused): 9 owed.
+        await _seed_pause_window(
+            cron, "2026-07-01T10:10:00+00:00", "2026-07-01T10:20:00+00:00"
+        )
+        _make_pause_live(cron)
+        backfills = []
+
+        async def _fake_backfill(job, count, offset, now):
+            backfills.append((job.name, count))
+
+        cron._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+        ref = datetime.datetime(2026, 7, 1, 10, 10, 0, tzinfo=_UTC)
+
+        # first pass: paused, so defer AND pin the pre-pause watermark.
+        await cron._catch_up(ref)
+        assert cron._caught_up is False
+        assert backfills == []
+        assert (
+            await cron._pending_catchup_watermark("p")
+            == "2026-07-01T10:00:00+00:00"
+        )
+
+        # the held slots fire while paused, advancing durable_last_run_at.
+        for i in range(n_held):
+            await _seed_held_slot(
+                cron,
+                datetime.datetime(
+                    2026, 7, 1, 10, 11 + i, 0, tzinfo=_UTC
+                ).isoformat(),
+            )
+        # the window expires: the durable record stays 'paused', only memory
+        # clears (the reader-enforced auto-expiry _pause_active applies).
+        del cron._paused["p"]
+
+        cron._catchup_next_retry = 0.0
+        await cron._catch_up(ref)
+        await asyncio.sleep(0)  # let the backfill task run
+        assert cron._caught_up is True
+        assert backfills == [("p", 9)]
+    finally:
+        await _stop_state(cron)
+
+
+@pytest.mark.parametrize("n_held", [0, 1, 5])
+async def test_catch_up_pins_partial_window_backlog_against_held_rows(
+    tmp_path, n_held
+):
+    # #9 residual boundary: the pause window does NOT cover _catchup_reference
+    # (the operator paused mid-downtime), so only part of the backlog is
+    # excused and the rest stays owed. A single held-slot skip row still
+    # advances the derived watermark past the reference and forfeits the owed
+    # part unless the pre-pause watermark is pinned. AT (1) and ACROSS (5) the
+    # one-held-row boundary the owed count must stay 5.
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+        # since=10:05:30 < reference 10:10:30: 10:01..10:05 predate the pause
+        # (owed), 10:06..10:10 fall inside the window (excused): 5 owed.
+        await _seed_pause_window(
+            cron, "2026-07-01T10:05:30+00:00", "2026-07-01T10:20:00+00:00"
+        )
+        _make_pause_live(cron)
+        backfills = []
+
+        async def _fake_backfill(job, count, offset, now):
+            backfills.append((job.name, count))
+
+        cron._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+        ref = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
+
+        await cron._catch_up(ref)
+        assert cron._caught_up is False
+        assert backfills == []
+        assert (
+            await cron._pending_catchup_watermark("p")
+            == "2026-07-01T10:00:00+00:00"
+        )
+
+        for i in range(n_held):
+            await _seed_held_slot(
+                cron,
+                datetime.datetime(
+                    2026, 7, 1, 10, 11 + i, 0, tzinfo=_UTC
+                ).isoformat(),
+            )
+        del cron._paused["p"]
+
+        cron._catchup_next_retry = 0.0
+        await cron._catch_up(ref)
+        await asyncio.sleep(0)
+        assert cron._caught_up is True
+        assert backfills == [("p", 5)]
     finally:
         await _stop_state(cron)
 

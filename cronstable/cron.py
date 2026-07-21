@@ -6275,6 +6275,38 @@ class Cron:
                 # never latch, or that backlog is forfeited forever. The
                 # deferred retry still counts only the pre-boot downtime:
                 # every pass is anchored to _catchup_reference.
+                #
+                # Pin the pre-pause watermark before deferring. While paused,
+                # every held slot writes a synthetic "skipped" ledger row
+                # whose finished_at advances durable_last_run_at (the watermark
+                # _missed_occurrences reads) forward through the window, so by
+                # the time the pause lifts the derived watermark has walked
+                # past _catchup_reference and the deferred retry would count
+                # nothing owed. An open checkpoint fixes the watermark at the
+                # last real run: durable_last_completed_at is skip-blind, so it
+                # is immune to the held-slot rows however many land, and the
+                # checkpoint survives a manual resume that erases the pause
+                # window or a restart taken mid-pause. _missed_occurrences
+                # hoists `after` back to it. The is-None guard keeps the
+                # recheck loop from re-pinning (and churning the checkpoint
+                # stream) once the watermark is fixed.
+                try:
+                    if await self._pending_catchup_watermark(name) is None:
+                        real = await asyncio.wait_for(
+                            self.durable_last_completed_at(name),
+                            timeout=STATE_OP_TIMEOUT,
+                        )
+                        if real is not None:
+                            await self._checkpoint_catchup(name, "open", real)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:  # noqa: BLE001 - defer, never latch
+                    logger.warning(
+                        "catch-up: cannot pin the pre-pause watermark for %s "
+                        "(%s); will retry",
+                        name,
+                        ex,
+                    )
                 logger.debug(
                     "catch-up: %s is paused; deferring its evaluation until "
                     "the pause lifts",
@@ -7399,17 +7431,33 @@ class Cron:
             return False
 
     async def launch_scheduled_job(self, job: JobConfig) -> None:
-        # The pause gate. Only scheduled fires arrive here (manual start and
-        # catch-up go through maybe_launch_job directly), and the cluster
-        # gate already ran, so under election exactly the owning node writes
-        # the skip row. The synthetic ledger row is what keeps the derived
-        # catch-up watermark advancing across the pause: its finished_at is
-        # the skip instant, so the skipped slots are never owed later. It
-        # carries no ``ranAt`` and never enters _last_completed_at, so the
-        # retry ladder's superseded-by-run guards cannot mistake a held
-        # slot for the run that would resolve them.
+        # The pause gate for scheduled fires. Manual start and catch-up go
+        # through maybe_launch_job directly, and the cluster gate already
+        # ran, so under election exactly the owning node writes the skip
+        # row. The synthetic ledger row is what keeps the derived catch-up
+        # watermark advancing across the pause: its finished_at is the skip
+        # instant, so the skipped slots are never owed later. It carries no
+        # ``ranAt`` and never enters _last_completed_at, so the retry
+        # ladder's superseded-by-run guards cannot mistake a held slot for
+        # the run that would resolve them.
+        #
+        # @reboot jobs are EXEMPT from this gate. One reaches this launcher
+        # only from the three pause-aware reboot callers (_spawn_reboot_jobs,
+        # _process_paused_reboots, _process_pending_reboots), never from a
+        # scheduled fire, because _ensure_seeded seeds the next-fire index
+        # for CronTab schedules only. Each caller already decided to run the
+        # job AND already spent the once-per-boot token (the boot marker, or
+        # the cluster's mark_reboot_ran) across an await before reaching
+        # here. That token cannot be un-spent, so skipping on a pause that
+        # lands in the record-then-run window would FORFEIT the boot run
+        # instead of deferring it, the exact loss the reboot callers avoid by
+        # deferring a job that is paused when THEY examine it. This exemption
+        # closes the remaining millisecond window between spending the token
+        # and reaching this gate. Safe because no scheduled fire can arrive
+        # here for an @reboot job, so nothing that should be paused is run.
         pause = self._pause_active(job.name)
-        if pause is not None:
+        is_reboot = isinstance(job.schedule, str) and job.schedule == "@reboot"
+        if pause is not None and not is_reboot:
             logger.info(
                 "Job %s skipped: paused until %s%s",
                 job.name,
@@ -9062,6 +9110,37 @@ class Cron:
                 # re-arm OR settle. Cross-node retry resume is a later
                 # phase's leased, reconciled affair.
                 continue
+            if name not in self._last_completed_at:
+                # The warmed ring (_rehydrate_from_state, above) is capped at
+                # RUN_HISTORY_LIMIT, so a pause holding at least that many
+                # slots fills every ring entry with "skipped" rows and floods
+                # out the real run that DID resolve this ladder, leaving the
+                # memo unset. The superseded-by-run guard would then read
+                # None and re-arm a ladder a real run already settled, a
+                # double-run this method exists to avoid (and a regression:
+                # pre-memo the skip row's fresh finished_at settled it by
+                # accident). The durable fold is flood-independent
+                # (derive_max over ranAt), so seed the memo from it before the
+                # guard reads it. One extra read, only when a pending record
+                # actually exists, so steady state is unchanged; it mirrors
+                # the deeper-read _warm_last_success_beyond_history sets for
+                # the SLA memo.
+                try:
+                    durable_at = await asyncio.wait_for(
+                        self.durable_last_completed_at(name),
+                        timeout=STATE_OP_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - unknown -> guard stays open
+                    durable_at = None
+                parsed = (
+                    _parse_iso_utc(durable_at)
+                    if isinstance(durable_at, str)
+                    else None
+                )
+                if parsed is not None:
+                    self._last_completed_at[name] = parsed
             validated = self._validate_pending_retry(name, job, rec)
             if validated is None:
                 continue
@@ -9214,6 +9293,15 @@ class Cron:
         stream = self._run_stream(name)
         derived = await backend.derive_max(stream, "ranAt")
         best = derived if isinstance(derived, str) else None
+        # KNOWN BOUND: the pre-ranAt compatibility fold below reads only the
+        # newest RUN_HISTORY_LIMIT records. A ledger written entirely before
+        # ``ranAt`` existed, then buried under at least RUN_HISTORY_LIMIT
+        # pause-skip rows, folds to None here (the real rows fall outside this
+        # window and carry no ``ranAt`` for the derive_max above to catch), so
+        # a peer could claim a ladder that resolved. Only reachable inside the
+        # upgrade window: any post-upgrade run row carries ``ranAt`` and
+        # restores the unbounded derive_max path. Left as a bound rather than
+        # a second deep re-read on every claim scan.
         recs = await backend.list_records(
             stream, limit=RUN_HISTORY_LIMIT, newest_first=True
         )

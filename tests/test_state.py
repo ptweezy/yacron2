@@ -3102,23 +3102,36 @@ def test_unlink_windows_retry_loop_forced(tmp_path, monkeypatch):
 def test_makedirs_durable_walk_breaks_at_self_referential_root(
     tmp_path, monkeypatch
 ):
-    # Force the walk-up loop to reach a self-referential root (dirname == the
-    # path itself) so its ``break`` fires before makedirs raises for the
-    # unreachable ancestor.  Simulated on Linux by making isdir report the
-    # whole ancestor chain -- up to and including "/" -- as absent.
+    # Force the walk-up loop to reach a self-referential root (dirname(cur) ==
+    # cur) so its ``break`` fires before makedirs raises for the unreachable
+    # ancestor.  The whole ancestor chain, up to and including the filesystem
+    # root the walk converges on, is reported absent; makedirs then raises.
+    # The root is derived from the path itself, so this resolves identically
+    # on POSIX ("/") and Windows (a drive root such as "C:\\").
     backend = _backend(tmp_path)
-    fake = "/cronstable_no_such_root_xyz"
+    target = os.path.join(str(tmp_path), "no_such_root", "a", "b")
+
+    chain = set()
+    cur = os.path.abspath(target)
+    while True:
+        chain.add(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
     real_isdir = os.path.isdir
 
     def isdir(p):
-        ap = os.path.abspath(str(p))
-        if ap == fake or ap.startswith(fake + "/") or ap == "/":
-            return False
-        return real_isdir(p)
+        return False if os.path.abspath(str(p)) in chain else real_isdir(p)
+
+    def boom(*a, **k):
+        raise OSError("unreachable ancestor")
 
     monkeypatch.setattr(os.path, "isdir", isdir)
+    monkeypatch.setattr(os, "makedirs", boom)
     with pytest.raises(OSError):
-        backend._makedirs_durable(fake + "/a/b")
+        backend._makedirs_durable(target)
 
 
 async def test_prune_tolerates_unlink_oserror(tmp_path, monkeypatch):

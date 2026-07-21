@@ -40,6 +40,7 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [Metrics with statsd](Metrics-with-Statsd): Emitting start/stop/success/duration metrics over UDP to statsd.
 - [Metrics with Prometheus](Metrics-with-Prometheus): The `/metrics` endpoint on the web API, with job, scheduler, and cluster metrics in Prometheus or OpenMetrics format.
 - [HTTP Control API](HTTP-API): The optional REST interface: job status, on-demand start and cancel, run history, live log streaming, DAG and state-inspection routes, and cluster/fleet views.
+- [Listener TLS](Listener-TLS): Native `https://` for the web API and the job-facing state endpoint: certificates, optional client-certificate (mTLS) caller authentication, in-place rotation, and the client flags.
 - [Web Dashboard](Web-Dashboard): The built-in browser dashboard: live status and log tailing, run history and resource charts, timezone-aware schedule previews, incident tools, cluster and fleet views, and a wallboard/TV mode, in one self-contained page.
 - [Terminal Dashboard](Terminal-Dashboard): `cronstable tui`, the dashboard's TUI sibling — the same board and the same keyboard shortcuts, in a terminal over SSH.
 - [Calendar Export (iCal)](Calendar-Export): The scheduler's upcoming fires as subscribable `.ics` feeds (fleet-wide and per job) and the dashboard's seven-day week calendar, with token-in-URL auth for calendar clients.

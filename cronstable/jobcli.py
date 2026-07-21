@@ -23,6 +23,7 @@ opts into a shared namespace for deliberate cross-job coordination.
 import argparse
 import json
 import os
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -35,6 +36,16 @@ from typing import Any, Dict, Optional, Tuple
 # into its import graph -- these three names are a stable wire contract.
 ENV_URL = "CRONSTABLE_STATE_URL"
 ENV_TOKEN = "CRONSTABLE_STATE_TOKEN"
+# Injected too, but only when state.jobApi.tls.ca is set: the trust anchor to
+# verify the endpoint against, because an internally-issued certificate is
+# signed by nothing the job's Python already trusts.  It rides in on the
+# environment rather than a flag for two reasons: it is the same kind of fact
+# as the URL and the token (where the endpoint is, how to speak to it), and a
+# per-subcommand --cacert would have to be threaded through every job-facing
+# verb.  There is deliberately no way to switch verification OFF from in here:
+# nothing running inside a job's environment should be able to downgrade the
+# channel that carries that job's own secrets.
+ENV_CACERT = "CRONSTABLE_STATE_CACERT"
 
 # Injected into every DAG task so `cronstable xcom` knows this task's own
 # key and the run's shared XCom scope (an artifact scope; XCom is a thin,
@@ -93,6 +104,56 @@ def _endpoint() -> Tuple[str, str]:
     return url, token
 
 
+# The verifying openers, keyed by the CA path that produced them.  Built once
+# each for the same reason _OPENER is a module global: `lock run` makes two
+# requests (the acquire, then the release in its finally), and re-reading and
+# re-parsing the CA PEM for the second one buys nothing, since the injected
+# environment cannot change under a running CLI process.  Keyed by path rather
+# than held in a single slot so the cache can never hand back an opener built
+# for a DIFFERENT CA than the one the environment currently names.
+_TLS_OPENERS: Dict[str, urllib.request.OpenerDirector] = {}
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    """The opener this request goes through: verifying, or the plain one.
+
+    With ENV_CACERT unset this is _OPENER itself, so the plaintext loopback
+    path is exactly what it was before the endpoint could speak TLS.  With it
+    set, the same no-proxy posture is paired with an HTTPSHandler pinned to
+    that CA.
+
+    ``ssl`` is imported at module scope rather than deferred into here
+    because deferring it would buy nothing: ``urllib.request`` already pulls
+    it in transitively (through ``http.client``), so it is resident before
+    this module's first line runs, and the TLS diagnostic arm in _http needs
+    the name as well.
+    """
+    cacert = os.environ.get(ENV_CACERT)
+    if not cacert:
+        return _OPENER
+    cached = _TLS_OPENERS.get(cacert)
+    if cached is not None:
+        return cached
+    try:
+        ctx = ssl.create_default_context(cafile=cacert)
+    except (OSError, ssl.SSLError) as ex:
+        # A missing or malformed CA file is the job environment's problem and
+        # must read as one.  Allowed to propagate it would be caught by the
+        # OSError arm in _http and reported as "cannot reach the state
+        # endpoint", blaming a daemon that is answering perfectly well.
+        raise _CliError(
+            "cannot load the CA bundle {} points at ({}): {}".format(
+                ENV_CACERT, cacert, ex
+            )
+        ) from ex
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
+    _TLS_OPENERS[cacert] = opener
+    return opener
+
+
 def _http(
     method: str,
     path: str,
@@ -142,11 +203,23 @@ def _http(
     if timeout is None:
         timeout = _DEFAULT_TIMEOUT
     try:
-        with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
+        with _opener().open(req, timeout=timeout) as resp:  # noqa: S310
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as ex:
         return ex.code, dict(ex.headers or {}), ex.read()
     except urllib.error.URLError as ex:
+        # A handshake failure arrives here WRAPPED: urllib turns the OSError
+        # the TLS layer raised into a URLError, so this cannot be a separate
+        # `except ssl.SSLError` clause ahead of this one.  It has to be told
+        # apart before the generic message below claims the endpoint is
+        # unreachable, which sends the reader after a daemon that is
+        # listening and answering; what is wrong is the trust between them.
+        if isinstance(ex.reason, ssl.SSLError):
+            raise _CliError(
+                "TLS handshake with the cronstable state endpoint at {} "
+                "failed: {} (does {} point at the CA that signed the "
+                "daemon's certificate?)".format(url, ex.reason, ENV_CACERT)
+            ) from ex
         raise _CliError(
             "cannot reach the cronstable state endpoint at {}: {}".format(
                 url, ex.reason

@@ -69,6 +69,14 @@ def test_tui_stub_matches_real_registration():
     [
         ("_MCP_DEFAULT_URL", "cronstable.mcpcli", "DEFAULT_URL"),
         ("_MCP_ENV_TOKEN", "cronstable.mcpcli", "ENV_TOKEN"),
+        ("_MCP_ENV_CACERT", "cronstable.mcpcli", "ENV_CACERT"),
+        (
+            "_MCP_ENV_CLIENT_CERT",
+            "cronstable.mcpcli",
+            "ENV_CLIENT_CERT",
+        ),
+        ("_MCP_ENV_CLIENT_KEY", "cronstable.mcpcli", "ENV_CLIENT_KEY"),
+        ("_MCP_ENV_INSECURE", "cronstable.mcpcli", "ENV_INSECURE"),
         (
             "_MCP_DEFAULT_PROTOCOL_VERSION",
             "cronstable.mcpcli",
@@ -77,6 +85,10 @@ def test_tui_stub_matches_real_registration():
         ("_MCP_DEFAULT_TIMEOUT", "cronstable.mcpcli", "DEFAULT_TIMEOUT"),
         ("_TUI_DEFAULT_URL", "cronstable.tui", "DEFAULT_URL"),
         ("_TUI_ENV_TOKEN", "cronstable.tui", "ENV_TOKEN"),
+        ("_TUI_ENV_CACERT", "cronstable.tui", "ENV_CACERT"),
+        ("_TUI_ENV_CLIENT_CERT", "cronstable.tui", "ENV_CLIENT_CERT"),
+        ("_TUI_ENV_CLIENT_KEY", "cronstable.tui", "ENV_CLIENT_KEY"),
+        ("_TUI_ENV_INSECURE", "cronstable.tui", "ENV_INSECURE"),
         ("_TUI_THEME_HUES", "cronstable.tui", "THEME_HUES"),
     ],
 )

@@ -1922,3 +1922,139 @@ def test_web_drawer_shows_the_sla_state_the_wiki_promises():
         pathlib.Path(tui.__file__).parent.parent / "wiki" / "Web-Dashboard.md"
     ).read_text(encoding="utf-8")
     assert "**OVERDUE** badge on its row, drawer, and wallboard tile" in wiki
+
+
+# ===================================================================
+#  TLS: flag/env resolution and where the context is applied
+# ===================================================================
+class _TlsArgs:
+    """The four TLS flags argparse would hand dispatch, all unset."""
+
+    cacert = None
+    client_cert = None
+    client_key = None
+    insecure = False
+
+
+def _clear_tls_env(monkeypatch) -> None:
+    for var in (
+        tui.ENV_CACERT,
+        tui.ENV_CLIENT_CERT,
+        tui.ENV_CLIENT_KEY,
+        tui.ENV_INSECURE,
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+async def test_api_builds_a_connector_only_for_a_tls_context(monkeypatch):
+    """The context is applied once, at the connector, never per request:
+    a request method added later cannot quietly skip verification, and
+    stream() (SSE, the longest-lived connection) cannot be forgotten."""
+    import aiohttp
+
+    seen: List[Dict[str, Any]] = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            seen.append(kwargs)
+
+    class FakeConnector:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(aiohttp, "TCPConnector", FakeConnector)
+
+    await Api("http://daemon", None)._ensure()
+    assert "connector" not in seen[-1], "plain http keeps aiohttp's default"
+
+    ctx = object()
+    await Api("https://daemon", None, ctx)._ensure()
+    assert seen[-1]["connector"].kwargs == {"ssl": ctx}
+
+
+def test_resolve_tls_is_none_until_something_is_set(monkeypatch):
+    """No flags and no env means no context at all, so the session stays
+    on aiohttp's default transport (and its system trust store)."""
+    _clear_tls_env(monkeypatch)
+    assert tui._resolve_tls(_TlsArgs()) is None
+
+
+def test_resolve_tls_prefers_the_flag_over_the_env(monkeypatch):
+    """Flag-then-env, per field, exactly like _resolve_token."""
+    from cronstable import tlsutil
+
+    seen: Dict[str, Any] = {}
+
+    def _record(**kwargs):
+        seen.update(kwargs)
+        return "context"
+
+    monkeypatch.setattr(tlsutil, "build_verifying_client_ssl_context", _record)
+    _clear_tls_env(monkeypatch)
+    monkeypatch.setenv(tui.ENV_CACERT, "/env/ca.pem")
+    monkeypatch.setenv(tui.ENV_CLIENT_CERT, "/env/client.pem")
+    monkeypatch.setenv(tui.ENV_CLIENT_KEY, "/env/client.key")
+
+    class Args(_TlsArgs):
+        cacert = "/flag/ca.pem"
+
+    assert tui._resolve_tls(Args()) == "context"
+    # the flag wins where one was given; the env fills the rest in
+    assert seen == {
+        "ca": "/flag/ca.pem",
+        "cert": "/env/client.pem",
+        "key": "/env/client.key",
+        "insecure": False,
+    }
+
+
+def test_insecure_warns_that_the_token_still_travels(monkeypatch, capsys):
+    """--insecure must never be silent: verification is off but the
+    Authorization header is not, so the token goes to whoever answers."""
+    from cronstable import tlsutil
+
+    monkeypatch.setattr(
+        tlsutil,
+        "build_verifying_client_ssl_context",
+        lambda **kwargs: "context",
+    )
+    _clear_tls_env(monkeypatch)
+
+    class Args(_TlsArgs):
+        insecure = True
+
+    assert tui._resolve_tls(Args()) == "context"
+    err = capsys.readouterr().err
+    assert "--insecure" in err
+    assert "token" in err
+
+    # the env form is the same switch, and warns just as loudly
+    monkeypatch.setenv(tui.ENV_INSECURE, "YES")
+    assert tui._resolve_tls(_TlsArgs()) == "context"
+    assert "token" in capsys.readouterr().err
+
+
+def test_dispatch_reports_a_bad_ca_path_without_a_traceback(
+    monkeypatch, capsys, tmp_path
+):
+    """An unreadable CA is an operator typo, not a crash: dispatch exits
+    2 with one line, before the terminal ever goes into raw mode."""
+
+    class IsATty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("sys.stdin", IsATty())
+    monkeypatch.setattr("sys.stdout", IsATty())
+    _clear_tls_env(monkeypatch)
+    missing = tmp_path / "absent-ca.pem"
+
+    class Args(_TlsArgs):
+        url = tui.DEFAULT_URL
+        token = None
+        token_env = tui.ENV_TOKEN
+        cacert = str(missing)
+
+    assert tui.dispatch(Args()) == 2
+    assert "absent-ca.pem" in capsys.readouterr().err

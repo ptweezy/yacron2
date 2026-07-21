@@ -3774,7 +3774,7 @@ async def test_web_app_restarts_on_config_change(monkeypatch):
     monkeypatch.setattr(
         cronstable.cron,
         "web_site_from_url",
-        lambda runner, url: FakeSite(url),
+        lambda runner, url, ssl_context=None: FakeSite(url),
     )
 
     cron = cronstable.cron.Cron(None)

@@ -29,6 +29,7 @@
   - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)
+  - [Listener TLS](Listener-TLS)
   - [Calendar Export (iCal)](Calendar-Export)
   - [Web Dashboard](Web-Dashboard)
   - [Terminal Dashboard](Terminal-Dashboard)

@@ -100,6 +100,17 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   wiki page)
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* **Native TLS on the listeners**: `web.listen` accepts `https://` addresses
+  served from a `web.tls` block, mixed freely with plaintext and unix-socket
+  entries on one runner, and an optional `clientCa` makes the listener require
+  a client certificate signed by your own CA (mutual TLS), so it authenticates
+  its callers rather than merely encrypting them. A web certificate replaced in
+  place is picked up without a daemon restart. The job-facing state API gains
+  the same block as `state.jobApi.tls`, and `cronstable tui` / `cronstable mcp`
+  gain `--cacert`, `--client-cert`, `--client-key` and `--insecure` (see
+  [Serving the API over TLS](#serving-the-api-over-tls) and the
+  [Listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS)
+  wiki page)
 * **iCal calendar export**: subscribe any calendar app to `GET /calendar.ics`
   (or one job's `/jobs/{name}/calendar.ics`) and the fleet's upcoming fires,
   enumerated by the scheduler's own engine, land on the on-call engineer's
@@ -1783,6 +1794,67 @@ web:
   ui: false
 ```
 
+#### Serving the API over TLS
+
+`web.listen` also accepts `https://` addresses, served from a `web.tls` block.
+Each entry keeps its own transport, so one runner can serve the same API and
+dashboard in plaintext on loopback and over TLS on a routable interface;
+`unix://` listeners are always plaintext, where the socket's own permissions
+(`socketMode`) are the access control.
+
+```yaml
+web:
+  listen:
+     - http://127.0.0.1:8080                      # loopback, plaintext
+     - https://0.0.0.0:8443                       # served with the material below
+  tls:
+    cert: /etc/cronstable/web.pem
+    key:  /etc/cronstable/web.key
+    clientCa: /etc/cronstable/callers-ca.pem      # optional: require client certs
+```
+
+`clientCa` turns the listener into **mutual TLS**: a caller that presents no
+certificate, or one signed by another CA, is refused at the handshake. That CA
+file is therefore the caller allowlist (a server does no hostname verification,
+so any certificate that CA ever signed is accepted), so point it at a CA minted
+for this purpose rather than a shared organisational one. Because mTLS does
+authenticate the caller, `mcp.enabled` on such a listener no longer requires
+`web.authToken`.
+
+Web certificates rotate in place. cronstable fingerprints the files and
+restarts the listener when they change on disk, so a cert-manager, Vault or
+Kubernetes secret refresh needs no daemon restart. That restart drops the
+connections open at the time, including the SSE log streams the dashboard and
+the TUI hold, which reconnect on their own; a live log tail blips.
+
+The job-facing state API gets the same block: `state.jobApi.listen` accepts an
+`https://` URL served from `state.jobApi.tls.cert` and `.key`, and
+`state.jobApi.tls.ca` is the trust anchor handed to every job as
+`CRONSTABLE_STATE_CACERT`, so `cronstable state|cursor|lock|artifact` inside a
+job can verify an internally-issued certificate. That listener builds its
+context once at startup, so rotating its certificate takes a daemon restart.
+
+The clients take the same four options, as flags or environment variables
+(`cronstable tui`, `cronstable mcp`):
+
+| Flag | Environment | Effect |
+| --- | --- | --- |
+| `--cacert PATH` | `CRONSTABLE_WEB_CACERT` | verify against this CA instead of the system trust store |
+| `--client-cert PATH` | `CRONSTABLE_WEB_CLIENT_CERT` | certificate to present to a `clientCa` listener |
+| `--client-key PATH` | `CRONSTABLE_WEB_CLIENT_KEY` | private key for `--client-cert` |
+| `--insecure` | `CRONSTABLE_WEB_INSECURE` | skip verification; warns, because the bearer token is still sent |
+
+Client hostname verification is on, so the certificate has to cover the name
+actually dialled: `https://127.0.0.1:8443` needs an IP SAN for `127.0.0.1`, and
+`https://localhost:8443` needs a DNS SAN.
+
+This is a teaser: issuing the certificates, the mTLS trust model and how it
+interacts with `web.authToken`, the rotation mechanics and what they do not
+cover, the job state API's trust anchor, and the full client flag surface are
+covered in depth in the
+[Listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS)
+guide in the wiki.
+
 Now you have the following options to control it (using HTTPie as example):
 
 #### Get the version of cronstable
@@ -2251,6 +2323,7 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
   [Terminal Dashboard](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard) ·
   [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export) ·
   [HTTP API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) ·
+  [Listener TLS](https://github.com/ptweezy/cronstable/wiki/Listener-TLS) ·
   [MCP Server](https://github.com/ptweezy/cronstable/wiki/MCP) ·
   [Metrics with Prometheus](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Prometheus) ·
   [Metrics with Statsd](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Statsd) ·

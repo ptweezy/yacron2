@@ -10,6 +10,7 @@ itself is tested against a fake opener; everything above it monkeypatches
 import argparse
 import io
 import json
+import ssl
 import sys
 import urllib.error
 
@@ -26,6 +27,10 @@ def _args(**overrides):
         protocol_version=None,
         timeout=1.0,
         mcp_check=False,
+        cacert=None,
+        client_cert=None,
+        client_key=None,
+        insecure=False,
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -56,6 +61,88 @@ def test_resolve_token_custom_env(monkeypatch):
 def test_resolve_token_absent(monkeypatch):
     monkeypatch.delenv(mcpcli.ENV_TOKEN, raising=False)
     assert mcpcli._resolve_token(_args()) is None
+
+
+# ---------------------------------------------------------------------------
+# TLS resolution and the opener it selects
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_tls_env(monkeypatch):
+    """No CRONSTABLE_WEB_* TLS variable leaks in from the developer's shell.
+
+    Autouse because the drivers now resolve TLS on every run: an exported
+    CRONSTABLE_WEB_CACERT would otherwise fail tests that have nothing to do
+    with TLS.  Tests that want a variable set request the fixture and use the
+    monkeypatch it returns.
+    """
+    for name in (
+        mcpcli.ENV_CACERT,
+        mcpcli.ENV_CLIENT_CERT,
+        mcpcli.ENV_CLIENT_KEY,
+        mcpcli.ENV_INSECURE,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def test_resolve_tls_none_without_flags(_no_tls_env):
+    # the plaintext default: no context at all, so the bridge keeps the
+    # transport it had before TLS existed.
+    assert mcpcli._resolve_tls(_args()) is None
+
+
+def test_resolve_tls_insecure_warns_on_stderr(_no_tls_env, capsys):
+    ctx = mcpcli._resolve_tls(_args(insecure=True))
+    assert ctx is not None
+    assert ctx.verify_mode == ssl.CERT_NONE
+    # the warning is the point: verification is off while the token still
+    # goes out, so this must never be silent.
+    err = capsys.readouterr().err
+    assert "--insecure" in err
+    assert "bearer token" in err
+
+
+def test_resolve_tls_insecure_via_env_also_warns(_no_tls_env, capsys):
+    _no_tls_env.setenv(mcpcli.ENV_INSECURE, "yes")
+    assert mcpcli._resolve_tls(_args()).verify_mode == ssl.CERT_NONE
+    assert "--insecure" in capsys.readouterr().err
+
+
+def test_resolve_tls_cacert_flag_beats_env(_no_tls_env, tmp_path):
+    # flag-then-env precedence, asserted through the error: the flag's path is
+    # the one that gets opened.
+    _no_tls_env.setenv(mcpcli.ENV_CACERT, str(tmp_path / "from-env.pem"))
+    with pytest.raises(mcpcli._BridgeError) as caught:
+        mcpcli._resolve_tls(_args(cacert=str(tmp_path / "from-flag.pem")))
+    assert "from-flag.pem" in str(caught.value)
+
+
+def test_resolve_tls_bad_path_is_a_clean_error(_no_tls_env, tmp_path):
+    # an unreadable CA must not exit with a traceback out of ssl.
+    with pytest.raises(mcpcli._BridgeError, match="TLS material"):
+        mcpcli._resolve_tls(_args(cacert=str(tmp_path / "absent.pem")))
+
+
+def test_build_opener_without_context_is_the_shared_global():
+    # identity, not equality: _OPENER is the monkeypatch seam, so the no-TLS
+    # path must hand back that very object.
+    assert mcpcli._build_opener(None) is mcpcli._OPENER
+
+
+def test_build_opener_with_context_is_a_separate_opener():
+    opener = mcpcli._build_opener(ssl.create_default_context())
+    assert opener is not mcpcli._OPENER
+    handlers = [type(h).__name__ for h in opener.handlers]
+    assert "HTTPSHandler" in handlers
+    # an empty ProxyHandler evicts urllib's default one and installs no
+    # *_open method of its own, so proxy support ends up absent entirely:
+    # the same shape _OPENER has, which is the point of passing it along.
+    assert "ProxyHandler" not in handlers
+    assert "ProxyHandler" not in [
+        type(h).__name__ for h in mcpcli._OPENER.handlers
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +229,42 @@ def test_post_transport_failures_raise_bridge_error(monkeypatch, raised):
         mcpcli._post("http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
 
 
+def test_post_without_opener_uses_the_module_global(monkeypatch):
+    # the five-argument call is the pre-TLS signature; it must still go
+    # through _OPENER, read at call time so the monkeypatch takes.
+    opener = _FakeOpener(_FakeResponse(200, b"{}"))
+    monkeypatch.setattr(mcpcli, "_OPENER", opener)
+    mcpcli._post("http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
+    assert opener.request is not None
+
+
+def test_post_uses_the_supplied_opener(monkeypatch):
+    unused = _FakeOpener(_FakeResponse(500, b"nope"))
+    monkeypatch.setattr(mcpcli, "_OPENER", unused)
+    chosen = _FakeOpener(_FakeResponse(200, b'{"ok": 1}'))
+    status, _body = mcpcli._post(
+        "http://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0, opener=chosen
+    )
+    assert status == 200
+    assert chosen.request is not None
+    assert unused.request is None
+
+
+def test_post_tls_failure_names_cacert_not_unreachable(monkeypatch):
+    # a verification failure arrives as URLError(reason=SSLError); reporting it
+    # as "cannot reach" would send the operator after a network problem.
+    failure = urllib.error.URLError(
+        ssl.SSLCertVerificationError(1, "certificate verify failed")
+    )
+    monkeypatch.setattr(mcpcli, "_OPENER", _FakeOpener(failure))
+    with pytest.raises(mcpcli._BridgeError) as caught:
+        mcpcli._post("https://127.0.0.1:9", b"{}", None, "2025-11-25", 1.0)
+    message = str(caught.value)
+    assert "TLS verification failed" in message
+    assert "--cacert" in message
+    assert "cannot reach" not in message
+
+
 # ---------------------------------------------------------------------------
 # reply sniffing / error message helpers
 # ---------------------------------------------------------------------------
@@ -192,7 +315,9 @@ class _PostRecorder:
         self._outcomes = list(outcomes)
         self.calls = []
 
-    def __call__(self, url, frame, token, protocol_version, timeout):
+    def __call__(
+        self, url, frame, token, protocol_version, timeout, opener=None
+    ):
         self.calls.append(
             {
                 "url": url,
@@ -200,6 +325,7 @@ class _PostRecorder:
                 "token": token,
                 "pv": protocol_version,
                 "timeout": timeout,
+                "opener": opener,
             }
         )
         outcome = self._outcomes.pop(0)
@@ -350,6 +476,32 @@ def test_bridge_http_error_becomes_error_frame(monkeypatch, capsys):
     assert "authentication required" in frames[0]["error"]["message"]
 
 
+def test_bridge_threads_the_default_opener_into_post(monkeypatch, capsys):
+    # with no TLS flags the bridge still resolves an opener; it must be the
+    # shared global, so the plaintext path is byte-for-byte what it was.
+    _code, recorder = _run(
+        monkeypatch,
+        '{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n',
+        [(200, b'{"id": 1}')],
+    )
+    assert recorder.calls[0]["opener"] is mcpcli._OPENER
+
+
+def test_bridge_reports_bad_tls_material_and_exits_nonzero(
+    monkeypatch, capsys, tmp_path
+):
+    # a bad path is fatal before the read loop, not an error frame per request.
+    recorder = _PostRecorder([])
+    monkeypatch.setattr(mcpcli, "_post", recorder)
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"id": 1}\n'))
+    code = mcpcli._run_bridge(_args(cacert=str(tmp_path / "absent.pem")))
+    assert code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""  # stdout carries JSON-RPC frames only
+    assert "TLS material" in captured.err
+    assert recorder.calls == []
+
+
 def test_bridge_empty_200_body_becomes_error_frame(monkeypatch, capsys):
     code, _ = _run(
         monkeypatch,
@@ -392,6 +544,23 @@ def test_check_happy_path(monkeypatch, capsys):
     assert recorder.calls[0]["pv"] == mcpcli.DEFAULT_PROTOCOL_VERSION
     assert recorder.calls[1]["pv"] == "2025-06-18"
     assert json.loads(recorder.calls[1]["frame"])["method"] == "tools/list"
+
+
+def test_check_threads_the_default_opener_into_post(monkeypatch, capsys):
+    code, recorder = _check(
+        monkeypatch, [(200, b'{"result": {}}'), (200, b'{"result": {}}')]
+    )
+    assert code == 0
+    assert [c["opener"] for c in recorder.calls] == [mcpcli._OPENER] * 2
+
+
+def test_check_bad_tls_material_fails_before_any_request(
+    monkeypatch, capsys, tmp_path
+):
+    code, recorder = _check(monkeypatch, [], cacert=str(tmp_path / "no.pem"))
+    assert code == 1
+    assert "mcp check: " in capsys.readouterr().err
+    assert recorder.calls == []
 
 
 def test_check_unreachable_daemon(monkeypatch, capsys):
@@ -470,3 +639,30 @@ def test_parser_defaults(monkeypatch):
     assert args.timeout == mcpcli.DEFAULT_TIMEOUT
     assert args.mcp_check is False
     assert args.protocol_version is None
+    # the TLS flags default to "untouched transport", matching _resolve_tls
+    # returning None for them.
+    assert args.cacert is None
+    assert args.client_cert is None
+    assert args.client_key is None
+    assert args.insecure is False
+
+
+def test_parser_accepts_the_tls_flags():
+    args = _parse_cli(
+        [
+            "mcp",
+            "--cacert",
+            "ca.pem",
+            "--client-cert",
+            "c.pem",
+            "--client-key",
+            "k.pem",
+            "--insecure",
+        ]
+    )
+    assert (args.cacert, args.client_cert, args.client_key) == (
+        "ca.pem",
+        "c.pem",
+        "k.pem",
+    )
+    assert args.insecure is True

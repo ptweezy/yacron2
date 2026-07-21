@@ -1297,10 +1297,13 @@ def _bind_of(listen):
 
 
 def test_bind_target_forms():
-    assert _bind_of(None) == ("127.0.0.1", 0)
-    assert _bind_of("127.0.0.1:9123") == ("127.0.0.1", 9123)
-    assert _bind_of("http://10.0.0.5:8099") == ("10.0.0.5", 8099)
-    assert _bind_of("http://10.0.0.5") == ("10.0.0.5", 0)
+    assert _bind_of(None) == ("http", "127.0.0.1", 0)
+    assert _bind_of("127.0.0.1:9123") == ("http", "127.0.0.1", 9123)
+    assert _bind_of("http://10.0.0.5:8099") == ("http", "10.0.0.5", 8099)
+    assert _bind_of("http://10.0.0.5") == ("http", "10.0.0.5", 0)
+    # the scheme is carried through, not discarded: it decides whether start()
+    # wraps the site in TLS and which scheme jobs are told to dial.
+    assert _bind_of("https://10.0.0.5:8443") == ("https", "10.0.0.5", 8443)
 
 
 # ---------------------------------------------------------------------------

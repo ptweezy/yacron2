@@ -33,6 +33,7 @@ the HTTP surface over them.  It is imported only when a ``state`` section with
 
 import asyncio
 import hmac
+import ipaddress
 import logging
 import math
 import os
@@ -42,7 +43,7 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
-from cronstable import _json, jobstate
+from cronstable import _json, jobstate, tlsutil
 from cronstable.jobstate import GLOBAL_SCOPE, JobStateError
 from cronstable.state import Lease, StateBackend, _DocumentUnreadable
 
@@ -78,6 +79,24 @@ MAX_LOCK_PERMITS = 1024
 MAX_LOCK_TTL = 30 * 86400.0
 
 
+def _is_wildcard(host: str) -> bool:
+    """True for a bind address meaning "every interface".
+
+    Spelled several ways (``0.0.0.0``, ``::``, ``::0``, the long
+    ``0:0:0:0:0:0:0:0`` form, or nothing at all), so this compares parsed
+    addresses rather than a list of strings someone happened to think of.
+    Such a host is never advertised to jobs: it is not an address a job on
+    another machine can dial, and on Windows not one it can dial at all.
+    """
+    text = host.strip().strip("[]")
+    if not text:
+        return True
+    try:
+        return ipaddress.ip_address(text).is_unspecified
+    except ValueError:
+        return False  # a name, which a job can resolve
+
+
 def _bracket_host(host: str) -> str:
     """A host formatted for a URL authority (IPv6 literals bracketed).
 
@@ -98,6 +117,11 @@ ENV_JOB_NAME = "CRONSTABLE_JOB_NAME"
 ENV_ATTEMPT = "CRONSTABLE_ATTEMPT"
 ENV_SCHEDULED_AT = "CRONSTABLE_SCHEDULED_AT"
 ENV_HOST = "CRONSTABLE_HOST"
+# Set only when the endpoint serves TLS with a CA configured: the path the
+# job CLI should verify the endpoint against. An internally-issued
+# certificate is signed by nothing the job's Python already trusts, so
+# without this the job cannot verify the URL it was just handed.
+ENV_CACERT = "CRONSTABLE_STATE_CACERT"
 
 
 @dataclass
@@ -147,14 +171,20 @@ class _LockHold:
     lost: bool = False
 
 
-def run_environment(ctx: RunContext, base_url: str) -> Dict[str, str]:
+def run_environment(
+    ctx: RunContext, base_url: str, cacert: Optional[str] = None
+) -> Dict[str, str]:
     """The ``CRONSTABLE_*`` env the daemon injects for one run.
 
     All values are ``str`` (Windows and POSIX both reject non-str env values);
     an unknown scheduled time is the empty string rather than absent, so a job
     can test the variable rather than guess whether it was set.
+
+    ``cacert`` is added only when set, so a plaintext or publicly-trusted
+    endpoint leaves the job's environment exactly as it was before TLS
+    existed.
     """
-    return {
+    env = {
         ENV_URL: base_url,
         ENV_TOKEN: ctx.token,
         ENV_RUN_ID: ctx.run_id,
@@ -163,6 +193,9 @@ def run_environment(ctx: RunContext, base_url: str) -> Dict[str, str]:
         ENV_SCHEDULED_AT: ctx.scheduled_at or "",
         ENV_HOST: ctx.host,
     }
+    if cacert:
+        env[ENV_CACERT] = cacert
+    return env
 
 
 class JobLockManager:
@@ -450,18 +483,25 @@ class JobStateAPI:
     def base_url(self) -> Optional[str]:
         return self._base_url
 
-    def _bind_target(self) -> "tuple[str, int]":
-        """``(host, port)`` to bind: the configured listen, or ephemeral."""
+    @property
+    def cacert(self) -> Optional[str]:
+        """The CA path a job needs to verify this endpoint, if any."""
+        return (self._config.get("tls") or {}).get("ca") or None
+
+    def _bind_target(self) -> "tuple[str, str, int]":
+        """``(scheme, host, port)`` to bind: the configured listen, or the
+        ephemeral loopback default."""
         listen = self._config.get("listen")
         if not listen:
-            return "127.0.0.1", 0
+            return "http", "127.0.0.1", 0
         text = str(listen)
         if "://" not in text:
             text = "http://" + text
         parsed = urlparse(text)
+        scheme = parsed.scheme or "http"
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port if parsed.port is not None else 0
-        return host, port
+        return scheme, host, port
 
     def _client_max_size(self) -> int:
         """The transport-level body cap, derived from the configured limits.
@@ -490,16 +530,37 @@ class JobStateAPI:
         app.add_routes(self._routes())
         runner = web.AppRunner(app)
         await runner.setup()
-        host, port = self._bind_target()
-        site = web.TCPSite(runner, host, port)
+        scheme, host, port = self._bind_target()
+        # Built HERE rather than in __init__ so a bad certificate lands inside
+        # the caller's try (Cron._start_job_api catches OSError, and
+        # ssl.SSLError is one), degrading to "jobs run without the state
+        # endpoint" with a clear log instead of escaping into the state
+        # backend's own startup path.
+        ssl_context = None
+        if scheme == "https":
+            tls = self._config.get("tls") or {}
+            ssl_context = tlsutil.build_listener_ssl_context(
+                tls["cert"], tls["key"]
+            )
+        site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
         await site.start()
         # read the actually-bound address (the port is OS-assigned when 0).
         bound_host, bound_port = "127.0.0.1", port
         if runner.addresses:
             addr = runner.addresses[0]
             bound_host, bound_port = str(addr[0]), int(addr[1])
-        self._base_url = "http://{}:{}".format(
-            _bracket_host(bound_host), bound_port
+        # Advertise the CONFIGURED host rather than the bound one: a wildcard
+        # bind reports 0.0.0.0 / ::, which is not an address a job on another
+        # host can dial (and on Windows not one it can dial at all). Config
+        # validation already refuses a wildcard over https, where it could
+        # additionally never match a certificate SAN. Fall back to the bound
+        # address only when nothing was configured, i.e. the ephemeral
+        # loopback default, where the bound host is the right answer.
+        advertise = bound_host
+        if self._config.get("listen") and not _is_wildcard(host):
+            advertise = host
+        self._base_url = "{}://{}:{}".format(
+            scheme, _bracket_host(advertise), bound_port
         )
         self._runner = runner
         logger.info("state job API listening on %s", self._base_url)

@@ -193,9 +193,12 @@ The MCP surface fits cronstable's hardened posture and is safe by default:
   on a routable (non-loopback, non-socket) listener, cronstable **fails
   closed**: it refuses to start (with no token there is no auth middleware at
   all, so `/mcp` would be wide open). Restrict `web.listen` to loopback /
-  unix sockets, set `web.authToken`, or, only if the endpoint is protected by
+  unix sockets, set `web.authToken`, set `web.tls.clientCa` so an `https://`
+  listener authenticates its callers by certificate (see
+  [Listener TLS](Listener-TLS)), or, only if the endpoint is protected by
   other means (an mTLS-terminating proxy), set `mcp.allowUnauthenticated:
-  true`.
+  true`. A plain `https://` listener does not lift the gate: encryption is not
+  caller authentication.
 - **Origin + body defenses.** A present, non-allow-listed `Origin` is refused
   `403` (DNS-rebinding defense; browser clients go on `mcp.allowedOrigins`),
   and an oversized request body is refused `413`.

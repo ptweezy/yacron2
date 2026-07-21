@@ -1,5 +1,6 @@
 import copy
 import datetime
+import hashlib
 import ipaddress
 import logging
 import math
@@ -3729,13 +3730,13 @@ class _CachedDirFile(NamedTuple):
 
     ``sources`` is every on-disk file the file's parse read (itself, its
     transitive ``include``s, and the ``env_file`` of each job and DAG task
-    it defines); ``stamps`` is the sorted ``(abspath, st_mtime_ns,
-    st_size)`` fingerprint of exactly those, and ``config`` is the parsed
-    result to hand back untouched when they are all still current.
+    it defines); ``sig`` is the sorted ``(abspath, content_digest)``
+    fingerprint of exactly those, and ``config`` is the parsed result to
+    hand back untouched when they are all still byte-for-byte current.
     """
 
     sources: FrozenSet[str]
-    stamps: Tuple[Tuple[str, Optional[int], Optional[int]], ...]
+    sig: Tuple[Tuple[str, Optional[str]], ...]
     config: CronstableConfig
 
 
@@ -3743,32 +3744,42 @@ class _CachedDirFile(NamedTuple):
 #: config directory reopens the scheduler's whole-config reparse
 #: (cronstable.cron._config_signature), which then rebuilds EVERY file's
 #: JobConfigs even though only one changed.  Keyed by absolute path and
-#: validated against the same cheap ``(mtime_ns, size)`` stat fingerprint
-#: that gate uses, this hands back the unchanged files' already-parsed
-#: configs and re-runs strictyaml only for the file that actually moved.
-#: Bounded LRU so a process that parses many distinct configs (tests) does
-#: not grow it without limit; a stale or evicted entry only costs a
-#: reparse, never correctness (every hit re-stats all of its sources).
+#: validated by hashing each source's CONTENT, this hands back the
+#: unchanged files' already-parsed configs and re-runs strictyaml only for
+#: the file that actually changed -- so a cache hit is byte-exact with a
+#: full reparse, never merely mtime-close.  Bounded LRU so a process that
+#: parses many distinct configs (tests) does not grow it without limit; a
+#: stale or evicted entry only costs a reparse, never correctness.
 _DIR_FILE_CACHE: "OrderedDict[str, _CachedDirFile]" = OrderedDict()
 _DIR_FILE_CACHE_MAX = 1024
 
 
-def _dir_file_stamps(
+def _dir_file_content_sig(
     sources: FrozenSet[str],
-) -> Tuple[Tuple[str, Optional[int], Optional[int]], ...]:
-    """Sorted ``(abspath, st_mtime_ns, st_size)`` stat fingerprint.
+) -> Tuple[Tuple[str, Optional[str]], ...]:
+    """Sorted ``(abspath, content_digest)`` fingerprint of a parse's inputs.
 
-    A vanished source collapses to ``(path, None, None)`` so a deleted
-    include or env_file still reads as a change, mirroring
-    :meth:`cronstable.cron.Cron._config_signature`.
+    Hashes each source's bytes -- the file itself, its transitive
+    includes, and its jobs'/tasks' env_files -- rather than trusting a
+    ``(mtime_ns, size)`` stat, so a size-preserving edit that also
+    preserves mtime (coarse-granularity network/container filesystems, or
+    mtime-pinning tooling such as ``rsync -a`` / ``cp --preserve=timestamps``
+    / backup-restore) still invalidates the cache.  Reading the bytes is
+    the cheap part the pre-cache code paid on EVERY reparse anyway; the
+    strictyaml parse and JobConfig build are what the cache skips.  A
+    vanished or unreadable source hashes to ``None`` so a deletion still
+    reads as a change.
     """
-    parts: List[Tuple[str, Optional[int], Optional[int]]] = []
+    parts: List[Tuple[str, Optional[str]]] = []
     for src in sorted(sources):
         try:
-            st = os.stat(src)
-            parts.append((src, st.st_mtime_ns, st.st_size))
+            with open(src, "rb") as handle:
+                digest: Optional[str] = hashlib.blake2b(
+                    handle.read(), digest_size=16
+                ).hexdigest()
         except OSError:
-            parts.append((src, None, None))
+            digest = None
+        parts.append((src, digest))
     return tuple(parts)
 
 
@@ -3787,7 +3798,7 @@ def _parse_config_dir_file(
     cached = _DIR_FILE_CACHE.get(abspath)
     if (
         cached is not None
-        and _dir_file_stamps(cached.sources) == cached.stamps
+        and _dir_file_content_sig(cached.sources) == cached.sig
     ):
         _DIR_FILE_CACHE.move_to_end(abspath)
         return cached.config, cached.sources
@@ -3806,7 +3817,7 @@ def _parse_config_dir_file(
                 file_sources.add(os.path.abspath(template.env_file))
     frozen = frozenset(file_sources)
     _DIR_FILE_CACHE[abspath] = _CachedDirFile(
-        frozen, _dir_file_stamps(frozen), config
+        frozen, _dir_file_content_sig(frozen), config
     )
     _DIR_FILE_CACHE.move_to_end(abspath)
     while len(_DIR_FILE_CACHE) > _DIR_FILE_CACHE_MAX:

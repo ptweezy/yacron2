@@ -1827,6 +1827,15 @@ class Cron:
             for name, slot in self._last_run_slot.items()
             if name in keep
         }
+        # The trends cache is busted per job by _record_run, but a job the
+        # reload REMOVED (or a classic-crontab name reminted when a line
+        # shifts) never runs again under that name, so its entry would
+        # orphan forever; prune it here with every other per-job map.
+        self._trends_cache = {
+            name: entry
+            for name, entry in self._trends_cache.items()
+            if name in keep
+        }
         # Pause state survives a job-config edit (deliberately no digest
         # check, unlike retries: the operator paused the NAME, not one
         # definition of it); only a job the reload removed is pruned.

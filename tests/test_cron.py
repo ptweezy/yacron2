@@ -6427,6 +6427,25 @@ async def test_job_trends_payload_caches_within_ttl_and_busts_on_run():
     assert len(backend.reads) == reads2
 
 
+def test_apply_reload_prunes_trends_cache_for_removed_jobs():
+    # _trends_cache is busted per job by _record_run, but a job the reload
+    # REMOVED (or a classic-crontab name reminted when a line shifts) never
+    # runs again under that name, so without a reload-time prune its entry
+    # would orphan forever -- a slow leak under name churn. It must be pruned
+    # exactly like every other per-job map in _apply_reload.
+    two = "jobs:\n" + "".join(
+        "  - name: {n}\n    command: echo {n}\n    schedule: '* * * * *'\n".format(n=n)
+        for n in ("keep", "gone")
+    )
+    one = "jobs:\n  - name: keep\n    command: echo keep\n    schedule: '* * * * *'\n"
+    cron = cronstable.cron.Cron(None, config_yaml=two)
+    cron._trends_cache["keep"] = (1e18, {"name": "keep"})
+    cron._trends_cache["gone"] = (1e18, {"name": "gone"})
+    cron._apply_reload(cronstable.config.parse_config_string(one, "t.yaml"))
+    assert "keep" in cron._trends_cache
+    assert "gone" not in cron._trends_cache
+
+
 @pytest.mark.asyncio
 async def test_sla_warm_seeds_reference_past_the_in_memory_history_guard(
     monkeypatch,

@@ -535,6 +535,35 @@ jobs:
     assert conf.logging_config == {"version": 1}
 
 
+def test_parse_config_dir_cache_validates_content_not_mtime(tmp_path):
+    # The per-file dir cache must reuse a parse only when the bytes are
+    # unchanged, NOT merely when (mtime_ns, size) match. A size-preserving
+    # edit whose mtime is then pinned back (coarse-granularity network FS,
+    # rsync -a, cp --preserve=timestamps, backup-restore) must still be
+    # picked up -- otherwise a reparse triggered by a neighbouring file
+    # would keep serving the stale schedule the pre-cache full reparse read.
+    import os
+
+    a = tmp_path / "a.yaml"
+    a.write_text(
+        'jobs:\n  - name: bak\n    command: echo x\n    schedule: "0 3 * * *"\n'
+    )
+    first = config.parse_config_with_sources(str(tmp_path))[0]
+    assert str(first.jobs[0].schedule) == "0 3 * * *"
+    st = os.stat(a)
+
+    # "0 3" -> "0 5": identical byte length; then pin mtime + size back
+    a.write_text(
+        'jobs:\n  - name: bak\n    command: echo x\n    schedule: "0 5 * * *"\n'
+    )
+    os.utime(a, ns=(st.st_atime_ns, st.st_mtime_ns))
+    again = os.stat(a)
+    assert (again.st_mtime_ns, again.st_size) == (st.st_mtime_ns, st.st_size)
+
+    second = config.parse_config_with_sources(str(tmp_path))[0]
+    assert str(second.jobs[0].schedule) == "0 5 * * *"  # not the stale 0 3
+
+
 def test_parse_config_dir_multiple_web(tmp_path):
     (tmp_path / "a.yaml").write_text(
         "web:\n  listen:\n    - http://127.0.0.1:8080\n"

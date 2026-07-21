@@ -881,3 +881,61 @@ def test_redact_action_with_report_redacts_nested_secret():
     assert out["report"]["sentry"]["dsn"]["value"] == _SECRET_PLACEHOLDER
     # original untouched
     assert action["report"]["sentry"]["dsn"]["value"] == "https://k@e/1"
+
+
+# ---------------------------------------------------------------------------
+# sla / onLate exclusion: alerting-only config must never shift identity, or
+# every persisted digest (retry ladders, @reboot markers) is mass-invalidated
+# the moment an operator adds a threshold.
+# ---------------------------------------------------------------------------
+
+_SLA_BARE = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+"""
+
+_SLA_CONFIGURED = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    sla:
+      maxTimeSinceSuccessSeconds: 3600
+      lateAfterSeconds: 300
+      maxRuntimeSeconds: 1200
+    onLate:
+      report:
+        shell:
+          command: notify
+"""
+
+
+def test_sla_and_onlate_stay_out_of_canonical_job():
+    # even a job that fully configures both blocks emits neither key
+    (job,) = _jobs(_SLA_CONFIGURED)
+    canon = canonical_job(job)
+    assert "sla" not in canon
+    assert "onLate" not in canon
+
+
+def test_sla_and_onlate_do_not_change_id():
+    assert _id(_SLA_BARE) == _id(_SLA_CONFIGURED)
+
+
+def test_job_digest_unchanged_by_sla_attributes():
+    # regression lock: a config without sla/onLate keeps its digest
+    # byte-identical whatever those attributes hold, proving the digest
+    # never reads them.
+    (job,) = _jobs(_SLA_BARE)
+    before = job_digest(job)
+    before_set = job_set_id([job])
+    job.sla = {
+        "maxTimeSinceSuccessSeconds": 60,
+        "lateAfterSeconds": 60,
+        "maxRuntimeSeconds": 60,
+    }
+    job.onLate = {"report": {"shell": {"command": "notify"}}}
+    assert job_digest(job) == before
+    assert job_set_id([job]) == before_set

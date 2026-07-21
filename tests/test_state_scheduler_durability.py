@@ -22,7 +22,7 @@ import pytest
 from aiohttp import web
 
 import cronstable.platform as platform_mod
-from cronstable.cron import Cron
+from cronstable.cron import Cron, PauseInfo
 from cronstable.fingerprint import job_digest
 from cronstable.job import JobRetryState
 from cronstable.prometheus import PrometheusMetrics
@@ -277,7 +277,9 @@ async def test_retry_handoff_armedat_anchors_superseded_guard(tmp_path):
         t_arm = datetime.datetime(2026, 7, 1, 0, 0, 0, tzinfo=_UTC)
         t_handoff = datetime.datetime(2026, 7, 1, 0, 0, 50, tzinfo=_UTC)
         # a run finished at 00:00:30 -- AFTER the arm, BEFORE the hand-off.
-        cron.last_run["j"] = _info(second=30)
+        # Recorded through _record_run, not poked into last_run: the guard
+        # reads the skip-blind watermark that only _record_run maintains.
+        cron._record_run("j", _info(second=30))
         base = {
             "kind": "handoff",
             "attempt": 2,
@@ -549,6 +551,318 @@ async def test_rearm_superseded_by_newer_run(tmp_path):
         assert rec["reason"] == "superseded-by-run"
     finally:
         await _stop_state(cron)
+
+
+# --- superseded-by-run vs. pause-held slots -------------------------------
+#
+# A pause-held slot appends a synthetic "skipped" ledger row stamped NOW so
+# the catch-up watermark keeps advancing across the window. Nothing ran, so
+# that row must never satisfy the retry ladder's superseded-by-run guards:
+# not in memory, not across a restart, not on a peer's claim scan.
+
+
+async def _seed_run_record(cron, name, finished, outcome, ran_at=True):
+    """Append a hand-written ledger row the way a real run would land."""
+    rec = {
+        "outcome": outcome,
+        "exit_code": 0 if outcome == "success" else 1,
+        "started_at": None,
+        "finished_at": finished.isoformat(),
+        "duration": None,
+        "fail_reason": None if outcome == "success" else "boom",
+    }
+    if ran_at:
+        rec["ranAt"] = finished.isoformat()
+    await cron.state_backend.append_record("runs/" + name, rec)
+
+
+async def _seed_pending_armed_at(cron, name, attempt, not_before, at):
+    """`_seed_pending` with an explicit arm instant (its ``at``)."""
+    await cron.state_backend.append_record(
+        "retries/" + name,
+        {
+            "kind": "pending",
+            "attempt": attempt,
+            "notBefore": not_before.isoformat(),
+            "jobDigest": job_digest(cron.cron_jobs[name]),
+            "at": at.isoformat(),
+        },
+    )
+
+
+async def _hold_slots(cron, name, count):
+    """Pause the job and drive `count` scheduled fires into the pause gate."""
+    await cron.pause_job_by_name(name, duration=7200)
+    for _ in range(count):
+        await cron.launch_scheduled_job(cron.cron_jobs[name])
+    await _drain_state_writes(cron)
+
+
+async def test_pause_skip_row_is_absent_from_the_run_watermark(tmp_path):
+    # The two watermarks part ways over a held slot: catch-up's keeps
+    # advancing (finished_at), the supersede guards' does not (ranAt).
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        cron._record_run("j", _info())
+        await _drain_state_writes(cron)
+        ran = cron.last_run["j"].finished_at
+        await _hold_slots(cron, "j", 3)
+        assert cron.last_run["j"].outcome == "skipped"
+        skipped_at = cron.last_run["j"].finished_at
+        assert skipped_at > ran
+        assert await cron.durable_last_run_at("j") == skipped_at.isoformat()
+        completed = await cron.durable_last_completed_at("j")
+        assert completed == ran.isoformat()
+        assert cron._last_completed_at["j"] == ran
+    finally:
+        await _stop_state(cron)
+
+
+async def test_pause_skip_rows_do_not_settle_a_ladder_across_a_restart(
+    tmp_path,
+):
+    # The restart half of the in-process promise that a paused job's pending
+    # retry "waits and fires after the resume": the held slots stamped after
+    # the arm must not read as the run that resolved the ladder.
+    armed = _now_utc() - datetime.timedelta(seconds=900)
+    not_before = _now_utc() + datetime.timedelta(seconds=600)
+    first = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        await _seed_run_record(
+            first, "j", armed - datetime.timedelta(seconds=5), "failure"
+        )
+        await _seed_pending_armed_at(first, "j", 1, not_before, armed)
+        await _hold_slots(first, "j", 3)
+        rows = await first.state_backend.list_records("runs/j")
+        assert [r["outcome"] for r in rows[-3:]] == ["skipped"] * 3
+    finally:
+        await _stop_state(first)
+
+    second = await _stateful_cron(tmp_path, _RETRY_JOB)  # the restart
+    try:
+        state = second.retry_state.get("j")
+        assert state is not None and state.count == 1
+        state.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await state.task
+        second.retry_state.pop("j", None)
+        await _drain_state_writes(second)
+        rec = await _newest(second, "retries/j")
+        assert rec["kind"] == "pending"  # never settled by the pause
+    finally:
+        await _stop_state(second)
+
+
+async def test_real_run_under_a_pause_still_settles_the_ladder(tmp_path):
+    # The other half: the guard must track the newest NON-skipped instant,
+    # not merely ignore itself whenever the newest row is a skip. A real run
+    # that landed after the arm and was then buried under held slots still
+    # resolves the ladder, because no-run beats double-run.
+    armed = _now_utc() - datetime.timedelta(seconds=900)
+    ran = _now_utc() - datetime.timedelta(seconds=300)
+    not_before = _now_utc() + datetime.timedelta(seconds=600)
+    first = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        await _seed_pending_armed_at(first, "j", 1, not_before, armed)
+        await _seed_run_record(first, "j", ran, "success")
+        await _hold_slots(first, "j", 3)
+    finally:
+        await _stop_state(first)
+
+    second = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        assert "j" not in second.retry_state
+        await _drain_state_writes(second)
+        rec = await _newest(second, "retries/j")
+        assert rec["kind"] == "settled"
+        assert rec["reason"] == "superseded-by-run"
+    finally:
+        await _stop_state(second)
+
+
+@pytest.mark.parametrize("held", [48, 49, 50, 55])
+async def test_real_run_under_a_long_pause_still_settles_the_ladder(
+    tmp_path, held
+):
+    # The warmed ring is capped at RUN_HISTORY_LIMIT (50), so once a pause
+    # holds that many slots the real run that resolved the ladder is flooded
+    # out of the ring and _last_completed_at is never seeded from history.
+    # The re-arm must then fall back to the flood-independent durable fold,
+    # or a ladder a real run already superseded is re-armed and double-runs.
+    # This is a REGRESSION from the memo switch: pre-memo the skip row's own
+    # fresh finished_at settled this case by accident. AT and ACROSS the
+    # boundary: 48/49 keep the run inside the ring (still correct today),
+    # 50/55 push it out (broken without the durable seed).
+    armed = _now_utc() - datetime.timedelta(seconds=900)
+    ran = _now_utc() - datetime.timedelta(seconds=300)
+    not_before = _now_utc() + datetime.timedelta(seconds=600)
+    first = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        await _seed_pending_armed_at(first, "j", 1, not_before, armed)
+        await _seed_run_record(first, "j", ran, "success")
+        await _hold_slots(first, "j", held)
+        # nothing was pruned (maxRunsPerJob defaults to 0/unlimited): the real
+        # run is still in the ledger, just below the newest-50 window the
+        # warm-up reads.
+        rows = await first.state_backend.list_records("runs/j")
+        assert sum(1 for r in rows if r["outcome"] == "skipped") == held
+        assert sum(1 for r in rows if r["outcome"] == "success") == 1
+    finally:
+        await _stop_state(first)
+
+    second = await _stateful_cron(tmp_path, _RETRY_JOB)  # the restart
+    try:
+        assert "j" not in second.retry_state  # settled, never re-armed
+        await _drain_state_writes(second)
+        rec = await _newest(second, "retries/j")
+        assert rec["kind"] == "settled"
+        assert rec["reason"] == "superseded-by-run"
+    finally:
+        await _stop_state(second)
+
+
+@pytest.mark.parametrize("held", [49, 50, 55])
+async def test_pre_ranat_run_under_a_long_pause_still_settles_the_ladder(
+    tmp_path, held
+):
+    # #7 residual: the resolving run was written BEFORE the ``ranAt`` field
+    # existed (finished_at only), so derive_max("ranAt") sees nothing and the
+    # pre-ranAt compatibility fold in durable_last_completed_at must find it.
+    # That fold reads only the newest RUN_HISTORY_LIMIT (50) rows, so once the
+    # pause holds >= 50 slots the real run falls outside that window and the
+    # capped fold returns None, re-arming a resolved ladder into a double-run
+    # unless the deeper pre-ranAt re-read fires. AT and ACROSS the boundary:
+    # held=49 keeps the run inside the capped window (settles today), 50/55
+    # push it out (needs the deep re-read). Reached through the LOCAL retry
+    # rehydrate seeding _last_completed_at, not a peer claim scan.
+    armed = _now_utc() - datetime.timedelta(seconds=900)
+    ran = _now_utc() - datetime.timedelta(seconds=300)
+    not_before = _now_utc() + datetime.timedelta(seconds=600)
+    first = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        await _seed_pending_armed_at(first, "j", 1, not_before, armed)
+        await _seed_run_record(first, "j", ran, "success", ran_at=False)
+        await _hold_slots(first, "j", held)
+        rows = await first.state_backend.list_records("runs/j")
+        assert sum(1 for r in rows if r["outcome"] == "skipped") == held
+        assert sum(1 for r in rows if r["outcome"] == "success") == 1
+        # the resolving run carries no ``ranAt`` (the pre-upgrade shape).
+        assert not any("ranAt" in r for r in rows)
+    finally:
+        await _stop_state(first)
+
+    second = await _stateful_cron(tmp_path, _RETRY_JOB)  # the restart
+    try:
+        assert "j" not in second.retry_state  # settled, never re-armed
+        await _drain_state_writes(second)
+        rec = await _newest(second, "retries/j")
+        assert rec["kind"] == "settled"
+        assert rec["reason"] == "superseded-by-run"
+    finally:
+        await _stop_state(second)
+
+
+async def test_claim_scan_ignores_a_peers_pause_skip_rows(tmp_path):
+    # The scan's in-memory half: every node rehydrates the SHARED ledger, so
+    # the pausing owner's held slots become this node's last_run as well.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        cron._state_host = "node-b"
+        cron._record_run("j", _info())
+        await _hold_slots(cron, "j", 3)
+        assert cron.last_run["j"].outcome == "skipped"
+        stale = _now_utc() - datetime.timedelta(seconds=120)
+        foreign = {
+            "kind": "pending",
+            "attempt": 1,
+            "notBefore": stale.isoformat(),
+            "jobDigest": job_digest(cron.cron_jobs["j"]),
+            "host": "node-a",
+            "at": (_now_utc() - datetime.timedelta(seconds=900)).isoformat(),
+        }
+        assert cron._retry_record_claimable(
+            "j", cron.cron_jobs["j"], foreign
+        ) == (1, stale)
+    finally:
+        await _stop_state(cron)
+
+
+async def test_peer_claim_folds_pre_ranat_rows_but_not_skips(tmp_path):
+    # An upgraded ledger: rows written before ``ranAt`` existed still prove
+    # the ladder resolved, while the skip rows appended over them do not.
+    armed = _now_utc() - datetime.timedelta(seconds=900)
+    ran = _now_utc() - datetime.timedelta(seconds=300)
+    not_before = _now_utc() + datetime.timedelta(seconds=600)
+    owner = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        await _seed_run_record(owner, "j", ran, "success", ran_at=False)
+        await _hold_slots(owner, "j", 3)
+    finally:
+        await _stop_state(owner)
+
+    taker = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        taker._state_host = "node-b"
+        taker._last_completed_at.pop("j", None)  # only the ledger may decide
+        foreign = {
+            "kind": "pending",
+            "attempt": 1,
+            "notBefore": not_before.isoformat(),
+            "jobDigest": job_digest(taker.cron_jobs["j"]),
+            "host": "node-a",
+            "at": armed.isoformat(),
+        }
+        await taker.state_backend.append_record("retries/j", foreign)
+        claimed = await taker._claim_retry_under_lease(
+            "j", taker.cron_jobs["j"], foreign, 1, not_before
+        )
+        assert claimed is False
+        await _drain_state_writes(taker)
+        rec = await _newest(taker, "retries/j")
+        assert rec["kind"] == "settled"
+        assert rec["reason"] == "superseded-by-run"
+    finally:
+        await _stop_state(taker)
+
+
+async def test_peer_claim_ignores_pause_skip_rows_in_the_ledger(tmp_path):
+    # The cross-node half: the claim scan judges supersession off the shared
+    # ledger, where the pausing owner's held slots are all a peer can see.
+    armed = _now_utc() - datetime.timedelta(seconds=900)
+    not_before = _now_utc() + datetime.timedelta(seconds=600)
+    owner = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        owner._state_host = "node-a"
+        await _seed_run_record(
+            owner, "j", armed - datetime.timedelta(seconds=5), "failure"
+        )
+        await _hold_slots(owner, "j", 3)
+    finally:
+        await _stop_state(owner)
+
+    taker = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        taker._state_host = "node-b"
+        foreign = {
+            "kind": "pending",
+            "attempt": 1,
+            "notBefore": not_before.isoformat(),
+            "jobDigest": job_digest(taker.cron_jobs["j"]),
+            "host": "node-a",
+            "at": armed.isoformat(),
+        }
+        await taker.state_backend.append_record("retries/j", foreign)
+        claimed = await taker._claim_retry_under_lease(
+            "j", taker.cron_jobs["j"], foreign, 1, not_before
+        )
+        assert claimed is True
+        await _drain_state_writes(taker)
+        rec = await _newest(taker, "retries/j")
+        assert rec["kind"] == "pending"
+        assert rec["host"] == "node-b"
+        assert rec["claimedFrom"] == "node-a"
+    finally:
+        await _stop_state(taker)
 
 
 async def test_rearm_skips_other_hosts_pending(tmp_path):
@@ -858,6 +1172,124 @@ async def test_reboot_marker_recorded_before_launch(tmp_path, monkeypatch):
         assert events == ["record", "launch"]
     finally:
         cron.state_backend = None
+
+
+async def test_paused_reboot_defers_its_boot_run_across_a_restart(
+    tmp_path, monkeypatch
+):
+    # a pause DEFERS an @reboot job's boot run, it does not forfeit it: the
+    # once-per-boot marker stays unwritten while the job is paused, so the
+    # run is still owed after a daemon restart inside the same OS boot, and
+    # it fires exactly once when the pause lifts.
+    monkeypatch.setattr(platform_mod, "os_boot_id", lambda: "boot-A")
+    monkeypatch.setattr(platform_mod, "os_boot_time", lambda: None)
+    cron = await _stateful_cron(tmp_path, _REBOOT_JOB)
+    try:
+        await cron.pause_job_by_name("r", duration=3600)
+        await _drain_state_writes(cron)
+        calls, fake = _count_launcher()
+        cron.maybe_launch_job = fake  # type: ignore[method-assign]
+        await cron._spawn_reboot_jobs()
+        assert calls == []
+        # the boot token is NOT spent on a run that did not happen
+        assert await _newest(cron, "reboot/r") is None
+        assert "r" in cron._paused_reboot_jobs
+
+        # daemon restart inside the same OS boot: still paused, still owed
+        cron2 = await _stateful_cron(tmp_path, _REBOOT_JOB)
+        try:
+            assert cron2._pause_active("r") is not None
+            calls2, fake2 = _count_launcher()
+            cron2.maybe_launch_job = fake2  # type: ignore[method-assign]
+            await cron2._spawn_reboot_jobs()
+            assert calls2 == []
+            assert await _newest(cron2, "reboot/r") is None
+
+            # the pause lifts -> the deferred boot run happens, once
+            await cron2.resume_job_by_name("r")
+            await _drain_state_writes(cron2)
+            await cron2._process_paused_reboots()
+            assert calls2 == ["r"]
+            rec = await _newest(cron2, "reboot/r")
+            assert rec["bootId"] == "boot-A"
+            await cron2._process_paused_reboots()
+            assert calls2 == ["r"]
+            assert not cron2._paused_reboot_jobs
+        finally:
+            await _stop_state(cron2)
+
+        # ...and a later restart in the same OS boot does not repeat it
+        cron3 = await _stateful_cron(tmp_path, _REBOOT_JOB)
+        try:
+            calls3, fake3 = _count_launcher()
+            cron3.maybe_launch_job = fake3  # type: ignore[method-assign]
+            await cron3._spawn_reboot_jobs()
+            assert calls3 == []
+        finally:
+            await _stop_state(cron3)
+    finally:
+        await _stop_state(cron)
+
+
+async def test_paused_reboot_in_the_record_then_run_window_still_runs(
+    tmp_path, monkeypatch
+):
+    # #8 residual (a REGRESSION-adjacent loss the defer fix did not close):
+    # a pause that arrives DURING the record-then-run window -- after
+    # _reboot_boot_gate has burnt this OS boot's marker, before the launcher's
+    # pause gate -- must NOT forfeit the boot run. The once-per-boot token is
+    # already spent and cannot be un-spent, so an @reboot job is exempt from
+    # launch_scheduled_job's pause gate. Standalone path (via
+    # _spawn_reboot_jobs); the cluster path shares the same launcher exemption.
+    monkeypatch.setattr(platform_mod, "os_boot_id", lambda: "boot-A")
+    monkeypatch.setattr(platform_mod, "os_boot_time", lambda: None)
+    cron = await _stateful_cron(tmp_path, _REBOOT_JOB)
+    try:
+        calls, fake = _count_launcher()
+        cron.maybe_launch_job = fake  # type: ignore[method-assign]
+
+        real_gate = cron._reboot_boot_gate
+
+        async def gate_then_pause(job):
+            # spend the token (write the marker) via the real gate, then a
+            # concurrent pause task installs the pause mid-window -- exactly
+            # what _pause_periodic / a web pause handler can do at any await
+            # point between the gate and the launcher.
+            allowed = await real_gate(job)
+            await cron.pause_job_by_name(job.name, duration=3600)
+            return allowed
+
+        cron._reboot_boot_gate = gate_then_pause  # type: ignore[method-assign]
+        await cron._spawn_reboot_jobs()
+        await _drain_state_writes(cron)
+
+        # the token WAS spent (the marker is present)...
+        assert await _newest(cron, "reboot/r") is not None
+        # ...so the boot run must actually happen, not be skipped
+        assert calls == ["r"]
+        # and no synthetic "skipped" row stands in for a lost run
+        rows = await cron.state_backend.list_records("runs/r")
+        assert [r for r in rows if r.get("outcome") == "skipped"] == []
+    finally:
+        await _stop_state(cron)
+
+
+async def test_launch_gate_still_skips_a_paused_non_reboot_job(tmp_path):
+    # The @reboot pause-gate exemption is NARROW: an ordinary scheduled job
+    # that is paused still skips at the launcher and writes its synthetic
+    # skip row, so the catch-up watermark keeps advancing. Guards the fix
+    # against over-broadening the exemption.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        calls, fake = _count_launcher()
+        cron.maybe_launch_job = fake  # type: ignore[method-assign]
+        await cron.pause_job_by_name("j", duration=3600)
+        await _drain_state_writes(cron)
+        await cron.launch_scheduled_job(cron.cron_jobs["j"])
+        assert calls == []  # never launched
+        assert cron.last_run["j"].outcome == "skipped"
+    finally:
+        await _stop_state(cron)
 
 
 async def test_reboot_store_error_policy(tmp_path, monkeypatch):
@@ -1217,6 +1649,111 @@ async def test_state_periodic_writes_manifest(tmp_path):
         await _stop_state(cron)
 
 
+_PAUSE_GC_JOBS = """
+jobs:
+  - name: alive
+    command: ls
+    schedule: "0 0 * * *"
+  - name: dead
+    command: ls
+    schedule: "0 0 * * *"
+  - name: held
+    command: ls
+    schedule: "0 0 * * *"
+"""
+
+
+async def test_collect_state_garbage_reclaims_dead_pause_streams(
+    tmp_path, monkeypatch
+):
+    # A job paused then resumed keeps a paused/<job> stream that the
+    # per-minute refresh re-reads forever just to conclude "not paused". GC
+    # reclaims the dead stream (grace-gated) while leaving a live pause alone,
+    # so the steady-state refresh only reads streams with an active pause.
+    import cronstable.state as state_mod
+
+    cron = await _stateful_cron(tmp_path, _PAUSE_GC_JOBS)
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        # a resumed (dead) pause stream for a configured job, written long
+        # enough ago that its newest record is older than the grace window.
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        await backend.append_record(
+            "paused/dead",
+            {
+                "kind": "resumed",
+                "by": "op",
+                "channel": "cli",
+                "at": (
+                    _now_utc() - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+                "host": "h",
+            },
+        )
+        # a job paused on THIS node whose durable stream still tops out at an
+        # OLD resume (the pause write not yet landed): the local-pause guard
+        # must keep it even though the durable record reads as dead.
+        await backend.append_record(
+            "paused/held",
+            {
+                "kind": "resumed",
+                "by": "op",
+                "channel": "cli",
+                "at": (
+                    _now_utc() - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+                "host": "h",
+            },
+        )
+        monkeypatch.undo()
+        cron._paused["held"] = PauseInfo(
+            since=_now_utc(),
+            until=_now_utc() + datetime.timedelta(hours=1),
+            note="",
+            by="op",
+            channel="cli",
+        )
+        # a live pause on another configured job -> must be kept.
+        await backend.append_record(
+            "paused/alive",
+            {
+                "kind": "paused",
+                "since": _now_utc().isoformat(),
+                "until": (
+                    _now_utc() + datetime.timedelta(hours=1)
+                ).isoformat(),
+                "note": "",
+                "by": "op",
+                "channel": "cli",
+                "at": _now_utc().isoformat(),
+                "host": "h",
+            },
+        )
+        # this node's own manifest, old enough to satisfy the depth guard so
+        # GC actually proceeds (see the sibling test above).
+        await backend.append_record(
+            cron._manifest_stream(),
+            {
+                "jobSetId": "v1:self",
+                "host": cron._state_host,
+                "jobs": [],
+                "at": (
+                    _now_utc() - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+            },
+        )
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        # the dead resumed stream is reclaimed; the live pause and the
+        # locally-held job (stale durable record notwithstanding) survive.
+        assert await backend.list_records("paused/dead") == []
+        assert len(await backend.list_records("paused/alive")) == 1
+        assert len(await backend.list_records("paused/held")) == 1
+    finally:
+        await _stop_state(cron)
+
+
 async def test_collect_state_garbage_keeps_manifested_jobs(
     tmp_path, monkeypatch
 ):
@@ -1402,3 +1939,982 @@ async def test_state_metric_families_rendered(tmp_path):
 
 def _raise_runtime():
     raise RuntimeError("boom")
+
+
+# --- durable runtime pause/resume (paused/<job> stream) --------------------
+
+_PAUSE_JOB = """
+jobs:
+  - name: p
+    command: ls
+    schedule: "* * * * *"
+"""
+
+_PAUSE_CATCHUP_JOB = """
+jobs:
+  - name: p
+    command: ls
+    schedule: "* * * * *"
+    onMissed: run-all
+"""
+
+
+async def test_pause_record_written_and_survives_restart(tmp_path):
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        await cron.pause_job_by_name(
+            "p", duration=3600, note="maint", by="parker", channel="api"
+        )
+        await _drain_state_writes(cron)
+        rec = await _newest(cron, "paused/p")
+        assert rec is not None
+        assert rec["kind"] == "paused"
+        assert rec["note"] == "maint"
+        assert rec["by"] == "parker"
+        assert rec["channel"] == "api"
+        assert rec["host"] == cron._state_host
+        until = datetime.datetime.fromisoformat(rec["until"])
+        since = datetime.datetime.fromisoformat(rec["since"])
+        assert (until - since).total_seconds() == 3600
+    finally:
+        await _stop_state(cron)
+
+    # a fresh process over the same store: the pause is rehydrated and the
+    # fire gate honours it end to end (skip row, no launch).
+    cron2 = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        live = cron2._pause_active("p")
+        assert live is not None
+        assert live.note == "maint"
+        launched = []
+
+        async def fake(job, *, with_retries=True):
+            launched.append(job.name)
+            return True
+
+        cron2.maybe_launch_job = fake  # type: ignore[method-assign]
+        await cron2.launch_scheduled_job(cron2.cron_jobs["p"])
+        assert launched == []
+        assert cron2.last_run["p"].outcome == "skipped"
+        assert cron2.last_run["p"].skip_reason == "paused"
+    finally:
+        await _stop_state(cron2)
+
+
+async def test_resume_record_clears_pause_on_restart(tmp_path):
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        await cron.pause_job_by_name("p", duration=3600)
+        await cron.resume_job_by_name("p", by="parker")
+        await _drain_state_writes(cron)
+        # the per-job write chain keeps newest-record-wins honest: the
+        # resume lands ON TOP of the pause it revokes, never inverted.
+        rec = await _newest(cron, "paused/p")
+        assert rec is not None
+        assert rec["kind"] == "resumed"
+        assert rec["by"] == "parker"
+    finally:
+        await _stop_state(cron)
+
+    cron2 = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        assert cron2._pause_active("p") is None
+    finally:
+        await _stop_state(cron2)
+
+
+async def test_expired_durable_pause_not_rehydrated(tmp_path):
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        past = _now_utc() - datetime.timedelta(seconds=60)
+        await cron.state_backend.append_record(
+            "paused/p",
+            {
+                "kind": "paused",
+                "since": (past - datetime.timedelta(seconds=60)).isoformat(),
+                "until": past.isoformat(),
+                "note": "",
+                "by": "parker",
+                "channel": "api",
+                "at": past.isoformat(),
+                "host": "elsewhere",
+            },
+        )
+    finally:
+        await _stop_state(cron)
+
+    cron2 = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        # skip-expired at rehydrate: the window ended while nobody ran
+        assert cron2._pause_active("p") is None
+        assert "p" not in cron2._paused
+    finally:
+        await _stop_state(cron2)
+
+
+async def test_pause_window_excuses_only_the_slots_inside_it(tmp_path):
+    # the daemon was DOWN across an (expired) pause window: slots inside
+    # the window are never owed, slots after its end are owed as normal.
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await cron.state_backend.append_record(
+            "runs/p",
+            {
+                "outcome": "success",
+                "exit_code": 0,
+                "started_at": None,
+                "finished_at": "2026-07-01T10:00:00+00:00",
+                "duration": None,
+                "fail_reason": None,
+            },
+        )
+        now = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
+        job = cron.cron_jobs["p"]
+        # without a pause record: every slot since the watermark is owed
+        count, _ = await cron._missed_occurrences(job, now)
+        assert count == 10
+        await cron.state_backend.append_record(
+            "paused/p",
+            {
+                "kind": "paused",
+                "since": "2026-07-01T10:00:30+00:00",
+                "until": "2026-07-01T10:05:00+00:00",
+                "note": "",
+                "by": "parker",
+                "channel": "api",
+                "at": "2026-07-01T10:00:30+00:00",
+                "host": "elsewhere",
+            },
+        )
+        # 10:01..10:04 fall inside [since, until) and are excused; 10:05
+        # lands exactly on `until`, where _pause_active already reports the
+        # job as unpaused, so it is owed like 10:06..10:10.
+        count, _ = await cron._missed_occurrences(job, now)
+        assert count == 6
+    finally:
+        await _stop_state(cron)
+
+
+async def test_pause_window_leaves_the_pre_pause_backlog_owed(tmp_path):
+    # the pause began AFTER the daemon went down (a peer paused the job
+    # while this node was off): the slots that came due before the operator
+    # paused are genuine downtime and stay owed. A floor at `until` erased
+    # all of them.
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await cron.state_backend.append_record(
+            "runs/p",
+            {
+                "outcome": "success",
+                "exit_code": 0,
+                "started_at": None,
+                "finished_at": "2026-07-01T10:00:00+00:00",
+                "duration": None,
+                "fail_reason": None,
+            },
+        )
+        await cron.state_backend.append_record(
+            "paused/p",
+            {
+                "kind": "paused",
+                "since": "2026-07-01T10:05:30+00:00",
+                "until": "2026-07-01T10:08:00+00:00",
+                "note": "",
+                "by": "parker",
+                "channel": "api",
+                "at": "2026-07-01T10:05:30+00:00",
+                "host": "elsewhere",
+            },
+        )
+        now = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
+        job = cron.cron_jobs["p"]
+        # 10:01..10:05 predate the window, 10:06 and 10:07 are inside it,
+        # 10:08..10:10 are at/after its end: 8 owed, 2 excused.
+        count, _ = await cron._missed_occurrences(job, now)
+        assert count == 8
+    finally:
+        await _stop_state(cron)
+
+
+async def test_pause_window_does_not_erase_an_open_checkpoint_backlog(
+    tmp_path,
+):
+    # an open catch-up checkpoint deliberately hoists the window back to an
+    # older watermark; the pause excusal must not clamp that hoist away.
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await cron.state_backend.append_record(
+            "runs/p",
+            {
+                "outcome": "success",
+                "exit_code": 0,
+                "started_at": None,
+                "finished_at": "2026-07-01T10:07:00+00:00",
+                "duration": None,
+                "fail_reason": None,
+            },
+        )
+        await cron._checkpoint_catchup(
+            "p", "open", "2026-07-01T10:00:00+00:00"
+        )
+        await cron.state_backend.append_record(
+            "paused/p",
+            {
+                "kind": "paused",
+                "since": "2026-07-01T10:05:30+00:00",
+                "until": "2026-07-01T10:08:00+00:00",
+                "note": "",
+                "by": "parker",
+                "channel": "api",
+                "at": "2026-07-01T10:05:30+00:00",
+                "host": "elsewhere",
+            },
+        )
+        now = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
+        count, watermark = await cron._missed_occurrences(
+            cron.cron_jobs["p"], now
+        )
+        assert watermark == "2026-07-01T10:00:00+00:00"
+        assert count == 8
+    finally:
+        await _stop_state(cron)
+
+
+async def test_catch_up_defers_a_paused_job_and_backfills_on_resume(tmp_path):
+    # a pause taken after the downtime must not forfeit the backlog: the
+    # evaluation stays unresolved while the pause is live, then replays
+    # every owed pre-pause slot once it lifts.
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await cron.state_backend.append_record(
+            "runs/p",
+            {
+                "outcome": "success",
+                "exit_code": 0,
+                "started_at": None,
+                "finished_at": "2026-07-01T10:00:00+00:00",
+                "duration": None,
+                "fail_reason": None,
+            },
+        )
+        backfills = []
+
+        async def _fake_backfill(job, count, offset, now):
+            backfills.append((job.name, count))
+
+        cron._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+        # the pause is taken now, i.e. long after the owed slots came due
+        await cron.pause_job_by_name("p", duration=3600)
+        await _drain_state_writes(cron)
+        now = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
+
+        await cron._catch_up(now)
+        assert cron._caught_up is False  # deferred, not latched
+        assert "p" not in cron._catchup_done
+        assert backfills == []
+
+        await cron.resume_job_by_name("p")
+        await _drain_state_writes(cron)
+        cron._catchup_next_retry = 0.0
+        await cron._catch_up(now)
+        await asyncio.sleep(0)  # let the backfill task run
+        assert cron._caught_up is True
+        assert backfills == [("p", 10)]
+    finally:
+        await _stop_state(cron)
+
+
+async def _seed_real_run(cron, when):
+    # a real run carries `ranAt` (JobRunInfo.to_dict); a skip row never does.
+    await cron.state_backend.append_record(
+        "runs/p",
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": None,
+            "finished_at": when,
+            "duration": None,
+            "fail_reason": None,
+            "ranAt": when,
+        },
+    )
+
+
+async def _seed_held_slot(cron, when):
+    # the synthetic row launch_scheduled_job writes for a slot held by a live
+    # pause: no `ranAt`, but a `finished_at` that advances durable_last_run_at.
+    await cron.state_backend.append_record(
+        "runs/p",
+        {
+            "outcome": "skipped",
+            "exit_code": None,
+            "started_at": None,
+            "finished_at": when,
+            "duration": None,
+            "fail_reason": None,
+            "skip_reason": "paused",
+        },
+    )
+
+
+async def _seed_pause_window(cron, since, until):
+    await cron.state_backend.append_record(
+        "paused/p",
+        {
+            "kind": "paused",
+            "since": since,
+            "until": until,
+            "note": "",
+            "by": "parker",
+            "channel": "api",
+            "at": since,
+            "host": "elsewhere",
+        },
+    )
+
+
+def _make_pause_live(cron):
+    # a live in-memory pause so _pause_active (wall-clock) routes the catch-up
+    # evaluation into the deferral branch, independent of the FIXED durable
+    # window the store carries for the excusal walk.
+    real_now = _now_utc()
+    cron._paused["p"] = PauseInfo(
+        since=real_now,
+        until=real_now + datetime.timedelta(hours=1),
+        note="",
+        by="parker",
+        channel="api",
+    )
+
+
+@pytest.mark.parametrize("n_held", [0, 1, 10])
+async def test_catch_up_pins_backlog_against_held_slot_rows(tmp_path, n_held):
+    # #37 residual: while a job is paused every held slot writes a synthetic
+    # "skipped" ledger row whose finished_at advances durable_last_run_at (the
+    # watermark _missed_occurrences reads). Merely deferring the evaluation is
+    # not enough: by the time the pause lifts the derived watermark has walked
+    # past _catchup_reference and the pre-pause backlog reads as nothing owed,
+    # forfeited forever. The deferral must PIN the pre-pause watermark (an open
+    # checkpoint at the last real run, which is skip-blind) so the backlog
+    # survives however many held rows land. AT (1) and ACROSS (10) the
+    # one-held-row boundary the owed count must stay 9.
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+        # since=10:10 == the reference below, so 10:01..10:09 predate the pause
+        # (owed) and only 10:10 is inside the window (excused): 9 owed.
+        await _seed_pause_window(
+            cron, "2026-07-01T10:10:00+00:00", "2026-07-01T10:20:00+00:00"
+        )
+        _make_pause_live(cron)
+        backfills = []
+
+        async def _fake_backfill(job, count, offset, now):
+            backfills.append((job.name, count))
+
+        cron._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+        ref = datetime.datetime(2026, 7, 1, 10, 10, 0, tzinfo=_UTC)
+
+        # first pass: paused, so defer AND pin the pre-pause watermark.
+        await cron._catch_up(ref)
+        assert cron._caught_up is False
+        assert backfills == []
+        assert (
+            await cron._pending_catchup_watermark("p")
+            == "2026-07-01T10:00:00+00:00"
+        )
+
+        # the held slots fire while paused, advancing durable_last_run_at.
+        for i in range(n_held):
+            await _seed_held_slot(
+                cron,
+                datetime.datetime(
+                    2026, 7, 1, 10, 11 + i, 0, tzinfo=_UTC
+                ).isoformat(),
+            )
+        # the window expires: the durable record stays 'paused', only memory
+        # clears (the reader-enforced auto-expiry _pause_active applies).
+        del cron._paused["p"]
+
+        cron._catchup_next_retry = 0.0
+        await cron._catch_up(ref)
+        await asyncio.sleep(0)  # let the backfill task run
+        assert cron._caught_up is True
+        assert backfills == [("p", 9)]
+    finally:
+        await _stop_state(cron)
+
+
+@pytest.mark.parametrize("n_held", [0, 1, 5])
+async def test_catch_up_pins_partial_window_backlog_against_held_rows(
+    tmp_path, n_held
+):
+    # #9 residual boundary: the pause window does NOT cover _catchup_reference
+    # (the operator paused mid-downtime), so only part of the backlog is
+    # excused and the rest stays owed. A single held-slot skip row still
+    # advances the derived watermark past the reference and forfeits the owed
+    # part unless the pre-pause watermark is pinned. AT (1) and ACROSS (5) the
+    # one-held-row boundary the owed count must stay 5.
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+        # since=10:05:30 < reference 10:10:30: 10:01..10:05 predate the pause
+        # (owed), 10:06..10:10 fall inside the window (excused): 5 owed.
+        await _seed_pause_window(
+            cron, "2026-07-01T10:05:30+00:00", "2026-07-01T10:20:00+00:00"
+        )
+        _make_pause_live(cron)
+        backfills = []
+
+        async def _fake_backfill(job, count, offset, now):
+            backfills.append((job.name, count))
+
+        cron._run_catch_up = _fake_backfill  # type: ignore[method-assign]
+        ref = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
+
+        await cron._catch_up(ref)
+        assert cron._caught_up is False
+        assert backfills == []
+        assert (
+            await cron._pending_catchup_watermark("p")
+            == "2026-07-01T10:00:00+00:00"
+        )
+
+        for i in range(n_held):
+            await _seed_held_slot(
+                cron,
+                datetime.datetime(
+                    2026, 7, 1, 10, 11 + i, 0, tzinfo=_UTC
+                ).isoformat(),
+            )
+        del cron._paused["p"]
+
+        cron._catchup_next_retry = 0.0
+        await cron._catch_up(ref)
+        await asyncio.sleep(0)
+        assert cron._caught_up is True
+        assert backfills == [("p", 5)]
+    finally:
+        await _stop_state(cron)
+
+
+@pytest.mark.parametrize("n_held", [0, 1, 5])
+async def test_missed_occurrences_backstops_an_unpinned_pause_window(
+    tmp_path, n_held
+):
+    # #9 residual: a pause whose whole lifetime slipped between two startup
+    # catch-up passes is never pinned by _evaluate_catch_up (its pause branch
+    # only fires for a LIVE pause it reaches). With no pin, held-slot skip
+    # rows advance durable_last_run_at past the pre-pause backlog and
+    # _missed_occurrences forfeits it. The read-time backstop must fall back
+    # to the skip-blind durable_last_completed_at when a durable pause window
+    # exists and it is older. Here NO in-memory pause is ever set (never
+    # _make_pause_live), so nothing pins the checkpoint; only the backstop can
+    # save the backlog. AT (1) and ACROSS (5) the one-held-row boundary the
+    # owed count must stay 11; n_held=0 is the control (no skip row advanced
+    # the watermark, so nothing is forfeited either way).
+    cron = await _stateful_cron(tmp_path, _PAUSE_CATCHUP_JOB)
+    try:
+        await _seed_real_run(cron, "2026-07-01T10:00:00+00:00")
+        # window [10:05:30, 10:20): 10:01..10:05 predate it (owed),
+        # 10:06..10:19 fall inside (excused), 10:20..10:25 follow it (owed).
+        await _seed_pause_window(
+            cron, "2026-07-01T10:05:30+00:00", "2026-07-01T10:20:00+00:00"
+        )
+        # the held slots fired while paused; the pause has since expired from
+        # memory unpinned (the pin never ran because it was never live here).
+        for i in range(n_held):
+            await _seed_held_slot(
+                cron,
+                datetime.datetime(
+                    2026, 7, 1, 10, 6 + i, 0, tzinfo=_UTC
+                ).isoformat(),
+            )
+        assert await cron._pending_catchup_watermark("p") is None
+        ref = datetime.datetime(2026, 7, 1, 10, 25, 0, tzinfo=_UTC)
+        count, watermark = await cron._missed_occurrences(
+            cron.cron_jobs["p"], ref
+        )
+        assert count == 11  # 5 pre-pause + 6 post-window: backlog preserved
+        assert watermark == "2026-07-01T10:00:00+00:00"
+    finally:
+        await _stop_state(cron)
+
+
+async def test_refresh_picks_up_foreign_pause_and_resume(tmp_path):
+    # cross-node propagation: a pause written by ANY host is honoured here
+    # (host is audit info only, unlike retry records), and its revocation
+    # propagates the same way.
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        until = _now_utc() + datetime.timedelta(seconds=3600)
+        await cron.state_backend.append_record(
+            "paused/p",
+            {
+                "kind": "paused",
+                "since": _now_utc().isoformat(),
+                "until": until.isoformat(),
+                "note": "peer",
+                "by": "other-node",
+                "channel": "api",
+                "at": _now_utc().isoformat(),
+                "host": "other-host",
+            },
+        )
+        await cron._refresh_pauses_from_store()
+        live = cron._pause_active("p")
+        assert live is not None
+        assert live.by == "other-node"
+        await cron.state_backend.append_record(
+            "paused/p",
+            {
+                "kind": "resumed",
+                "by": "other-node",
+                "channel": "api",
+                "at": _now_utc().isoformat(),
+                "host": "other-host",
+            },
+        )
+        await cron._refresh_pauses_from_store()
+        assert cron._pause_active("p") is None
+    finally:
+        await _stop_state(cron)
+
+
+async def test_refresh_keeps_last_known_state_on_store_error(
+    tmp_path, caplog
+):
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        await cron.pause_job_by_name("p", duration=3600)
+        await _drain_state_writes(cron)
+
+        async def _boom(*_a, **_k):
+            raise OSError("store down")
+
+        cron.state_backend.list_stream_names = _boom  # type: ignore[method-assign]
+        await cron._refresh_pauses_from_store()
+        # under BOTH degrade and fail-closed: keep last known state + warn
+        assert cron._pause_active("p") is not None
+        assert any(
+            "cannot refresh pause state" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        cron.state_backend = None
+
+
+def _peer_pause_record(until, *, by="other-node"):
+    return {
+        "kind": "paused",
+        "since": _now_utc().isoformat(),
+        "until": until.isoformat(),
+        "note": "peer",
+        "by": by,
+        "channel": "api",
+        "at": _now_utc().isoformat(),
+        "host": "other-host",
+    }
+
+
+def _peer_resume_record(by="other-node"):
+    return {
+        "kind": "resumed",
+        "by": by,
+        "channel": "api",
+        "at": _now_utc().isoformat(),
+        "host": "other-host",
+    }
+
+
+def _gate_pause_read(cron, stream_name):
+    """Hold the refresh inside its read of one paused/ stream.
+
+    Returns (entered, release): await `entered` once the refresh is parked
+    mid-read, mutate pause state, then set `release`. The snapshot is taken
+    BEFORE the wait, so the refresh resumes holding a pre-mutation read,
+    which is the window every TOCTOU test below needs.
+    """
+    real = cron.state_backend.list_records
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated(stream, **kw):
+        recs = await real(stream, **kw)
+        if stream == stream_name:
+            entered.set()
+            await release.wait()
+        return recs
+
+    cron.state_backend.list_records = gated  # type: ignore[method-assign]
+    return entered, release
+
+
+async def test_refresh_does_not_clobber_a_pause_taken_during_its_read(
+    tmp_path,
+):
+    # the store's newest record says "not paused"; an operator pause lands
+    # AND its durable write completes while the refresh is parked inside
+    # that read. The acknowledged pause must survive.
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        await cron.state_backend.append_record(
+            "paused/p", _peer_resume_record()
+        )
+        entered, release = _gate_pause_read(cron, "paused/p")
+        refresh = asyncio.create_task(cron._refresh_pauses_from_store())
+        await entered.wait()
+        await cron.pause_job_by_name("p", duration=3600, by="parker")
+        # drain it: the write tail entry is deleted by its own done-callback,
+        # so a liveness check would find no trace of the pause by now.
+        await _drain_state_writes(cron)
+        assert "p" not in cron._pause_write_tail
+        release.set()
+        await refresh
+        live = cron._pause_active("p")
+        assert live is not None
+        assert live.by == "parker"
+    finally:
+        await _stop_state(cron)
+
+
+async def test_refresh_does_not_resurrect_a_pause_resumed_during_its_read(
+    tmp_path,
+):
+    # the mirror case: the store still holds the live `paused` record the
+    # operator has just revoked, and the refresh is parked inside that read.
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        await cron.pause_job_by_name("p", duration=3600)
+        await _drain_state_writes(cron)
+        entered, release = _gate_pause_read(cron, "paused/p")
+        refresh = asyncio.create_task(cron._refresh_pauses_from_store())
+        await entered.wait()
+        await cron.resume_job_by_name("p", by="parker")
+        await _drain_state_writes(cron)
+        assert "p" not in cron._pause_write_tail
+        release.set()
+        await refresh
+        assert cron._pause_active("p") is None
+    finally:
+        await _stop_state(cron)
+
+
+_PAUSE_TWO_JOBS = """
+jobs:
+  - name: a-job
+    command: ls
+    schedule: "* * * * *"
+  - name: z-job
+    command: ls
+    schedule: "* * * * *"
+"""
+
+
+async def test_unreadable_pause_stream_does_not_starve_later_jobs(
+    tmp_path, caplog
+):
+    # streams are swept in the store's sorted order, so a stream that fails
+    # every pass would starve every job after it forever (this sweep is also
+    # the boot rehydrate). Only the failing job keeps its last known state.
+    cron = await _stateful_cron(tmp_path, _PAUSE_TWO_JOBS)
+    try:
+        until = _now_utc() + datetime.timedelta(seconds=3600)
+        for name in ("a-job", "z-job"):
+            await cron.state_backend.append_record(
+                "paused/" + name, _peer_pause_record(until)
+            )
+        real = cron.state_backend.list_records
+
+        async def flaky(stream, **kw):
+            if stream == "paused/a-job":
+                raise OSError("stream directory unreadable")
+            return await real(stream, **kw)
+
+        cron.state_backend.list_records = flaky  # type: ignore[method-assign]
+        await cron._refresh_pauses_from_store()
+        assert cron._pause_active("z-job") is not None
+        assert cron._pause_active("a-job") is None
+        assert any(
+            "cannot refresh pause state for a-job" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        cron.state_backend = None
+
+
+async def test_backend_swap_cancels_the_in_flight_pause_refresh(tmp_path):
+    # the refresh holds a local binding to the OLD backend across its awaits
+    # (and a filesystem store keeps serving reads after stop()), so a pass
+    # left running through a swap re-installs the dead store's pauses.
+    store_a = tmp_path / "a"
+    store_b = tmp_path / "b"
+    cron = await _stateful_cron(store_a, _PAUSE_JOB)
+    peer = await _stateful_cron(store_b, _PAUSE_JOB)
+    try:
+        await peer.state_backend.append_record(
+            "paused/p", _peer_resume_record()
+        )
+    finally:
+        await _stop_state(peer)
+    cfg_b = _state_cfg("state:\n  path: {}\n".format(store_b))
+    try:
+        await cron.pause_job_by_name("p", duration=3600)
+        await _drain_state_writes(cron)
+        entered, release = _gate_pause_read(cron, "paused/p")
+        cron._pause_periodic()
+        stale = cron._pause_refresh_task
+        assert stale is not None
+        await entered.wait()
+
+        await cron.start_stop_state(cfg_b)
+        cancelled = cron._pause_refresh_task is None
+        # release before asserting: a pass left parked here would sit out
+        # the whole store timeout on the way to teardown.
+        release.set()
+        await asyncio.gather(stale, return_exceptions=True)
+        # the new store says resumed, and the abandoned pass must not undo it
+        assert cron._pause_active("p") is None
+        assert cancelled
+    finally:
+        await _stop_state(cron)
+
+
+async def test_pause_taken_while_the_store_is_down_survives_its_return(
+    tmp_path, caplog
+):
+    # a configured-but-down store is transient. Dropping the record would
+    # leave `resumed` newest in the stream, and the refresh that follows the
+    # store's return would silently revoke the operator's pause.
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    cfg = _state_cfg("state:\n  path: {}\n".format(tmp_path))
+    try:
+        await cron.pause_job_by_name("p", duration=3600)
+        await cron.resume_job_by_name("p")
+        await _drain_state_writes(cron)
+        assert (await _newest(cron, "paused/p"))["kind"] == "resumed"
+
+        cron.state_backend = None
+        await cron.pause_job_by_name("p", duration=3600, by="parker")
+        assert cron._pause_active("p") is not None
+        assert any(
+            "holds in memory only" in r.getMessage()
+            and r.levelname == "WARNING"
+            for r in caplog.records
+        )
+
+        await cron.start_stop_state(cfg)
+        await _drain_state_writes(cron)
+        # the housekeeping pass that follows the store's return must find
+        # the operator's pause on top of the stream, not the record it
+        # superseded.
+        await cron._refresh_pauses_from_store()
+        assert cron._pause_active("p") is not None
+        rec = await _newest(cron, "paused/p")
+        assert rec["kind"] == "paused"
+        assert rec["by"] == "parker"
+    finally:
+        await _stop_state(cron)
+
+
+async def test_resume_taken_while_the_store_is_down_survives_its_return(
+    tmp_path,
+):
+    # the mirror case: the live `paused` record must not re-pause a job the
+    # operator resumed during the outage.
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    cfg = _state_cfg("state:\n  path: {}\n".format(tmp_path))
+    try:
+        await cron.pause_job_by_name("p", duration=3600)
+        await _drain_state_writes(cron)
+
+        cron.state_backend = None
+        await cron.resume_job_by_name("p", by="parker")
+        assert cron._pause_active("p") is None
+
+        await cron.start_stop_state(cfg)
+        await _drain_state_writes(cron)
+        await cron._refresh_pauses_from_store()
+        assert cron._pause_active("p") is None
+        rec = await _newest(cron, "paused/p")
+        assert rec["kind"] == "resumed"
+        assert rec["by"] == "parker"
+    finally:
+        await _stop_state(cron)
+
+
+async def test_stateless_pause_holds_in_memory_without_a_warning(caplog):
+    # no `state` section: memory-only is the contract, so nothing is
+    # buffered for replay and nothing is logged about a store that was
+    # never configured.
+    cron = Cron(None, config_yaml=_PAUSE_JOB)
+    await cron.pause_job_by_name("p", duration=3600)
+    assert cron._pause_active("p") is not None
+    assert cron._pause_pending_writes == {}
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+async def test_backend_swap_cancels_the_refresh_before_the_teardown_awaits(
+    tmp_path,
+):
+    # cancelling the refresh at the END of the teardown block is too late:
+    # backend.stop() and _stop_job_api() both yield (with one keep-alive
+    # connection open the latter spans several loop turns), and a pass whose
+    # store read resolves in that window runs its whole mutation loop against
+    # the store being abandoned. Memory holds no pause here and only store A
+    # does, so anything installed came from the dead store; store B has no
+    # paused/p stream at all, so its rehydrate never visits the job and the
+    # stale window would stick until its own `until` elapsed.
+    store_a = tmp_path / "a"
+    store_b = tmp_path / "b"
+    cron = await _stateful_cron(store_a, _PAUSE_JOB)
+    cfg_b = _state_cfg("state:\n  path: {}\n".format(store_b))
+    try:
+        until = _now_utc() + datetime.timedelta(seconds=3600)
+        await cron.state_backend.append_record(
+            "paused/p", _peer_pause_record(until)
+        )
+        entered, release = _gate_pause_read(cron, "paused/p")
+        cron._pause_periodic()
+        stale = cron._pause_refresh_task
+        assert stale is not None
+        await entered.wait()
+
+        # stand in for the teardown's own awaits deterministically: release
+        # the parked read as the first of them starts, and burn the loop
+        # turns the real _stop_job_api would.
+        seen = {}
+        real_stop = cron.state_backend.stop
+
+        async def yielding_stop():
+            seen["task"] = cron._pause_refresh_task
+            release.set()
+            for _ in range(4):
+                await asyncio.sleep(0)
+            await real_stop()
+
+        cron.state_backend.stop = yielding_stop  # type: ignore[method-assign]
+        await cron.start_stop_state(cfg_b)
+        await asyncio.gather(stale, return_exceptions=True)
+        assert "p" not in cron._paused
+        assert cron._pause_active("p") is None
+        # and the ordering that guarantees it
+        assert seen["task"] is None
+    finally:
+        await _stop_state(cron)
+
+
+async def test_pause_whose_durable_append_fails_is_not_reverted(tmp_path):
+    # the store is UP and the append fails anyway (ENOSPC, EACCES, a
+    # transient NFS error). The record it meant to supersede is still newest
+    # in the stream, so a dropped write lets the next refresh silently
+    # revoke the operator's pause: the same class as the store-down case.
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    try:
+        await cron.pause_job_by_name("p", duration=3600)
+        await cron.resume_job_by_name("p")
+        await _drain_state_writes(cron)
+        assert (await _newest(cron, "paused/p"))["kind"] == "resumed"
+
+        real_append = cron.state_backend.append_record
+
+        async def failing(stream, record, **kw):
+            if stream == "paused/p":
+                raise OSError("ENOSPC")
+            return await real_append(stream, record, **kw)
+
+        cron.state_backend.append_record = failing  # type: ignore[method-assign]
+        await cron.pause_job_by_name("p", duration=3600, by="parker")
+        await _drain_state_writes(cron)
+        assert cron._pause_active("p") is not None
+        # buffered for retry, not dropped
+        assert cron._pause_pending_writes["p"]["kind"] == "paused"
+
+        # a refresh before the retry lands must keep memory, not revert it
+        # to the `resumed` record still on top of the stream.
+        await cron._refresh_pauses_from_store()
+        live = cron._pause_active("p")
+        assert live is not None
+        assert live.by == "parker"
+
+        # and the housekeeping pass retries the write once the store heals
+        cron.state_backend.append_record = real_append  # type: ignore[method-assign]
+        cron._pause_periodic()
+        await _drain_state_writes(cron)
+        rec = await _newest(cron, "paused/p")
+        assert rec["kind"] == "paused"
+        assert rec["by"] == "parker"
+        assert cron._pause_pending_writes == {}
+    finally:
+        await _stop_state(cron)
+
+
+async def test_buffered_pause_does_not_outlive_a_resume_taken_stateless(
+    tmp_path,
+):
+    # a pause buffered during an outage, then the `state` section removed and
+    # the job resumed memory-only: the superseded buffer must not be replayed
+    # as fresh intent when the section comes back and re-pause the job.
+    cron = await _stateful_cron(tmp_path, _PAUSE_JOB)
+    cfg = _state_cfg("state:\n  path: {}\n".format(tmp_path))
+    try:
+        await _drain_state_writes(cron)
+        cron.state_backend = None  # the store goes down
+        await cron.pause_job_by_name("p", duration=3600, by="parker")
+        assert cron._pause_pending_writes["p"]["kind"] == "paused"
+
+        await cron.start_stop_state(None)  # the `state` section is removed
+        assert cron.state_backend is None
+        await cron.resume_job_by_name("p", by="parker")
+        assert cron._pause_active("p") is None
+        assert "p" not in cron._pause_pending_writes
+
+        await cron.start_stop_state(cfg)  # the section comes back
+        await _drain_state_writes(cron)
+        await cron._refresh_pauses_from_store()
+        assert cron._pause_active("p") is None
+    finally:
+        await _stop_state(cron)
+
+
+_PAUSE_JOB_RENAMED = """
+jobs:
+  - name: q
+    command: ls
+    schedule: "* * * * *"
+"""
+
+
+async def test_refresh_drops_a_job_a_reload_removed_during_its_read(tmp_path):
+    # the membership test runs BEFORE the store read, and the generation guard
+    # does not cover this: _apply_reload prunes _pause_gen with _paused, so the
+    # sampled and current generations are both 0 and it passes. Installing the
+    # read would leave a permanent stale _paused entry and resurrect the metric
+    # series prune() just dropped.
+    cfg_file = tmp_path / "c.yaml"
+    cfg_file.write_text(_PAUSE_JOB)
+    cron = Cron(str(cfg_file))
+    cfg = _state_cfg("state:\n  path: {}\n".format(tmp_path / "store"))
+    await cron.start_stop_state(cfg)
+    assert cron.state_backend is not None
+    try:
+        until = _now_utc() + datetime.timedelta(seconds=3600)
+        await cron.state_backend.append_record(
+            "paused/p", _peer_pause_record(until)
+        )
+        entered, release = _gate_pause_read(cron, "paused/p")
+        refresh = asyncio.create_task(cron._refresh_pauses_from_store())
+        await entered.wait()
+
+        cfg_file.write_text(_PAUSE_JOB_RENAMED)
+        cron.update_config()
+        assert "p" not in cron.cron_jobs
+        assert "p" not in cron.metrics._jobs
+
+        release.set()
+        await refresh
+        assert "p" not in cron._paused
+        assert cron._pause_active("p") is None
+        assert "p" not in cron.metrics._jobs
+    finally:
+        await _stop_state(cron)

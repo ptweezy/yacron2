@@ -2,8 +2,9 @@
 
 cronstable exposes an optional [aiohttp](https://docs.aiohttp.org/) REST control API,
 enabled by adding a top-level `web` section to the configuration. It serves
-endpoints for querying the daemon version, inspecting job status, starting and
-cancelling jobs on demand, reading per-job run history, tailing captured job
+endpoints for querying the daemon version, inspecting job status, starting,
+cancelling, [pausing and resuming](Pausing-Jobs) jobs on demand, reading
+per-job run history, tailing captured job
 output live, exposing [Prometheus metrics](Metrics-with-Prometheus), and (when
 a `cluster` section is configured) reporting the cluster and fleet views. This page documents the configuration schema, every endpoint,
 bearer-token authentication, Unix-socket permissions, and lifecycle behavior.
@@ -97,6 +98,8 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/jobs/{name}/trends` | `_web_job_trends` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
 | `POST` | `/jobs/{name}/cancel` | `_web_cancel_job` | `200` |
+| `POST` | `/jobs/{name}/pause` | `_web_pause_job` | `200` |
+| `POST` | `/jobs/{name}/resume` | `_web_resume_job` | `200` |
 | `GET` | `/jobs/{name}/logs` | `_web_job_logs` | `200` (SSE stream) |
 | `GET` | `/dags` | `_web_list_dags` | `200` |
 | `GET` | `/dags/{name}/runs` | `_web_dag_runs` | `200` |
@@ -301,7 +304,10 @@ would have fired; see [Schedule Linting](Schedule-Linting)) and
 transition skips or repeats. An [`H` schedule](Hashed-Schedules) reports
 its `resolved` spelling and checks against the resolved slots. `@reboot`
 jobs answer `reboot: true` with no checks; a disabled job still explains
-its timetable and reports `enabled: false`. The `cron_why_no_run`
+its timetable and reports `enabled: false`. A [paused](Pausing-Jobs) job
+adds a `notes` entry with code `paused` naming the expiry, the actor, and
+the note, because a schedule match says nothing about whether the fire
+would launch. The `cron_why_no_run`
 [MCP tool](MCP) serves the same payload to agents. See
 [Why Didn't It Run?](Why-No-Run) for a walkthrough.
 
@@ -613,6 +619,65 @@ $ http post http://127.0.0.1:8080/jobs/test-03/cancel
 HTTP/1.1 200 OK
 ```
 
+### `POST /jobs/{name}/pause`
+
+Pauses the named job's scheduled fires until a deadline: due slots are skipped
+(each recorded as an `outcome: "skipped"` run with `skip_reason: "paused"`),
+pending retries defer, and catch-up owes nothing for the window, while manual
+start, cancel, and already-running instances are unaffected. The full
+semantics live on [Pausing Jobs](Pausing-Jobs); this section is the endpoint
+reference.
+
+The JSON body is optional; every field is optional:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `durationSeconds` | int | `3600` | Pause length in seconds, `1` to `2592000` (30 days). Exclusive with `until`. |
+| `until` | string | (none) | Absolute ISO-8601 expiry. Must be in the future, at most 30 days away; without a UTC offset it is read as UTC. Exclusive with `durationSeconds`. |
+| `note` | string | `""` | Audit note, at most 500 characters. |
+| `by` | string | `"api"` | Acting operator, at most 100 characters. |
+
+| Condition | Response |
+| --- | --- |
+| No job with that name. | `404 Not Found`. |
+| Both `durationSeconds` and `until`, a wrong type, an out-of-range duration, a past or over-cap `until`, an oversized `note`/`by`, or a malformed body. | `400 Bad Request` with the reason as text. |
+| Otherwise. | `200 OK`, body `{"paused": {since, until, note, by, channel}}` (ISO-8601 instants; `channel` is `"api"` here). |
+
+Pausing an already-paused job overwrites the window (idempotent; also how a
+pause is extended).
+
+```shell
+$ http post http://127.0.0.1:8080/jobs/test-02/pause durationSeconds:=7200 note="db migration"
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "paused": {
+        "since": "2026-07-19T14:00:00+00:00",
+        "until": "2026-07-19T16:00:00+00:00",
+        "note": "db migration",
+        "by": "api",
+        "channel": "api"
+    }
+}
+```
+
+### `POST /jobs/{name}/resume`
+
+Ends the named job's pause immediately. The optional JSON body takes `by` (a
+string, at most 100 characters). Returns `404 Not Found` for an unknown job;
+otherwise `200 OK` with `{"paused": null}`, including when the job was not
+paused (resume is a no-op then, but with a [state store](Durable-State) the
+durable "resumed" record is still written, so a pause taken on another node
+that this node has not yet seen is revoked too).
+
+```shell
+$ http post http://127.0.0.1:8080/jobs/test-02/resume by=parker
+HTTP/1.1 200 OK
+
+{"paused": null}
+```
+
 ### `GET /jobs`
 
 Returns a JSON array describing every job: its schedule and timezone, whether
@@ -633,6 +698,8 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
 | `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
+| `paused` | Always present: the active [runtime pause](Pausing-Jobs), `{since, until, note, by, channel}` (ISO-8601 instants), or `null` when the job is not paused. |
+| `sla` | Present only for jobs with a configured [`sla:` block](Late-Run-Detection): `{thresholds, state, breaches}`, where `thresholds` holds the non-null threshold keys, `state` is `"ok"` or `"late"`, and `breaches` lists each latched check as `{check, since, observed_seconds, threshold_seconds}` (`observed_seconds` re-measured at payload time). |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |
 
 ```shell
@@ -686,7 +753,10 @@ be `unknown`: a crash-reconciled run, recorded when the daemon exited or lost
 the [state store](Durable-State) mid-run so no completion was ever written.
 It is a non-verdict: excluded from `success_rate`, counted only in `total`,
 with no `started_at` or `duration` (`fail_reason` explains the interruption).
-`stats` summarizes them:
+`outcome` can also be `skipped`: a scheduled slot deliberately not launched,
+with `skip_reason` naming why (`"paused"`; see [Pausing Jobs](Pausing-Jobs)).
+Skipped rows carry no `started_at`, `exit_code`, or `duration`, and like
+`unknown` they count only in `total`. `stats` summarizes them:
 
 | `stats` field | Meaning |
 | --- | --- |
@@ -1154,7 +1224,8 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 
 Independently of `authToken`, an always-on middleware refuses **cross-site
 browser requests to the mutating endpoints** (`POST /jobs/{name}/start`,
-`POST /jobs/{name}/cancel`, `POST /dags/{name}/trigger`,
+`POST /jobs/{name}/cancel`, `POST /jobs/{name}/pause`,
+`POST /jobs/{name}/resume`, `POST /dags/{name}/trigger`,
 `POST /dags/{name}/backfill`, and the task decision route). Those POSTs are
 CORS "simple requests" -- the browser sends them without a preflight -- so
 without this gate any web page an operator happens to visit could fire them
@@ -1408,6 +1479,8 @@ those commands read the injected environment for you.
 ## See also
 
 - [Web Dashboard](Web-Dashboard): the built-in browser UI served by this interface.
+- [Pausing Jobs](Pausing-Jobs): the semantics behind `POST /jobs/{name}/pause` and `/resume`.
+- [Late-Run Detection](Late-Run-Detection): the `sla` payload field and the monitor behind it.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the full metric reference behind `GET /metrics` and Prometheus scrape configuration.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the `GET /cluster` view and the separate mTLS `/peer` endpoint.
 - [Running on Windows](Running-on-Windows): `unix://` listeners and `socketMode`

@@ -26,6 +26,7 @@
     --disabled: #7d8590;
     --cancelled: #c98bff;
     --unknown: #9aa5b1;   /* crash-reconciled runs: neutral, never green */
+    --paused: #56d4dd;    /* runtime pause: cyan, off every outcome hue */
 
     /* cluster peer states (cdots + swimlane segments) */
     --peer-agreed: #3fb950;
@@ -223,6 +224,7 @@
     --disabled: #565e68;
     --cancelled: #7a3fd6;
     --unknown: #57606a;
+    --paused: #12626b;
 
     --peer-agreed: #12692b;
     --peer-syncing: #7d5300;
@@ -283,6 +285,7 @@
     --pending: #835c08;
     --cancelled: #a92b86;
     --disabled: #495057;
+    --paused: #0d5a75;
     --peer-agreed: #0a4f1c;
     --peer-syncing: #835c08;
     --peer-bad: #ad2456;
@@ -448,6 +451,7 @@
   .dot.disabled { background: var(--disabled); }
   .dot.cancelled { background: var(--cancelled); }
   .dot.unknown { background: var(--unknown); }
+  .dot.paused { background: var(--paused); }
   .dot.live { background: #5cff97; filter: drop-shadow(0 0 4px rgba(92, 255, 151, .9)); }
   html[data-theme$="-light"] .dot.live { background: var(--ok); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--ok) 60%, transparent)); }
   .dot.dead { background: var(--fail); }
@@ -551,6 +555,9 @@
   .st.disabled .glyph, .st.disabled .label { color: var(--disabled); }
   .st.cancelled .glyph, .st.cancelled .label { color: var(--cancelled); }
   .st.unknown .glyph, .st.unknown .label { color: var(--unknown); }
+  .st.paused .glyph, .st.paused .label { color: var(--paused); }
+  /* "skipped" ledger rows (pause-skips): neutral, never green */
+  .st.skipped .glyph, .st.skipped .label { color: var(--disabled); }
 
   .jobname { font-weight: 700; color: var(--fg); }
   .jobcmd { color: var(--fg-faint); margin-top: 1px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -612,6 +619,7 @@
   .spark i.fail { background: var(--fail); }
   .spark i.cancelled { background: var(--cancelled); }
   .spark i.unknown { background: var(--unknown); }
+  .spark i.skipped { background: var(--disabled); }
   /* padding: 0 shields it from the generic .empty empty-state card rule
      below, which would otherwise balloon every no-history row */
   .spark.empty { color: var(--fg-faint); font-size: 11px; padding: 0; }
@@ -628,6 +636,7 @@
   .btn svg { width: 12px; height: 12px; }
   .btn.run { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, var(--border)); }
   .btn.cancel { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 30%, var(--border)); }
+  .btn.pause, .btn.resume { color: var(--paused); border-color: color-mix(in srgb, var(--paused) 30%, var(--border)); }
   .btn.primary { background: var(--selbg); color: var(--fg); border-color: var(--border2); }
 
   .empty { padding: 48px 24px; text-align: center; color: var(--fg-dim); }
@@ -649,6 +658,7 @@
   .drawer-head h2 { margin: 0; font-size: 15px; font-weight: 700; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .drawer-head .meta { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 5px 12px; font-size: 11.5px; color: var(--fg-dim); }
   .drawer-head .meta b { color: var(--fg); font-weight: 700; }
+  .drawer-head .meta .overdue, .drawer-head .meta .overdue b { color: var(--fail); }
 
   .tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--bg2); }
   .tabs button {
@@ -706,7 +716,7 @@
 
   .barchart { display: flex; align-items: flex-end; gap: 2px; height: 60px; padding: 6px 0 0; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
   .barchart i { flex: 1; min-width: 2px; background: var(--fg-faint); border-radius: 1px 1px 0 0; min-height: 2px; }
-  .barchart i.ok { background: var(--ok); } .barchart i.fail { background: var(--fail); } .barchart i.cancelled { background: var(--cancelled); } .barchart i.unknown { background: var(--unknown); }
+  .barchart i.ok { background: var(--ok); } .barchart i.fail { background: var(--fail); } .barchart i.cancelled { background: var(--cancelled); } .barchart i.unknown { background: var(--unknown); } .barchart i.skipped { background: var(--disabled); }
 
   /* ---------- resource charts (drawer Resources tab + node card) ---------- */
   /* series inks: CPU wears --run (blue), memory --pending (amber) — the
@@ -967,6 +977,11 @@
   .wb-tile.st-unknown .wb-glyph { color: var(--unknown); }
   .wb-tile.st-disabled { opacity: .55; }
   .wb-tile.st-disabled .wb-glyph { color: var(--disabled); }
+  .wb-tile.st-paused { opacity: .7; }
+  .wb-tile.st-paused .wb-glyph { color: var(--paused); }
+  /* SLA overdue badge on a tile: orthogonal to outcome, never recolors the tile */
+  .wb-overdue { color: var(--fail); font-weight: 700; font-size: calc(10.5px * var(--wb-u, 1));
+    letter-spacing: 1px; text-transform: uppercase; white-space: nowrap; }
   body.fx .wb-tile.st-fail { box-shadow: 0 0 16px color-mix(in srgb, var(--fail) 30%, transparent); }
   .wb-tile.flip { animation: wbflip .7s ease-out; }
   /* no 100% frame: the flip settles to the tile's own (tinted) background */
@@ -976,6 +991,7 @@
   .wb-stat { color: var(--fg-dim); } .wb-stat b { color: var(--fg); font-size: 16px; margin-right: 4px; }
   .wb-stat.fail b { color: var(--fail); } .wb-stat.run b { color: var(--run); } .wb-stat.ok b { color: var(--ok); }
   .wb-stat.pending b { color: var(--pending); } .wb-stat.unknown b { color: var(--unknown); } .wb-stat.cancelled b { color: var(--cancelled); }
+  .wb-stat.paused b { color: var(--paused); } .wb-stat.overdue b { color: var(--fail); }
   /* fit-governor honesty chip: says what the truncated grid actually cut */
   .wb-stat.more { color: var(--fg-dim); font-style: italic; }
   .wb-stat.more.warn { color: var(--fail); font-style: normal; font-weight: 700; }
@@ -1110,6 +1126,7 @@
   #fleetPanel .cell.fail { color: var(--fail); font-weight: 700; }
   #fleetPanel .cell.cancelled { color: var(--fg-dim); }
   #fleetPanel .cell.unknown { color: var(--unknown); }
+  #fleetPanel .cell.skipped { color: var(--fg-dim); }
   #fleetPanel .cell.run { color: var(--accent); }
   #fleetPanel .cell.none { color: var(--fg-faint); }
   #fleetPanel td.owner { box-shadow: inset 2px 0 0 var(--accent); }
@@ -1183,6 +1200,7 @@
   .tlrow .tlt { color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .tlrow .tlg { text-align: center; }
   .tlrow.ok .tlg { color: var(--ok); } .tlrow.fail .tlg { color: var(--fail); } .tlrow.cancelled .tlg { color: var(--cancelled); } .tlrow.unknown .tlg { color: var(--unknown); }
+  .tlrow.skipped .tlg { color: var(--fg-dim); }
   .tlrow .tlnm { font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tlrow .tlre { color: var(--fg-faint); font-size: 11px; }
   .tlrow .tlmeta { color: var(--fg-dim); font-size: 11px; white-space: nowrap; }
@@ -1325,6 +1343,10 @@
     border: 1px solid color-mix(in srgb, var(--unknown) 35%, var(--border)); }
   .ha-chip.live-res { color: var(--run); background: color-mix(in srgb, var(--run) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--run) 30%, var(--border)); font-variant-numeric: tabular-nums; }
+  .ha-chip.paused { color: var(--paused); background: color-mix(in srgb, var(--paused) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--paused) 35%, var(--border)); }
+  .ha-chip.overdue { color: var(--fail); background: color-mix(in srgb, var(--fail) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--fail) 35%, var(--border)); }
 
   /* the 8 DAG task states get their OWN palette so they never overload the
      job-outcome colors. dot + glyph + label share the state's hue. */
@@ -1646,6 +1668,7 @@
       <div class="drawer-tools">
         <button class="btn run" id="dRun"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg> Run</button>
         <button class="btn cancel" id="dCancel"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="1"/></svg> Cancel</button>
+        <button class="btn pause" id="dPause"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg> Pause</button>
         <span class="logsearch"><span class="faint">/</span><input id="logSearch" type="text" placeholder="search logs" autocomplete="off" spellcheck="false"><span class="count" id="logCount"></span></span>
         <label class="toggle"><input type="checkbox" id="optRegex"> regex</label>
         <label class="toggle"><input type="checkbox" id="optOnly"> matches only</label>
@@ -2153,6 +2176,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     J("cache-evict", "*/6 * * * *", { p: PL, o: "meridian-i", cmd: 'echo "cache-evict expired stale keys on ' + host + '"' }),
     J("session-gc", "*/10 * * * *", { p: LD, o: "meridian-a", cmd: 'echo "reaped idle sessions"' }),
     J("tmp-cleanup", "*/30 * * * *", { p: LD, o: "meridian-b", cmd: 'echo "swept scratch space"' }),
+    // runtime pause + per-job SLA showcases
+    J("archive-cold-storage", "*/5 * * * *", { p: LD, o: "meridian-h", paused: 1, cmd: 'echo "archive-cold-storage shipped cold objects to the glacier tier"' }),
+    J("partner-settlement-import", "*/10 * * * *", { p: LD, o: "meridian-i", fail: "feed", late: 1, cmd: 'echo "waiting on settlements drop from sftp.partner.example" >&2; exit 4  # sla.maxTimeSinceSuccessSeconds: 900' }),
     J("backup-warehouse", "0 3 * * *", { p: LD, o: "meridian-c", cmd: 'echo "backup-warehouse -> ${BACKUP_BUCKET:-<unset>} (retain ${BACKUP_RETENTION_DAYS:-30}d)"' }),
     J("silent-cleanup", "*/8 * * * *", { p: LD, o: "meridian-d", cap0: 1, cmd: 'echo "silent-cleanup ran, but its output is not captured on ' + host + '"' }),
     J("audit-log-ship", "*/12 * * * *", { p: LD, o: "meridian-e", cmd: 'echo "audit-log-ship shipped the audit trail on ' + host + '"' }),
@@ -2183,6 +2209,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       case "timeout": return { outcome: "failure", exit_code: 137, fail_reason: "execution timeout (10s) exceeded — SIGKILL" };
       case "selfheal": return (bucket % 4 === 0) ? { outcome: "failure", exit_code: 75, fail_reason: "retryable: broker not ready" } : ok();
       case "rt3": return (bucket % 13 === 0) ? { outcome: "failure", exit_code: 3, fail_reason: "thumbnail encoder returned 3" } : ok();
+      // the SLA-overdue fixture: failing for the last ~50 minutes, so its last
+      // success sits well past maxTimeSinceSuccessSeconds (jobDict adds d.sla)
+      case "feed": return (nowMs() - t < 3000e3) ? { outcome: "failure", exit_code: 4, fail_reason: "partner feed not delivered (SFTP drop empty)" } : ok();
       case "cancelled": return (bucket % 6 === 0) ? { outcome: "cancelled", exit_code: null, fail_reason: "superseded (concurrencyPolicy: Replace)" } : ok();
       default: return ok();
     }
@@ -2197,7 +2226,18 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   function jobDict(job, now) {
     var d = { name: job.name, enabled: !job.disabled, schedule: job.schedule, command: job.cmd,
       captureStdout: !job.cap0, captureStderr: !job.cap0, utc: job.tz !== "local", timezone: job.tz && job.tz !== "local" ? job.tz : null,
-      running: false, pids: [], scheduled_in: null, last_run: null, history: [] };
+      running: false, pids: [], scheduled_in: null, last_run: null, history: [], paused: null };
+    // runtime pause: a user action (OVERLAY, including an explicit resume as
+    // null) wins over the roster fixture's standing maintenance pause. The
+    // fixture anchors on the hour so its record (and the render signatures
+    // derived from it) stays stable between polls.
+    if (Object.prototype.hasOwnProperty.call(OVERLAY.paused, job.name)) d.paused = OVERLAY.paused[job.name];
+    else if (job.paused) { var ph = Math.floor(now / 3600000) * 3600000;
+      d.paused = { since: iso(ph - 1800000), until: iso(ph + 5400000), note: "upstream maintenance window", by: "sre-oncall", channel: "api" }; }
+    // per-job SLA: the "feed" fail profile keeps the job success-free for the
+    // trailing 3000s, so the breach numbers below stay coherent with history
+    if (job.late) d.sla = { thresholds: { maxTimeSinceSuccessSeconds: 900 }, state: "late",
+      breaches: [{ check: "maxTimeSinceSuccess", since: iso(now - 2100000), observed_seconds: 3000, threshold_seconds: 900 }] };
     if (job.resolved) d.schedule_resolved = job.resolved;
     if (job.disabled) { d.history = []; return d; }
     if (job.p && job.p !== EN) d.clusterPolicy = job.p;
@@ -2497,10 +2537,12 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   // =================================================================
   //  user-action overlay (start / trigger / backfill / approve)
   // =================================================================
-  var OVERLAY = { started: {}, dagRuns: [], created: 0 };
+  var OVERLAY = { started: {}, dagRuns: [], created: 0, paused: {} };
   function applyOverlay(now) {
     // clear manual "started" runs whose synthetic duration elapsed
     Object.keys(OVERLAY.started).forEach(function (n) { if (now - OVERLAY.started[n].at > OVERLAY.started[n].dur) delete OVERLAY.started[n]; });
+    // pause records auto-expire, mirroring the daemon's reader-enforced expiry
+    Object.keys(OVERLAY.paused).forEach(function (n) { var p = OVERLAY.paused[n]; if (p && new Date(p.until).getTime() <= now) delete OVERLAY.paused[n]; });
   }
   function seedApprovalRun() {
     // one release-train run parked on its approval gate, ready to interact with
@@ -2721,6 +2763,19 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if ((m = /^\/jobs\/([^/]+)\/trends$/.exec(url))) { var tr = buildTrends(decodeURIComponent(m[1])); return tr ? J200(tr) : E(404, "unknown job"); }
     if ((m = /^\/jobs\/([^/]+)\/start$/.exec(url)) && method === "POST") { var jn = decodeURIComponent(m[1]); var jb = BYNAME[jn]; if (!jb) return E(404); if (jb.disabled) return E(409, "job is disabled"); OVERLAY.started[jn] = { at: nowMs(), dur: (jb.run || 3) * 1000 }; return E(200); }
     if ((m = /^\/jobs\/([^/]+)\/cancel$/.exec(url)) && method === "POST") { return BYNAME[decodeURIComponent(m[1])] ? E(200) : E(404); }
+    if ((m = /^\/jobs\/([^/]+)\/pause$/.exec(url)) && method === "POST") {
+      var pn = decodeURIComponent(m[1]); if (!BYNAME[pn]) return E(404);
+      var pb; try { pb = JSON.parse(opts && opts.body || "{}"); } catch (e) { pb = {}; }
+      var pdur = Math.min(Math.max(pb.durationSeconds || 3600, 1), 2592000);   // PAUSE_DEFAULT/MAX_SECONDS
+      var prec = { since: iso(nowMs()), until: iso(nowMs() + pdur * 1000), note: pb.note || null, by: pb.by || "demo", channel: "api" };
+      OVERLAY.paused[pn] = prec;
+      return J200({ paused: prec });
+    }
+    if ((m = /^\/jobs\/([^/]+)\/resume$/.exec(url)) && method === "POST") {
+      var rn = decodeURIComponent(m[1]); if (!BYNAME[rn]) return E(404);
+      OVERLAY.paused[rn] = null;      // explicit resume also overrides a roster fixture pause
+      return J200({ paused: null });
+    }
 
     if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/tasks\/([^/]+)\/logs$/.exec(url))) return new Response(sseStream(decodeURIComponent(m[3]), "task", opts), { status: 200, headers: { "Content-Type": "text/event-stream" } });
     if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/tasks\/([^/]+)\/decision$/.exec(url)) && method === "POST") {
@@ -3644,9 +3699,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   const PREF_PREFIX = "cronstable.";             // localStorage prefs
   const MAX_LOG_LINES = 5000;                 // bound the in-memory log view
   const RE_SCAN_CAP = 5000;                   // cap chars scanned per line (ReDoS guard)
-  const GLYPH = { ok: "●", fail: "✕", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍" };
+  const GLYPH = { ok: "●", fail: "✕", run: "▶", pending: "◔", disabled: "◌", cancelled: "⊘", unknown: "◍", paused: "⏸", skipped: "⊘" };
   // one place that maps a run outcome -> its CSS state class
-  const outcomeCls = (o) => o === "failure" ? "fail" : o === "cancelled" ? "cancelled" : o === "unknown" ? "unknown" : "ok";
+  const outcomeCls = (o) => o === "failure" ? "fail" : o === "cancelled" ? "cancelled" : o === "unknown" ? "unknown" : o === "skipped" ? "skipped" : "ok";
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e; };
@@ -3825,16 +3880,21 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   }
   function health(job) {
     if (!job.enabled) return { key: "disabled", label: "Disabled" };
+    // a pause parks future slots only: a live run still shows Running
+    if (job.paused && !job.running) return { key: "paused", label: "Paused" };
     if (job.running) return { key: "run", label: "Running" };
     if (job.last_run) {
       if (job.last_run.outcome === "failure") return { key: "fail", label: "Failed" };
       if (job.last_run.outcome === "cancelled") return { key: "cancelled", label: "Cancelled" };
       if (job.last_run.outcome === "unknown") return { key: "unknown", label: "Unknown" };
+      // a pause-skipped slot is not a verdict on the job: it never ran, so
+      // it must not paint the green "OK" a real success earns
+      if (job.last_run.outcome === "skipped") return { key: "pending", label: "Skipped" };
       return { key: "ok", label: "OK" };
     }
     return { key: "pending", label: "Pending" };
   }
-  const STATUS_ORDER = { run: 0, fail: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, disabled: 6 };
+  const STATUS_ORDER = { run: 0, fail: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, paused: 6, disabled: 7 };
 
   // ===================================================================
   //  cron schedule intelligence  (client-side)
@@ -4300,11 +4360,14 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     const running = state.jobs.filter((j) => j.running).length;
     const failing = state.jobs.filter((j) => health(j).key === "fail").length;
     const ok = state.jobs.filter((j) => health(j).key === "ok").length;
+    const paused = state.jobs.filter((j) => health(j).key === "paused").length;
     $("summary").innerHTML =
       '<span class="pill"><b>' + total + "</b>&nbsp;jobs</span>" +
       '<span class="pill opt"><span class="dot run"></span><b>' + running + "</b>&nbsp;running</span>" +
       '<span class="pill opt"><span class="dot ' + (failing ? "fail" : "ok") + '"></span><b>' + failing + "</b>&nbsp;failing</span>" +
-      '<span class="pill opt"><span class="dot ok"></span><b>' + ok + "</b>&nbsp;ok</span>";
+      '<span class="pill opt"><span class="dot ok"></span><b>' + ok + "</b>&nbsp;ok</span>" +
+      // zero-elided like the wallboard's rare buckets: most fleets pause nothing
+      (paused ? '<span class="pill opt"><span class="dot paused"></span><b>' + paused + "</b>&nbsp;paused</span>" : "");
   }
 
   function sparkline(job) {
@@ -4535,6 +4598,10 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         j.retry ? j.retry.attempt + ":" + (j.retry.nextRetryAt || "") : "",
         j.slot ? (j.slot.held ? "h" : "w") + ":" + j.slot.refs : "",
         j.rebootPending ? "rb" : "",
+        // runtime pause + SLA state: the status cell, chips, the pause/resume
+        // action button and the "next" cells all render from these.
+        j.paused ? "p:" + (j.paused.until || "") + ":" + (j.paused.note || "") + ":" + (j.paused.by || "") : "",
+        j.sla ? j.sla.state : "",
       ]),
     });
     if (sig === state.lastRowSig) return;
@@ -4550,11 +4617,11 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         last = '<span class="nowrap" data-ago="' + escAttr(lr.finished_at) + '">' + fmtAgo(lr.finished_at) + "</span>" + exit;
       }
       const nsec = nextRunSeconds(job);
-      const next = (job.running || !job.enabled)
+      const next = (job.running || !job.enabled || job.paused)
         ? '<span class="faint">—</span>'
         : '<span class="nowrap" data-next="' + escAttr(job.name) + '">' + fmtIn(nsec) + "</span>";
       const atMs = nsec == null ? null : Date.now() + nsec * 1000;
-      const nextAt = (job.running || !job.enabled || atMs == null)
+      const nextAt = (job.running || !job.enabled || job.paused || atMs == null)
         ? '<span class="faint">—</span>'
         : '<span class="nowrap" title="' + escAttr(fmtAtTitle(atMs)) + '">' + fmtAt(atMs) + "</span>";
       const rowCls = (state.drawerJob === job.name ? " active" : "") + (state.selected === job.name ? " sel" : "");
@@ -4562,6 +4629,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         ? '<button class="btn cancel" data-cancel="' + escAttr(job.name) + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>Stop</button>'
         : '<button class="btn run" data-run="' + escAttr(job.name) + '"' + (job.enabled ? "" : ' disabled title="job is disabled"') +
           '><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>';
+      const pauseBtn = job.paused
+        ? '<button class="btn resume" data-resume="' + escAttr(job.name) + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Resume</button>'
+        : '<button class="btn pause" data-pause="' + escAttr(job.name) + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>Pause</button>';
       return (
         '<tr data-job="' + escAttr(job.name) + '" class="' + rowCls.trim() + '">' +
           '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + haChips(job) + "</td>" +
@@ -4577,7 +4647,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
           '<td class="col-nextat muted nowrap">' + nextAt + "</td>" +
           '<td class="col-rate">' + rateCell(job) + "</td>" +
           '<td class="col-trend">' + sparkline(job) + "</td>" +
-          '<td><div class="actions">' + runBtn +
+          '<td><div class="actions">' + runBtn + pauseBtn +
             '<button class="btn" data-logs="' + escAttr(job.name) + '">Logs</button>' +
           "</div></td>" +
         "</tr>"
@@ -4621,9 +4691,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     document.querySelectorAll("[data-next]").forEach((e) => {
       const job = state.byName[e.getAttribute("data-next")];
       // both surfaces attach data-next only to live-countdown cells now; the
-      // running/disabled guard catches a job that flipped state since render
+      // running/disabled/paused guard catches a job that flipped state since render
       if (!job) return;
-      if (job.running || !job.enabled) { e.textContent = "—"; return; }
+      if (job.running || !job.enabled || job.paused) { e.textContent = "—"; return; }
       e.textContent = wbStale ? "stale" : fmtIn(nextRunSeconds(job));
     });
     $("clock").textContent = utcClock();
@@ -4984,7 +5054,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   // key makes the sort comparator return NaN, which leaves the whole ordering
   // unspecified (unknown once had exactly that bug). Mirrors STATUS_ORDER's
   // relative placement of unknown (after pending, before cancelled).
-  const WB_ORDER = { fail: 0, run: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, disabled: 6 };
+  const WB_ORDER = { fail: 0, run: 1, pending: 2, unknown: 3, cancelled: 4, ok: 5, paused: 6, disabled: 7 };
   function utcClock() { const n = new Date(); return pad2(n.getUTCHours()) + ":" + pad2(n.getUTCMinutes()) + ":" + pad2(n.getUTCSeconds()) + " UTC"; }
   // The wallboard's staleness gate. TV mode hides the header (and with it the
   // #conn indicator), so the surface must judge freshness itself: stale when
@@ -5094,6 +5164,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       j.last_run && j.last_run.exit_code,
       (j.history || []).length,
       state.justFailed && state.justFailed.has(j.name) ? 1 : 0,
+      // pause expiry drives the tile's countdown line; sla.state its badge
+      j.paused ? (j.paused.until || "p") : "",
+      j.sla ? j.sla.state : "",
     ]));
     if (sig !== state.wbSig) {
       state.wbSig = sig;
@@ -5115,6 +5188,12 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
               : '<span class="wb-ago">' + (h.key === "unknown" ? "interrupted" : "—") + "</span>") +
             (h.key === "fail" && lr && lr.exit_code != null ? '<span class="wb-exit">· exit ' + esc(lr.exit_code) + "</span>" : "") +
             "</div>";
+        } else if (h.key === "paused") {
+          // pause expiry countdown rides tick()'s [data-until-iso] sweep
+          line = '<div class="wb-next">' + (job.paused && job.paused.until
+            ? '⏸ <span data-until-iso="' + escAttr(job.paused.until) + '">' +
+              esc(fmtIn((new Date(job.paused.until).getTime() - Date.now()) / 1000)) + "</span>"
+            : "⏸") + "</div>";
         } else if (!job.enabled) {
           line = '<div class="wb-next">—</div>';
         } else {
@@ -5124,6 +5203,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         return '<div class="wb-tile st-' + h.key + flip + '" data-job="' + escAttr(job.name) + '">' +
           '<div class="wb-glyph">' + GLYPH[h.key] + "</div>" +
           '<div class="wb-name" title="' + escAttr(job.name) + '">' + esc(job.name) + "</div>" +
+          (job.sla && job.sla.state === "late" ? '<span class="wb-overdue">overdue</span>' : "") +
           line +
           '<div class="wb-spark">' + sparkline(job) + "</div>" +
         "</div>";
@@ -5142,12 +5222,14 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   }
   function renderWbFoot() {
     const j = state.jobs;
-    const c = { fail: 0, run: 0, pending: 0, unknown: 0, cancelled: 0, ok: 0, disabled: 0 };
+    const c = { fail: 0, run: 0, pending: 0, unknown: 0, cancelled: 0, ok: 0, paused: 0, disabled: 0 };
     for (const x of j) c[health(x).key]++;
+    // SLA overdue is orthogonal to the health buckets, so it is its own count
+    const late = j.filter((x) => x.sla && x.sla.state === "late").length;
     // every health bucket is represented (zero-count rarities are elided), so
     // the tally adds up to the jobs total instead of silently dropping
     // pending/unknown/cancelled jobs
-    const sig = j.length + "|" + c.fail + "|" + c.run + "|" + c.ok + "|" + c.pending + "|" + c.unknown + "|" + c.cancelled + "|" + c.disabled + "|" + (state.clusterLine || "");
+    const sig = j.length + "|" + c.fail + "|" + c.run + "|" + c.ok + "|" + c.pending + "|" + c.unknown + "|" + c.cancelled + "|" + c.paused + "|" + c.disabled + "|" + late + "|" + (state.clusterLine || "");
     if (sig === state.wbFootSig) return;   // keeps #wbExit alive (and focused) across polls
     state.wbFootSig = sig;
     $("wbFoot").innerHTML =
@@ -5158,6 +5240,8 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       (c.pending ? '<span class="wb-stat pending"><b>' + c.pending + "</b>pending</span>" : "") +
       (c.unknown ? '<span class="wb-stat unknown"><b>' + c.unknown + "</b>unknown</span>" : "") +
       (c.cancelled ? '<span class="wb-stat cancelled"><b>' + c.cancelled + "</b>cancelled</span>" : "") +
+      (c.paused ? '<span class="wb-stat paused"><b>' + c.paused + "</b>paused</span>" : "") +
+      (late ? '<span class="wb-stat overdue"><b>' + late + "</b>overdue</span>" : "") +
       '<span class="wb-stat off"><b>' + c.disabled + "</b>off</span>" +
       (state.clusterLine ? '<span class="wb-stat cl">' + esc(state.clusterLine) + "</span>" : "") +
       '<span class="wb-stat more" id="wbMore" style="display:none"></span>' +
@@ -5793,7 +5877,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         else if (s.running) { cls = "cell run"; body = GLYPH.run + " running"; tip = "running now"; }
         else if (s.last) {
           const k = outcomeCls(s.last.outcome);
-          const g = s.last.outcome === "failure" ? GLYPH.fail : s.last.outcome === "cancelled" ? GLYPH.cancelled : s.last.outcome === "unknown" ? GLYPH.unknown : GLYPH.ok;
+          const g = GLYPH[k];
           cls = "cell " + k;
           body = g + " " + esc(s.last.outcome === "success" ? "ok" : s.last.outcome) +
             '<span class="age" data-ago-short="' + escAttr(s.last.finished_at || "") + '">' + esc(agoShort(s.last.finished_at)) + "</span>";
@@ -5963,6 +6047,22 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       else { toast("err", "could not cancel (HTTP " + res.status + ")"); }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "could not cancel " + name); }
   }
+  // One-click pause with the daemon's default duration (the API takes an
+  // optional durationSeconds/until/note body; the dashboard keeps v1 minimal).
+  async function pauseJob(name) {
+    try {
+      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/pause", { method: "POST" });
+      if (res.ok) { toast("ok", "⏸ paused " + name); setTimeout(loadJobs, 300); }
+      else { toast("err", "could not pause (HTTP " + res.status + ")"); }
+    } catch (e) { if (e.message !== "unauthorized") toast("err", "could not pause " + name); }
+  }
+  async function resumeJob(name) {
+    try {
+      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/resume", { method: "POST" });
+      if (res.ok) { toast("ok", "▶ resumed " + name); setTimeout(loadJobs, 300); }
+      else { toast("err", "could not resume (HTTP " + res.status + ")"); }
+    } catch (e) { if (e.message !== "unauthorized") toast("err", "could not resume " + name); }
+  }
   function runAllFailing() {
     const failing = state.jobs.filter((j) => health(j).key === "fail" && j.enabled);
     if (!failing.length) { toast("info", "no failing jobs"); return; }
@@ -6058,9 +6158,26 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       if ("clusterOwner" in job) cl += " → " + esc(job.clusterOwner || "no quorum");
       parts.push('<span class="faint">' + cl + "</span>");
     }
+    if (job.paused) {
+      const p = job.paused;
+      parts.push("<span>⏸ paused until <b>" + esc(fmtAt(new Date(p.until).getTime())) + "</b>" +
+        (p.by ? " by " + esc(p.by) : "") + (p.note ? ' · <span class="faint">' + esc(p.note) + "</span>" : "") + "</span>");
+    }
+    // the row chip buries the breached checks in a tooltip; the drawer is
+    // where an operator lands to read them, so spell them out here
+    if (job.sla && job.sla.state === "late") {
+      const checks = (job.sla.breaches || []).map((b) => b.check).join(", ");
+      parts.push('<span class="overdue">⚠ <b>OVERDUE</b>' +
+        (checks ? ' · <span class="faint">' + esc(checks) + "</span>" : "") + "</span>");
+    }
     $("dMeta").innerHTML = parts.join("");
     $("dRun").disabled = !job.enabled || job.running;
     $("dCancel").disabled = !job.running;
+    // the pause button doubles as resume; a manual Run stays allowed while paused
+    $("dPause").className = "btn " + (job.paused ? "resume" : "pause");
+    $("dPause").innerHTML = job.paused
+      ? '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg> Resume'
+      : '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg> Pause';
   }
 
   // ---- history pane ----
@@ -7071,6 +7188,8 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       out.push({ ic: GLYPH[health(j).key], lbl: "Logs: " + j.name, sub: "open", run: () => openDrawer(j.name, "logs") });
       if (j.enabled && !j.running) out.push({ ic: "▶", lbl: "Run: " + j.name, run: () => runJob(j.name) });
       if (j.running) out.push({ ic: "■", lbl: "Cancel: " + j.name, run: () => cancelJob(j.name) });
+      if (j.paused) out.push({ ic: "▶", lbl: "Resume: " + j.name, run: () => resumeJob(j.name) });
+      else out.push({ ic: "⏸", lbl: "Pause: " + j.name, run: () => pauseJob(j.name) });
       out.push({ ic: "❏", lbl: "Copy command: " + j.name, run: () => copyText(j.command, "command") });
       out.push({ ic: "◴", lbl: "Schedule: " + j.name, run: () => openDrawer(j.name, "schedule") });
       out.push({ ic: "≋", lbl: "Tail: " + j.name, sub: "multi-tail", run: () => openTail([j.name]) });
@@ -7460,6 +7579,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       case "Enter": { const j = selectedJob(); if (j) openDrawer(j.name); break; }
       case "r": { const j = selectedJob(); if (j && j.enabled && !j.running) runJob(j.name); break; }
       case "x": { const j = selectedJob(); if (j && j.running) cancelJob(j.name); break; }
+      case "p": { const j = selectedJob(); if (j) (j.paused ? resumeJob : pauseJob)(j.name); break; }
       case "c": { const j = selectedJob(); if (j) copyText(j.command, "command"); break; }
     }
   });
@@ -7540,7 +7660,26 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     return '<span class="ha-chip live-res" title="live CPU% and resident memory of the running instance(s)">▮ ' +
       fmtPercent(rr.cpu_percent) + " · " + fmtBytes(rr.rss_bytes) + "</span>";
   }
-  function haChips(job) { return retryChip(job) + slotChip(job) + rebootChip(job) + reconChip(job) + liveResChip(job); }
+  // SLA breach marker. Independent of health(): an overdue job can still be
+  // green (its runs succeed, they just have not happened in time).
+  function overdueChip(job) {
+    const s = job.sla; if (!s || s.state !== "late") return "";
+    const checks = (s.breaches || []).map((b) => b.check).join(", ");
+    return '<span class="ha-chip overdue" title="' + escAttr("SLA breached: " + (checks || "late")) + '">⚠ overdue</span>';
+  }
+  // pause expiry (+ note/by in the tooltip); the countdown rides tick()'s
+  // [data-until-iso] sweep like the retry chip's next-fire
+  function pausedChip(job) {
+    const p = job.paused; if (!p) return "";
+    let til = "";
+    if (p.until) {
+      const secs = (new Date(p.until).getTime() - Date.now()) / 1000;
+      til = ' <span data-until-iso="' + escAttr(p.until) + '">' + fmtIn(secs) + "</span>";
+    }
+    return '<span class="ha-chip paused" title="' +
+      escAttr("paused" + (p.by ? " by " + p.by : "") + (p.note ? ": " + p.note : "")) + '">⏸' + (til || " paused") + "</span>";
+  }
+  function haChips(job) { return retryChip(job) + slotChip(job) + rebootChip(job) + reconChip(job) + liveResChip(job) + overdueChip(job) + pausedChip(job); }
 
   // ---- DAG index card ----
   let dagReqSeq = 0, dagAppliedSeq = 0;
@@ -8340,6 +8479,10 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       if (runBtn) { e.stopPropagation(); if (!runBtn.disabled) runJob(runBtn.getAttribute("data-run")); return; }
       const cancelBtn = e.target.closest("[data-cancel]");
       if (cancelBtn) { e.stopPropagation(); cancelJob(cancelBtn.getAttribute("data-cancel")); return; }
+      const pauseBtn = e.target.closest("[data-pause]");
+      if (pauseBtn) { e.stopPropagation(); pauseJob(pauseBtn.getAttribute("data-pause")); return; }
+      const resumeBtn = e.target.closest("[data-resume]");
+      if (resumeBtn) { e.stopPropagation(); resumeJob(resumeBtn.getAttribute("data-resume")); return; }
       const logsBtn = e.target.closest("[data-logs]");
       if (logsBtn) { e.stopPropagation(); openDrawer(logsBtn.getAttribute("data-logs")); return; }
       const tr = e.target.closest("tr[data-job]");
@@ -8540,6 +8683,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     $("dCopy").addEventListener("click", () => { const j = state.byName[state.drawerJob]; if (j) copyText(j.command, "command"); });
     $("dRun").addEventListener("click", () => { if (state.drawerJob) runJob(state.drawerJob); });
     $("dCancel").addEventListener("click", () => { if (state.drawerJob) cancelJob(state.drawerJob); });
+    $("dPause").addEventListener("click", () => { const j = state.byName[state.drawerJob]; if (j) (j.paused ? resumeJob : pauseJob)(j.name); });
     $("dClear").addEventListener("click", clearTerm);
     $("dDownload").addEventListener("click", downloadLogs);
     $("dTabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-tab]"); if (b) switchTab(b.getAttribute("data-tab")); });
@@ -8652,6 +8796,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       ["j / ↓", "Next job"], ["k / ↑", "Previous job"],
       ["Enter", "Open selected job"],
       ["r", "Run selected job"], ["x", "Cancel selected (running) job"],
+      ["p", "Pause or resume selected job"],
       ["c", "Copy selected command"],
       ["g", "Refresh now"], ["t", "Cycle theme"], ["T", "Light / dark theme"],
       ["i", "Incident timeline"],
@@ -9245,7 +9390,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     for (const j of state.jobs) {
       const lr = j.last_run;
       if (!lr || !lr.finished_at) continue;
-      const cls = lr.outcome === "failure" ? "fail" : lr.outcome === "cancelled" ? "cancelled" : "ok";
+      const cls = outcomeCls(lr.outcome);
       if (state.timeline.failOnly && cls !== "fail") continue;
       events.push({ name: j.name, cls: cls, fin: Date.parse(lr.finished_at) || 0, iso: lr.finished_at, x: lr.exit_code, d: lr.duration, r: lr.fail_reason || "" });
     }

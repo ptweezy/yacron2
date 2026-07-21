@@ -92,7 +92,27 @@ def install_fleet_fixtures(daemon: FakeDaemon) -> None:
         outcome="success",
         command="set -eu\ntoken=$(cronstable secret get t)\ncurl -s x",
     )
-    daemon.jobs = [monitored, retrying, spread, slotted, long_cmd]
+    held = _job(
+        "held-batch",
+        outcome="success",
+        paused={
+            "since": _iso(600),
+            "until": "2027-01-01T23:45:00+00:00",
+            "note": "vendor maintenance",
+            "by": "parker",
+            "channel": "api",
+        },
+    )
+    overdue = _job("late-feed", outcome="success", late=True)
+    daemon.jobs = [
+        monitored,
+        retrying,
+        spread,
+        slotted,
+        long_cmd,
+        held,
+        overdue,
+    ]
     daemon.log_lines["flaky-etl"] = [
         {"stream": "stdout", "line": "starting etl"},
         {"stream": "stderr", "line": "\x1b[31mboom\x1b[0m"},
@@ -272,7 +292,7 @@ def install_fleet_fixtures(daemon: FakeDaemon) -> None:
 async def start_rich(h: Harness, tmp_path, **kw):
     install_fleet_fixtures(h.daemon)
     app = await h.start(tmp_path, **kw)
-    await _wait_for(lambda: len(app.jobs) == 5)
+    await _wait_for(lambda: len(app.jobs) == 7)
     return app
 
 
@@ -365,6 +385,39 @@ async def test_tour_drawer_unmonitored_and_wrap(tmp_path):
         await _wait_for(lambda: app.drawer_res is not None)
         screen = await snap_text(h)
         assert "no resource monitoring" in screen
+    finally:
+        await h.stop()
+
+
+# ===================================================================
+#  paused chip + OVERDUE badge, on every surface
+# ===================================================================
+async def test_tour_paused_and_overdue_badges(tmp_path):
+    h = Harness()
+    try:
+        app = await start_rich(h, tmp_path)
+        screen = await snap_text(h)
+        # list: the paused status chip, the parked next-fire cell, and
+        # the independent OVERDUE badge on the late job's status cell
+        assert "⏸ Paused" in screen
+        assert "til 23:45" in screen
+        assert "OVERDUE" in screen
+        # drawer meta line: until · note · by
+        app.open_drawer("held-batch", "schedule")
+        screen = await snap_text(h)
+        assert "paused til 23:45" in screen
+        assert "vendor maintenance" in screen
+        assert "by parker" in screen
+        h.keys.send("esc")
+        await _wait_for(lambda: not app.is_open("drawer"))
+        # wallboard tiles carry both marks
+        h.keys.send("w")
+        await _wait_for(lambda: app.wallboard)
+        screen = await snap_text(h)
+        assert "held-batch" in screen and "til 23:45" in screen
+        assert "late-feed" in screen and "OVERDUE" in screen
+        h.keys.send("w")
+        await _wait_for(lambda: not app.wallboard)
     finally:
         await h.stop()
 

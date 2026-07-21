@@ -648,6 +648,21 @@ class ShellReporter(Reporter):
         env["CRONSTABLE_MAX_RSS_BYTES"] = (
             str(usage.max_rss_bytes) if usage is not None else ""
         )
+        # SLA breach detail, when this report is an onLate dispatch (only
+        # SlaBreachContext carries sla_vars; a finished run has none).
+        # Always exported, empty when N/A, matching the CPU vars above.
+        # The dict check also shields against non-dict stand-ins.
+        sla_vars = getattr(job, "sla_vars", None)
+        if not isinstance(sla_vars, dict):
+            sla_vars = {}
+        for env_name, key in (
+            ("CRONSTABLE_SLA_CHECK", "sla_check"),
+            ("CRONSTABLE_SLA_THRESHOLD_SECONDS", "threshold_seconds"),
+            ("CRONSTABLE_SLA_OBSERVED_SECONDS", "observed_seconds"),
+            ("CRONSTABLE_LAST_SUCCESS_AT", "last_success_at"),
+        ):
+            value = sla_vars.get(key)
+            env[env_name] = str(value) if value is not None else ""
 
         logger.debug("Executing shell report cmd: %s", cmd)
         # Same process-group isolation as the job itself, so the timeout kill
@@ -1339,3 +1354,111 @@ class RunningJob:
             "cpu_system_seconds": usage.cpu_system_seconds if usage else None,
             "max_rss_bytes": usage.max_rss_bytes if usage else None,
         }
+
+
+class SlaBreachContext:
+    """Reporting context for one SLA breach: a job that did NOT (yet) run.
+
+    Quacks like a :class:`RunningJob` exactly as far as the reporters
+    read one (``config``, ``template_vars``, and the attributes
+    :class:`ShellReporter` exports), with every run-shaped field
+    explicitly empty. Deliberately NOT a bare ``RunningJob``: with no
+    process, the default ``failsWhen.nonzeroReturn`` would synthesize the
+    bogus fail_reason "failsWhen=nonzeroReturn and retcode=None" (and
+    ``__init__`` would build a pointless statsd writer); here ``failed``
+    and ``fail_reason`` state exactly what happened.
+
+    ``template_vars`` carries the full standard key set with None/False
+    fills, so operator templates written for onFailure render unchanged
+    on onLate, plus the breach detail (``sla_check``,
+    ``threshold_seconds``, ``observed_seconds``, ``last_success_at``).
+    ``env`` carries HOSTNAME so the default sentry fingerprint's
+    ``{{ environment.HOSTNAME }}`` line keeps its host dimension.
+    """
+
+    def __init__(
+        self,
+        config: JobConfig,
+        *,
+        check: str,
+        threshold_seconds: float,
+        observed_seconds: float,
+        last_success_at: Optional[str] = None,
+    ) -> None:
+        self.config = config
+        self.sla_check = check
+        self.threshold_seconds = threshold_seconds
+        self.observed_seconds = observed_seconds
+        self.last_success_at = last_success_at
+        self.fail_reason = "sla: {} breached".format(check)
+        self.failed = True
+        self.retcode = None  # type: Optional[int]
+        self.stdout = None  # type: Optional[str]
+        self.stderr = None  # type: Optional[str]
+        self.stdout_discarded = 0
+        self.stderr_discarded = 0
+        self.resource_usage = None  # type: Optional[ResourceUsage]
+        self.env = {"HOSTNAME": os.environ.get("HOSTNAME", "")}
+        # read by ShellReporter for the CRONSTABLE_SLA_* exports.
+        self.sla_vars = {
+            "sla_check": check,
+            "threshold_seconds": threshold_seconds,
+            "observed_seconds": observed_seconds,
+            "last_success_at": last_success_at,
+        }
+
+    @property
+    def template_vars(self) -> dict:
+        return {
+            "name": self.config.name,
+            "success": False,
+            "fail_reason": self.fail_reason,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "exit_code": self.retcode,
+            "command": self.config.command,
+            "shell": self.config.shell,
+            "environment": self.env,
+            "cpu_seconds": None,
+            "cpu_user_seconds": None,
+            "cpu_system_seconds": None,
+            "max_rss_bytes": None,
+            "sla_check": self.sla_check,
+            "threshold_seconds": self.threshold_seconds,
+            "observed_seconds": self.observed_seconds,
+            "last_success_at": self.last_success_at,
+        }
+
+
+async def report_sla_breach(
+    ctx: SlaBreachContext, report_config: dict
+) -> None:
+    """Fan one SLA breach out to all four reporters (the onLate hook).
+
+    The ``_report_common`` gather idiom with ``success=False``
+    throughout: an overdue job is bad news, so MailReporter's empty-body
+    suppression (success-only) can never eat the alert and Sentry
+    defaults to level "error".
+    """
+    logger.info(
+        "Cron job %s: reporting SLA breach (%s)",
+        ctx.config.name,
+        ctx.sla_check,
+    )
+    results = await asyncio.gather(
+        *[
+            # duck-typed on purpose: the context quacks like the
+            # RunningJob slice each reporter actually reads.
+            r.report(False, ctx, report_config)  # type: ignore[arg-type]
+            for r in RunningJob.REPORTERS
+        ],
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error(
+                "Problem reporting job %s SLA breach: %s",
+                ctx.config.name,
+                result,
+                exc_info=result,
+            )

@@ -5,6 +5,118 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.26 (2026-07-20)
+
+Two operator features land this release: a runtime job pause and per-job SLA
+(late-run) monitoring, each wired through the HTTP API, the web and terminal
+dashboards, Prometheus, and MCP.  Both are control-and-alerting layers only:
+neither changes what a job runs or when, and both stay off the scheduling hot
+path.  A pause is runtime-only state, and the `sla`/`onLate` config keys are
+excluded from the job-set-id fingerprint, so replicas never read either as
+drift.  The rest of the branch hardens their edge cases; one internal change
+stands apart from both.
+
+### A job can be paused at runtime
+
+- **`POST /jobs/{name}/pause` holds a job's scheduled fires; `/resume` ends the
+  hold.**  The body is optional: `durationSeconds` (default `3600`, range `1`
+  to `2592000`) or, exclusively, an absolute `until` (future, at most 30 days
+  out, naive timestamps read as UTC), plus a `note` (at most 500 chars) and
+  `by` (at most 100 chars).  An unknown job is `404`; both time keys at once, an
+  out-of-range or past deadline, a wrong type, or an oversized field is `400`.
+  Re-pausing overwrites the window, which is how a pause is extended.  Both
+  routes sit behind `web.authToken` and the cross-site request defense, like
+  `start` and `cancel`.
+- **A pause is always bounded.**  Every pause carries an `until`; there is no
+  indefinite pause (edit `enabled: false` for that).  Expiry takes no timer: an
+  elapsed window reads as absent everywhere at once, and the once-a-minute
+  housekeeping pass sweeps the record and logs the auto-resume, with nothing to
+  reconcile if the daemon restarts across the deadline.
+- **Skipped slots are recorded, not silent.**  Each due slot inside the window
+  writes a synthetic run-ledger row with `outcome: "skipped"` and
+  `skip_reason: "paused"` (no `started_at`, no `exit_code`), so history shows a
+  deliberate skip rather than a gap, and stamps neither success nor failure.
+- **Interactions are conservative.**  Catch-up owes nothing for a paused
+  window, including slots the daemon slept through.  Pending retries defer
+  rather than cancel.  Manual `start` still launches a paused job (a disabled
+  one is refused `409`), and `cancel` and running instances are untouched.  A
+  paused `@reboot` job defers its once-per-boot run instead of forfeiting it,
+  firing when the pause lifts (still exactly once per OS boot).  SLA checks are
+  suppressed while paused, and any active OVERDUE clears on the pause itself.
+- **Durable and fleet-wide with a state store.**  Without a `state:` store a
+  pause is in-memory and forgotten on restart.  With one, each pause and resume
+  appends to a durable `paused/<job>` stream (newest wins): boot rehydrates
+  active windows before the first fire, every node sharing the store honours the
+  pause, and a resume revokes it fleet-wide even on a node that had not yet seen
+  it.  Propagation rides the housekeeping pass (up to about a minute; the
+  accepting node applies it immediately), and the fire-time check is
+  memory-only, so an unreadable store never blocks firing.
+- **Every surface shows it.**  `paused` is always present on `GET /jobs`
+  (`{since, until, note, by, channel}` or `null`); `/schedule/why` adds a
+  `paused` note naming expiry, actor, and note; the dashboards add a **Paused**
+  status, a `⏸` chip, a summary pill, and a `p` toggle; Prometheus adds
+  `cronstable_job_paused{job_name}` and counts skips under
+  `cronstable_job_runs_total{status="skipped"}`; MCP gains `cron_pause_job` and
+  `cron_resume_job` in the `act` toolset.  `channel` records the acting surface
+  (`api` or `mcp`).
+
+### Per-job SLA monitoring with an onLate hook
+
+- **A new `sla:` block declares three independent thresholds (seconds).**
+  `maxTimeSinceSuccessSeconds` (no successful finish in the window: the
+  dead-man check for a wedged or silently dead job), `lateAfterSeconds` (a due
+  slot has not started within the window), and `maxRuntimeSeconds` (a run has
+  been going longer than the window; observes only, never kills, use
+  `executionTimeout` to enforce).  Each is off (`null`) until set and must be
+  `> 0`.
+- **A new `onLate` reporting hook, the fourth alongside onFailure /
+  onPermanentFailure / onSuccess.**  It fires once per breach through the same
+  mail, sentry, shell, and webhook reporters, with defaults reworded for an
+  overdue condition (an "is overdue" mail subject and body naming check,
+  threshold, observed value, and last success, a Slack-compatible webhook body,
+  and the sentry fingerprint `["cronstable", "sla", "{{ name }}"]` so breaches
+  group apart from run failures).  Configuring an `onLate` reporter with no
+  `sla` threshold set is a load-time `ConfigError` (`onLate requires sla`).
+- **Evaluated in-process, once per minute, memory-only.**  A state store is not
+  required (it does improve the staleness reference across restarts).  With no
+  success on record the check references when the monitor first saw the job, so
+  a fresh boot ages into the breach rather than paging instantly.  Disabled and
+  paused jobs are skipped, and time a job spends paused or disabled is credited
+  to the staleness check, so a resumed or re-enabled job gets a fresh window
+  instead of paging the instant it comes back.  Under leader election only the
+  owning node evaluates, so one breach pages once and an ownership handoff does
+  not false-page.
+- **Breaches latch per `(job, check)`.**  Entry fires `onLate` once, sets
+  `cronstable_job_late{job_name, check}` to `1`, increments
+  `cronstable_job_sla_breaches_total`, and logs a warning; nothing re-fires
+  while the breach holds; recovery clears the gauge and logs, with no recovery
+  report.  The latch is in-memory, so a still-breached check reports once more
+  after a restart.  Reports dispatch off the scheduler loop, ordered after the
+  same job's in-flight completion reports.
+- **Breach variables.**  `sla_check`, `threshold_seconds`, `observed_seconds`,
+  and `last_success_at` join the standard template set (run-shaped fields
+  empty), and the shell reporter also receives them as `CRONSTABLE_SLA_CHECK`,
+  `CRONSTABLE_SLA_THRESHOLD_SECONDS`, `CRONSTABLE_SLA_OBSERVED_SECONDS`, and
+  `CRONSTABLE_LAST_SUCCESS_AT`.
+- **Every surface shows it.**  `GET /jobs` carries an `sla` object for
+  configured jobs (`{thresholds, state, breaches}`, `observed_seconds`
+  re-measured at payload time); the dashboards add an **OVERDUE** badge (row,
+  drawer, wallboard) independent of run status; Prometheus adds
+  `cronstable_job_late` and `cronstable_job_sla_breaches_total`; MCP observe
+  tools `cron_list_jobs` and `cron_get_job` return the same object.
+- **The monitor cannot report its own death.**  An in-process check dies with
+  the daemon; pair it with the external Prometheus staleness alert on
+  `cronstable_job_last_success_timestamp_seconds` as the outside backstop.
+
+### An unrelated internal change
+
+- **The classic-crontab control-character guard is rebuilt from explicit code
+  points.**  The refused set (C0 controls minus TAB and LF, DEL and the C1
+  range, and the Unicode line and paragraph separators) is unchanged, so every
+  crontab that parsed before parses the same; enumerating the points instead of
+  a literal range keeps the TAB/LF carve-out visible and clears a
+  static-analysis false positive (CodeQL `py/overly-large-range`).
+
 ## 1.2.25 (2026-07-19)
 
 A bounding and hardening release.  The previous two passes made the hot

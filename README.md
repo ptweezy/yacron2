@@ -64,6 +64,22 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
     dropped, so no writable paths or elevated privileges are required (see
     [Production container deployment](#production-container-deployment))
 * Option to automatically retry failing cron jobs, with exponential backoff
+* **Per-job SLA monitoring**: an `sla:` block declares thresholds for the runs
+  that did not happen: too long without a success, a due slot that never
+  started, a run exceeding its runtime bound. A breach fires a dedicated
+  `onLate` reporting hook once (mail, Sentry, shell, webhook), gauges and
+  counters land in the metrics, and the dashboards badge the job OVERDUE
+  (see [Late-run detection](#late-run-detection-sla-monitoring) and the
+  [Late-Run Detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection)
+  wiki page)
+* **Runtime pause/resume**: pause any job's scheduled fires for a bounded
+  window (an hour by default, thirty days at most) over the API, the
+  dashboards, or MCP, without touching the config. Skipped slots are recorded
+  visibly, pending retries defer, catch-up owes nothing for the window, and
+  with a `state:` store the pause survives restarts and is honored by every
+  node (see [Pause and resume a job](#pause-and-resume-a-job) and the
+  [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)
+  wiki page)
 * **Opt-in durable state**: point a single `state:` config block at a local
   directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
   gain durability across restarts: missed-run catch-up after downtime and
@@ -1604,6 +1620,42 @@ For that situation, you can use the `onPermanentFailure` option:
         smtpHost: 127.0.0.1
 ```
 
+### Late-run detection (SLA monitoring)
+
+Failure hooks only see runs that happened. An `sla:` block watches for the
+runs that did not: each job can declare up to three independent thresholds,
+evaluated once per minute by an in-process monitor, with a dedicated
+`onLate` reporting hook that fires once when a threshold is breached and
+takes the same `report` block (mail, Sentry, shell, webhook) as `onFailure`:
+
+```yaml
+- name: nightly-etl
+  command: python -m etl.run
+  schedule: "0 4 * * *"
+  sla:
+    maxTimeSinceSuccessSeconds: 129600   # no success for 36h
+    lateAfterSeconds: 900                # a due slot not started within 15min
+    maxRuntimeSeconds: 7200              # a run still going after 2h
+  onLate:
+    report:
+      webhook:
+        url:
+          fromEnvVar: SLACK_WEBHOOK_URL
+```
+
+Breaches latch: one report per breach, not one per minute, with a recovery
+log line and no report when the check clears. `maxRuntimeSeconds` observes
+and never kills (use `executionTimeout` to enforce a limit); paused and
+disabled jobs are excused; under leader election only the job's owning node
+evaluates, so one breach pages once. Breaches surface as an OVERDUE badge in
+both dashboards, an `sla` object on `GET /jobs`, and
+`cronstable_job_late{job_name, check}` /
+`cronstable_job_sla_breaches_total{job_name, check}` in the metrics. The
+monitor runs inside the daemon and cannot report its own death, so pair it
+with an external Prometheus staleness alert. See the
+[Late-Run Detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection)
+wiki page.
+
 ### Concurrency
 
 Sometimes it may happen that a cron job takes so long to execute that when the moment its next scheduled execution is reached a previous instance may still be running.  How cronstable handles this situation is controlled by the option `concurrencyPolicy`, which takes one of the following values:
@@ -1817,6 +1869,30 @@ is not currently running, and `404 Not Found` for an unknown job.
 $ http post http://127.0.0.1:8080/jobs/test-03/cancel
 HTTP/1.1 200 OK
 ```
+
+#### Pause and resume a job
+
+`POST /jobs/{name}/pause` holds a job's scheduled fires until a deadline,
+without touching the config: an hour by default, or a `durationSeconds` /
+`until` window of up to thirty days, plus optional `note` and `by` audit
+fields. While paused, each due slot is recorded as a `skipped` run (so the
+history shows the deliberate gap), pending retries wait and fire after the
+resume, missed-run catch-up owes nothing for the window, and manual start
+still works. `POST /jobs/{name}/resume` ends the pause early; every pause
+expires on its own. With a `state:` store configured the pause survives
+restarts and is honored by every node sharing the store. The dashboards
+toggle it with one click (the `p` key), and paused jobs read
+`cronstable_job_paused 1` in the metrics.
+
+```shell
+$ http post http://127.0.0.1:8080/jobs/test-02/pause durationSeconds:=7200 note="db migration"
+HTTP/1.1 200 OK
+
+{"paused": {"since": "2026-07-19T14:00:00+00:00", "until": "2026-07-19T16:00:00+00:00", "note": "db migration", "by": "api", "channel": "api"}}
+```
+
+See the [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs)
+wiki page for the full semantics.
 
 #### Get detailed job info (used by the dashboard)
 
@@ -2165,6 +2241,8 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
 * **Trust it**:
   [Failure Detection and Retries](https://github.com/ptweezy/cronstable/wiki/Failure-Detection-and-Retries) ·
   [Reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) ·
+  [Pausing Jobs](https://github.com/ptweezy/cronstable/wiki/Pausing-Jobs) ·
+  [Late-Run Detection](https://github.com/ptweezy/cronstable/wiki/Late-Run-Detection) ·
   [Concurrency and Timeouts](https://github.com/ptweezy/cronstable/wiki/Concurrency-and-Timeouts) ·
   [Performance Benchmarks](https://github.com/ptweezy/cronstable/wiki/Performance-Benchmarks) ·
   [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting)

@@ -89,7 +89,7 @@ All metrics are prefixed `cronstable_`. Per-job metrics carry the job name in a 
 
 | Metric | Type | Description |
 | --- | --- | --- |
-| `cronstable_job_runs_total{job_name, status}` | counter | Finished runs by outcome: `status="success"` / `"failure"` / `"cancelled"`, exactly as recorded in the [run history](HTTP-API#get-jobsnameruns). Zero-filled for every configured job from the first scrape. Runs replaced under `concurrencyPolicy: Replace` are not runs and are not counted, matching the dashboard. |
+| `cronstable_job_runs_total{job_name, status}` | counter | Finished runs by outcome: `status="success"` / `"failure"` / `"cancelled"` / `"skipped"`, exactly as recorded in the [run history](HTTP-API#get-jobsnameruns). `skipped` counts the synthetic ledger rows a [paused](Pausing-Jobs) job writes in place of a launch; those stamp neither last-outcome timestamp. Zero-filled for every configured job from the first scrape. Runs replaced under `concurrencyPolicy: Replace` are not runs and are not counted, matching the dashboard. |
 | `cronstable_job_duration_seconds` | histogram | Duration of finished runs (bucket bounds from `durationBuckets`). Cancelled-without-starting records carry no duration and are not observed. |
 | `cronstable_job_retries_total{job_name}` | counter | Retry attempts actually launched (`onFailure.retry`); deferred or abandoned retries are not counted. |
 | `cronstable_job_permanent_failures_total{job_name}` | counter | Failures with no retry remaining -- exactly when [`onPermanentFailure`](Failure-Detection-and-Retries) reporting fires. |
@@ -108,6 +108,9 @@ All metrics are prefixed `cronstable_`. Per-job metrics carry the job name in a 
 | `cronstable_job_peak_rss_bytes{job_name}` | gauge | Highest resident-set size (bytes) observed across all of the job's monitored runs. Absent until the first monitored run. |
 | `cronstable_job_last_run_cpu_seconds{job_name}` | gauge | Total CPU time of the most recent monitored run. Absent unless that run had `monitorResources` on. |
 | `cronstable_job_last_run_max_rss_bytes{job_name}` | gauge | Peak resident-set size (bytes) of the most recent monitored run. Absent unless that run had `monitorResources` on. |
+| `cronstable_job_paused{job_name}` | gauge | `1` while the job is [paused at runtime](Pausing-Jobs), else `0`. |
+| `cronstable_job_late{job_name, check}` | gauge | `1` while the job's [SLA check](Late-Run-Detection) is breached, per `check` (`maxTimeSinceSuccess` / `lateAfter` / `maxRuntime`). Emitted only for checks the job configures in its `sla:` block, from the monitor's first evaluation; paused jobs are exempt. |
+| `cronstable_job_sla_breaches_total{job_name, check}` | counter | [SLA breaches](Late-Run-Detection) latched for the job, per `check`; increments once per breach, not per evaluation. Emitted alongside `cronstable_job_late`, zero-filled from the first evaluation. |
 
 The four resource families above require the job to opt into
 [`monitorResources`](Configuration-Reference#metrics); they are sampled and
@@ -190,6 +193,8 @@ groups:
 
 The [Clustering monitoring guide](Clustering-and-Leader-Election#monitoring-and-alerting) discusses the cluster signals in depth.
 
+The staleness rule above (`YacronJobStale`) is the external backstop to pair with per-job [late-run detection](Late-Run-Detection): the in-process `sla:` monitor gives per-job thresholds and rich `onLate` notifications, but it dies with the daemon, while a Prometheus rule on `time() - cronstable_job_last_success_timestamp_seconds` (plus `up == 0` on the scrape itself) still fires when the daemon, its host, or its network is gone.
+
 ## See also
 
 - [HTTP Control API](HTTP-API): the web server `/metrics` is part of -- listeners, `authToken`, headers, reload behavior.
@@ -197,4 +202,6 @@ The [Clustering monitoring guide](Clustering-and-Leader-Election#monitoring-and-
 - [Resource Monitoring](Resource-Monitoring): the `monitorResources` sampling behind the per-job CPU/RSS families.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): what the cluster gauges mean and when they change.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): how run outcomes, retries, and permanent failures are determined.
+- [Late-Run Detection](Late-Run-Detection): the `sla:` monitor behind `cronstable_job_late` and the breach counter.
+- [Pausing Jobs](Pausing-Jobs): the runtime pause behind `cronstable_job_paused` and the `skipped` run outcome.
 - [Configuration Reference](Configuration-Reference): the full `web` section.

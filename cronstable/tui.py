@@ -126,8 +126,10 @@ GLYPH = {
     "run": "▶",
     "pending": "◔",
     "disabled": "◌",
+    "paused": "⏸",
     "cancelled": "⊘",
     "unknown": "◍",
+    "skipped": "⊘",
 }
 GLYPH_ASCII = {
     "ok": "o",
@@ -135,8 +137,10 @@ GLYPH_ASCII = {
     "run": ">",
     "pending": ".",
     "disabled": "-",
+    "paused": "p",
     "cancelled": "/",
     "unknown": "?",
+    "skipped": "/",
 }
 
 #: Sort rank of each health key in the jobs table (web STATUS_ORDER).
@@ -147,7 +151,8 @@ STATUS_ORDER = {
     "unknown": 3,
     "cancelled": 4,
     "ok": 5,
-    "disabled": 6,
+    "paused": 6,
+    "disabled": 7,
 }
 
 #: Wallboard tile order: worst first (web WB_ORDER).
@@ -158,7 +163,8 @@ WB_ORDER = {
     "unknown": 3,
     "cancelled": 4,
     "ok": 5,
-    "disabled": 6,
+    "paused": 6,
+    "disabled": 7,
 }
 
 #: Status-filter segments, in toolbar order (web segment row).
@@ -185,6 +191,15 @@ def fmt_in(sec: Optional[float]) -> str:
     if sec < 172800:
         return "in %dh" % (sec // 3600)
     return "in %dd" % (sec // 86400)
+
+
+def fmt_til(iso: Optional[str]) -> str:
+    """``til HH:MM`` (UTC) for a pause-expiry stamp."""
+    t = parse_iso(iso)
+    if t is None:
+        return "til ?"
+    stamp = datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc)
+    return "til %s" % stamp.strftime("%H:%M")
 
 
 def fmt_ago(iso: Optional[str], now: Optional[float] = None) -> str:
@@ -303,10 +318,47 @@ def utc_clock(now: Optional[float] = None) -> str:
 # ===================================================================
 #  status / health / verdict  (ports of the web page's client logic)
 # ===================================================================
+#: The one place a run outcome becomes a state key, the port of the web
+#: page's ``outcomeCls``. Every panel that paints a run reads it from
+#: here: five hand-rolled copies of this ladder used to live inline, and
+#: all five had dropped the ``skipped`` arm, so a slot a pause held back
+#: painted in the same green a real success earns.
+OUTCOME_KEY = {
+    "failure": "fail",
+    "cancelled": "cancelled",
+    "unknown": "unknown",
+    "skipped": "skipped",
+}
+#: Theme colour for each key ``outcome_key`` can return. "skipped" takes
+#: the neutral "off" ink the web gives it, never "ok".
+OUTCOME_COLOR = {
+    "ok": "ok",
+    "fail": "fail",
+    "cancelled": "off",
+    "unknown": "pending",
+    "skipped": "off",
+}
+
+
+def outcome_key(outcome: Optional[str]) -> str:
+    """State key for a run outcome: ``fail``/``cancelled``/``unknown``/
+    ``skipped``, else ``ok``. Anything painting a run goes through here
+    so a sixth copy of the ladder cannot drift again."""
+    return OUTCOME_KEY.get(outcome or "", "ok")
+
+
+def outcome_color(outcome: Optional[str]) -> str:
+    """Theme colour key for a run outcome, via :func:`outcome_key`."""
+    return OUTCOME_COLOR[outcome_key(outcome)]
+
+
 def health(job: Dict[str, Any]) -> Tuple[str, str]:
     """``(key, label)`` for a /jobs entry: the web ``health()`` port."""
     if not job.get("enabled"):
         return ("disabled", "Disabled")
+    if job.get("paused") and not job.get("running"):
+        # a pause parks future slots only: a live run still shows Running
+        return ("paused", "Paused")
     if job.get("running"):
         return ("run", "Running")
     last = job.get("last_run")
@@ -318,6 +370,10 @@ def health(job: Dict[str, Any]) -> Tuple[str, str]:
             return ("cancelled", "Cancelled")
         if outcome == "unknown":
             return ("unknown", "Unknown")
+        # a pause-skipped slot is not a verdict on the job: it never ran, so
+        # it must not paint the green "OK" a real success earns
+        if outcome == "skipped":
+            return ("pending", "Skipped")
         return ("ok", "OK")
     return ("pending", "Pending")
 
@@ -328,7 +384,13 @@ def segment_of(key: str) -> str:
         return "off"
     if key in ("ok", "fail", "run"):
         return key
-    return ""  # pending/unknown/cancelled match only "all"
+    return ""  # pending/unknown/cancelled/paused match only "all"
+
+
+def sla_overdue(job: Dict[str, Any]) -> bool:
+    """True when the payload's ``sla`` block reports the job late."""
+    sla = job.get("sla")
+    return isinstance(sla, dict) and sla.get("state") == "late"
 
 
 def correlate(
@@ -1021,18 +1083,7 @@ def spark_cells(
             if top
             else 0
         )
-        outcome = run.get("outcome")
-        color = (
-            "fail"
-            if outcome == "failure"
-            else "cancelled"
-            if outcome == "cancelled"
-            else "unknown"
-            if outcome == "unknown"
-            else "ok"
-        )
-        color = {"cancelled": "off", "unknown": "pending"}.get(color, color)
-        cells.append((_SPARK_BARS[idx], color))
+        cells.append((_SPARK_BARS[idx], outcome_color(run.get("outcome"))))
     return cells
 
 
@@ -2937,6 +2988,42 @@ class AppActions(App):
         else:
             self.toast("fail", "cancel %s: HTTP %d" % (name, status))
 
+    async def pause_job(self, name: str) -> None:
+        try:
+            status, _ = await self.api.post("/jobs/%s/pause" % _quote(name))
+        except Unauthorized:
+            self.open("token")
+            self.focus = "token"
+            return
+        except Exception as exc:  # noqa: BLE001 - toast + carry on
+            self.toast("fail", "pause %s: %s" % (name, exc))
+            return
+        if status == 200:
+            self.toast("ok", "⏸ paused %s" % name)
+            self.refresh_now()
+        elif status == 404:
+            self.toast("fail", "no such job: %s" % name)
+        else:
+            self.toast("fail", "pause %s: HTTP %d" % (name, status))
+
+    async def resume_job(self, name: str) -> None:
+        try:
+            status, _ = await self.api.post("/jobs/%s/resume" % _quote(name))
+        except Unauthorized:
+            self.open("token")
+            self.focus = "token"
+            return
+        except Exception as exc:  # noqa: BLE001 - toast + carry on
+            self.toast("fail", "resume %s: %s" % (name, exc))
+            return
+        if status == 200:
+            self.toast("ok", "⏵ resumed %s" % name)
+            self.refresh_now()
+        elif status == 404:
+            self.toast("fail", "no such job: %s" % name)
+        else:
+            self.toast("fail", "resume %s: HTTP %d" % (name, status))
+
     async def run_all_failing(self) -> None:
         failing = [j["name"] for j in self.jobs if health(j)[0] == "fail"]
         if not failing:
@@ -3385,6 +3472,23 @@ class AppPalette(AppActions):
                         functools.partial(self._act_cancel_job, name),
                     )
                 )
+            if "paused" in job:  # absent from an older daemon's payload
+                if job.get("paused"):
+                    out.append(
+                        (
+                            "⏵",
+                            "Resume: %s" % name,
+                            functools.partial(self._act_resume_job, name),
+                        )
+                    )
+                else:
+                    out.append(
+                        (
+                            "⏸",
+                            "Pause: %s" % name,
+                            functools.partial(self._act_pause_job, name),
+                        )
+                    )
             out.append(
                 (
                     "❏",
@@ -3416,6 +3520,12 @@ class AppPalette(AppActions):
 
     def _act_cancel_job(self, name: str) -> None:
         self._spawn(self.cancel_job(name))
+
+    def _act_pause_job(self, name: str) -> None:
+        self._spawn(self.pause_job(name))
+
+    def _act_resume_job(self, name: str) -> None:
+        self._spawn(self.resume_job(name))
 
     def _act_tail_one(self, name: str) -> None:
         self.open_tail([name])
@@ -3711,6 +3821,15 @@ class AppKeys(AppPalette):
             job = self.selected_job()
             if job and job.get("running"):
                 await self.cancel_job(job["name"])
+        elif key == "p":
+            # toggle; inert against an older daemon whose /jobs payload
+            # has no "paused" key
+            job = self.selected_job()
+            if job and "paused" in job:
+                if job.get("paused"):
+                    await self.resume_job(job["name"])
+                else:
+                    await self.pause_job(job["name"])
         elif key == "c":
             job = self.selected_job()
             if job:
@@ -4315,7 +4434,15 @@ class AppRender(AppKeys):
         monitored = any(
             j.get("running_resources") is not None for j in self.jobs
         )
-        layout: List[Tuple[str, int]] = [("status", 11), ("name", 24)]
+        # the OVERDUE badge / the "⏸ til HH:MM" cell want a wider column,
+        # but only as a bonus paid out of leftover slack below: neither is
+        # allowed to price a whole droppable column off the board
+        overdue = any(sla_overdue(j) for j in self.jobs)
+        paused = any(j.get("paused") for j in self.jobs)
+        layout: List[Tuple[str, int]] = [
+            ("status", 11),
+            ("name", 24),
+        ]
         if not compact:
             layout.append(("schedule", 14))
         layout += [("last", 10), ("next", 8), ("dur", 8)]
@@ -4336,8 +4463,24 @@ class AppRender(AppKeys):
                     layout.pop(idx)
                     total -= width + 1
                     break
-        # the name and command columns flex into whatever is left
         slack = cols - (sum(w for _, w in layout) + len(layout))
+        # pay the badge/pause bonuses out of that slack, cheapest first:
+        # the pause cell's content is a timestamp that only reads whole,
+        # while the status cell keeps its fixed-width OVERDUE badge and
+        # squeezes the label beside it, so a partial payout still aligns
+        for col, want in (
+            ("next", 4 if paused else 0),
+            ("status", 8 if overdue else 0),
+        ):
+            if want <= 0 or slack <= 0:
+                continue
+            for idx, (c, width) in enumerate(layout):
+                if c == col:
+                    take = min(want, slack)
+                    layout[idx] = (c, width + take)
+                    slack -= take
+                    break
+        # the name and command columns flex into whatever is left
         if slack > 0:
             names = [
                 i for i, (c, _) in enumerate(layout) if c in ("cmd", "name")
@@ -4405,6 +4548,7 @@ class AppRender(AppKeys):
             "run": "run",
             "pending": "pending",
             "disabled": "off",
+            "paused": "off",
             "cancelled": "off",
             "unknown": "pending",
         }[key]
@@ -4414,14 +4558,18 @@ class AppRender(AppKeys):
         for col, width in layout:
             if col == "status":
                 text = "%s %s" % (paint.glyph(key, ascii_mode), label)
-                cells.append(
-                    paint.style(
-                        pad_to(text, width),
-                        color,
-                        bg=bg,
-                        bold=key in ("fail", "run"),
-                    )
+                overdue = sla_overdue(job)
+                cell = paint.style(
+                    pad_to(text, width - 8 if overdue else width),
+                    color,
+                    bg=bg,
+                    bold=key in ("fail", "run"),
                 )
+                if overdue:
+                    cell += paint.style(
+                        pad_to(" OVERDUE", 8), "fail", bg=bg, bold=True
+                    )
+                cells.append(cell)
             elif col == "name":
                 flash = job.get("name") in self.just_failed
                 cells.append(
@@ -4461,10 +4609,21 @@ class AppRender(AppKeys):
                         )
                     )
             elif col == "next":
+                paused = job.get("paused")
                 if job.get("running"):
                     text = "· · ·"
                 elif not job.get("enabled"):
                     text = "—"
+                elif paused:
+                    until = (
+                        paused.get("until")
+                        if isinstance(paused, dict)
+                        else None
+                    )
+                    text = "%s %s" % (
+                        paint.glyph("paused", ascii_mode),
+                        fmt_til(until),
+                    )
                 else:
                     text = fmt_in(self.next_run_seconds(job))
                 cells.append(paint.style(pad_to(text, width), "fg", bg=bg))
@@ -4528,7 +4687,7 @@ class AppRender(AppKeys):
 
     def render_footer(self, paint: Painter, cols: int) -> str:
         hints = (
-            "j/k move · enter open · r run · x cancel · c copy · "
+            "j/k move · enter open · r run · x cancel · p pause · c copy · "
             "/ filter · g refresh · t theme · i incident · w wallboard · "
             "ctrl+k palette · ? help · q quit"
         )
@@ -4597,6 +4756,7 @@ class AppRender(AppKeys):
                     "run": "run",
                     "pending": "pending",
                     "disabled": "off",
+                    "paused": "off",
                     "cancelled": "off",
                     "unknown": "pending",
                 }[key]
@@ -4609,6 +4769,16 @@ class AppRender(AppKeys):
                     line2 = fmt_ago(last.get("finished_at"))
                     if key == "fail" and last.get("exit_code") is not None:
                         line2 += " · exit %s" % last["exit_code"]
+                elif key == "paused":
+                    paused = job.get("paused")
+                    line2 = "%s %s" % (
+                        paint.glyph("paused", ascii_mode),
+                        fmt_til(
+                            paused.get("until")
+                            if isinstance(paused, dict)
+                            else None
+                        ),
+                    )
                 elif not job.get("enabled"):
                     line2 = "—"
                 else:
@@ -4617,6 +4787,8 @@ class AppRender(AppKeys):
                         if stale
                         else fmt_in(self.next_run_seconds(job))
                     )
+                if sla_overdue(job):
+                    line2 += " · OVERDUE"
                 dim_all = stale
                 lines3[0].append(
                     paint.style(
@@ -4716,6 +4888,7 @@ HELP_ROWS = [
     ("Enter", "Open selected job"),
     ("r", "Run selected job"),
     ("x", "Cancel selected (running) job"),
+    ("p", "Pause or resume selected job"),
     ("c", "Copy selected command"),
     ("g", "Refresh now"),
     ("t", "Cycle theme"),
@@ -4951,17 +5124,8 @@ class AppOverlays(AppRender):
         for idx, entry in enumerate(entries[start : start + visible]):
             name, fin, outcome, exit_code, reason, duration = entry
             selected = start + idx == self.timeline_sel
-            key = {
-                "failure": "fail",
-                "cancelled": "cancelled",
-                "unknown": "unknown",
-            }.get(outcome, "ok")
-            color = {
-                "fail": "fail",
-                "cancelled": "off",
-                "unknown": "pending",
-                "ok": "ok",
-            }[key]
+            key = outcome_key(outcome)
+            color = OUTCOME_COLOR[key]
             line = "%s %s %s" % (
                 pad_to(fmt_ago(fin), 9),
                 paint.glyph(key, ascii_mode),
@@ -5497,28 +5661,20 @@ class AppOverlays(AppRender):
                     )
                 elif cell.get("last"):
                     outcome = str((cell["last"] or {}).get("outcome", ""))
-                    key = {
-                        "failure": "fail",
-                        "cancelled": "cancelled",
-                        "unknown": "unknown",
-                    }.get(outcome, "ok")
+                    key = outcome_key(outcome)
                     label = {
                         "success": "ok",
                         "failure": "fail",
                         "cancelled": "cancel",
                         "unknown": "lost",
+                        "skipped": "skip",
                     }.get(outcome, outcome[:6])
                     text = "%s %s %s" % (
                         paint.glyph(key, ascii_mode),
                         label,
                         ago_short((cell["last"] or {}).get("finished_at")),
                     )
-                    color = {
-                        "fail": "fail",
-                        "cancelled": "off",
-                        "unknown": "pending",
-                        "ok": "ok",
-                    }[key]
+                    color = OUTCOME_COLOR[key]
                 elif cell.get("enabled") is False:
                     text, color = (
                         paint.glyph("disabled", ascii_mode) + " off",
@@ -5569,7 +5725,20 @@ class AppOverlays(AppRender):
         )
         for name in names[self.panel_scroll : self.panel_scroll + visible]:
             runs = self.heat_data.get(name, [])
-            cells: List[Tuple[int, str]] = [(0, "ok") for _ in range(buckets)]
+            # "skipped" seeds the bucket and ranks below "ok": an hour that
+            # only ever held slots back for a pause must not shade green,
+            # but one real success in it outranks any number of holds. An
+            # empty bucket paints a blank shade, so its seed never shows.
+            rank = {
+                "skipped": 0,
+                "ok": 1,
+                "unknown": 2,
+                "cancelled": 3,
+                "fail": 4,
+            }
+            cells: List[Tuple[int, str]] = [
+                (0, "skipped") for _ in range(buckets)
+            ]
             for run in runs:
                 t = parse_iso(run.get("finished_at"))
                 if t is None:
@@ -5579,26 +5748,14 @@ class AppOverlays(AppRender):
                     continue
                 idx = buckets - 1 - int(age_h)
                 count, worst = cells[idx]
-                outcome = str(run.get("outcome", ""))
-                rank = {"ok": 0, "unknown": 1, "cancelled": 2, "fail": 3}
-                key = {
-                    "failure": "fail",
-                    "cancelled": "cancelled",
-                    "unknown": "unknown",
-                }.get(outcome, "ok")
-                if rank.get(key, 0) >= rank.get(worst, 0):
+                key = outcome_key(str(run.get("outcome", "")))
+                if rank[key] >= rank[worst]:
                     worst = key
                 cells[idx] = (count + 1, worst)
             spans = [paint.style(pad_to(" " + truncate(name, 22), 24), "fg")]
             for count, worst in cells:
                 shade = shades[min(len(shades) - 1, count)]
-                color = {
-                    "ok": "ok",
-                    "fail": "fail",
-                    "cancelled": "off",
-                    "unknown": "pending",
-                }[worst]
-                spans.append(paint.style(shade, color))
+                spans.append(paint.style(shade, OUTCOME_COLOR[worst]))
             body.append("".join(spans))
         if not names:
             body.append(paint.style("  gathering run history…", "dim"))
@@ -5991,6 +6148,7 @@ class AppDrawers(AppOverlays):
             "run": "run",
             "pending": "pending",
             "disabled": "off",
+            "paused": "off",
             "cancelled": "off",
             "unknown": "pending",
         }[key]
@@ -6005,6 +6163,30 @@ class AppDrawers(AppOverlays):
             )
             + paint.style("  %s" % label, "dim")
             + paint.style("   r run · x cancel · esc close", "dim"),
+        ]
+        paused = job.get("paused")
+        if paused:
+            bits = [
+                "paused %s"
+                % fmt_til(
+                    paused.get("until") if isinstance(paused, dict) else None
+                )
+            ]
+            if isinstance(paused, dict):
+                # note/by are free-form operator text straight off the API
+                if paused.get("note"):
+                    bits.append(oneline(paused["note"]))
+                if paused.get("by"):
+                    bits.append("by %s" % oneline(paused["by"]))
+            rows.append(
+                " "
+                + paint.style(
+                    "%s %s"
+                    % (paint.glyph("paused", ascii_mode), " · ".join(bits)),
+                    "warn",
+                )
+            )
+        rows += [
             self._tabs_row(paint, self.DRAWER_TABS, self.drawer_tab),
             paint.hline(width - 2),
         ]
@@ -6180,17 +6362,8 @@ class AppDrawers(AppOverlays):
         )
         for run in runs[self.panel_scroll : self.panel_scroll + available]:
             outcome = str(run.get("outcome", ""))
-            key = {
-                "failure": "fail",
-                "cancelled": "cancelled",
-                "unknown": "unknown",
-            }.get(outcome, "ok")
-            color = {
-                "fail": "fail",
-                "cancelled": "off",
-                "unknown": "pending",
-                "ok": "ok",
-            }[key]
+            key = outcome_key(outcome)
+            color = OUTCOME_COLOR[key]
             dur = run.get("duration")
             bar_w = 12
             bar = ""

@@ -14,7 +14,7 @@ jobs:
 
 ## Why a hash and not jitter
 
-Random jitter also spreads load, but it destroys the question a monitoring product must answer: "was this run late?" A randomly jittered job has no fixed expected time, so lateness is undefined. A hashed slot is a pure function of the job name: it survives restarts, config reloads, and re-deploys, and it is identical on every replica of the same config. The job fires at the same minute today, tomorrow, and on the standby node, so [late-run detection](Failure-Detection-and-Retries), `scheduled_in` countdowns, and the dashboards' next-fire previews all keep working.
+Random jitter also spreads load, but it destroys the question a monitoring product must answer: "was this run late?" A randomly jittered job has no fixed expected time, so lateness is undefined. A hashed slot is a pure function of the job name: it survives restarts, config reloads, and re-deploys, and it is identical on every replica of the same config. The job fires at the same minute today, tomorrow, and on the standby node, so [late-run detection](Late-Run-Detection), `scheduled_in` countdowns, and the dashboards' next-fire previews all keep working.
 
 The cost of that predictability: **renaming a job re-hashes its slots** (the name is the seed), and in a [classic crontab file](Classic-Crontabs), where names embed the line number, inserting a line above an `H` entry moves it the same way.
 

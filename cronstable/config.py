@@ -323,6 +323,31 @@ DEFAULT_WEBHOOK_BODY_TEMPLATE = (
     + "{% endfilter %}}"
 )
 
+# Defaults for the onLate report block: an SLA breach has no run outcome, so
+# the completed/failed wording of the standard templates does not apply.
+DEFAULT_LATE_SUBJECT_TEMPLATE = (
+    "Cron job '{{name}}' is overdue ({{sla_check}})"
+)
+
+DEFAULT_LATE_BODY_TEMPLATE = """
+SLA check: {{sla_check}}
+Threshold: {{threshold_seconds}} seconds
+Observed: {{observed_seconds}} seconds
+{% if last_success_at -%}
+Last success: {{last_success_at}}
+{% else -%}
+Last success: (none recorded)
+{% endif %}
+"""
+
+DEFAULT_LATE_WEBHOOK_BODY_TEMPLATE = (
+    '{"text": {% filter tojson %}'
+    + DEFAULT_LATE_SUBJECT_TEMPLATE
+    + "\n"
+    + DEFAULT_LATE_BODY_TEMPLATE
+    + "{% endfilter %}}"
+)
+
 # Named (not inlined below) because cronstable.fingerprint compares against it
 # to keep the reporter timeout out of a job's identity while it holds the
 # default -- see canonical_job's omit-when-default rule.
@@ -448,6 +473,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "onPermanentFailure": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
     "onSuccess": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
+    # per-job SLA thresholds (seconds), each independent and off (None) until
+    # set: staleness (time since last success), lateness (a due slot that has
+    # not started) and overrun (a run still going). Evaluated once per minute
+    # by the in-process monitor (cronstable.cron); breaches fire onLate.
+    "sla": {
+        "maxTimeSinceSuccessSeconds": None,
+        "lateAfterSeconds": None,
+        "maxRuntimeSeconds": None,
+    },
+    "onLate": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
     "environment": [],
     # run-scoped secrets staged for the job over the loopback endpoint; each is
     # {name, value|fromFile|fromEnvVar}. Resolved fresh per run, never durably
@@ -466,6 +501,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "streamPrefix": "[{job_name} {stream_name}] ",
     "enabled": True,
 }
+
+# An SLA breach has no run to report on, so the onLate defaults swap the
+# standard completed/failed wording for the overdue templates and give
+# breaches their own sentry grouping (never folded into run failures).
+# _REPORT_DEFAULTS itself stays untouched: a new key there would enter every
+# job's report block and shift fingerprints (see cronstable.fingerprint).
+_late_report = DEFAULT_CONFIG["onLate"]["report"]
+_late_report["mail"]["subject"] = DEFAULT_LATE_SUBJECT_TEMPLATE
+_late_report["mail"]["body"] = DEFAULT_LATE_BODY_TEMPLATE
+_late_report["webhook"]["body"] = DEFAULT_LATE_WEBHOOK_BODY_TEMPLATE
+_late_report["sentry"]["fingerprint"] = ["cronstable", "sla", "{{ name }}"]
+del _late_report
 
 
 _report_schema = Map(
@@ -588,6 +635,14 @@ _job_defaults_common = {
     ),
     Opt("onPermanentFailure"): Map({Opt("report"): _report_schema}),
     Opt("onSuccess"): Map({Opt("report"): _report_schema}),
+    Opt("sla"): Map(
+        {
+            Opt("maxTimeSinceSuccessSeconds"): EmptyNone() | Int(),
+            Opt("lateAfterSeconds"): EmptyNone() | Int(),
+            Opt("maxRuntimeSeconds"): EmptyNone() | Int(),
+        }
+    ),
+    Opt("onLate"): Map({Opt("report"): _report_schema}),
     Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
     # run-scoped secrets: each is resolved fresh per run and served
     # to the job over the loopback endpoint (`cronstable
@@ -1210,6 +1265,9 @@ class JobConfig:
         "onFailure",
         "onPermanentFailure",
         "onSuccess",
+        "sla",
+        "has_sla",
+        "onLate",
         "env_file",
         "environment",
         "secrets",
@@ -1247,7 +1305,9 @@ class JobConfig:
         # depends on a durable state backend, not a property of "which jobs run
         # on which schedule", so it does not gate leader-election drift and
         # needs no SCHEME_VERSION bump.  The same goes for the archival pair
-        # (observability, not behaviour).  onlyIfLastSucceeded is different:
+        # (observability, not behaviour) and for sla/onLate (alerting-only:
+        # thresholds and late reports never change what runs or when).
+        # onlyIfLastSucceeded is different:
         # it gates EVERY scheduled fire, so it IS fingerprinted, like
         # `enabled` -- replicas disagreeing on it must show as drift.
         self.onMissed = config.pop("onMissed")
@@ -1308,6 +1368,12 @@ class JobConfig:
         self.onFailure = config.pop("onFailure")
         self.onPermanentFailure = config.pop("onPermanentFailure")
         self.onSuccess = config.pop("onSuccess")
+        self.sla = config.pop("sla")
+        # True iff any sla threshold is set: lets the per-minute monitor skip
+        # the whole evaluation for a job with no check, without re-deriving it
+        # from the sla dict each pass (see cronstable.cron.Cron._sla_periodic).
+        self.has_sla = any(v is not None for v in self.sla.values())
+        self.onLate = config.pop("onLate")
 
         self.env_file = config.pop("env_file")
         self.environment = config.pop("environment")
@@ -1529,6 +1595,35 @@ class JobConfig:
             require(
                 self.executionTimeout > 0,
                 "executionTimeout must be > 0 when set",
+            )
+        for key in (
+            "maxTimeSinceSuccessSeconds",
+            "lateAfterSeconds",
+            "maxRuntimeSeconds",
+        ):
+            if self.sla.get(key) is not None:
+                require(
+                    self.sla[key] > 0,
+                    "sla.{} must be > 0 when set".format(key),
+                )
+        if all(v is None for v in self.sla.values()):
+            # a reporter left at its all-None defaults is not "configured";
+            # only an onLate that would actually fire demands an sla block.
+            report = self.onLate.get("report") or {}
+            sentry_dsn = (report.get("sentry") or {}).get("dsn") or {}
+            mail = report.get("mail") or {}
+            shell = report.get("shell") or {}
+            webhook_url = (report.get("webhook") or {}).get("url") or {}
+            secret_keys = ("value", "fromFile", "fromEnvVar")
+            require(
+                not (
+                    any(sentry_dsn.get(k) is not None for k in secret_keys)
+                    or mail.get("to") is not None
+                    or mail.get("from") is not None
+                    or shell.get("command") is not None
+                    or any(webhook_url.get(k) is not None for k in secret_keys)
+                ),
+                "onLate requires sla",
             )
         retry = self.onFailure.get("retry")
         if retry is not None:

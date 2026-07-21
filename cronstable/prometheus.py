@@ -13,8 +13,9 @@ Split of responsibilities:
 * :class:`PrometheusMetrics` (one instance, owned by ``Cron`` so it
   survives web-app restarts and cluster-manager rebuilds) accumulates the
   monotonic state that cannot be derived at scrape time: run outcomes,
-  duration histograms, retry/permanent-failure counts, config-reload
-  results, and leadership/quorum transition counts.
+  duration histograms, retry/permanent-failure counts, SLA breach counts,
+  config-reload results, and leadership/quorum transition counts, plus the
+  pause and SLA-latch gauge state the scheduler pushes as it changes.
 * Everything else -- per-job enabled/running/next-run gauges, last-run
   summaries, and the whole cluster block -- is read live from the ``Cron``
   object at scrape time, from the same state that backs the JSON API
@@ -73,8 +74,10 @@ DEFAULT_DURATION_BUCKETS = (
 # The run outcomes _record_run can produce (see cron.JobRunInfo). Emitted
 # zero-filled for every job so alert expressions like
 # increase(cronstable_job_runs_total{status="failure"}[1h]) see the series from
-# the first scrape, not only after the first failure.
-RUN_OUTCOMES = ("success", "failure", "cancelled")
+# the first scrape, not only after the first failure. "skipped" is the
+# synthetic ledger row a paused job writes in place of a launch; it stamps
+# neither last-outcome timestamp.
+RUN_OUTCOMES = ("success", "failure", "cancelled", "skipped")
 
 # Mirror of the per-peer STATUS_* constants in cronstable.cluster (a documented
 # API surface: the /cluster payload and its wiki table). Kept as literals so
@@ -255,6 +258,9 @@ class _JobMetrics:
         "cpu_system_sum",
         "cpu_count",
         "max_rss_observed",
+        "paused",
+        "sla_late",
+        "sla_breaches",
     )
 
     def __init__(self, n_buckets: int) -> None:
@@ -277,6 +283,34 @@ class _JobMetrics:
         self.cpu_count = 0
         # high-water peak RSS across every monitored run of this job (bytes).
         self.max_rss_observed = 0
+        # runtime pause flag, pushed by the scheduler on pause/resume/
+        # auto-expire/rehydrate (not derived at scrape time).
+        self.paused = False
+        # SLA latch state and breach counts, keyed by check name. sla_late
+        # holds the current 0/1 latch per check; sla_breaches counts
+        # ok-to-breached transitions and rides the counter snapshot.
+        self.sla_late: Dict[str, int] = {}
+        self.sla_breaches: Dict[str, int] = {}
+
+
+def _seed_counter_map(target: Dict[str, int], raw: Any) -> None:
+    """ADD a persisted ``{key: count}`` mapping into a live counter dict.
+
+    Shared by the outcome counters and the SLA breach counters, whose
+    snapshot shape is identical.  Anything not a string key mapped to a
+    positive non-bool int is skipped field by field: a corrupt or foreign
+    snapshot degrades to fewer seeded counters, never to an exception.
+    """
+    if not isinstance(raw, dict):
+        return
+    for key, count in raw.items():
+        if (
+            isinstance(key, str)
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+        ):
+            target[key] = target.get(key, 0) + count
 
 
 class PrometheusMetrics:
@@ -376,6 +410,20 @@ class PrometheusMetrics:
     def job_permanent_failure(self, name: str) -> None:
         self._job(name).permanent_failures += 1
 
+    def job_pause_state(self, name: str, paused: bool) -> None:
+        self._job(name).paused = paused
+
+    def job_sla_late(self, name: str, check: str, late: bool) -> None:
+        job = self._job(name)
+        job.sla_late[check] = 1 if late else 0
+        # A tracked check implies the breach counter series: zero-fill it so
+        # increase() sees the series before the first breach ever fires.
+        job.sla_breaches.setdefault(check, 0)
+
+    def job_sla_breach(self, name: str, check: str) -> None:
+        job = self._job(name)
+        job.sla_breaches[check] = job.sla_breaches.get(check, 0) + 1
+
     def config_parse(self, ok: bool) -> None:
         self._last_reload_ok = ok
         if ok:
@@ -418,6 +466,7 @@ class PrometheusMetrics:
                 "cpu_system_sum": job.cpu_system_sum,
                 "cpu_count": job.cpu_count,
                 "max_rss_observed": job.max_rss_observed,
+                "sla_breaches": dict(job.sla_breaches),
             }
         return {"buckets": list(self._buckets), "jobs": jobs}
 
@@ -454,16 +503,8 @@ class PrometheusMetrics:
             if name not in keep_set or not isinstance(data, dict):
                 continue
             job = self._job(name)
-            runs = data.get("runs")
-            if isinstance(runs, dict):
-                for outcome, count in runs.items():
-                    if (
-                        isinstance(outcome, str)
-                        and isinstance(count, int)
-                        and not isinstance(count, bool)
-                        and count > 0
-                    ):
-                        job.runs[outcome] = job.runs.get(outcome, 0) + count
+            _seed_counter_map(job.runs, data.get("runs"))
+            _seed_counter_map(job.sla_breaches, data.get("sla_breaches"))
             for attr in ("retries", "permanent_failures", "start_failures"):
                 value = data.get(attr)
                 if (
@@ -815,6 +856,24 @@ class PrometheusMetrics:
             "Highest resident-set size observed across the job's "
             "resource-monitored runs (requires monitorResources).",
         )
+        paused = MetricFamily(
+            "cronstable_job_paused",
+            "gauge",
+            "Whether the job is currently paused at runtime.",
+        )
+        late = MetricFamily(
+            "cronstable_job_late",
+            "gauge",
+            "Whether the job's SLA check is currently breached, by check "
+            "(absent unless the job has an sla block; paused jobs are "
+            "exempt).",
+        )
+        sla_breaches = MetricFamily(
+            "cronstable_job_sla_breaches",
+            "counter",
+            "SLA breaches detected for the job, by check "
+            "(absent unless the job has an sla block).",
+        )
         for name in sorted(self._jobs):
             job = self._jobs[name]
             labels = {"job_name": name}
@@ -860,6 +919,18 @@ class PrometheusMetrics:
                 last_success.add(labels, job.last_success_time)
             if job.last_failure_time is not None:
                 last_failure.add(labels, job.last_failure_time)
+            paused.add(labels, 1 if job.paused else 0)
+            # SLA series appear only once the monitor tracks a check for the
+            # job (conditional emission, like the CPU counters above).
+            for check in sorted(job.sla_late):
+                late.add(
+                    {"job_name": name, "check": check}, job.sla_late[check]
+                )
+            for check in sorted(job.sla_breaches):
+                sla_breaches.add(
+                    {"job_name": name, "check": check},
+                    job.sla_breaches[check],
+                )
 
         info = MetricFamily(
             "cronstable_job",
@@ -979,8 +1050,11 @@ class PrometheusMetrics:
             last_failure,
             cpu_seconds,
             peak_rss,
+            sla_breaches,
             info,
             enabled,
+            paused,
+            late,
             running,
             next_run,
             last_run_time,

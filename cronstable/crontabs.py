@@ -81,7 +81,21 @@ _ENV_LINE = re.compile(
 # comment if honoured as separators, and confusing the shell if passed
 # through.  Refusing with a file:line error follows the module's documented
 # bias: refuse rather than half-imitate.
-_CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
+# Built from explicit code points rather than literal ``x-y`` ranges: a
+# range spanning CR (0x0d) reads to static analysers (CodeQL
+# py/overly-large-range) as a possible typo, and enumerating the points
+# keeps the TAB/LF carve-out visible at the spot the class is defined.
+_REFUSED_CONTROLS = (
+    # C0 controls, minus TAB (0x09) and LF (0x0a)
+    [c for c in range(0x00, 0x20) if c not in (0x09, 0x0A)]
+    # DEL and the C1 controls
+    + list(range(0x7F, 0xA0))
+    # the Unicode line/paragraph separators
+    + [0x2028, 0x2029]
+)
+_CONTROL_CHARS = re.compile(
+    "[" + "".join(chr(c) for c in _REFUSED_CONTROLS) + "]"
+)
 
 
 def _physical_lines(data: str) -> List[str]:

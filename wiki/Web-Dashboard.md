@@ -51,7 +51,7 @@ click either chip to copy the value), a live UTC clock, a **node meter**, a
 **connection indicator** (`live` when the server is responding, `no signal`
 when polls are failing; hover it to see how long ago the last successful
 response arrived), and **summary pills** counting the total jobs and how many
-are running, failing, and OK.
+are running, failing, paused, and OK.
 
 The **node meter** shows this node's live CPU and memory bars (polled from
 [`GET /node`](HTTP-API#get-node); it stays hidden when the host can't be
@@ -65,15 +65,15 @@ Each row shows:
 
 | Column | What it shows |
 | --- | --- |
-| **Status** | The job's current health: one of **Running**, **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`), each with a color and glyph. |
+| **Status** | The job's current health: one of **Running**, **Paused** (a [runtime pause](Pausing-Jobs), glyph `⏸`), **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`), each with a color and glyph. A job [late on an SLA check](Late-Run-Detection) additionally carries an **OVERDUE** badge, independent of its status. |
 | **Job** | The job `name` and its command. |
 | **Owner** | *(cluster only, under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load))* the node that currently **owns** the job. The jobs owned by the node you're viewing are highlighted in the accent color, so you can see at a glance which work lands here; `EveryNode` jobs read **all nodes**, and a `Leader` job with no quorum reads **no quorum**. The column is hidden entirely outside spread mode. Sortable, so you can group jobs by node. |
 | **Schedule** | The raw schedule string; hover it for a plain-English reading. |
 | **Last run** | How long ago the last run finished (kept fresh every second) and an exit-code badge. |
 | **Took** | The last run's duration. |
-| **Next** | A live countdown to the next scheduled run (`—` while running or disabled). |
-| **Trend** | A **sparkline** of recent runs: one bar per run, height by duration, colored by outcome. |
-| **Actions** | One-click **Run** (or **Stop**, for a running job) and **Logs**. |
+| **Next** | A live countdown to the next scheduled run (`—` while running, paused, or disabled). |
+| **Trend** | A **sparkline** of recent runs: one bar per run, height by duration, colored by outcome (pause-skipped slots paint neutral, not green). |
+| **Actions** | One-click **Run** (or **Stop**, for a running job), **Pause** (or **Resume**, for a paused job), and **Logs**. |
 
 The **⊞ cols** button in the table header opens a column picker, so you can
 trim the table down or add columns that are off by default (the choice is
@@ -94,6 +94,23 @@ The toolbar above the table lets you:
 - narrow by status with the **all / ok / fail / run / off** segmented control;
 - **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header, including the optional columns; clicking again reverses);
 - **run every failing job at once** with the **run failing** button.
+
+### Paused and overdue jobs
+
+A [paused](Pausing-Jobs) job shows the **Paused** status with a `⏸` chip
+naming the pause expiry and note, counts into its own summary pill and
+wallboard tile, and shows `—` in the **Next** column while its slots are
+being skipped. Pausing from the dashboard is one click (the row or drawer
+button, the palette, or the `p` key, which toggles pause/resume on the
+selected job) and takes the default one-hour window; the drawer's meta line
+shows "paused until ... by ...". Longer or annotated pauses go through the
+[HTTP API](HTTP-API#post-jobsnamepause).
+
+A job whose [SLA check](Late-Run-Detection) is breached carries an
+**OVERDUE** badge on its row, drawer, and wallboard tile, independent of its
+status: a job can be OK by its last run and still overdue for its next one.
+The row badge names the breached checks in its tooltip; the drawer header
+spells them out beside the badge.
 
 ## The job drawer
 
@@ -591,6 +608,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 | `Enter` | Open the selected job |
 | `r` | Run the selected job |
 | `x` | Cancel the selected (running) job |
+| `p` | Pause or resume the selected job |
 | `c` | Copy the selected job's command |
 | `g` | Refresh now |
 | `t` | Cycle the theme |
@@ -693,6 +711,8 @@ replays output buffered by the current process.
 - [Terminal Dashboard](Terminal-Dashboard): `cronstable tui`, this dashboard's TUI sibling — the same board and the same shortcuts, rendered in a terminal over the same API.
 - [MCP](MCP): the third frontend — the same daemon, for AI agents.
 - [HTTP Control API](HTTP-API): the REST endpoints, configuration schema, authentication, and Unix-socket options the dashboard is built on.
+- [Pausing Jobs](Pausing-Jobs): the runtime pause behind the `⏸` chip and the `p` key.
+- [Late-Run Detection](Late-Run-Detection): the `sla:` monitor behind the OVERDUE badge.
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the cluster panel, per-job `clusterPolicy`, and the `GET /cluster` view it polls.
 - [Orchestration and DAGs](Orchestration-and-DAGs): the `dags:` semantics behind the [DAG card and drawer](#dag-orchestration).
 - [Durable State](Durable-State): the store the [state inspector](#durable-state-inspector) inventories, and what rehydrates run history across restarts.

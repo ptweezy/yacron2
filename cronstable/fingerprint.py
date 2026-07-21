@@ -232,9 +232,10 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
         "enabled": job.enabled,
         # gates every scheduled fire (like `enabled`), so replicas that
         # disagree on it must show as drift.  The catch-up trio
-        # (onMissed/startingDeadlineSeconds/catchupJitterSeconds) and the
-        # archival pair stay excluded: restart-time / observability-only,
-        # node-local behaviour (see cronstable.config.JobConfig.__init__).
+        # (onMissed/startingDeadlineSeconds/catchupJitterSeconds), the
+        # archival pair and the sla/onLate pair stay excluded: restart-time,
+        # observability-only or alerting-only behaviour that never changes
+        # what runs or when (see cronstable.config.JobConfig.__init__).
         "onlyIfLastSucceeded": job.onlyIfLastSucceeded,
         "failsWhen": job.failsWhen,
         "onFailure": _redact_action(job.onFailure),

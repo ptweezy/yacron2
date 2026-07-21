@@ -15,7 +15,7 @@ import sys
 
 from cronstable import mcp as mcp_mod
 from cronstable.config import _build_mcp_config, parse_config_string
-from cronstable.cron import Cron, JobRunInfo
+from cronstable.cron import PAUSE_DEFAULT_SECONDS, Cron, JobRunInfo
 from cronstable.job import JobOutputStream
 from cronstable.mcp import MCPHandler
 from cronstable.resources import ResourceUsage
@@ -495,6 +495,122 @@ async def test_cancel_job_not_running_is_tool_error():
     )
     assert result["isError"] is True
     assert "not running" in result["content"][0]["text"]
+
+
+async def test_pause_job_confirm_gate_and_success():
+    h = _handler()
+    result = await _call(h, "cron_pause_job", {"name": "hello"})
+    assert result["isError"] is True  # confirm missing
+    assert "hello" not in h._cron._paused
+    result = await _call(
+        h,
+        "cron_pause_job",
+        {
+            "name": "hello",
+            "durationSeconds": 120,
+            "note": "db migration",
+            "confirm": True,
+        },
+    )
+    body = result["structuredContent"]
+    assert body["paused"] == "hello"
+    assert body["until"] in result["content"][0]["text"]
+    info = h._cron._paused["hello"]
+    assert (info.by, info.channel) == ("mcp", "mcp")
+    assert info.note == "db migration"
+    assert (info.until - info.since).total_seconds() == 120
+
+
+async def test_pause_job_default_duration():
+    h = _handler()
+    result = await _call(
+        h, "cron_pause_job", {"name": "hello", "confirm": True}
+    )
+    assert result["structuredContent"]["paused"] == "hello"
+    info = h._cron._paused["hello"]
+    assert (
+        info.until - info.since
+    ).total_seconds() == PAUSE_DEFAULT_SECONDS
+
+
+async def test_pause_job_unknown_and_bad_duration():
+    h = _handler()
+    result = await _call(
+        h, "cron_pause_job", {"name": "ghost", "confirm": True}
+    )
+    assert result["isError"] is True
+    assert "not found" in result["content"][0]["text"]
+    result = await _call(
+        h,
+        "cron_pause_job",
+        {"name": "hello", "durationSeconds": 0, "confirm": True},
+    )
+    assert result["isError"] is True
+    assert "between 1 and" in result["content"][0]["text"]
+    result = await _call(
+        h,
+        "cron_pause_job",
+        {"name": "hello", "durationSeconds": "soon", "confirm": True},
+    )
+    assert result["isError"] is True
+    assert "integer" in result["content"][0]["text"]
+    assert "hello" not in h._cron._paused  # no rejected call took effect
+
+
+async def test_resume_job_confirm_gate_clears_pause_and_noops():
+    h = _handler()
+    await _call(h, "cron_pause_job", {"name": "hello", "confirm": True})
+    result = await _call(h, "cron_resume_job", {"name": "hello"})
+    assert result["isError"] is True  # confirm missing
+    assert "hello" in h._cron._paused
+    result = await _call(
+        h, "cron_resume_job", {"name": "hello", "confirm": True}
+    )
+    assert result["structuredContent"] == {"resumed": "hello"}
+    assert "hello" not in h._cron._paused
+    # resuming an unpaused job is still a success (idempotent no-op)
+    result = await _call(
+        h, "cron_resume_job", {"name": "hello", "confirm": True}
+    )
+    assert result["structuredContent"] == {"resumed": "hello"}
+    result = await _call(
+        h, "cron_resume_job", {"name": "ghost", "confirm": True}
+    )
+    assert result["isError"] is True
+    assert "not found" in result["content"][0]["text"]
+
+
+_SLA_YAML = _YAML + """\
+  - name: watched
+    command: echo hi
+    schedule: "0 * * * *"
+    sla:
+      lateAfterSeconds: 60
+"""
+
+
+async def test_observe_payloads_carry_paused_and_sla():
+    # the shared payload builder's new fields must reach the observe tools
+    # untouched (no tool-side field filtering)
+    h = _handler(yaml=_SLA_YAML)
+    await _call(
+        h,
+        "cron_pause_job",
+        {"name": "hello", "note": "window", "confirm": True},
+    )
+    result = await _call(h, "cron_get_job", {"name": "hello"})
+    paused = result["structuredContent"]["paused"]
+    assert (paused["by"], paused["channel"]) == ("mcp", "mcp")
+    assert paused["note"] == "window"
+    result = await _call(h, "cron_get_job", {"name": "watched"})
+    sla = result["structuredContent"]["sla"]
+    assert sla["thresholds"] == {"lateAfterSeconds": 60}
+    assert sla["state"] == "ok"
+    result = await _call(h, "cron_list_jobs")
+    rows = {r["name"]: r for r in result["structuredContent"]["jobs"]}
+    assert rows["hello"]["paused"] is not None
+    assert rows["watched"]["paused"] is None
+    assert "sla" in rows["watched"]
 
 
 # ---------------------------------------------------------------------------

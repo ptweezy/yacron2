@@ -198,6 +198,8 @@ async def test_default_lists_observe_readonly_only():
     # no dag/state/mutating tools in the default profile
     assert not any(n.startswith("cron_list_dags") for n in names)
     assert "cron_run_job" not in names
+    assert "cron_pause_job" not in names
+    assert "cron_resume_job" not in names
     assert "cron_inspect_state" not in names
 
 
@@ -206,6 +208,8 @@ async def test_mutating_tools_absent_under_readonly():
     names = await _tool_names(h)
     assert "cron_run_job" not in names
     assert "cron_cancel_job" not in names
+    assert "cron_pause_job" not in names
+    assert "cron_resume_job" not in names
     assert "cron_trigger_dag" not in names
     # read DAG tools still present (reads aren't gated by readOnly)
     assert "cron_list_dags" in names
@@ -219,6 +223,8 @@ async def test_mutating_tools_present_when_writes_enabled():
     for expected in (
         "cron_run_job",
         "cron_cancel_job",
+        "cron_pause_job",
+        "cron_resume_job",
         "cron_trigger_dag",
         "cron_backfill_dag",
         "cron_decide_gate",

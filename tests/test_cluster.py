@@ -22,6 +22,7 @@ from cronstable.cluster import (
     ClusterView,
     _aged_job_summaries,
     _hrw_owner,
+    _hrw_owner_bytes,
     _parse_members,
     _parse_str_list,
     _split_host_port,
@@ -1080,6 +1081,26 @@ def test_elect_job_owner_uses_candidate_names():
     assert withcand == _hrw_owner("job-x", ["b", "a", "c", "d"])
     # quorum gate still on live, regardless of candidate_names
     assert elect_job_owner("job-x", "b", [], 4, ["a"]) is None
+
+
+def test_hrw_owner_bytes_matches_hrw_owner():
+    # The per-poll spread gate elects with the pre-encoded fast path
+    # (_hrw_owner_bytes); it must pick the identical winner as the reference
+    # _hrw_owner(max over (score, name)) for every job/member combination, or
+    # the memoized election in job_owner would silently reassign ownership.
+    member_sets = [
+        ["only-node"],
+        ["node-a", "node-b", "node-c"],
+        ["z", "a", "m", "node-42", "node-7", "node-a"],
+        ["dup", "dup", "other"],  # duplicates must not change the winner
+    ]
+    jobs = ["job-1", "deploy", "x", "a-much-longer-job-name", "unicode-é"]
+    for members in member_sets:
+        member_bytes = [m.encode("utf-8") for m in members]
+        for job in jobs:
+            assert _hrw_owner_bytes(job, members, member_bytes) == _hrw_owner(
+                job, members
+            )
 
 
 @pytest.mark.asyncio

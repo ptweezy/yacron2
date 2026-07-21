@@ -2304,6 +2304,45 @@ async def test_read_xcom_list_non_list_json_is_empty(tmp_path):
         await _teardown(cron)
 
 
+async def test_read_xcom_list_oversized_blob_is_empty(tmp_path, monkeypatch):
+    # A fan-out blob larger than MAX_MAPPED_XCOM_BYTES is refused BEFORE the
+    # blob is fetched/decoded (the OOM guard) and mapped to empty, like the
+    # other definitively-unusable outputs. Shrink the ceiling so a tiny blob
+    # trips it without materialising megabytes in the test.
+    monkeypatch.setattr(dag, "MAX_MAPPED_XCOM_BYTES", 4)
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        scope = dag.xcom_scope("xc", "run-x")
+        await jobstate.artifact_put(
+            cron.state_backend, scope, dag.xcom_name("gen", "items"),
+            b'["a", "b", "c"]',  # 15 bytes > the 4-byte ceiling
+        )
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_read_xcom_list_over_item_cap_returns_unchanged(
+    tmp_path, monkeypatch
+):
+    # Past MAX_MAPPED_ITEMS the list is returned as-is for _apply_expansions to
+    # fail the task; _read_xcom_list must skip the O(len) portability walk here
+    # rather than map to empty. Shrink the cap so a short list trips it.
+    monkeypatch.setattr(dag, "MAX_MAPPED_ITEMS", 3)
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        scope = dag.xcom_scope("xc", "run-x")
+        await jobstate.artifact_put(
+            cron.state_backend, scope, dag.xcom_name("gen", "items"),
+            b"[1, 2, 3, 4, 5]",  # 5 > 3
+        )
+        got = await cron._dag._read_xcom_list("run-x", "xc", "gen", "items")
+        assert got == [1, 2, 3, 4, 5]
+    finally:
+        await _teardown(cron)
+
+
 async def test_read_xcom_list_timeout_is_none(tmp_path, monkeypatch):
     cron = await _make_cron(tmp_path, _XC_YAML)
     try:

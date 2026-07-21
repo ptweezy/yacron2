@@ -218,6 +218,27 @@ async def test_document_absent_reads_none(tmp_path):
     await backend.stop()
 
 
+async def test_artifact_get_max_bytes_refuses_oversized_before_fetch(tmp_path):
+    # The mapped-XCom fan-out OOM guard: artifact_get(max_bytes=...) must refuse
+    # a payload whose recorded size exceeds the budget WITHOUT fetching the
+    # blob, so an upstream that opted out of the publish-time size limit cannot
+    # OOM the daemon during a fan-out read.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await jobstate.artifact_put(backend, "scope", "big", b"x" * 5000)
+    # under budget: the payload comes back as normal.
+    got = await jobstate.artifact_get(backend, "scope", "big", max_bytes=10000)
+    assert got is not None and got[1] == b"x" * 5000
+    # over budget: a 413 is raised from the record's size, before get_blob.
+    with pytest.raises(JobStateError) as excinfo:
+        await jobstate.artifact_get(backend, "scope", "big", max_bytes=100)
+    assert excinfo.value.status == 413
+    # no max_bytes => unchanged behaviour (returns the payload).
+    unbounded = await jobstate.artifact_get(backend, "scope", "big")
+    assert unbounded is not None and unbounded[1] == b"x" * 5000
+    await backend.stop()
+
+
 async def test_document_write_read_roundtrip(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()

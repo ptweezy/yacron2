@@ -39,7 +39,7 @@ import aiohttp
 from aiohttp import web
 
 import cronstable.version
-from cronstable import platform, tlsutil
+from cronstable import _json, platform, tlsutil
 from cronstable.config import (
     ClusterConfig,
     ConfigError,
@@ -149,6 +149,15 @@ CATCHUP_STREAM_KEEP = 8
 # stall job scheduling: past the timeout the read is abandoned (its daemon
 # worker thread is left to the OS) and the caller falls back.
 STATE_OP_TIMEOUT = 10.0
+# Backstop cap on the tracked fire-and-forget durable-write set. Each write is
+# individually bounded by STATE_OP_TIMEOUT (see _track_state_write callers), so
+# a wedged mount already drains the backlog at rate x timeout instead of
+# forever; this cap is the second line of defence for a pathological write rate
+# against a slow store, shedding new best-effort writes rather than letting the
+# set (and its buffered records) grow without bound -> OOM. Sized well above
+# any plausible healthy burst (a whole fleet firing in one slot drains in ms on
+# a live backend), so it only trips when writes are genuinely not completing.
+MAX_PENDING_STATE_WRITES = 8192
 # How long to wait before re-evaluating catch-up when it could not resolve on
 # a pass -- the state backend had not (re)started yet, or the cluster had not
 # converged on an owner.  Keeps the retry off the per-second hot path.
@@ -772,10 +781,40 @@ def command_str(command: Union[str, List[str]]) -> str:
     return command if isinstance(command, str) else " ".join(command)
 
 
+def _json_response(
+    payload: Any,
+    *,
+    status: int = 200,
+    headers: Optional[Any] = None,
+) -> web.Response:
+    """A JSON ``web.Response`` serialized with the orjson-accelerated encoder.
+
+    Drop-in for :func:`aiohttp.web.json_response` on the data endpoints: it
+    serializes with :func:`cronstable._json.dumps_bytes` (orjson when present,
+    several times faster than aiohttp's default ``json.dumps``, and compact
+    separators so the payload ships fewer bytes) instead of the stdlib.  A web
+    response is transient (never a durable, cross-fleet record), so a
+    non-finite float or other non-portable value falls back to the stdlib and
+    never 500s the endpoint -- exactly as :func:`cronstable.mcp._dumps` does.
+    """
+    try:
+        body = _json.dumps_bytes(payload)
+    except _json.UnsupportedValue:
+        body = json.dumps(payload, default=str).encode("utf-8")
+    return web.Response(
+        body=body,
+        status=status,
+        headers=headers,
+        content_type="application/json",
+    )
+
+
 async def _sse_send_line(
     resp: web.StreamResponse, stream_name: str, line: str
 ) -> None:
-    payload = json.dumps({"stream": stream_name, "line": line.rstrip("\n")})
+    payload = _json.dumps_bytes(
+        {"stream": stream_name, "line": line.rstrip("\n")}
+    ).decode("utf-8")
     await resp.write(("event: line\ndata: " + payload + "\n\n").encode())
 
 
@@ -799,6 +838,16 @@ def naturaltime(seconds: float) -> str:
 
 def get_now(timezone: Optional[datetime.tzinfo]) -> datetime.datetime:
     return datetime.datetime.now(timezone)
+
+
+async def _noop_state_write() -> None:
+    """Placeholder body for a shed durable write (see _track_state_write).
+
+    Returned as an already-scheduled, immediately-completing task so callers
+    that chain on the tracked-write result behave identically whether or not
+    the real write was tracked.
+    """
+    return None
 
 
 def next_sleep_interval(subminute: bool = False) -> float:
@@ -1831,7 +1880,7 @@ class Cron:
         job_set = self.job_set_id()
         headers = self.web_config.get("headers", None)
         if request.headers.get("Accept") == "application/json":
-            return web.json_response(
+            return _json_response(
                 {"job_set_id": job_set, "jobs": len(self.cron_jobs)},
                 headers=headers,
             )
@@ -1863,7 +1912,7 @@ class Cron:
 
     async def _web_get_cluster(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        return web.json_response(
+        return _json_response(
             self.cluster_payload(),
             headers=self.web_config.get("headers", None),
         )
@@ -1881,7 +1930,7 @@ class Cron:
         overlay); the dashboard then hides its fleet view.
         """
         assert self.web_config is not None
-        return web.json_response(
+        return _json_response(
             self.fleet_payload(), headers=self.web_config.get("headers", None)
         )
 
@@ -1911,7 +1960,7 @@ class Cron:
         not read the host); the dashboard then hides the node meter.
         """
         assert self.web_config is not None
-        return web.json_response(
+        return _json_response(
             self.node_payload(), headers=self.web_config.get("headers", None)
         )
 
@@ -1961,7 +2010,7 @@ class Cron:
             else self._state_host
         )
         history = self._node_sampler.history()
-        return web.json_response(
+        return _json_response(
             {
                 "node_name": node_name,
                 "enabled": history is not None,
@@ -2050,7 +2099,7 @@ class Cron:
         assert self.web_config is not None
         out = self.status_payload()
         if request.headers.get("Accept") == "application/json":
-            return web.json_response(
+            return _json_response(
                 out, headers=self.web_config.get("headers", None)
             )
         else:
@@ -2194,7 +2243,7 @@ class Cron:
         headers = self.web_config.get("headers", None)
         expr = request.query.get("expr", "")
         if not expr.strip():
-            return web.json_response(
+            return _json_response(
                 {"error": "missing ?expr= query parameter"},
                 status=400,
                 headers=headers,
@@ -2208,10 +2257,10 @@ class Cron:
                 request.query.get("seed"),
             )
         except ValueError as err:
-            return web.json_response(
+            return _json_response(
                 {"error": str(err)}, status=400, headers=headers
             )
-        return web.json_response(payload, headers=headers)
+        return _json_response(payload, headers=headers)
 
     def _job_or_dag_schedule(self, name: str) -> Optional[JobConfig]:
         """The named job, or a DAG's synthetic ``dag:<name>`` schedule job.
@@ -2346,7 +2395,7 @@ class Cron:
         name = request.query.get("job", "").strip()
         at = request.query.get("at", "").strip()
         if not name or not at:
-            return web.json_response(
+            return _json_response(
                 {"error": "missing ?job= or ?at= query parameter"},
                 status=400,
                 headers=headers,
@@ -2354,12 +2403,12 @@ class Cron:
         try:
             payload = self.schedule_why_payload(name, at)
         except ValueError as err:
-            return web.json_response(
+            return _json_response(
                 {"error": str(err)}, status=400, headers=headers
             )
         if payload is None:
             raise web.HTTPNotFound()
-        return web.json_response(payload, headers=headers)
+        return _json_response(payload, headers=headers)
 
     def _schedule_entries(self) -> List[ScheduleEntry]:
         """The analyzable fleet: every enabled, cron-scheduled job.
@@ -2523,16 +2572,16 @@ class Cron:
                 hours, request.query.get("tz") or None
             )
         except ValueError as err:
-            return web.json_response(
+            return _json_response(
                 {"error": str(err)}, status=400, headers=headers
             )
-        return web.json_response(payload, headers=headers)
+        return _json_response(payload, headers=headers)
 
     async def _web_schedule_duplicates(
         self, request: web.Request
     ) -> web.Response:
         assert self.web_config is not None
-        return web.json_response(
+        return _json_response(
             await self.schedule_duplicates_payload_async(),
             headers=self.web_config.get("headers", None),
         )
@@ -2550,10 +2599,10 @@ class Cron:
                 request.query.get("tz") or None,
             )
         except ValueError as err:
-            return web.json_response(
+            return _json_response(
                 {"error": str(err)}, status=400, headers=headers
             )
-        return web.json_response(payload, headers=headers)
+        return _json_response(payload, headers=headers)
 
     def _avg_duration(self, name: str) -> Optional[float]:
         """Mean runtime in seconds over retained history, or ``None``.
@@ -3497,7 +3546,7 @@ class Cron:
             )
         except ApiActionError as ex:
             raise self._action_http_error(ex) from ex
-        return web.json_response(
+        return _json_response(
             {"paused": paused}, headers=self.web_config.get("headers", None)
         )
 
@@ -3513,7 +3562,7 @@ class Cron:
             )
         except ApiActionError as ex:
             raise self._action_http_error(ex) from ex
-        return web.json_response(
+        return _json_response(
             {"paused": None}, headers=self.web_config.get("headers", None)
         )
 
@@ -3857,7 +3906,7 @@ class Cron:
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        return web.json_response(
+        return _json_response(
             self.jobs_payload(), headers=self.web_config.get("headers", None)
         )
 
@@ -3879,7 +3928,7 @@ class Cron:
         return dags
 
     async def _web_list_dags(self, request: web.Request) -> web.Response:
-        return web.json_response(
+        return _json_response(
             await self.dags_payload(), headers=self._web_headers()
         )
 
@@ -3889,7 +3938,7 @@ class Cron:
         runs = await self._dag.list_runs(name, limit=limit)
         if runs is None:
             raise web.HTTPNotFound()
-        return web.json_response(
+        return _json_response(
             {"dag": name, "runs": runs}, headers=self._web_headers()
         )
 
@@ -3899,7 +3948,7 @@ class Cron:
         body = await self._dag.get_run(name, run_key)
         if body is None:
             raise web.HTTPNotFound()
-        return web.json_response(body, headers=self._web_headers())
+        return _json_response(body, headers=self._web_headers())
 
     async def _web_dag_xcom(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -3907,13 +3956,13 @@ class Cron:
         result = await self._dag.xcom_for_run(name, run_key)
         if result is None:
             raise web.HTTPNotFound()
-        return web.json_response(result, headers=self._web_headers())
+        return _json_response(result, headers=self._web_headers())
 
     # --- durable state inspector (metadata-only) --------------------------
 
     async def _web_state(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        return web.json_response(
+        return _json_response(
             await self.state_payload(),
             headers=self.web_config.get("headers", None),
         )
@@ -4035,7 +4084,7 @@ class Cron:
             )
         except ApiActionError as ex:
             raise _http_for_action_error(ex) from ex
-        return web.json_response(
+        return _json_response(
             payload, headers=self.web_config.get("headers", None)
         )
 
@@ -4084,7 +4133,7 @@ class Cron:
             )
         except ApiActionError as ex:
             raise _http_for_action_error(ex) from ex
-        return web.json_response(
+        return _json_response(
             payload, headers=self.web_config.get("headers", None)
         )
 
@@ -4093,7 +4142,7 @@ class Cron:
         run_key = await self._dag.trigger_run(name)
         if run_key is None:
             raise web.HTTPNotFound()
-        return web.json_response(
+        return _json_response(
             {"dag": name, "runKey": run_key}, headers=self._web_headers()
         )
 
@@ -4109,7 +4158,7 @@ class Cron:
         result = await self._dag.backfill(name, start, end)
         if not result.get("ok"):
             raise web.HTTPBadRequest(text=str(result.get("reason")))
-        return web.json_response(result, headers=self._web_headers())
+        return _json_response(result, headers=self._web_headers())
 
     async def _web_dag_decision(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -4127,7 +4176,7 @@ class Cron:
         )
         if not result.get("ok"):
             raise web.HTTPConflict(text=str(result.get("reason")))
-        return web.json_response(result, headers=self._web_headers())
+        return _json_response(result, headers=self._web_headers())
 
     @staticmethod
     def _web_int_query(
@@ -4178,7 +4227,7 @@ class Cron:
         payload = self.job_runs_payload(name)
         if payload is None:
             raise web.HTTPNotFound()
-        return web.json_response(
+        return _json_response(
             payload, headers=self.web_config.get("headers", None)
         )
 
@@ -4203,7 +4252,7 @@ class Cron:
         payload = self.job_resources_payload(name, max_runs)
         if payload is None:
             raise web.HTTPNotFound()
-        return web.json_response(
+        return _json_response(
             payload, headers=self.web_config.get("headers", None)
         )
 
@@ -4268,7 +4317,7 @@ class Cron:
         payload = await self.job_trends_payload(name)
         if payload is None:
             raise web.HTTPNotFound()
-        return web.json_response(
+        return _json_response(
             payload, headers=self.web_config.get("headers", None)
         )
 
@@ -5464,8 +5513,21 @@ class Cron:
         shutdown flush can bound-wait it; never awaited on a scheduling
         path.  The coroutine itself is responsible for catching and logging
         its own failures (they are all best-effort).
+
+        When the tracked set has grown past :data:`MAX_PENDING_STATE_WRITES`
+        (a store so slow that writes are not draining), the new write is shed
+        rather than tracked: its coroutine is closed, the drop is counted, and
+        an already-resolved placeholder task is returned so callers that store
+        or chain on the result (``_inflight_write_tail``, the pause-refresh and
+        GC/retry tasks) keep working unchanged.  Shedding is safe because
+        every state write is best-effort; the alternative is unbounded growth.
         """
-        task = asyncio.create_task(coro)
+        if len(self._pending_state_writes) >= MAX_PENDING_STATE_WRITES:
+            coro.close()
+            self.metrics.state_write_dropped("overflow")
+            task = asyncio.create_task(_noop_state_write())
+        else:
+            task = asyncio.create_task(coro)
         self._pending_state_writes.add(task)
         task.add_done_callback(self._pending_state_writes.discard)
         return task
@@ -8683,8 +8745,14 @@ class Cron:
         }
         stream = self._inflight_stream(job.name)
         try:
-            await backend.append_record(
-                stream, record, prune_keep=INFLIGHT_STREAM_KEEP
+            # Bounded like every other store op: a wedged mount times the
+            # write out (caught below) instead of hanging this tracked task
+            # forever, which would pile up in _pending_state_writes.
+            await asyncio.wait_for(
+                backend.append_record(
+                    stream, record, prune_keep=INFLIGHT_STREAM_KEEP
+                ),
+                timeout=STATE_OP_TIMEOUT,
             )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget
             self.metrics.state_write_dropped("inflight")
@@ -8709,10 +8777,13 @@ class Cron:
             "at": get_now(datetime.timezone.utc).isoformat(),
         }
         try:
-            await backend.append_record(
-                self._inflight_stream(name),
-                record,
-                prune_keep=INFLIGHT_STREAM_KEEP,
+            await asyncio.wait_for(
+                backend.append_record(
+                    self._inflight_stream(name),
+                    record,
+                    prune_keep=INFLIGHT_STREAM_KEEP,
+                ),
+                timeout=STATE_OP_TIMEOUT,
             )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget
             self.metrics.state_write_dropped("inflight")
@@ -9139,12 +9210,17 @@ class Cron:
             # include_series: the ledger is what rehydrates the resource
             # charts after a restart. Bounded per record by the job's
             # monitorResources.history, per stream by the folded prune.
-            await backend.append_record(
-                stream,
-                info.to_dict(include_series=True),
-                prune_keep=(
-                    self._state_max_runs if self._state_max_runs > 0 else None
+            await asyncio.wait_for(
+                backend.append_record(
+                    stream,
+                    info.to_dict(include_series=True),
+                    prune_keep=(
+                        self._state_max_runs
+                        if self._state_max_runs > 0
+                        else None
+                    ),
                 ),
+                timeout=STATE_OP_TIMEOUT,
             )
             job = self.cron_jobs.get(name)
             if job is not None and job.archiveOutput:
@@ -9187,8 +9263,11 @@ class Cron:
         record["at"] = get_now(datetime.timezone.utc).isoformat()
         stream = self._counters_stream()
         try:
-            await backend.append_record(
-                stream, record, prune_keep=COUNTER_STREAM_KEEP
+            await asyncio.wait_for(
+                backend.append_record(
+                    stream, record, prune_keep=COUNTER_STREAM_KEEP
+                ),
+                timeout=STATE_OP_TIMEOUT,
             )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
             self.metrics.state_write_dropped("counters")
@@ -9246,12 +9325,17 @@ class Cron:
             "lines": lines,
         }
         stream = self._log_stream(job.name)
-        await backend.append_record(
-            stream,
-            record,
-            prune_keep=(
-                self._state_max_runs if self._state_max_runs > 0 else None
+        # Bounded; the caller (_persist_run_record) catches a timeout as a
+        # dropped write rather than letting a wedged mount hang the task.
+        await asyncio.wait_for(
+            backend.append_record(
+                stream,
+                record,
+                prune_keep=(
+                    self._state_max_runs if self._state_max_runs > 0 else None
+                ),
             ),
+            timeout=STATE_OP_TIMEOUT,
         )
 
     async def _warm_last_success_beyond_history(

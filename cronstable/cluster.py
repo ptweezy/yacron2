@@ -191,6 +191,7 @@ from typing import (
     List,
     Optional,
     Set,
+    Tuple,
     TypeVar,
     cast,
 )
@@ -725,6 +726,33 @@ def _hrw_owner(job_name: str, members: List[str]) -> str:
     everything the way ``hash % N`` would.
     """
     return max(members, key=lambda n: (_hrw_score(job_name, n), n))
+
+
+def _hrw_owner_bytes(
+    job_name: str, members: List[str], member_bytes: List[bytes]
+) -> str:
+    """:func:`_hrw_owner` with the members' name bytes pre-encoded.
+
+    Identical result to ``_hrw_owner(job_name, members)`` -- same score, same
+    ``(score, name)`` tie-break, same first-max semantics -- but the per-poll
+    ownership gates call this once per job over a member list that is fixed for
+    the whole poll (see :meth:`ClusterManager._spread_owner_set`).  Encoding
+    ``job_name`` once here and reusing the cached ``member_bytes`` removes the
+    O(members) node-name re-encoding (and the O(jobs) member-list rebuild) that
+    ``max(members, key=_hrw_score(job, .))`` repeats for every job.
+    """
+    job_prefix = job_name.encode("utf-8") + b"\x00"
+    best_name = members[0]
+    best_score = int.from_bytes(
+        hashlib.sha256(job_prefix + member_bytes[0]).digest()[:8], "big"
+    )
+    for name, name_bytes in zip(members[1:], member_bytes[1:], strict=True):
+        score = int.from_bytes(
+            hashlib.sha256(job_prefix + name_bytes).digest()[:8], "big"
+        )
+        if (score, name) > (best_score, best_name):
+            best_score, best_name = score, name
+    return best_name
 
 
 def elect_job_owner(
@@ -1823,7 +1851,18 @@ class ClusterManager(LeadershipBackend):
         # slightly-wasteful degradation).
         if request.headers.get("If-None-Match") == etag:
             return web.Response(status=304, headers=headers)
-        resp = web.json_response(payload, headers=headers)
+        # Serialize the body with the orjson-accelerated encoder (compact, and
+        # several times faster than aiohttp's default json.dumps). The ETag
+        # above is a hash of a canonical projection of the payload (see
+        # _peer_etag), NOT of these body bytes, so the encoder change cannot
+        # affect 304 matching; peers parse the body back through _json.loads.
+        try:
+            body_bytes = _json.dumps_bytes(payload)
+        except _json.UnsupportedValue:
+            body_bytes = json.dumps(payload).encode("utf-8")
+        resp = web.Response(
+            body=body_bytes, headers=headers, content_type="application/json"
+        )
         # Compress bodies worth compressing. The poller advertises gzip
         # support on every request (aiohttp's default Accept-Encoding) and
         # decompresses -- and caps the DECOMPRESSED size -- as it reads (see
@@ -3237,6 +3276,7 @@ class ClusterManager(LeadershipBackend):
             or bool(self.conflicting_policies())
         )
 
+    @_memoized_derived
     def leader_name(self) -> Optional[str]:
         """Elected leader as this node sees it, or ``None`` if not quorate.
 
@@ -3245,6 +3285,10 @@ class ClusterManager(LeadershipBackend):
         (:meth:`_eligible_candidates`) -- bridge-discovered nodes so we defer
         across a bridge instead of double-leading, and never a peer we can tell
         is itself sub-quorum (which would stand a healthy majority down).
+
+        Memoized: a zero-arg pure derivation whose ``elect_leader`` ``min``
+        over the (memoized) agreeing/eligible sets otherwise re-ran on every
+        ``is_leader``/quorum check -- per due job, claim-scan job, and poll.
         """
         return elect_leader(
             self.node_name,
@@ -3329,6 +3373,7 @@ class ClusterManager(LeadershipBackend):
         """
         return self._view_settled()
 
+    @_memoized_derived
     def available_leader_name(self) -> str:
         """Elected leader ignoring quorum (for the ``PreferLeader`` policy).
 
@@ -3435,13 +3480,35 @@ class ClusterManager(LeadershipBackend):
         converging skip rather than a permanent zero-run behind a sub-quorum
         node (see :meth:`_unconfirmed_contenders`).
         """
-        return elect_job_owner(
-            job_name,
+        quorate, members, member_bytes = self._spread_owner_set()
+        if not quorate:
+            return None
+        return _hrw_owner_bytes(job_name, members, member_bytes)
+
+    @_memoized_derived
+    def _spread_owner_set(self) -> "Tuple[bool, List[str], List[bytes]]":
+        """``(quorate, members, member_name_bytes)`` for spread ownership.
+
+        All three are job-INDEPENDENT: the quorum gate is over the mutual live
+        set, and the rendezvous members are this node plus the
+        confirmed-quorate candidates and quorate-vouched contenders -- exactly
+        the arguments :func:`elect_job_owner` derives, but derived ONCE per
+        generation here instead of rebuilt per job.  :meth:`job_owner` then
+        pays only the irreducible per-(job,node) rendezvous hash, so a spread
+        poll over J jobs drops from O(J*P) list allocations + node-name
+        re-encodes to O(P) once plus J*P hashes.  Equivalent to the old inline:
+        ``quorate`` is ``len([self] + agreeing) >= quorum_size(cluster_size)``
+        and ``members`` is ``[self, *eligible, *unconfirmed]``.
+        """
+        live_count = 1 + len(self._agreeing_peer_names())
+        quorate = live_count >= quorum_size(self.cluster_size())
+        members = [
             self.node_name,
-            self._agreeing_peer_names(),
-            self.cluster_size(),
-            [*self._eligible_candidates(), *self._unconfirmed_contenders()],
-        )
+            *self._eligible_candidates(),
+            *self._unconfirmed_contenders(),
+        ]
+        member_bytes = [name.encode("utf-8") for name in members]
+        return quorate, members, member_bytes
 
     def is_job_owner(self, job_name: str) -> bool:
         """Whether this node owns ``job_name`` (quorate rendezvous winner).
@@ -3495,11 +3562,28 @@ class ClusterManager(LeadershipBackend):
         (no double-run), while the absent quorum gate guarantees the winner
         still runs (no zero-run); see :meth:`_available_contenders`.
         """
-        return elect_available_job_owner(
-            job_name,
+        members, member_bytes = self._available_owner_members()
+        return _hrw_owner_bytes(job_name, members, member_bytes)
+
+    @_memoized_derived
+    def _available_owner_members(self) -> "Tuple[List[str], List[bytes]]":
+        """``(members, member_name_bytes)`` for never-skip spread ownership.
+
+        The job-independent rendezvous set of :meth:`available_job_owner`
+        (``[self, *agreeing, *available_contenders]``), derived once per
+        generation with names pre-encoded, so the per-job path pays only the
+        rendezvous hash.  The duplicate-name tiebreak (in
+        :meth:`is_available_job_owner`
+        via :meth:`_cedes_to_lower_instance`) recomputes the election over a
+        DIFFERENT (per-twin) member set, so it keeps using the un-memoized
+        module helper.
+        """
+        members = [
             self.node_name,
-            [*self._agreeing_peer_names(), *self._available_contenders()],
-        )
+            *self._agreeing_peer_names(),
+            *self._available_contenders(),
+        ]
+        return members, [name.encode("utf-8") for name in members]
 
     def is_available_job_owner(self, job_name: str) -> bool:
         """Whether this node owns ``job_name`` in its reachable set.

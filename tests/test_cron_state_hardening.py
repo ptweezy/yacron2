@@ -1004,3 +1004,39 @@ async def test_slot_release_write_yields_to_racing_reclaim(tmp_path):
         assert observed.fence == first.fence
     finally:
         await _stop_cluster_cron(cron)
+
+
+async def test_track_state_write_sheds_when_pending_set_full(monkeypatch):
+    # A wedged store must not let the tracked fire-and-forget write set grow
+    # without bound (-> OOM). Past MAX_PENDING_STATE_WRITES a new best-effort
+    # write is SHED: its coroutine is closed and the drop counted, and a
+    # placeholder task is returned so callers that chain on the result keep
+    # working. Every state write is best-effort, so shedding is safe.
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    monkeypatch.setattr(cron_mod, "MAX_PENDING_STATE_WRITES", 2)
+
+    async def _block():
+        await asyncio.sleep(3600)
+
+    fillers = [asyncio.ensure_future(_block()) for _ in range(2)]
+    cron._pending_state_writes = set(fillers)
+    before = cron.metrics._state_dropped.get("overflow", 0)
+
+    ran = False
+
+    async def _would_write():
+        nonlocal ran
+        ran = True
+
+    task = cron._track_state_write(_would_write())
+    await task  # the shed placeholder completes immediately
+    assert cron.metrics._state_dropped.get("overflow", 0) == before + 1
+    assert ran is False  # the real write coroutine was closed, never run
+
+    # under the cap the write is tracked and actually runs.
+    for f in fillers:
+        f.cancel()
+    cron._pending_state_writes = set()
+    real_task = cron._track_state_write(_would_write())
+    await real_task
+    assert ran is True

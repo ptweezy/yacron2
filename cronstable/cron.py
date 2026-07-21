@@ -3053,6 +3053,16 @@ class Cron:
                 # otherwise pin cronstable_job_late, the /jobs sla block and
                 # the OVERDUE chip at breached for the whole window.
                 self._sla_clear_latches(name)
+                if not job.enabled:
+                    # a disabled job cannot run, so its staleness baseline
+                    # rolls forward with the clock: re-enabling then gives it
+                    # a full threshold to succeed in -- the same credit a
+                    # pause banks -- instead of paging maxTimeSinceSuccess for
+                    # the whole span it was deliberately switched off. This
+                    # covers the never-succeeded fallback (the _sla_first_seen
+                    # arm of _sla_stale_reference); a job that HAS succeeded
+                    # takes the _sla_last_success arm and is out of scope here.
+                    self._sla_first_seen[name] = now
                 continue
             if not self._cluster_allows(job):
                 # not this node's job right now: same latch drop, and drop
@@ -7533,6 +7543,18 @@ class Cron:
             if job.concurrencyPolicy == "Allow":
                 pass
             elif job.concurrencyPolicy == "Forbid":
+                # the slot is deliberately DROPPED, not late: an overrun is
+                # maxRuntime's to report, once. RECORD the excuse (pop the due
+                # slot) rather than only inferring it from running_jobs, so it
+                # survives the run ending and the reaper emptying running_jobs
+                # -- otherwise the stale due latches lateAfter in the window
+                # between the run finishing and the next slot launching. This
+                # mirrors the cluster-slot path, which excuses via
+                # _sla_peer_owns_slot. Popping lands lateAfter on its "nothing
+                # to be late for" branch, so no fake start is fabricated and
+                # the next genuinely unserved slot still latches once
+                # _launch_plan records it.
+                self._sla_due.pop(job.name, None)
                 return False
             elif job.concurrencyPolicy == "Replace":
                 for running_job in self.running_jobs[job.name]:
@@ -8860,6 +8882,41 @@ class Cron:
         if seen:
             self._sla_last_success.setdefault(name, min(seen))
 
+    async def _seed_stale_reference(
+        self, name: str, history: Iterable[JobRunInfo]
+    ) -> None:
+        """Warm the maxTimeSinceSuccess staleness reference from ``history``.
+
+        Split out of the rehydrate warm-up so the two early-continue guards
+        (a job that already carries in-memory history, or one that finished a
+        run while the read awaited) still seed the reference before skipping
+        the rest of the warm-up. Without it, a job that FAILED during a state
+        outage -- non-empty run_history by the time the store finally comes
+        up -- would skip seeding, and _sla_stale_reference would re-baseline
+        it on process start: exactly the silent threshold the deep re-read
+        exists to prevent, one guard higher. By finished_at, not by position:
+        record filenames order on WRITE time and run-record writes are
+        unserialized, so the last-APPENDED success can be older than one
+        appended before it. setdefault throughout, so a live success recorded
+        by _record_run while an await yielded is never clobbered.
+        """
+        history = list(history)
+        successes = [
+            r.finished_at
+            for r in history
+            if r.outcome == "success" and r.finished_at is not None
+        ]
+        if successes:
+            self._sla_last_success.setdefault(name, max(successes))
+            return
+        # a reload during one of the awaits above can drop the job, so .get()
+        # rather than a subscript.
+        warmed_job = self.cron_jobs.get(name)
+        if warmed_job is not None and (
+            warmed_job.sla.get("maxTimeSinceSuccessSeconds") is not None
+        ):
+            await self._warm_last_success_beyond_history(name, history)
+
     async def _rehydrate_from_state(self) -> None:
         """Warm the in-memory history from the durable ledger, once, on boot.
 
@@ -8879,8 +8936,12 @@ class Cron:
         warmed = 0
         for name in list(self.cron_jobs):
             # a job that already accumulated in-memory history this process
-            # (unusual at boot) is left as the live source of truth.
+            # (unusual at boot) is left as the live source of truth -- but the
+            # staleness reference is still seeded from that history, so a job
+            # that only FAILED during a state outage does not re-baseline
+            # maxTimeSinceSuccess on process start when the store returns.
             if self.run_history.get(name):
+                await self._seed_stale_reference(name, self.run_history[name])
                 continue
             try:
                 recs = await asyncio.wait_for(
@@ -8911,7 +8972,10 @@ class Cron:
                 # a run finished while we awaited the read (the await above
                 # yields): the live run is fresher than anything in the
                 # ledger snapshot; appending the old records after it would
-                # regress last_run and scramble the history's order.
+                # regress last_run and scramble the history's order. The
+                # staleness reference is still seeded from that live history
+                # (setdefault, so a fresher live success is never clobbered).
+                await self._seed_stale_reference(name, self.run_history[name])
                 continue
             recs.reverse()  # oldest-first, to match the append order
             for rec in recs:
@@ -8923,44 +8987,31 @@ class Cron:
                 self.last_run[name] = history[-1]
                 warmed += 1
                 # warm the staleness reference too: with a durable ledger
-                # the maxTimeSinceSuccess check must page from the REAL
-                # last success after a restart, not re-baseline on process
-                # start (that grace is only for stateless boots). By
-                # finished_at, not by position: record filenames order on
-                # WRITE time and run-record writes are unserialized, so the
-                # last-APPENDED success can be older than one appended
-                # before it.
-                successes = [
-                    r.finished_at
-                    for r in history
-                    if r.outcome == "success" and r.finished_at is not None
-                ]
-                if successes:
-                    self._sla_last_success.setdefault(name, max(successes))
-                else:
-                    # a reload during one of the awaits above can drop the
-                    # job, so .get() rather than a subscript.
-                    warmed_job = self.cron_jobs.get(name)
-                    if warmed_job is not None and (
-                        warmed_job.sla.get("maxTimeSinceSuccessSeconds")
-                        is not None
-                    ):
-                        await self._warm_last_success_beyond_history(
-                            name, history
-                        )
+                # the maxTimeSinceSuccess check must page from the REAL last
+                # success after a restart, not re-baseline on process start
+                # (that grace is only for stateless boots). Shared with the
+                # two early-continue guards above, so a job with pre-existing
+                # in-memory history is seeded the same way.
+                await self._seed_stale_reference(name, history)
                 # and the onlyIfLastSucceeded memo, for the same reason the
                 # gate keeps one: a pause running across the restart would
                 # otherwise leave the warmed ring full of "skipped" rows
-                # with no real outcome behind them.
-                for restored in reversed(history):
-                    if (
-                        restored.outcome in ("success", "failure")
-                        and restored.finished_at is not None
-                    ):
-                        self._last_real_outcome.setdefault(
-                            name, (restored.finished_at, restored.outcome)
-                        )
-                        break
+                # with no real outcome behind them. By finished_at, not by
+                # position (the same unserialized-write hazard as the success
+                # scan above): seeding the last-APPENDED real outcome could
+                # pick an older success over a newer failure and reopen the
+                # very gate this memo exists to hold.
+                reals = [
+                    r
+                    for r in history
+                    if r.outcome in ("success", "failure")
+                    and r.finished_at is not None
+                ]
+                if reals:
+                    newest = max(reals, key=lambda r: r.finished_at)
+                    self._last_real_outcome.setdefault(
+                        name, (newest.finished_at, newest.outcome)
+                    )
                 # and the retry ladder's supersede watermark: last_run is
                 # history[-1], which a pause running across the restart
                 # makes a "skipped" row with a fresh finished_at. Reading

@@ -1922,3 +1922,528 @@ def test_web_drawer_shows_the_sla_state_the_wiki_promises():
         pathlib.Path(tui.__file__).parent.parent / "wiki" / "Web-Dashboard.md"
     ).read_text(encoding="utf-8")
     assert "**OVERDUE** badge on its row, drawer, and wallboard tile" in wiki
+
+
+# ===================================================================
+#  added coverage: pure helpers, plumbing, and CLI
+# ===================================================================
+def _iso_ago(seconds: float) -> str:
+    return datetime.datetime.fromtimestamp(
+        time.time() - seconds, tz=datetime.timezone.utc
+    ).isoformat()
+
+
+def _paint(app):
+    return tui.Painter(app.theme)
+
+
+def _txt(rows):
+    return strip_ansi("\n".join(rows))
+
+
+def test_more_format_helpers_branches():
+    from cronstable.tui import ago_short, fmt_percent, parse_iso, segment_of
+
+    now = 1_000_000.0
+    assert fmt_in(200000) == "in 2d"
+    # a future stamp clamps to zero rather than going negative
+    future = datetime.datetime.fromtimestamp(
+        now + 100, tz=datetime.timezone.utc
+    ).isoformat()
+    assert fmt_ago(future, now) == "0s ago"
+    two_h = datetime.datetime.fromtimestamp(
+        now - 7200, tz=datetime.timezone.utc
+    ).isoformat()
+    assert fmt_ago(two_h, now) == "2h ago"
+    two_d = datetime.datetime.fromtimestamp(
+        now - 200000, tz=datetime.timezone.utc
+    ).isoformat()
+    assert fmt_ago(two_d, now) == "2d ago"
+    assert ago_short(None) == "?"
+    assert ago_short(
+        datetime.datetime.fromtimestamp(
+            now - 30, tz=datetime.timezone.utc
+        ).isoformat(),
+        now,
+    ) == "30s"
+    assert ago_short(two_h, now) == "2h"
+    assert ago_short(two_d, now) == "2d"
+    assert fmt_percent(None) == "—"
+    assert fmt_percent(5.0) == "5.0%"
+    assert fmt_percent(55) == "55%"
+    assert fmt_bytes(None) == "—"
+    # a naive ISO stamp is pinned to UTC rather than rejected
+    assert parse_iso("2026-01-01T00:00:00") is not None
+    assert segment_of("disabled") == "off"
+    assert segment_of("ok") == "ok"
+    assert segment_of("pending") == ""
+
+
+def test_compute_view_last_and_next_sort_keys():
+    jobs = [
+        _job("old", outcome="success", finished_ago=1000),
+        _job("recent", outcome="success", finished_ago=5),
+        _job("never"),
+    ]
+    jobs[2]["last_run"] = None
+    by_last = compute_view(jobs, "", "all", "last", 1)
+    assert by_last[0]["name"] == "recent"  # newest finish first
+    nexts = [
+        _job("soon", scheduled_in=5.0),
+        _job("later", scheduled_in=500.0),
+        _job("none", scheduled_in=None),
+    ]
+    by_next = compute_view(nexts, "", "all", "next", 1)
+    assert by_next[0]["name"] == "soon"
+    assert by_next[-1]["name"] == "none"  # None sorts to the end (inf)
+
+
+def test_verdict_correlated_with_shared_reason():
+    jobs = [
+        _job(
+            "a",
+            outcome="failure",
+            exit_code=69,
+            fail_reason="disk full",
+            finished_ago=10,
+        ),
+        _job(
+            "b",
+            outcome="failure",
+            exit_code=69,
+            fail_reason="disk full",
+            finished_ago=12,
+        ),
+    ]
+    verdict, incident = verdict_info(jobs, None)
+    assert "(disk full)" in verdict["sub"]
+    assert "within" in verdict["sub"]
+    assert sorted(incident) == ["a", "b"]
+
+
+def test_verdict_cluster_alert_without_failures():
+    alert = {"bad": True, "reason": "no quorum", "node": None}
+    verdict, _ = verdict_info([_job("ok", outcome="success")], alert)
+    assert "leadership / quorum degraded" in verdict["sub"]
+
+
+def test_rewrite_sgr_intensity_and_default_codes():
+    theme = Theme("carolina", light=False)
+    out = rewrite_sgr("\x1b[1mbold\x1b[0m tail", theme)
+    assert "\x1b[1m" in out  # bold intensity kept verbatim
+    out2 = rewrite_sgr("\x1b[91mbright\x1b[39mdefault", theme)
+    assert strip_ansi(out2) == "brightdefault"
+    assert theme.fg("fg") in out2  # code 39 -> the theme default ink
+
+
+def test_sparkline_returns_a_plain_string():
+    from cronstable.tui import sparkline
+
+    s = sparkline(
+        [
+            {"outcome": "success", "duration": 1.0},
+            {"outcome": "failure", "duration": 3.0},
+        ],
+        6,
+    )
+    assert isinstance(s, str) and strip_ansi(s) == s and s
+
+
+def test_prefs_path_and_cvd_fallback(tmp_path):
+    from cronstable.tui import prefs_path
+
+    assert prefs_path().endswith("tui.json")
+    path = str(tmp_path / "p.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"cvd": "notamode"}, fh)
+    assert load_prefs(path)["cvd"] == "none"
+
+
+def test_key_decoder_extra_branches():
+    from cronstable.tui import KeyDecoder, _decode_control
+
+    assert _decode_control("\x1b") == "esc"
+    assert _decode_control("\x1c") == "\x1c"  # an unmapped control passes
+    dec = KeyDecoder()
+    assert dec.feed(b"\x1c") == ["\x1c"]
+    # a single buffered escape byte is incomplete on its own
+    assert KeyDecoder._try_escape("\x1b") == (False, None)
+    # a modified tilde key ("5;3~") collapses to the plain navigation key
+    assert KeyDecoder().feed(b"\x1b[5;3~") == ["pgup"]
+    # an unrecognised tilde CSI is swallowed
+    assert KeyDecoder().feed(b"\x1b[99~") == []
+
+
+def test_painter_and_frame_helpers(tmp_path):
+    from cronstable.tui import Finding, finding_rows, scroll_window
+
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    assert tui.DIM_SGR in paint.style("x", dim=True)
+    assert tui.REVERSE in paint.style("x", reverse=True)
+    assert scroll_window(5, 10, 0, 0) == 0
+    assert scroll_window(100, 10, 5, 50) == 5  # cursor above the window
+    assert scroll_window(100, 10, 80, 0) == 71  # cursor below the window
+    rows = finding_rows(
+        [
+            Finding("never-fires", "warning", "this can never fire"),
+            Finding("uneven", "warning", "warn " * 40),
+            Finding("note", "note", "a gentle note"),
+        ],
+        paint,
+        40,
+        4,
+    )
+    body = _txt(rows)
+    assert "never fire" in body and "gentle note" in body
+
+
+def test_term_exit_headless_screen_and_clipboard(monkeypatch):
+    import io
+
+    out = io.StringIO()
+    term = tui.Term(stream=out)
+    term.exit()  # never entered: writes the reset without touching termios
+    assert tui.RESET in out.getvalue()
+    assert tui.HeadlessTerm().screen() == ""
+    ht = tui.HeadlessTerm()
+    monkeypatch.setattr(tui.shutil, "which", lambda name: "/usr/bin/" + name)
+
+    class Proc:
+        returncode = 0
+
+    monkeypatch.setattr(tui.subprocess, "run", lambda *a, **k: Proc())
+    assert tui.copy_to_clipboard(ht, "hello")
+    assert ht.copied == ["hello"]
+
+
+def test_add_tui_command_registers_all_flags():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers()
+    tui.add_tui_command(sub)
+    args = parser.parse_args(
+        [
+            "tui",
+            "--url",
+            "http://x:1",
+            "--tv",
+            "--ascii",
+            "--boot",
+            "--poll",
+            "0",
+            "--theme",
+            "amber",
+            "--job",
+            "j",
+        ]
+    )
+    assert args.tv and args.ascii and args.boot
+    assert args.theme == "amber" and args.job == "j"
+
+
+def test_resolve_token_sources(monkeypatch):
+    class WithToken:
+        token = "explicit"
+        token_env = "SOME_VAR"
+
+    assert tui._resolve_token(WithToken) == "explicit"
+
+    class FromEnv:
+        token = None
+        token_env = "CS_TUI_TOK"
+
+    monkeypatch.setenv("CS_TUI_TOK", "fromenv")
+    assert tui._resolve_token(FromEnv) == "fromenv"
+    monkeypatch.delenv("CS_TUI_TOK", raising=False)
+
+    class Missing:
+        token = None
+        token_env = "CS_TUI_TOK"
+
+    assert tui._resolve_token(Missing) is None
+
+
+def test_dispatch_runs_amain(monkeypatch):
+    class Tty:
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return 0
+
+    monkeypatch.setattr("sys.stdin", Tty())
+    monkeypatch.setattr("sys.stdout", Tty())
+    seen = {}
+
+    class FakeApp:
+        def __init__(self, *a, **k):
+            seen["kwargs"] = k
+
+        async def run(self):
+            seen["ran"] = True
+
+    monkeypatch.setattr(tui, "TuiApp", FakeApp)
+    monkeypatch.setattr(tui, "Term", lambda *a, **k: object())
+    monkeypatch.setattr(tui, "PosixKeyReader", lambda *a, **k: object())
+
+    class Args:
+        url = tui.DEFAULT_URL
+        token = None
+        token_env = tui.ENV_TOKEN
+        theme = "amber-light"
+        tv = True
+        job = "watched"
+        boot = True
+        no_boot = False
+        ascii = True
+        poll = 0.0
+
+    assert tui.dispatch(Args()) == 0
+    assert seen.get("ran")
+    assert seen["kwargs"]["start_job"] == "watched"
+    assert seen["kwargs"]["boot"] is True
+
+    class ArgsNoBoot(Args):
+        no_boot = True
+        boot = False
+        theme = None
+        ascii = False
+        poll = None
+        tv = False
+
+    assert tui.dispatch(ArgsNoBoot()) == 0
+    assert seen["kwargs"]["boot"] is False
+
+
+# ===================================================================
+#  added coverage: job / DAG action error + status branches
+# ===================================================================
+def _post_status(status, payload=None):
+    async def _post(*a, **k):
+        return status, (payload if payload is not None else {})
+
+    return _post
+
+
+async def _raise_unauth(*a, **k):
+    raise tui.Unauthorized()
+
+
+async def _raise_boom(*a, **k):
+    raise RuntimeError("boom")
+
+
+def _reset_token(app):
+    app.open_overlays = []
+    app.focus = None
+
+
+def _msgs(app):
+    return [m for _, m, _ in app.toasts]
+
+
+async def test_job_action_error_and_status_paths(tmp_path):
+    app = _bare_app(tmp_path)
+    job = _job("j", outcome="success")
+    app.jobs = [job]
+    app.by_name = {"j": job}
+
+    for action in (app.run_job, app.cancel_job, app.pause_job, app.resume_job):
+        app.toasts = []
+        app.api.post = _raise_unauth
+        await action("j")
+        assert app.is_open("token") and app.focus == "token"
+        _reset_token(app)
+        app.api.post = _raise_boom
+        await action("j")
+        assert _msgs(app)  # an exception surfaces as a toast
+
+    # run_job status ladder: 409 disabled, 404 missing, other -> HTTP N
+    app.toasts = []
+    app.api.post = _post_status(409)
+    await app.run_job("j")
+    assert any("disabled" in m for m in _msgs(app))
+    app.api.post = _post_status(404)
+    await app.run_job("j")
+    assert any("no such job" in m for m in _msgs(app))
+    app.api.post = _post_status(503)
+    await app.run_job("j")
+    assert any("HTTP 503" in m for m in _msgs(app))
+
+    # cancel_job: 409 not running, other -> HTTP N
+    app.toasts = []
+    app.api.post = _post_status(409)
+    await app.cancel_job("j")
+    assert any("not running" in m for m in _msgs(app))
+    app.api.post = _post_status(503)
+    await app.cancel_job("j")
+    assert any("HTTP 503" in m for m in _msgs(app))
+
+    # pause_job / resume_job: 404 missing, other -> HTTP N
+    for action, verb in ((app.pause_job, "pause"), (app.resume_job, "resume")):
+        app.toasts = []
+        app.api.post = _post_status(404)
+        await action("j")
+        assert any("no such job" in m for m in _msgs(app))
+        app.api.post = _post_status(503)
+        await action("j")
+        assert any("HTTP 503" in m for m in _msgs(app))
+
+
+async def test_run_all_failing_iterates(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [
+        _job("bad", outcome="failure"),
+        _job("good", outcome="success"),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    posted = []
+
+    async def post(path, body=None):
+        posted.append(path)
+        return 200, {}
+
+    app.api.post = post
+    await app.run_all_failing()
+    assert any("bad" in p for p in posted)
+    assert not any("good" in p for p in posted)
+
+
+async def test_dag_action_error_and_status_paths(tmp_path):
+    app = _bare_app(tmp_path)
+    app.dag_name = "d"
+    app.dag_run_key = "rk"
+
+    # dag_trigger
+    app.api.post = _raise_unauth
+    await app.dag_trigger("d")
+    assert app.is_open("token")
+    _reset_token(app)
+    app.api.post = _raise_boom
+    await app.dag_trigger("d")
+    assert any("trigger" in m for m in _msgs(app))
+    app.api.post = _post_status(500)
+    await app.dag_trigger("d")
+    assert any("HTTP 500" in m for m in _msgs(app))
+
+    # dag_decision: guard, unauthorized, exception, HTTP fail
+    app.dag_run_key = None
+    await app.dag_decision("t", "approve")  # no run key -> silent return
+    app.dag_run_key = "rk"
+    app.api.post = _raise_unauth
+    await app.dag_decision("t", "approve")
+    _reset_token(app)
+    app.api.post = _raise_boom
+    await app.dag_decision("t", "approve")
+    app.api.post = _post_status(500)
+    await app.dag_decision("t", "approve")
+    assert any("HTTP 500" in m for m in _msgs(app))
+
+    # dag_backfill: guard, bad spec, unauthorized, exception, HTTP+detail
+    app.toasts = []
+    app.dag_name = None
+    await app.dag_backfill("2026-01-01..2026-01-02")  # no dag -> return
+    app.dag_name = "d"
+    await app.dag_backfill("only-one")  # not two parts -> warn
+    assert any("FROM..TO" in m for m in _msgs(app))
+    app.api.post = _raise_unauth
+    await app.dag_backfill("2026-01-01..2026-01-02")
+    _reset_token(app)
+    app.api.post = _raise_boom
+    await app.dag_backfill("2026-01-01..2026-01-02")
+    app.api.post = _post_status(500, {"error": "range too wide"})
+    await app.dag_backfill("2026-01-01..2026-01-02")
+    assert any("range too wide" in m for m in _msgs(app))
+
+
+async def test_save_log_success_and_oserror(tmp_path, monkeypatch):
+    app = _bare_app(tmp_path)
+    # no tail / no drawer job -> silent no-op
+    app.log_tail = None
+    app.drawer_job = "x"
+    app.save_log()
+    assert not app.toasts
+    monkeypatch.setattr(
+        "os.path.expanduser", lambda p: p.replace("~", str(tmp_path))
+    )
+    app.log_tail = _stub_tail(app, [("stdout", "hi", 1.0)])
+    app.drawer_job = "job"
+    app.save_log()
+    assert any("saved" in m for m in _msgs(app))
+    real_open = open
+
+    def boom_open(path, *a, **k):
+        if "cronstable-job" in str(path):
+            raise OSError("disk full")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", boom_open)
+    app.toasts = []
+    app.save_log()
+    assert any("save failed" in m for m in _msgs(app))
+
+
+async def test_mitigate_bulk_edge_paths(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [
+        _job("runner", running=True, scheduled_in=None),
+        _job("off", enabled=False),
+    ]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    # nothing eligible to start, and a name not in by_name is skipped
+    app.open_mitigate(["off", "runner", "ghost"], "set")
+    await app.mitigate_bulk("start")
+    assert any("nothing to start" in ln for ln in app.mitigate_log)
+
+    # the running guard makes a second call a no-op
+    app.mitigate_running = True
+    before = list(app.mitigate_log)
+    await app.mitigate_bulk("start")
+    assert app.mitigate_log == before
+    app.mitigate_running = False
+
+    # a real sweep with an HTTP failure then an exception
+    app.jobs = [_job("s1"), _job("s2")]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    calls = [0]
+
+    async def flaky(path, body=None):
+        calls[0] += 1
+        if calls[0] == 1:
+            return 500, {}
+        raise RuntimeError("net")
+
+    app.api.post = flaky
+    app.open_mitigate(["s1", "s2", "ghost"], "set")
+    await app.mitigate_bulk("start")
+    assert any("HTTP 500" in ln for ln in app.mitigate_log)
+    assert any("error" in ln for ln in app.mitigate_log)
+
+    # the abort path breaks the sweep partway
+    app.api.post = None
+
+    async def abort_after_one(path, body=None):
+        app.mitigate_abort = True
+        return 200, {}
+
+    app.api.post = abort_after_one
+    app.open_mitigate(["s1", "s2"], "set")
+    await app.mitigate_bulk("start")
+    assert any("aborted" in ln for ln in app.mitigate_log)
+
+    # unauthorized stops the sweep with a note
+    app.api.post = _raise_unauth
+    app.open_mitigate(["s1"], "set")
+    await app.mitigate_bulk("start")
+    assert any("unauthorized" in ln for ln in app.mitigate_log)
+
+
+def test_tail_preset_and_add_tail_guards(tmp_path):
+    app = _bare_app(tmp_path)
+    app.jobs = [_job("only", outcome="success")]
+    app.by_name = {"only": app.jobs[0]}
+    # no failing jobs right now
+    app.tail_preset("fail")
+    assert any("no fail jobs" in m for m in _msgs(app))

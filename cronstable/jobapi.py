@@ -33,7 +33,6 @@ the HTTP surface over them.  It is imported only when a ``state`` section with
 
 import asyncio
 import hmac
-import ipaddress
 import logging
 import math
 import os
@@ -44,6 +43,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 from cronstable import _json, jobstate, tlsutil
+from cronstable.config import _is_wildcard_host
 from cronstable.jobstate import GLOBAL_SCOPE, JobStateError
 from cronstable.state import Lease, StateBackend, _DocumentUnreadable
 
@@ -77,24 +77,6 @@ MAX_LOCK_PERMITS = 1024
 # [5s, MAX_LOCK_TTL] (30 days -- far beyond any sane job-coordination hold,
 # while keeping a crashed holder's lease reclaimable within the epoch).
 MAX_LOCK_TTL = 30 * 86400.0
-
-
-def _is_wildcard(host: str) -> bool:
-    """True for a bind address meaning "every interface".
-
-    Spelled several ways (``0.0.0.0``, ``::``, ``::0``, the long
-    ``0:0:0:0:0:0:0:0`` form, or nothing at all), so this compares parsed
-    addresses rather than a list of strings someone happened to think of.
-    Such a host is never advertised to jobs: it is not an address a job on
-    another machine can dial, and on Windows not one it can dial at all.
-    """
-    text = host.strip().strip("[]")
-    if not text:
-        return True
-    try:
-        return ipaddress.ip_address(text).is_unspecified
-    except ValueError:
-        return False  # a name, which a job can resolve
 
 
 def _bracket_host(host: str) -> str:
@@ -557,7 +539,7 @@ class JobStateAPI:
         # address only when nothing was configured, i.e. the ephemeral
         # loopback default, where the bound host is the right answer.
         advertise = bound_host
-        if self._config.get("listen") and not _is_wildcard(host):
+        if self._config.get("listen") and not _is_wildcard_host(host):
             advertise = host
         self._base_url = "{}://{}:{}".format(
             scheme, _bracket_host(advertise), bound_port

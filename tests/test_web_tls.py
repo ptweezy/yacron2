@@ -934,3 +934,111 @@ async def test_bearer_token_still_applies_over_https(tmp_path):
                 assert resp.status == 200
     finally:
         await cron.start_stop_web_app(None)
+
+
+def _job_api_state_yaml(store, port, tls):
+    """A ``state`` block whose loopback job API serves TLS over ``https``."""
+    return (
+        "state:\n"
+        "  path: " + str(store) + "\n"
+        "  jobApi:\n"
+        "    listen: https://localhost:" + str(port) + "\n"
+        "    tls:\n"
+        "      cert: " + tls["cert"] + "\n"
+        "      key: " + tls["key"] + "\n"
+        "      ca: " + tls["ca"] + "\n"
+    )
+
+
+async def test_plaintext_job_api_has_no_tls_signature(tmp_path):
+    # The loopback plaintext default (crypto-free, so this runs everywhere)
+    # watches no files: its signature is None, so the rotation check
+    # short-circuits and a no-op reload never disturbs the endpoint.
+    from tests.test_state import _state_cfg
+
+    cfg = _state_cfg("state:\n  path: " + str(tmp_path))
+    cron = Cron(None)
+    try:
+        await cron.start_stop_state(cfg)
+        first = cron._job_api
+        assert first is not None
+        assert cron._job_api_tls_signature is None
+        # an unchanged reload reaches the rotation arm but does nothing
+        await cron.start_stop_state(cfg)
+        assert cron._job_api is first
+    finally:
+        await cron.start_stop_state(None)
+
+
+async def test_job_api_in_place_rotation_restarts_only_the_listener(tmp_path):
+    # The jobApi https listener's analogue of
+    # test_in_place_rotation_restarts_the_listener: the state config is
+    # byte-identical across a rotation, so only the file signature notices it.
+    # The restart rebuilds ONLY the listener -- the store backend, and the
+    # object identity that proves it, are untouched.
+    from tests.test_state import _state_cfg
+
+    tls = _write_tls(tmp_path)
+    port = _free_port()
+    cfg = _state_cfg(_job_api_state_yaml(tmp_path / "store", port, tls))
+    cron = Cron(None)
+    try:
+        await cron.start_stop_state(cfg)
+        first = cron._job_api
+        backend = cron.state_backend
+        assert first is not None
+        assert cron._job_api_tls_signature is not None
+        # an unchanged config with unchanged files leaves both in place
+        await cron.start_stop_state(cfg)
+        assert cron._job_api is first
+        assert cron.state_backend is backend
+
+        # rotate IN PLACE: overwrite the configured cert/key paths with fresh
+        # material signed by a different CA, as a secret refresh would
+        rotated = _write_tls(tmp_path, cn="rotated")
+        for field in ("cert", "key"):
+            _copy_bytes(rotated[field], tls[field])
+        await cron.start_stop_state(cfg)
+        # the listener was rebuilt; the backend was NOT
+        assert cron._job_api is not None
+        assert cron._job_api is not first
+        assert cron.state_backend is backend
+        # and the NEW certificate is what the endpoint serves now: a client
+        # pinning the rotated CA completes the handshake (401 is the endpoint
+        # answering on its own terms, over TLS)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                cron._job_api.base_url + "/v1/run",
+                ssl=_client_ctx(rotated["ca"]),
+                headers={"Authorization": "Bearer nope"},
+            ) as resp:
+                assert resp.status == 401
+    finally:
+        await cron.start_stop_state(None)
+
+
+async def test_job_api_half_written_rotation_keeps_the_old_listener(
+    tmp_path, caplog
+):
+    # A half-written rotation (cert-manager / Vault / a Kubernetes secret
+    # refresh is not atomic across the files) must keep the working endpoint up
+    # and retry, not tear it down and then fail to rebuild.
+    from tests.test_state import _state_cfg
+
+    tls = _write_tls(tmp_path)
+    port = _free_port()
+    cfg = _state_cfg(_job_api_state_yaml(tmp_path / "store", port, tls))
+    cron = Cron(None)
+    try:
+        await cron.start_stop_state(cfg)
+        first = cron._job_api
+        assert first is not None
+        # overwrite the cert with garbage: the signature changes (a rotation is
+        # detected) but the new material will not build a context
+        with open(tls["cert"], "wb") as fh:
+            fh.write(GARBAGE_PEM)
+        await cron.start_stop_state(cfg)
+        assert cron._job_api is first
+        assert "not yet loadable" in caplog.text
+    finally:
+        await cron.start_stop_state(None)

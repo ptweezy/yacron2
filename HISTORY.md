@@ -71,6 +71,14 @@ cluster's own functions delegate to it under their existing names.
   authenticates callers.  The in-job CLI has no TLS flags at all and no way
   to switch verification off, by design: nothing running inside a job should
   be able to downgrade the channel carrying that job's own secrets.
+- **An in-place rotation of the endpoint's certificate is picked up while
+  the daemon runs**, the same as a web certificate.  The `cert`/`key` files
+  are fingerprinted as the listener loaded them; a change (same paths, new
+  bytes, which is how cert-manager, Vault and Kubernetes secret refreshes
+  renew) rebuilds just this listener on the next housekeeping pass, without
+  disturbing the store backend or its leases, and gated on the new material
+  loading first so a half-written refresh keeps the old certificate up.
+  `state.jobApi.tls.ca` is exempt, because jobs read it fresh by path.
 - **A wildcard host over `https://` is a configuration error.**  Jobs dial
   the address they are handed and no certificate carries a SAN for every
   interface, so `https://0.0.0.0:9000` could only ever fail verification.

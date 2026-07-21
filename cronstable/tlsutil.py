@@ -40,6 +40,15 @@ from typing import (
 # missing/None entry rather than indexing.
 LISTENER_TLS_KEYS = ("cert", "key", "clientCa")
 
+# The server-side files of a `state.jobApi.tls` block, in signature order.
+# `ca` is deliberately excluded: unlike `cert`/`key` it is never loaded into
+# the listener's SSLContext.  It is handed to jobs as a PATH (via
+# CRONSTABLE_STATE_CACERT) and read fresh by each job, so the daemon caches
+# nothing an in-place `ca` rotation would stale, and watching it here would
+# restart the listener for no reason.  See
+# cronstable.cron.Cron._job_api_tls_files_changed.
+JOB_API_TLS_KEYS = ("cert", "key")
+
 
 def listener_tls_configured(tls: Optional[Mapping[str, Any]]) -> bool:
     """Whether a ``tls`` block actually names material to serve.

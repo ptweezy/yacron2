@@ -1288,6 +1288,15 @@ class Cron:
         # with it). None keeps the classic behaviour: no endpoint, no injected
         # CRONSTABLE_STATE_* env, jobs unaware of the store.
         self._job_api: Optional["JobStateAPI"] = None
+        # On-disk fingerprint of the job API's TLS files (cert/key) as the
+        # RUNNING listener loaded them, or None for a plaintext endpoint. The
+        # SSLContext is built once inside JobStateAPI.start() and never
+        # reloaded, so an in-place rotation (same paths, new bytes) is
+        # otherwise invisible and the endpoint keeps serving the old
+        # certificate until it expires. The web-app analogue is
+        # _web_tls_signature; only meaningful while _job_api is not None, which
+        # is why _stop_job_api clears it. See _job_api_tls_files_changed.
+        self._job_api_tls_signature = None  # type: Optional[Dict[str, Any]]
         # the durable DAG orchestrator (cronstable.dagrun.DagScheduler);
         # inert until a `dags:` section and a state backend are configured. It
         # holds a back-reference to this Cron and reuses its state/lease/launch
@@ -5191,14 +5200,20 @@ class Cron:
     ) -> None:
         """(Re)build the durable state backend to match the config.
 
-        Mirrors :meth:`start_stop_cluster` but simpler: the backend has no
-        election, TLS, or convergence to reason about.  It is rebuilt only when
-        the ``state`` section is added, removed, or changed (the backend tracks
-        the job-set id itself via ``self.job_set_id``, so an ordinary reload
-        that only edits jobs does not disturb it).  A start failure -- an
-        unwritable path, a bad mount -- is logged and swallowed, exactly like a
-        cluster start failure, so durability being misconfigured never stops
-        cronstable from running jobs in memory.
+        Mirrors :meth:`start_stop_cluster` but simpler: the store backend has
+        no election or convergence to reason about, and is rebuilt only when
+        the ``state`` section is added, removed, or changed (the backend
+        tracks the job-set id itself via ``self.job_set_id``, so an ordinary
+        reload that only edits jobs does not disturb it).  A start failure --
+        an unwritable path, a bad mount -- is logged and swallowed, exactly
+        like a cluster start failure, so durability being misconfigured never
+        stops cronstable from running jobs in memory.
+
+        The loopback job API in front of the backend *can* serve TLS (an
+        off-host ``state.jobApi.listen`` over ``https://``); an in-place
+        rotation of its certificate is picked up by restarting just that
+        listener, without disturbing the backend or its leases (see
+        :meth:`_maybe_restart_job_api_for_tls`).
         """
         self._state_configured = state_config is not None
         if state_config is not None:
@@ -5267,6 +5282,11 @@ class Cron:
             # TTL) so the new store's active runs are re-adopted from scratch
             # by reconcile_on_boot (re-run because _state_rehydrated cleared).
             self._dag.forget()
+        elif backend is not None and state_config is not None:
+            # config byte-identical, so the teardown above did not fire: the
+            # store backend stays, but the job API's TLS certificate may have
+            # rotated in place under it. Cheap stat-compare once per pass.
+            await self._maybe_restart_job_api_for_tls(state_config)
         if state_config is not None and self.state_backend is None:
             try:
                 # Construct INSIDE the try: building the backend resolves and
@@ -5322,6 +5342,21 @@ class Cron:
         # never enters the graph unless a job API is actually configured.
         from cronstable.jobapi import JobStateAPI
 
+        # Snapshot the TLS files BEFORE api.start() loads them, mirroring
+        # _build_web_tls: a rotation landing in the gap then compares unequal
+        # on the next pass -- a spurious restart, the safe direction, not a
+        # missed one. None for a plaintext endpoint (no cert/key), which
+        # therefore never triggers a rotation restart.
+        job_api_tls = job_api_cfg.get("tls")
+        tls_signature: Optional[Dict[str, Any]] = None
+        if tlsutil.listener_tls_configured(job_api_tls):
+            # listener_tls_configured is truthy only when cert and key are
+            # present, so the block is non-None here; the assert is only so
+            # the call type-checks (it is not a TypeGuard).
+            assert job_api_tls is not None
+            tls_signature = tlsutil.tls_file_signature(
+                job_api_tls, tlsutil.JOB_API_TLS_KEYS
+            )
         api = JobStateAPI(
             lambda: self.state_backend,
             host=self._state_host,
@@ -5338,16 +5373,86 @@ class Cron:
             )
             return
         self._job_api = api
+        self._job_api_tls_signature = tls_signature
 
     async def _stop_job_api(self) -> None:
         api = self._job_api
         if api is None:
             return
         self._job_api = None
+        self._job_api_tls_signature = None
         try:
             await asyncio.wait_for(api.stop(), timeout=STATE_OP_TIMEOUT)
         except (OSError, asyncio.TimeoutError) as ex:
             logger.warning("state: job API did not stop cleanly: %s", ex)
+
+    def _job_api_tls_files_changed(
+        self, tls: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Whether the running job API's TLS files differ from what it loaded.
+
+        The job-state analogue of :meth:`_web_tls_files_changed`, and the only
+        thing that makes an in-place certificate rotation of the job API
+        listener visible: the state config is byte-identical across such a
+        rotation, so the ``state_config != backend.config`` gate never fires
+        for it.
+
+        Only the server material is watched, via
+        :data:`cronstable.tlsutil.JOB_API_TLS_KEYS` (``cert``/``key``): the
+        ``ca`` is handed to jobs as a path and read fresh by each one, so
+        nothing the daemon holds goes stale when it rotates.
+
+        Gated on ``_job_api_tls_signature`` -- ``None`` for a plaintext
+        endpoint, which therefore never restarts on this -- rather than on the
+        config, so a loopback endpoint is untouched.
+        """
+        if self._job_api_tls_signature is None or not tls:
+            return False
+        return (
+            tlsutil.tls_file_signature(tls, tlsutil.JOB_API_TLS_KEYS)
+            != self._job_api_tls_signature
+        )
+
+    async def _maybe_restart_job_api_for_tls(
+        self, state_config: StateConfig
+    ) -> None:
+        """Restart the job API listener if its TLS cert/key rotated in place.
+
+        Called on an otherwise no-op reload (state config byte-identical). The
+        web-app analogue is the TLS arm of :meth:`_web_restart_reason`; this
+        is lighter because only the listener is rebuilt -- the store backend,
+        its leases and its renewers are untouched.
+
+        Restarting is gated on the new material actually loading. A
+        half-written rotation (cert-manager, Vault and Kubernetes secret
+        refreshes are not atomic across the files), or a config edit racing
+        one, would otherwise tear a working endpoint down and then fail to
+        rebuild it, leaving jobs with no state endpoint until the next reload;
+        keeping the old listener up and retrying is the safe direction.
+
+        The loadability gate covers the material; the rebind itself is not
+        pre-validated (make-before-break is infeasible -- the new listener
+        wants the same port the old one holds). A rebind that fails leaves the
+        endpoint down with the error :meth:`_start_job_api` logs, the same
+        degraded state as a failed initial start, until the ``state`` config
+        next changes.
+        """
+        tls = (state_config.get("jobApi") or {}).get("tls")
+        if self._job_api is None or not self._job_api_tls_files_changed(tls):
+            return
+        if not tlsutil.listener_tls_loadable(tls):
+            logger.warning(
+                "state: new job API TLS material is not yet loadable (a "
+                "partial/half-written rotation, or a config edit racing "
+                "one?); keeping the running endpoint and retrying next reload"
+            )
+            return
+        logger.info(
+            "state: job API TLS certificate files changed, restarting the "
+            "loopback state endpoint"
+        )
+        await self._stop_job_api()
+        await self._start_job_api(state_config)
 
     def _track_state_write(
         self, coro: Coroutine[Any, Any, None]

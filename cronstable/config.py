@@ -2293,6 +2293,11 @@ def _is_wildcard_host(host: str) -> bool:
     all of the IP forms to the one unspecified address per family, so this
     compares parsed values rather than the handful of strings someone
     happened to think of.
+
+    Shared with :mod:`cronstable.jobapi`, which imports it to decide what
+    address to advertise to jobs (a wildcard is not one a job can dial);
+    here it also gates a wildcard bind over ``https://`` (no certificate SAN
+    can cover an unspecified address).
     """
     text = host.strip().strip("[]")
     if not text:
@@ -2300,7 +2305,8 @@ def _is_wildcard_host(host: str) -> bool:
     try:
         return ipaddress.ip_address(text).is_unspecified
     except ValueError:
-        # a name, not a literal; a name can be covered by a certificate SAN
+        # a name, not a literal: a job can resolve it, and a certificate SAN
+        # can cover it
         return False
 
 

@@ -2136,3 +2136,105 @@ def test_env_interp_expanded_value_feeds_section_validator(monkeypatch):
         config.parse_config_string(
             "state:\n  path: ${SDIR}\n", "test.yaml"
         )
+
+
+def test_env_interp_unterminated_default_is_linear_not_quadratic():
+    # A value carrying many unterminated ``${x:-`` fragments made the old
+    # re.sub restart its ``[^}]*`` default scan to end-of-string at every
+    # ``${`` offset: O(n^2), a config-load / --validate-config / hot-reload
+    # stall.  The hand-written scanner keeps it amortised linear; assert via
+    # growth ratio (~4x per 2x input before the fix, ~2x after) rather than
+    # wall-clock, so a slow CI box cannot flake it.
+    import time
+
+    # unterminated (no closing ``}``): every fragment is left verbatim, and a
+    # leading ``}`` sitting *behind* the fragments must not rescue the match.
+    assert config._interpolate_env_value("${a:-" * 40, "p", "loc") == (
+        "${a:-" * 40
+    )
+    assert config._interpolate_env_value("}" + "${a:-" * 40, "p", "loc") == (
+        "}" + "${a:-" * 40
+    )
+    timings = []
+    for n in (16_000, 32_000, 64_000):
+        value = "${a:-" * n
+        started = time.perf_counter()
+        config._interpolate_env_value(value, "p", "loc")
+        timings.append(time.perf_counter() - started)
+    assert timings[2] < timings[0] * 8, timings  # quadratic would be ~16x
+
+
+def test_env_interp_skip_is_structural_not_by_key_name(monkeypatch):
+    # command/shell/logging are skipped only where they are runtime-shell or
+    # logging.config territory (a job/task field, a shell reporter block, the
+    # top-level logging section).  The very same names as user-chosen keys in
+    # an arbitrary-key map (web.headers here) are ordinary values and must
+    # interpolate like any other.
+    monkeypatch.setenv("HDR", "expanded")
+    conf = config.parse_config_string(
+        "web:\n"
+        "  listen:\n"
+        '    - "127.0.0.1:8080"\n'
+        "  headers:\n"
+        '    command: "c=${HDR}"\n'
+        '    shell: "s=${HDR}"\n'
+        '    logging: "l=${HDR}"\n'
+        '    normal: "n=${HDR}"\n',
+        "test.yaml",
+    )
+    assert conf.web_config["headers"] == {
+        "command": "c=expanded",
+        "shell": "s=expanded",
+        "logging": "l=expanded",
+        "normal": "n=expanded",
+    }
+
+
+def test_env_interp_in_reporter_value_maps(monkeypatch):
+    # Inside a report block only the shell reporter sub-block is skipped; a
+    # webhook header or a sentry extra keyed command/shell still interpolates.
+    monkeypatch.setenv("TOK", "xyz")
+    conf = config.parse_config_string(
+        "jobs:\n"
+        "  - name: n\n"
+        "    command: c\n"
+        "    schedule:\n"
+        '      minute: "*"\n'
+        "    onFailure:\n"
+        "      report:\n"
+        "        webhook:\n"
+        "          url:\n"
+        "            value: https://h/x\n"
+        "          headers:\n"
+        '            command: "Bearer ${TOK}"\n'
+        "        sentry:\n"
+        "          dsn:\n"
+        "            value: https://k@o/1\n"
+        "          extra:\n"
+        '            shell: "ctx-${TOK}"\n',
+        "test.yaml",
+    )
+    report = conf.jobs[0].onFailure["report"]
+    assert report["webhook"]["headers"]["command"] == "Bearer xyz"
+    assert report["sentry"]["extra"]["shell"] == "ctx-xyz"
+
+
+def test_env_interp_unset_under_value_map_key_named_shell_fails_fast(
+    monkeypatch,
+):
+    # The over-broad skip used to swallow an unset ${VAR} under a header keyed
+    # ``shell``; it now fail-fasts like any other value, naming the location.
+    monkeypatch.delenv("MISSING", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            "web:\n"
+            "  listen:\n"
+            '    - "127.0.0.1:8080"\n'
+            "  headers:\n"
+            '    shell: "${MISSING}"\n',
+            "prod.yaml",
+        )
+    msg = str(exc.value)
+    assert "MISSING" in msg
+    assert "web.headers.shell" in msg
+    assert "prod.yaml" in msg

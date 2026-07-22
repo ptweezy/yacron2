@@ -5,6 +5,55 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.29 (2026-07-21)
+
+A configuration release.  A YAML config can now pull its own values from the
+environment.  `${VAR}` and `${VAR:-default}` in any string value are expanded
+from cronstable's process environment when the file loads, so one config file
+serves many environments without a wrapper entrypoint templating the YAML from
+env first.  A listen address, a state path, a timezone, an `include` path or a
+webhook URL can come from an environment variable while the config itself stays
+declarative.  It is opt-in by syntax: a config that never writes `${...}`
+behaves exactly as before, and expansion introduces no new keys.
+
+### Environment-variable interpolation
+
+- **`${VAR}` expands to an environment variable and `${VAR:-default}` supplies
+  a fallback** when the variable is unset or set-but-empty (the shell's `:-`).
+  `$$` is a literal `$`, so `$${VAR}` stays `${VAR}`.  Only these braced forms
+  are recognised: a lone `$`, a bare `$VAR`, or a malformed `${...}` is left
+  exactly as written, so a value that never used the syntax passes through
+  untouched.
+- **An unset variable with no default is a hard `ConfigError`** that names the
+  variable, the config value it appeared in (e.g. `web.listen[0]`), and the
+  file.  A missing deploy-time variable therefore fails at load, and
+  `cronstable --validate-config` catches it in CI or a deploy check before the
+  scheduler ever starts.
+- **Expansion runs after the document is validated**, over the parsed values,
+  so it reaches every string-typed field.  A consequence is that a numeric key
+  cannot itself be a bare `${VAR}` (its value fails schema validation before
+  expansion is reached); put the variable inside a string, as in
+  `listen: ["0.0.0.0:${PORT}"]`.  The section builders then validate the
+  expanded value, so an interpolated `state.path` that resolves to empty is
+  rejected the usual way.
+- **Each file is expanded against the environment as it is parsed.**  An
+  `include` path is an ordinary string value, so it too may be built from a
+  variable (`- ${ENVIRONMENT:-prod}.yaml`), and an included file resolves its
+  own references.  An environment value is never rescanned for further
+  `${...}`, so a variable cannot expand into another expansion.
+- **Job, DAG-task and shell-reporter `command`/`shell` are left untouched**:
+  their `${VAR}` belongs to the runtime shell, which expands it against the
+  job's own environment (`env_file`, per-job `environment`, staged secrets) at
+  execution time, not the daemon's.  The `logging` section is likewise left for
+  Python's `logging.config`, whose `$`-style formatters legitimately write
+  `${asctime}` in a `format` string; interpolating it would fail an otherwise
+  valid logging config to load.
+- **The job-set id is taken over the expanded config**, so a job set that
+  interpolates per-environment values gets a different id per environment by
+  design (the deployments really are running different job sets).  Keep
+  interpolated variables out of fingerprinted job fields if one id must compare
+  across environments.
+
 ## 1.2.28 (2026-07-21)
 
 A performance and hardening release.  The cron engine, the config loader, the

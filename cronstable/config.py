@@ -3385,6 +3385,223 @@ class CronstableConfig:
     mcp_config: Optional[MCPConfig] = None
 
 
+# Environment-variable interpolation over the validated config document.
+#
+# After strictyaml validates a YAML file, every ``${VAR}`` /
+# ``${VAR:-default}`` in a *string* value is replaced with the environment
+# variable VAR.  ``:-default`` supplies a fallback when VAR is unset or empty
+# (exactly like the POSIX shell); ``$$`` is the escape for a literal ``$``.  A
+# reference to an unset variable with no default is a hard ConfigError naming
+# the variable and where it appeared, so a missing deploy-time variable fails
+# fast at load (and under ``--validate-config``) rather than silently expanding
+# to nothing.
+#
+# Expansion runs post-validation over the parsed document, so only fields
+# strictyaml already accepted as strings are eligible; a numeric key such as
+# ``smtpPort`` cannot itself be a bare ``${VAR}`` (put the variable inside a
+# string, e.g. ``listen: ["0.0.0.0:${PORT}"]``).  Only the braced forms are
+# recognised: a lone ``$``, a bare ``$VAR``, or a malformed ``${...}`` is left
+# verbatim, so an existing config that never used the syntax is untouched.
+#
+# A few structural locations are skipped whole, because a ``${...}`` there is
+# another layer's expansion syntax rather than ours:
+#
+# * A job's or DAG task's ``command`` and ``shell``, and a shell reporter's
+#   ``shell`` block: that ``${VAR}`` belongs to the runtime shell, which
+#   expands it against the *job's* environment (env_file, per-job environment,
+#   staged secrets) at execution time, not the daemon's.
+# * The top-level ``logging`` section: it is handed to Python's
+#   ``logging.config`` verbatim, and a ``$``-style formatter (``style: "$"``)
+#   legitimately writes ``${asctime}`` / ``${message}`` in its ``format``
+#   string, so the whole subtree is left for logging.config.
+#
+# The skip is decided by WHERE a key sits in the validated document, not by
+# its spelling: a user-chosen key that happens to be named ``command`` /
+# ``shell`` / ``logging`` inside an arbitrary-key map (``web.headers``, a
+# ``webhook.headers`` entry, ``sentry.extra``) is interpolated like any other
+# value. The walk tags each map it descends into with a small "kind"; only the
+# job, task and defaults kinds own shell-territory ``command`` / ``shell``, a
+# report kind owns the shell reporter, and the root kind owns ``logging``.
+#
+# Because fingerprints hash the post-expansion config, a job set that
+# interpolates env vars gets a different job-set id per environment; that is
+# intended (the configs really do differ).
+# ASCII-only variable-name character sets (a name is
+# ``[A-Za-z_][A-Za-z0-9_]*``), matched by hand so the expansion is a single
+# linear pass instead of ``re.sub``.  ``re.sub`` retries the pattern at every
+# position, and its ``:-([^}]*)`` default lets the engine scan to
+# end-of-string at each retry, so a value carrying many unterminated
+# ``${x:-`` fragments cost O(n^2) to expand: a config-load, ``--validate-
+# config`` and hot-reload stall.  The scanner below is O(n); it never re-scans
+# a span, and stops looking for a closing ``}`` once none can remain ahead.
+_ENV_NAME_START = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
+)
+_ENV_NAME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+)
+
+
+def _resolve_env(
+    name: str, default: Optional[str], path: str, location: str
+) -> str:
+    """Resolve one ``${VAR}`` / ``${VAR:-default}`` reference to its value.
+
+    ``default`` is the captured fallback text, or None for a braced reference
+    that carried no ``:-`` at all.  ``location`` is a dotted path to the value
+    inside the document (e.g. ``web.listen[0]``); it appears only in the
+    unset-variable error so the operator can find the offending key.
+    """
+    present = name in os.environ
+    value = os.environ.get(name, "")
+    if default is not None:
+        # `:-` falls back to the default when unset OR set-but-empty.
+        return value if (present and value != "") else default
+    # A bare `${VAR}` yields the value whenever the variable is set (even to
+    # the empty string); only a genuinely unset variable is an error.
+    if present:
+        return value
+    where = "config value {}".format(location) if location else "the config"
+    raise ConfigError(
+        "{}: {} references environment variable ${{{}}}, which is not "
+        "set; export it, or write ${{{}:-default}} to supply a "
+        "fallback".format(path, where, name, name)
+    )
+
+
+def _interpolate_env_value(raw: str, path: str, location: str) -> str:
+    """Expand ``${VAR}`` / ``${VAR:-default}`` / ``$$`` in one string value.
+
+    A single linear left-to-right pass equivalent to the grammar
+    ``$$ | ${NAME} | ${NAME:-DEFAULT}`` (NAME is ``[A-Za-z_][A-Za-z0-9_]*``,
+    DEFAULT is any run of non-``}`` characters, the same as the old
+    ``re.sub``); every other ``$`` (a lone ``$``, a bare ``$VAR``, a malformed
+    ``${...``) is copied verbatim.
+    """
+    if "$" not in raw:  # the overwhelmingly common case
+        return raw
+    n = len(raw)
+    out = []
+    i = 0
+    braces_possible = True  # cleared once no ``}`` can remain ahead
+    while i < n:
+        j = raw.find("$", i)
+        if j < 0:
+            out.append(raw[i:])
+            break
+        out.append(raw[i:j])  # verbatim run up to this ``$``
+        nxt = raw[j + 1] if j + 1 < n else ""
+        if nxt == "$":  # ``$$`` -> a literal ``$``
+            out.append("$")
+            i = j + 2
+            continue
+        if braces_possible and nxt == "{":
+            k = j + 2
+            if k < n and raw[k] in _ENV_NAME_START:
+                start = k
+                k += 1
+                while k < n and raw[k] in _ENV_NAME_CHARS:
+                    k += 1
+                name = raw[start:k]
+                if raw[k : k + 2] == ":-":
+                    close = raw.find("}", k + 2)
+                    if close < 0:
+                        # No ``}`` at or after here means none remains anywhere
+                        # ahead (the cursor only advances), so no braced form
+                        # can ever complete again.  Stop scanning for one; this
+                        # is what keeps the pass O(n) on ``${x:-`` heavy input.
+                        braces_possible = False
+                    else:
+                        out.append(
+                            _resolve_env(
+                                name, raw[k + 2 : close], path, location
+                            )
+                        )
+                        i = close + 1
+                        continue
+                elif k < n and raw[k] == "}":
+                    out.append(_resolve_env(name, None, path, location))
+                    i = k + 1
+                    continue
+        # a lone ``$``, a malformed ``${...``, or braces no longer possible
+        out.append("$")
+        i = j + 1
+    return "".join(out)
+
+
+# Map "kinds" whose ``command`` / ``shell`` keys are runtime-shell territory.
+_ENV_SHELL_MAP_KINDS = frozenset({"job", "task", "defaults"})
+# How a sequence's kind names the kind of each of its elements.
+_ENV_SEQ_ELEM_KIND = {
+    "job-seq": "job",
+    "dag-seq": "dag",
+    "task-seq": "task",
+}
+
+
+def _env_child_kind(kind: str, key: str) -> str:
+    """Classify the child reached from a map of ``kind`` through ``key``.
+
+    A map's kind tells the walk, when it later processes that map's own keys,
+    whether a ``command`` / ``shell`` / ``logging`` there is a structural field
+    (shell or logging territory) or just a user-chosen key in a value map.  A
+    ``-seq`` kind is a sequence whose elements carry the singular kind (see
+    :data:`_ENV_SEQ_ELEM_KIND`).
+    """
+    if key == "report":  # a report block may sit under any hook map
+        return "report"
+    if kind == "root":
+        if key == "defaults":
+            return "defaults"
+        if key == "jobs":
+            return "job-seq"
+        if key == "dags":
+            return "dag-seq"
+        return "other"
+    if kind == "dag" and key == "tasks":
+        return "task-seq"
+    return "other"
+
+
+def _interpolate_env(doc: Any, path: str) -> Any:
+    """Return ``doc`` with env-var references expanded in every string value.
+
+    Walks the validated document, rebuilding it; see the module comment above
+    :func:`_interpolate_env_value` for the grammar and the intentionally
+    skipped structural fields (which are recognised by position, not by key
+    name, via :func:`_env_child_kind`).
+    """
+
+    def walk(node: Any, location: str, kind: str) -> Any:
+        if isinstance(node, dict):
+            out = {}
+            for key, value in node.items():
+                if (
+                    (kind == "report" and key == "shell")
+                    or (
+                        kind in _ENV_SHELL_MAP_KINDS
+                        and key in ("command", "shell")
+                    )
+                    or (kind == "root" and key == "logging")
+                ):
+                    out[key] = value  # another layer's ${...}: leave verbatim
+                    continue
+                child = "{}.{}".format(location, key) if location else str(key)
+                out[key] = walk(value, child, _env_child_kind(kind, key))
+            return out
+        if isinstance(node, list):
+            elem = _ENV_SEQ_ELEM_KIND.get(kind, "other")
+            return [
+                walk(item, "{}[{}]".format(location, index), elem)
+                for index, item in enumerate(node)
+            ]
+        if isinstance(node, str):
+            return _interpolate_env_value(node, path, location)
+        return node
+
+    return walk(doc, "", "root")
+
+
 def parse_config_string(
     data: str,
     path: str,
@@ -3408,6 +3625,10 @@ def parse_config_string(
         # cronstable bug, and one bad file aborts a whole config-directory
         # load.
         raise ConfigError("{}: {}".format(path, ex)) from ex
+    # Expand ${VAR} references over the validated doc before building the
+    # config (an unset-variable ConfigError propagates as-is). Runs per file,
+    # so each included file expands against its own ${VAR}s.
+    doc = _interpolate_env(doc, path)
     return _config_from_doc(doc, path, _seen, _sources)
 
 

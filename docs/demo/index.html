@@ -310,7 +310,11 @@
   }
 
   * { box-sizing: border-box; }
-  html, body { height: 100%; }
+  html { height: 100%; }
+  /* min-height (not height:100%) so the body box grows to contain all content.
+     the sticky header's containing block is this box; a fixed 100% height caps
+     it at one viewport, so the header un-sticks once you scroll past that. */
+  body { min-height: 100%; }
   body {
     margin: 0;
     background: var(--bg);

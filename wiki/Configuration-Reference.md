@@ -30,6 +30,14 @@ and any included files override `DEFAULT_CONFIG`, and an individual job override
 both. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) for
 the precise merge order.
 
+After validation, `${VAR}` and `${VAR:-default}` in any string value are
+expanded from cronstable's environment (`$$` is a literal `$`), so a listen
+address, state path, timezone, or webhook URL can come from an environment
+variable. Job and reporter `command`/`shell` fields are left for the runtime
+shell, and the `logging` section is left for Python's `logging.config`. An
+unset variable with no default is a hard `ConfigError`. See
+[Environment-Variable Interpolation](Environment-Variable-Interpolation).
+
 ## Top-level structure
 
 ```yaml

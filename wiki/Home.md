@@ -20,6 +20,7 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [Schedule Linting](Schedule-Linting): Advisory findings for legal-but-suspect schedules: dead never-fires schedules, AND day semantics, uneven steps, skipped months, and DST anomalies.
 - [Hashed Schedules (H)](Hashed-Schedules): Jenkins-style `H` fields that hash the job name to a stable slot, spreading a fleet across the hour while keeping every job's fire time predictable.
 - [Commands and Environment](Commands-and-Environment): Shell vs. argv commands, environment variables, env files, and per-job user/group.
+- [Environment-Variable Interpolation](Environment-Variable-Interpolation): Expanding `${VAR}` / `${VAR:-default}` in config string values from the daemon's environment, with `$$` escaping and a hard error on an unset variable.
 - [Output Capturing](Output-Capturing): Capturing stdout/stderr and customizing stream prefixes.
 - [Includes, Defaults, and Multi-File Config](Includes-and-Defaults): Sharing settings via `defaults`, the `include` directive, and multi-file config directories.
 - [Logging Configuration](Logging-Configuration): Customizing cronstable's own logging via the `logging` section.

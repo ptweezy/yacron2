@@ -2232,6 +2232,37 @@ defaults:
         ...
 ```
 
+### Environment variable interpolation
+
+Any string value in the config can pull from cronstable's environment with
+`${VAR}`, or `${VAR:-default}` for a fallback, so one config file serves many
+environments without a wrapper script templating it. Write `$$` for a literal
+`$`. Interpolation runs after the file is validated, so it reaches any
+string-typed field (a listen address, a state path, a timezone, a webhook URL),
+and a `${VAR}` that is unset and has no default is a hard configuration error
+that names the variable, caught by `cronstable --validate-config`.
+
+```yaml
+web:
+  listen:
+    - "0.0.0.0:${WEB_PORT:-8080}"   # port from the environment, default 8080
+state:
+  path: ${STATE_DIR}               # required: unset fails --validate-config
+jobs:
+  - name: rollup-${REGION}
+    command: run-rollup             # ${VAR} in a command is left for the shell
+    schedule:
+      minute: "0"
+    timezone: ${TZ:-UTC}
+```
+
+A job's (and reporter's) `command` and `shell` are deliberately left untouched,
+so their `${VAR}` is expanded by the runtime shell against the job's own
+environment, not the daemon's; the `logging` section is likewise left for
+Python's `logging.config`. See
+[Environment-Variable Interpolation](https://github.com/ptweezy/cronstable/wiki/Environment-Variable-Interpolation)
+for the full rules, including how it affects the [job-set id](#job-set-id).
+
 ### Custom logging
 
 It's possible to provide a custom logging configuration, via the `logging`
@@ -2307,6 +2338,7 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
   [Classic Crontabs](https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs) ·
   [Includes and Defaults](https://github.com/ptweezy/cronstable/wiki/Includes-and-Defaults) ·
   [Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment) ·
+  [Environment-Variable Interpolation](https://github.com/ptweezy/cronstable/wiki/Environment-Variable-Interpolation) ·
   [Output Capturing](https://github.com/ptweezy/cronstable/wiki/Output-Capturing) ·
   [Logging](https://github.com/ptweezy/cronstable/wiki/Logging-Configuration)
 * **Trust it**:

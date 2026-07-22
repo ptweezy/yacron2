@@ -1864,3 +1864,377 @@ def test_onlate_with_no_reporter_configured_needs_no_sla():
         "          to:\n"
     )
     assert job.sla["lateAfterSeconds"] is None
+
+
+# --- ${ENV} interpolation over the validated config document -----------------
+
+
+def test_env_interp_basic_and_default(monkeypatch):
+    monkeypatch.setenv("PORT", "9000")
+    monkeypatch.delenv("BIND_HOST", raising=False)
+    conf = config.parse_config_string(
+        """
+web:
+  listen:
+    - "0.0.0.0:${PORT}"
+    - "${BIND_HOST:-127.0.0.1}:8080"
+""",
+        "test.yaml",
+    )
+    assert conf.web_config["listen"] == ["0.0.0.0:9000", "127.0.0.1:8080"]
+
+
+def test_env_interp_in_job_scalar_fields(monkeypatch):
+    monkeypatch.setenv("ENVNAME", "staging")
+    monkeypatch.setenv("TZONE", "Europe/Berlin")
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: sync-${ENVNAME}
+    command: echo hi
+    schedule:
+      minute: "*"
+    timezone: ${TZONE}
+""",
+        "test.yaml",
+    )
+    job = conf.jobs[0]
+    assert job.name == "sync-staging"
+    assert str(job.timezone) == "Europe/Berlin"
+
+
+def test_env_interp_skips_command_and_shell(monkeypatch):
+    # A ${VAR} inside a job command or the shell interpreter belongs to the
+    # runtime shell and must survive verbatim -- even when the variable is
+    # unset (so it is never a load-time error either).
+    monkeypatch.delenv("HOME_DIR", raising=False)
+    monkeypatch.delenv("MY_SHELL", raising=False)
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: n
+    shell: ${MY_SHELL}
+    command:
+      echo ${HOME_DIR}
+    schedule:
+      minute: "*"
+""",
+        "test.yaml",
+    )
+    job = conf.jobs[0]
+    assert job.command == "echo ${HOME_DIR}"
+    assert job.shell == "${MY_SHELL}"
+
+
+def test_env_interp_skips_shell_reporter_command(monkeypatch):
+    # The shell reporter runs a command too; the whole `report.shell` block is
+    # left untouched, so an unset ${VAR} there is not a load-time error, while
+    # a sibling webhook URL still expands.
+    monkeypatch.setenv("HOOK", "abc123")
+    monkeypatch.delenv("PAGER_CMD_ARG", raising=False)
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: n
+    command: c
+    schedule:
+      minute: "*"
+    onFailure:
+      report:
+        shell:
+          command: page ${PAGER_CMD_ARG}
+        webhook:
+          url:
+            value: https://hooks.example/${HOOK}
+""",
+        "test.yaml",
+    )
+    report = conf.jobs[0].onFailure["report"]
+    assert report["shell"]["command"] == "page ${PAGER_CMD_ARG}"
+    assert report["webhook"]["url"]["value"] == "https://hooks.example/abc123"
+
+
+def test_env_interp_unset_without_default_raises_naming_key(monkeypatch):
+    monkeypatch.delenv("NEEDED_PORT", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            """
+web:
+  listen:
+    - "0.0.0.0:${NEEDED_PORT}"
+""",
+            "prod.yaml",
+        )
+    msg = str(exc.value)
+    # names the missing variable, the config location, and the source file
+    assert "NEEDED_PORT" in msg
+    assert "web.listen[0]" in msg
+    assert "prod.yaml" in msg
+
+
+def test_env_interp_dollar_escape(monkeypatch):
+    monkeypatch.setenv("X", "val")
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: n
+    command: c
+    schedule:
+      minute: "*"
+    streamPrefix: "$$5 and $${X} literal but ${X} expands"
+""",
+        "test.yaml",
+    )
+    assert conf.jobs[0].streamPrefix == "$5 and ${X} literal but val expands"
+
+
+def test_env_interp_default_used_only_when_unset_or_empty(monkeypatch):
+    # `:-` mirrors the shell: default when unset OR set-but-empty; a bare
+    # ${VAR} on a set-but-empty variable expands to empty (never an error).
+    monkeypatch.setenv("EMPTY", "")
+    monkeypatch.setenv("SET", "here")
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: n
+    command: c
+    schedule:
+      minute: "*"
+    streamPrefix: "[${EMPTY}][${EMPTY:-fb}][${SET:-fb}]"
+""",
+        "test.yaml",
+    )
+    assert conf.jobs[0].streamPrefix == "[][fb][here]"
+
+
+def test_env_interp_leaves_unbraced_and_malformed_literal(monkeypatch):
+    # Only the braced forms are recognised; a bare $VAR, a lone $, and a
+    # malformed ${...} are passed through untouched so pre-existing configs
+    # that never used the syntax keep their exact values.
+    monkeypatch.delenv("VAR", raising=False)
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: n
+    command: c
+    schedule:
+      minute: "*"
+    streamPrefix: "price $5, $VAR, ${unclosed and a{brace}"
+""",
+        "test.yaml",
+    )
+    assert (
+        conf.jobs[0].streamPrefix == "price $5, $VAR, ${unclosed and a{brace}"
+    )
+
+
+def test_env_interp_expands_state_path_and_include_path(monkeypatch, tmp_path):
+    # A whole section (state.path) and an include path can both come from the
+    # environment; the included file is resolved after expansion.
+    monkeypatch.setenv("STATE_DIR", str(tmp_path / "state"))
+    (tmp_path / "extra.yaml").write_text(
+        "jobs:\n  - name: extra\n    command: c\n    schedule:\n"
+        "      minute: '*'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EXTRA", "extra.yaml")
+    main = tmp_path / "main.yaml"
+    main.write_text(
+        "state:\n  path: ${STATE_DIR}\ninclude:\n  - ${EXTRA}\n"
+        "jobs:\n  - name: inline\n    command: c\n    schedule:\n"
+        "      minute: '*'\n",
+        encoding="utf-8",
+    )
+    conf = config.parse_config(str(main))
+    assert conf.state_config["path"] == str(tmp_path / "state")
+    assert sorted(j.name for j in conf.jobs) == ["extra", "inline"]
+
+
+def test_env_interp_empty_config_is_noop(monkeypatch):
+    assert config.parse_config_string("", "test.yaml").jobs == []
+
+
+def test_env_interp_skips_logging_section(monkeypatch):
+    # The `logging` section is handed to logging.config.dictConfig verbatim; a
+    # `$`-style formatter legitimately writes ${asctime}/${message} in its
+    # format string, so the whole section must be left untouched (not treated
+    # as unset environment variables, which would fail an otherwise valid
+    # config to load).
+    monkeypatch.delenv("asctime", raising=False)
+    monkeypatch.delenv("message", raising=False)
+    conf = config.parse_config_string(
+        """
+logging:
+  version: 1
+  formatters:
+    tmpl:
+      style: "$"
+      format: "${asctime} ${levelname} ${message}"
+  root:
+    level: INFO
+jobs:
+  - name: j
+    command: c
+    schedule:
+      minute: "*"
+""",
+        "test.yaml",
+    )
+    fmt = conf.logging_config["formatters"]["tmpl"]["format"]
+    assert fmt == "${asctime} ${levelname} ${message}"
+
+
+def test_env_interp_in_defaults_block_inherited(monkeypatch):
+    # A ${VAR} in a `defaults:` value expands and is inherited by jobs; the
+    # `shell` default is skipped like any other shell field.
+    monkeypatch.setenv("PREFIX", "east-")
+    conf = config.parse_config_string(
+        """
+defaults:
+  streamPrefix: ${PREFIX}
+jobs:
+  - name: j
+    command: c
+    schedule:
+      minute: "*"
+""",
+        "test.yaml",
+    )
+    assert conf.jobs[0].streamPrefix == "east-"
+
+
+def test_env_interp_skips_dag_task_command(monkeypatch):
+    monkeypatch.setenv("TID", "load")
+    monkeypatch.delenv("TASK_ARG", raising=False)
+    conf = config.parse_config_string(
+        """
+state:
+  path: /tmp/st
+  jobApi:
+    enabled: true
+dags:
+  - name: d
+    schedule:
+      minute: "*"
+    tasks:
+      - id: t-${TID}
+        command: run ${TASK_ARG}
+""",
+        "test.yaml",
+    )
+    task = conf.dags[0].tasks[0]
+    assert task.id == "t-load"
+    assert task.job_template.command == "run ${TASK_ARG}"
+
+
+def test_env_interp_expanded_value_feeds_section_validator(monkeypatch):
+    # Expansion runs before the section builders, so an interpolated value that
+    # is invalid is rejected by the normal validator (here: an empty state
+    # path), not silently accepted.
+    monkeypatch.setenv("SDIR", "")
+    with pytest.raises(ConfigError, match="state.path is required"):
+        config.parse_config_string(
+            "state:\n  path: ${SDIR}\n", "test.yaml"
+        )
+
+
+def test_env_interp_unterminated_default_is_linear_not_quadratic():
+    # A value carrying many unterminated ``${x:-`` fragments made the old
+    # re.sub restart its ``[^}]*`` default scan to end-of-string at every
+    # ``${`` offset: O(n^2), a config-load / --validate-config / hot-reload
+    # stall.  The hand-written scanner keeps it amortised linear; assert via
+    # growth ratio (~4x per 2x input before the fix, ~2x after) rather than
+    # wall-clock, so a slow CI box cannot flake it.
+    import time
+
+    # unterminated (no closing ``}``): every fragment is left verbatim, and a
+    # leading ``}`` sitting *behind* the fragments must not rescue the match.
+    assert config._interpolate_env_value("${a:-" * 40, "p", "loc") == (
+        "${a:-" * 40
+    )
+    assert config._interpolate_env_value("}" + "${a:-" * 40, "p", "loc") == (
+        "}" + "${a:-" * 40
+    )
+    timings = []
+    for n in (16_000, 32_000, 64_000):
+        value = "${a:-" * n
+        started = time.perf_counter()
+        config._interpolate_env_value(value, "p", "loc")
+        timings.append(time.perf_counter() - started)
+    assert timings[2] < timings[0] * 8, timings  # quadratic would be ~16x
+
+
+def test_env_interp_skip_is_structural_not_by_key_name(monkeypatch):
+    # command/shell/logging are skipped only where they are runtime-shell or
+    # logging.config territory (a job/task field, a shell reporter block, the
+    # top-level logging section).  The very same names as user-chosen keys in
+    # an arbitrary-key map (web.headers here) are ordinary values and must
+    # interpolate like any other.
+    monkeypatch.setenv("HDR", "expanded")
+    conf = config.parse_config_string(
+        "web:\n"
+        "  listen:\n"
+        '    - "127.0.0.1:8080"\n'
+        "  headers:\n"
+        '    command: "c=${HDR}"\n'
+        '    shell: "s=${HDR}"\n'
+        '    logging: "l=${HDR}"\n'
+        '    normal: "n=${HDR}"\n',
+        "test.yaml",
+    )
+    assert conf.web_config["headers"] == {
+        "command": "c=expanded",
+        "shell": "s=expanded",
+        "logging": "l=expanded",
+        "normal": "n=expanded",
+    }
+
+
+def test_env_interp_in_reporter_value_maps(monkeypatch):
+    # Inside a report block only the shell reporter sub-block is skipped; a
+    # webhook header or a sentry extra keyed command/shell still interpolates.
+    monkeypatch.setenv("TOK", "xyz")
+    conf = config.parse_config_string(
+        "jobs:\n"
+        "  - name: n\n"
+        "    command: c\n"
+        "    schedule:\n"
+        '      minute: "*"\n'
+        "    onFailure:\n"
+        "      report:\n"
+        "        webhook:\n"
+        "          url:\n"
+        "            value: https://h/x\n"
+        "          headers:\n"
+        '            command: "Bearer ${TOK}"\n'
+        "        sentry:\n"
+        "          dsn:\n"
+        "            value: https://k@o/1\n"
+        "          extra:\n"
+        '            shell: "ctx-${TOK}"\n',
+        "test.yaml",
+    )
+    report = conf.jobs[0].onFailure["report"]
+    assert report["webhook"]["headers"]["command"] == "Bearer xyz"
+    assert report["sentry"]["extra"]["shell"] == "ctx-xyz"
+
+
+def test_env_interp_unset_under_value_map_key_named_shell_fails_fast(
+    monkeypatch,
+):
+    # The over-broad skip used to swallow an unset ${VAR} under a header keyed
+    # ``shell``; it now fail-fasts like any other value, naming the location.
+    monkeypatch.delenv("MISSING", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            "web:\n"
+            "  listen:\n"
+            '    - "127.0.0.1:8080"\n'
+            "  headers:\n"
+            '    shell: "${MISSING}"\n',
+            "prod.yaml",
+        )
+    msg = str(exc.value)
+    assert "MISSING" in msg
+    assert "web.headers.shell" in msg
+    assert "prod.yaml" in msg

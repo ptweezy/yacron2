@@ -198,7 +198,13 @@ other list-valued options concatenate.
 
 `include` is an optional list of file paths. Each path is resolved
 relative to the directory of the **including** file
-(`os.path.join(os.path.dirname(path), include)`). An included file may be
+(`os.path.join(os.path.dirname(path), include)`). An include path is an
+ordinary string value, so it may itself use a `${VAR}` reference (e.g.
+`- ${ENVIRONMENT:-prod}.yaml`); each file is also expanded against the
+environment as it is parsed, so an included file resolves its own `${VAR}`
+references (see
+[Environment-Variable Interpolation](Environment-Variable-Interpolation)). An
+included file may be
 YAML or a [classic crontab](Classic-Crontabs) (same recognition rules as
 `-c`); note that crontab entries always carry the built-in defaults, so, like
 any included file's jobs, they do not pick up the including file's
@@ -275,6 +281,8 @@ file in the directory is parsed with its own fresh cycle-detection state.
   built-in defaults.
 - [Commands and Environment](Commands-and-Environment): `environment` and
   `env_file`.
+- [Environment-Variable Interpolation](Environment-Variable-Interpolation):
+  `${VAR}` expansion in config string values, applied per file at parse time.
 - [Durable State](Durable-State#run-scoped-secrets): run-scoped `secrets`.
 - [Reporting](Reporting): Sentry `fingerprint` and the report blocks.
 - [Logging Configuration](Logging-Configuration): the `logging` section.

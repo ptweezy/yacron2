@@ -14,7 +14,7 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-# cronstable
+# cronstable™
 / kraahn-stuh-bl /
 
 A stability-focused, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-inlcuded, security-hardened, production-ready cron replacement.
@@ -2371,8 +2371,14 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
 ## Contributing and license
 
 Bug reports, feature ideas, and pull requests are welcome; see
-[CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, how to sign off
+your commits (DCO), and
 [Contributing and Releasing](https://github.com/ptweezy/cronstable/wiki/Contributing-and-Releasing)
-for how releases work. cronstable is [MIT-licensed](LICENSE).
+for how releases work. cronstable is [MIT-licensed](LICENSE); see
+[LICENSING.md](LICENSING.md) for how the repository's licensing is organized.
+
+**Trademarks.** The MIT License covers the code, not the brand. cronstable™ and
+the cronstable logo are trademarks of the cronstable authors; see
+[TRADEMARKS.md](TRADEMARKS.md).
 
 cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.

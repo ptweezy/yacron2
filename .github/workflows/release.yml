@@ -263,6 +263,33 @@ jobs:
       - run: pip install tox tox-uv
       - run: tox -e lint,mypy,bandit
 
+  # Dependency-license gate. cronstable's core is MIT and it BUNDLES its deps
+  # (the PyInstaller binaries and Docker images vendor the whole tree), so a
+  # copyleft (GPL/AGPL) or non-open source-available (SSPL/BUSL) dependency must
+  # never slip in. scripts/check_licenses.py reads the INSTALLED dist metadata
+  # (no third-party scanner) and fails on a disallowed license; weak file-scoped
+  # copyleft (LGPL/MPL) is reported but allowed. It installs the runtime plus the
+  # bundled `speedups` extra (uvloop/orjson ship inside the binaries), i.e. the
+  # exact set the artifacts carry. See LICENSING.md.
+  licenses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+      - name: Install runtime + bundled extras
+        run: |
+          set -euo pipefail
+          uv venv --python 3.14
+          uv pip install ".[speedups]"
+      - name: Check dependency licenses
+        run: uv run python .github/scripts/check_licenses.py
+
   tox:
     strategy:
       fail-fast: false
@@ -971,6 +998,69 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Developer Certificate of Origin (DCO) check. Every commit in a pull request
+  # must carry a `Signed-off-by:` trailer (add one with `git commit -s`); see the
+  # DCO file and CONTRIBUTING.md. PR-scoped (releases land via merge/bot commits
+  # on main, which this does not police), so it is NOT in the release gate below
+  # and never blocks a publish.
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0  # the full PR commit range must be walkable
+      - name: Verify Signed-off-by on every PR commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          # The PR's own commits only (base..head), merges excluded: a
+          # maintainer's merge is not a contribution needing a sign-off.
+          for sha in $(git rev-list --no-merges "${BASE_SHA}..${HEAD_SHA}"); do
+            if ! git show -s --format='%B' "$sha" \
+                 | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::Commit $(git show -s --format='%h %s' "$sha") is missing a Signed-off-by line."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::DCO check failed. Sign off your commits (git commit -s). To fix an existing branch: git rebase --signoff ${BASE_SHA} then git push --force-with-lease. See CONTRIBUTING.md."
+            exit 1
+          fi
+          echo "All PR commits carry a DCO sign-off."
+
+  # Proprietary-package boundary guard. Builds the MIT core AND cronstable-pro
+  # (pro/) and proves Pro still imports the core and keeps its entitlement gate
+  # fail-closed. The whole point of the split is that premium code depends on the
+  # core's public API without living inside the MIT package. This runs on every
+  # push and PR but is NOT in the release gate below; the MIT core ships
+  # independently of the proprietary package's health.
+  pro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0  # setuptools_scm needs history to version the core
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+      - name: Build core + pro, prove the boundary, run pro's tests
+        run: |
+          set -euo pipefail
+          uv venv --python 3.14
+          uv pip install .              # the MIT core (root), from local source
+          uv pip install "./pro[dev]"   # cronstable-pro (its core dep is satisfied)
+          uv run python -c "import cronstable_pro; print('pro', cronstable_pro.__version__, '/ core', cronstable_pro.core_version())"
+          uv run pytest pro/tests -q
+
   # ---------------------------------------------------------------------------
   # Publish. Runs ONLY on a release, and ONLY after every gate job above has
   # succeeded. Skip-propagation makes docker-push/homebrew skip automatically
@@ -982,6 +1072,7 @@ jobs:
       - version
       - tox
       - tox-static
+      - licenses
       - dist
       - binaries
       - binaries-musl

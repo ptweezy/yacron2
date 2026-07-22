@@ -288,7 +288,7 @@ jobs:
           uv venv --python 3.14
           uv pip install ".[speedups]"
       - name: Check dependency licenses
-        run: uv run python scripts/check_licenses.py
+        run: uv run python .github/scripts/check_licenses.py
 
   tox:
     strategy:
@@ -1032,6 +1032,34 @@ jobs:
             exit 1
           fi
           echo "All PR commits carry a DCO sign-off."
+
+  # Proprietary-package boundary guard. Builds the MIT core AND cronstable-pro
+  # (pro/) and proves Pro still imports the core and keeps its entitlement gate
+  # fail-closed. The whole point of the split is that premium code depends on the
+  # core's public API without living inside the MIT package. This runs on every
+  # push and PR but is NOT in the release gate below; the MIT core ships
+  # independently of the proprietary package's health.
+  pro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0  # setuptools_scm needs history to version the core
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          version: "0.11.29"
+      - name: Build core + pro, prove the boundary, run pro's tests
+        run: |
+          set -euo pipefail
+          uv venv --python 3.14
+          uv pip install .              # the MIT core (root), from local source
+          uv pip install "./pro[dev]"   # cronstable-pro (its core dep is satisfied)
+          uv run python -c "import cronstable_pro; print('pro', cronstable_pro.__version__, '/ core', cronstable_pro.core_version())"
+          uv run pytest pro/tests -q
 
   # ---------------------------------------------------------------------------
   # Publish. Runs ONLY on a release, and ONLY after every gate job above has

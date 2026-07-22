@@ -28,10 +28,12 @@ whole tree is MIT.
 | Path | License | Notes |
 | --- | --- | --- |
 | `/` core (`cronstable/`, docs, tests, CI, packaging, ...) | MIT | See [LICENSE](LICENSE). |
-| `pro/` | Proprietary | cronstable Pro. See [pro/LICENSE](pro/LICENSE). Not open source. |
+| `pro/` | Proprietary | cronstable Pro (the `cronstable-pro` package). See [pro/LICENSE](pro/LICENSE). Not open source. |
+| `ios/` | Proprietary | The native iOS app. See [ios/LICENSE](ios/LICENSE). Not open source. |
 
-As more proprietary components are added (for example a native-app directory),
-each gets its own `LICENSE` file under the same rule, and a row here.
+As more proprietary components are added, each gets its own `LICENSE` file under
+the same rule, and a row here. Proprietary directories are pruned from the public
+MIT sdist (see `MANIFEST.in`), so they are never distributed through PyPI.
 
 ## Keeping the boundary clean
 
@@ -44,7 +46,7 @@ each gets its own `LICENSE` file under the same rule, and a row here.
 - New files in a proprietary directory carry an SPDX header so the license is
   unambiguous even out of context:
 
-  ```
+  ```text
   # SPDX-License-Identifier: LicenseRef-cronstable-Proprietary
   ```
 
@@ -58,7 +60,7 @@ root LICENSE preserves yacron's copyright alongside cronstable's, as MIT
 requires.
 
 Runtime dependencies are all permissive (MIT / BSD / Apache / PSF / MPL). A CI
-guard ([scripts/check_licenses.py](scripts/check_licenses.py), run by the
+guard ([.github/scripts/check_licenses.py](.github/scripts/check_licenses.py), run by the
 `licenses` job) fails the build if a strong-copyleft (GPL / AGPL) or non-open
 source-available (SSPL / BUSL) dependency is ever introduced, so the permissive
 baseline cannot regress by accident. This matters because the shipped artifacts

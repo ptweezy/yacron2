@@ -7,13 +7,7 @@ instead.
 
 ## Why this file exists
 
-cronstable is planned to grow beyond its open-source core: paid/premium features
-and native apps (for example on iOS) will live alongside the MIT core. Because
-MIT is a permissive, non-copyleft license, mixing it with proprietary code in
-one repository is legally fine: there is no copyleft that "reaches" into adjacent
-directories. The only real risk is *ambiguity*, so this file plus per-directory
-`LICENSE` files make the boundary explicit, and no one can reasonably assume the
-whole tree is MIT.
+cronstable is planned to grow.
 
 ## The rule
 

@@ -65,6 +65,14 @@ Fields added after the `v1` scheme shipped enter the identity only when they
 are set away from their default (`concurrencyScope` above is one), so
 upgrading cronstable never changes the id of an existing configuration.
 
+Because the id is taken over effective config, it also reflects
+[environment-variable interpolation](Environment-Variable-Interpolation): a
+`${VAR}` in a fingerprinted string field is expanded before the fingerprint is
+computed, so a config that interpolates per-environment values yields a
+**different id per environment** by design. That is correct (the deployments
+really are running different job sets); if you need one id to compare across
+environments, keep interpolated variables out of fingerprinted job fields.
+
 ## No secret material
 
 The id is logged at startup and served on a possibly-unauthenticated HTTP
@@ -153,3 +161,4 @@ pending record whenever any job in the set changed.
 - [Command-Line Reference](CLI-Reference): the `--job-set-id` flag.
 - [Metrics with Prometheus](Metrics-with-Prometheus): the `cronstable_job_set_info` gauge.
 - [Includes and Defaults](Includes-and-Defaults): the merge that produces the effective config the id is taken over.
+- [Environment-Variable Interpolation](Environment-Variable-Interpolation): `${VAR}` expansion, which feeds the fingerprint and makes the id track the environment.

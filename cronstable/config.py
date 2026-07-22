@@ -3385,6 +3385,113 @@ class CronstableConfig:
     mcp_config: Optional[MCPConfig] = None
 
 
+# Environment-variable interpolation over the validated config document.
+#
+# After strictyaml validates a YAML file, every ``${VAR}`` /
+# ``${VAR:-default}`` in a *string* value is replaced with the environment
+# variable VAR.  ``:-default`` supplies a fallback when VAR is unset or empty
+# (exactly like the POSIX shell); ``$$`` is the escape for a literal ``$``.  A
+# reference to an unset variable with no default is a hard ConfigError naming
+# the variable and where it appeared, so a missing deploy-time variable fails
+# fast at load (and under ``--validate-config``) rather than silently expanding
+# to nothing.
+#
+# Expansion runs post-validation over the parsed document, so only fields
+# strictyaml already accepted as strings are eligible; a numeric key such as
+# ``smtpPort`` cannot itself be a bare ``${VAR}`` (put the variable inside a
+# string, e.g. ``listen: ["0.0.0.0:${PORT}"]``).  Only the braced forms are
+# recognised: a lone ``$``, a bare ``$VAR``, or a malformed ``${...}`` is left
+# verbatim, so an existing config that never used the syntax is untouched.
+#
+# Job / DAG-task / shell-reporter ``command`` and ``shell`` values are
+# deliberately skipped (the whole subtree, so a ``report.shell`` block goes
+# untouched too): their ``${VAR}`` belongs to the runtime shell, which expands
+# it against the *job's* environment (env_file, per-job environment, staged
+# secrets) at execution time, not the daemon's.  Because fingerprints hash the
+# post-expansion config, a job set that interpolates env vars gets a different
+# job-set id per environment; that is intended (the configs really do differ).
+_ENV_INTERP_SKIP_KEYS = frozenset({"command", "shell"})
+
+_ENV_INTERP_RE = re.compile(
+    r"""
+    \$\$                            # an escaped literal dollar sign, or
+    | \$\{                          # ${
+        ([A-Za-z_][A-Za-z0-9_]*)    #   a variable name
+        (?::-([^}]*))?              #   optional  :-default  (default has no })
+      \}                           # }
+    """,
+    re.VERBOSE,
+)
+
+
+def _interpolate_env_value(raw: str, path: str, location: str) -> str:
+    """Expand ``${VAR}`` / ``${VAR:-default}`` / ``$$`` in one string value.
+
+    ``location`` is a dotted path to the value inside the document (e.g.
+    ``web.listen[0]``); it appears only in the unset-variable error so the
+    operator can find the offending key.
+    """
+    if "$" not in raw:  # the overwhelmingly common case; skip the regex
+        return raw
+
+    def replace(match: "re.Match[str]") -> str:
+        if match.group(0) == "$$":
+            return "$"
+        name = match.group(1)
+        default = match.group(2)
+        present = name in os.environ
+        value = os.environ.get(name, "")
+        if default is not None:
+            # `:-` falls back to the default when unset OR set-but-empty.
+            return value if (present and value != "") else default
+        # A bare `${VAR}` yields the value whenever the variable is set (even
+        # to the empty string); only a genuinely unset variable is an error.
+        if present:
+            return value
+        where = (
+            "config value {}".format(location) if location else "the config"
+        )
+        raise ConfigError(
+            "{}: {} references environment variable ${{{}}}, which is not "
+            "set; export it, or write ${{{}:-default}} to supply a "
+            "fallback".format(path, where, name, name)
+        )
+
+    return _ENV_INTERP_RE.sub(replace, raw)
+
+
+def _interpolate_env(doc: Any, path: str) -> Any:
+    """Return ``doc`` with env-var references expanded in every string value.
+
+    Walks the validated document, rebuilding it; see the comment above
+    :data:`_ENV_INTERP_SKIP_KEYS` for the grammar and the intentionally
+    skipped fields.
+    """
+
+    def walk(node: Any, location: str) -> Any:
+        if isinstance(node, dict):
+            out = {}
+            for key, value in node.items():
+                if key in _ENV_INTERP_SKIP_KEYS:
+                    out[key] = value  # shell territory: leave it verbatim
+                else:
+                    child = (
+                        "{}.{}".format(location, key) if location else str(key)
+                    )
+                    out[key] = walk(value, child)
+            return out
+        if isinstance(node, list):
+            return [
+                walk(item, "{}[{}]".format(location, index))
+                for index, item in enumerate(node)
+            ]
+        if isinstance(node, str):
+            return _interpolate_env_value(node, path, location)
+        return node
+
+    return walk(doc, "")
+
+
 def parse_config_string(
     data: str,
     path: str,
@@ -3408,6 +3515,10 @@ def parse_config_string(
         # cronstable bug, and one bad file aborts a whole config-directory
         # load.
         raise ConfigError("{}: {}".format(path, ex)) from ex
+    # Expand ${VAR} references over the validated doc before building the
+    # config (an unset-variable ConfigError propagates as-is). Runs per file,
+    # so each included file expands against its own ${VAR}s.
+    doc = _interpolate_env(doc, path)
     return _config_from_doc(doc, path, _seen, _sources)
 
 

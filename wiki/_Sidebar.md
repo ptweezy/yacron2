@@ -11,6 +11,7 @@
   - [Schedules and Timezones](Schedules-and-Timezones)
   - [Business-Day Schedules](Business-Day-Schedules)
   - [Commands and Environment](Commands-and-Environment)
+  - [Environment-Variable Interpolation](Environment-Variable-Interpolation)
   - [Output Capturing](Output-Capturing)
   - [Includes, Defaults, and Multi-File Config](Includes-and-Defaults)
   - [Logging Configuration](Logging-Configuration)

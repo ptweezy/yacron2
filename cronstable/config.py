@@ -1466,7 +1466,14 @@ class JobConfig:
         if timezone is not None:
             try:
                 return ZoneInfo(timezone)
-            except (ZoneInfoNotFoundError, ValueError) as err:
+            # ZoneInfo maps the key onto a tzdata path: an unknown zone raises
+            # ZoneInfoNotFoundError, an embedded NUL raises ValueError, and an
+            # over-long or OS-invalid component raises OSError (ENAMETOOLONG /
+            # EINVAL).  Catch all three so a bad timezone (now reachable from
+            # ${ENV} interpolation, not only a literal) fails the load as a
+            # ConfigError, not a raw traceback that crashes startup and
+            # mislabels an operator typo as a cronstable bug.
+            except (ZoneInfoNotFoundError, ValueError, OSError) as err:
                 raise ConfigError(
                     "unknown timezone: {}".format(timezone)
                 ) from err

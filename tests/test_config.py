@@ -2238,3 +2238,24 @@ def test_env_interp_unset_under_value_map_key_named_shell_fails_fast(
     assert "MISSING" in msg
     assert "web.headers.shell" in msg
     assert "prod.yaml" in msg
+
+
+def test_env_interp_hostile_timezone_raises_configerror_not_oserror(
+    monkeypatch,
+):
+    # ${ENV} interpolation lets an environment value flow into `timezone`;
+    # an over-long / OS-invalid component makes ZoneInfo raise OSError
+    # (ENAMETOOLONG / EINVAL), which _resolve_timezone must surface as a
+    # ConfigError so config load only ever fails with ConfigError (never a raw
+    # traceback that crashes startup / a hot-reload tick).
+    monkeypatch.setenv("TZ_FROM_ENV", "A" * 4096)
+    with pytest.raises(ConfigError, match="unknown timezone"):
+        config.parse_config_string(
+            "jobs:\n"
+            "  - name: n\n"
+            "    command: c\n"
+            "    schedule:\n"
+            '      minute: "*"\n'
+            "    timezone: ${TZ_FROM_ENV}\n",
+            "test.yaml",
+        )

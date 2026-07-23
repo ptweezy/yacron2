@@ -5,7 +5,7 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
-## Unreleased
+## 1.2.30 (2026-07-23)
 
 A reporting, orchestration-visibility, and API-contract release. Report
 payloads now carry the run's host, schedule, start time and ledger id; a global

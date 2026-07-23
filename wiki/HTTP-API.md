@@ -86,12 +86,16 @@ A machine-readable [OpenAPI 3.0](https://spec.openapis.org/oas/v3.0.3) contract
 for this API ships in the repository at
 [`docs/openapi.yaml`](https://github.com/ptweezy/cronstable/blob/main/docs/openapi.yaml).
 It is the source a generated client is built from (e.g. with
-`swift-openapi-generator`) and is validated on every CI run
-(`.github/scripts/check_openapi.py`, `tox -e openapi`), so it cannot drift into
-being malformed. It documents each endpoint's path, parameters, auth, and
-response shape; fast-moving nested payloads are typed at the top level and left
-open below that, with this page as the field-by-field reference. The `POST /mcp`
-JSON-RPC endpoint is documented under [MCP](MCP), not in the OpenAPI spec.
+`swift-openapi-generator`), and two CI checks keep it honest:
+`.github/scripts/check_openapi.py` (`tox -e openapi`) validates the document
+itself (schema, refs, duplicated keys), and `tests/test_openapi.py` diffs the
+spec's paths and methods against the daemon's route table in both directions,
+so the spec and the served surface cannot drift apart. It documents each
+endpoint's path, parameters, auth, and response shape; fast-moving nested
+payloads are typed at the top level and left open below that, with this page as
+the field-by-field reference. The `/mcp` endpoint appears in the spec with its
+surface and auth only; the JSON-RPC protocol it speaks is documented under
+[MCP](MCP).
 
 ## Endpoints
 
@@ -1340,7 +1344,11 @@ Each entry resolves its secret from the same `value`/`fromFile`/`fromEnvVar`
 sources as `authToken`, and fails closed the same way — a configured entry that
 resolves to an empty token refuses to start the web API. `authToken` and
 `authTokens` compose: every configured token is accepted, and a request
-authenticates if it matches **any** of them (constant-time compared).
+authenticates if it matches **any** of them (constant-time compared). Two
+tokens resolving to the same secret are refused at startup (naming the two
+labels, never the secret): matching is by secret, so only one entry's scopes
+could ever apply, and a scoped entry repeating the all-scopes `authToken`
+would otherwise silently downgrade it.
 
 There are three scopes:
 

@@ -10144,11 +10144,19 @@ async def _rehydrate_seed_pending_retry(
 
 
 class _FakeRun5:
-    """A minimal RunningJob stand-in carrying just a config with a name."""
+    """A minimal RunningJob stand-in carrying just a config with a name.
+
+    The reaped-run flags are the ones every real RunningJob carries and the
+    DAG-task report dispatch reads (cancelled/replaced skip reporting; a
+    None fail_reason reads as success).
+    """
 
     def __init__(self, config, *, state_token=None):
         self.config = config
         self.state_token = state_token
+        self.cancelled = False
+        self.replaced = False
+        self.fail_reason = None
 
 
 # --- inflight open/closed persistence --------------------------------------

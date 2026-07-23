@@ -348,6 +348,49 @@ def test_resolve_tokens_empty_source_fails_closed():
         )
 
 
+def test_resolve_tokens_explicit_empty_value_fails_closed():
+    # `value: ""` rides the same fail-closed branch as a missing source.
+    with pytest.raises(ConfigError):
+        Cron._resolve_web_tokens(
+            {"authTokens": [{"value": "", "scopes": ["view"], "label": "e"}]}
+        )
+
+
+def test_resolve_tokens_scoped_duplicate_of_scalar_refused():
+    # matching is by secret: a scoped entry repeating the scalar authToken
+    # would silently downgrade the all-scopes token to the entry's scopes
+    # (the middleware's no-early-return loop keeps the LAST match). Refused
+    # at resolve time instead; the error names labels, never the secret.
+    with pytest.raises(ConfigError) as exc:
+        Cron._resolve_web_tokens(
+            {
+                "authToken": {"value": "sekrit-dup-9x"},
+                "authTokens": [
+                    {
+                        "value": "sekrit-dup-9x",
+                        "scopes": ["view"],
+                        "label": "wall",
+                    }
+                ],
+            }
+        )
+    assert "'wall'" in str(exc.value)
+    assert "'authToken'" in str(exc.value)
+    assert "sekrit-dup-9x" not in str(exc.value)
+
+
+def test_resolve_tokens_two_scoped_duplicates_refused():
+    with pytest.raises(ConfigError):
+        Cron._resolve_web_tokens(
+            {
+                "authTokens": [
+                    {"value": "s", "scopes": ["view"], "label": "a"},
+                    {"value": "s", "scopes": ["control"], "label": "b"},
+                ]
+            }
+        )
+
+
 # --------------------------------------------------------------------------
 # end-to-end over a real aiohttp app
 # --------------------------------------------------------------------------

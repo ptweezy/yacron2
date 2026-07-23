@@ -462,3 +462,153 @@ async def test_emit_cluster_role_logs_quiet_without_notify(monkeypatch):
     cron._emit_cluster_role_logs()  # must not raise
     await _drain_notify(cron)
     assert captured == []
+
+
+# ---------------------------------------------------------------------------
+# Integration seams: YAML -> Cron, reload, real reporters, live DAG call site
+# ---------------------------------------------------------------------------
+
+
+def test_notify_yaml_reaches_cron_dispatch_config():
+    # the config -> Cron seam _dispatch_notify reads: a daemon built from
+    # YAML carrying `notify:` must hold it without any test hand-wiring.
+    cron = _cron(_NOTIFY_YAML + _JOB)
+    assert cron._notify_config is not None
+    assert cron._notify_config["events"] == frozenset(
+        {"dag_failure", "quorum_loss"}
+    )
+    assert (
+        cron._notify_config["report"]["webhook"]["url"]["value"]
+        == "https://example.invalid/hook"
+    )
+
+
+def test_apply_reload_swaps_notify_config():
+    # a reload that adds, edits, or removes `notify:` takes effect at once.
+    cron = _cron(_JOB)
+    assert cron._notify_config is None
+    cron._apply_reload(config.parse_config_string(_NOTIFY_YAML + _JOB, ""))
+    assert cron._notify_config is not None
+    assert cron._notify_config["events"] == frozenset(
+        {"dag_failure", "quorum_loss"}
+    )
+    cron._apply_reload(config.parse_config_string(_JOB, ""))
+    assert cron._notify_config is None
+
+
+async def test_report_event_flows_through_real_webhook_reporter():
+    # no mocks: the NotifyEventContext shim rides the real WebhookReporter,
+    # and the default notify body template posts Slack-shaped JSON.
+    from cronstable.job import report_event
+
+    from tests.test_job import _WebhookServer
+
+    server = _WebhookServer()
+    async with server as url:
+        notify_cfg = config._build_notify_config(
+            {"report": {"webhook": {"url": {"value": url}}}}
+        )
+        ctx = NotifyEventContext(
+            event="dag_failure",
+            success=False,
+            name="etl",
+            subject="DAG 'etl' run r1 failed",
+            message="1 task(s) failed: t1",
+            fields={"dag": "etl"},
+        )
+        await report_event(ctx, notify_cfg["report"])
+    (request,) = server.requests
+    payload = json.loads(request["body"])
+    assert payload == {
+        "text": (
+            "cronstable dag_failure: DAG 'etl' run r1 failed\n"
+            "1 task(s) failed: t1\n"
+        )
+    }
+
+
+async def test_report_event_flows_through_real_shell_reporter(tmp_path):
+    # the exact hazard _NotifyJobShim guards: ShellReporter builds a
+    # subprocess env from the context, and any None value dies in os.fsencode
+    # at spawn. Run the real reporter with a real subprocess and read back
+    # what it saw.
+    import sys
+
+    from cronstable.job import report_event, report_hostname
+
+    out = tmp_path / "env.json"
+    code = (
+        "import json,os,sys;"
+        "json.dump({k: os.environ[k] for k in sys.argv[2:]},"
+        " open(sys.argv[1], 'w'))"
+    )
+    wanted = [
+        "CRONSTABLE_JOB_NAME",
+        "CRONSTABLE_FAIL_REASON",
+        "CRONSTABLE_HOST",
+        "CRONSTABLE_RETCODE",
+        "CRONSTABLE_JOB_SCHEDULE",
+    ]
+    notify_cfg = config._build_notify_config(
+        {
+            "report": {
+                "shell": {
+                    "command": [sys.executable, "-c", code, str(out)] + wanted
+                }
+            }
+        }
+    )
+    ctx = NotifyEventContext(
+        event="quorum_loss",
+        success=False,
+        name="node-a",
+        subject="node node-a left quorum",
+        message="No majority reachable.",
+        fields={"quorate": False},
+    )
+    await report_event(ctx, notify_cfg["report"])
+    seen = json.loads(out.read_text())
+    assert seen["CRONSTABLE_JOB_NAME"] == "node-a"
+    assert seen["CRONSTABLE_FAIL_REASON"] == "No majority reachable."
+    assert seen["CRONSTABLE_HOST"] == report_hostname()
+    assert seen["CRONSTABLE_RETCODE"] == "None"  # no process ran
+    assert seen["CRONSTABLE_JOB_SCHEDULE"] == ""
+
+
+async def test_do_advance_dispatches_approval_waiting_live(
+    tmp_path, monkeypatch
+):
+    # the LIVE call site (dagrun._do_advance -> _notify_pending_approvals):
+    # a real run parks a real approval gate and the alert fires once, with
+    # the dedup holding across further advances. Only report_event is
+    # recorded; everything upstream of it is production code.
+    from tests.test_state_dag_run import _drive, _make_cron, _teardown
+
+    captured = []
+
+    async def fake_report_event(ctx, report_config):
+        captured.append(ctx)
+
+    monkeypatch.setattr(cronstable.cron, "report_event", fake_report_event)
+    yaml = (
+        "notify:\n  report:\n    webhook:\n      url:\n"
+        "        value: https://example.invalid/hook\n"
+        "dags:\n  - name: ap\n    tasks:\n"
+        "      - id: gate\n        type: approval\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        run_key = await cron._dag.trigger_run("ap")
+        body = await _drive(cron, "ap", run_key)
+        assert body["tasks"]["gate"]["awaitingApproval"] is True
+        await _drain_notify(cron)
+        assert [c.event for c in captured] == ["approval_waiting"]
+        vars_ = captured[0].template_vars
+        assert vars_["dag"] == "ap"
+        assert vars_["taskkey"] == "gate"
+        # further advances re-observe the parked gate; the dedup holds.
+        await _drive(cron, "ap", run_key)
+        await _drain_notify(cron)
+        assert len(captured) == 1
+    finally:
+        await _teardown(cron)

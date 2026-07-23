@@ -818,6 +818,28 @@ class WebhookReporter(Reporter):
                     )
 
 
+def report_config_enabled(report_config: Dict[str, Any]) -> bool:
+    """Whether any of the four reporters would actually fire for this config.
+
+    Mirrors each reporter's own disabled early-return exactly (sentry: no DSN
+    source; mail: ``to`` and ``from`` unset; shell: no command; webhook: no URL
+    source), so a caller can skip scheduling a report fan-out that every
+    reporter would drop on arrival. Used by the DAG-task reaper path, where a
+    mapped fan-out can finish hundreds of instances at once and the common
+    case (no reporter configured) must cost dict probes, not task spawns.
+    """
+    dsn = report_config["sentry"]["dsn"]
+    if dsn["value"] or dsn["fromFile"] or dsn["fromEnvVar"]:
+        return True
+    mail = report_config["mail"]
+    if mail["to"] and mail["from"]:
+        return True
+    if report_config["shell"]["command"] is not None:
+        return True
+    url = report_config["webhook"]["url"]
+    return bool(url["value"] or url["fromFile"] or url["fromEnvVar"])
+
+
 class JobRetryState:
     def __init__(
         self, initial_delay: float, multiplier: float, max_delay: float

@@ -35,8 +35,14 @@ version at release time — see [Contributing](CONTRIBUTING.md#releasing).)
 
 - **A DAG task inherits the file's `defaults:` block just as a job does** —
   global `shell`, `environment`, `env_file`, capture, `monitorResources`,
-  run-scoped `secrets`, and reporter (`onFailure`/`onSuccess`/…) config now
+  run-scoped `secrets`, and reporter (`onFailure`/`onSuccess`) config now
   reach DAG tasks, with the task's own value winning on any key it sets.
+- **DAG task runs now fire their `onFailure`/`onSuccess` reporters** — set
+  per-task (a new report-only task key; there is no `onFailure.retry` on a
+  task, attempts stay graph-driven) or inherited from `defaults:`. Every
+  failed attempt reports via `onFailure`; cancelled and replaced instances do
+  not report, matching job semantics. Reports are spawned off the reaper, so
+  a slow reporter never stalls completion handling or the graph advance.
   Previously a task template was built over the built-in defaults only, so a
   global reporter or environment silently skipped DAG tasks. Graph-shape fields
   (`dependsOn`, `triggerRule`, `retries`, `expand`, `onReject`, the poke
@@ -73,11 +79,15 @@ version at release time — see [Contributing](CONTRIBUTING.md#releasing).)
 ### OpenAPI specification
 
 - **The HTTP control API is now described by an OpenAPI 3.0 spec at
-  [`docs/openapi.yaml`](docs/openapi.yaml)**, validated on every CI run
-  (`.github/scripts/check_openapi.py`, `tox -e openapi`). It is the contract a
-  generated client is built from and a brake on accidental breaking changes at
-  cronstable's fast release cadence; the [HTTP-API wiki page](wiki/HTTP-API.md)
-  remains the field-by-field reference.
+  [`docs/openapi.yaml`](docs/openapi.yaml)**, kept honest by two CI checks:
+  `.github/scripts/check_openapi.py` (`tox -e openapi`) validates the document
+  itself (schema, refs, duplicated keys), and `tests/test_openapi.py` diffs the
+  spec's paths and methods against the served route table
+  (`cronstable.cron.WEB_ROUTES`, now the single source the aiohttp app builds
+  its routes from) in both directions, so a route added or renamed without a
+  spec edit fails the suite. It is the contract a generated client is built
+  from; the [HTTP-API wiki page](wiki/HTTP-API.md) remains the field-by-field
+  reference.
 
 ### Scoped web bearer tokens (`web.authTokens`)
 
@@ -96,7 +106,9 @@ version at release time — see [Contributing](CONTRIBUTING.md#releasing).)
   every configured token is accepted, and both keys compose. Each scoped entry
   resolves its secret from the same `value`/`fromFile`/`fromEnvVar` sources and
   **fails closed** the same way (a configured-but-empty entry refuses to start
-  the web API). `mcp.enabled`'s fail-closed gate is satisfied by either key.
+  the web API); two tokens resolving to the same secret are refused at startup,
+  since matching is by secret and only one entry's scopes could apply.
+  `mcp.enabled`'s fail-closed gate is satisfied by either key.
 - **Revoke a device** by dropping its entry and reloading; its optional `label`
   identifies it in logs and 403 bodies. These transport scopes are unrelated to
   the loopback job-state API's key-value `scope`. See the

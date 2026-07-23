@@ -802,6 +802,13 @@ _dag_task_launch_fields = {
         )
     ),
     Opt("stateAllowedScopes"): Seq(Str()),
+    # Per-task run reporting: report-only (no `retry` key, unlike a job's
+    # onFailure): a task's attempts are graph-driven (the DAG node's
+    # `retries`), so a job-level retry ladder here would be dead config
+    # presented as live. An inherited `defaults:` onFailure.retry is likewise
+    # inert for tasks. Fired by Cron._handle_finished_dag_task per task run.
+    Opt("onFailure"): Map({Opt("report"): _report_schema}),
+    Opt("onSuccess"): Map({Opt("report"): _report_schema}),
 }
 
 _dag_task_schema_dict = dict(_dag_task_launch_fields)

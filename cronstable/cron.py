@@ -79,6 +79,7 @@ from cronstable.job import (
     NotifyEventContext,
     RunningJob,
     SlaBreachContext,
+    report_config_enabled,
     report_event,
     report_sla_breach,
 )
@@ -374,6 +375,76 @@ _WEB_SCOPE_OVERRIDES = {
     # it further); a scoped token needs `control` to drive it.
     "/mcp": "control",
 }
+
+# The web control API's complete route table: (method, path, handler, gate).
+# `handler` names a Cron method, except on the "mcp"-gated rows where it names
+# an MCPHandler method (that server is rebuilt per app start). `gate` marks the
+# conditionally registered groups: None (always), "mcp" (mcp.enabled),
+# "metrics" (a metrics section is configured), "ui" (web.ui, the default).
+# This is the single source of truth for the app's surface:
+# start_stop_web_app builds its aiohttp routes from it, and
+# tests/test_openapi.py diffs it (plus _WEB_SCOPE_OVERRIDES' keys) against
+# docs/openapi.yaml, so a route added, removed, or renamed here without a
+# matching spec edit fails the suite instead of drifting silently. Rows keep
+# registration order; append conditional groups at the end.
+WEB_ROUTES: "Tuple[Tuple[str, str, str, Optional[str]], ...]" = (
+    ("GET", "/version", "_web_get_version", None),
+    ("GET", "/job-set-id", "_web_job_set_id", None),
+    ("GET", "/cluster", "_web_get_cluster", None),
+    ("GET", "/fleet", "_web_get_fleet", None),
+    ("GET", "/node", "_web_get_node", None),
+    ("GET", "/node/history", "_web_node_history", None),
+    ("GET", "/status", "_web_get_status", None),
+    ("GET", "/summary", "_web_get_summary", None),
+    ("GET", "/schedule/preview", "_web_schedule_preview", None),
+    ("GET", "/schedule/pressure", "_web_schedule_pressure", None),
+    ("GET", "/schedule/duplicates", "_web_schedule_duplicates", None),
+    ("GET", "/schedule/suggest", "_web_schedule_suggest", None),
+    ("GET", "/schedule/why", "_web_schedule_why", None),
+    ("GET", "/calendar.ics", "_web_calendar", None),
+    ("GET", "/jobs", "_web_list_jobs", None),
+    ("GET", "/jobs/{name}", "_web_get_job", None),
+    ("GET", "/jobs/{name}/runs", "_web_job_runs", None),
+    ("GET", "/jobs/{name}/calendar.ics", "_web_job_calendar", None),
+    ("GET", "/jobs/{name}/resources", "_web_job_resources", None),
+    ("GET", "/jobs/{name}/trends", "_web_job_trends", None),
+    ("POST", "/jobs/{name}/start", "_web_start_job", None),
+    ("POST", "/jobs/{name}/cancel", "_web_cancel_job", None),
+    ("POST", "/jobs/{name}/pause", "_web_pause_job", None),
+    ("POST", "/jobs/{name}/resume", "_web_resume_job", None),
+    ("GET", "/jobs/{name}/logs", "_web_job_logs", None),
+    # DAG introspection + control
+    ("GET", "/dags", "_web_list_dags", None),
+    ("GET", "/dags/{name}/runs", "_web_dag_runs", None),
+    ("GET", "/dags/{name}/runs/{run_key}", "_web_dag_run", None),
+    ("GET", "/dags/{name}/runs/{run_key}/xcom", "_web_dag_xcom", None),
+    (
+        "GET",
+        "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
+        "_web_dag_task_logs",
+        None,
+    ),
+    ("POST", "/dags/{name}/trigger", "_web_dag_trigger", None),
+    ("POST", "/dags/{name}/backfill", "_web_dag_backfill", None),
+    (
+        "POST",
+        "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
+        "_web_dag_decision",
+        None,
+    ),
+    # durable state inspector (metadata-only)
+    ("GET", "/state", "_web_state", None),
+    ("GET", "/state/documents", "_web_state_documents", None),
+    ("GET", "/state/records", "_web_state_records", None),
+    # The MCP server rides these same listeners and the auth middleware:
+    # /mcp is NEVER in WEB_PUBLIC_PATHS, so it inherits the bearer-token gate
+    # (and the `control` scope override above, on every method).
+    ("POST", "/mcp", "handle_http", "mcp"),
+    ("GET", "/mcp", "handle_http_get", "mcp"),
+    ("OPTIONS", "/mcp", "handle_options", "mcp"),
+    ("GET", "/metrics", "_web_metrics", "metrics"),
+    ("GET", "/", "_web_index", "ui"),
+)
 
 
 def _effective_web_scopes(scopes: Iterable[str]) -> "frozenset[str]":
@@ -5177,54 +5248,6 @@ class Cron:
                     self._make_auth_middleware(token_table, frozenset(public))
                 )
             app = web.Application(middlewares=middlewares)
-            routes = [
-                web.get("/version", self._web_get_version),
-                web.get("/job-set-id", self._web_job_set_id),
-                web.get("/cluster", self._web_get_cluster),
-                web.get("/fleet", self._web_get_fleet),
-                web.get("/node", self._web_get_node),
-                web.get("/node/history", self._web_node_history),
-                web.get("/status", self._web_get_status),
-                web.get("/summary", self._web_get_summary),
-                web.get("/schedule/preview", self._web_schedule_preview),
-                web.get("/schedule/pressure", self._web_schedule_pressure),
-                web.get("/schedule/duplicates", self._web_schedule_duplicates),
-                web.get("/schedule/suggest", self._web_schedule_suggest),
-                web.get("/schedule/why", self._web_schedule_why),
-                web.get("/calendar.ics", self._web_calendar),
-                web.get("/jobs", self._web_list_jobs),
-                web.get("/jobs/{name}", self._web_get_job),
-                web.get("/jobs/{name}/runs", self._web_job_runs),
-                web.get("/jobs/{name}/calendar.ics", self._web_job_calendar),
-                web.get("/jobs/{name}/resources", self._web_job_resources),
-                web.get("/jobs/{name}/trends", self._web_job_trends),
-                web.post("/jobs/{name}/start", self._web_start_job),
-                web.post("/jobs/{name}/cancel", self._web_cancel_job),
-                web.post("/jobs/{name}/pause", self._web_pause_job),
-                web.post("/jobs/{name}/resume", self._web_resume_job),
-                web.get("/jobs/{name}/logs", self._web_job_logs),
-                # DAG introspection + control
-                web.get("/dags", self._web_list_dags),
-                web.get("/dags/{name}/runs", self._web_dag_runs),
-                web.get("/dags/{name}/runs/{run_key}", self._web_dag_run),
-                web.get(
-                    "/dags/{name}/runs/{run_key}/xcom", self._web_dag_xcom
-                ),
-                web.get(
-                    "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
-                    self._web_dag_task_logs,
-                ),
-                web.post("/dags/{name}/trigger", self._web_dag_trigger),
-                web.post("/dags/{name}/backfill", self._web_dag_backfill),
-                web.post(
-                    "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
-                    self._web_dag_decision,
-                ),
-                # durable state inspector (metadata-only)
-                web.get("/state", self._web_state),
-                web.get("/state/documents", self._web_state_documents),
-                web.get("/state/records", self._web_state_records),
-            ]
             # The MCP server (POST /mcp) rides these same listeners and the
             # auth middleware above -- /mcp is NEVER added to `public`, so it
             # inherits the bearer-token gate. Built here (not in __init__) so a
@@ -5236,9 +5259,6 @@ class Cron:
                 from cronstable.mcp import MCPHandler
 
                 self._mcp = MCPHandler(self, mcp_config)
-                routes.append(web.post("/mcp", self._mcp.handle_http))
-                routes.append(web.get("/mcp", self._mcp.handle_http_get))
-                routes.append(web.options("/mcp", self._mcp.handle_options))
                 logger.info("mcp: serving the MCP endpoint at POST /mcp")
             if metrics_config is not None:
                 # buckets apply from here on; a changed bucket set restarts
@@ -5246,9 +5266,22 @@ class Cron:
                 self.metrics.set_duration_buckets(
                     metrics_config["durationBuckets"]
                 )
-                routes.append(web.get("/metrics", self._web_metrics))
-            if ui_enabled:
-                routes.append(web.get("/", self._web_index))
+            # Routes come from the declarative WEB_ROUTES table (the spec's
+            # single source of truth; see its comment), in table order, with
+            # the conditional groups skipped when their feature is off.
+            routes = []
+            for method, path, handler_name, gate in WEB_ROUTES:
+                if gate == "mcp":
+                    if self._mcp is None:
+                        continue
+                    handler = getattr(self._mcp, handler_name)
+                else:
+                    if gate == "metrics" and metrics_config is None:
+                        continue
+                    if gate == "ui" and not ui_enabled:
+                        continue
+                    handler = getattr(self, handler_name)
+                routes.append(web.route(method, path, handler))
             app.add_routes(routes)
             self.web_runner = web.AppRunner(app)
             await self.web_runner.setup()
@@ -6515,7 +6548,10 @@ class Cron:
         None when neither is configured (auth stays off -- the sentinel the
         caller keys on to decide whether to install the auth middleware at
         all). Fails closed on any configured-but-empty source, exactly like
-        :meth:`_resolve_web_token`.
+        :meth:`_resolve_web_token`, and on two tokens resolving to one secret:
+        matching is by secret, so only one entry's scopes could ever apply.
+        The likely duplicate is a scoped entry repeating the scalar authToken,
+        which would silently downgrade the all-scopes token to that entry.
         """
         tokens = []  # type: list[_WebToken]
         scalar = Cron._resolve_web_token(web_config)
@@ -6529,6 +6565,18 @@ class Cron:
             scopes = _effective_web_scopes(entry.get("scopes") or [])
             label = entry.get("label") or what
             tokens.append(_WebToken(secret.encode("utf-8"), scopes, label))
+        seen = {}  # type: Dict[bytes, str]
+        for token in tokens:
+            first = seen.get(token.token_bytes)
+            if first is not None:
+                # names only, never the secret
+                raise ConfigError(
+                    "web token {!r} resolves to the same secret as {!r}; "
+                    "duplicate secrets are refused because requests match "
+                    "tokens by secret, so only one entry's scopes could "
+                    "apply".format(token.label, first)
+                )
+            seen[token.token_bytes] = token.label
         return tokens or None
 
     @staticmethod
@@ -10813,6 +10861,51 @@ class Cron:
             await self._dag.on_task_finished(job)
         except Exception:  # noqa: BLE001 - never kill the reaper
             logger.exception("dag: failed to record a task completion")
+        # Fire the task's own run reporters (onFailure/onSuccess, set per-task
+        # or inherited from the `defaults:` block), after the durable
+        # transition above so a report can never delay it. No retry arming and
+        # no onPermanentFailure: a task's attempts are graph-driven (the DAG
+        # node's `retries`), so every failed attempt reports via onFailure.
+        # Cancelled/replaced runs are not failures (mirroring
+        # _handle_finished_job's early returns), and shutdown skips reporting
+        # exactly as handle_job_failure's stop-event gate does. The
+        # enabled-probe keeps the common unconfigured case at dict lookups: a
+        # mapped fan-out can land hundreds of completions in one reaper batch,
+        # and each spawn is a task plus a four-reporter gather.
+        if not (job.cancelled or job.replaced or self._stop_event.is_set()):
+            failed = job.fail_reason is not None
+            hook = job.config.onFailure if failed else job.config.onSuccess
+            if report_config_enabled(hook["report"]):
+                self._queue_dag_task_report(job, failed=failed)
+
+    def _queue_dag_task_report(self, job: RunningJob, *, failed: bool) -> None:
+        """Spawn one DAG task run's report fan-out as a tracked task.
+
+        The DAG sibling of :meth:`_queue_job_completion`, minus the per-name
+        sequencing: a task report carries no retry-arm step, so mapped
+        instances of one task finishing together may report concurrently.
+        Tracked in ``_completion_tasks`` so shutdown's
+        :meth:`_drain_completions` awaits in-flight reports (and tests observe
+        them deterministically).
+        """
+
+        async def _report() -> None:
+            try:
+                if failed:
+                    await job.report_failure()
+                else:
+                    await job.report_success()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Unexpected error reporting the dag task run %s",
+                    job.config.name,
+                )
+
+        task = asyncio.create_task(_report())
+        self._completion_tasks.add(task)
+        task.add_done_callback(self._completion_tasks.discard)
 
     async def handle_job_failure(self, job: RunningJob) -> None:
         if self._stop_event.is_set():

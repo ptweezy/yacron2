@@ -6,9 +6,11 @@ openapi: 3.0.3
 # This is the machine-readable contract for the aiohttp control API cronstable
 # serves when a `web:` section is configured (see the Web Dashboard and the
 # HTTP-API wiki page). It is the source a generated client (e.g. the iOS app,
-# via swift-openapi-generator) is built from, and it is validated in CI
-# (.github/scripts/check_openapi.py) so it cannot silently drift into being
-# malformed.
+# via swift-openapi-generator) is built from. Two checks keep it honest:
+# .github/scripts/check_openapi.py (structure: schema validity, refs,
+# path/parameter agreement, duplicate path keys) and tests/test_openapi.py
+# (drift: every path+method here must match cronstable.cron.WEB_ROUTES, the
+# table the aiohttp app is built from, in both directions).
 #
 # It documents the *shape* of every endpoint -- its path, method, parameters,
 # auth, and the top-level fields of each response. Rich nested payloads that
@@ -778,26 +780,59 @@ paths:
       tags: [state]
       summary: State documents (metadata only)
       operationId: getStateDocuments
+      parameters:
+        - name: ns
+          in: query
+          required: true
+          description: >-
+            The namespace to inspect. Must start with `kv/`, `cursor/`, or
+            `idem/`; anything else (or an absent `ns`) is 400.
+          schema: { type: string }
       responses:
         "200":
-          description: Document metadata (values redacted).
+          description: >-
+            `{namespace, documents}`; KV values are redacted to a
+            `valueSize`/`valueType` summary.
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+        "400":
+          description: "`ns` missing or not a `kv/`/`cursor/`/`idem/` namespace."
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No `state:` store is configured.
 
   /state/records:
     get:
       tags: [state]
       summary: State records (metadata only)
       operationId: getStateRecords
+      parameters:
+        - name: stream
+          in: query
+          required: true
+          description: The stream to inspect; an absent or empty value is 400.
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: Newest records returned, clamped to 1-500.
+          schema: { type: integer, default: 100, minimum: 1, maximum: 500 }
       responses:
         "200":
-          description: Record metadata (payloads never crossed here).
+          description: "`{stream, records}` (payloads never crossed here)."
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+        "400":
+          description: "`stream` missing or empty."
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            `logs/` streams carry raw job output and are refused by the
+            metadata-only inspector.
+        "404":
+          description: No `state:` store is configured.
 
   /metrics:
     get:
@@ -818,6 +853,80 @@ paths:
               schema: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /mcp:
+    description: >-
+      The MCP (Model Context Protocol) endpoint, registered only when
+      `mcp.enabled` is set. The JSON-RPC 2.0 protocol it speaks (Streamable
+      HTTP transport, message set, toolsets) is documented on the MCP wiki
+      page, not re-typed here; this entry pins the surface and its auth. Every
+      method requires the `control` scope from a scoped token: /mcp is an
+      action-capable surface, whatever its own `mcp.readOnly`/toolset config
+      then narrows. It also enforces its own `Origin` allow-list.
+    post:
+      tags: [mcp]
+      summary: MCP JSON-RPC message
+      operationId: postMcp
+      x-required-scope: control
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: The JSON-RPC response.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "202":
+          description: A notification or client response; no reply body.
+        "400":
+          description: Empty body, malformed JSON, or a JSON-RPC batch.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    get:
+      tags: [mcp]
+      summary: Not supported (stateless transport)
+      operationId: getMcp
+      x-required-scope: control
+      responses:
+        "405":
+          description: >-
+            Always; the stateless transport opens no server-to-client SSE
+            stream. `Allow: POST, OPTIONS`.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    options:
+      tags: [mcp]
+      summary: CORS preflight
+      operationId: optionsMcp
+      x-required-scope: control
+      responses:
+        "204":
+          description: Preflight approved for an allow-listed `Origin`.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The `Origin` is not on `mcp.allowedOrigins`.
+        "405":
+          description: No `Origin` header (not a browser preflight).
+
+  /:
+    get:
+      tags: [ui]
+      summary: The dashboard page
+      operationId: getIndex
+      description: >-
+        The single-page Web Dashboard, registered unless `web.ui: false`.
+        Served without authentication (the page holds no data; the browser
+        then sends the bearer token on every data request it makes).
+      security: []
+      responses:
+        "200":
+          description: The dashboard HTML.
+          content:
+            text/html:
+              schema: { type: string }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -828,20 +937,22 @@ components:
         `web.authTokens` is set. Compared in constant time; a missing or wrong
         token is 401. Tokens may be *scoped*: the scalar `web.authToken` grants
         all scopes, while each `web.authTokens` entry lists some of `view`
-        (every read-only GET), `control` (the mutating POSTs and POST /mcp) and
-        `approve` (the DAG decision route); `control` and `approve` each imply
-        `view`. A recognised token that lacks the scope an operation requires
-        is 403, not 401. The required scope defaults to `view` for GET/HEAD and
-        `control` for other methods; operations that need more carry an
-        `x-required-scope` extension.
+        (every read-only GET), `control` (the mutating POSTs and every /mcp
+        method, GET and OPTIONS included) and `approve` (the DAG decision
+        route); `control` and `approve` each imply `view`. A recognised token
+        that lacks the scope an operation requires is 403, not 401. The
+        required scope defaults to `view` for GET/HEAD and `control` for other
+        methods; operations that need more carry an `x-required-scope`
+        extension.
     icsToken:
       type: apiKey
       in: query
       name: token
       description: >-
-        The `web.authToken` value as a `?token=` query parameter. Accepted
-        ONLY on the `.ics` calendar routes (calendar clients cannot send a
-        bearer header); every other route refuses query tokens.
+        Any configured token (`web.authToken` or a `web.authTokens` entry
+        holding `view`) as a `?token=` query parameter. Accepted ONLY on the
+        `.ics` calendar routes (calendar clients cannot send a bearer header);
+        every other route refuses query tokens.
 
   parameters:
     JobName:
@@ -888,7 +999,9 @@ components:
 
   responses:
     Unauthorized:
-      description: Missing or invalid bearer token (when `web.authToken` is set).
+      description: >-
+        Missing or unrecognised bearer token (when `web.authToken` or any
+        `web.authTokens` entry is configured).
     Forbidden:
       description: >-
         The bearer token is valid but lacks the scope this operation requires

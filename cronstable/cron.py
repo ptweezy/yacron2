@@ -25,6 +25,7 @@ from typing import (  # noqa
     FrozenSet,
     Iterable,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -42,6 +43,7 @@ from aiohttp import web
 import cronstable.version
 from cronstable import _json, platform, tlsutil
 from cronstable.config import (
+    WEB_TOKEN_SCOPES,
     ClusterConfig,
     ConfigError,
     CronstableConfig,
@@ -74,8 +76,11 @@ from cronstable.ical import CalendarEntry, render_calendar
 from cronstable.job import (
     JobOutputStream,
     JobRetryState,
+    NotifyEventContext,
     RunningJob,
     SlaBreachContext,
+    report_config_enabled,
+    report_event,
     report_sla_breach,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
@@ -352,6 +357,152 @@ WEB_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # gating it here too would 403 a browser MCP client the operator explicitly
 # allow-listed there.
 WEB_ORIGIN_EXEMPT_PATHS = frozenset({"/mcp"})
+
+# The full set of web scopes: what the scalar web.authToken (and any scoped
+# token that lists every scope) grants. `control` and `approve` each imply
+# `view`, expanded by _effective_web_scopes at token-resolution time.
+_WEB_ALL_SCOPES = frozenset(WEB_TOKEN_SCOPES)
+
+# Routes whose required scope differs from the method default (a safe method ->
+# `view`, everything else -> `control`). Keyed by the matched aiohttp
+# resource's canonical path. Anything not listed uses the method default, so a
+# newly added POST route requires `control` automatically instead of slipping
+# through unguarded; a new GET requires only `view`.
+_WEB_SCOPE_OVERRIDES = {
+    # the DAG approval-gate decision is the one action gated by `approve`.
+    "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision": "approve",
+    # /mcp is an action-capable surface (its own readOnly/act config narrows
+    # it further); a scoped token needs `control` to drive it.
+    "/mcp": "control",
+}
+
+# The web control API's complete route table: (method, path, handler, gate).
+# `handler` names a Cron method, except on the "mcp"-gated rows where it names
+# an MCPHandler method (that server is rebuilt per app start). `gate` marks the
+# conditionally registered groups: None (always), "mcp" (mcp.enabled),
+# "metrics" (a metrics section is configured), "ui" (web.ui, the default).
+# This is the single source of truth for the app's surface:
+# start_stop_web_app builds its aiohttp routes from it, and
+# tests/test_openapi.py diffs it (plus _WEB_SCOPE_OVERRIDES' keys) against
+# docs/openapi.yaml, so a route added, removed, or renamed here without a
+# matching spec edit fails the suite instead of drifting silently. Rows keep
+# registration order; append conditional groups at the end.
+WEB_ROUTES: "Tuple[Tuple[str, str, str, Optional[str]], ...]" = (
+    ("GET", "/version", "_web_get_version", None),
+    ("GET", "/job-set-id", "_web_job_set_id", None),
+    ("GET", "/cluster", "_web_get_cluster", None),
+    ("GET", "/fleet", "_web_get_fleet", None),
+    ("GET", "/node", "_web_get_node", None),
+    ("GET", "/node/history", "_web_node_history", None),
+    ("GET", "/status", "_web_get_status", None),
+    ("GET", "/summary", "_web_get_summary", None),
+    ("GET", "/schedule/preview", "_web_schedule_preview", None),
+    ("GET", "/schedule/pressure", "_web_schedule_pressure", None),
+    ("GET", "/schedule/duplicates", "_web_schedule_duplicates", None),
+    ("GET", "/schedule/suggest", "_web_schedule_suggest", None),
+    ("GET", "/schedule/why", "_web_schedule_why", None),
+    ("GET", "/calendar.ics", "_web_calendar", None),
+    ("GET", "/jobs", "_web_list_jobs", None),
+    ("GET", "/jobs/{name}", "_web_get_job", None),
+    ("GET", "/jobs/{name}/runs", "_web_job_runs", None),
+    ("GET", "/jobs/{name}/calendar.ics", "_web_job_calendar", None),
+    ("GET", "/jobs/{name}/resources", "_web_job_resources", None),
+    ("GET", "/jobs/{name}/trends", "_web_job_trends", None),
+    ("POST", "/jobs/{name}/start", "_web_start_job", None),
+    ("POST", "/jobs/{name}/cancel", "_web_cancel_job", None),
+    ("POST", "/jobs/{name}/pause", "_web_pause_job", None),
+    ("POST", "/jobs/{name}/resume", "_web_resume_job", None),
+    ("GET", "/jobs/{name}/logs", "_web_job_logs", None),
+    # DAG introspection + control
+    ("GET", "/dags", "_web_list_dags", None),
+    ("GET", "/dags/{name}/runs", "_web_dag_runs", None),
+    ("GET", "/dags/{name}/runs/{run_key}", "_web_dag_run", None),
+    ("GET", "/dags/{name}/runs/{run_key}/xcom", "_web_dag_xcom", None),
+    (
+        "GET",
+        "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
+        "_web_dag_task_logs",
+        None,
+    ),
+    ("POST", "/dags/{name}/trigger", "_web_dag_trigger", None),
+    ("POST", "/dags/{name}/backfill", "_web_dag_backfill", None),
+    (
+        "POST",
+        "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
+        "_web_dag_decision",
+        None,
+    ),
+    # durable state inspector (metadata-only)
+    ("GET", "/state", "_web_state", None),
+    ("GET", "/state/documents", "_web_state_documents", None),
+    ("GET", "/state/records", "_web_state_records", None),
+    # The MCP server rides these same listeners and the auth middleware:
+    # /mcp is NEVER in WEB_PUBLIC_PATHS, so it inherits the bearer-token gate
+    # (and the `control` scope override above, on every method).
+    ("POST", "/mcp", "handle_http", "mcp"),
+    ("GET", "/mcp", "handle_http_get", "mcp"),
+    ("OPTIONS", "/mcp", "handle_options", "mcp"),
+    ("GET", "/metrics", "_web_metrics", "metrics"),
+    ("GET", "/", "_web_index", "ui"),
+)
+
+
+def _effective_web_scopes(scopes: Iterable[str]) -> "frozenset[str]":
+    """Expand declared token scopes: ``control`` and ``approve`` imply
+    ``view`` (an action UI must read state first)."""
+    effective = set(scopes)
+    if effective & {"control", "approve"}:
+        effective.add("view")
+    return frozenset(effective)
+
+
+def _required_web_scope(request) -> str:
+    """The scope a request must hold, from its matched route and method.
+
+    Safe methods (GET/HEAD/OPTIONS) default to ``view`` and mutating methods
+    to ``control``; a small override table promotes the DAG decision route to
+    ``approve`` and the MCP endpoint to ``control``. An unmatched route (a
+    request that will 404) has no resource, so it falls back to the method
+    default; it is still authenticated, it just 404s afterwards.
+    """
+    route = request.match_info.route
+    resource = getattr(route, "resource", None)
+    if resource is not None:
+        override = _WEB_SCOPE_OVERRIDES.get(resource.canonical)
+        if override is not None:
+            return override
+    if request.method in WEB_SAFE_METHODS:
+        return "view"
+    return "control"
+
+
+class _WebToken(NamedTuple):
+    """A resolved web bearer token: its raw bytes (for the constant-time
+    compare), the scopes it grants (view already implied by control/approve),
+    and a human label used to identify and revoke it."""
+
+    token_bytes: bytes
+    scopes: "frozenset[str]"
+    label: str
+
+
+def _accepts_json(request: "web.Request") -> bool:
+    """Whether the request's ``Accept`` header names ``application/json``.
+
+    The two dual-format endpoints (``/status``, ``/job-set-id``) default to
+    text and switch to JSON on request. A generated client sends compound
+    headers (``application/json, */*`` or with ``;q=`` parameters), so this
+    parses the media ranges instead of comparing the raw header. Deliberately
+    matches only the EXPLICIT ``application/json`` range: honouring the
+    ``*/*``/``application/*`` wildcards would flip curl's default Accept
+    (``*/*``) from text to JSON and break every existing script that parses
+    the text form.
+    """
+    accept = request.headers.get("Accept", "")
+    for media_range in accept.split(","):
+        if media_range.split(";", 1)[0].strip().lower() == "application/json":
+            return True
+    return False
 
 
 def _origin_matches_host(origin: str, host: Optional[str]) -> bool:
@@ -1191,6 +1342,11 @@ class Cron:
         self._config_sources: FrozenSet[str] = frozenset()
         self._config_sig: Optional[tuple] = None
         self._last_config: Optional[CronstableConfig] = None
+        # the optional `notify:` block: a report config fired on daemon events
+        # (DAG failures, approval gates, leadership/quorum changes). None keeps
+        # the classic job-runs-only reporting. Set from config in both the
+        # config_yaml (test) path below and in _apply_reload.
+        self._notify_config: Optional[Dict[str, Any]] = None
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -1201,6 +1357,7 @@ class Cron:
                 (job.name, job) for job in config.jobs
             )
             self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
+            self._notify_config = config.notify_config
             self._job_set_id_cache = None
 
         self._wait_for_running_jobs_task = None  # type: Optional[asyncio.Task]
@@ -1241,6 +1398,12 @@ class Cron:
         # never allowed to gate the loop, so _record_run schedules the write
         # here rather than awaiting it.
         self._pending_state_writes: Set[asyncio.Task] = set()
+        # in-flight daemon-event notification fan-outs (the `notify:` block),
+        # spawned fire-and-forget off the raising loop (a slow SMTP/webhook
+        # reporter must never stall the scheduling or cluster loop); tracked so
+        # they are not GC'd mid-flight and can be cancelled at shutdown. See
+        # _dispatch_notify.
+        self._notify_tasks: Set[asyncio.Task] = set()
         # in-flight report+retry-arm sequences of finished jobs, spawned off
         # the reaper loop (one slow SMTP/webhook reporter must not stall every
         # other job's completion handling); tracked so shutdown can drain them
@@ -1605,8 +1768,10 @@ class Cron:
         self._slot_renewers.clear()
 
         # cancel any pending catch-up backfills (they also self-abort on the
-        # stop event, set above, but cancelling is prompt and tidy at exit).
-        for task in list(self._catchup_tasks):
+        # stop event, set above, but cancelling is prompt and tidy at exit),
+        # and any in-flight event notifications (best-effort, fire-and-forget:
+        # a half-sent alert is fine at exit, each reporter is time-bounded).
+        for task in list(self._catchup_tasks) + list(self._notify_tasks):
             task.cancel()
 
         if self.state_backend is not None:
@@ -1806,6 +1971,9 @@ class Cron:
         # up on the next service tick; in-flight runs of a removed DAG finish
         # and are GC'd).
         self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
+        # swap in the reloaded notify block (read live by _dispatch_notify), so
+        # a reload that adds/edits/removes `notify:` takes effect at once.
+        self._notify_config = config.notify_config
         # The job set changed: drop the memoized fingerprint so the next
         # job_set_id() recomputes it once. A failed parse raises before this
         # point, so a bad reload never stales the cache.
@@ -1965,7 +2133,7 @@ class Cron:
         assert self.web_config is not None
         job_set = self.job_set_id()
         headers = self.web_config.get("headers", None)
-        if request.headers.get("Accept") == "application/json":
+        if _accepts_json(request):
             return _json_response(
                 {"job_set_id": job_set, "jobs": len(self.cron_jobs)},
                 headers=headers,
@@ -2184,7 +2352,7 @@ class Cron:
     async def _web_get_status(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         out = self.status_payload()
-        if request.headers.get("Accept") == "application/json":
+        if _accepts_json(request):
             return _json_response(
                 out, headers=self.web_config.get("headers", None)
             )
@@ -2216,6 +2384,112 @@ class Cron:
                 text="\n".join(lines),
                 headers=self.web_config.get("headers", None),
             )
+
+    def summary_payload(self) -> Dict[str, Any]:
+        """A single batched fleet overview (behind ``GET /summary``).
+
+        One call carries what an at-a-glance client (a home-screen widget, a
+        status tile) needs: the fleet's job counts, the soonest upcoming
+        fire, and this node's identity and cluster role, so it refreshes with
+        one request instead of pulling and folding the whole ``/jobs`` array.
+        Every count is derived from the same live scheduler state ``/jobs`` and
+        ``/status`` read, so the surfaces cannot disagree.
+        """
+        now = get_now(datetime.timezone.utc)
+        total = enabled = running = paused = failing = never_fires = 0
+        soonest_name: Optional[str] = None
+        soonest_in: Optional[float] = None
+        for name, job in self.cron_jobs.items():
+            total += 1
+            is_running = bool(self.running_jobs.get(name))
+            if is_running:
+                running += 1
+            if job.enabled:
+                enabled += 1
+            pause = self._pause_active(name)
+            if pause is not None:
+                paused += 1
+            last = self.last_run.get(name)
+            # "failing" is a last-outcome verdict (matching the dashboard's
+            # failing-count badge), not a count of jobs mid-retry.
+            if last is not None and last.outcome == "failure":
+                failing += 1
+            if self._schedule_never_fires(name, job):
+                never_fires += 1
+            scheduled_in = self._scheduled_in(name, job, is_running)
+            if scheduled_in is not None and pause is not None:
+                # a fire the pause window covers is skipped at the gate, so
+                # it must not be reported as the fleet's next fire; a fire
+                # past the pause's `until` still counts.
+                fire_at = now + datetime.timedelta(seconds=scheduled_in)
+                if fire_at < pause.until:
+                    scheduled_in = None
+            if scheduled_in is not None and (
+                soonest_in is None or scheduled_in < soonest_in
+            ):
+                soonest_in = scheduled_in
+                soonest_name = name
+        # the cluster node name when clustered, else the plain hostname (the
+        # same identity node_payload reports).
+        mgr = self.cluster_manager
+        node_name = (
+            mgr.node_name
+            if mgr is not None and getattr(mgr, "node_name", None)
+            else self._state_host
+        )
+        next_fire: Optional[Dict[str, Any]] = None
+        if soonest_name is not None and soonest_in is not None:
+            when = self._next_fire.get(soonest_name)
+            next_fire = {
+                "job": soonest_name,
+                "in": soonest_in,
+                # absolute instant from the loop's next-fire index; during the
+                # brief pre-seed startup window it is derived from the relative
+                # countdown instead so the field is never null when a fire is
+                # known to be coming.
+                "at": (
+                    when.isoformat()
+                    if when is not None
+                    else (
+                        now + datetime.timedelta(seconds=soonest_in)
+                    ).isoformat()
+                ),
+            }
+        summary: Dict[str, Any] = {
+            "version": cronstable.version.version,
+            "node_name": node_name,
+            "generated_at": now.isoformat(),
+            "jobs": {
+                "total": total,
+                "enabled": enabled,
+                "disabled": total - enabled,
+                "running": running,
+                "paused": paused,
+                "failing": failing,
+                "never_fires": never_fires,
+            },
+            "next_fire": next_fire,
+        }
+        if self.cron_dags:
+            summary["dags"] = {"total": len(self.cron_dags)}
+        if mgr is not None:
+            summary["cluster"] = {
+                "enabled": True,
+                "distribution": mgr.distribution,
+                "quorate": mgr.is_quorate(),
+                "is_leader": mgr.is_leader(),
+                "leader": mgr.leader_name(),
+            }
+        else:
+            summary["cluster"] = {"enabled": False}
+        return summary
+
+    async def _web_get_summary(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        return _json_response(
+            self.summary_payload(),
+            headers=self.web_config.get("headers", None),
+        )
 
     @staticmethod
     def _zone_from_name(tz_name: Optional[str]) -> datetime.tzinfo:
@@ -4091,6 +4365,21 @@ class Cron:
         headers["ETag"] = etag
         return headers
 
+    async def _web_get_job(self, request: web.Request) -> web.Response:
+        """One job's full detail dict (``GET /jobs/{name}``).
+
+        The single-job sibling of ``GET /jobs``: the identical per-job shape
+        ``_job_to_dict`` builds, so a client (a widget, a detail screen) can
+        refresh one job without pulling and filtering the whole fleet.  The
+        detail dict was already exposed to MCP (``cron_get_job``); this puts it
+        on REST too.  ``404`` for an unknown job, like the sibling
+        ``/jobs/{name}/...`` routes.
+        """
+        payload = self.job_detail_payload(request.match_info["name"])
+        if payload is None:
+            raise web.HTTPNotFound()
+        return _json_response(payload, headers=self._web_headers())
+
     # --- DAG introspection + control --------------------------------------
 
     def _web_headers(self) -> Any:
@@ -4968,9 +5257,13 @@ class Cron:
                 middlewares.append(
                     self._make_origin_middleware(frozenset(allowed_origins))
                 )
-            token = self._resolve_web_token(web_config)
-            if token is not None:
-                logger.info("web: requiring bearer-token authentication")
+            token_table = self._resolve_web_tokens(web_config)
+            if token_table is not None:
+                logger.info(
+                    "web: requiring bearer-token authentication (%d token%s)",
+                    len(token_table),
+                    "" if len(token_table) == 1 else "s",
+                )
                 # the UI page is served unauthenticated (it holds no data); the
                 # browser then sends the token on every data request.
                 public = set(WEB_PUBLIC_PATHS) if ui_enabled else set()
@@ -4979,55 +5272,9 @@ class Cron:
                     # send a bearer token; everything else stays gated.
                     public.add("/metrics")
                 middlewares.append(
-                    self._make_auth_middleware(token, frozenset(public))
+                    self._make_auth_middleware(token_table, frozenset(public))
                 )
             app = web.Application(middlewares=middlewares)
-            routes = [
-                web.get("/version", self._web_get_version),
-                web.get("/job-set-id", self._web_job_set_id),
-                web.get("/cluster", self._web_get_cluster),
-                web.get("/fleet", self._web_get_fleet),
-                web.get("/node", self._web_get_node),
-                web.get("/node/history", self._web_node_history),
-                web.get("/status", self._web_get_status),
-                web.get("/schedule/preview", self._web_schedule_preview),
-                web.get("/schedule/pressure", self._web_schedule_pressure),
-                web.get("/schedule/duplicates", self._web_schedule_duplicates),
-                web.get("/schedule/suggest", self._web_schedule_suggest),
-                web.get("/schedule/why", self._web_schedule_why),
-                web.get("/calendar.ics", self._web_calendar),
-                web.get("/jobs", self._web_list_jobs),
-                web.get("/jobs/{name}/runs", self._web_job_runs),
-                web.get("/jobs/{name}/calendar.ics", self._web_job_calendar),
-                web.get("/jobs/{name}/resources", self._web_job_resources),
-                web.get("/jobs/{name}/trends", self._web_job_trends),
-                web.post("/jobs/{name}/start", self._web_start_job),
-                web.post("/jobs/{name}/cancel", self._web_cancel_job),
-                web.post("/jobs/{name}/pause", self._web_pause_job),
-                web.post("/jobs/{name}/resume", self._web_resume_job),
-                web.get("/jobs/{name}/logs", self._web_job_logs),
-                # DAG introspection + control
-                web.get("/dags", self._web_list_dags),
-                web.get("/dags/{name}/runs", self._web_dag_runs),
-                web.get("/dags/{name}/runs/{run_key}", self._web_dag_run),
-                web.get(
-                    "/dags/{name}/runs/{run_key}/xcom", self._web_dag_xcom
-                ),
-                web.get(
-                    "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
-                    self._web_dag_task_logs,
-                ),
-                web.post("/dags/{name}/trigger", self._web_dag_trigger),
-                web.post("/dags/{name}/backfill", self._web_dag_backfill),
-                web.post(
-                    "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
-                    self._web_dag_decision,
-                ),
-                # durable state inspector (metadata-only)
-                web.get("/state", self._web_state),
-                web.get("/state/documents", self._web_state_documents),
-                web.get("/state/records", self._web_state_records),
-            ]
             # The MCP server (POST /mcp) rides these same listeners and the
             # auth middleware above -- /mcp is NEVER added to `public`, so it
             # inherits the bearer-token gate. Built here (not in __init__) so a
@@ -5039,9 +5286,6 @@ class Cron:
                 from cronstable.mcp import MCPHandler
 
                 self._mcp = MCPHandler(self, mcp_config)
-                routes.append(web.post("/mcp", self._mcp.handle_http))
-                routes.append(web.get("/mcp", self._mcp.handle_http_get))
-                routes.append(web.options("/mcp", self._mcp.handle_options))
                 logger.info("mcp: serving the MCP endpoint at POST /mcp")
             if metrics_config is not None:
                 # buckets apply from here on; a changed bucket set restarts
@@ -5049,9 +5293,22 @@ class Cron:
                 self.metrics.set_duration_buckets(
                     metrics_config["durationBuckets"]
                 )
-                routes.append(web.get("/metrics", self._web_metrics))
-            if ui_enabled:
-                routes.append(web.get("/", self._web_index))
+            # Routes come from the declarative WEB_ROUTES table (the spec's
+            # single source of truth; see its comment), in table order, with
+            # the conditional groups skipped when their feature is off.
+            routes = []
+            for method, path, handler_name, gate in WEB_ROUTES:
+                if gate == "mcp":
+                    if self._mcp is None:
+                        continue
+                    handler = getattr(self._mcp, handler_name)
+                else:
+                    if gate == "metrics" and metrics_config is None:
+                        continue
+                    if gate == "ui" and not ui_enabled:
+                        continue
+                    handler = getattr(self, handler_name)
+                routes.append(web.route(method, path, handler))
             app.add_routes(routes)
             self.web_runner = web.AppRunner(app)
             await self.web_runner.setup()
@@ -5214,6 +5471,7 @@ class Cron:
                 # silent about why it stopped Leader jobs (until/unless a
                 # replacement manager comes up and re-logs). Only fires when
                 # election was on (the flags are only ever set then).
+                node = getattr(mgr, "node_name", None) or self._state_host
                 if self._was_leader:
                     # a real leadership loss (the rebuilt manager re-elects
                     # from scratch), so it counts as a transition too
@@ -5222,12 +5480,39 @@ class Cron:
                         "cluster: this node lost scheduled-job leadership "
                         "(leadership manager stopped for reload)"
                     )
+                    self._dispatch_notify(
+                        "leader_change",
+                        success=False,
+                        name=node,
+                        subject="node {} lost scheduled-job leadership".format(
+                            node
+                        ),
+                        message=(
+                            "This node is no longer the scheduled-job leader "
+                            "(leadership manager stopped for a config reload)."
+                        ),
+                        role="follower",
+                        is_leader=False,
+                        leader=None,
+                    )
                 if self._was_quorate:
                     self.metrics.cluster_quorum_transition()
                     logger.info(
                         "cluster: this node left quorum (leadership manager "
                         "stopped for reload); Leader jobs cannot run until it "
                         "is rebuilt"
+                    )
+                    self._dispatch_notify(
+                        "quorum_loss",
+                        success=False,
+                        name=node,
+                        subject="node {} left quorum".format(node),
+                        message=(
+                            "This node left quorum (leadership manager "
+                            "stopped for a config reload); Leader jobs "
+                            "cannot run until it is rebuilt."
+                        ),
+                        quorate=False,
                     )
                 await mgr.stop()
                 self.cluster_manager = None
@@ -5725,6 +6010,45 @@ class Cron:
         task.add_done_callback(self._pending_state_writes.discard)
         return task
 
+    def _dispatch_notify(
+        self,
+        event: str,
+        *,
+        success: bool,
+        name: str,
+        subject: str,
+        message: str,
+        **fields: Any,
+    ) -> None:
+        """Fire the ``notify:`` reporters for a daemon/orchestration event.
+
+        A fast, synchronous edge callable from any loop (the cluster
+        role-transition path is sync, the DAG scheduler async): it schedules
+        the reporter fan-out as a tracked fire-and-forget task, returning at
+        once,
+        so a slow SMTP/webhook reporter never stalls the caller (a scheduling
+        pass, a cluster tick, a DAG advance holding its run lease).  A no-op
+        when no ``notify:`` block is configured or the event is not on its
+        allow-list, so the common (unconfigured) case costs one dict lookup.
+        """
+        cfg = self._notify_config
+        if cfg is None:
+            return
+        allowed = cfg.get("events")
+        if allowed is not None and event not in allowed:
+            return
+        ctx = NotifyEventContext(
+            event=event,
+            success=success,
+            name=name,
+            subject=subject,
+            message=message,
+            fields=fields,
+        )
+        task = asyncio.create_task(report_event(ctx, cfg["report"]))
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
     def _state_periodic(self) -> None:
         """Kick off the periodic durable-state chores that are due.
 
@@ -6196,19 +6520,21 @@ class Cron:
             logger.info("state: swept %d orphaned artifact blob(s)", removed)
 
     @staticmethod
-    def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
-        auth = web_config.get("authToken")
-        if not auth:
-            return None
-        # authToken is configured: resolve it from exactly one source and fail
-        # closed (ConfigError) if it cannot be resolved to a non-empty secret.
-        # Otherwise a misconfigured source (unset env var, empty/missing file)
-        # would silently leave the web API listening with no authentication.
-        if auth.get("value"):
-            token = str(auth["value"])
-        elif auth.get("fromFile"):
+    def _resolve_web_secret(spec: dict, what: str) -> str:
+        """Resolve one ``{value|fromFile|fromEnvVar}`` bearer secret, failing
+        closed.
+
+        Shared by the scalar ``web.authToken`` and every scoped
+        ``web.authTokens`` entry: a source that is configured but resolves to
+        an empty secret raises :class:`ConfigError` rather than silently
+        leaving the web API (or one device) unauthenticated. ``what`` names
+        the config key for the error message.
+        """
+        if spec.get("value"):
+            token = str(spec["value"])
+        elif spec.get("fromFile"):
             try:
-                with open(auth["fromFile"], "rt") as token_file:
+                with open(spec["fromFile"], "rt") as token_file:
                     token = token_file.read().strip()
             # UnicodeDecodeError alongside OSError: a binary token file
             # raises it from read(), and only ConfigError gets the clean
@@ -6216,24 +6542,83 @@ class Cron:
             # is logged as an internal bug. Mirrors config._resolve_secret.
             except (OSError, UnicodeDecodeError) as ex:
                 raise ConfigError(
-                    "web.authToken.fromFile could not be read: {}".format(ex)
+                    "{}.fromFile could not be read: {}".format(what, ex)
                 ) from ex
-        elif auth.get("fromEnvVar"):
-            token = os.environ.get(auth["fromEnvVar"], "")
+        elif spec.get("fromEnvVar"):
+            token = os.environ.get(spec["fromEnvVar"], "")
         else:
             token = ""
         if not token:
             raise ConfigError(
-                "web.authToken is configured but resolved to an empty token; "
-                "refusing to start the web API without authentication"
+                "{} is configured but resolved to an empty token; refusing "
+                "to start the web API without authentication".format(what)
             )
         return token
 
     @staticmethod
+    def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
+        # The scalar web.authToken: an all-scopes ("god") token, or None when
+        # it is not configured. Kept as its own method so its behaviour (and
+        # tests) are unchanged; _resolve_web_tokens builds on it.
+        auth = web_config.get("authToken")
+        if not auth:
+            return None
+        return Cron._resolve_web_secret(auth, "web.authToken")
+
+    @staticmethod
+    def _resolve_web_tokens(
+        web_config: WebConfig,
+    ) -> "Optional[list[_WebToken]]":
+        """Resolve every configured web bearer token into a lookup table.
+
+        The scalar ``web.authToken`` (if set) becomes a single all-scopes
+        token; each ``web.authTokens`` entry becomes a scoped token. Returns
+        None when neither is configured (auth stays off; this None is the
+        sentinel the caller keys on to decide whether to install the auth
+        middleware at all). Fails closed on any configured-but-empty source,
+        exactly like
+        :meth:`_resolve_web_token`, and on two tokens resolving to one secret:
+        matching is by secret, so only one entry's scopes could ever apply.
+        The likely duplicate is a scoped entry repeating the scalar authToken,
+        which would silently downgrade the all-scopes token to that entry.
+        """
+        tokens = []  # type: list[_WebToken]
+        scalar = Cron._resolve_web_token(web_config)
+        if scalar is not None:
+            tokens.append(
+                _WebToken(scalar.encode("utf-8"), _WEB_ALL_SCOPES, "authToken")
+            )
+        for index, entry in enumerate(web_config.get("authTokens") or []):
+            what = "web.authTokens[{}]".format(index)
+            secret = Cron._resolve_web_secret(entry, what)
+            scopes = _effective_web_scopes(entry.get("scopes") or [])
+            label = entry.get("label") or what
+            tokens.append(_WebToken(secret.encode("utf-8"), scopes, label))
+        seen = {}  # type: Dict[bytes, str]
+        for token in tokens:
+            first = seen.get(token.token_bytes)
+            if first is not None:
+                # names only, never the secret
+                raise ConfigError(
+                    "web token {!r} resolves to the same secret as {!r}; "
+                    "duplicate secrets are refused because requests match "
+                    "tokens by secret, so only one entry's scopes could "
+                    "apply".format(token.label, first)
+                )
+            seen[token.token_bytes] = token.label
+        return tokens or None
+
+    @staticmethod
     def _make_auth_middleware(
-        token: str, public_paths: "frozenset[str]" = frozenset()
+        tokens, public_paths: "frozenset[str]" = frozenset()
     ):
-        token_bytes = token.encode("utf-8")
+        # Backward-compatible: a bare string is a single all-scopes token, so
+        # existing callers/tests that pass one keep working unchanged.
+        if isinstance(tokens, str):
+            tokens = [
+                _WebToken(tokens.encode("utf-8"), _WEB_ALL_SCOPES, "authToken")
+            ]
+        token_table = list(tokens)
 
         @web.middleware
         async def auth_middleware(request, handler):
@@ -6267,8 +6652,31 @@ class Cron:
                 presented_bytes = presented.encode("utf-8")
             except UnicodeEncodeError:
                 raise web.HTTPUnauthorized() from None
-            if not hmac.compare_digest(presented_bytes, token_bytes):
+            # Match against every configured token in constant time, with no
+            # early return, so timing does not reveal which token (if any)
+            # matched. A 401 means no token matched; authorization (scope)
+            # is a separate, later check.
+            matched = None  # type: Optional[_WebToken]
+            for entry in token_table:
+                if hmac.compare_digest(presented_bytes, entry.token_bytes):
+                    matched = entry
+            if matched is None:
                 raise web.HTTPUnauthorized()
+            # A full-scope token satisfies every route, so skip the per-route
+            # scope lookup entirely (this is also what keeps the single-token
+            # path, and its tests, behaving exactly as before). A scoped
+            # token is checked against the route's required scope: a valid
+            # token that lacks it is 403 (Forbidden), distinct from the 401
+            # for an unrecognised token.
+            if matched.scopes != _WEB_ALL_SCOPES:
+                required = _required_web_scope(request)
+                if required not in matched.scopes:
+                    raise web.HTTPForbidden(
+                        text=(
+                            "token {!r} lacks the {!r} scope required for "
+                            "this endpoint".format(matched.label, required)
+                        )
+                    )
             return await handler(request)
 
         return auth_middleware
@@ -8059,6 +8467,23 @@ class Cron:
                     "cluster: this node left quorum; no majority reachable, "
                     "so Leader jobs cannot run until one is"
                 )
+            if not quorate and self._notify_config is not None:
+                # losing quorum stands Leader jobs down: an alert-worthy edge.
+                # (Regaining quorum is recovery, logged above but not paged.)
+                # Guarded on _notify_config so an unconfigured daemon builds no
+                # payload, and mgr is touched only when the event fires.
+                node = getattr(mgr, "node_name", None) or self._state_host
+                self._dispatch_notify(
+                    "quorum_loss",
+                    success=False,
+                    name=node,
+                    subject="node {} left quorum".format(node),
+                    message=(
+                        "No majority reachable; Leader jobs cannot run on "
+                        "this node until quorum is restored."
+                    ),
+                    quorate=False,
+                )
             self._was_quorate = quorate
         if spread:
             return  # no single leader in spread mode
@@ -8069,6 +8494,26 @@ class Cron:
                 "cluster: this node %s scheduled-job leadership",
                 "acquired" if leader else "lost",
             )
+            # Guarded on _notify_config so an unconfigured daemon builds no
+            # payload and mgr.leader_name() runs only when the event fires.
+            if self._notify_config is not None:
+                node = getattr(mgr, "node_name", None) or self._state_host
+                self._dispatch_notify(
+                    "leader_change",
+                    success=False,
+                    name=node,
+                    subject="node {} {} scheduled-job leadership".format(
+                        node, "acquired" if leader else "lost"
+                    ),
+                    message=(
+                        "This node is now the scheduled-job leader."
+                        if leader
+                        else "This node is no longer the scheduled-job leader."
+                    ),
+                    role="leader" if leader else "follower",
+                    is_leader=leader,
+                    leader=mgr.leader_name() if mgr is not None else None,
+                )
             self._was_leader = leader
 
     @staticmethod
@@ -10445,6 +10890,51 @@ class Cron:
             await self._dag.on_task_finished(job)
         except Exception:  # noqa: BLE001 - never kill the reaper
             logger.exception("dag: failed to record a task completion")
+        # Fire the task's own run reporters (onFailure/onSuccess, set per-task
+        # or inherited from the `defaults:` block), after the durable
+        # transition above so a report can never delay it. No retry arming and
+        # no onPermanentFailure: a task's attempts are graph-driven (the DAG
+        # node's `retries`), so every failed attempt reports via onFailure.
+        # Cancelled/replaced runs are not failures (mirroring
+        # _handle_finished_job's early returns), and shutdown skips reporting
+        # exactly as handle_job_failure's stop-event gate does. The
+        # enabled-probe keeps the common unconfigured case at dict lookups: a
+        # mapped fan-out can land hundreds of completions in one reaper batch,
+        # and each spawn is a task plus a four-reporter gather.
+        if not (job.cancelled or job.replaced or self._stop_event.is_set()):
+            failed = job.fail_reason is not None
+            hook = job.config.onFailure if failed else job.config.onSuccess
+            if report_config_enabled(hook["report"]):
+                self._queue_dag_task_report(job, failed=failed)
+
+    def _queue_dag_task_report(self, job: RunningJob, *, failed: bool) -> None:
+        """Spawn one DAG task run's report fan-out as a tracked task.
+
+        The DAG sibling of :meth:`_queue_job_completion`, minus the per-name
+        sequencing: a task report carries no retry-arm step, so mapped
+        instances of one task finishing together may report concurrently.
+        Tracked in ``_completion_tasks`` so shutdown's
+        :meth:`_drain_completions` awaits in-flight reports (and tests observe
+        them deterministically).
+        """
+
+        async def _report() -> None:
+            try:
+                if failed:
+                    await job.report_failure()
+                else:
+                    await job.report_success()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Unexpected error reporting the dag task run %s",
+                    job.config.name,
+                )
+
+        task = asyncio.create_task(_report())
+        self._completion_tasks.add(task)
+        task.add_done_callback(self._completion_tasks.discard)
 
     async def handle_job_failure(self, job: RunningJob) -> None:
         if self._stop_event.is_set():

@@ -5,6 +5,115 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.30 (2026-07-23)
+
+A reporting, orchestration-visibility, and API-contract release. Report
+payloads now carry the run's host, schedule, start time and ledger id; a global
+`defaults:` block finally reaches DAG tasks; a new `notify:` block reports on
+DAG failures, approval gates, and leadership changes (not just job runs); the
+REST API gains a single-job and a batched-summary endpoint; the web API can now
+issue **scoped, per-device bearer tokens** so a phone or wallboard need not
+carry an all-powerful token; and the whole HTTP control API is now described by
+a CI-checked OpenAPI spec. Every change is useful to existing webhook/ntfy/CLI
+users, not just to API clients. (Rename this `Unreleased` heading to the cut
+version at release time; see [Contributing](CONTRIBUTING.md#releasing).)
+
+### Richer report payloads
+
+- **`template_vars` gains `host`, `schedule`, `started_at` and `run_id`**, so a
+  webhook, ntfy, mail or Sentry report can identify the run (which node ran it,
+  its crontab line (object schedules rendered), the ISO-8601 start instant, and
+  its [durable-ledger](wiki/Durable-State.md) id) without the template digging
+  through `environment`. `started_at`/`run_id` are `None` before a run starts
+  and on an `onLate` breach (which describes a run that did not happen); `host`
+  and `schedule` are always populated. Existing templates are unaffected.
+- **The shell reporter exports `CRONSTABLE_HOST`, `CRONSTABLE_RUN_ID` and
+  `CRONSTABLE_STARTED_AT`** alongside the existing `CRONSTABLE_*` variables, so
+  a notify script sees the same run context.
+
+### The global `defaults:` block now covers DAG tasks
+
+- **A DAG task inherits the file's `defaults:` block just as a job does**:
+  global `shell`, `environment`, `env_file`, capture, `monitorResources`,
+  run-scoped `secrets`, and reporter (`onFailure`/`onSuccess`) config now
+  reach DAG tasks, with the task's own value winning on any key it sets.
+- **DAG task runs now fire their `onFailure`/`onSuccess` reporters**, set
+  per-task (a new report-only task key; there is no `onFailure.retry` on a
+  task, attempts stay graph-driven) or inherited from `defaults:`. Every
+  failed attempt reports via `onFailure`; cancelled and replaced instances do
+  not report, matching job semantics. Reports are spawned off the reaper, so
+  a slow reporter never stalls completion handling or the graph advance.
+  Previously a task template was built over the built-in defaults only, so a
+  global reporter or environment silently skipped DAG tasks. Graph-shape fields
+  (`dependsOn`, `triggerRule`, `retries`, `expand`, `onReject`, the poke
+  settings) are never touched by `defaults:`, and the DAG's synthetic
+  schedule-trigger job stays on the built-in defaults so a global reporter fires
+  per DAG **run**, not on every tick.
+
+### Daemon event notifications (`notify:`)
+
+- **A new top-level `notify:` block reports on daemon and orchestration
+  events**, over the same four reporters (sentry / mail / shell / webhook) a job
+  uses. It fires on `dag_failure` (a DAG run ended failed), `approval_waiting`
+  (an approval gate began awaiting a decision, once per gate), `leader_change`
+  (this node acquired or lost scheduled-job leadership), and `quorum_loss` (this
+  node left quorum). An optional `events` allow-list filters which fire; the
+  default is all. Its default templates key on the event (`event` / `subject` /
+  `message`) rather than the completed/failed job wording, and it has its own
+  Sentry grouping. Until now only job runs could report; DAG failures, gate
+  waits, and cluster events never fired a notification. Notifications are
+  fire-and-forget and never block the scheduler, cluster loop, or a DAG advance.
+
+### New REST endpoints
+
+- **`GET /jobs/{name}`** returns one job's detail in the identical shape as an
+  entry of `GET /jobs`, so a client can refresh a single job without pulling and
+  filtering the whole fleet. (The same detail was already an MCP tool,
+  `cron_get_job`; this puts it on REST too.)
+- **`GET /summary`** returns one batched fleet overview for an at-a-glance
+  client (a widget, a status tile): fleet job counts (total / enabled /
+  disabled / running / paused / failing / never-fires), the soonest upcoming
+  fire, this node's identity, and its compact cluster role: one small poll
+  instead of folding the whole `/jobs` array.
+
+### OpenAPI specification
+
+- **The HTTP control API is now described by an OpenAPI 3.0 spec at
+  [`docs/openapi.yaml`](docs/openapi.yaml)**, kept honest by two CI checks:
+  `.github/scripts/check_openapi.py` (`tox -e openapi`) validates the document
+  itself (schema, refs, duplicated keys), and `tests/test_openapi.py` diffs the
+  spec's paths and methods against the served route table
+  (`cronstable.cron.WEB_ROUTES`, now the single source the aiohttp app builds
+  its routes from) in both directions, so a route added or renamed without a
+  spec edit fails the suite. It is the contract a generated client is built
+  from; the [HTTP-API wiki page](wiki/HTTP-API.md) remains the field-by-field
+  reference.
+
+### Scoped web bearer tokens (`web.authTokens`)
+
+- **A new `web.authTokens` list issues per-device bearer tokens, each with its
+  own scopes** (`view` / `control` / `approve`), so a phone, a wallboard, or a
+  CI trigger need not carry the all-powerful `web.authToken`. `view` covers
+  every read-only `GET`; `control` covers the mutating `POST`s (start / cancel
+  / pause / resume, DAG trigger / backfill) and `POST /mcp`; `approve` covers
+  only the DAG approval-gate decision. `control` and `approve` each imply
+  `view`. A recognised token that lacks a route's scope is now **`403
+  Forbidden`** (naming the token and the missing scope), distinct from the
+  `401` for an unknown token. New routes get a safe default (a `GET` needs
+  `view`, any other method needs `control`), so nothing is ever unguarded by
+  omission.
+- **The scalar `web.authToken` is unchanged**: it remains an all-scopes token,
+  every configured token is accepted, and both keys compose. Each scoped entry
+  resolves its secret from the same `value`/`fromFile`/`fromEnvVar` sources and
+  **fails closed** the same way (a configured-but-empty entry refuses to start
+  the web API); two tokens resolving to the same secret are refused at startup,
+  since matching is by secret and only one entry's scopes could apply.
+  `mcp.enabled`'s fail-closed gate is satisfied by either key.
+- **Revoke a device** by dropping its entry and reloading; its optional `label`
+  identifies it in logs and 403 bodies. These transport scopes are unrelated to
+  the loopback job-state API's key-value `scope`. See the
+  [HTTP-API wiki page](wiki/HTTP-API.md#scoped-tokens-webauthtokens).
+
 ## 1.2.29 (2026-07-21)
 
 A configuration release.  A YAML config can now pull its own values from the

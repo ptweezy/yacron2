@@ -18,6 +18,8 @@ orjson>=3.9; python_version < "3.15" and (platform_machine != "ARM64" or sys_pla
 bandit[toml]
 mypy
 mypy-extensions
+# validates docs/openapi.yaml (see .github/scripts/check_openapi.py, tox -e openapi).
+openapi-spec-validator
 pytest
 pytest-asyncio
 pytest-cov

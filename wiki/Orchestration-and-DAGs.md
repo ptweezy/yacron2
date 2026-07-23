@@ -74,7 +74,23 @@ Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `captureStderr`, `executionTimeout`, `killTimeout`, `user` / `group`,
 `failsWhen`, run-scoped `secrets`, `monitorResources`, and the rest of the
 shared launch keys; the complete list, with types and defaults, is in the
-[configuration reference](Configuration-Reference#dags). A monitored task
+[configuration reference](Configuration-Reference#dags). Because a task **is**
+a job invocation, its launch fields inherit the file's
+[`defaults:` block](Includes-and-Defaults#the-defaults-section) the same way a
+job does: a global `shell`, `environment`, `monitorResources`, run-scoped
+`secrets`, or reporter block covers DAG tasks too, and the task's own value
+wins on any key it sets. A task's `onFailure` / `onSuccess` reporters (set
+per-task or inherited) fire on each of its runs, every failed attempt
+included; per-task the two hooks accept a `report` block only, since a task's
+retries come from the node's `retries` field, not a job-level
+`onFailure.retry` ladder (an inherited one is ignored for tasks). Only the
+**launch** fields inherit; the DAG-node
+fields that shape the graph (`dependsOn`, `triggerRule`, `retries`,
+`retryDelaySeconds`, `expand`, `onReject`, the poke settings) are never touched
+by a `defaults:` block. The DAG's own schedule frame is separate too: the
+synthetic trigger job that fires the DAG on schedule stays on the built-in
+defaults, so a global `onSuccess`/`onFailure` reporter does not alert on every
+DAG tick. A monitored task
 instance's sampled CPU time and peak RSS land in the `resources` object of
 its task record in the `dag_run` document, and in the task's statsd sink if
 one is configured; task instances do not appear in the per-job Prometheus
@@ -211,6 +227,12 @@ curl -X POST .../dags/nightly-etl/runs/<run_key>/tasks/publish-gate/decision \
 `approve` succeeds the gate and the graph proceeds; `reject` fails it (or, with
 `onReject: skip`, marks it `skipped`, cascading `skipped` to its `all_success`
 downstream). The decision (`by`, timestamp) is recorded durably.
+
+A gate that begins waiting can page you: configure the
+[`notify:` block](Reporting#daemon-event-notifications-notify) with the
+`approval_waiting` event to have cronstable fire a reporter (webhook, mail, …)
+the first time each gate parks awaiting a decision. A whole DAG run reaching
+`failed` similarly fires the `dag_failure` event.
 
 ## Scheduling, catch-up, and backfill
 

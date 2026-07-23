@@ -356,6 +356,32 @@ DEFAULT_LATE_WEBHOOK_BODY_TEMPLATE = (
     + "{% endfilter %}}"
 )
 
+# The canonical daemon/orchestration events the `notify:` block reports on
+# (and the values a `notify.events` allow-list may name). None is a job run,
+# so they never fire onFailure/onSuccess; they fan out to the notify report
+# block instead. See Cron._dispatch_notify.
+NOTIFY_EVENTS = (
+    "dag_failure",  # a DAG run reached a terminal FAILED state
+    "approval_waiting",  # an approval gate began awaiting a decision
+    "leader_change",  # this node acquired or lost scheduled-job leadership
+    "quorum_loss",  # this node left quorum (Leader jobs stand down)
+)
+
+# Defaults for the notify report block: a daemon/orchestration event is not a
+# job run, so the completed/failed wording of the standard templates does not
+# fit.  These key on the event's own vars (event / subject / message) instead.
+DEFAULT_NOTIFY_SUBJECT_TEMPLATE = "cronstable {{ event }}: {{ subject }}"
+
+DEFAULT_NOTIFY_BODY_TEMPLATE = "{{ message }}\n"
+
+DEFAULT_NOTIFY_WEBHOOK_BODY_TEMPLATE = (
+    '{"text": {% filter tojson %}'
+    + DEFAULT_NOTIFY_SUBJECT_TEMPLATE
+    + "\n"
+    + DEFAULT_NOTIFY_BODY_TEMPLATE
+    + "{% endfilter %}}"
+)
+
 # Named (not inlined below) because cronstable.fingerprint compares against it
 # to keep the reporter timeout out of a job's identity while it holds the
 # default -- see canonical_job's omit-when-default rule.
@@ -521,6 +547,26 @@ _late_report["mail"]["body"] = DEFAULT_LATE_BODY_TEMPLATE
 _late_report["webhook"]["body"] = DEFAULT_LATE_WEBHOOK_BODY_TEMPLATE
 _late_report["sentry"]["fingerprint"] = ["cronstable", "sla", "{{ name }}"]
 del _late_report
+
+# The `notify:` report block merges over these event-shaped defaults, exactly
+# as onLate merges over the overdue templates.  Kept wholly separate from
+# _REPORT_DEFAULTS (a deepcopy) so a daemon event's wording never leaks into a
+# job's report block or its fingerprint, and give events their own sentry
+# grouping keyed on the event name.
+_NOTIFY_REPORT_DEFAULTS: Dict[str, Any] = copy.deepcopy(_REPORT_DEFAULTS)
+_NOTIFY_REPORT_DEFAULTS["mail"]["subject"] = DEFAULT_NOTIFY_SUBJECT_TEMPLATE
+_NOTIFY_REPORT_DEFAULTS["mail"]["body"] = DEFAULT_NOTIFY_BODY_TEMPLATE
+_NOTIFY_REPORT_DEFAULTS["webhook"]["body"] = (
+    DEFAULT_NOTIFY_WEBHOOK_BODY_TEMPLATE
+)
+_NOTIFY_REPORT_DEFAULTS["sentry"]["body"] = (
+    DEFAULT_NOTIFY_SUBJECT_TEMPLATE + "\n" + DEFAULT_NOTIFY_BODY_TEMPLATE
+)
+_NOTIFY_REPORT_DEFAULTS["sentry"]["fingerprint"] = [
+    "cronstable",
+    "{{ event }}",
+    "{{ name }}",
+]
 
 
 _report_schema = Map(
@@ -756,6 +802,13 @@ _dag_task_launch_fields = {
         )
     ),
     Opt("stateAllowedScopes"): Seq(Str()),
+    # Per-task run reporting: report-only (no `retry` key, unlike a job's
+    # onFailure): a task's attempts are graph-driven (the DAG node's
+    # `retries`), so a job-level retry ladder here would be dead config
+    # presented as live. An inherited `defaults:` onFailure.retry is likewise
+    # inert for tasks. Fired by Cron._handle_finished_dag_task per task run.
+    Opt("onFailure"): Map({Opt("report"): _report_schema}),
+    Opt("onSuccess"): Map({Opt("report"): _report_schema}),
 }
 
 _dag_task_schema_dict = dict(_dag_task_launch_fields)
@@ -801,6 +854,15 @@ _dag_schema_dict = {
     "tasks": Seq(Map(_dag_task_schema_dict)),
 }
 
+# Bearer-token scopes for the web control API (web.authTokens[].scopes).
+# `view` = every read-only GET; `control` = the mutating POST endpoints
+# (start/cancel/pause/resume/trigger/backfill); `approve` = the DAG
+# approval-gate decision only. Holding `control` or `approve` implies `view`
+# (an action UI must read state first). The scalar web.authToken is an
+# all-scopes ("god") token. Enforcement lives in
+# cronstable.cron.Cron._make_auth_middleware / _required_web_scope.
+WEB_TOKEN_SCOPES = ("view", "control", "approve")
+
 CONFIG_SCHEMA = EmptyDict() | Map(
     {
         Opt("defaults"): Map(_job_defaults_common),
@@ -825,6 +887,26 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("fromFile"): EmptyNone() | Str(),
                         Opt("fromEnvVar"): EmptyNone() | Str(),
                     }
+                ),
+                # additional per-device *scoped* bearer tokens, so a phone or
+                # a wallboard need not carry the all-scopes `authToken` above.
+                # Each entry resolves its secret from the same
+                # value/fromFile/fromEnvVar sources, carries a `scopes` list
+                # (view / control / approve; control and approve imply view)
+                # and an optional `label` used to identify and revoke it (drop
+                # the entry and reload). Written block-style (strictyaml
+                # rejects flow lists). See
+                # cronstable.cron.Cron._resolve_web_tokens.
+                Opt("authTokens"): Seq(
+                    Map(
+                        {
+                            Opt("value"): EmptyNone() | Str(),
+                            Opt("fromFile"): EmptyNone() | Str(),
+                            Opt("fromEnvVar"): EmptyNone() | Str(),
+                            "scopes": Seq(Enum(list(WEB_TOKEN_SCOPES))),
+                            Opt("label"): Str(),
+                        }
+                    )
                 ),
                 # octal permissions to apply to a unix:// listen socket
                 Opt("socketMode"): Str(),
@@ -1066,6 +1148,17 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("handlers"): YamlAny(),
                 Opt("loggers"): YamlAny(),
                 Opt("root"): YamlAny(),
+            }
+        ),
+        # Optional daemon-level event notifications: fan DAG failures, approval
+        # gates awaiting a decision, and leadership/quorum changes out to the
+        # same reporters a job uses.  `report` reuses the job report schema;
+        # `events` is an optional allow-list (default = every event).  See
+        # cronstable.cron.Cron._dispatch_notify.
+        Opt("notify"): Map(
+            {
+                Opt("events"): Seq(Enum(list(NOTIFY_EVENTS))),
+                Opt("report"): _report_schema,
             }
         ),
     }
@@ -1707,8 +1800,9 @@ class JobConfig:
 
 # Defaults for the DAG-node fields strictyaml leaves absent (unlike jobs, a
 # task dict is not pre-merged over a full defaults dict, so absent optionals
-# stay absent).  The launch fields are filled from DEFAULT_CONFIG when the
-# per-task JobConfig template is built.
+# stay absent).  The launch fields are filled from the assembled job-defaults
+# base (DEFAULT_CONFIG plus any `defaults:` block) when the per-task JobConfig
+# template is built (see DagTaskConfig).
 _DAG_TASK_DEFAULTS: Dict[str, Any] = {
     "type": "task",
     "dependsOn": [],
@@ -1754,7 +1848,21 @@ class DagTaskConfig:
 
     __slots__ = ("id", "type", "job_template", "spec")
 
-    def __init__(self, dag_name: str, raw_task: dict) -> None:
+    def __init__(
+        self,
+        dag_name: str,
+        raw_task: dict,
+        defaults: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        # `defaults` is the assembled job-defaults base (DEFAULT_CONFIG plus
+        # any included-file and top-level `defaults:` block), the same base a
+        # regular job is merged over.  A task's launch fields therefore inherit
+        # global reporters, environment, shell, capture, secrets,
+        # monitorResources and timeouts just as a job does.  It falls back to
+        # DEFAULT_CONFIG when a DagConfig is built directly (e.g. in a test)
+        # without a defaults base.  The DAG-node fields are popped out below
+        # before this merge, so a `defaults:` block never perturbs graph shape.
+        base = defaults if defaults is not None else DEFAULT_CONFIG
         merged = mergedicts(_DAG_TASK_DEFAULTS, raw_task)
         self.id: str = merged["id"]
         self.type: str = merged["type"]
@@ -1782,7 +1890,7 @@ class DagTaskConfig:
                 "-1 retry-forever sentinel is not supported for dag "
                 "tasks)".format(dag_name, self.id)
             )
-        job_dict = mergedicts(DEFAULT_CONFIG, merged)
+        job_dict = mergedicts(base, merged)
         job_dict["name"] = "{}.{}".format(dag_name, self.id)
         # never auto-fires: task templates are not in the scheduler's job set,
         # so this placeholder schedule is only there to satisfy JobConfig.
@@ -1835,7 +1943,9 @@ class DagConfig:
         "task_templates",
     )
 
-    def __init__(self, raw_dag: dict) -> None:
+    def __init__(
+        self, raw_dag: dict, defaults: Optional[Dict[str, Any]] = None
+    ) -> None:
         raw = dict(raw_dag)
         self.name: str = raw.pop("name")
         self.enabled: bool = bool(raw.pop("enabled", True))
@@ -1849,7 +1959,7 @@ class DagConfig:
             raise ConfigError(
                 "dag {!r}: needs at least one task".format(self.name)
             )
-        self.tasks = [DagTaskConfig(self.name, t) for t in tasks_raw]
+        self.tasks = [DagTaskConfig(self.name, t, defaults) for t in tasks_raw]
         self.task_templates: Dict[str, JobConfig] = {
             t.id: t.job_template for t in self.tasks
         }
@@ -1882,6 +1992,11 @@ class DagConfig:
         ):
             if key in raw:
                 overrides[key] = raw[key]
+        # The synthetic schedule-trigger job deliberately builds on
+        # DEFAULT_CONFIG, NOT the user `defaults:` base the tasks use: it runs
+        # a placeholder `true` on every DAG tick, so inheriting a global
+        # onSuccess/onFailure reporter here would fire an alert per tick rather
+        # than per DAG run.  DAG-run reporting is a separate concern.
         job_dict = mergedicts(DEFAULT_CONFIG, overrides)
         try:
             job = JobConfig(job_dict)
@@ -3318,6 +3433,17 @@ def _is_local_listener(addr: str) -> bool:
         return False
 
 
+def _web_has_any_token(web: dict) -> bool:
+    """Whether the web config declares any bearer token at all.
+
+    True when either the scalar ``web.authToken`` or one or more scoped
+    ``web.authTokens`` entries are present. A bare presence test (like the
+    fail-closed MCP gate needs): it does not resolve the sources, matching
+    the historical ``web.get("authToken")`` truthiness check.
+    """
+    return bool(web.get("authToken") or web.get("authTokens"))
+
+
 def _validate_mcp_config(config: "CronstableConfig") -> None:
     """Fail-closed checks for the MCP server that also need the web section.
 
@@ -3344,7 +3470,7 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
             "mcp.toolsets includes 'act' but mcp.readOnly is true; mutating "
             "tools stay suppressed until readOnly is set false"
         )
-    if mcp.get("allowUnauthenticated") or web.get("authToken"):
+    if mcp.get("allowUnauthenticated") or _web_has_any_token(web):
         return
     # An https listener with web.tls.clientCa authenticates its callers at the
     # transport (CERT_REQUIRED against that CA), which is the same guarantee
@@ -3360,10 +3486,11 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
     ]
     if routable:
         raise ConfigError(
-            "mcp.enabled is set but web.authToken is not, and the web API "
-            "listens on non-loopback address(es) {}: /mcp would be served "
-            "without authentication (with no token the web app installs no "
-            "auth middleware at all). Set web.authToken, restrict web.listen "
+            "mcp.enabled is set but no web.authToken/authTokens is set, and "
+            "the web API listens on non-loopback address(es) {}: /mcp would "
+            "be served without authentication (with no token the web app "
+            "installs no auth middleware at all). Set web.authToken or a "
+            "web.authTokens entry, restrict web.listen "
             "to loopback/unix-socket addresses, set web.tls.clientCa so the "
             "listener authenticates callers by certificate, or set "
             "mcp.allowUnauthenticated: true when the endpoint is protected "
@@ -3390,6 +3517,10 @@ class CronstableConfig:
     # Optional MCP server section; None keeps the server off. Defaulted so the
     # empty config in Cron.update_config and other constructors need no change.
     mcp_config: Optional[MCPConfig] = None
+    # Optional daemon-level event notifications (`notify:`): a report block
+    # that fires on DAG failures, approval gates, and leadership/quorum
+    # changes. None keeps the classic job-runs-only reporting.
+    notify_config: Optional[Dict[str, Any]] = None
 
 
 # Environment-variable interpolation over the validated config document.
@@ -3657,6 +3788,24 @@ def parse_crontab_string(data: str, path: str) -> CronstableConfig:
     return _config_from_doc({"jobs": job_docs}, path, None)
 
 
+def _build_notify_config(raw: dict) -> Dict[str, Any]:
+    """Assemble the ``notify:`` block: an event allow-list + a report block.
+
+    ``report`` merges over the event-shaped :data:`_NOTIFY_REPORT_DEFAULTS`
+    exactly as a job's report merges over the job defaults, so an omitted
+    reporter simply stays disabled.  ``events`` (optional) is an allow-list of
+    :data:`NOTIFY_EVENTS`; absent or empty means every event fires.
+    """
+    report = mergedicts(
+        copy.deepcopy(_NOTIFY_REPORT_DEFAULTS), raw.get("report") or {}
+    )
+    events = raw.get("events")
+    return {
+        "events": frozenset(events) if events else None,
+        "report": report,
+    }
+
+
 def _config_from_doc(
     doc: dict,
     path: str,
@@ -3684,6 +3833,9 @@ def _config_from_doc(
     stateconf = _build_state_config(doc["state"]) if "state" in doc else None
     mcpconf = _build_mcp_config(doc["mcp"]) if "mcp" in doc else None
     logging_conf = LoggingConfig(doc["logging"]) if "logging" in doc else None
+    notifyconf = (
+        _build_notify_config(doc["notify"]) if "notify" in doc else None
+    )
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
         # Included jobs arrive already fully constructed, so they carry only
@@ -3716,6 +3868,10 @@ def _config_from_doc(
             if logging_conf:
                 raise ConfigError("multiple logging configs")
             logging_conf = inc_config.logging_config
+        if inc_config.notify_config:
+            if notifyconf:
+                raise ConfigError("multiple notify configs")
+            notifyconf = inc_config.notify_config
     defaults = mergedicts(DEFAULT_CONFIG, inc_defaults_merged)
     defaults = mergedicts(defaults, doc.get("defaults", {}))
     # One env_file is frequently shared by many jobs in a doc; a per-doc
@@ -3724,11 +3880,15 @@ def _config_from_doc(
     for config_job in doc.get("jobs", []):
         job_dict = mergedicts(defaults, config_job)
         jobs.append(JobConfig(job_dict, env_cache=env_cache))
-    # DAGs are self-contained (tasks carry their own launch fields), so a
-    # top-level `defaults:` block is not applied to them; each DAG builds its
-    # per-task templates over DEFAULT_CONFIG in DagConfig.
+    # A DAG task is a job invocation, so its launch fields inherit the same
+    # `defaults:` base a regular job does (global reporters, environment,
+    # shell, capture, secrets, monitorResources, timeouts).  The DAG-node
+    # fields (deps/type/retries/mapping) are graph shape, not launch config,
+    # and are never touched by a `defaults:` block.  The DAG's synthetic
+    # schedule-trigger job stays on DEFAULT_CONFIG (see DagConfig), so a global
+    # onSuccess/onFailure reporter does not fire on every DAG tick.
     for config_dag in doc.get("dags", []):
-        dags.append(DagConfig(config_dag))
+        dags.append(DagConfig(config_dag, defaults))
     return CronstableConfig(
         jobs=jobs,
         web_config=webconf,
@@ -3738,6 +3898,7 @@ def _config_from_doc(
         state_config=stateconf,
         dags=dags,
         mcp_config=mcpconf,
+        notify_config=notifyconf,
     )
 
 
@@ -4069,6 +4230,8 @@ def _parse_config_dir(
     mcp_config_source_fname: Optional[str] = None
     logging_config: Optional[LoggingConfig] = None
     logging_config_source_fname: Optional[str] = None
+    notify_config: Optional[Dict[str, Any]] = None
+    notify_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
     # Sort by name so job order and the "first config found" error messages
     # are deterministic; os.scandir yields entries in arbitrary FS order.
@@ -4150,6 +4313,17 @@ def _parse_config_dir(
                         logging_config_source_fname, direntry.path
                     )
                 )
+        if config.notify_config is not None:
+            if notify_config is None:
+                notify_config = config.notify_config
+                notify_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'notify' configurations found: "
+                    "first in {}, now in {}".format(
+                        notify_config_source_fname, direntry.path
+                    )
+                )
         job_defaults = JobDefaults(
             mergedicts(job_defaults, config.job_defaults)
         )
@@ -4167,4 +4341,5 @@ def _parse_config_dir(
         state_config=state_config,
         dags=dags,
         mcp_config=mcp_config,
+        notify_config=notify_config,
     )

@@ -503,6 +503,144 @@ async def test_web_status_text_says_never_fires():
     assert "never fires" in parked
 
 
+# ---------------------------------------------------------------------------
+# GET /jobs/{name}: single-job detail (was MCP-only)
+# ---------------------------------------------------------------------------
+
+
+async def test_web_get_job_returns_same_shape_as_list():
+    cron = _cron(_DEAD_JOB)
+    resp = await cron._web_get_job(Req(match={"name": "live"}))
+    body = json.loads(resp.text)
+    expected = cron._job_to_dict("live", cron.cron_jobs["live"])
+    # identical per-job shape to an entry in GET /jobs (the live countdown
+    # ticks between the two builds, so compare every key but that one).
+    assert body.pop("scheduled_in") == pytest.approx(
+        expected.pop("scheduled_in"), abs=1.0
+    )
+    assert body == expected
+    assert body["name"] == "live"
+
+
+async def test_web_get_job_unknown_is_404():
+    cron = _cron(_DEAD_JOB)
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_get_job(Req(match={"name": "nope"}))
+
+
+# ---------------------------------------------------------------------------
+# GET /summary: one batched fleet overview for widgets
+# ---------------------------------------------------------------------------
+
+_SUMMARY_JOBS = """
+jobs:
+  - name: a
+    command: echo hi
+    schedule: "*/5 * * * *"
+  - name: b
+    command: echo hi
+    schedule: "*/10 * * * *"
+  - name: c
+    command: echo hi
+    schedule: "* * * * *"
+    enabled: false
+  - name: dead
+    command: echo hi
+    schedule: "0 0 1 1 * 2020"
+"""
+
+
+async def test_summary_payload_counts_and_next_fire():
+    import cronstable.version
+
+    cron = _cron(_SUMMARY_JOBS)
+    cron._ensure_seeded(datetime.datetime.now(_UTC))
+    # b is running (so it drops out of "next fire"); a's last run failed.
+    cron.running_jobs["b"] = [types.SimpleNamespace(proc=None)]
+    cron.last_run["a"] = _run("failure")
+
+    summary = cron.summary_payload()
+    assert summary["version"] == cronstable.version.version
+    assert summary["node_name"] == cron._state_host
+    assert summary["jobs"] == {
+        "total": 4,
+        "enabled": 3,  # a, b, dead (c is disabled)
+        "disabled": 1,
+        "running": 1,  # b
+        "paused": 0,
+        "failing": 1,  # a's last run failed
+        "never_fires": 1,  # dead
+    }
+    # a fires every 5 min; b is running, c disabled, dead never fires -> a wins.
+    assert summary["next_fire"]["job"] == "a"
+    assert summary["next_fire"]["in"] >= 0
+    assert summary["next_fire"]["at"].endswith("+00:00")
+    # no cluster section configured
+    assert summary["cluster"] == {"enabled": False}
+    # no dags configured -> the dags block is omitted (lean)
+    assert "dags" not in summary
+
+
+async def test_summary_paused_counts_and_next_fire_skips_covered_fire():
+    from cronstable.cron import PauseInfo
+
+    now = datetime.datetime.now(_UTC)
+    cron = _cron(_SUMMARY_JOBS)
+    cron._ensure_seeded(now)
+    # deterministic fire instants: a in ~250s, b in ~400s.
+    cron._next_fire["a"] = now + datetime.timedelta(seconds=250)
+    cron._next_fire["b"] = now + datetime.timedelta(seconds=400)
+
+    def _pause(until_seconds):
+        return PauseInfo(
+            since=now,
+            until=now + datetime.timedelta(seconds=until_seconds),
+            note="",
+            by="t",
+            channel="api",
+        )
+
+    # the pause covers a's fire (300 > 250): that slot is skipped at the
+    # gate, so a must not be reported as the fleet's next fire; b wins.
+    cron._paused["a"] = _pause(300)
+    summary = cron.summary_payload()
+    assert summary["jobs"]["paused"] == 1
+    assert summary["next_fire"]["job"] == "b"
+    # the pause lifts before the fire (100 < 250): the fire happens, so a
+    # still wins while still counting as paused right now.
+    cron._paused["a"] = _pause(100)
+    summary = cron.summary_payload()
+    assert summary["jobs"]["paused"] == 1
+    assert summary["next_fire"]["job"] == "a"
+
+
+async def test_web_get_summary_endpoint_returns_json():
+    cron = _cron(_SUMMARY_JOBS)
+    resp = await cron._web_get_summary(Req())
+    body = json.loads(resp.text)
+    assert body["jobs"]["total"] == 4
+    assert body["generated_at"].endswith("+00:00")
+
+
+_NO_COUNTDOWN_JOBS = """
+jobs:
+  - name: parked
+    command: echo hi
+    schedule: "0 0 1 1 * 2020"
+  - name: boot
+    command: echo hi
+    schedule: "@reboot"
+"""
+
+
+async def test_summary_next_fire_null_when_nothing_fires():
+    cron = _cron(_NO_COUNTDOWN_JOBS)
+    summary = cron.summary_payload()
+    # parked never fires (past year) and @reboot has no countdown -> no soonest.
+    assert summary["next_fire"] is None
+    assert summary["jobs"]["never_fires"] == 1  # parked; @reboot is not "dead"
+
+
 def test_dead_schedule_never_enters_the_fire_index_but_warns(caplog):
     import logging as _logging
 

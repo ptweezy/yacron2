@@ -122,6 +122,20 @@ def test_loopback_no_token_allowed():
     assert _parse(yaml).mcp_config["enabled"] is True
 
 
+def test_scoped_tokens_satisfy_mcp_fail_closed_gate():
+    # a routable listener with mcp.enabled and ONLY scoped web.authTokens (no
+    # scalar authToken) still authenticates /mcp, so the gate must pass.
+    yaml = (
+        "web:\n  listen:\n    - http://0.0.0.0:8080\n"
+        "  authTokens:\n"
+        "    - label: agent\n"
+        "      scopes:\n        - control\n"
+        "      value: s3cret\n"
+        "mcp:\n  enabled: true\n"
+    )
+    assert _parse(yaml).mcp_config["enabled"] is True
+
+
 def test_routable_with_token_allowed():
     yaml = (
         "web:\n  listen:\n    - http://0.0.0.0:8080\n"

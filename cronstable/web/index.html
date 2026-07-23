@@ -421,6 +421,7 @@
   .brand .mark svg { display: block; filter: drop-shadow(0 0 5px var(--glow)); }
   .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; }
   .brand .tag { font-size: 11px; color: var(--fg-faint); cursor: default; }
+  .brand .tm { font-size: 9px; color: var(--fg-faint); margin-left: -6px; transform: translateY(-4px); cursor: default; user-select: none; }
   /* header text can't be selected, so these copy their value on click instead */
   .brand .ver { font-size: 10.5px; color: var(--fg-faint); cursor: pointer; }
   .brand .ver:hover { color: var(--fg-dim); text-decoration: underline dotted; }
@@ -1462,7 +1463,7 @@
 
 <header>
   <div class="brand">
-    <h1 class="glow" id="brandName" title="the cronstable logo, the l is self-balancing double pendulum">cronstab<span class="mark" id="mark">l</span>e</h1>
+    <h1 class="glow" id="brandName" title="the cronstable logo, the l is self-balancing double pendulum">cronstab<span class="mark" id="mark">l</span>e</h1><span class="tm" title="cronstable is a trademark of the cronstable authors">™</span>
     <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
     <span class="ver" id="jobset" title=""></span>

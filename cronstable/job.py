@@ -57,6 +57,31 @@ if "HOSTNAME" not in os.environ:
     os.environ["HOSTNAME"] = gethostname()
 
 
+def report_hostname() -> str:
+    """The host name to stamp on report payloads.
+
+    ``os.environ["HOSTNAME"]`` is forced to :func:`gethostname` at import (see
+    above), so this is the daemon's host regardless of whether the environment
+    named it.  Shared by ``template_vars`` and the shell reporter so every
+    notification channel agrees on which node ran the job.
+    """
+    return os.environ.get("HOSTNAME", "")
+
+
+def schedule_string(config: "JobConfig") -> str:
+    """A job's schedule as a crontab line, object schedules rendered.
+
+    ``config.schedule_unparsed`` is ``Union[str, dict]``; the object form is
+    rendered the same way the status payload, prometheus, and the shell
+    reporter's ``CRONSTABLE_JOB_SCHEDULE`` do, so every report payload carries
+    the identical string no matter which spelling the config used.
+    """
+    unparsed = config.schedule_unparsed
+    if isinstance(unparsed, str):
+        return unparsed
+    return schedule_object_to_crontab(unparsed)
+
+
 def fixup_pyinstaller_env(env: Dict[str, str]) -> None:
     # check for pyinstaller env, fix clobbered env vars
     # https://github.com/gjcarneiro/yacron/issues/68
@@ -623,11 +648,7 @@ class ShellReporter(Reporter):
             # reporter for every object-schedule job.  README declares this
             # variable (str), and the two schedule spellings are documented
             # as equivalent.
-            "CRONSTABLE_JOB_SCHEDULE": (
-                job.config.schedule_unparsed
-                if isinstance(job.config.schedule_unparsed, str)
-                else schedule_object_to_crontab(job.config.schedule_unparsed)
-            ),
+            "CRONSTABLE_JOB_SCHEDULE": schedule_string(job.config),
             "CRONSTABLE_FAILED": "1" if job.failed else "0",
             "CRONSTABLE_RETCODE": str(job.retcode),
             "CRONSTABLE_STDERR": std_err_str_safe,
@@ -647,6 +668,16 @@ class ShellReporter(Reporter):
         )
         env["CRONSTABLE_MAX_RSS_BYTES"] = (
             str(usage.max_rss_bytes) if usage is not None else ""
+        )
+        # run context: identity and timing of the run being reported. A
+        # SlaBreachContext (onLate) carries no run, so run_id/started_at are
+        # absent there and export empty. host is the daemon's, always set.
+        env["CRONSTABLE_HOST"] = report_hostname()
+        run_id = getattr(job, "run_id", None)
+        env["CRONSTABLE_RUN_ID"] = run_id if run_id else ""
+        started_at = getattr(job, "started_at", None)
+        env["CRONSTABLE_STARTED_AT"] = (
+            started_at.isoformat() if started_at is not None else ""
         )
         # SLA breach detail, when this report is an onLate dispatch (only
         # SlaBreachContext carries sla_vars; a finished run has none).
@@ -785,6 +816,28 @@ class WebhookReporter(Reporter):
                         job.config.name,
                         resp.status,
                     )
+
+
+def report_config_enabled(report_config: Dict[str, Any]) -> bool:
+    """Whether any of the four reporters would actually fire for this config.
+
+    Mirrors each reporter's own disabled early-return exactly (sentry: no DSN
+    source; mail: ``to`` and ``from`` unset; shell: no command; webhook: no URL
+    source), so a caller can skip scheduling a report fan-out that every
+    reporter would drop on arrival. Used by the DAG-task reaper path, where a
+    mapped fan-out can finish hundreds of instances at once and the common
+    case (no reporter configured) must cost dict probes, not task spawns.
+    """
+    dsn = report_config["sentry"]["dsn"]
+    if dsn["value"] or dsn["fromFile"] or dsn["fromEnvVar"]:
+        return True
+    mail = report_config["mail"]
+    if mail["to"] and mail["from"]:
+        return True
+    if report_config["shell"]["command"] is not None:
+        return True
+    url = report_config["webhook"]["url"]
+    return bool(url["value"] or url["fromFile"] or url["fromEnvVar"])
 
 
 class JobRetryState:
@@ -1347,6 +1400,19 @@ class RunningJob:
             "command": self.config.command,
             "shell": self.config.shell,
             "environment": self.env,
+            # run context: which node ran it, its schedule, when it started,
+            # and the durable-ledger id, so a webhook/ntfy payload can identify
+            # the run without the template digging into ``environment``.
+            # started_at is ISO-8601 (None before start / on a failed launch);
+            # run_id is None without a durable state store.
+            "host": report_hostname(),
+            "schedule": schedule_string(self.config),
+            "started_at": (
+                self.started_at.isoformat()
+                if self.started_at is not None
+                else None
+            ),
+            "run_id": self.run_id,
             # resource accounting for report templates; all None when the run
             # was not monitored (monitorResources off / unavailable).
             "cpu_seconds": usage.cpu_total_seconds if usage else None,
@@ -1419,6 +1485,12 @@ class SlaBreachContext:
             "command": self.config.command,
             "shell": self.config.shell,
             "environment": self.env,
+            # run context: an SLA breach describes a job that did NOT run, so
+            # started_at/run_id are None; host and schedule still describe it.
+            "host": report_hostname(),
+            "schedule": schedule_string(self.config),
+            "started_at": None,
+            "run_id": None,
             "cpu_seconds": None,
             "cpu_user_seconds": None,
             "cpu_system_seconds": None,
@@ -1459,6 +1531,129 @@ async def report_sla_breach(
             logger.error(
                 "Problem reporting job %s SLA breach: %s",
                 ctx.config.name,
+                result,
+                exc_info=result,
+            )
+
+
+class _NotifyJobShim:
+    """The tiny ``JobConfig`` slice the reporters read for a daemon event.
+
+    A daemon/orchestration event (a DAG failure, an approval gate, a
+    leadership change) has no job, but :class:`SentryReporter` and
+    :class:`ShellReporter` reach into ``job.config`` for ``name`` / ``command``
+    / ``shell`` / ``schedule_unparsed``.  This supplies exactly those, with the
+    non-name launch fields empty so the shell reporter's env encodes to strings
+    rather than ``None`` (which would die in ``os.fsencode`` at spawn).
+    """
+
+    __slots__ = ("name", "command", "shell", "schedule_unparsed")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.command = ""
+        self.shell = platform.DEFAULT_SHELL
+        self.schedule_unparsed = ""
+
+
+class NotifyEventContext:
+    """Reporting context for a daemon/orchestration event (the ``notify:``
+    block): a DAG run failure, an approval gate awaiting a decision, or a
+    leadership / quorum change; none of which is a job run.
+
+    Quacks like a :class:`RunningJob` exactly as far as the four reporters read
+    one (a minimal :class:`_NotifyJobShim` ``config``, the run-shaped fields
+    empty, and a ``template_vars`` carrying the standard key set so operator
+    templates written for a job render unchanged), plus the event detail:
+    ``event`` (the :data:`~cronstable.config.NOTIFY_EVENTS` name), ``subject``
+    (a one-line headline), ``message`` (the body), and any event-specific
+    ``fields`` (dag, run_key, taskkey, role, leader, ...).  The notify report
+    defaults key their templates on ``event`` / ``subject`` / ``message``.
+    """
+
+    def __init__(
+        self,
+        *,
+        event: str,
+        success: bool,
+        name: str,
+        subject: str,
+        message: str,
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.event = event
+        self.config = _NotifyJobShim(name)
+        self._success = success
+        self._subject = subject
+        self._message = message
+        self._fields = fields or {}
+        # run-shaped fields the reporters read, all empty: no process ran.
+        self.fail_reason = None if success else message
+        self.failed = not success
+        self.retcode = None  # type: Optional[int]
+        self.stdout = None  # type: Optional[str]
+        self.stderr = None  # type: Optional[str]
+        self.stdout_discarded = 0
+        self.stderr_discarded = 0
+        self.resource_usage = None  # type: Optional[ResourceUsage]
+        self.env = {"HOSTNAME": report_hostname()}
+
+    @property
+    def template_vars(self) -> dict:
+        base = {
+            "name": self.config.name,
+            "success": self._success,
+            "fail_reason": self.fail_reason,
+            "stdout": None,
+            "stderr": None,
+            "exit_code": None,
+            "command": self.config.command,
+            "shell": self.config.shell,
+            "environment": self.env,
+            "host": report_hostname(),
+            "schedule": "",
+            "started_at": None,
+            "run_id": None,
+            "cpu_seconds": None,
+            "cpu_user_seconds": None,
+            "cpu_system_seconds": None,
+            "max_rss_bytes": None,
+            # the event detail the notify templates render.
+            "event": self.event,
+            "subject": self._subject,
+            "message": self._message,
+        }
+        # event-specific extras (dag, run_key, taskkey, role, leader, ...);
+        # last so an event can override a standard key if it must.
+        base.update(self._fields)
+        return base
+
+
+async def report_event(ctx: NotifyEventContext, report_config: dict) -> None:
+    """Fan one daemon/orchestration event out to all four reporters.
+
+    The ``_report_common`` gather idiom, reused for the ``notify:`` block: the
+    context is a :class:`NotifyEventContext` rather than a job.  ``success`` is
+    threaded from the event (an alert-worthy event passes ``success=False`` so
+    MailReporter's empty-body suppression cannot eat it).  Every reporter error
+    is caught and logged; a notification failure never propagates to the
+    scheduler or cluster loop that raised the event.
+    """
+    logger.info("Reporting %s event: %s", ctx.event, ctx._subject)
+    results = await asyncio.gather(
+        *[
+            # duck-typed on purpose: the context quacks like the RunningJob
+            # slice each reporter actually reads.
+            r.report(not ctx.failed, ctx, report_config)  # type: ignore[arg-type]
+            for r in RunningJob.REPORTERS
+        ],
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error(
+                "Problem reporting %s event: %s",
+                ctx.event,
                 result,
                 exc_info=result,
             )

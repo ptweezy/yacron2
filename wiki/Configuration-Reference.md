@@ -427,7 +427,10 @@ Plus the shared launch fields a job takes: `shell`, `environment`,
 `captureStdout` / `captureStderr`, `monitorResources`, `saveLimit`,
 `maxLineLength`, `streamPrefix`, `failsWhen`, `executionTimeout`,
 `killTimeout`, `statsd`, `user` / `group`, `env_file`, `secrets`,
-`stateAllowedScopes`. Where a task's `monitorResources` numbers surface is
+`stateAllowedScopes`, and report-only `onFailure` / `onSuccess` hooks
+(each accepts a `report` block that fires on the task's runs; there is no
+`onFailure.retry` on a task, since a task's attempts come from the node's
+`retries` field above). Where a task's `monitorResources` numbers surface is
 covered under [Metrics](#metrics) below.
 
 The graph is validated at load: unknown/duplicate ids, a cycle, a self-edge, or

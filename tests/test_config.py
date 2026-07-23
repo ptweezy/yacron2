@@ -467,6 +467,99 @@ dags:
     assert task.job_template.monitorResources is True
 
 
+def test_defaults_block_applies_to_dag_tasks():
+    # a top-level `defaults:` block inherits into a DAG task's launch template
+    # exactly as it does into a regular job: global environment, shell, capture
+    # and reporter config cover DAG tasks, with the task's own fields winning.
+    conf = config.parse_config_string(
+        """
+defaults:
+  shell: /bin/bash
+  captureStdout: false
+  environment:
+    - key: SHARED
+      value: from-default
+    - key: ONLY_DEFAULT
+      value: d
+  onFailure:
+    report:
+      webhook:
+        url:
+          value: https://example.invalid/hook
+
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+      - id: b
+        command: bar
+        shell: /bin/sh
+        retries: 2
+        dependsOn:
+          - a
+        environment:
+          - key: SHARED
+            value: from-task
+""",
+        "",
+    )
+    task_a = conf.dags[0].task_templates["a"]
+    task_b = conf.dags[0].task_templates["b"]
+    # the DAG-node fields are popped out before the defaults merge, so graph
+    # shape is exactly what the tasks declared, defaults block or not.
+    specs = {t.id: t.spec for t in conf.dags[0].tasks}
+    assert specs["a"].depends_on == ()
+    assert specs["a"].max_attempts == 1  # retries default 0
+    assert specs["b"].depends_on == ("a",)
+    assert specs["b"].max_attempts == 3  # the task's own retries: 2
+
+    # inherited from the defaults block
+    assert task_a.shell == "/bin/bash"
+    assert task_a.captureStdout is False
+    env_a = {e["key"]: e["value"] for e in task_a.environment}
+    assert env_a == {"SHARED": "from-default", "ONLY_DEFAULT": "d"}
+    # the global reporter config now reaches DAG tasks
+    assert (
+        task_a.onFailure["report"]["webhook"]["url"]["value"]
+        == "https://example.invalid/hook"
+    )
+
+    # the task's own launch fields win over the defaults; env merges by key so
+    # the task's SHARED overrides while ONLY_DEFAULT is still inherited.
+    assert task_b.shell == "/bin/sh"
+    env_b = {e["key"]: e["value"] for e in task_b.environment}
+    assert env_b == {"SHARED": "from-task", "ONLY_DEFAULT": "d"}
+
+
+def test_defaults_reporter_does_not_reach_dag_schedule_job():
+    # the DAG's synthetic schedule-trigger job runs `true` every tick, so a
+    # global reporter must NOT ride on it (that would alert per tick, not per
+    # run); it stays on DEFAULT_CONFIG.
+    conf = config.parse_config_string(
+        """
+defaults:
+  onSuccess:
+    report:
+      webhook:
+        url:
+          value: https://example.invalid/hook
+
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+""",
+        "",
+    )
+    schedule_job = conf.dags[0].schedule_job
+    assert schedule_job is not None
+    assert schedule_job.onSuccess["report"]["webhook"]["url"]["value"] is None
+
+
 def test_report_defaults_not_aliased():
     # onFailure/onPermanentFailure/onSuccess report blocks must be independent
     # objects so mutating one cannot corrupt the others (or the global
@@ -1004,7 +1097,7 @@ def test_blank_second_is_rejected_not_column_shifted(blank):
     # exactly one whitespace-free token, naming the offending key.
     with pytest.raises(ConfigError, match="schedule.second"):
         _one_job(
-            "    schedule:\n      second: {}\n      minute: \"5\"\n".format(
+            '    schedule:\n      second: {}\n      minute: "5"\n'.format(
                 blank
             )
         )
@@ -1041,9 +1134,7 @@ def test_monitor_resources_bool_form():
 
 def test_monitor_resources_map_form():
     job = _monitor_job(
-        "    monitorResources:\n"
-        "      interval: 0.25\n"
-        "      history: 100\n"
+        "    monitorResources:\n      interval: 0.25\n      history: 100\n"
     )
     # writing the map at all opts in (enabled defaults true)
     assert job.monitorResources is True
@@ -1053,9 +1144,7 @@ def test_monitor_resources_map_form():
 
 def test_monitor_resources_map_enabled_false():
     job = _monitor_job(
-        "    monitorResources:\n"
-        "      enabled: false\n"
-        "      interval: 0.5\n"
+        "    monitorResources:\n      enabled: false\n      interval: 0.5\n"
     )
     assert job.monitorResources is False
 
@@ -1153,6 +1242,7 @@ def test_resolve_secret_missing_file_is_config_error(tmp_path):
 def test_web_allowed_origins_parse():
     cfg = _web_config("  allowedOrigins:\n    - https://dash.example\n")
     assert cfg["allowedOrigins"] == ["https://dash.example"]
+
 
 # ===========================================================================
 # Parse edges: schedule/timezone failures, section merge conflicts,
@@ -1316,6 +1406,49 @@ def test_mcp_act_with_read_only_warns_but_loads(caplog):
         config._validate_cross_sections(conf)
     assert conf.mcp_config["enabled"] is True
     assert "mutating tools stay suppressed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# web.authTokens (scoped bearer tokens)
+# ---------------------------------------------------------------------------
+
+
+def test_web_auth_tokens_parse():
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authTokens:\n"
+        "    - label: phone\n"
+        "      scopes:\n        - view\n        - control\n"
+        "      value: secret-tok\n"
+    )
+    conf = parse_config_string(yaml, "")
+    entries = conf.web_config["authTokens"]
+    assert len(entries) == 1
+    assert entries[0]["label"] == "phone"
+    assert entries[0]["scopes"] == ["view", "control"]
+    assert entries[0]["value"] == "secret-tok"
+
+
+def test_web_auth_tokens_reject_unknown_scope():
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authTokens:\n"
+        "    - scopes:\n        - bogus\n"
+        "      value: secret-tok\n"
+    )
+    with pytest.raises(ConfigError):
+        parse_config_string(yaml, "")
+
+
+def test_web_auth_tokens_require_scopes():
+    # `scopes` is required on each entry (a scopeless token is meaningless).
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authTokens:\n"
+        "    - value: secret-tok\n"
+    )
+    with pytest.raises(ConfigError):
+        parse_config_string(yaml, "")
 
 
 # ---------------------------------------------------------------------------
@@ -1485,7 +1618,11 @@ def test_etcd_endpoints_must_be_non_empty():
     # an etcd cluster with an empty endpoints list has nothing to talk to.
     with pytest.raises(ConfigError, match="at least one URL"):
         config._build_etcd_cluster_config(
-            {"backend": "etcd", "nodeName": "node-a", "etcd": {"endpoints": []}}
+            {
+                "backend": "etcd",
+                "nodeName": "node-a",
+                "etcd": {"endpoints": []},
+            }
         )
 
 
@@ -1529,9 +1666,10 @@ def test_schedule_object_valid_forms_render_exactly_as_before():
     assert config.schedule_object_to_crontab({"year": "2030"}) == (
         "* * * * * 2030"
     )
-    assert config.schedule_object_to_crontab(
-        {"second": "30", "year": "2030"}
-    ) == "30 * * * * * 2030"
+    assert (
+        config.schedule_object_to_crontab({"second": "30", "year": "2030"})
+        == "30 * * * * * 2030"
+    )
     assert config.schedule_has_seconds({"second": "0"}) is True
     assert config.schedule_has_seconds({"minute": "5"}) is False
 
@@ -1574,9 +1712,7 @@ def test_resolve_secret_nul_and_surrogate_sources_are_config_errors():
             else "fromEnvVar could not be read"
         ),
     ):
-        config._resolve_secret(
-            {"name": "s", "fromEnvVar": "A\ud800B"}, "what"
-        )
+        config._resolve_secret({"name": "s", "fromEnvVar": "A\ud800B"}, "what")
 
 
 @pytest.mark.parametrize(
@@ -1753,8 +1889,9 @@ def test_onlate_defaults_use_late_templates():
     ]
     # everything else keeps the standard report defaults
     assert report["shell"] == config._REPORT_DEFAULTS["shell"]
-    assert report["mail"]["smtpPort"] == (
-        config._REPORT_DEFAULTS["mail"]["smtpPort"]
+    assert (
+        report["mail"]["smtpPort"]
+        == (config._REPORT_DEFAULTS["mail"]["smtpPort"])
     )
     # and the shared defaults were not repointed at the late templates
     assert config._REPORT_DEFAULTS["mail"]["subject"] == (
@@ -2133,9 +2270,7 @@ def test_env_interp_expanded_value_feeds_section_validator(monkeypatch):
     # path), not silently accepted.
     monkeypatch.setenv("SDIR", "")
     with pytest.raises(ConfigError, match="state.path is required"):
-        config.parse_config_string(
-            "state:\n  path: ${SDIR}\n", "test.yaml"
-        )
+        config.parse_config_string("state:\n  path: ${SDIR}\n", "test.yaml")
 
 
 def test_env_interp_unterminated_default_is_linear_not_quadratic():

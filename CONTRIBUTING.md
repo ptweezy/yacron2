@@ -3,6 +3,33 @@
 Thanks for working on cronstable! This document covers local development and,
 importantly, how releases are cut.
 
+## Signing off your commits (DCO)
+
+cronstable uses the [Developer Certificate of Origin](DCO) (DCO): a lightweight,
+sign-off-based alternative to a CLA. By signing off, you certify that you wrote
+the patch, or otherwise have the right to submit it under the project's license
+(the full text is in the [DCO](DCO) file).
+
+Add a sign-off to each commit with `-s`:
+
+```sh
+git commit -s -m "Fix the thing"
+```
+
+That appends a trailer with the name and email from your git config:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+CI (the `dco` job) checks that every commit in a pull request carries this
+trailer. Forgot it? Sign off the whole branch and force-push:
+
+```sh
+git rebase --signoff origin/develop
+git push --force-with-lease
+```
+
 ## Development setup
 
 cronstable targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13 and 3.14 are tested)

@@ -71,15 +71,20 @@ The following variables are available when rendering any report template:
 | `command` | str or list | The job's command. |
 | `shell` | str | The job's shell. |
 | `environment` | dict or None | The subprocess environment (`None` when the job defines no `environment`). |
+| `host` | str | The daemon's host name (`os.environ["HOSTNAME"]`, forced to the system hostname at startup), i.e. which node ran the job. Always set. |
+| `schedule` | str | The job's schedule as a crontab line; an object-form `schedule:` is rendered to the same string every other consumer shows (e.g. `CRONSTABLE_JOB_SCHEDULE`). |
+| `started_at` | str or None | ISO-8601 instant the run started, or `None` before it starts / on a failed launch (and always `None` on an [`onLate`](Late-Run-Detection) breach, which describes a run that did not happen). |
+| `run_id` | str or None | The run's id in the [durable run ledger](Durable-State), or `None` when no `state:` store is configured (and `None` on an `onLate` breach). |
 | `cpu_seconds` | float or None | Total CPU time (user + system) of the run's process tree, or `None` when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `cpu_user_seconds` / `cpu_system_seconds` | float or None | The user- and system-mode components of `cpu_seconds`. |
 | `max_rss_bytes` | int or None | Peak resident-set size (bytes) observed during the run, or `None` when unmonitored. |
 
 An [`onLate`](Late-Run-Detection) dispatch renders the same variable set with
 the run-shaped fields empty (`success` is `False`, `fail_reason` is
-`sla: <check> breached`, `stdout`/`stderr`/`exit_code` are `None`) plus four
-breach variables: `sla_check`, `threshold_seconds`, `observed_seconds`, and
-`last_success_at`. See [Late-Run Detection](Late-Run-Detection#the-onlate-report).
+`sla: <check> breached`, `stdout`/`stderr`/`exit_code`/`started_at`/`run_id`
+are `None`) plus four breach variables: `sla_check`, `threshold_seconds`,
+`observed_seconds`, and `last_success_at`. `host` and `schedule` are still
+populated (they describe the job even when it did not run). See [Late-Run Detection](Late-Run-Detection#the-onlate-report).
 
 The README's variable list omits `fail_reason`; the code provides it (it is
 also used by the default body template). To capture output for inclusion in reports, enable `captureStderr`
@@ -314,6 +319,9 @@ following variables describing the job outcome:
 | `CRONSTABLE_STDOUT_TRUNCATED` | `"1"` if `CRONSTABLE_STDOUT` was truncated, `"0"` otherwise. |
 | `CRONSTABLE_CPU_SECONDS` | Total CPU seconds of the run's process tree, or empty string when the job was not [`monitorResources`](Configuration-Reference#metrics)-monitored (see [resource monitoring](Resource-Monitoring)). |
 | `CRONSTABLE_MAX_RSS_BYTES` | Peak resident-set size in bytes, or empty string when unmonitored. |
+| `CRONSTABLE_HOST` | The daemon's host name, i.e. which node ran the job. Always set. |
+| `CRONSTABLE_RUN_ID` | The run's id in the [durable run ledger](Durable-State), or empty string when no `state:` store is configured (and on an `onLate` dispatch, which has no run). |
+| `CRONSTABLE_STARTED_AT` | ISO-8601 instant the run started, or empty string on an `onLate` dispatch (which describes a run that did not happen). |
 | `CRONSTABLE_SLA_CHECK` | On an [`onLate`](Late-Run-Detection) dispatch, the breached check (`maxTimeSinceSuccess`, `lateAfter`, or `maxRuntime`); empty string on run reports. |
 | `CRONSTABLE_SLA_THRESHOLD_SECONDS` | The breached check's configured threshold; empty string on run reports. |
 | `CRONSTABLE_SLA_OBSERVED_SECONDS` | The measured value that breached it; empty string on run reports. |
@@ -436,6 +444,68 @@ ntfy (plain-text body, priority via header):
 ```
 
 Note that `headers` values are sent verbatim; only `body` is a jinja2 template.
+
+## Daemon event notifications (`notify:`)
+
+The four hooks above report on **job runs**. A separate top-level `notify:`
+block reports on **daemon and orchestration events** that are not job runs, over
+the same four reporters:
+
+| Event | Fires when |
+| --- | --- |
+| `dag_failure` | A [DAG](Orchestration-and-DAGs) run reaches a terminal `failed` state. |
+| `approval_waiting` | An [approval gate](Orchestration-and-DAGs#approval-gates) begins awaiting a decision (fired once per gate). |
+| `leader_change` | This node acquires or loses scheduled-job [leadership](Clustering-and-Leader-Election). |
+| `quorum_loss` | This node leaves quorum, so its `Leader` jobs stand down. |
+
+The block carries a `report` block (the identical `sentry` / `mail` / `shell` /
+`webhook` schema documented above) and an optional `events` allow-list. Omit
+`events` to report on every event; list a subset to filter. There is at most
+one `notify:` block across a config (like `web:`), and it is picked up on a
+reload.
+
+```yaml
+notify:
+  events:              # optional; default is every event
+    - dag_failure
+    - quorum_loss
+  report:
+    webhook:
+      url:
+        fromEnvVar: OPS_WEBHOOK_URL
+```
+
+Because a daemon event has no job run, `notify`'s default templates key on the
+event instead of the completed/failed job wording. The template variables are:
+
+| Variable | Description |
+| --- | --- |
+| `event` | The event name (one of the four above). |
+| `subject` | A one-line headline (e.g. `DAG 'etl' run 2026-… failed`). |
+| `message` | The body detail (e.g. `2 task(s) failed: extract, load`). |
+| `name` | The subject's name: the DAG name, or this node's name for cluster events. |
+| `host` | The daemon's host name. |
+| `success` | Always `False` (these are alert-worthy events). |
+| event extras | `dag_failure`/`approval_waiting`: `dag`, `run_key`, `run_id`, `taskkey`, `failed_tasks`. `leader_change`: `role`, `is_leader`, `leader`. `quorum_loss`: `quorate`. |
+
+The default mail subject is `cronstable {{ event }}: {{ subject }}`, the default
+body is `{{ message }}`, the default webhook body wraps them in the
+Slack-compatible `{"text": …}` shape, and the default sentry fingerprint is
+`["cronstable", "{{ event }}", "{{ name }}"]` (grouping events by type and
+subject). Override any of them exactly as for a job report.
+
+Notes:
+
+- **DAG task *runs* are reported by the job hooks, not `notify:`.** A DAG task
+  is a job invocation, so its own `onFailure`/`onSuccess` (inherited from the
+  file's [`defaults:`](Includes-and-Defaults#defaults-also-cover-dag-tasks) or
+  set per-task) fire on its runs. `notify.dag_failure` fires once for the whole
+  DAG *run* reaching `failed`, naming the failed tasks.
+- **Regaining leadership or quorum is not paged.** `leader_change` fires on both
+  acquire and lose (differentiated by `is_leader`), but a quorum *recovery* is
+  logged, not notified; the loss is the alert.
+- Notifications are fire-and-forget and never block the scheduler, cluster loop,
+  or a DAG advance; a reporter failure is logged and dropped.
 
 ## Secrets
 

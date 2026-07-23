@@ -1,0 +1,31 @@
+# cronstable Pro. PROPRIETARY; not published to PyPI (see ./LICENSE and
+# ../LICENSING.md). This is a SEPARATE distribution from the MIT core: it depends
+# on `cronstable` and builds on its public API, so proprietary code never lives
+# inside the MIT package. `pro/` is also pruned from the core's public sdist in
+# the root MANIFEST.in, so it is never shipped through the MIT distribution.
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cronstable-pro"
+version = "0.0.0.dev0"  # scaffold; move to setuptools_scm or bump by hand later
+description = "Proprietary premium features for cronstable (not open source)."
+requires-python = ">=3.10"
+# A non-OSI license reference (PEP 639), not an open-source SPDX id.
+license = "LicenseRef-cronstable-Proprietary"
+license-files = ["LICENSE"]
+authors = [{ name = "Parker Loflin" }]
+dependencies = [
+    # The MIT core. Pin to a compatible range once the API surface Pro relies on
+    # is settled; unpinned here so the scaffold tracks the local checkout.
+    "cronstable",
+]
+# Belt-and-suspenders against an accidental upload: twine/PyPI honor this marker.
+classifiers = ["Private :: Do Not Upload"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["cronstable_pro"]

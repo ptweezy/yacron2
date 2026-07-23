@@ -100,6 +100,22 @@ examples. On Windows you'd set e.g. `shell: powershell`, leave it empty to use
 cmd.exe (via %ComSpec%), or pass `command` as a list to bypass the shell
 entirely (see [Running on Windows](Running-on-Windows)).
 
+### Defaults also cover DAG tasks
+
+A [DAG task](Orchestration-and-DAGs) is a job invocation, so its launch fields
+inherit the `defaults:` block just as a job's do: a global `shell`,
+`environment`, `env_file`, `captureStdout`/`captureStderr`, `monitorResources`,
+run-scoped `secrets`, or reporter (`onFailure`/`onSuccess`/…) block covers DAG
+tasks too, with the task's own value winning on any key it sets. The DAG-node
+fields that shape the graph (`dependsOn`, `triggerRule`, `retries`, `expand`,
+`onReject`, the poke settings) are graph structure, not launch config, and are
+never touched by `defaults:`. The DAG's synthetic schedule-trigger job (which
+runs a placeholder `true` on every tick) deliberately stays on the built-in
+defaults, so a global reporter fires per DAG **run**, not on every tick. As
+with jobs, in [directory mode](#directory-mode) and across
+[includes](#the-include-directive) a `defaults:` block reaches only the jobs
+**and DAGs** defined in the same file.
+
 ### Merge precedence
 
 Within a single parsed file (`parse_config_string`), each job's effective

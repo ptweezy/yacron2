@@ -201,6 +201,11 @@ class DagScheduler:
         # each run's buffered completions in ONE document RMW instead of one
         # per task -- the win for a mapped fan-out finishing together.
         self._completion_buffer: Dict[RunRef, List[Dict[str, Any]]] = {}
+        # (dag, run_key, taskkey) approval gates this node has already fired an
+        # `approval_waiting` notification for.  _do_advance observes a waiting
+        # gate on every pass while it is parked, so this dedups to one alert
+        # per gate; a run's entries drop when it reaches a terminal state.
+        self._approval_notified: Set[Tuple[str, str, str]] = set()
         self._service_task: Optional[asyncio.Task] = None
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
@@ -920,7 +925,7 @@ class DagScheduler:
                 combined.reconciled,
             )
         if dag.is_terminal_run(body):
-            await self._on_terminal(ref)
+            await self._on_terminal(ref, body)
             return
         run_id = str(body.get("runId"))
         result = combined.advance
@@ -995,13 +1000,17 @@ class DagScheduler:
                 )
         # 5. terminal? release the lease; else schedule the next wake.
         if dag.is_terminal_run(body):
-            await self._on_terminal(ref)
-        elif result.deferred:
-            # the claim quota capped this pass (dag.MAX_CLAIMS_PER_PASS):
-            # more instances are claimable right now, so re-service promptly.
-            self._wake[ref] = now
+            await self._on_terminal(ref, body)
         else:
-            self._wake[ref] = self._compute_wake(spec, body, now)
+            # a non-terminal run may have just parked an approval gate; alert
+            # on it once (deduped) before scheduling the next wake.
+            self._notify_pending_approvals(dagcfg, ref, run_id, body)
+            if result.deferred:
+                # the claim quota capped this pass (dag.MAX_CLAIMS_PER_PASS):
+                # more instances are claimable now, so re-service promptly.
+                self._wake[ref] = now
+            else:
+                self._wake[ref] = self._compute_wake(spec, body, now)
 
     async def _read_expansions(
         self, dagcfg: Any, run_id: str, body: Dict[str, Any]
@@ -1182,12 +1191,83 @@ class DagScheduler:
                 soonest = min(soonest, float(entry["nextRetryAt"]))
         return soonest
 
-    async def _on_terminal(self, ref: RunRef) -> None:
+    async def _on_terminal(self, ref: RunRef, body: Dict[str, Any]) -> None:
         logger.info("dag run %s/%s reached a terminal state", ref[0], ref[1])
         # terminality is monotonic: remember it so the adopt scan never
         # re-reads this run's document just to rediscover it finished.
-        self._terminal_run_keys.setdefault(ref[0], set()).add(ref[1])
+        seen = self._terminal_run_keys.setdefault(ref[0], set())
+        first_time = ref[1] not in seen
+        seen.add(ref[1])
+        # a terminal run has no waiting gates: drop its approval-dedup entries
+        # so a long-lived daemon does not accumulate them run after run.
+        self._approval_notified = {
+            k for k in self._approval_notified if (k[0], k[1]) != ref
+        }
+        # fire the notify `dag_failure` event once, only on the transition this
+        # node observed (first_time), never on a re-service or a re-adopt of an
+        # already-known-terminal run.
+        if first_time and body.get("state") == dag.FAILED:
+            self._notify_dag_failure(ref, body)
         await self._release(ref)
+
+    def _notify_dag_failure(self, ref: RunRef, body: Dict[str, Any]) -> None:
+        """Fire the notify ``dag_failure`` event for a FAILED run."""
+        dag_name, run_key = ref
+        failed = sorted(
+            tk
+            for tk, entry in body.get("tasks", {}).items()
+            if entry.get("state") in (dag.FAILED, dag.UPSTREAM_FAILED)
+        )
+        detail = ", ".join(failed) if failed else "(no task detail)"
+        self._cron._dispatch_notify(
+            "dag_failure",
+            success=False,
+            name=dag_name,
+            subject="DAG {!r} run {} failed".format(dag_name, run_key),
+            message="{} task(s) failed: {}".format(len(failed), detail),
+            dag=dag_name,
+            run_key=run_key,
+            run_id=str(body.get("runId")),
+            failed_tasks=failed,
+        )
+
+    def _notify_pending_approvals(
+        self, dagcfg: Any, ref: RunRef, run_id: str, body: Dict[str, Any]
+    ) -> None:
+        """Fire ``approval_waiting`` once per gate that has begun waiting.
+
+        ``_do_advance`` re-reads the run body every pass, so a parked gate is
+        observed repeatedly; :attr:`_approval_notified` dedups to one alert per
+        gate.  Best-effort and synchronous (the dispatch itself is
+        fire-and-forget), so it never delays the advance.
+        """
+        for taskkey, entry in body.get("tasks", {}).items():
+            if entry.get("state") != dag.RUNNING or not entry.get(
+                "awaitingApproval"
+            ):
+                continue
+            key = (ref[0], ref[1], taskkey)
+            if key in self._approval_notified:
+                continue
+            self._approval_notified.add(key)
+            self._cron._dispatch_notify(
+                "approval_waiting",
+                success=False,
+                name=dagcfg.name,
+                subject="DAG {!r} run {} awaiting approval: {}".format(
+                    dagcfg.name, ref[1], taskkey
+                ),
+                message=(
+                    "Task {} is an approval gate awaiting a decision; "
+                    "approve or reject it to let the run continue.".format(
+                        taskkey
+                    )
+                ),
+                dag=dagcfg.name,
+                run_key=ref[1],
+                run_id=run_id,
+                taskkey=taskkey,
+            )
 
     # =====================================================================
     # Launching a task instance (reuses the RunningJob/job-API machinery)

@@ -51,7 +51,8 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `cronstable/con
 | `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port`, `https://host:port`, or `unix:///path`. An empty list disables the server. |
 | `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response (all routes, including `/cluster` and `/job-set-id`) and to the 409 conflict body, but not the 404 or 401. |
 | `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [Cross-site request defense](#cross-site-request-defense)). |
-| `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes (see [Authentication](#authentication)). |
+| `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes as an all-scopes token (see [Authentication](#authentication)). |
+| `authTokens` | sequence of maps (`value`/`fromFile`/`fromEnvVar` + `scopes` + optional `label`) | `[]` | Additional per-device scoped bearer tokens (`view`/`control`/`approve`); revoke one by dropping its entry and reloading (see [Scoped tokens](#scoped-tokens-webauthtokens)). |
 | `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
 | `tls` | map (`cert`/`key`/`clientCa`) | (none) | Certificate and key served by every `https://` listen address, plus an optional CA that makes those listeners require a client certificate (mutual TLS). `cert` and `key` are required together; the block and the `https://` addresses are validated against each other at load. See [Listener TLS](Listener-TLS). |
 | `ui` | bool | `true` | Serve the [Web Dashboard](Web-Dashboard) page at `/` (see [`GET /`](#get--the-dashboard-page)); `ui: false` exposes only the REST endpoints. |
@@ -79,6 +80,23 @@ over TLS on a routable address; `unix://` listeners are always plaintext, with
 behavior, and the client-side flags are documented in
 [Listener TLS](Listener-TLS).
 
+## OpenAPI specification
+
+A machine-readable [OpenAPI 3.0](https://spec.openapis.org/oas/v3.0.3) contract
+for this API ships in the repository at
+[`docs/openapi.yaml`](https://github.com/ptweezy/cronstable/blob/main/docs/openapi.yaml).
+It is the source a generated client is built from (e.g. with
+`swift-openapi-generator`), and two CI checks keep it honest:
+`.github/scripts/check_openapi.py` (`tox -e openapi`) validates the document
+itself (schema, refs, duplicated keys), and `tests/test_openapi.py` diffs the
+spec's paths and methods against the daemon's route table in both directions,
+so the spec and the served surface cannot drift apart. It documents each
+endpoint's path, parameters, auth, and response shape; fast-moving nested
+payloads are typed at the top level and left open below that, with this page as
+the field-by-field reference. The `/mcp` endpoint appears in the spec with its
+surface and auth only; the JSON-RPC protocol it speaks is documented under
+[MCP](MCP).
+
 ## Endpoints
 
 All routes are registered in `start_stop_web_app`:
@@ -92,6 +110,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/node` | `_web_get_node` | `200` |
 | `GET` | `/node/history` | `_web_node_history` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
+| `GET` | `/summary` | `_web_get_summary` | `200` |
 | `GET` | `/schedule/preview` | `_web_schedule_preview` | `200` (`400` for a missing `expr` or unknown `tz`) |
 | `GET` | `/schedule/pressure` | `_web_schedule_pressure` | `200` (`400` for an unknown `tz`) |
 | `GET` | `/schedule/duplicates` | `_web_schedule_duplicates` | `200` |
@@ -99,6 +118,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/schedule/why` | `_web_schedule_why` | `200` (`400` for a missing `job`/`at` or an unparseable `at`; `404` for an unknown job) |
 | `GET` | `/calendar.ics` | `_web_calendar` | `200` (`text/calendar`) |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
+| `GET` | `/jobs/{name}` | `_web_get_job` | `200` (`404` for an unknown job) |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `GET` | `/jobs/{name}/calendar.ics` | `_web_job_calendar` | `200` (`text/calendar`; `404` for an unknown job) |
 | `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
@@ -155,9 +175,12 @@ Content-Type: text/plain; charset=utf-8
 Returns the status of every configured job. The response format depends on the
 request's `Accept` header:
 
-- If `Accept` is exactly `application/json`, the response is a JSON array
-  (`application/json`).
-- Otherwise the response is `text/plain`, one job per line.
+- If `Accept` lists `application/json` among its media ranges (compound
+  headers like `application/json, */*` and `;q=` parameters included), the
+  response is a JSON array (`application/json`).
+- Otherwise the response is `text/plain`, one job per line. The `*/*` and
+  `application/*` wildcards keep the text default, so curl's default `Accept`
+  keeps returning the classic text form.
 
 Each job has one of three statuses, determined in this order:
 
@@ -208,6 +231,44 @@ Content-Type: application/json; charset=utf-8
     {"job": "test-03", "status": "disabled"}
 ]
 ```
+
+### `GET /summary`
+
+One batched, at-a-glance overview of the whole daemon, for a client that wants
+a single small poll instead of pulling and folding the entire `/jobs` array:
+a home-screen widget, a status tile, a wallboard header. Always
+`application/json`.
+
+Every count is derived from the same live scheduler state `/jobs` and `/status`
+read, so the surfaces never disagree.
+
+| Field | Meaning |
+| --- | --- |
+| `version` | The daemon version (same value as [`GET /version`](#get-version)). |
+| `node_name` | The cluster node name when clustered, else the hostname (the same identity [`GET /node`](#get-node) reports). |
+| `generated_at` | ISO-8601 instant the summary was built. |
+| `jobs` | Fleet counts: `total`, `enabled`, `disabled`, `running` (jobs with a live instance), `paused`, `failing` (jobs whose last finished run failed), and `never_fires` (enabled jobs whose schedule has no future occurrence; see [Schedule Linting](Schedule-Linting)). |
+| `next_fire` | The soonest upcoming scheduled fire across the fleet, `{job, in, at}` where `in` is seconds from now and `at` is the absolute ISO-8601 instant, or `null` when nothing is due (every job disabled, running, `@reboot`, dead-scheduled, or paused through its next fire; a [paused](#post-jobsnamepause) slot is skipped at the gate, so it is never reported as the next fire). |
+| `dags` | `{total}`; present only when DAGs are configured. |
+| `cluster` | `{enabled: false}` with no `cluster` section; otherwise `{enabled: true, distribution, quorate, is_leader, leader}`, the compact leadership view (full detail is [`GET /cluster`](#get-cluster)). |
+
+```shell
+$ http get http://127.0.0.1:8080/summary
+{
+    "version": "1.2.29",
+    "node_name": "node-a",
+    "generated_at": "2026-07-22T14:00:00+00:00",
+    "jobs": {
+        "total": 42, "enabled": 40, "disabled": 2, "running": 3,
+        "paused": 1, "failing": 2, "never_fires": 0
+    },
+    "next_fire": {"job": "backup", "in": 118.4, "at": "2026-07-22T14:01:58+00:00"},
+    "cluster": {"enabled": false}
+}
+```
+
+`failing` is a last-outcome verdict (the same signal the dashboard's failing
+badge shows), not a count of jobs mid-retry.
 
 ### `GET /schedule/preview`
 
@@ -743,6 +804,31 @@ $ http get http://127.0.0.1:8080/jobs
 ]
 ```
 
+### `GET /jobs/{name}`
+
+One job's detail, in the **identical** shape as a single entry of
+[`GET /jobs`](#get-jobs) (every field documented in that table, plus the same
+conditional `running_resources` / `retry` / `sla` / `schedule_resolved`
+extras). It lets a client (a detail screen, a widget) refresh a single job
+without pulling and filtering the whole fleet. Returns `404 Not Found` for an
+unknown job, like the other `/jobs/{name}/...` routes. The same detail dict has
+long been available to AI agents as the `cron_get_job` [MCP tool](MCP); this
+puts it on the REST surface too.
+
+```shell
+$ http get http://127.0.0.1:8080/jobs/test-01
+{
+    "name": "test-01",
+    "enabled": true,
+    "schedule": "*/5 * * * *",
+    "command": "echo foobar",
+    "running": false,
+    "scheduled_in": 42.1,
+    "last_run": {"outcome": "success", "exit_code": 0, "...": "..."},
+    "history": [{"outcome": "success", "duration": 1.02}]
+}
+```
+
 ### `GET /jobs/{name}/runs`
 
 Returns the job's retained run history (oldest first, bounded, and held in
@@ -1064,8 +1150,10 @@ empty `stream` parameter is a `400`; a stateless install is a `404`
 Returns this instance's job-set id: the order-independent fingerprint of every
 job's effective configuration that replicas compare to confirm they hold the
 same set of jobs (see [job-set id](Job-Set-ID)).
-The response is `text/plain` by default; with `Accept: application/json` it is
-a JSON object that also carries the job count.
+The response is `text/plain` by default; when `Accept` lists
+`application/json` among its media ranges it is a JSON object that also
+carries the job count (wildcards keep the text default, as on
+[`GET /status`](#get-status)).
 
 ```shell
 $ http get http://127.0.0.1:8080/job-set-id
@@ -1230,6 +1318,75 @@ web:
 $ http get http://127.0.0.1:8080/status "Authorization:Bearer s3cr3t"
 $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 ```
+
+### Scoped tokens (`web.authTokens`)
+
+The scalar `web.authToken` above is an all-scopes token: it can read, control,
+and approve. To hand out a narrower credential (a phone that should never
+carry the god token, a wallboard that only reads, a CI job that only triggers)
+add `web.authTokens`, a list of per-device tokens each carrying a `scopes`
+list and an optional `label`:
+
+```yaml
+web:
+  listen:
+    - http://0.0.0.0:8080
+  authToken:                     # optional: the legacy all-scopes token
+    fromEnvVar: CRONSTABLE_WEB_TOKEN
+  authTokens:
+    - label: parker-iphone
+      scopes: [view, control, approve]
+      fromEnvVar: IPHONE_TOKEN
+    - label: wallboard-ipad
+      scopes: [view]
+      fromFile: /run/secrets/wallboard-token
+    - label: ci-trigger
+      scopes: [control]
+      value: "…"
+```
+
+Each entry resolves its secret from the same `value`/`fromFile`/`fromEnvVar`
+sources as `authToken`, and fails closed the same way: a configured entry that
+resolves to an empty token refuses to start the web API. `authToken` and
+`authTokens` compose: every configured token is accepted, and a request
+authenticates if it matches **any** of them (constant-time compared). Two
+tokens resolving to the same secret are refused at startup (naming the two
+labels, never the secret): matching is by secret, so only one entry's scopes
+could ever apply, and a scoped entry repeating the all-scopes `authToken`
+would otherwise silently downgrade it.
+
+There are three scopes:
+
+| Scope | Grants |
+| --- | --- |
+| `view` | Every read-only `GET`: jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, `/metrics`. |
+| `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP endpoint (`POST /mcp`). |
+| `approve` | Only the DAG approval-gate decision (`POST …/decision`). |
+
+`control` and `approve` each **imply** `view` (an action UI has to read state
+first), so a `[control]` token can also hit every `GET`; `approve` does **not**
+imply `control`. The required scope for a route is the safe-method default
+(`GET`/`HEAD`/`OPTIONS` → `view`, everything else → `control`) with two
+promotions: the approval decision needs `approve`, and `/mcp` needs `control`.
+A newly added `POST` route therefore requires `control` automatically rather
+than slipping through unguarded.
+
+The two failure modes are distinct:
+
+- A missing/unrecognised token is **`401 Unauthorized`** (as before).
+- A recognised token that lacks the scope a route needs is **`403 Forbidden`**,
+  with a body naming the token label and the missing scope.
+
+To **revoke** a device, delete its `authTokens` entry and reload
+(`SIGHUP`/`cronstable reload`): the web app is rebuilt against the current
+config, so the dropped token stops working immediately while the others keep
+their sessions. The `label` is only an identifier for humans and log/error
+messages; matching is by the secret.
+
+> The scalar `authToken` is an all-scopes token; `authTokens` only adds
+> narrower credentials beside it. These transport scopes are unrelated to the
+> loopback [job-state API](Durable-State)'s `scope` (a key-value isolation
+> boundary); same word, different feature.
 
 ### Client certificates (mutual TLS)
 

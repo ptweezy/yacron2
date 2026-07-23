@@ -4,6 +4,7 @@ import os
 import signal
 import tempfile
 import time
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import aiosmtplib
@@ -485,7 +486,9 @@ async def test_report_sentry(  # noqa: C901
         raise AssertionError
 
     job_config.onSuccess["report"]["sentry"]["body"] = (
-        cronstable.config.DEFAULT_CONFIG["onFailure"]["report"]["sentry"]["body"]
+        cronstable.config.DEFAULT_CONFIG["onFailure"]["report"]["sentry"][
+            "body"
+        ]
     )
 
     job_config.onSuccess["report"]["sentry"]["fingerprint"] = ["{{ name }}"]
@@ -620,6 +623,8 @@ jobs:
             retcode=123,
             fail_reason="",
             failed=True,
+            run_id="run-mock",
+            started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=timezone.utc),
         )
 
         shell_reporter = cronstable.job.ShellReporter()
@@ -719,10 +724,7 @@ async def test_report_webhook(success, expected_subject):
         conf = cronstable.config.parse_config_string(
             _webhook_job_config(
                 f"            value: {url}",
-                extra=(
-                    "          headers:\n"
-                    "            X-Custom: yes-hello"
-                ),
+                extra=("          headers:\n            X-Custom: yes-hello"),
             ),
             "",
         )
@@ -814,9 +816,7 @@ async def test_report_webhook_env_var_not_set(monkeypatch, caplog):
             await cronstable.job.WebhookReporter().report(
                 False, job, job_config.onFailure["report"]
             )
-    assert any(
-        "url env var" in rec.message for rec in caplog.records
-    )
+    assert any("url env var" in rec.message for rec in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -985,8 +985,7 @@ async def test_monitor_resources_populates_usage():
     assert job.resource_usage.max_rss_bytes > 0
     # exposed to report templates as well
     assert (
-        job.template_vars["max_rss_bytes"]
-        == job.resource_usage.max_rss_bytes
+        job.template_vars["max_rss_bytes"] == job.resource_usage.max_rss_bytes
     )
 
 
@@ -1006,6 +1005,55 @@ async def test_monitor_resources_off_by_default():
     await job.wait()
     assert job.resource_usage is None
     assert job.template_vars["cpu_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_template_vars_carry_run_context(monkeypatch):
+    # a report payload should identify the run: host, schedule, start instant,
+    # and the durable-ledger run id (all new alongside the run's outcome).
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print(out="hi"))
+        + """
+    schedule: "*/5 * * * *"
+""",
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None, run_id="run-xyz")
+    # a sentinel host, so the assertion pins WHERE the value comes from
+    # (comparing against report_hostname()'s own expression proves nothing).
+    monkeypatch.setenv("HOSTNAME", "host-sentinel-1")
+    tv = job.template_vars
+    # host, schedule and the ledger id are known before the run starts.
+    assert tv["host"] == "host-sentinel-1"
+    assert tv["schedule"] == "*/5 * * * *"
+    assert tv["run_id"] == "run-xyz"
+    # nothing has started yet, so there is no start instant.
+    assert tv["started_at"] is None
+
+    await job.start()
+    await job.wait()
+    started = job.template_vars["started_at"]
+    assert started is not None
+    # surfaced as ISO-8601, matching the run-history field of the same name.
+    assert started == job.started_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_template_vars_schedule_renders_object_form():
+    # schedule_unparsed is Union[str, dict]; an object schedule must render to
+    # its crontab line here just as it does for the shell reporter's
+    # CRONSTABLE_JOB_SCHEDULE, so every report payload agrees.
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n"
+        "  - name: objsched\n"
+        "    command: echo hi\n"
+        "    schedule:\n"
+        '      minute: "*/5"\n',
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    assert job.template_vars["schedule"] == "*/5 * * * *"
 
 
 @pytest.mark.asyncio
@@ -1038,9 +1086,7 @@ def _spawner_yaml(name="test", execution_timeout=0.25, kill_timeout=1):
     schedule: "* * * * *"
     captureStderr: false
     captureStdout: true
-""".format(
-            execution_timeout, kill_timeout
-        )
+""".format(execution_timeout, kill_timeout)
     )
 
 
@@ -1075,7 +1121,9 @@ async def test_execution_timeout_kills_the_whole_process_group():
     helper_pid = int(job.stdout.strip())
     # the helper went down WITH the group rather than outliving the job --
     # executionTimeout bounds the run's work, not just its root process.
-    assert await _await_reaped(helper_pid), "the helper outlived the group kill"
+    assert await _await_reaped(helper_pid), (
+        "the helper outlived the group kill"
+    )
 
 
 @pytest.mark.asyncio
@@ -1660,6 +1708,11 @@ GOLDEN_SHELL_ENV_KEYS = frozenset(
         # monitored), see ShellReporter.report / cronstable.resources.
         "CRONSTABLE_CPU_SECONDS",
         "CRONSTABLE_MAX_RSS_BYTES",
+        # run context: the daemon host (always set), plus the run's ledger id
+        # and start instant (empty on an onLate dispatch, which has no run).
+        "CRONSTABLE_HOST",
+        "CRONSTABLE_RUN_ID",
+        "CRONSTABLE_STARTED_AT",
         # SLA breach detail: always exported, empty on run-completion
         # reports (only an onLate dispatch's SlaBreachContext carries
         # sla_vars).
@@ -1718,6 +1771,8 @@ async def _capture_shell_reporter_env(
         fail_reason=fail_reason,
         failed=failed,
         resource_usage=None,
+        run_id="run-abc123",
+        started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=timezone.utc),
     )
     await cronstable.job.ShellReporter().report(
         False, job, job_config.onFailure["report"]
@@ -1727,6 +1782,9 @@ async def _capture_shell_reporter_env(
 
 @pytest.mark.asyncio
 async def test_report_shell_full_env_contract(monkeypatch):
+    # sentinel host: pins that CRONSTABLE_HOST is sourced from the daemon's
+    # HOSTNAME rather than restating report_hostname()'s own expression.
+    monkeypatch.setenv("HOSTNAME", "host-sentinel-3")
     env = await _capture_shell_reporter_env(
         monkeypatch, stdout="out", stderr="err"
     )
@@ -1745,6 +1803,11 @@ async def test_report_shell_full_env_contract(monkeypatch):
     # unmonitored run: resource vars present but empty
     assert env["CRONSTABLE_CPU_SECONDS"] == ""
     assert env["CRONSTABLE_MAX_RSS_BYTES"] == ""
+    # run context: host is the daemon's, run id and start instant come off the
+    # (mocked) run.
+    assert env["CRONSTABLE_HOST"] == "host-sentinel-3"
+    assert env["CRONSTABLE_RUN_ID"] == "run-abc123"
+    assert env["CRONSTABLE_STARTED_AT"] == "2026-07-22T03:00:00+00:00"
     assert env["CRONSTABLE_FAIL_REASON"] == "boom"
     assert env["CRONSTABLE_STDOUT"] == "out"
     assert env["CRONSTABLE_STDERR"] == "err"
@@ -2317,8 +2380,7 @@ async def test_mail_report_times_out(monkeypatch, caplog):
             )
 
     assert any(
-        "did not complete within" in rec.getMessage()
-        for rec in caplog.records
+        "did not complete within" in rec.getMessage() for rec in caplog.records
     )
 
 
@@ -2336,6 +2398,10 @@ def _shell_job_mock(job_config):
         fail_reason="boom",
         failed=True,
         resource_usage=None,
+        # a real RunningJob always carries these; set them so the mock encodes
+        # to strings in the reporter's child env rather than raw Mock objects.
+        run_id="run-mock",
+        started_at=datetime(2026, 7, 22, 3, 0, 0, tzinfo=timezone.utc),
     )
 
 
@@ -2376,9 +2442,7 @@ async def test_shell_report_plain_shell_nonzero_is_logged(caplog):
             False, job, conf.jobs[0].onFailure["report"]
         )
 
-    assert any(
-        "return code 3" in rec.getMessage() for rec in caplog.records
-    )
+    assert any("return code 3" in rec.getMessage() for rec in caplog.records)
 
 
 async def test_shell_report_spawn_error_is_logged(caplog):
@@ -2419,14 +2483,11 @@ async def test_shell_report_timeout_kills_hanging_reporter(caplog):
         )
 
     assert any(
-        "did not finish within" in rec.getMessage()
-        for rec in caplog.records
+        "did not finish within" in rec.getMessage() for rec in caplog.records
     )
 
 
-async def test_shell_report_timeout_direct_kill_fallback(
-    monkeypatch, caplog
-):
+async def test_shell_report_timeout_direct_kill_fallback(monkeypatch, caplog):
     # when the reporter times out and its process group cannot be signalled
     # (kill_process_group returns False), the reporter falls back to killing
     # the direct child.
@@ -2467,8 +2528,7 @@ async def test_shell_report_timeout_direct_kill_fallback(
 
     assert killed, "direct-kill fallback did not run"
     assert any(
-        "did not finish within" in rec.getMessage()
-        for rec in caplog.records
+        "did not finish within" in rec.getMessage() for rec in caplog.records
     )
 
 
@@ -2570,8 +2630,9 @@ def test_live_resources_delegate_to_monitor():
 # ---------------------------------------------------------------------------
 
 
-def _set_fails_when(job, always=False, nonzero=False, stdout=False,
-                    stderr=False):
+def _set_fails_when(
+    job, always=False, nonzero=False, stdout=False, stderr=False
+):
     job.config.failsWhen = {
         "always": always,
         "nonzeroReturn": nonzero,
@@ -2591,9 +2652,7 @@ def test_fail_reason_nonzero_return():
     job = _fresh_job()
     _set_fails_when(job, nonzero=True)
     job.retcode = 5
-    assert job.fail_reason == (
-        "failsWhen=nonzeroReturn and retcode=5"
-    )
+    assert job.fail_reason == ("failsWhen=nonzeroReturn and retcode=5")
 
 
 def test_fail_reason_produces_stdout():
@@ -2793,9 +2852,13 @@ def _breach_ctx(job_config, check="lateAfter"):
     )
 
 
-def test_sla_breach_context_full_template_var_contract():
+def test_sla_breach_context_full_template_var_contract(monkeypatch):
     # the full standard key set with None/False fills, so operator templates
     # written for onFailure render unchanged on onLate, plus the breach vars.
+    # A sentinel host pins where `host` comes from (asserting against
+    # report_hostname()'s own expression would prove nothing). Set before the
+    # context is built: SlaBreachContext captures env at construction.
+    monkeypatch.setenv("HOSTNAME", "host-sentinel-2")
     conf = cronstable.config.parse_config_string(_SLA_MAIL_JOB, "")
     ctx = _breach_ctx(conf.jobs[0])
     tv = ctx.template_vars
@@ -2809,6 +2872,10 @@ def test_sla_breach_context_full_template_var_contract():
         "command",
         "shell",
         "environment",
+        "host",
+        "schedule",
+        "started_at",
+        "run_id",
         "cpu_seconds",
         "cpu_user_seconds",
         "cpu_system_seconds",
@@ -2826,13 +2893,18 @@ def test_sla_breach_context_full_template_var_contract():
     assert tv["exit_code"] is None
     assert tv["cpu_seconds"] is None
     assert tv["max_rss_bytes"] is None
+    # a breach describes a job that did NOT run: no start instant, no run id.
+    assert tv["started_at"] is None
+    assert tv["run_id"] is None
+    assert tv["host"] == "host-sentinel-2"
+    assert tv["schedule"] == "* * * * *"
     assert tv["sla_check"] == "lateAfter"
     assert tv["threshold_seconds"] == 120
     assert tv["observed_seconds"] == 300.5
     assert tv["last_success_at"] == "2020-01-01T10:00:00+00:00"
     # HOSTNAME rides env so the default sentry fingerprint's
     # {{ environment.HOSTNAME }} line keeps its host dimension.
-    assert tv["environment"]["HOSTNAME"] == os.environ["HOSTNAME"]
+    assert tv["environment"]["HOSTNAME"] == "host-sentinel-2"
     # the explicit run-shaped fills the reporters read directly
     assert ctx.failed is True
     assert ctx.retcode is None
@@ -2986,9 +3058,7 @@ jobs:
     # detail as valid JSON in the Slack-compatible {"text": ...} shape
     payload = json.loads(request["body"])
     assert set(payload.keys()) == {"text"}
-    assert payload["text"].startswith(
-        "Cron job 'test' is overdue (lateAfter)"
-    )
+    assert payload["text"].startswith("Cron job 'test' is overdue (lateAfter)")
     assert "SLA check: lateAfter" in payload["text"]
     assert "Threshold: 120 seconds" in payload["text"]
 

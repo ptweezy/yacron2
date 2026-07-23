@@ -1,0 +1,1263 @@
+openapi: 3.0.3
+
+# ---------------------------------------------------------------------------
+# cronstable HTTP control API.
+#
+# This is the machine-readable contract for the aiohttp control API cronstable
+# serves when a `web:` section is configured (see the Web Dashboard and the
+# HTTP-API wiki page). It is the source a generated client (e.g. the iOS app,
+# via swift-openapi-generator) is built from. Two checks keep it honest:
+# .github/scripts/check_openapi.py (structure: schema validity, refs,
+# path/parameter agreement, duplicate path keys) and tests/test_openapi.py
+# (drift: every path+method here must match cronstable.cron.WEB_ROUTES, the
+# table the aiohttp app is built from, in both directions).
+#
+# It documents the *shape* of every endpoint: its path, method, parameters,
+# auth, and the top-level fields of each response. Rich nested payloads that
+# move quickly with the code (resource series, DAG run documents, cluster
+# views) are typed at the top level and left open (additionalProperties) below
+# that, so the contract stays a brake on breaking changes without becoming a
+# second copy of the code that rots. The prose reference for every field lives
+# on the wiki HTTP-API page.
+# ---------------------------------------------------------------------------
+
+info:
+  title: cronstable HTTP control API
+  description: >-
+    The optional REST + SSE control API a cronstable daemon serves when a
+    `web:` section is configured. Every route is documented in prose on the
+    HTTP-API wiki page; this spec is the generated-client contract.
+  version: "1.2.x"
+  license:
+    name: MIT
+    url: https://github.com/ptweezy/cronstable/blob/main/LICENSE
+
+servers:
+  - url: "{scheme}://{host}:{port}"
+    description: >-
+      A self-hosted cronstable daemon. There is no vendor endpoint: the
+      operator supplies the address of their own `web.listen` listener (LAN,
+      Tailscale, or a reverse proxy). `unix://` listeners are not addressable
+      here.
+    variables:
+      scheme:
+        default: http
+        enum: [http, https]
+      host:
+        default: 127.0.0.1
+      port:
+        default: "8080"
+
+# Bearer-token auth applies to every route when `web.authToken` is configured;
+# an unauthenticated daemon ignores it. The `.ics` calendar routes additionally
+# accept the same token as a `?token=` query parameter (declared per-operation),
+# because calendar clients cannot send a bearer header.
+security:
+  - bearerAuth: []
+  - {} # an unauthenticated daemon (no web.authToken) accepts calls with no token
+
+tags:
+  - name: meta
+    description: Version, identity, and the batched fleet summary.
+  - name: jobs
+    description: Job status, history, resources, and run/cancel/pause control.
+  - name: dags
+    description: DAG introspection and control (orchestration).
+  - name: schedule
+    description: Schedule intelligence (preview, pressure, duplicates, why).
+  - name: cluster
+    description: Cluster, fleet, and node views.
+  - name: calendar
+    description: iCalendar feeds.
+  - name: state
+    description: Durable-state inspector (metadata only).
+  - name: metrics
+    description: Prometheus exposition.
+
+paths:
+  /version:
+    get:
+      tags: [meta]
+      summary: Daemon version
+      operationId: getVersion
+      responses:
+        "200":
+          description: The cronstable version as plain text.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /job-set-id:
+    get:
+      tags: [meta]
+      summary: Job-set identity
+      operationId: getJobSetId
+      description: >-
+        The fingerprint of the configured job set. Returns plain text, or a
+        JSON object when the `Accept` header lists `application/json` among
+        its media ranges (compound headers and `;q=` parameters included;
+        the `*/*` and `application/*` wildcards keep the text default).
+      responses:
+        "200":
+          description: The job-set id.
+          content:
+            text/plain:
+              schema: { type: string }
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_set_id: { type: string }
+                  jobs: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /status:
+    get:
+      tags: [jobs]
+      summary: Per-job status
+      operationId: getStatus
+      description: >-
+        Every job's status (running / disabled / scheduled). Returns one line
+        per job as plain text, or a JSON array when the `Accept` header lists
+        `application/json` among its media ranges (compound headers and `;q=`
+        parameters included; wildcards keep the text default).
+      responses:
+        "200":
+          description: Job status rows.
+          content:
+            text/plain:
+              schema: { type: string }
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StatusRow" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /summary:
+    get:
+      tags: [meta]
+      summary: Batched fleet overview
+      operationId: getSummary
+      description: >-
+        One at-a-glance overview for a widget or status tile: fleet job counts,
+        the soonest upcoming fire, this node's identity, and its cluster role.
+      responses:
+        "200":
+          description: The fleet summary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Summary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /jobs:
+    get:
+      tags: [jobs]
+      summary: List all jobs
+      operationId: listJobs
+      description: >-
+        Every job with its schedule, running state, next fire, last run, and a
+        compact recent-outcome tail. Supports `ETag` / `If-None-Match` (304).
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: The job list.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Job" }
+        "304": { description: Not modified (matching `If-None-Match`). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /jobs/{name}:
+    get:
+      tags: [jobs]
+      summary: One job's detail
+      operationId: getJob
+      description: One job in the identical shape as an entry of `GET /jobs`.
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "200":
+          description: The job detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{name}/runs:
+    get:
+      tags: [jobs]
+      summary: Job run history + stats
+      operationId: getJobRuns
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "200":
+          description: Retained run history and aggregate statistics.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobRuns" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{name}/trends:
+    get:
+      tags: [jobs]
+      summary: Job stats per time window
+      operationId: getJobTrends
+      description: The `GET /jobs/{name}/runs` stats object, per time window, over the durable ledger.
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "200":
+          description: Windowed trend statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  source: { type: string, enum: [durable, memory] }
+                  generated_at: { type: string, format: date-time }
+                  windows:
+                    type: object
+                    additionalProperties: { $ref: "#/components/schemas/RunStats" }
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{name}/resources:
+    get:
+      tags: [jobs]
+      summary: Job CPU/RSS time series
+      operationId: getJobResources
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+        - name: runs
+          in: query
+          description: Number of recent monitored runs to include (clamped).
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Chart-grade CPU/RSS series for the job.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  monitored: { type: boolean }
+                  interval: { type: number, nullable: true }
+                  live: { type: array, items: { type: object, additionalProperties: true } }
+                  runs: { type: array, items: { type: object, additionalProperties: true } }
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{name}/logs:
+    get:
+      tags: [jobs]
+      summary: Live job output (SSE)
+      operationId: streamJobLogs
+      description: >-
+        A Server-Sent Events stream of the job's captured output: buffered
+        lines first, then live lines, then an `end` event. See the HTTP-API
+        wiki for the event grammar.
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "200":
+          description: An SSE stream (`text/event-stream`).
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{name}/start:
+    post:
+      tags: [jobs]
+      summary: Run a job now
+      operationId: startJob
+      x-required-scope: control
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "200": { description: Launched (empty body). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: The job is disabled. }
+
+  /jobs/{name}/cancel:
+    post:
+      tags: [jobs]
+      summary: Cancel a running job
+      operationId: cancelJob
+      x-required-scope: control
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      responses:
+        "200": { description: All running instances cancelled (empty body). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: The job is not running. }
+
+  /jobs/{name}/pause:
+    post:
+      tags: [jobs]
+      summary: Pause a job's scheduled fires
+      operationId: pauseJob
+      x-required-scope: control
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PauseRequest" }
+      responses:
+        "200":
+          description: The active pause window.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  paused: { $ref: "#/components/schemas/Pause" }
+        "400": { description: A malformed or out-of-range pause request. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /jobs/{name}/resume:
+    post:
+      tags: [jobs]
+      summary: End a job's pause
+      operationId: resumeJob
+      x-required-scope: control
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                by: { type: string }
+      responses:
+        "200":
+          description: Pause cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  paused:
+                    type: object
+                    nullable: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /dags:
+    get:
+      tags: [dags]
+      summary: List DAGs
+      operationId: listDags
+      responses:
+        "200":
+          description: Configured DAGs and their tasks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Dag" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /dags/{name}/runs:
+    get:
+      tags: [dags]
+      summary: List a DAG's runs
+      operationId: listDagRuns
+      parameters:
+        - $ref: "#/components/parameters/DagName"
+        - name: limit
+          in: query
+          description: Max runs to return (default 50, max 500).
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Recent dag_runs (newest first).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dag: { type: string }
+                  runs:
+                    type: array
+                    items: { $ref: "#/components/schemas/DagRunSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: >-
+            No such DAG, or no `state:` store is configured (run documents
+            only exist in a durable store).
+
+  /dags/{name}/runs/{run_key}:
+    get:
+      tags: [dags]
+      summary: One DAG run's document
+      operationId: getDagRun
+      parameters:
+        - $ref: "#/components/parameters/DagName"
+        - $ref: "#/components/parameters/RunKey"
+      responses:
+        "200":
+          description: The full durable run document.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DagRunDocument" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /dags/{name}/runs/{run_key}/xcom:
+    get:
+      tags: [dags]
+      summary: A DAG run's XCom outputs
+      operationId: getDagRunXcom
+      parameters:
+        - $ref: "#/components/parameters/DagName"
+        - $ref: "#/components/parameters/RunKey"
+      responses:
+        "200":
+          description: The XCom entries the run's tasks published.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: >-
+            No such DAG or run, or no `state:` store is configured (XCom only
+            exists in a durable store).
+
+  /dags/{name}/runs/{run_key}/tasks/{taskkey}/logs:
+    get:
+      tags: [dags]
+      summary: Live DAG task output (SSE)
+      operationId: streamDagTaskLogs
+      parameters:
+        - $ref: "#/components/parameters/DagName"
+        - $ref: "#/components/parameters/RunKey"
+        - $ref: "#/components/parameters/TaskKey"
+      responses:
+        "200":
+          description: An SSE stream (`text/event-stream`) of a running task instance.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /dags/{name}/trigger:
+    post:
+      tags: [dags]
+      summary: Trigger a manual DAG run
+      operationId: triggerDag
+      x-required-scope: control
+      parameters:
+        - $ref: "#/components/parameters/DagName"
+      responses:
+        "200":
+          description: The created run.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dag: { type: string }
+                  runKey: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { description: The run could not be durably recorded. }
+
+  /dags/{name}/backfill:
+    post:
+      tags: [dags]
+      summary: Backfill a DAG across a range
+      operationId: backfillDag
+      x-required-scope: control
+      parameters:
+        - $ref: "#/components/parameters/DagName"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                from: { type: string, format: date-time }
+                to: { type: string, format: date-time }
+              required: [from, to]
+      responses:
+        "200":
+          description: The backfill result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  created: { type: integer }
+        "400":
+          description: >-
+            A bad range or an unknown/unscheduled DAG (every refused backfill
+            is 400 with a `reason`; this route never returns 404).
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision:
+    post:
+      tags: [dags]
+      summary: Approve or reject an approval gate
+      operationId: decideDagTask
+      x-required-scope: approve
+      parameters:
+        - $ref: "#/components/parameters/DagName"
+        - $ref: "#/components/parameters/RunKey"
+        - $ref: "#/components/parameters/TaskKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                decision: { type: string, enum: [approve, reject] }
+                by: { type: string }
+              required: [decision]
+      responses:
+        "200": { description: The decision was recorded. }
+        "400": { description: A bad decision value. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: The task is not awaiting a decision. }
+
+  /cluster:
+    get:
+      tags: [cluster]
+      summary: This node's cluster view
+      operationId: getCluster
+      responses:
+        "200":
+          description: "The cluster/leadership view (`enabled: false` when unclustered)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ClusterView" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /fleet:
+    get:
+      tags: [cluster]
+      summary: Fleet-wide per-node job view
+      operationId: getFleet
+      responses:
+        "200":
+          description: Each node's per-job run summaries.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /node:
+    get:
+      tags: [cluster]
+      summary: This node's live CPU/memory
+      operationId: getNode
+      responses:
+        "200":
+          description: The node's identity and live resources.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeView" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /node/history:
+    get:
+      tags: [cluster]
+      summary: This node's CPU/memory history
+      operationId: getNodeHistory
+      responses:
+        "200":
+          description: Oldest-first `[t, cpu%, mem%]` points.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_name: { type: string }
+                  enabled: { type: boolean }
+                  interval: { type: number, nullable: true }
+                  points:
+                    type: array
+                    items:
+                      type: array
+                      items: { type: number }
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /schedule/preview:
+    get:
+      tags: [schedule]
+      summary: Decode and lint one cron expression
+      operationId: schedulePreview
+      parameters:
+        - name: expr
+          in: query
+          required: true
+          schema: { type: string }
+        - name: tz
+          in: query
+          schema: { type: string }
+        - name: count
+          in: query
+          schema: { type: integer }
+        - name: seed
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: The decoded, described, previewed, and linted expression.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { description: A missing `expr` or unknown `tz`. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /schedule/pressure:
+    get:
+      tags: [schedule]
+      summary: Forward-looking collision heatmap
+      operationId: schedulePressure
+      parameters:
+        - name: hours
+          in: query
+          schema: { type: integer }
+        - name: tz
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: The fleet's fire density over the window.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { description: An unknown `tz`. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /schedule/duplicates:
+    get:
+      tags: [schedule]
+      summary: Jobs whose schedules coincide
+      operationId: scheduleDuplicates
+      responses:
+        "200":
+          description: Groups of jobs firing on identical instants.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /schedule/suggest:
+    get:
+      tags: [schedule]
+      summary: Suggest the least-loaded slot
+      operationId: scheduleSuggest
+      parameters:
+        - name: period
+          in: query
+          schema: { type: string, enum: [hourly, daily] }
+        - name: tz
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: The winning slot and alternatives.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { description: A bad `period` or unknown `tz`. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /schedule/why:
+    get:
+      tags: [schedule]
+      summary: Explain why a job did/didn't fire at an instant
+      operationId: scheduleWhy
+      parameters:
+        - name: job
+          in: query
+          required: true
+          schema: { type: string }
+        - name: at
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: A field-by-field match explanation.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { description: A missing `job`/`at` or unparseable `at`. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /calendar.ics:
+    get:
+      tags: [calendar]
+      summary: Fleet-wide iCalendar feed
+      operationId: getCalendar
+      security:
+        - bearerAuth: []
+        - icsToken: []
+        - {}
+      parameters:
+        - name: days
+          in: query
+          schema: { type: integer }
+        - name: per_job
+          in: query
+          schema: { type: integer }
+        - $ref: "#/components/parameters/IcsToken"
+      responses:
+        "200":
+          description: An RFC 5545 calendar feed.
+          content:
+            text/calendar:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /jobs/{name}/calendar.ics:
+    get:
+      tags: [calendar]
+      summary: One job's iCalendar feed
+      operationId: getJobCalendar
+      security:
+        - bearerAuth: []
+        - icsToken: []
+        - {}
+      parameters:
+        - $ref: "#/components/parameters/JobName"
+        - name: days
+          in: query
+          schema: { type: integer }
+        - name: per_job
+          in: query
+          schema: { type: integer }
+        - $ref: "#/components/parameters/IcsToken"
+      responses:
+        "200":
+          description: An RFC 5545 calendar feed for one job.
+          content:
+            text/calendar:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /state:
+    get:
+      tags: [state]
+      summary: Durable-state health + inventory (metadata only)
+      operationId: getState
+      responses:
+        "200":
+          description: "Store health and topology (`enabled: false` when stateless)."
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /state/documents:
+    get:
+      tags: [state]
+      summary: State documents (metadata only)
+      operationId: getStateDocuments
+      parameters:
+        - name: ns
+          in: query
+          required: true
+          description: >-
+            The namespace to inspect. Must start with `kv/`, `cursor/`, or
+            `idem/`; anything else (or an absent `ns`) is 400.
+          schema: { type: string }
+      responses:
+        "200":
+          description: >-
+            `{namespace, documents}`; KV values are redacted to a
+            `valueSize`/`valueType` summary.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: "`ns` missing or not a `kv/`/`cursor/`/`idem/` namespace."
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No `state:` store is configured.
+
+  /state/records:
+    get:
+      tags: [state]
+      summary: State records (metadata only)
+      operationId: getStateRecords
+      parameters:
+        - name: stream
+          in: query
+          required: true
+          description: The stream to inspect; an absent or empty value is 400.
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: Newest records returned, clamped to 1-500.
+          schema: { type: integer, default: 100, minimum: 1, maximum: 500 }
+      responses:
+        "200":
+          description: "`{stream, records}` (payloads never crossed here)."
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: "`stream` missing or empty."
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            `logs/` streams carry raw job output and are refused by the
+            metadata-only inspector.
+        "404":
+          description: No `state:` store is configured.
+
+  /metrics:
+    get:
+      tags: [metrics]
+      summary: Prometheus exposition
+      operationId: getMetrics
+      description: >-
+        The Prometheus text exposition. Omitted when `web.metrics: false`;
+        exempt from the bearer token when `web.metrics.public: true`.
+      security:
+        - bearerAuth: []
+        - {}
+      responses:
+        "200":
+          description: >-
+            The metrics exposition: the classic text format by default, or
+            OpenMetrics when the `Accept` header names
+            `application/openmetrics-text`.
+          content:
+            text/plain:
+              schema: { type: string }
+            application/openmetrics-text:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /mcp:
+    description: >-
+      The MCP (Model Context Protocol) endpoint, registered only when
+      `mcp.enabled` is set. The JSON-RPC 2.0 protocol it speaks (Streamable
+      HTTP transport, message set, toolsets) is documented on the MCP wiki
+      page, not re-typed here; this entry pins the surface and its auth. Every
+      method requires the `control` scope from a scoped token: /mcp is an
+      action-capable surface, whatever its own `mcp.readOnly`/toolset config
+      then narrows. It also enforces its own `Origin` allow-list.
+    post:
+      tags: [mcp]
+      summary: MCP JSON-RPC message
+      operationId: postMcp
+      x-required-scope: control
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: The JSON-RPC response.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "202":
+          description: A notification or client response; no reply body.
+        "400":
+          description: Empty body, malformed JSON, or a JSON-RPC batch.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    get:
+      tags: [mcp]
+      summary: Not supported (stateless transport)
+      operationId: getMcp
+      x-required-scope: control
+      responses:
+        "405":
+          description: >-
+            Always; the stateless transport opens no server-to-client SSE
+            stream. `Allow: POST, OPTIONS`.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    options:
+      tags: [mcp]
+      summary: CORS preflight
+      operationId: optionsMcp
+      x-required-scope: control
+      responses:
+        "204":
+          description: Preflight approved for an allow-listed `Origin`.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The `Origin` is not on `mcp.allowedOrigins`.
+        "405":
+          description: No `Origin` header (not a browser preflight).
+
+  /:
+    get:
+      tags: [ui]
+      summary: The dashboard page
+      operationId: getIndex
+      description: >-
+        The single-page Web Dashboard, registered unless `web.ui: false`.
+        Served without authentication (the page holds no data; the browser
+        then sends the bearer token on every data request it makes).
+      security: []
+      responses:
+        "200":
+          description: The dashboard HTML.
+          content:
+            text/html:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        `Authorization: Bearer <token>` when `web.authToken` or one or more
+        `web.authTokens` is set. Compared in constant time; a missing or wrong
+        token is 401. Tokens may be *scoped*: the scalar `web.authToken` grants
+        all scopes, while each `web.authTokens` entry lists some of `view`
+        (every read-only GET), `control` (the mutating POSTs and every /mcp
+        method, GET and OPTIONS included) and `approve` (the DAG decision
+        route); `control` and `approve` each imply `view`. A recognised token
+        that lacks the scope an operation requires is 403, not 401. The
+        required scope defaults to `view` for GET/HEAD and `control` for other
+        methods; operations that need more carry an `x-required-scope`
+        extension.
+    icsToken:
+      type: apiKey
+      in: query
+      name: token
+      description: >-
+        Any configured token (`web.authToken` or a `web.authTokens` entry
+        holding `view`) as a `?token=` query parameter. Accepted ONLY on the
+        `.ics` calendar routes (calendar clients cannot send a bearer header);
+        every other route refuses query tokens.
+
+  parameters:
+    JobName:
+      name: name
+      in: path
+      required: true
+      description: The job's `name`.
+      schema: { type: string }
+    DagName:
+      name: name
+      in: path
+      required: true
+      description: The DAG's `name`.
+      schema: { type: string }
+    RunKey:
+      name: run_key
+      in: path
+      required: true
+      description: The DAG run key.
+      schema: { type: string }
+    TaskKey:
+      name: taskkey
+      in: path
+      required: true
+      description: The task key within the run.
+      schema: { type: string }
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: A prior `ETag`; a match yields 304.
+      schema: { type: string }
+    IcsToken:
+      name: token
+      in: query
+      required: false
+      description: The auth token, for calendar clients that cannot send a bearer header.
+      schema: { type: string }
+
+  headers:
+    ETag:
+      description: A content hash for conditional `If-None-Match` requests.
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: >-
+        Missing or unrecognised bearer token (when `web.authToken` or any
+        `web.authTokens` entry is configured).
+    Forbidden:
+      description: >-
+        The bearer token is valid but lacks the scope this operation requires
+        (see `x-required-scope`), or a cross-site `Origin` was refused.
+    NotFound:
+      description: No such job, DAG, or run.
+
+  schemas:
+    StatusRow:
+      type: object
+      description: One job's compact status.
+      properties:
+        job: { type: string }
+        status: { type: string, enum: [running, disabled, scheduled] }
+        pid:
+          type: array
+          items: { type: integer }
+        scheduled_in:
+          description: Seconds until the next fire (number), or the string "@reboot", or null.
+          nullable: true
+        never_fires: { type: boolean }
+      required: [job, status]
+      additionalProperties: true
+
+    Summary:
+      type: object
+      description: The batched fleet overview behind `GET /summary`.
+      properties:
+        version: { type: string }
+        node_name: { type: string }
+        generated_at: { type: string, format: date-time }
+        jobs:
+          type: object
+          properties:
+            total: { type: integer }
+            enabled: { type: integer }
+            disabled: { type: integer }
+            running: { type: integer }
+            paused: { type: integer }
+            failing: { type: integer }
+            never_fires: { type: integer }
+        next_fire:
+          nullable: true
+          type: object
+          properties:
+            job: { type: string }
+            in: { type: number }
+            at: { type: string, format: date-time }
+        dags:
+          type: object
+          properties:
+            total: { type: integer }
+        cluster:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            distribution: { type: string }
+            quorate: { type: boolean }
+            is_leader: { type: boolean }
+            leader: { type: string, nullable: true }
+          additionalProperties: true
+      additionalProperties: true
+
+    Job:
+      type: object
+      description: One job's full state (an entry of `GET /jobs`, or `GET /jobs/{name}`).
+      properties:
+        name: { type: string }
+        enabled: { type: boolean }
+        schedule: { type: string }
+        command: { type: string }
+        captureStdout: { type: boolean }
+        captureStderr: { type: boolean }
+        utc: { type: boolean }
+        timezone: { type: string, nullable: true }
+        running: { type: boolean }
+        pids:
+          type: array
+          items: { type: integer }
+        scheduled_in: { type: number, nullable: true }
+        never_fires: { type: boolean }
+        schedule_findings:
+          type: array
+          items: { $ref: "#/components/schemas/ScheduleFinding" }
+        last_run:
+          allOf: [{ $ref: "#/components/schemas/JobRun" }]
+          nullable: true
+        history:
+          type: array
+          items:
+            type: object
+            properties:
+              outcome: { type: string }
+              duration: { type: number, nullable: true }
+        paused:
+          allOf: [{ $ref: "#/components/schemas/Pause" }]
+          nullable: true
+      required: [name, enabled, schedule, running]
+      additionalProperties: true
+
+    JobRun:
+      type: object
+      description: One finished run.
+      properties:
+        outcome: { type: string, enum: [success, failure, cancelled, unknown, skipped] }
+        exit_code: { type: integer, nullable: true }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        duration: { type: number, nullable: true }
+        fail_reason: { type: string, nullable: true }
+        resources:
+          type: object
+          nullable: true
+          additionalProperties: true
+      additionalProperties: true
+
+    JobRuns:
+      type: object
+      properties:
+        name: { type: string }
+        runs:
+          type: array
+          items: { $ref: "#/components/schemas/JobRun" }
+        stats: { $ref: "#/components/schemas/RunStats" }
+      additionalProperties: true
+
+    RunStats:
+      type: object
+      description: Aggregate run statistics.
+      properties:
+        total: { type: integer }
+        success: { type: integer }
+        failure: { type: integer }
+        cancelled: { type: integer }
+        unknown: { type: integer }
+        success_rate: { type: number, nullable: true }
+        avg_duration: { type: number, nullable: true }
+        min_duration: { type: number, nullable: true }
+        max_duration: { type: number, nullable: true }
+        last_duration: { type: number, nullable: true }
+      additionalProperties: true
+
+    ScheduleFinding:
+      type: object
+      properties:
+        code: { type: string }
+        level: { type: string }
+        message: { type: string }
+
+    Pause:
+      type: object
+      description: An active runtime pause window.
+      properties:
+        since: { type: string, format: date-time }
+        until: { type: string, format: date-time }
+        note: { type: string }
+        by: { type: string }
+        channel: { type: string }
+      additionalProperties: true
+
+    PauseRequest:
+      type: object
+      properties:
+        durationSeconds: { type: integer }
+        until: { type: string, format: date-time }
+        note: { type: string }
+        by: { type: string }
+
+    Dag:
+      type: object
+      properties:
+        name: { type: string }
+        enabled: { type: boolean }
+        scheduled: { type: boolean }
+        schedule: { type: string }
+        tasks:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              type: { type: string }
+              dependsOn:
+                type: array
+                items: { type: string }
+            additionalProperties: true
+      additionalProperties: true
+
+    DagRunSummary:
+      type: object
+      properties:
+        runKey: { type: string }
+        runId: { type: string }
+        state: { type: string }
+        kind: { type: string }
+        logicalDate: { type: string, format: date-time, nullable: true }
+        taskStates:
+          type: object
+          additionalProperties: { type: integer }
+      additionalProperties: true
+
+    DagRunDocument:
+      type: object
+      description: The full durable run document (task states, timings, decisions, XCom).
+      additionalProperties: true
+
+    ClusterView:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        backend: { type: string }
+        node_name: { type: string }
+        job_set_id: { type: string }
+        cluster_size: { type: integer }
+        quorum: { type: integer }
+        elect_leader: { type: boolean }
+        distribution: { type: string }
+        quorate: { type: boolean }
+        leader: { type: string, nullable: true }
+        is_leader: { type: boolean }
+        peers:
+          type: array
+          items: { type: object, additionalProperties: true }
+      additionalProperties: true
+
+    NodeView:
+      type: object
+      properties:
+        node_name: { type: string }
+        resources:
+          type: object
+          nullable: true
+          properties:
+            cpu_percent: { type: number }
+            cpu_count: { type: integer }
+            mem_percent: { type: number }
+            mem_used_bytes: { type: integer }
+            mem_total_bytes: { type: integer }
+            proc_rss_bytes: { type: integer }
+            proc_cpu_percent: { type: number }
+          additionalProperties: true
+      additionalProperties: true

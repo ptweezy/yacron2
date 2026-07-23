@@ -13,7 +13,12 @@ degrade the DAG approval gate to the `control` scope.
 
 import pathlib
 
-from ruamel.yaml import YAML
+# strictyaml's VENDORED ruamel (the same import cronstable.backends.kubernetes
+# uses): guaranteed present wherever cronstable is, unlike the standalone
+# ruamel.yaml distribution, which is NOT a dependency (strictyaml >= 1.5
+# vendors its copy) and is only ever importable here by accident of the
+# developer's global site-packages.
+from strictyaml.ruamel import YAML
 
 from cronstable.cron import _WEB_SCOPE_OVERRIDES, WEB_ROUTES, Cron
 

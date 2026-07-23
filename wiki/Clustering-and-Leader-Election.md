@@ -732,6 +732,14 @@ curl -s http://localhost:8080/jobs | python -m json.tool | grep -A1 clusterOwner
 
 ## Observing the cluster
 
+Leadership transitions can page you, not just show up in the logs: the
+top-level [`notify:` block](Reporting#daemon-event-notifications-notify) fires a
+reporter (webhook, mail, …) on the `leader_change` event (this node acquired or
+lost scheduled-job leadership) and the `quorum_loss` event (this node left
+quorum, so its `Leader` jobs stood down). Both are also exported as the
+`cronstable_cluster_leader_transitions` /
+`cronstable_cluster_quorum_transitions` [Prometheus metrics](Metrics-with-Prometheus).
+
 `GET /cluster` on the [web/HTTP interface](HTTP-API) returns the current view as
 JSON. When no `cluster` section is configured it returns
 `{"enabled": false, "peers": []}`; otherwise it returns the node's view:

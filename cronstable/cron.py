@@ -74,8 +74,10 @@ from cronstable.ical import CalendarEntry, render_calendar
 from cronstable.job import (
     JobOutputStream,
     JobRetryState,
+    NotifyEventContext,
     RunningJob,
     SlaBreachContext,
+    report_event,
     report_sla_breach,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
@@ -1191,6 +1193,11 @@ class Cron:
         self._config_sources: FrozenSet[str] = frozenset()
         self._config_sig: Optional[tuple] = None
         self._last_config: Optional[CronstableConfig] = None
+        # the optional `notify:` block: a report config fired on daemon events
+        # (DAG failures, approval gates, leadership/quorum changes). None keeps
+        # the classic job-runs-only reporting. Set from config in both the
+        # config_yaml (test) path below and in _apply_reload.
+        self._notify_config: Optional[Dict[str, Any]] = None
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -1201,6 +1208,7 @@ class Cron:
                 (job.name, job) for job in config.jobs
             )
             self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
+            self._notify_config = config.notify_config
             self._job_set_id_cache = None
 
         self._wait_for_running_jobs_task = None  # type: Optional[asyncio.Task]
@@ -1241,6 +1249,12 @@ class Cron:
         # never allowed to gate the loop, so _record_run schedules the write
         # here rather than awaiting it.
         self._pending_state_writes: Set[asyncio.Task] = set()
+        # in-flight daemon-event notification fan-outs (the `notify:` block),
+        # spawned fire-and-forget off the raising loop (a slow SMTP/webhook
+        # reporter must never stall the scheduling or cluster loop); tracked so
+        # they are not GC'd mid-flight and can be cancelled at shutdown. See
+        # _dispatch_notify.
+        self._notify_tasks: Set[asyncio.Task] = set()
         # in-flight report+retry-arm sequences of finished jobs, spawned off
         # the reaper loop (one slow SMTP/webhook reporter must not stall every
         # other job's completion handling); tracked so shutdown can drain them
@@ -1605,8 +1619,10 @@ class Cron:
         self._slot_renewers.clear()
 
         # cancel any pending catch-up backfills (they also self-abort on the
-        # stop event, set above, but cancelling is prompt and tidy at exit).
-        for task in list(self._catchup_tasks):
+        # stop event, set above, but cancelling is prompt and tidy at exit),
+        # and any in-flight event notifications (best-effort, fire-and-forget:
+        # a half-sent alert is fine at exit, each reporter is time-bounded).
+        for task in list(self._catchup_tasks) + list(self._notify_tasks):
             task.cancel()
 
         if self.state_backend is not None:
@@ -1806,6 +1822,9 @@ class Cron:
         # up on the next service tick; in-flight runs of a removed DAG finish
         # and are GC'd).
         self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
+        # swap in the reloaded notify block (read live by _dispatch_notify), so
+        # a reload that adds/edits/removes `notify:` takes effect at once.
+        self._notify_config = config.notify_config
         # The job set changed: drop the memoized fingerprint so the next
         # job_set_id() recomputes it once. A failed parse raises before this
         # point, so a bad reload never stales the cache.
@@ -2216,6 +2235,104 @@ class Cron:
                 text="\n".join(lines),
                 headers=self.web_config.get("headers", None),
             )
+
+    def summary_payload(self) -> Dict[str, Any]:
+        """A single batched fleet overview (behind ``GET /summary``).
+
+        One call carries what an at-a-glance client -- a home-screen widget, a
+        status tile -- needs: the fleet's job counts, the soonest upcoming
+        fire, and this node's identity and cluster role, so it refreshes with
+        one request instead of pulling and folding the whole ``/jobs`` array.
+        Every count is derived from the same live scheduler state ``/jobs`` and
+        ``/status`` read, so the surfaces cannot disagree.
+        """
+        now = get_now(datetime.timezone.utc)
+        total = enabled = running = paused = failing = never_fires = 0
+        soonest_name: Optional[str] = None
+        soonest_in: Optional[float] = None
+        for name, job in self.cron_jobs.items():
+            total += 1
+            is_running = bool(self.running_jobs.get(name))
+            if is_running:
+                running += 1
+            if job.enabled:
+                enabled += 1
+            if self._pause_active(name) is not None:
+                paused += 1
+            last = self.last_run.get(name)
+            # "failing" is a last-outcome verdict (matching the dashboard's
+            # failing-count badge), not a count of jobs mid-retry.
+            if last is not None and last.outcome == "failure":
+                failing += 1
+            if self._schedule_never_fires(name, job):
+                never_fires += 1
+            scheduled_in = self._scheduled_in(name, job, is_running)
+            if scheduled_in is not None and (
+                soonest_in is None or scheduled_in < soonest_in
+            ):
+                soonest_in = scheduled_in
+                soonest_name = name
+        # the cluster node name when clustered, else the plain hostname (the
+        # same identity node_payload reports).
+        mgr = self.cluster_manager
+        node_name = (
+            mgr.node_name
+            if mgr is not None and getattr(mgr, "node_name", None)
+            else self._state_host
+        )
+        next_fire: Optional[Dict[str, Any]] = None
+        if soonest_name is not None and soonest_in is not None:
+            when = self._next_fire.get(soonest_name)
+            next_fire = {
+                "job": soonest_name,
+                "in": soonest_in,
+                # absolute instant from the loop's next-fire index; during the
+                # brief pre-seed startup window it is derived from the relative
+                # countdown instead so the field is never null when a fire is
+                # known to be coming.
+                "at": (
+                    when.isoformat()
+                    if when is not None
+                    else (
+                        now + datetime.timedelta(seconds=soonest_in)
+                    ).isoformat()
+                ),
+            }
+        summary: Dict[str, Any] = {
+            "version": cronstable.version.version,
+            "node_name": node_name,
+            "generated_at": now.isoformat(),
+            "jobs": {
+                "total": total,
+                "enabled": enabled,
+                "disabled": total - enabled,
+                "running": running,
+                "paused": paused,
+                "failing": failing,
+                "never_fires": never_fires,
+            },
+            "next_fire": next_fire,
+        }
+        if self.cron_dags:
+            summary["dags"] = {"total": len(self.cron_dags)}
+        if mgr is not None:
+            summary["cluster"] = {
+                "enabled": True,
+                "distribution": mgr.distribution,
+                "quorate": mgr.is_quorate(),
+                "is_leader": mgr.is_leader(),
+                "leader": mgr.leader_name(),
+            }
+        else:
+            summary["cluster"] = {"enabled": False}
+        return summary
+
+    async def _web_get_summary(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        return _json_response(
+            self.summary_payload(),
+            headers=self.web_config.get("headers", None),
+        )
 
     @staticmethod
     def _zone_from_name(tz_name: Optional[str]) -> datetime.tzinfo:
@@ -4091,6 +4208,21 @@ class Cron:
         headers["ETag"] = etag
         return headers
 
+    async def _web_get_job(self, request: web.Request) -> web.Response:
+        """One job's full detail dict (``GET /jobs/{name}``).
+
+        The single-job sibling of ``GET /jobs``: the identical per-job shape
+        ``_job_to_dict`` builds, so a client can refresh one job -- a widget, a
+        detail screen -- without pulling and filtering the whole fleet.  The
+        detail dict was already exposed to MCP (``cron_get_job``); this puts it
+        on REST too.  ``404`` for an unknown job, like the sibling
+        ``/jobs/{name}/...`` routes.
+        """
+        payload = self.job_detail_payload(request.match_info["name"])
+        if payload is None:
+            raise web.HTTPNotFound()
+        return _json_response(payload, headers=self._web_headers())
+
     # --- DAG introspection + control --------------------------------------
 
     def _web_headers(self) -> Any:
@@ -4990,6 +5122,7 @@ class Cron:
                 web.get("/node", self._web_get_node),
                 web.get("/node/history", self._web_node_history),
                 web.get("/status", self._web_get_status),
+                web.get("/summary", self._web_get_summary),
                 web.get("/schedule/preview", self._web_schedule_preview),
                 web.get("/schedule/pressure", self._web_schedule_pressure),
                 web.get("/schedule/duplicates", self._web_schedule_duplicates),
@@ -4997,6 +5130,7 @@ class Cron:
                 web.get("/schedule/why", self._web_schedule_why),
                 web.get("/calendar.ics", self._web_calendar),
                 web.get("/jobs", self._web_list_jobs),
+                web.get("/jobs/{name}", self._web_get_job),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
                 web.get("/jobs/{name}/calendar.ics", self._web_job_calendar),
                 web.get("/jobs/{name}/resources", self._web_job_resources),
@@ -5214,6 +5348,7 @@ class Cron:
                 # silent about why it stopped Leader jobs (until/unless a
                 # replacement manager comes up and re-logs). Only fires when
                 # election was on (the flags are only ever set then).
+                node = getattr(mgr, "node_name", None) or self._state_host
                 if self._was_leader:
                     # a real leadership loss (the rebuilt manager re-elects
                     # from scratch), so it counts as a transition too
@@ -5222,12 +5357,39 @@ class Cron:
                         "cluster: this node lost scheduled-job leadership "
                         "(leadership manager stopped for reload)"
                     )
+                    self._dispatch_notify(
+                        "leader_change",
+                        success=False,
+                        name=node,
+                        subject="node {} lost scheduled-job leadership".format(
+                            node
+                        ),
+                        message=(
+                            "This node is no longer the scheduled-job leader "
+                            "(leadership manager stopped for a config reload)."
+                        ),
+                        role="follower",
+                        is_leader=False,
+                        leader=None,
+                    )
                 if self._was_quorate:
                     self.metrics.cluster_quorum_transition()
                     logger.info(
                         "cluster: this node left quorum (leadership manager "
                         "stopped for reload); Leader jobs cannot run until it "
                         "is rebuilt"
+                    )
+                    self._dispatch_notify(
+                        "quorum_loss",
+                        success=False,
+                        name=node,
+                        subject="node {} left quorum".format(node),
+                        message=(
+                            "This node left quorum (leadership manager "
+                            "stopped for a config reload); Leader jobs "
+                            "cannot run until it is rebuilt."
+                        ),
+                        quorate=False,
                     )
                 await mgr.stop()
                 self.cluster_manager = None
@@ -5724,6 +5886,44 @@ class Cron:
         self._pending_state_writes.add(task)
         task.add_done_callback(self._pending_state_writes.discard)
         return task
+
+    def _dispatch_notify(
+        self,
+        event: str,
+        *,
+        success: bool,
+        name: str,
+        subject: str,
+        message: str,
+        **fields: Any,
+    ) -> None:
+        """Fire the ``notify:`` reporters for a daemon/orchestration event.
+
+        A fast, synchronous edge callable from any loop -- the cluster
+        role-transition path is sync, the DAG scheduler async: it schedules the
+        reporter fan-out as a tracked fire-and-forget task and returns at once,
+        so a slow SMTP/webhook reporter never stalls the caller (a scheduling
+        pass, a cluster tick, a DAG advance holding its run lease).  A no-op
+        when no ``notify:`` block is configured or the event is not on its
+        allow-list, so the common (unconfigured) case costs one dict lookup.
+        """
+        cfg = self._notify_config
+        if cfg is None:
+            return
+        allowed = cfg.get("events")
+        if allowed is not None and event not in allowed:
+            return
+        ctx = NotifyEventContext(
+            event=event,
+            success=success,
+            name=name,
+            subject=subject,
+            message=message,
+            fields=fields,
+        )
+        task = asyncio.create_task(report_event(ctx, cfg["report"]))
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
 
     def _state_periodic(self) -> None:
         """Kick off the periodic durable-state chores that are due.
@@ -8059,6 +8259,23 @@ class Cron:
                     "cluster: this node left quorum; no majority reachable, "
                     "so Leader jobs cannot run until one is"
                 )
+            if not quorate and self._notify_config is not None:
+                # losing quorum stands Leader jobs down: an alert-worthy edge.
+                # (Regaining quorum is recovery, logged above but not paged.)
+                # Guarded on _notify_config so an unconfigured daemon builds no
+                # payload, and mgr is touched only when the event fires.
+                node = getattr(mgr, "node_name", None) or self._state_host
+                self._dispatch_notify(
+                    "quorum_loss",
+                    success=False,
+                    name=node,
+                    subject="node {} left quorum".format(node),
+                    message=(
+                        "No majority reachable; Leader jobs cannot run on "
+                        "this node until quorum is restored."
+                    ),
+                    quorate=False,
+                )
             self._was_quorate = quorate
         if spread:
             return  # no single leader in spread mode
@@ -8069,6 +8286,26 @@ class Cron:
                 "cluster: this node %s scheduled-job leadership",
                 "acquired" if leader else "lost",
             )
+            # Guarded on _notify_config so an unconfigured daemon builds no
+            # payload and mgr.leader_name() runs only when the event fires.
+            if self._notify_config is not None:
+                node = getattr(mgr, "node_name", None) or self._state_host
+                self._dispatch_notify(
+                    "leader_change",
+                    success=False,
+                    name=node,
+                    subject="node {} {} scheduled-job leadership".format(
+                        node, "acquired" if leader else "lost"
+                    ),
+                    message=(
+                        "This node is now the scheduled-job leader."
+                        if leader
+                        else "This node is no longer the scheduled-job leader."
+                    ),
+                    role="leader" if leader else "follower",
+                    is_leader=leader,
+                    leader=mgr.leader_name() if mgr is not None else None,
+                )
             self._was_leader = leader
 
     @staticmethod

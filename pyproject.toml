@@ -122,6 +122,8 @@ dev = [
     "bandit[toml]",
     "mypy",
     "mypy-extensions",
+    # validates docs/openapi.yaml (.github/scripts/check_openapi.py, tox -e openapi).
+    "openapi-spec-validator",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",

@@ -79,6 +79,19 @@ over TLS on a routable address; `unix://` listeners are always plaintext, with
 behavior, and the client-side flags are documented in
 [Listener TLS](Listener-TLS).
 
+## OpenAPI specification
+
+A machine-readable [OpenAPI 3.0](https://spec.openapis.org/oas/v3.0.3) contract
+for this API ships in the repository at
+[`docs/openapi.yaml`](https://github.com/ptweezy/cronstable/blob/main/docs/openapi.yaml).
+It is the source a generated client is built from (e.g. with
+`swift-openapi-generator`) and is validated on every CI run
+(`.github/scripts/check_openapi.py`, `tox -e openapi`), so it cannot drift into
+being malformed. It documents each endpoint's path, parameters, auth, and
+response shape; fast-moving nested payloads are typed at the top level and left
+open below that, with this page as the field-by-field reference. The `POST /mcp`
+JSON-RPC endpoint is documented under [MCP](MCP), not in the OpenAPI spec.
+
 ## Endpoints
 
 All routes are registered in `start_stop_web_app`:
@@ -92,6 +105,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/node` | `_web_get_node` | `200` |
 | `GET` | `/node/history` | `_web_node_history` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
+| `GET` | `/summary` | `_web_get_summary` | `200` |
 | `GET` | `/schedule/preview` | `_web_schedule_preview` | `200` (`400` for a missing `expr` or unknown `tz`) |
 | `GET` | `/schedule/pressure` | `_web_schedule_pressure` | `200` (`400` for an unknown `tz`) |
 | `GET` | `/schedule/duplicates` | `_web_schedule_duplicates` | `200` |
@@ -99,6 +113,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/schedule/why` | `_web_schedule_why` | `200` (`400` for a missing `job`/`at` or an unparseable `at`; `404` for an unknown job) |
 | `GET` | `/calendar.ics` | `_web_calendar` | `200` (`text/calendar`) |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
+| `GET` | `/jobs/{name}` | `_web_get_job` | `200` (`404` for an unknown job) |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `GET` | `/jobs/{name}/calendar.ics` | `_web_job_calendar` | `200` (`text/calendar`; `404` for an unknown job) |
 | `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
@@ -208,6 +223,44 @@ Content-Type: application/json; charset=utf-8
     {"job": "test-03", "status": "disabled"}
 ]
 ```
+
+### `GET /summary`
+
+One batched, at-a-glance overview of the whole daemon, for a client that wants
+a single small poll instead of pulling and folding the entire `/jobs` array — a
+home-screen widget, a status tile, a wallboard header. Always
+`application/json`.
+
+Every count is derived from the same live scheduler state `/jobs` and `/status`
+read, so the surfaces never disagree.
+
+| Field | Meaning |
+| --- | --- |
+| `version` | The daemon version (same value as [`GET /version`](#get-version)). |
+| `node_name` | The cluster node name when clustered, else the hostname (the same identity [`GET /node`](#get-node) reports). |
+| `generated_at` | ISO-8601 instant the summary was built. |
+| `jobs` | Fleet counts: `total`, `enabled`, `disabled`, `running` (jobs with a live instance), `paused`, `failing` (jobs whose last finished run failed), and `never_fires` (enabled jobs whose schedule has no future occurrence; see [Schedule Linting](Schedule-Linting)). |
+| `next_fire` | The soonest upcoming scheduled fire across the fleet — `{job, in, at}` where `in` is seconds from now and `at` is the absolute ISO-8601 instant — or `null` when nothing is due (every job disabled, running, `@reboot`, or dead-scheduled). |
+| `dags` | `{total}` — present only when DAGs are configured. |
+| `cluster` | `{enabled: false}` with no `cluster` section; otherwise `{enabled: true, distribution, quorate, is_leader, leader}`, the compact leadership view (full detail is [`GET /cluster`](#get-cluster)). |
+
+```shell
+$ http get http://127.0.0.1:8080/summary
+{
+    "version": "1.2.29",
+    "node_name": "node-a",
+    "generated_at": "2026-07-22T14:00:00+00:00",
+    "jobs": {
+        "total": 42, "enabled": 40, "disabled": 2, "running": 3,
+        "paused": 1, "failing": 2, "never_fires": 0
+    },
+    "next_fire": {"job": "backup", "in": 118.4, "at": "2026-07-22T14:01:58+00:00"},
+    "cluster": {"enabled": false}
+}
+```
+
+`failing` is a last-outcome verdict (the same signal the dashboard's failing
+badge shows), not a count of jobs mid-retry.
 
 ### `GET /schedule/preview`
 
@@ -741,6 +794,31 @@ $ http get http://127.0.0.1:8080/jobs
         ]
     }
 ]
+```
+
+### `GET /jobs/{name}`
+
+One job's detail, in the **identical** shape as a single entry of
+[`GET /jobs`](#get-jobs) (every field documented in that table, plus the same
+conditional `running_resources` / `retry` / `sla` / `schedule_resolved`
+extras). It lets a client refresh a single job — a detail screen, a widget —
+without pulling and filtering the whole fleet. Returns `404 Not Found` for an
+unknown job, like the other `/jobs/{name}/...` routes. The same detail dict has
+long been available to AI agents as the `cron_get_job` [MCP tool](MCP); this
+puts it on the REST surface too.
+
+```shell
+$ http get http://127.0.0.1:8080/jobs/test-01
+{
+    "name": "test-01",
+    "enabled": true,
+    "schedule": "*/5 * * * *",
+    "command": "echo foobar",
+    "running": false,
+    "scheduled_in": 42.1,
+    "last_run": {"outcome": "success", "exit_code": 0, "...": "..."},
+    "history": [{"outcome": "success", "duration": 1.02}]
+}
 ```
 
 ### `GET /jobs/{name}/runs`

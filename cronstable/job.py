@@ -24,7 +24,7 @@ from typing import (
 
 import aiohttp
 
-from cronstable import platform
+from cronstable import platform, push
 from cronstable.config import JobConfig, schedule_object_to_crontab
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
@@ -818,15 +818,46 @@ class WebhookReporter(Reporter):
                     )
 
 
+class PushReporter(Reporter):
+    """End-to-end encrypted push alerts to paired devices.
+
+    The thin edge only: this reads the per-job/per-event ``push`` block
+    (enabled/priority/includeLogTail) and hands the context to the
+    daemon-global :class:`cronstable.push.PushService`, which owns the
+    device registry, the sealing and the relay client.  Config
+    validation guarantees a ``push:`` section exists whenever this is
+    enabled, so a missing service here is a real wiring bug worth an
+    error line, not a silent drop.
+    """
+
+    async def report(
+        self, success: bool, job: "RunningJob", config: Dict[str, Any]
+    ) -> None:
+        push_config = config.get("push") or {}
+        if not push_config.get("enabled"):
+            return  # push disabled: early return
+        service = push.get_service()
+        if service is None:
+            logger.error(
+                "push: report.push.enabled is set for %s but the push "
+                "service is not running (no push: section applied); "
+                "alert dropped",
+                job.config.name,
+            )
+            return
+        await service.send_report(job, success, push_config)
+
+
 def report_config_enabled(report_config: Dict[str, Any]) -> bool:
-    """Whether any of the four reporters would actually fire for this config.
+    """Whether any of the five reporters would actually fire for this config.
 
     Mirrors each reporter's own disabled early-return exactly (sentry: no DSN
     source; mail: ``to`` and ``from`` unset; shell: no command; webhook: no URL
-    source), so a caller can skip scheduling a report fan-out that every
-    reporter would drop on arrival. Used by the DAG-task reaper path, where a
-    mapped fan-out can finish hundreds of instances at once and the common
-    case (no reporter configured) must cost dict probes, not task spawns.
+    source; push: not enabled), so a caller can skip scheduling a report
+    fan-out that every reporter would drop on arrival. Used by the DAG-task
+    reaper path, where a mapped fan-out can finish hundreds of instances at
+    once and the common case (no reporter configured) must cost dict probes,
+    not task spawns.
     """
     dsn = report_config["sentry"]["dsn"]
     if dsn["value"] or dsn["fromFile"] or dsn["fromEnvVar"]:
@@ -837,7 +868,11 @@ def report_config_enabled(report_config: Dict[str, Any]) -> bool:
     if report_config["shell"]["command"] is not None:
         return True
     url = report_config["webhook"]["url"]
-    return bool(url["value"] or url["fromFile"] or url["fromEnvVar"])
+    if url["value"] or url["fromFile"] or url["fromEnvVar"]:
+        return True
+    # .get, not [], so report dicts predating the push block (older
+    # persisted shapes, hand-built test configs) keep working.
+    return bool((report_config.get("push") or {}).get("enabled"))
 
 
 class JobRetryState:
@@ -878,6 +913,7 @@ class RunningJob:
         MailReporter(),
         ShellReporter(),
         WebhookReporter(),
+        PushReporter(),
     ]  # type: List[Reporter]
 
     def __init__(
@@ -1630,7 +1666,7 @@ class NotifyEventContext:
 
 
 async def report_event(ctx: NotifyEventContext, report_config: dict) -> None:
-    """Fan one daemon/orchestration event out to all four reporters.
+    """Fan one daemon/orchestration event out to every reporter.
 
     The ``_report_common`` gather idiom, reused for the ``notify:`` block: the
     context is a :class:`NotifyEventContext` rather than a job.  ``success`` is

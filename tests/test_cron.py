@@ -1053,6 +1053,11 @@ async def test_auth_middleware():
             # .ics query-token carve-out); a real request always has them
             self.path = "/jobs"
             self.query = {}
+            # the middleware files the matched token on the request
+            self.store = {}
+
+        def __setitem__(self, key, value):
+            self.store[key] = value
 
     resp = await middleware(FakeRequest("Bearer secret"), handler)
     assert resp.text == "ok"

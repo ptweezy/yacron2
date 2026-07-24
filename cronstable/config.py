@@ -387,6 +387,16 @@ DEFAULT_NOTIFY_WEBHOOK_BODY_TEMPLATE = (
 # default -- see canonical_job's omit-when-default rule.
 DEFAULT_REPORT_SHELL_TIMEOUT = 60
 
+# Named for the same fingerprint reason: the push block post-dates the v1
+# identity scheme, so cronstable.fingerprint omits it from a job's canonical
+# form while it still equals these defaults (an all-default block must not
+# repoint every existing job's digest on upgrade).
+DEFAULT_PUSH_REPORT = {
+    "enabled": False,
+    "priority": "time-sensitive",
+    "includeLogTail": True,
+}
+
 _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
@@ -433,6 +443,10 @@ _REPORT_DEFAULTS = {
         "body": DEFAULT_WEBHOOK_BODY_TEMPLATE,
         "timeout": 10,
     },
+    # end-to-end encrypted push alerts to paired devices (cronstable.push).
+    # Off by default; the relay endpoint and device registry live in the
+    # daemon-global `push:` section, this block only opts a job/event in.
+    "push": dict(DEFAULT_PUSH_REPORT),
 }
 
 
@@ -633,6 +647,20 @@ _report_schema = Map(
                 Opt("headers"): MapPattern(Str(), Str()),
                 Opt("body"): Str(),
                 Opt("timeout"): Float(),
+            }
+        ),
+        Opt("push"): Map(
+            {
+                # opt this job/event into the E2E encrypted push channel;
+                # the relay and device registry come from the daemon-global
+                # `push:` section (required when this is enabled anywhere).
+                Opt("enabled"): Bool(),
+                # relayed to APNs as the interruption level: time-sensitive
+                # breaks through scheduled summaries, passive does not.
+                Opt("priority"): Enum(["time-sensitive", "passive"]),
+                # carry the last captured output lines inside the sealed
+                # payload (trimmed oldest-first to fit the APNs size cap).
+                Opt("includeLogTail"): Bool(),
             }
         ),
     }
@@ -953,6 +981,20 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("points"): Int(),
                     }
                 ),
+                # opt-in zero-config LAN discovery: advertise the web API as
+                # a `_cronstable._tcp` mDNS/Bonjour service so a companion
+                # app on the same network finds the daemon without a typed
+                # URL. Off by default; needs the `discovery` extra
+                # (python-zeroconf) and at least one TCP listen address.
+                # The map form overrides the advertised instance name.
+                # See cronstable.discovery.
+                Opt("bonjour"): Bool()
+                | Map(
+                    {
+                        Opt("enabled"): Bool(),
+                        Opt("name"): Str(),
+                    }
+                ),
             }
         ),
         # Optional MCP (Model Context Protocol) server: expose jobs, DAGs,
@@ -1159,6 +1201,27 @@ CONFIG_SCHEMA = EmptyDict() | Map(
             {
                 Opt("events"): Seq(Enum(list(NOTIFY_EVENTS))),
                 Opt("report"): _report_schema,
+            }
+        ),
+        # Optional end-to-end encrypted push alerts (cronstable.push): the
+        # daemon-global relay endpoint and paired-device registry the `push`
+        # reporter needs. Turning the reporter on stays per-job/per-event
+        # (`report: push: enabled: true` / `notify.report.push`); this
+        # section only says where alerts go and where pairings are stored.
+        # The relay URL is explicit and required: the daemon never posts
+        # alert ciphertext anywhere the operator did not spell out.
+        Opt("push"): Map(
+            {
+                "relay": Map(
+                    {
+                        "url": Str(),
+                        Opt("timeout"): Float(),
+                    }
+                ),
+                # registry storage for stateless installs; with a `state:`
+                # section the registry rides the durable store instead
+                # (cluster-visible). One of the two must exist.
+                Opt("devicesFile"): EmptyNone() | Str(),
             }
         ),
     }
@@ -3357,6 +3420,27 @@ def _validate_web_config(webconf: WebConfig) -> None:
     # First, before the early returns below (no nodeHistory map, no metrics
     # map) skip everything appended after them.
     _validate_web_tls(webconf)
+    if resolve_bonjour_config(webconf) is not None:
+        # Imported here so a config without the advert never pays for
+        # the probe; discovery.py itself imports zeroconf guardedly.
+        from cronstable.discovery import HAVE_ZEROCONF
+
+        if not HAVE_ZEROCONF:
+            raise ConfigError(
+                "web.bonjour is enabled but python-zeroconf is not "
+                "installed; install the discovery extra (pip install "
+                '"cronstable[discovery]") or disable web.bonjour'
+            )
+        tcp_listens = [
+            addr
+            for addr in (webconf.get("listen") or [])
+            if not str(addr).startswith("unix://")
+        ]
+        if not tcp_listens:
+            raise ConfigError(
+                "web.bonjour needs a TCP web listener to advertise, but "
+                "every web.listen entry is a unix socket"
+            )
     history = webconf.get("nodeHistory")
     if isinstance(history, dict):
         interval = history.get("interval")
@@ -3499,6 +3583,88 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
         )
 
 
+def _push_report_users(config: "CronstableConfig") -> List[str]:
+    """Every place the assembled config enables the push reporter.
+
+    Human-readable names ("job backup", "dag etl task load", "notify"),
+    used to point at the offenders when a ``push:`` section is missing.
+    """
+
+    def _uses(holder: Any) -> bool:
+        for action in (
+            "onFailure",
+            "onPermanentFailure",
+            "onSuccess",
+            "onLate",
+        ):
+            block = getattr(holder, action, None)
+            if isinstance(block, dict):
+                push_report = (block.get("report") or {}).get("push") or {}
+                if push_report.get("enabled"):
+                    return True
+        return False
+
+    users = []
+    for job in config.jobs:
+        if _uses(job):
+            users.append("job {}".format(job.name))
+    for dag_config in config.dags:
+        for taskkey, template in dag_config.task_templates.items():
+            if _uses(template):
+                users.append("dag {} task {}".format(dag_config.name, taskkey))
+    notify = config.notify_config
+    if notify is not None:
+        push_report = (notify.get("report") or {}).get("push") or {}
+        if push_report.get("enabled"):
+            users.append("notify")
+    return users
+
+
+def _validate_push_config(config: "CronstableConfig") -> None:
+    """Fail-closed checks for push that need the fully assembled config.
+
+    Runs at the top-level parse (from :func:`_validate_cross_sections`):
+    the ``push:`` section, the ``state:`` section and the jobs enabling
+    the reporter may legitimately live in different config-dir files.
+
+    Everything here refuses to start rather than degrade: push is an
+    alerting channel, and a channel that silently self-disables (a
+    missing library, a registry with nowhere to live, a reporter with
+    no relay) is a missed page at 2 a.m., the one failure mode this
+    feature exists to prevent.
+    """
+    users = _push_report_users(config)
+    push_conf = config.push_config
+    if push_conf is None:
+        if users:
+            raise ConfigError(
+                "report.push.enabled is set ({}) but no `push:` section "
+                "is configured; add one (push.relay.url plus a `state:` "
+                "section or push.devicesFile) or disable the push "
+                "reporter".format(", ".join(sorted(users)))
+            )
+        return
+    # Imported here, not at module top: cronstable.push pulls in aiohttp
+    # and the optional PyNaCl probe, which a bare config parse (e.g.
+    # `--validate-config` in scripts) should not pay for unless a push
+    # section actually exists.
+    from cronstable.push import HAVE_PYNACL
+
+    if not HAVE_PYNACL:
+        raise ConfigError(
+            "a `push:` section is configured but PyNaCl is not installed; "
+            'install the push extra (pip install "cronstable[push]") or '
+            "remove the section. Push alerts fail closed rather than "
+            "silently self-disabling."
+        )
+    if not push_conf.get("devicesFile") and config.state_config is None:
+        raise ConfigError(
+            "push: needs durable storage for its paired-device registry: "
+            "configure a `state:` section (shared store, cluster-visible "
+            "pairings) or set push.devicesFile (single node)"
+        )
+
+
 @dataclass(slots=True)
 class CronstableConfig:
     jobs: List[JobConfig]
@@ -3521,6 +3687,10 @@ class CronstableConfig:
     # that fires on DAG failures, approval gates, and leadership/quorum
     # changes. None keeps the classic job-runs-only reporting.
     notify_config: Optional[Dict[str, Any]] = None
+    # Optional end-to-end encrypted push alerts (`push:`): the relay
+    # endpoint + device-registry storage the push reporter needs. None
+    # keeps push off (and refuses report.push.enabled anywhere).
+    push_config: Optional[Dict[str, Any]] = None
 
 
 # Environment-variable interpolation over the validated config document.
@@ -3806,6 +3976,57 @@ def _build_notify_config(raw: dict) -> Dict[str, Any]:
     }
 
 
+def _build_push_config(raw: dict) -> Dict[str, Any]:
+    """Assemble the ``push:`` block: relay endpoint + registry storage.
+
+    Only shape/range checks live here; the cross-section requirements
+    (PyNaCl installed, a ``state:`` section or ``devicesFile`` for the
+    registry, and a ``push:`` block existing wherever ``report.push``
+    is enabled) run once on the fully assembled config in
+    :func:`_validate_push_config`, because the sections involved may
+    live in different config-directory files.
+    """
+    relay = raw.get("relay") or {}
+    url = (relay.get("url") or "").strip()
+    parsed = _safe_urlparse(url, "push.relay.url")
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ConfigError(
+            "push.relay.url must be an http(s) URL, got {!r}".format(url)
+        )
+    # `is None`, not `or`: an explicit `timeout: 0` must reach the range
+    # check below and be refused, not silently become the default.
+    timeout_raw = relay.get("timeout")
+    timeout = 10.0 if timeout_raw is None else float(timeout_raw)
+    if timeout <= 0:
+        raise ConfigError("push.relay.timeout must be > 0 seconds")
+    return {
+        "relay": {"url": url, "timeout": timeout},
+        "devicesFile": raw.get("devicesFile") or None,
+    }
+
+
+def resolve_bonjour_config(
+    web_config: Optional[WebConfig],
+) -> Optional[Dict[str, Any]]:
+    """Collapse ``web.bonjour``'s bool-or-map forms to one shape.
+
+    Returns ``None`` when the advert is off (absent, ``false``, or the
+    map form with ``enabled: false``), else ``{"name": ...}`` where
+    ``name`` is the operator's instance-name override or ``None`` for
+    the default (the node's hostname).
+    """
+    if web_config is None:
+        return None
+    raw = web_config.get("bonjour")
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        if not raw.get("enabled", True):
+            return None
+        return {"name": raw.get("name")}
+    return {"name": None}
+
+
 def _config_from_doc(
     doc: dict,
     path: str,
@@ -3836,6 +4057,7 @@ def _config_from_doc(
     notifyconf = (
         _build_notify_config(doc["notify"]) if "notify" in doc else None
     )
+    pushconf = _build_push_config(doc["push"]) if "push" in doc else None
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
         # Included jobs arrive already fully constructed, so they carry only
@@ -3872,6 +4094,10 @@ def _config_from_doc(
             if notifyconf:
                 raise ConfigError("multiple notify configs")
             notifyconf = inc_config.notify_config
+        if inc_config.push_config:
+            if pushconf:
+                raise ConfigError("multiple push configs")
+            pushconf = inc_config.push_config
     defaults = mergedicts(DEFAULT_CONFIG, inc_defaults_merged)
     defaults = mergedicts(defaults, doc.get("defaults", {}))
     # One env_file is frequently shared by many jobs in a doc; a per-doc
@@ -3899,6 +4125,7 @@ def _config_from_doc(
         dags=dags,
         mcp_config=mcpconf,
         notify_config=notifyconf,
+        push_config=pushconf,
     )
 
 
@@ -4000,6 +4227,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
                 )
     _validate_dags(config)
     _validate_mcp_config(config)
+    _validate_push_config(config)
 
 
 def _validate_dags(config: CronstableConfig) -> None:

@@ -50,7 +50,8 @@ class _FakeMatchInfo:
 class _ScopedReq:
     """A minimal stand-in for aiohttp's Request carrying just what the auth
     middleware and _required_web_scope read: path, method, headers, query,
-    and a match_info whose route resource has a canonical path."""
+    a match_info whose route resource has a canonical path, and the
+    mapping surface the middleware files the matched token into."""
 
     def __init__(
         self,
@@ -67,6 +68,13 @@ class _ScopedReq:
         self.match_info = _FakeMatchInfo(
             path if canonical == "__self__" else canonical
         )
+        self.store = {}
+
+    def __setitem__(self, key, value):
+        self.store[key] = value
+
+    def get(self, key, default=None):
+        return self.store.get(key, default)
 
 
 async def _run(middleware, request):

@@ -137,6 +137,7 @@ jobs:
                 "webhook": (
                     config.DEFAULT_CONFIG["onFailure"]["report"]["webhook"]
                 ),
+                "push": config.DEFAULT_CONFIG["onFailure"]["report"]["push"],
             },
             "retry": {
                 "backoffMultiplier": 2,
@@ -214,6 +215,7 @@ jobs:
                 "webhook": (
                     config.DEFAULT_CONFIG["onFailure"]["report"]["webhook"]
                 ),
+                "push": config.DEFAULT_CONFIG["onFailure"]["report"]["push"],
             },
             "retry": {
                 "backoffMultiplier": 2,

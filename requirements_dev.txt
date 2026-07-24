@@ -14,6 +14,13 @@ cryptography; platform_machine != "ARM64" or sys_platform != "win32"
 # test_orjson_is_installed_where_a_wheel_exists fails if this line ever stops
 # covering the cells that DO have wheels.
 orjson>=3.9; python_version < "3.15" and (platform_machine != "ARM64" or sys_platform != "win32")
+# pynacl backs the optional `push` extra (E2E-encrypted push alerts). Installed
+# in dev unconditionally so the sealing/round-trip tests in tests/test_push.py
+# really run in every CI cell: its cp38-abi3 wheels cover every runner we use
+# (including win-arm64, unlike cryptography above), so no marker is needed;
+# the tests still importorskip so a bare `pip install -e .` checkout can run
+# the rest of the suite.
+pynacl>=1.5
 # security linter; bandit[toml] reads its config from pyproject.toml.
 bandit[toml]
 mypy

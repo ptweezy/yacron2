@@ -1,8 +1,9 @@
 # Reporting (Mail, Sentry, Shell, Webhook)
 
-cronstable can report a job's outcome through four reporters - Sentry, e-mail
-(SMTP), an arbitrary shell command, and an HTTP webhook (Slack-compatible out
-of the box) - configured under the `report` block of the `onFailure`,
+cronstable can report a job's outcome through five reporters: Sentry, e-mail
+(SMTP), an arbitrary shell command, an HTTP webhook (Slack-compatible out
+of the box), and end-to-end encrypted push to paired devices, configured
+under the `report` block of the `onFailure`,
 `onPermanentFailure`, `onSuccess`, and `onLate` hooks. This page documents
 every reporter
 option, its type and default, the secret-resolution rules, the jinja2 template
@@ -21,7 +22,7 @@ same schema:
 | `onLate` | The in-process SLA monitor latches a breach of one of the job's `sla:` thresholds: too long without a success, a due slot that never started, or a run exceeding its runtime bound. Fires once per breach, not per evaluation. See [Late-Run Detection](Late-Run-Detection). |
 
 All four hooks accept the identical `report` block (`sentry`, `mail`, `shell`,
-`webhook`). The default report configuration is applied independently to each
+`webhook`, `push`). The default report configuration is applied independently to each
 hook (`_REPORT_DEFAULTS` is deep-copied into each), so configuring one
 hook does not affect the others. `onLate`'s defaults differ in wording only:
 an SLA breach has no run outcome to describe, so its default mail subject is
@@ -35,9 +36,9 @@ A run that is deliberately terminated to make way for a newer instance
 (`concurrencyPolicy: Replace`) is not treated as a failure and is neither
 reported nor retried. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
-### All four reporters always run
+### All five reporters always run
 
-For any given hook, cronstable always invokes all four reporters concurrently
+For any given hook, cronstable always invokes all five reporters concurrently
 (`asyncio.gather` with `return_exceptions=True`). A reporter that is not
 configured returns early and does nothing:
 
@@ -45,6 +46,7 @@ configured returns early and does nothing:
 - Mail returns if `to` or `from` is unset.
 - Shell returns if `command` is unset (`None`).
 - Webhook returns if no `url` source is set.
+- Push returns if `enabled` is `false` (the default).
 
 An exception raised by one reporter is logged at `ERROR` level (with traceback)
 and does not prevent the other reporters from running, nor does it propagate to
@@ -445,11 +447,66 @@ ntfy (plain-text body, priority via header):
 
 Note that `headers` values are sent verbatim; only `body` is a jinja2 template.
 
+## Push reporter
+
+Sends an end-to-end encrypted alert to every paired device through a hosted
+relay. The payload is sealed to each device's X25519 public key (a libsodium
+sealed box) before it leaves the daemon, so the relay forwards ciphertext it
+cannot read; the companion app decrypts and renders the notification on the
+device. Reporting occurs only when `enabled` is `true`; otherwise the
+reporter returns early. It requires the `push` extra
+(`pip install "cronstable[push]"`) and a daemon-global `push:` section
+naming the relay and the device-registry storage; both requirements are
+enforced at config load. Pairing, storage, size limits, and the trust model
+are documented on [Push Notifications](Push-Notifications).
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool (Opt) | `false` | Opt this hook into the push channel. Enabling it anywhere requires a `push:` section (a `ConfigError` otherwise). |
+| `priority` | `time-sensitive` or `passive` (Opt) | `time-sensitive` | Relayed to APNs as the interruption level: `time-sensitive` breaks through scheduled summaries, `passive` does not. |
+| `includeLogTail` | bool (Opt) | `true` | Carry the last captured output lines (stderr when captured, else stdout, up to 40 lines) inside the sealed payload, trimmed oldest-first to fit the size cap. |
+
+Example:
+
+```yaml
+push:
+  relay:
+    url: https://relay.example.net/v1/notify
+  devicesFile: /var/lib/cronstable/devices.json
+
+jobs:
+  - name: backup
+    command: /usr/local/bin/backup.sh
+    schedule: "0 3 * * *"
+    captureStderr: true
+    onFailure:
+      report:
+        push:
+          enabled: true
+          priority: time-sensitive
+```
+
+Notes on behavior:
+
+- This block only opts a hook in; the relay endpoint and the paired-device
+  registry live in the daemon-global `push:` section (see
+  [Push Notifications](Push-Notifications#the-push-section)).
+- Unlike the other reporters there is no template: the sealed payload is a
+  fixed JSON shape (name, kind, host, timestamp, run context, optional log
+  tail) that the companion app renders after decrypting. See
+  [what an alert contains](Push-Notifications#size-limits-and-what-an-alert-contains).
+- The alert fans out to every paired device. A sealing failure or relay
+  outage is logged per device and, like every reporter error, neither fails
+  the job nor blocks the other reporters. With no device paired, the alert
+  is dropped with a warning naming the pairing endpoint.
+- The same block under `notify.report` (below) pushes daemon events: DAG
+  failures, approval gates, and leadership/quorum changes.
+
 ## Daemon event notifications (`notify:`)
 
 The four hooks above report on **job runs**. A separate top-level `notify:`
 block reports on **daemon and orchestration events** that are not job runs, over
-the same four reporters:
+the same five reporters:
 
 | Event | Fires when |
 | --- | --- |
@@ -459,7 +516,7 @@ the same four reporters:
 | `quorum_loss` | This node leaves quorum, so its `Leader` jobs stand down. |
 
 The block carries a `report` block (the identical `sentry` / `mail` / `shell` /
-`webhook` schema documented above) and an optional `events` allow-list. Omit
+`webhook` / `push` schema documented above) and an optional `events` allow-list. Omit
 `events` to report on every event; list a subset to filter. There is at most
 one `notify:` block across a config (like `web:`), and it is picked up on a
 reload.
@@ -543,6 +600,7 @@ the logs (it is tied to a secret); for sentry, the DSN env-var name is logged.
 
 ## Related pages
 
+- [Push Notifications](Push-Notifications): the end-to-end encrypted channel behind the push reporter, and how devices are paired
 - [Configuration Reference](Configuration-Reference)
 - [Failure Detection and Retries](Failure-Detection-and-Retries)
 - [Late-Run Detection](Late-Run-Detection): the `sla:` thresholds behind the `onLate` hook

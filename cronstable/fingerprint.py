@@ -46,6 +46,7 @@ import json
 from typing import Any, Dict, Iterable, List, Union
 
 from cronstable.config import (
+    DEFAULT_PUSH_REPORT,
     DEFAULT_REPORT_SHELL_TIMEOUT,
     JobConfig,
     schedule_object_to_crontab,
@@ -175,6 +176,12 @@ def _omit_default_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
         and shell.get("timeout") == DEFAULT_REPORT_SHELL_TIMEOUT
     ):
         report["shell"] = {k: v for k, v in shell.items() if k != "timeout"}
+    # The whole push block post-dates v1: at its defaults it vanishes from
+    # identity; a job that actually enables (or tunes) push gets a new
+    # digest, correctly, since what fires on failure changed. pop() is
+    # safe: `report` is the fresh top-level copy _redact_report returned.
+    if report.get("push") == DEFAULT_PUSH_REPORT:
+        report.pop("push")
     return report
 
 

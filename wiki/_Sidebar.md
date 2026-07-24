@@ -27,9 +27,11 @@
   - [Job-Set ID](Job-Set-ID)
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
+  - [Push Notifications](Push-Notifications)
   - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)
+  - [LAN Discovery (Bonjour/mDNS)](LAN-Discovery)
   - [Listener TLS](Listener-TLS)
   - [Calendar Export (iCal)](Calendar-Export)
   - [Web Dashboard](Web-Dashboard)

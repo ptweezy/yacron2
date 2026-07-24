@@ -139,6 +139,11 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/state` | `_web_state` | `200` |
 | `GET` | `/state/documents` | `_web_state_documents` | `200` |
 | `GET` | `/state/records` | `_web_state_records` | `200` |
+| `GET` | `/whoami` | `_web_whoami` | `200` |
+| `GET` | `/push/devices` | `_web_push_devices` | `200` (`404` until a `push:` section is configured) |
+| `POST` | `/push/devices` | `_web_push_pair` | `201` (`200` when an existing public key re-pairs) |
+| `DELETE` | `/push/devices/{id}` | `_web_push_revoke` | `200` |
+| `POST` | `/push/devices/{id}/test` | `_web_push_test` | `200` (`502` when sealing or the relay failed) |
 | `POST` | `/mcp` | `MCPHandler.handle_http` | `200` (JSON-RPC response; `202` for a notification; omitted unless `mcp.enabled`) |
 | `GET` | `/mcp` | `MCPHandler.handle_http_get` | `405` (always, with `Allow: POST, OPTIONS`; omitted unless `mcp.enabled`) |
 | `OPTIONS` | `/mcp` | `MCPHandler.handle_options` | `204` (CORS preflight for an allow-listed `Origin`; omitted unless `mcp.enabled`) |
@@ -1145,6 +1150,114 @@ output, which the metadata-only stance keeps off this surface. A missing or
 empty `stream` parameter is a `400`; a stateless install is a `404`
 (`state store is not configured`), as for `/state/documents`.
 
+### `GET /whoami`
+
+Describes the bearer token that authenticated this request: its `label`, the
+scopes it grants (with the implied `view` expanded), and whether it is an
+all-scopes token. A companion app uses it to show what it may do; the
+dashboard uses it to warn when its pairing QR would hand a phone the
+all-scopes token (see [Push Notifications](Push-Notifications)). Requires the
+`view` scope.
+
+```shell
+$ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/whoami
+{
+    "authenticated": true,
+    "label": "wallboard-ipad",
+    "scopes": ["view"],
+    "allScopes": false
+}
+```
+
+When no token is configured there is no auth middleware and no token to
+describe: `authenticated` is `false`, `label` is `null`, `scopes` lists every
+scope, and `allScopes` is `true` (every scope is effectively granted).
+
+### `GET /push/devices`
+
+Lists every device paired for [end-to-end encrypted push
+alerts](Push-Notifications), sorted by pairing time. Push tokens are redacted
+to their trailing six characters (the token is what lets a third party
+address the device through the platform push service); public keys are
+returned whole. Requires the `view` scope.
+
+Like all `/push/...` routes, it answers `404` until a `push:` section is
+configured (the routes are always registered, so a reload that adds the
+section needs no web-app restart), and `503` when the device registry's
+store is unavailable.
+
+```shell
+$ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/push/devices
+{
+    "devices": [
+        {
+            "id": "f1e2d3c4b5a69788",
+            "name": "parker-iphone",
+            "platform": "ios",
+            "publicKey": "jSNlDu28No2itHnvrs6ajHHuNAxvqgOjmGxHJrMo8yg=",
+            "pushToken": "…4af1c9",
+            "createdAt": "2026-07-23T14:00:00+00:00",
+            "createdBy": "parker-iphone"
+        }
+    ]
+}
+```
+
+### `POST /push/devices`
+
+Pairs a device for encrypted push alerts. The JSON body carries four
+required fields: `name` (up to 64 characters), `platform` (up to 32),
+`publicKey` (base64 decoding to exactly 32 bytes, an X25519 public key), and
+`pushToken` (the platform push token, up to 512 characters). Requires the
+`control` scope.
+
+A new pairing answers `201` with `{"device": …, "created": true}`. Pairing
+is keyed on the public key: the same key pairing again answers `200` with
+`created: false`, updating `name`/`platform`/`pushToken` in place while
+keeping the record's `id` and `createdAt`, so revocation references stay
+stable. `createdBy` records the label of the token that performed the
+pairing. A malformed body, a missing or over-long field, or an invalid key
+is a `400` naming the problem; no `push:` section is a `404`; a store that
+cannot be written is a `503`.
+
+```shell
+$ curl -X POST -H "Authorization: Bearer s3cr3t" \
+    -H "Content-Type: application/json" \
+    -d '{"name": "parker-iphone", "platform": "ios", "publicKey": "jSNlDu28No2itHnvrs6ajHHuNAxvqgOjmGxHJrMo8yg=", "pushToken": "8f3a1bc2…d94af1c9"}' \
+    http://127.0.0.1:8080/push/devices
+{"device": {"id": "f1e2d3c4b5a69788", "…": "…"}, "created": true}
+```
+
+### `DELETE /push/devices/{id}`
+
+Revokes one paired device; the daemon stops sealing alerts to it. Requires
+the `control` scope. Answers `{"revoked": "<id>"}`, or `404` when no device
+has that id (or no `push:` section is configured), or `503` when the store
+is unavailable.
+
+```shell
+$ curl -X DELETE -H "Authorization: Bearer s3cr3t" \
+    http://127.0.0.1:8080/push/devices/f1e2d3c4b5a69788
+{"revoked": "f1e2d3c4b5a69788"}
+```
+
+### `POST /push/devices/{id}/test`
+
+Seals a test alert to one device and posts it to the configured relay,
+returning the round-trip outcome `{device, status, error}` (`status` is the
+relay's HTTP status), so "my phone is silent" is debuggable from the
+dashboard instead of the logs. Requires the `control` scope. Answers `200`
+when the relay accepted the alert and `502` when sealing failed or the relay
+refused or was unreachable (the `error` field says which); `404` for an
+unknown device id or no `push:` section; `503` when the registry store is
+unavailable.
+
+```shell
+$ curl -X POST -H "Authorization: Bearer s3cr3t" \
+    http://127.0.0.1:8080/push/devices/f1e2d3c4b5a69788/test
+{"device": "f1e2d3c4b5a69788", "status": 200, "error": null}
+```
+
 ### `GET /job-set-id`
 
 Returns this instance's job-set id: the order-independent fingerprint of every
@@ -1676,6 +1789,8 @@ those commands read the injected environment for you.
 ## See also
 
 - [Web Dashboard](Web-Dashboard): the built-in browser UI served by this interface.
+- [Push Notifications](Push-Notifications): the encrypted push channel behind the `/push/devices` routes and the pairing flow.
+- [LAN Discovery](LAN-Discovery): advertising this interface as a `_cronstable._tcp` mDNS service with `web.bonjour`.
 - [Listener TLS](Listener-TLS): serving these listeners over `https://`, requiring client certificates, certificate rotation, and the client-side flags.
 - [Pausing Jobs](Pausing-Jobs): the semantics behind `POST /jobs/{name}/pause` and `/resume`.
 - [Late-Run Detection](Late-Run-Detection): the `sla` payload field and the monitor behind it.

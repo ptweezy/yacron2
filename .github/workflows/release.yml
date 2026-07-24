@@ -415,6 +415,16 @@ jobs:
           # build, so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
+          # Bundle pynacl (the `push` extra): abi3 wheels cover amd64/arm64.
+          # verify_pynacl.py round-trips a real sealed box and uninstalls a
+          # broken build, so the binary either seals correctly or ships
+          # without the extra (push then fails closed at config load).
+          uv pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
+          uv run python pyinstaller/verify_pynacl.py || uv pip uninstall pynacl || true
+          # Bundle zeroconf (the `discovery` extra) for the opt-in
+          # web.bonjour LAN advert; a clean import is the whole contract.
+          uv pip install "zeroconf>=0.132" || echo "zeroconf unavailable; discovery extra not bundled"
+          uv run python -c "import zeroconf, zeroconf.asyncio" || uv pip uninstall zeroconf || true
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           mv dist/cronstable "dist/cronstable-linux-${{ matrix.arch }}"
@@ -506,6 +516,17 @@ jobs:
               # when the wheel is missing; the shared script round-trip-verifies
               # it and drops a broken QEMU build -> stdlib json fallback.
               RUST_SETUP="apk add --no-cache curl && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
+              # Bundle pynacl (the `push` extra): musllinux wheels on amd64/
+              # arm64, else a plain-C source build (bundled libsodium; the
+              # libffi-dev/make toolchain is best-effort here). A build that
+              # fails the sealed-box round-trip is uninstalled, so the binary
+              # never ships a miscompiled libsodium (push fails closed).
+              apk add --no-cache libffi-dev make >/dev/null 2>&1 || true
+              pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
+              python pyinstaller/verify_pynacl.py || pip uninstall -y pynacl || true
+              # Bundle zeroconf (the `discovery` extra) for web.bonjour.
+              pip install "zeroconf>=0.132" || echo "zeroconf unavailable; discovery extra not bundled"
+              python -c "import zeroconf, zeroconf.asyncio" || pip uninstall -y zeroconf || true
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test: a musl binary on a musl host
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}-musl
@@ -587,6 +608,16 @@ jobs:
               # when the wheel is missing; the shared script round-trip-verifies
               # it and drops a broken QEMU build -> stdlib json fallback.
               RUST_SETUP="apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
+              # Bundle pynacl (the `push` extra): manylinux wheels on amd64/
+              # arm64, else a plain-C source build (bundled libsodium, no
+              # Rust; libffi-dev is best-effort). verify_pynacl.py drops a
+              # QEMU-miscompiled build so push fails closed, never garbles.
+              apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true
+              pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
+              python pyinstaller/verify_pynacl.py || pip uninstall -y pynacl || true
+              # Bundle zeroconf (the `discovery` extra) for web.bonjour.
+              pip install "zeroconf>=0.132" || echo "zeroconf unavailable; discovery extra not bundled"
+              python -c "import zeroconf, zeroconf.asyncio" || pip uninstall -y zeroconf || true
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
@@ -659,6 +690,13 @@ jobs:
           # the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
+          # Bundle pynacl (the `push` extra); macOS ships universal2 wheels.
+          # verify_pynacl.py round-trips a sealed box, else uninstalls.
+          uv pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
+          uv run python pyinstaller/verify_pynacl.py || uv pip uninstall pynacl || true
+          # Bundle zeroconf (the `discovery` extra) for web.bonjour.
+          uv pip install "zeroconf>=0.132" || echo "zeroconf unavailable; discovery extra not bundled"
+          uv run python -c "import zeroconf, zeroconf.asyncio" || uv pip uninstall zeroconf || true
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Assert the binary is the intended native arch: Rosetta would happily
@@ -777,6 +815,13 @@ jobs:
           # so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
+          # Bundle pynacl (the `push` extra); Windows ships wheels for
+          # win32/amd64/arm64. verify_pynacl.py round-trips, else uninstalls.
+          uv pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
+          uv run python pyinstaller/verify_pynacl.py || uv pip uninstall pynacl || true
+          # Bundle zeroconf (the `discovery` extra) for web.bonjour.
+          uv pip install "zeroconf>=0.132" || echo "zeroconf unavailable; discovery extra not bundled"
+          uv run python -c "import zeroconf, zeroconf.asyncio" || uv pip uninstall zeroconf || true
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"

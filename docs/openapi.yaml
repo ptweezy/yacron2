@@ -71,6 +71,8 @@ tags:
     description: iCalendar feeds.
   - name: state
     description: Durable-state inspector (metadata only).
+  - name: push
+    description: End-to-end encrypted push alerts and device pairing.
   - name: metrics
     description: Prometheus exposition.
 
@@ -846,6 +848,151 @@ paths:
         "404":
           description: No `state:` store is configured.
 
+  /whoami:
+    get:
+      tags: [meta]
+      summary: Describe the presented bearer token
+      operationId: getWhoami
+      description: >-
+        The label and scopes of the token that authenticated this request,
+        so a client can tell what it may do (and the dashboard can warn
+        when its pairing QR would hand a phone the all-scopes token). With
+        no token configured there is no auth middleware: `authenticated`
+        is false and every scope is effectively granted.
+      responses:
+        "200":
+          description: The matched token's identity.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WhoAmI" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /push/devices:
+    get:
+      tags: [push]
+      summary: List paired push devices
+      operationId: getPushDevices
+      description: >-
+        Every device paired for end-to-end encrypted push alerts. Push
+        tokens are redacted to their trailing characters; public keys are
+        returned whole. 404 until a `push:` section is configured.
+      responses:
+        "200":
+          description: "`{devices}`, sorted by pairing time."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items: { $ref: "#/components/schemas/PushDevice" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No `push:` section is configured.
+        "503":
+          description: The device registry's store is unavailable.
+    post:
+      tags: [push]
+      summary: Pair a device
+      operationId: pairPushDevice
+      x-required-scope: control
+      description: >-
+        Register a device (X25519 public key + platform push token) for
+        encrypted alerts. Pairing is keyed on the public key: the same key
+        pairing again updates its record in place (push tokens rotate,
+        phones get renamed) and keeps its id and createdAt, so revocation
+        references stay stable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 64 }
+                platform: { type: string, maxLength: 32 }
+                publicKey:
+                  type: string
+                  description: The device X25519 public key, base64 (32 bytes).
+                pushToken: { type: string, maxLength: 512 }
+              required: [name, platform, publicKey, pushToken]
+      responses:
+        "201":
+          description: "`{device, created: true}`: a new pairing."
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "200":
+          description: >-
+            `{device, created: false}`: an existing public key re-paired.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: >-
+            Malformed JSON body, or a field missing, over-long, or not a
+            valid base64 32-byte key.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: No `push:` section is configured.
+        "503":
+          description: The device registry's store is unavailable.
+
+  /push/devices/{id}:
+    delete:
+      tags: [push]
+      summary: Revoke a paired device
+      operationId: revokePushDevice
+      x-required-scope: control
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+      responses:
+        "200":
+          description: "`{revoked: id}`."
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: No `push:` section, or no device with this id.
+        "503":
+          description: The device registry's store is unavailable.
+
+  /push/devices/{id}/test:
+    post:
+      tags: [push]
+      summary: Send a test alert to one device
+      operationId: testPushDevice
+      x-required-scope: control
+      description: >-
+        Seals a test payload to the device and posts it to the configured
+        relay, returning the outcome, so delivery is debuggable end to
+        end from the dashboard.
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+      responses:
+        "200":
+          description: "`{device, status, error: null}`: the relay accepted it."
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "502":
+          description: >-
+            `{device, status, error}`: sealing failed or the relay refused
+            or was unreachable.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: No `push:` section, or no device with this id.
+        "503":
+          description: The device registry's store is unavailable.
+
   /metrics:
     get:
       tags: [metrics]
@@ -1008,6 +1155,12 @@ components:
       required: false
       description: The auth token, for calendar clients that cannot send a bearer header.
       schema: { type: string }
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      description: The paired device's id (assigned at pairing).
+      schema: { type: string }
 
   headers:
     ETag:
@@ -1027,6 +1180,36 @@ components:
       description: No such job, DAG, or run.
 
   schemas:
+    WhoAmI:
+      type: object
+      description: The bearer token that authenticated the request.
+      properties:
+        authenticated: { type: boolean }
+        label: { type: string, nullable: true }
+        scopes:
+          type: array
+          items: { type: string, enum: [view, control, approve] }
+        allScopes: { type: boolean }
+      required: [authenticated, scopes, allScopes]
+
+    PushDevice:
+      type: object
+      description: One paired push device, as listed (push token redacted).
+      properties:
+        id: { type: string }
+        name: { type: string }
+        platform: { type: string }
+        publicKey:
+          type: string
+          description: The device X25519 public key, base64.
+        pushToken:
+          type: string
+          description: Redacted to its trailing characters.
+        createdAt: { type: string, format: date-time }
+        createdBy: { type: string, nullable: true }
+      required: [id, name, platform, publicKey]
+      additionalProperties: true
+
     StatusRow:
       type: object
       description: One job's compact status.

@@ -54,6 +54,15 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   (see [Schedule linting](#schedule-linting))
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
+* **End-to-end encrypted push notifications**: a fifth reporter seals each
+  alert to a paired device's own key (libsodium sealed box), so the relay
+  that forwards it to the platform push service never sees job names,
+  hostnames, or log lines; pairing is a dashboard QR scan or one API call,
+  and an opt-in Bonjour/mDNS advert lets a companion app find the daemon on
+  the LAN (see [Push notifications](#push-notifications) and the
+  [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
+  and [LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
+  wiki pages)
 * Flexible configuration: you decide how to determine if a cron job fails or not
 * Designed for running in Docker, Kubernetes, or 12 factor environments:
   * Runs in the foreground
@@ -1443,6 +1452,54 @@ command is captured and interpreted as html and placed in the email message:
         smtpPort: 1025
         subject: This is a cron job with html body
 ```
+
+### Push notifications
+
+A fifth reporter, `push`, delivers end-to-end encrypted alerts to paired
+devices. Each alert is sealed to the device's X25519 public key (a libsodium
+sealed box) before it leaves the daemon; the hosted relay that forwards it to
+the platform push service (APNs) sees only ciphertext and routing metadata,
+never job names, hostnames, or log lines. It needs the `push` extra
+(`pip install "cronstable[push]"`), a daemon-global `push:` section, and an
+opt-in on the reporting hooks; a config that enables push without any of
+those refuses to start rather than silently not alerting:
+
+```yaml
+push:
+  relay:
+    url: https://relay.example.net/v1/notify
+  devicesFile: /var/lib/cronstable/devices.json
+
+defaults:
+  onFailure:
+    report:
+      push:
+        enabled: true
+```
+
+(With a `state:` section configured, `devicesFile` can be dropped: pairings
+ride the durable store and are visible to every node sharing it.)
+
+Pair a device from the dashboard ("Pair a device" in the command palette or
+settings, a QR scan) or with one call:
+
+```shell
+$ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"name": "my-iphone", "platform": "ios", "publicKey": "<base64 X25519 key>", "pushToken": "<device push token>"}' \
+    http://127.0.0.1:8080/push/devices
+```
+
+Setting `web.bonjour: true` (with the `discovery` extra installed)
+additionally advertises the web API as a `_cronstable._tcp` mDNS service on
+the local network, so a companion app finds the daemon without a typed URL;
+see the
+[LAN Discovery](https://github.com/ptweezy/cronstable/wiki/LAN-Discovery)
+wiki page.
+
+See
+[Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
+in the wiki for the report options, pairing and revocation, storage, size
+limits, and the relay trust model.
 
 ### Metrics
 

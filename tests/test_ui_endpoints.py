@@ -1028,6 +1028,11 @@ class _AuthReq:
         self.path = path
         self.headers = headers or {}
         self.query = query or {}
+        # the middleware files the matched token on the request
+        self.store = {}
+
+    def __setitem__(self, key, value):
+        self.store[key] = value
 
 
 async def _run_auth(middleware, request):

@@ -114,6 +114,19 @@ speedups = [
     # (unlike uvloop) it needs no platform marker.
     "orjson>=3.9",
 ]
+# End-to-end encrypted push alerts (the `push` reporter; see cronstable.push).
+# PyNaCl bundles libsodium (pure C, no Rust), ships abi3 wheels for every
+# mainstream target incl. win-arm64, and source-builds with a plain C
+# toolchain on the leaner arches. Optional so the zero-new-dep,
+# architecture-portable core install holds; UNLIKE the speedups extras there
+# is no silent runtime fallback: a config with a `push:` section refuses to
+# start when this is absent (an alerting channel must fail closed, not
+# self-disable). See config._validate_push_config.
+push = ["pynacl>=1.5"]
+# Zero-config LAN discovery (the opt-in `web.bonjour` mDNS advert; see
+# cronstable.discovery). Same fail-closed contract: web.bonjour without this
+# installed is a ConfigError, never a silent no-advert.
+discovery = ["zeroconf>=0.132"]
 dev = [
     # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.
@@ -188,10 +201,18 @@ warn_return_any = true
 strict_optional = true
 
 [[tool.mypy.overrides]]
-# The optional `speedups` deps are imported behind try/except with a stdlib
-# fallback (orjson in cronstable._json, uvloop in cronstable.__main__), so a checkout
-# without the extra installed must still type-check cleanly.
-module = ["orjson", "uvloop"]
+# The optional-extra deps are imported behind try/except guards (orjson in
+# cronstable._json, uvloop in cronstable.__main__, pynacl in cronstable.push,
+# zeroconf in cronstable.discovery), so a checkout without the extras
+# installed must still type-check cleanly.
+module = [
+    "orjson",
+    "uvloop",
+    "nacl",
+    "nacl.*",
+    "zeroconf",
+    "zeroconf.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

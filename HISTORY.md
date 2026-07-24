@@ -5,6 +5,99 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## Unreleased
+
+An alerting-reach release. A fifth reporter delivers end-to-end encrypted push
+alerts to paired devices through a hosted relay that never sees plaintext; a
+device-pairing API and a dashboard QR panel manage those pairings; a new
+`GET /whoami` tells any client what its bearer token may do; and an opt-in
+Bonjour/mDNS advert lets a companion app on the same network find the daemon
+without a typed URL. Both capabilities are optional extras (`push`,
+`discovery`) and both fail closed at config load: a config that asks for
+either on an install without the library refuses to start instead of silently
+not alerting or not advertising. (Rename this `Unreleased` heading to the cut
+version at release time; see [Contributing](CONTRIBUTING.md#releasing).)
+
+### End-to-end encrypted push alerts (the `push` reporter)
+
+- **A fifth reporter, `push`, seals every alert to each paired device's public
+  key** (a libsodium sealed box: X25519 + XSalsa20-Poly1305) and hands the
+  ciphertext to a hosted relay that forwards it to the platform push service
+  (APNs). The relay sees only a device token, a ciphertext, an opaque
+  collapse-id hash, a priority, and an event flag, never job names, hostnames,
+  or log lines, so a self-hosted daemon can use a shared relay without
+  trusting it. See the
+  [Push Notifications wiki page](wiki/Push-Notifications.md); the versioned
+  wire contract is [`docs/relay-protocol.md`](docs/relay-protocol.md).
+- **`report: push:` rides the existing report schema** on `onFailure` /
+  `onPermanentFailure` / `onSuccess` / `onLate` and under `notify.report`, so
+  DAG failures, approval gates, and leader/quorum events can push too. Its
+  keys: `enabled` (default `false`), `priority` (`time-sensitive` or
+  `passive`, relayed as the APNs interruption level), and `includeLogTail`
+  (default `true`).
+- **A daemon-global `push:` section says where alerts go and where pairings
+  live**: `push.relay.url` (required, http(s)) plus an optional
+  `push.relay.timeout`, and registry storage that rides the durable `state:`
+  store when one is configured (one document per device, cluster-visible,
+  never swept by state GC) or a local `push.devicesFile` otherwise.
+- **The sealed payload always fits the platform cap**: the ciphertext is sized
+  so the relay's final APNs JSON stays under APNs' 4096-byte limit, trimming
+  the log tail oldest-first (the newest lines carry the failure) and keeping
+  the alert's identity (name, kind, host) intact.
+- **Push is a new optional extra (`push`, PyNaCl) and fails closed**: a
+  `push:` section without PyNaCl installed, `report.push.enabled` anywhere
+  without a `push:` section, and a `push:` section with neither a `state:`
+  section nor `devicesFile` are all `ConfigError`s at parse time. The release
+  binaries bundle PyNaCl per architecture behind a sealed-box verification
+  step (a broken build is dropped); a lane that cannot build it ships without
+  the extra, and the config error then says so.
+
+### Device pairing API and dashboard QR
+
+- **Four new endpoints manage the paired-device registry**:
+  `GET /push/devices` lists pairings (push tokens redacted to their trailing
+  characters), `POST /push/devices` pairs a device
+  (`{name, platform, publicKey, pushToken}`; the same public key pairing
+  again updates its record in place and keeps its id, so revocation
+  references stay stable), `DELETE /push/devices/{id}` revokes one, and
+  `POST /push/devices/{id}/test` round-trips a test alert through the relay
+  so a silent phone is debuggable from the dashboard. All ride the existing
+  listeners, bearer tokens, and scopes (`view` to list, `control` to mutate)
+  and answer `404` until a `push:` section is configured, so a reload that
+  adds the section needs no web-app restart.
+- **The dashboard gains a "Pair a device" panel** (command palette and
+  settings): a QR code of `{v: 1, name, url, token}` plus the same JSON as a
+  copyable string, with a warning when the stored token is the all-scopes
+  one, pointing at a scoped
+  [`web.authTokens`](wiki/HTTP-API.md#scoped-tokens-webauthtokens) entry for
+  phones instead.
+
+### `GET /whoami`
+
+- **A new introspection endpoint describes the presented bearer token**:
+  `{authenticated, label, scopes, allScopes}`, so a companion app can show
+  what it is allowed to do and the dashboard can warn before its pairing QR
+  hands a phone the all-scopes token. With no token configured there is no
+  auth middleware to match against: `authenticated` is `false`, `allScopes`
+  is `true`, and every scope is effectively granted.
+
+### Bonjour/mDNS LAN discovery (`web.bonjour`)
+
+- **`web.bonjour: true` advertises the web API as a `_cronstable._tcp` mDNS
+  service**, so a companion app (or `dns-sd -B _cronstable._tcp`) finds the
+  daemon without a typed URL. The advert carries the instance name (the
+  hostname, or the map form's `name:` override), the actually bound TCP port
+  (correct even for an ephemeral `:0` listen), and TXT records `v` (the
+  daemon version) and `scheme` (`http`/`https`). No secrets are advertised; a
+  discovered client still needs a bearer token to read anything. See the
+  [LAN Discovery wiki page](wiki/LAN-Discovery.md).
+- **It requires the new `discovery` extra (python-zeroconf) and a TCP
+  listener**, both enforced at parse time: `web.bonjour` without the library,
+  or with every `web.listen` entry a unix socket, is a `ConfigError`. Unlike
+  push, a *runtime* mDNS failure only logs and leaves the advert off until
+  the next config apply: discovery is a convenience and must never take down
+  a scheduler.
+
 ## 1.2.30 (2026-07-23)
 
 A reporting, orchestration-visibility, and API-contract release. Report
